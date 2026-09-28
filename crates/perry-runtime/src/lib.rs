@@ -11,6 +11,11 @@
 #![recursion_limit = "256"]
 // Anchors are `#[used(compiler)]`: retained by rustc, not ld64 dead-strip roots.
 #![feature(used_with_arg)]
+// `agent_ptrs::PERRY_AGENT_PTRS`: a thread-local generated code names directly.
+#![feature(thread_local)]
+// WASI (#11377): `std::os::wasi::fs::symlink_path` for `fs.symlink`.
+#![cfg_attr(target_os = "wasi", feature(wasi_ext))]
+#![cfg_attr(all(target_os = "wasi", target_env = "p2"), feature(wasip2))]
 
 /// Issue #62: route every Rust heap allocation through mimalloc instead of
 /// the system `malloc`. `gc_malloc`, arena block allocation, Vec/HashMap
@@ -68,6 +73,7 @@ pub mod abi_trampoline;
 pub mod agent;
 #[cfg(test)]
 mod agent_dispatch_tests;
+pub mod agent_ptrs;
 #[cfg(feature = "alloc-census")]
 pub mod alloc_census;
 pub mod app_group;
@@ -81,6 +87,8 @@ pub mod bigint;
 pub mod r#box;
 pub mod buffer;
 mod build_stamp;
+/// The layout facts generated code bakes in (`perry-abi`).
+pub use perry_abi as codegen_abi;
 pub(crate) mod cold_sort;
 pub(crate) mod once_init;
 pub use build_stamp::{PERRY_RUNTIME_BUILD_ID, PERRY_RUNTIME_BUILD_STAMP};
@@ -157,6 +165,7 @@ pub mod node_stream;
 pub mod node_submodules;
 pub mod node_test;
 pub mod yoga;
+pub(crate) mod zeroed_cache;
 // #3137/#3138/#3142: public `node:v8` serialize/deserialize + heap stats + GCProfiler.
 pub mod node_v8;
 // #3127/#3128/#3130/#3283: public `node:vm` import/require and narrowed execution.

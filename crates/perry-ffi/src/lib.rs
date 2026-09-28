@@ -38,19 +38,19 @@
 //! over-design up front.
 //!
 //! Followups will add: array read/alloc, object read/alloc, closure
-//! call helpers, NaN-box constants, async-runtime sharing
-//! (`spawn_async` / `block_on`). Tracked in #466 Phase 1's "Open
+//! call helpers, NaN-box constants, async work (`spawn_blocking`,
+//! the v2 `pool`, `turnloop_net`). Tracked in #466 Phase 1's "Open
 //! questions" section.
 
 #![deny(missing_docs)]
 
 mod async_runtime;
 pub use async_runtime::{
-    nanbox_string_bits, run_pending, spawn_async, spawn_blocking, spawn_blocking_with_reactor,
-    JsNativeAsyncCompletion, JsPromise, PERRY_NATIVE_ASYNC_ALREADY_COMPLETED,
-    PERRY_NATIVE_ASYNC_CLEANUP_ON_CANCEL, PERRY_NATIVE_ASYNC_CLEANUP_ON_REJECT,
-    PERRY_NATIVE_ASYNC_CLEANUP_ON_SUCCESS, PERRY_NATIVE_ASYNC_INVALID, PERRY_NATIVE_ASYNC_OK,
-    PERRY_NATIVE_ASYNC_THREAD_MAIN, PERRY_NATIVE_ASYNC_WRONG_THREAD,
+    nanbox_string_bits, run_pending, spawn_blocking, JsNativeAsyncCompletion, JsPromise,
+    PERRY_NATIVE_ASYNC_ALREADY_COMPLETED, PERRY_NATIVE_ASYNC_CLEANUP_ON_CANCEL,
+    PERRY_NATIVE_ASYNC_CLEANUP_ON_REJECT, PERRY_NATIVE_ASYNC_CLEANUP_ON_SUCCESS,
+    PERRY_NATIVE_ASYNC_INVALID, PERRY_NATIVE_ASYNC_OK, PERRY_NATIVE_ASYNC_THREAD_MAIN,
+    PERRY_NATIVE_ASYNC_WRONG_THREAD,
 };
 
 pub mod turnloop_net;
@@ -89,10 +89,10 @@ pub use handle::{
     acquire_handle_registration, drain_quarantined_handles, drop_handle, drop_handle_until,
     free_handle_id, free_handle_id_until, gc_register_mutable_root_scanner,
     gc_register_mutable_root_scanner_named, get_handle, get_handle_mut, handle_exists,
-    handle_registration, handle_registry_domain, iter_handle_ids_of, iter_handles_of,
-    iter_handles_of_mut, register_handle, reserve_handle_id, reserve_handle_id_in_domain,
-    shared_handle_id_pool, take_handle, with_handle, with_handle_mut, GcMutableRootScanner,
-    GcRootVisitor, Handle, INVALID_HANDLE,
+    handle_registration, handle_registry_domain, index_handle_type, iter_handle_ids_of,
+    iter_handles_of, iter_handles_of_mut, register_handle, reserve_handle_id,
+    reserve_handle_id_in_domain, shared_handle_id_pool, take_handle, with_handle, with_handle_mut,
+    GcMutableRootScanner, GcRootVisitor, Handle, INVALID_HANDLE,
 };
 
 mod jsvalue;

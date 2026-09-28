@@ -175,9 +175,34 @@ pub(crate) mod statics {
         O.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
+    /// The CALLING AGENT's queue of events waiting for its pump.
+    ///
+    /// #11340: this used to be one process-wide queue. Every agent's pump
+    /// drains through `js_ext_net_drain_pending`, and every push wakes the
+    /// primary thread, so a socket opened on a `worker_threads` worker had its
+    /// completions raced for by the primary: whichever pump ran first took
+    /// the worker's `'connect'` / `'data'` / `'close'`. Taken by the primary,
+    /// the event was dispatched against a socket whose listeners live on the
+    /// worker's heap — dropped (the worker then waited forever), delivered to
+    /// the wrong thread (`TypeError`s after the worker exited), or a crash.
+    /// Events are produced on the owning agent's thread (its loop's sink, or
+    /// an FFI call made by its JS), so keying by the agent that pushes is
+    /// keying by the agent that owns the socket.
+    ///
+    /// One queue per agent, created on the agent's first use and never freed:
+    /// the handful of bytes an exited worker's empty queue keeps is the price
+    /// of handing out `&'static` without a teardown hook.
     pub fn pending_events() -> &'static Mutex<Vec<PendingNetEvent>> {
-        static P: OnceLock<Mutex<Vec<PendingNetEvent>>> = OnceLock::new();
-        P.get_or_init(|| Mutex::new(Vec::new()))
+        type Queues = HashMap<u64, &'static Mutex<Vec<PendingNetEvent>>>;
+        static QUEUES: OnceLock<Mutex<Queues>> = OnceLock::new();
+        let agent = perry_ffi::agent_post::current_agent();
+        let mut queues = QUEUES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        queues
+            .entry(agent)
+            .or_insert_with(|| Box::leak(Box::new(Mutex::new(Vec::new()))))
     }
 
     /// HTTP Agent-owned socket handles are transport facades over the HTTP
@@ -228,6 +253,10 @@ pub(crate) mod statics {
 /// pass instead of needing a second per-server scanner.
 pub(crate) struct ServerState {
     pub async_id: u64,
+    /// The agent that created this server (`perry_ffi::agent_post::current_agent`).
+    /// Only that agent's pump delivers its events, so only that agent's
+    /// keepalive may count it (#11340).
+    pub owner_agent: u64,
     /// Set by `.listen()`. Keeps `has_active_handles` answering yes from the
     /// `listen()` call until the server's registry entry is removed by its
     /// `'close'`, including the window before the bind has been published.
@@ -249,6 +278,10 @@ pub(crate) struct ServerState {
 
 pub(crate) struct SocketState {
     pub(crate) tcp_async_id: u64,
+    /// The agent the socket belongs to — the one whose thread created it
+    /// (`perry_ffi::agent_post::current_agent`). Its events go to that agent's
+    /// queue, so only that agent's keepalive may count it (#11340).
+    pub(crate) owner_agent: u64,
     pub(crate) connect_async_id: u64,
     pub(crate) shutdown_async_id: u64,
     /// True only between `js_net_socket_alloc` and the first
@@ -402,6 +435,7 @@ pub(crate) fn register_turnloop_socket(
         socket_id,
         SocketState {
             tcp_async_id: 0,
+            owner_agent: perry_ffi::agent_post::current_agent(),
             connect_async_id: 0,
             shutdown_async_id: 0,
             awaiting_connect: false,
@@ -444,6 +478,7 @@ impl SocketState {
     pub(crate) fn for_test(awaiting_connect: bool) -> Self {
         SocketState {
             tcp_async_id: 0,
+            owner_agent: perry_ffi::agent_post::current_agent(),
             connect_async_id: 0,
             shutdown_async_id: 0,
             awaiting_connect,
@@ -696,6 +731,7 @@ pub unsafe extern "C" fn js_net_socket_alloc() -> i64 {
         id,
         SocketState {
             tcp_async_id,
+            owner_agent: perry_ffi::agent_post::current_agent(),
             connect_async_id: 0,
             shutdown_async_id: 0,
             awaiting_connect: true,
@@ -753,6 +789,7 @@ pub unsafe extern "C" fn js_net_create_server(
         id,
         ServerState {
             async_id: 0,
+            owner_agent: perry_ffi::agent_post::current_agent(),
             listen_armed: false,
             bound_port: 0,
             bound_host: String::new(),
@@ -1235,6 +1272,7 @@ where
         id,
         SocketState {
             tcp_async_id,
+            owner_agent: perry_ffi::agent_post::current_agent(),
             connect_async_id,
             shutdown_async_id: 0,
             awaiting_connect: false,

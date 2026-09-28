@@ -26,8 +26,8 @@ mod prebuilt_core;
 pub(crate) use driver::build_optimized_libs;
 pub(crate) use freshness::{
     auto_optimized_archives_are_fresh, auto_optimized_build_stamp, auto_optimized_cache_key,
-    auto_optimized_cross_features, auto_optimized_source_fingerprint, binding_bundles_tokio,
-    binding_needs_shared_tokio, effective_size_panic_immediate_abort, resolve_auto_well_known_libs,
+    auto_optimized_cross_features, auto_optimized_source_fingerprint, binding_cobuilds_with_stdlib,
+    effective_size_panic_immediate_abort, resolve_auto_well_known_libs,
     retain_workspace_declared_features, size_lto_fat, size_opt_level,
 };
 pub(crate) use no_auto::{resolve_no_auto_optimized_libs, resolve_prebuilt_ext_libs};
@@ -92,7 +92,44 @@ pub(crate) fn well_known_iteration_set(ctx: &CompilationContext) -> BTreeSet<Str
             }
         }
     }
+    // tokio lane L4: `node:tls` is served by perry-stdlib's TLS module over
+    // perry-ext-net's sockets — `tls.connect` and every client TLSSocket
+    // method are ext-net's — and bundled `net`, which used to fill that role
+    // for a TLS-only program, is gone. So a `tls` import routes `net` too.
+    if iteration_set
+        .iter()
+        .any(|m| m.strip_prefix("node:").unwrap_or(m) == "tls")
+    {
+        iteration_set.insert("net".to_string());
+    }
     iteration_set
+}
+
+/// Whether the well-known flip is on — i.e. `PERRY_DISABLE_WELL_KNOWN` unset.
+pub(crate) fn well_known_flip_enabled() -> bool {
+    std::env::var_os("PERRY_DISABLE_WELL_KNOWN").is_none()
+}
+
+/// Bindings whose wrapper crate is the ONLY implementation, so the flip routes
+/// them even when PERRY_DISABLE_WELL_KNOWN=1 — disabling it reverts to
+/// perry-stdlib's copies, and these have none. perry-stdlib's bundled `net`
+/// (the other `js_net_socket_*` / `js_tls_connect`) and `ws` copies ran on
+/// tokio sockets and were strict subsets of perry-ext-net / perry-ext-ws;
+/// tokio lane L4 deleted them. A `tls` import is covered through `net`:
+/// `tls.connect` is perry-ext-net's, and its symbols route to `net`
+/// (`perry_codegen::ext_registry`).
+pub(crate) fn wrapper_is_sole_provider(module: &str) -> bool {
+    matches!(module.strip_prefix("node:").unwrap_or(module), "net" | "ws")
+}
+
+/// The modules of an iteration set the well-known flip routes to a wrapper
+/// archive: every well-known import normally, only the
+/// [`wrapper_is_sole_provider`] ones when PERRY_DISABLE_WELL_KNOWN=1.
+pub(crate) fn retain_routed(mut set: BTreeSet<String>) -> BTreeSet<String> {
+    if !well_known_flip_enabled() {
+        set.retain(|module| wrapper_is_sole_provider(module));
+    }
+    set
 }
 
 /// Name wrapper archives needed by emitted object-file symbols but absent from
@@ -129,13 +166,13 @@ pub(crate) fn missing_ext_archive_diagnostics(
         missing.entry(filename).or_insert((
             symbol,
             &binding.krate,
-            binding_needs_shared_tokio(owner),
+            binding_cobuilds_with_stdlib(owner),
         ));
     }
     missing
         .into_iter()
-        .map(|(filename, (symbol, krate, shared_tokio))| {
-            let build = if shared_tokio {
+        .map(|(filename, (symbol, krate, cobuilt))| {
+            let build = if cobuilt {
                 format!(
                     "cargo build --release -p perry -p perry-runtime-static \
                      -p perry-stdlib-static -p {krate}"

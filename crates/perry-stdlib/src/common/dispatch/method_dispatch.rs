@@ -179,6 +179,12 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     } else {
         Vec::new()
     };
+    // The receiver's id must stay reachable while its method runs: a
+    // GC-reclaimable common handle (#11453) is released at a full trace that
+    // finds no word naming it, and a chained temporary receiver
+    // (`createHash(a).update(b)`) lives in no JS slot.
+    let _receiver =
+        scope.root_nanbox_u64(0x7FFD_0000_0000_0000 | (handle as u64 & 0x0000_FFFF_FFFF_FFFF));
     let arg_handles = scope.root_nanbox_f64_slice(&original_args);
     let args = perry_runtime::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
     let _ = method_name;
@@ -532,18 +538,6 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
         }
     }
 
-    // net.Socket: covers wrapper-function, struct-field, and Map.get
-    // receivers where codegen lost the static type. Static NATIVE_MODULE_TABLE
-    // path is still preferred when types are visible.
-    #[cfg(all(
-        feature = "bundled-net",
-        not(target_os = "ios"),
-        not(target_os = "android")
-    ))]
-    if crate::net::is_net_socket_handle(handle) {
-        return dispatch_net_socket(handle, method_name, &args);
-    }
-
     // zlib Transform streams (#1843): `zlib.createGzip()` etc. return handles
     // in the zlib small-handle range; their `.write`/`.end`/`.on`/`.pipe`/`.flush`/
     // `.params`/`.reset`/`.close` calls lose their static type and route here.
@@ -880,7 +874,6 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     // the well-known flip strips bundled-net. Same dispatch contract,
     // but routes through extern "C" symbols perry-ext-net provides.
     #[cfg(all(
-        not(feature = "bundled-net"),
         feature = "external-net-pump",
         not(target_os = "ios"),
         not(target_os = "android")

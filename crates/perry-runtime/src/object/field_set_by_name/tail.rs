@@ -187,16 +187,6 @@ pub(crate) fn set_field_by_name_object_tail(
             return;
         }
 
-        // Check if this is a ClosureHeader — closures support dynamic props via separate storage.
-        // ClosureHeader has CLOSURE_MAGIC (0x434C4F53) at offset 12.
-        // Without this check, crate::object::object_keys_array(obj) reads capture[0] → corruption/crash.
-        let type_tag_at_12 =
-            *((obj as *const u8).add(crate::closure::CLOSURE_TYPE_TAG_OFFSET) as *const u32);
-        if type_tag_at_12 == crate::closure::CLOSURE_MAGIC {
-            closure_set_field_by_name(obj, key, value);
-            return;
-        }
-
         if super::arguments_object_set_field(obj, key, value) {
             return;
         }
@@ -358,42 +348,60 @@ pub(crate) fn set_field_by_name_object_tail(
         {
             let class_id = (*obj).class_id;
             if class_id != 0 {
-                if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
-                    if let Some(ref reg) = *registry {
-                        let key_bytes = {
-                            let name_ptr =
-                                (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                            let name_len = (*key).byte_len as usize;
-                            std::slice::from_raw_parts(name_ptr, name_len)
-                        };
-                        let mut cid = class_id;
-                        let mut depth = 0usize;
-                        while depth < 32 {
-                            if let Some(vtable) = reg.get(&cid) {
-                                if let Ok(name) = std::str::from_utf8(key_bytes) {
-                                    if let Some(&setter_ptr) = vtable.setters.get(name) {
-                                        // Setters take `(this_f64, value_f64)`
-                                        // matching the codegen calling
-                                        // convention for class methods (this
-                                        // = NaN-boxed POINTER_TAG of the
-                                        // receiver).
-                                        let this_f64: f64 = f64::from_bits(
-                                            crate::value::js_nanbox_pointer(obj as i64).to_bits(),
-                                        );
-                                        let f: extern "C" fn(f64, f64) -> f64 =
-                                            std::mem::transmute(setter_ptr);
-                                        let _ = f(this_f64, value);
-                                        return;
-                                    }
-                                }
+                let key_bytes = {
+                    let name_ptr =
+                        (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                    std::slice::from_raw_parts(name_ptr, (*key).byte_len as usize)
+                };
+                if let Ok(name) = std::str::from_utf8(key_bytes) {
+                    // Class accessors are properties of the class prototype
+                    // chain (charter step 3). A getter-only accessor refuses
+                    // the write: no data property is created.
+                    let this_f64: f64 =
+                        f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
+                    let throw_getter_only = || {
+                        let class_name = super::class_registry::class_name_for_id(class_id)
+                            .unwrap_or_else(|| "Object".to_string());
+                        crate::collection_iter::throw_type_error(&format!(
+                            "Cannot set property {name} of #<{class_name}> which has only a getter"
+                        ));
+                    };
+                    // #11499: the receiver carrying a `class_id` may be the
+                    // CLASS OBJECT itself, not an instance of that class. The
+                    // vtable accessors below live on `C.prototype`, which is
+                    // NOT on the constructor's own prototype chain
+                    // (`VR8 -> XX -> Error -> Function.prototype`), so a
+                    // static write must resolve against the STATIC accessor
+                    // chain. cc 2.1.112 hits this with
+                    // `class XX extends Error { get errorCode(){…} }` plus
+                    // `VR8.errorCode = "invalid_request"`: the instance getter
+                    // was found for a static write and refused it.
+                    if crate::object::is_class_object_ptr(obj.cast()) {
+                        if super::class_registry::static_accessor_in_chain(class_id, name) {
+                            // A real `static set name(v)` (own or inherited
+                            // through `extends`) must still fire.
+                            if super::class_registry::class_static_accessor_setter_apply(
+                                class_id, name, this_f64, value,
+                            ) {
+                                return;
                             }
-                            match get_parent_class_id(cid) {
-                                Some(p) if p != 0 && p != cid => {
-                                    cid = p;
-                                    depth += 1;
-                                }
-                                _ => break,
-                            }
+                            // Static accessor with no setter: same strict-mode
+                            // refusal the instance side gives.
+                            throw_getter_only();
+                        }
+                        // No static accessor of this name: fall through to the
+                        // ordinary own-property store below.
+                    } else {
+                        match super::class_registry::class_chain_setter_apply(
+                            class_id, name, this_f64, value,
+                        ) {
+                            Some(true) => return,
+                            // This entry point is the strict one (issue #615:
+                            // strict is the TS default; sloppy writes reach
+                            // `js_put_value_set` with `strict = 0`, whose
+                            // OrdinarySet walk refuses the same write silently).
+                            Some(false) => throw_getter_only(),
+                            None => {}
                         }
                     }
                 }
@@ -599,6 +607,7 @@ pub(crate) fn set_field_by_name_object_tail(
                     if slot_idx >= live_slots {
                         set_object_live_slot_count(obj, slot_idx + 1);
                     }
+                    crate::object::proto_validity::note_marked_value_write(obj);
                     crate::gc::runtime_store_jsvalue_slot(
                         obj as usize,
                         slot as usize,
@@ -862,6 +871,9 @@ pub(crate) fn set_field_by_name_object_tail(
                     let grown =
                         crate::array::js_array_push(keys, JSValue::string_ptr(key as *mut _));
                     let _ = owned.get_raw_mut_ptr::<ArrayHeader>();
+                    // Its attributes, if it carries any, grow with it.
+                    let grown =
+                        crate::object::key_attrs::owned_note_append(grown, key_count as u32, 0);
                     crate::object::ObjectKeys::owned(grown)
                 }
             };
@@ -1049,6 +1061,8 @@ pub(crate) fn set_field_by_name_object_tail(
                 let owned = scope.root_raw_mut_ptr(keys);
                 let grown = crate::array::js_array_push(keys, JSValue::string_ptr(key as *mut _));
                 let _ = owned.get_raw_mut_ptr::<ArrayHeader>();
+                // Its attributes, if it carries any, grow with it.
+                let grown = crate::object::key_attrs::owned_note_append(grown, key_count as u32, 0);
                 crate::object::ObjectKeys::owned(grown)
             }
         };

@@ -808,16 +808,17 @@ fn p10_sink_done(_ctx: usize, _outcome: super::Outcome) {
 /// subject here is the crossing, not the response.
 #[test]
 fn a_thread_with_no_loop_posts_its_fetch_to_the_thread_that_owns_one() {
-    let _lease = super::become_the_owner_for_test();
+    let lease = super::become_the_owner_for_test();
+    let owner_agent = lease.agent();
     let owner = thread_fingerprint();
     let before_dispatched = perry_ffi::agent_post::dispatched();
     let before_submitted = super::submitted_total();
     let before_calls = P10_SINK_CALLS.load(AtomicOrdering::SeqCst);
 
     let poster_ran_its_own = std::thread::spawn(move || {
-        // A second thread acting FOR the same agent: it has no agent of its
-        // own, so `current_agent()` resolves to the primary agent — the one
-        // whose loop the thread above owns.
+        // A second thread acting FOR the same agent: it joins the agent whose
+        // loop the thread above owns, without minting one of its own.
+        perry_runtime::agent::enter_agent_for_test(owner_agent);
         assert!(
             !super::tl::available(),
             "this thread must NOT own the loop, or the post under test never \
@@ -866,8 +867,13 @@ fn a_thread_with_no_loop_posts_its_fetch_to_the_thread_that_owns_one() {
             "an unsupported URL must be refused to the caller, not be \
              handed to a thread that would refuse it identically"
         );
+        // Use a released ephemeral port: Fetch rejects well-known blocked
+        // ports before posting, whereas this test needs a transport failure.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
         let spec = super::RequestSpec {
-            url: "http://127.0.0.1:1/p10".to_string(),
+            url: format!("http://127.0.0.1:{port}/p10"),
             method: "GET".to_string(),
             headers: Vec::new(),
             body: None,

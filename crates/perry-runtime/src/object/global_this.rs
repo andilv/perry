@@ -49,6 +49,27 @@ mod populate;
 mod proto_methods;
 mod typed_array;
 
+/// Which `Function.prototype` intrinsic (`bind`/`call`/`apply`) has code
+/// pointer `func`, if any: the identity the shape-proven method path compares
+/// the prototype slot's VALUE against.
+#[inline]
+pub(crate) fn function_prototype_intrinsic_of(func: *const u8) -> Option<&'static str> {
+    if func == array_error::function_prototype_bind_thunk as *const u8 {
+        Some("bind")
+    } else if func == array_error::function_prototype_call_thunk as *const u8 {
+        Some("call")
+    } else if func == array_error::function_prototype_apply_thunk as *const u8 {
+        Some("apply")
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn function_prototype_bind_thunk_for_test() -> *const u8 {
+    array_error::function_prototype_bind_thunk as *const u8
+}
+
 pub(crate) use array_error::{
     function_apply_proxy, generic_array_like_to_vec, global_this_clear_immediate_thunk,
     global_this_clear_interval_thunk, global_this_clear_timeout_thunk,
@@ -133,16 +154,17 @@ pub(crate) use generator::append_async_function_root_snapshot;
 pub(crate) use generator::{
     ensure_generator_intrinsics, generator_function_constructor_of, generator_function_proto_of,
     generator_function_prototype_of, set_intrinsic_data_prop, set_intrinsic_to_string_tag,
-    wire_async_function_intrinsic_parents,
+    wire_function_intrinsic_parents,
 };
 pub use generator::{js_generator_attach_closure_prototype, js_generator_attach_prototype};
 pub use install_static::js_promise_static_function_value;
 pub(crate) use install_static::{
-    install_atomics_namespace_members, install_builtin_constructor_statics,
-    install_builtin_species_accessor, install_constructor_static,
-    install_constructor_static_with_call_arity, install_json_namespace_members,
-    install_noop_proto_methods, install_number_static_data_properties, install_proto_method,
-    install_proto_method_alias, install_proto_method_rest, install_proto_method_rest_with_length,
+    builtin_species_getter_thunk, install_atomics_namespace_members,
+    install_builtin_constructor_statics, install_builtin_species_accessor,
+    install_constructor_static, install_constructor_static_with_call_arity,
+    install_json_namespace_members, install_noop_proto_methods,
+    install_number_static_data_properties, install_proto_method, install_proto_method_alias,
+    install_proto_method_rest, install_proto_method_rest_with_length,
     install_reflect_namespace_members, subtle_crypto_decapsulate_bits_thunk,
     subtle_crypto_decapsulate_key_thunk, subtle_crypto_encapsulate_bits_thunk,
     subtle_crypto_encapsulate_key_thunk, url_pattern_exec_thunk, url_pattern_test_thunk,

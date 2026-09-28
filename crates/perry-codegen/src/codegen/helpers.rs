@@ -244,6 +244,23 @@ pub(crate) fn set_native_roots_for_target(triple: &str) {
     NATIVE_ROOTS_TARGET_OK.with(|c| c.set(arch_ok && windows_ok));
 }
 
+thread_local! {
+    static ILP32_TARGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record, per module, whether this compile targets 32-bit pointers. Only the
+/// wasm32 WASI lowering can get here with `true` (`compile_module` refuses
+/// every other ILP32 triple), so on every other target the inline paths that
+/// consult [`ilp32_target`] emit exactly what they always did.
+pub(crate) fn set_ilp32_for_target(triple: &str) {
+    ILP32_TARGET.with(|c| c.set(crate::target_layout::target_is_ilp32(triple)));
+}
+
+/// See [`set_ilp32_for_target`].
+pub(crate) fn ilp32_target() -> bool {
+    ILP32_TARGET.with(|c| c.get())
+}
+
 /// Whether precise roots should use a native-stack metadata backend rather
 /// than Perry's heap-backed shadow frame.
 pub(crate) fn native_stack_roots_enabled() -> bool {
@@ -645,6 +662,34 @@ pub(super) fn maybe_spill_roots_to_shadow_frame(
     );
 }
 
+/// #10663: a function body with at least this many property stores outside
+/// any loop outlines those stores' inline caches.
+///
+/// Each inline store cache is ~20 basic blocks and 4 non-leaf calls, which
+/// earns its keep only on a site that runs repeatedly. A site outside every
+/// loop runs once per call, so a body that is mostly such sites — a generated
+/// constant table, `mysql2/lib/constants/errors.js`'s 3,942 `exports.X = N`
+/// lines in one CommonJS factory — is dominated by cache code it never
+/// benefits from: that factory emitted ~886k IR lines and spent 217 s in one
+/// LLVM unit (26 s total for the whole build once outlined). Hand-written
+/// functions sit far below this count; a hot one that somehow exceeds it
+/// still keeps its in-loop sites inline, and its outlined sites still hit the
+/// runtime's per-site cache through the miss entry.
+pub(crate) const STRAIGHT_LINE_STORE_OUTLINE_MIN_SITES: usize = 512;
+
+/// Decide whether `func` outlines its straight-line store caches (#10663).
+/// Called with the HIR body before any statement is lowered.
+pub(crate) fn decide_straight_line_store_outline(
+    func: &mut crate::function::LlFunction,
+    body: &[perry_hir::Stmt],
+) {
+    if crate::collectors::count_straight_line_store_sites(body)
+        >= STRAIGHT_LINE_STORE_OUTLINE_MIN_SITES
+    {
+        func.request_straight_line_store_outline();
+    }
+}
+
 pub(super) fn enable_module_init_shadow_frame(
     func: &mut crate::function::LlFunction,
     stmts: &[perry_hir::Stmt],
@@ -726,9 +771,9 @@ thread_local! {
 /// while iOS/tvOS device targets can still cover A7–A11 chips (ARMv8.0–8.2,
 /// no JSCVT — `fjcvtzs` would be an illegal instruction) and generic aarch64
 /// (Graviton2/Neoverse-N1) lacks it too. `PERRY_JSCVT=0/off/false` reverts
-/// `toint32_wrap` to the branchless shift/select tower (A/B bisection; keyed
-/// into the object cache). Same thread-local per-module discipline as
-/// `FULL_OUTLINE_IC` above.
+/// `toint32_wrap` to the portable guarded `fptosi` + shift/select tower (A/B
+/// bisection; keyed into the object cache). Same thread-local per-module
+/// discipline as `FULL_OUTLINE_IC` above.
 pub(crate) fn jscvt_enabled() -> bool {
     JSCVT.with(|c| c.get())
 }
@@ -1259,6 +1304,9 @@ pub fn resolve_target_triple(name: &str) -> Option<String> {
         }
         "watchos" => Some("aarch64-apple-watchos".to_string()),
         "watchos-simulator" => Some("arm64-apple-watchos10.0-simulator".to_string()),
+        // Standalone WASI (#11375): only a compiler built with `target-wasi`
+        // knows the name; a default build keeps resolving it to None.
+        "wasi" if cfg!(feature = "target-wasi") => Some("wasm32-unknown-wasip2".to_string()),
         "tvos" => Some("aarch64-apple-tvos".to_string()),
         "tvos-simulator" => Some("arm64-apple-tvos17.0-simulator".to_string()),
         "harmonyos" => Some("aarch64-unknown-linux-ohos".to_string()),

@@ -84,20 +84,26 @@ mod class_gc_roots;
 mod class_handles;
 pub mod class_image;
 mod class_registry;
+#[cfg(test)]
+mod zeroed_cache_tests;
 pub(crate) use class_registry::async_resource_prototype_value;
 pub(crate) use class_registry::class_registry_census;
 #[cfg(feature = "regex-engine")]
 pub(crate) use class_registry::construct_two_rooted;
 pub(crate) use class_registry::{construct_rooted_arguments, scan_current_new_target_root_mut};
+pub(crate) mod accessor_pair;
+#[cfg(feature = "attr-census")]
+pub(crate) mod attr_census;
 pub(crate) mod canonical_keys;
 mod census;
+pub(crate) mod key_attrs;
 pub(crate) use census::object_tables_census;
 #[cfg(test)]
 mod bound_method_receiver_tests;
 mod collection_proto_thunks;
 mod data_view_registry;
 mod dataview_proto_thunks;
-mod date_proto_thunks;
+pub(crate) mod date_proto_thunks;
 mod delete_rest;
 pub(crate) mod descriptors;
 pub(crate) mod dictionary;
@@ -160,6 +166,9 @@ pub(crate) use side_table_roots::{
 };
 pub(crate) mod iterator_prototypes;
 pub(crate) mod map_set_subclass;
+pub mod method_site;
+mod slot_store;
+pub(crate) use slot_store::{store_object_field_slot, store_object_field_slot_layout_deferred};
 mod namespace_create;
 mod native_call_method;
 pub(crate) mod native_get;
@@ -226,10 +235,11 @@ pub(crate) mod regex_proto_thunks;
 mod spill;
 pub(crate) use spill::{
     learned_inline_field_count, learned_inline_fields_hot_addr, object_spill_enabled, overflow_get,
-    overflow_set, reserve_object_spill, spill_store_would_be_in_capacity,
+    overflow_set, reserve_object_spill, spill_get_present, spill_reserve_claimed,
+    spill_store_would_be_in_capacity, SPILL_MAX_FIELD_INDEX,
 };
 #[cfg(test)]
-use spill::{spill_capable_owner, spill_get, SPILL_MAX_FIELD_INDEX};
+use spill::{spill_capable_owner, spill_get};
 #[cfg(test)]
 pub(crate) use spill::{
     test_set_spill_safepoint_hook, SpillSafepointHook, TEST_LAYOUT_NOTE_SLOT_CALLS,
@@ -317,7 +327,6 @@ pub use with_env::*;
 pub(crate) use class_meta_registry::{
     builtin_error_prototype_name, class_generic_origin, extends_builtin_error, fetch_parent_kind,
     lookup_has_instance_hook, lookup_to_string_tag_hook, register_fetch_parent_kind,
-    CLASS_REGISTRY,
 };
 pub use class_meta_registry::{
     js_register_class_extends_error, js_register_class_generic_origin,
@@ -331,16 +340,16 @@ pub use descriptor_state::PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED;
 pub(crate) use descriptor_state::{
     accessor_descriptor_keys_for_obj, class_field_inline_guard_enabled,
     class_instance_set_may_intercept, clear_accessor_descriptor, clear_property_attrs,
-    constructor_accessor_ever_installed, descriptors_in_use, disable_class_field_inline_guard,
-    get_accessor_descriptor, get_property_attrs, install_fresh_accessor_property,
-    json_object_getter_value, mark_all_keys, object_has_descriptors,
-    object_proto_may_intercept_key, own_descriptors_skip_key, owner_has_property_descriptors,
-    owner_may_have_descriptor_entries, plain_custom_prototype_may_intercept,
-    plain_data_write_may_intercept, prune_dead_descriptor_owner_entries,
-    prune_dead_descriptor_owner_entries_young, reflect_getter_closure_bits,
-    set_accessor_descriptor, set_builtin_accessor_descriptor, set_builtin_property_attrs,
-    set_property_attrs, transfer_descriptor_owner, AccessorDescriptor, DescriptorTables,
-    PropertyAttrs,
+    constructor_accessor_ever_installed, define_builtin_data_property, descriptors_in_use,
+    disable_class_field_inline_guard, get_accessor_descriptor, get_property_attrs,
+    install_fresh_accessor_property, json_object_getter_value, mark_all_keys,
+    object_has_descriptors, object_proto_may_intercept_key, own_descriptors_skip_key,
+    owner_has_property_descriptors, owner_may_have_descriptor_entries,
+    plain_custom_prototype_may_intercept, plain_data_write_may_intercept,
+    prune_dead_descriptor_owner_entries, prune_dead_descriptor_owner_entries_young,
+    reflect_getter_closure_bits, set_accessor_descriptor, set_builtin_accessor_descriptor,
+    set_builtin_accessor_pair, set_builtin_property_attrs, set_property_attrs,
+    transfer_descriptor_owner, AccessorDescriptor, DescriptorTables, PropertyAttrs,
 };
 pub(crate) use field_get_set::FieldLookupCaches;
 pub(crate) use field_get_set::{
@@ -456,6 +465,7 @@ crate::perry_thread_local! {
     static ASYNC_GENERATOR_PROTOTYPE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
     static LOCAL_STORAGE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
     static SESSION_STORAGE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
+    static URL_INTRINSIC_PROTO_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
 }
 
 static HTTP_METHODS_CACHE: RealmAtomicU64 = RealmAtomicU64::new(&HTTP_METHODS_CACHE_SLOT);
@@ -490,6 +500,13 @@ pub(crate) static ASYNC_GENERATOR_INTRINSIC_PROTO_PTR: RealmAtomicI64 =
     RealmAtomicI64::new(&ASYNC_GENERATOR_INTRINSIC_PROTO_PTR_SLOT);
 pub(crate) static ASYNC_GENERATOR_PROTOTYPE_PTR: RealmAtomicI64 =
     RealmAtomicI64::new(&ASYNC_GENERATOR_PROTOTYPE_PTR_SLOT);
+/// `%URL.prototype%`, recorded when the `URL` builtin's prototype is built.
+/// `new URL(...)` links instances to THIS object rather than to whatever
+/// `globalThis.URL.prototype` currently is: a program may shadow or replace
+/// the global binding (a module-level `function URL`), and the instances the
+/// native constructor builds must keep the real component accessors (#11585).
+pub(crate) static URL_INTRINSIC_PROTO_PTR: RealmAtomicI64 =
+    RealmAtomicI64::new(&URL_INTRINSIC_PROTO_PTR_SLOT);
 pub(crate) static LOCAL_STORAGE_PTR: RealmAtomicI64 = RealmAtomicI64::new(&LOCAL_STORAGE_PTR_SLOT);
 pub(crate) static SESSION_STORAGE_PTR: RealmAtomicI64 =
     RealmAtomicI64::new(&SESSION_STORAGE_PTR_SLOT);
@@ -497,6 +514,26 @@ pub(crate) static SESSION_STORAGE_PTR: RealmAtomicI64 =
 per_test_global! {
     static GLOBAL_THIS_PTR: AtomicI64 = AtomicI64::new(0);
     static GLOBAL_THIS_READY: AtomicBool = AtomicBool::new(false);
+}
+
+/// #11471: `GLOBAL_THIS_PTR` is a process-global root slot that every thread
+/// overwrites with its own `globalThis` on first use (readers go through the
+/// per-thread `THREAD_GLOBAL_THIS`, so the slot only feeds the root scanner).
+/// When the last writer exits, clear the slot if it still names that thread's
+/// object, so no collection keeps marking (or rewriting) a freed address.
+pub(crate) fn release_global_this_ptr_in_freed_ranges(
+    freed: &crate::arena::thread_exit::FreedRanges,
+) {
+    let cached = GLOBAL_THIS_PTR.load(Ordering::Acquire);
+    if cached != 0 && freed.holds_i64(cached) {
+        let _ = GLOBAL_THIS_PTR.compare_exchange(cached, 0, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
+
+/// #11471 test probe: the raw `GLOBAL_THIS_PTR` root slot (0 when unset).
+#[doc(hidden)]
+pub fn global_this_root_slot_for_test() -> i64 {
+    GLOBAL_THIS_PTR.load(Ordering::Acquire)
 }
 
 // Overflow field storage for objects that exceed their pre-allocated inline slot count.
@@ -631,41 +668,19 @@ impl ObjectHotTables {
             ),
             shape_cache_overflow: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
             class_keys_by_id: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
-            transition_cache: std::cell::UnsafeCell::new(
-                vec![
-                    TransitionEntry {
-                        key_ptr: 0,
-                        next_keys: 0,
-                        prev_shape_id: 0,
-                        target_shape_id: 0,
-                        slot_idx: 0,
-                        target_len: 0,
-                    };
-                    TRANSITION_CACHE_SIZE
-                ]
-                .into_boxed_slice(),
-            ),
-            array_tail_forward: std::cell::UnsafeCell::new(
-                vec![
-                    array_tail_transition::ArrayTailTransitionEntry::EMPTY;
-                    array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE
-                ]
-                .into_boxed_slice(),
-            ),
-            array_tail_reverse: std::cell::UnsafeCell::new(
-                vec![
-                    array_tail_transition::ArrayTailTransitionEntry::EMPTY;
-                    array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE
-                ]
-                .into_boxed_slice(),
-            ),
-            array_tail_direct: std::cell::UnsafeCell::new(
-                vec![
-                    array_tail_transition::ArrayTailDirectIndex::EMPTY;
-                    array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE
-                ]
-                .into_boxed_slice(),
-            ),
+            // #11507: zero-allocated, so untouched pages are never mapped.
+            transition_cache: std::cell::UnsafeCell::new(crate::zeroed_cache::new_zeroed_cache(
+                TRANSITION_CACHE_SIZE,
+            )),
+            array_tail_forward: std::cell::UnsafeCell::new(crate::zeroed_cache::new_zeroed_cache(
+                array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE,
+            )),
+            array_tail_reverse: std::cell::UnsafeCell::new(crate::zeroed_cache::new_zeroed_cache(
+                array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE,
+            )),
+            array_tail_direct: std::cell::UnsafeCell::new(crate::zeroed_cache::new_zeroed_cache(
+                array_tail_transition::ARRAY_TAIL_TRANSITION_CACHE_SIZE,
+            )),
         }
     }
 }
@@ -903,6 +918,9 @@ pub(crate) struct TransitionEntry {
     slot_idx: u32,        // offset 24 — slot | key byte_len << 24 (namespace marker)
     target_len: u32,      // offset 28, nonzero when target was validated at insert
 }
+
+// SAFETY: all integer fields; `key_ptr == 0` is the miss (#11507).
+unsafe impl crate::zeroed_cache::ZeroEmpty for TransitionEntry {}
 
 /// ── Emitted transition-IC ABI (#9287) ──────────────────────────────────────
 ///
@@ -1496,6 +1514,7 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
         &ASYNC_GENERATOR_PROTOTYPE_PTR,
         &LOCAL_STORAGE_PTR,
         &SESSION_STORAGE_PTR,
+        &URL_INTRINSIC_PROTO_PTR,
     ] {
         slot.with_slot(|slot| {
             visitor.visit_atomic_i64_slot(slot, Ordering::Acquire, Ordering::Release);
@@ -1534,6 +1553,7 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
     // static with no `GcHeader`; it is an ordinary object now, so the slot
     // holding it is a real GC root that a moving collection must rewrite.
     null_stub::scan_null_stub_roots_mut(visitor);
+    crate::closure::shape::scan_function_prototype_roots_mut(visitor);
     #[cfg(feature = "regex-engine")]
     regex_proto_thunks::scan_canonical_test_site_roots_mut(visitor);
 }
@@ -1660,14 +1680,26 @@ pub struct ObjectHeader {
 /// that need the keys rather than the complete descriptor.
 #[inline]
 pub(crate) unsafe fn object_keys(obj: *const ObjectHeader) -> ObjectKeys {
+    object_keys_and_live_slot_count(obj).0
+}
+
+/// [`object_keys`] and [`object_live_slot_count`] together, from ONE shape
+/// table probe. A walk that needs both — `JSON.stringify` visits every object
+/// this way — otherwise pays the probe twice (#10696).
+#[inline]
+pub(crate) unsafe fn object_keys_and_live_slot_count(
+    obj: *const ObjectHeader,
+) -> (ObjectKeys, u32) {
     let Some(descriptor) = shapes::object_shape_descriptor(obj) else {
-        return ObjectKeys::NONE;
+        return (ObjectKeys::NONE, 0);
     };
+    let live_slots = descriptor.live_inline_slot_count;
     if descriptor.keys != 0 {
-        return ObjectKeys::new(
+        let keys = ObjectKeys::new(
             descriptor.keys as usize as *mut ArrayHeader,
             descriptor.logical_key_count,
         );
+        return (keys, live_slots);
     }
     // The shape publishes no keys. Either the receiver genuinely has none, or
     // it is in DICTIONARY MODE and carries its own ordered list (#10868 step
@@ -1679,7 +1711,7 @@ pub(crate) unsafe fn object_keys(obj: *const ObjectHeader) -> ObjectKeys {
     // line — the nonzero `keys` word returns above — so the branch costs
     // nothing on the path that matters. A dictionary list is the receiver's
     // own, so its header length is its count.
-    ObjectKeys::owned(dictionary::keys_array(obj))
+    (ObjectKeys::owned(dictionary::keys_array(obj)), live_slots)
 }
 
 /// Return the two shape facts needed together by callback-free serializers.
@@ -1742,11 +1774,14 @@ pub(crate) unsafe fn object_is_shaped(obj: *const ObjectHeader) -> bool {
         && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
 }
 
-const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 8);
+// 16-byte header with `meta` last (target_layout.rs): offset 8 LP64, 12 ILP32.
+const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 16 - size_of::<usize>());
 const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 8);
 
 pub(crate) mod cell_meta;
-pub(crate) use cell_meta::cell_meta_slot;
+pub(crate) use cell_meta::{
+    cell_expando_ensure, cell_expando_get, cell_meta_slot, cell_meta_slot_for_header,
+};
 // `cell_has_meta_edge` is `#[cfg(test)]` in `cell_meta`, so its re-export
 // must be too or the import is unresolved in a non-test build.
 #[cfg(test)]
@@ -1863,38 +1898,7 @@ pub(super) unsafe fn note_object_field_slot(
 }
 
 #[inline]
-pub(crate) unsafe fn store_object_field_slot(
-    obj: *mut ObjectHeader,
-    field_index: usize,
-    value_bits: u64,
-) {
-    let fields_ptr = (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut u64;
-    let slot = fields_ptr.add(field_index);
-    crate::gc::runtime_store_jsvalue_slot(obj as usize, slot as usize, field_index, value_bits);
-}
-
-/// #7630: `store_object_field_slot` without the per-slot layout note, for the
-/// JSON materialiser's construction loops. Returns whether the value carries a
-/// heap pointer; the caller accumulates that and settles the object's layout
-/// state once via `layout_finish_deferred_boxed_object`.
-#[inline]
-pub(crate) unsafe fn store_object_field_slot_layout_deferred(
-    obj: *mut ObjectHeader,
-    field_index: usize,
-    value_bits: u64,
-) -> bool {
-    let fields_ptr = (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut u64;
-    let slot = fields_ptr.add(field_index);
-    crate::gc::runtime_store_jsvalue_slot_layout_deferred(
-        obj as usize,
-        slot as usize,
-        field_index,
-        value_bits,
-    )
-}
-
-#[inline]
-pub(super) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
+pub(crate) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
     if obj.is_null() || (obj as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
         return;
     }
@@ -1912,6 +1916,8 @@ pub(super) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
 /// under the 2000-line cap.
 #[cfg(test)]
 mod keys_front_offset_tests;
+#[cfg(test)]
+mod native_module_namespace_proto_tests;
 #[cfg(test)]
 mod own_key_probe_tests;
 #[cfg(test)]
@@ -1933,63 +1939,3 @@ mod transition_ic_tests;
 mod wide_field_read_tests;
 #[cfg(test)]
 mod wide_object_membership_tests;
-
-/// The named-property bag for a cell that has no inline slot layout of its own,
-/// creating it on first write.
-///
-/// #6759 phase 1. An `ErrorHeader` (and the other exotic cells) cannot hold
-/// named properties inline, so they lived in tables keyed by the owner's
-/// ADDRESS — `ERROR_USER_PROPS` and friends — which cost four GC hooks
-/// (rekey-on-evacuation, finalize, dead-sweep, root scanner) and carried a
-/// standing hazard: a recycled address inherits the previous tenant's
-/// properties.
-///
-/// The bag is an ordinary object hanging off `ObjectMeta.expando`, so it is an
-/// ordinary child edge — it moves with its owner, dies with its owner, and
-/// keeps ECMA-262 insertion order for free because that is what an object's
-/// `keys_array` already does.
-pub(crate) unsafe fn cell_expando_ensure(user_ptr: usize) -> Option<*mut ObjectHeader> {
-    let meta = object_meta_ensure_for_cell(user_ptr)?;
-    if (*meta).expando != 0 {
-        return Some(
-            crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
-                as *mut ObjectHeader,
-        );
-    }
-    // `js_object_alloc` allocates and can move the owner, so re-resolve the
-    // meta record from the rooted address afterwards.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let owner = scope.root_raw_mut_ptr(user_ptr as *mut u8);
-    let bag = js_object_alloc(0, 0);
-    let user_ptr = owner.get_raw_mut_ptr::<u8>() as usize;
-    let meta = object_meta_ensure_for_cell(user_ptr)?;
-    if (*meta).expando != 0 {
-        return Some(
-            crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
-                as *mut ObjectHeader,
-        );
-    }
-    let boxed = crate::value::js_nanbox_pointer(bag as i64).to_bits();
-    // GC_STORE_AUDIT(BARRIERED): metadata-record slot store + object barrier.
-    (*meta).expando = boxed;
-    crate::gc::runtime_write_barrier_slot(
-        meta as usize,
-        &(*meta).expando as *const _ as usize,
-        boxed,
-    );
-    Some(bag)
-}
-
-/// The existing bag, or `None` when the owner never took one. Never allocates,
-/// so it is safe on read paths.
-pub(crate) unsafe fn cell_expando_get(user_ptr: usize) -> Option<*mut ObjectHeader> {
-    let slot = cell_meta_slot(user_ptr)?;
-    let meta = *slot;
-    if meta.is_null() || (*meta).expando == 0 {
-        return None;
-    }
-    Some(
-        crate::value::JSValue::from_bits((*meta).expando).as_pointer::<ObjectHeader>()
-            as *mut ObjectHeader,
-    )
-}

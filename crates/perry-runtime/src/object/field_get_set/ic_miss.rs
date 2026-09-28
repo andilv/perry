@@ -918,6 +918,18 @@ pub(super) fn get_field_ic_miss_impl(
             // `GC_TYPE_ARRAY` is a genuine dense array: buffers, typed arrays,
             // lazy arrays, Sets and Maps all carry their own distinct
             // `obj_type`.
+            //
+            // #10714: both emitted generic-get sites (the inline tower and
+            // the full-outline `js_object_get_field_ic` call) now answer a
+            // live plain Array's `.length` from its header BEFORE calling
+            // out, and the inline tower also follows one forwarding edge, so
+            // this arm sees only what they decline: a forwarding chain longer
+            // than one edge (`js_array_length` follows it and `clean_arr_ptr`
+            // compresses it to one, so the next inline read heals it), any
+            // stub on a full-outline site, and every Array read of a
+            // `--typed-feedback` build. The answers must stay identical — a
+            // change here must change `emit_plain_array_length_arm` in
+            // codegen's `expr/property_get/generic_dispatch.rs`.
             if gc_kind == Some(crate::gc::GC_TYPE_ARRAY) && unsafe { key_bytes_are(key, b"length") }
             {
                 if diag {
@@ -1049,8 +1061,6 @@ pub(super) fn get_field_ic_miss_impl(
         // `>= GC_HEADER_SIZE + 0x1000 && is_valid_obj_ptr` pair this used to
         // re-derive).
         let is_object = gc_kind == Some(crate::gc::GC_TYPE_OBJECT);
-        let has_own_descriptors = is_object
-            && gc_header.is_some_and(|h| h._reserved & crate::gc::OBJ_FLAG_HAS_DESCRIPTORS != 0);
         // #8122: ONE shape-table probe. `object_is_regular` is `GC_TYPE_OBJECT
         // && !FORWARDED && descriptor.object_kind == Ordinary`; the kind test
         // was already `GC_TYPE_OBJECT` above, so read the descriptor once and
@@ -1146,6 +1156,9 @@ pub(super) fn get_field_ic_miss_impl(
                 let k_ptr = (k_bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::StringHeader;
                 if !k_ptr.is_null() && crate::string::js_string_equals(k_ptr, key) != 0 {
                     if i >= alloc_limit {
+                        crate::hot_diag::recv_route_note_runtime(
+                            crate::hot_diag::RT_ROUTE_SPILL_MISS,
+                        );
                         // #9287: a field past the inline region primes too,
                         // with IC_SLOT_OVERFLOW_BIT — the emitted MRU hit path
                         // tests the bit and routes through
@@ -1156,25 +1169,37 @@ pub(super) fn get_field_ic_miss_impl(
                         // accessors), and the value must be readable through
                         // `overflow_get` right now — if it is not, priming
                         // would cache a lie.
-                        if !has_own_descriptors && (i as u32) < crate::proxy::IC_SLOT_OVERFLOW_BIT {
-                            if let Some(bits) = crate::object::overflow_get(obj as usize, i) {
-                                if bits != crate::value::TAG_HOLE {
-                                    let stamp = crate::object::shapes::object_shape_stamp(obj);
-                                    let token = (stamp as u64
-                                        | crate::object::shapes::PIC_ID_TOKEN_BIT)
-                                        as i64;
-                                    let cache = pic_slot_resolve(cache_slot);
-                                    packed_get::prime_get(
-                                        cache,
-                                        token,
-                                        (i as u32 | crate::proxy::IC_SLOT_OVERFLOW_BIT) as i64,
-                                        packed,
-                                    );
-                                    if diag {
-                                        ic_diag_note(cache_slot, key, R::OwnOverflowPrimed);
-                                    }
-                                    return f64::from_bits(bits);
+                        // Charter step 3: the receiver's keys say whether THIS
+                        // key is an accessor; an attribute on another key
+                        // changes nothing a read of this slot depends on.
+                        let key_is_accessor =
+                            shape.summary & crate::object::key_attrs::SUMMARY_ACCESSOR != 0
+                                && crate::object::key_attrs::keys_entry(keys, i as u32)
+                                    & crate::object::key_attrs::ENTRY_ACCESSOR
+                                    != 0;
+                        if !key_is_accessor && (i as u32) < crate::proxy::IC_SLOT_OVERFLOW_BIT {
+                            // S5: `spill_get_present`, not `overflow_get` — a
+                            // stored `undefined` is a value the site can serve
+                            // (the legacy convention read it as absent, so such
+                            // a site never primed and every read took the
+                            // by-name walk), and `None` for any value that does
+                            // not live in object-owned spill storage, which the
+                            // emitted spill read could not reach.
+                            if let Some(bits) = crate::object::spill_get_present(obj as usize, i) {
+                                let stamp = crate::object::shapes::object_shape_stamp(obj);
+                                let token =
+                                    (stamp as u64 | crate::object::shapes::PIC_ID_TOKEN_BIT) as i64;
+                                let cache = pic_slot_resolve(cache_slot);
+                                packed_get::prime_get(
+                                    cache,
+                                    token,
+                                    (i as u32 | crate::proxy::IC_SLOT_OVERFLOW_BIT) as i64,
+                                    packed,
+                                );
+                                if diag {
+                                    ic_diag_note(cache_slot, key, R::OwnOverflowPrimed);
                                 }
+                                return f64::from_bits(bits);
                             }
                         }
                         // Field is in the overflow map — fall through to the
@@ -1202,23 +1227,33 @@ pub(super) fn get_field_ic_miss_impl(
                     // shape id — no second probe.
                     let stamp = crate::object::shapes::object_shape_stamp(obj);
                     let token = (stamp as u64 | crate::object::shapes::PIC_ID_TOKEN_BIT) as i64;
-                    // A descriptor-bearing receiver primes only when the key is
-                    // proved a plain data slot. The one proof that exists is
-                    // the object-backed Array subclass's named-prefix proof
-                    // (every declared key accessor-free on THIS receiver; its
-                    // unrelated `length` descriptor must not make `arch.sset`
-                    // permanently generic). It is a PRIME-TIME proof only: the
-                    // site stores nothing but `(ShapeId, slot)`, and a ShapeId
-                    // implies its descriptor semantics (every descriptor event
-                    // mints a new generation, #10824/#10287), so the pair is a
-                    // fact about this one shape for as long as the id lives.
-                    // The proof builder is gated by an existing ObjectMeta
-                    // pointer so ordinary objects retain the old miss cost. It
-                    // runs whenever it ran before (it also publishes the token
-                    // on the object's meta, which `element_shape` consumes).
+                    // An accessor key primes only when the key is proved a
+                    // plain data slot by the object-backed Array subclass's
+                    // named-prefix proof (every declared key accessor-free on
+                    // THIS receiver). It is a PRIME-TIME proof only: the site
+                    // stores nothing but `(ShapeId, slot)`, and a ShapeId
+                    // implies its attributes (charter step 3: they live with
+                    // the keys), so the pair is a fact about this one shape for
+                    // as long as the id lives. The proof builder is gated by an
+                    // existing ObjectMeta pointer so ordinary objects retain the
+                    // old miss cost. It runs whenever it ran before (it also
+                    // publishes the token on the object's meta, which
+                    // `element_shape` consumes).
                     let named_prefix_proved = !(*obj).meta.is_null()
                         && crate::array::array_subclass_named_prefix_token_for_slot(obj, i) != 0;
-                    if has_own_descriptors && !named_prefix_proved {
+                    // Charter step 3 (#10871): the SHAPE says whether THIS key
+                    // is an accessor. A descriptor on another key of the
+                    // object changes nothing a read of this slot depends on.
+                    let key_is_accessor =
+                        shape.summary & crate::object::key_attrs::SUMMARY_ACCESSOR != 0
+                            && crate::object::key_attrs::keys_entry(keys, i as u32)
+                                & crate::object::key_attrs::ENTRY_ACCESSOR
+                                != 0;
+                    if key_is_accessor && !named_prefix_proved {
+                        #[cfg(feature = "attr-census")]
+                        crate::object::attr_census::note_global(
+                            "ic.read_prime_declined.accessor_key",
+                        );
                         miss_reason = R::OwnDescriptorFallthrough;
                         break;
                     }
@@ -1347,7 +1382,7 @@ fn outlined_mru_hit_enabled() -> bool {
 /// the caller has established that the tag was `POINTER`. `cache_slot` is the
 /// codegen-emitted per-site slot or null.
 #[inline]
-unsafe fn pic_outlined_mru_hit(
+pub(super) unsafe fn pic_outlined_mru_hit(
     obj_handle: *const ObjectHeader,
     cache_slot: *mut PicCacheSlot,
 ) -> Option<f64> {
@@ -1394,6 +1429,19 @@ pub extern "C" fn js_object_get_field_ic(
     key: *const crate::StringHeader,
     site_id: u64,
     cache_slot: *mut PicCacheSlot,
+) -> f64 {
+    get_field_ic_dispatch(obj_bits, key, site_id, cache_slot, true)
+}
+
+/// The whole full-outline read ladder; `probe_mru` is false only on the cold
+/// arm of the S2 split, whose leaf entry has already asked the MRU word.
+#[inline(always)]
+pub(super) fn get_field_ic_dispatch(
+    obj_bits: i64,
+    key: *const crate::StringHeader,
+    site_id: u64,
+    cache_slot: *mut PicCacheSlot,
+    probe_mru: bool,
 ) -> f64 {
     // POINTER_MASK: lower 48 bits — strips the NaN-box tag to a raw heap pointer.
     const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -1448,7 +1496,7 @@ pub extern "C" fn js_object_get_field_ic(
         // values — a heap STRING's `+4` is a `StringHeader` field that rule 3
         // deliberately does not bound. The kind test used to be what turned a
         // string away here; the tag does it now, one compare earlier.
-        if tag == 0x7FFD {
+        if probe_mru && tag == 0x7FFD {
             if let Some(value) = unsafe { pic_outlined_mru_hit(obj_handle, cache_slot) } {
                 crate::typed_feedback::js_typed_feedback_record_guard_pass(site_id);
                 return value;

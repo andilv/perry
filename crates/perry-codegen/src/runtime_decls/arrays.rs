@@ -118,6 +118,9 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // `expr/array_push.rs` whenever the declaration is not (or no longer) live.
     module.declare_function("js_array_declare_all_pointer_elements", VOID, &[I64]);
     module.declare_function("js_array_length", I32, &[I64]);
+    // #11522: GC-leaf plain-array fast lane of `js_array_length`; `-1` on a
+    // miss. See `expr::array_length`.
+    module.declare_function("js_array_length_leaf", I64, &[I64]);
     // Array.isArray runtime dispatch for values with indeterminate
     // static type (e.g. JSON.parse results, closure captures, any/
     // unknown-typed locals). Returns NaN-boxed boolean.
@@ -207,6 +210,9 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_write_barrier_root_nanbox", VOID, &[I64]);
     module.declare_function("js_write_barrier_root_heap_word", VOID, &[I64]);
     module.declare_function("js_gc_note_slot_layout", VOID, &[I64, I32, I64]);
+    //   js_gc_key_add_layout_unknown(obj_handle: u64) -- the key-add hit's
+    //   layout retirement (`expr/put_value_store_ic.rs`).
+    module.declare_function("js_gc_key_add_layout_unknown", VOID, &[I64]);
     //   js_gc_note_slot_layout_aware(parent, slot_index, value_bits, old_bits)
     module.declare_function("js_gc_note_slot_layout_aware", VOID, &[I64, I32, I64, I64]);
     module.declare_function(
@@ -335,6 +341,9 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_iterator_to_array", I64, &[DOUBLE]);
     module.declare_function("js_iterator_next_result", DOUBLE, &[DOUBLE]);
     module.declare_function("js_iterator_close_if_not_done", DOUBLE, &[DOUBLE, DOUBLE]);
+    // #10524: `const [a, b] = <untyped>` — 0 when the source is an ordinary
+    // Array whose iteration is unobservable (read it by index), 1 otherwise.
+    module.declare_function("js_array_destructure_needs_iterator", I32, &[DOUBLE]);
     module.declare_function("js_iterator_rest_to_array", DOUBLE, &[DOUBLE, DOUBLE]);
     // #1831: `yield*` iterator resolution — `operand[Symbol.iterator]()` or the
     // operand itself when already an iterator. Returns a NaN-boxed JSValue.

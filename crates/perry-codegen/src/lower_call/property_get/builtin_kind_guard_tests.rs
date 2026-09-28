@@ -13,6 +13,14 @@ use crate::compile_module;
 use crate::temp_root_coverage::{entry_opts, module_with_init};
 
 const DISPATCH: &str = "call double @js_typed_feedback_native_call_method_by_id(";
+/// The One Path method site's miss: universal dispatch behind the site
+/// (`expr/method_site.rs`), which a plain (non-builtin-named) call now takes.
+const SITE_MISS: &str = "call double @js_method_site_miss(";
+
+/// Does `ir` reach universal method dispatch, directly or behind a site?
+fn dispatches(ir: &str) -> bool {
+    ir.contains(DISPATCH) || ir.contains(SITE_MISS)
+}
 const GET_TIME: &str = "call double @js_date_get_time(";
 
 /// The `main` body for `init`, with `make()` importable as an `any`-returning
@@ -83,7 +91,7 @@ fn unproven_date_getter_checks_the_receiver_kind() {
         "a Date is recognized by its time value differing from the receiver bits:\n{ir}"
     );
     assert!(
-        ir.contains(DISPATCH),
+        dispatches(&ir),
         "a non-Date receiver must reach its own getTime through method dispatch:\n{ir}"
     );
     assert_eq!(
@@ -108,10 +116,7 @@ fn unproven_date_getter_reuses_the_time_value_from_the_check() {
         "the getter must read the time value the check produced, not re-classify \
          the receiver:\n{ir}"
     );
-    assert!(
-        ir.contains(DISPATCH),
-        "missing the method-dispatch arm:\n{ir}"
-    );
+    assert!(dispatches(&ir), "missing the method-dispatch arm:\n{ir}");
 }
 
 #[test]
@@ -128,10 +133,7 @@ fn unproven_date_setter_forwards_every_argument_on_both_arms() {
         ir.contains(GET_TIME) && ir.contains("call double @js_date_apply_setter("),
         "a Date receiver must keep the setter behind a runtime Date check:\n{ir}"
     );
-    assert!(
-        ir.contains(DISPATCH),
-        "missing the method-dispatch arm:\n{ir}"
-    );
+    assert!(dispatches(&ir), "missing the method-dispatch arm:\n{ir}");
 }
 
 #[test]
@@ -144,7 +146,7 @@ fn unproven_to_locale_string_formats_primitives_dates_and_symbols_directly() {
         ir.contains("call double @js_value_to_locale_string(")
             && ir.contains(GET_TIME)
             && ir.contains("call i32 @js_is_symbol(")
-            && ir.contains(DISPATCH),
+            && dispatches(&ir),
         "primitives, Dates and Symbols format directly; heap objects dispatch:\n{ir}"
     );
 }
@@ -156,7 +158,7 @@ fn unproven_number_method_uses_an_inline_tag_check() {
         vec![method_call(any_value(), "toFixed", vec![Expr::Number(2.0)])],
     );
     assert!(
-        ir.contains("call i64 @js_number_to_fixed(") && ir.contains(DISPATCH),
+        ir.contains("call i64 @js_number_to_fixed(") && dispatches(&ir),
         "toFixed on an unproven receiver needs both the Number and dispatch arms:\n{ir}"
     );
     assert!(
@@ -174,7 +176,7 @@ fn unproven_to_sorted_checks_for_a_plain_array_header() {
     assert!(
         ir.contains("call i64 @js_validate_array_comparator(")
             && ir.contains("call i64 @js_array_to_sorted_with_comparator(")
-            && ir.contains(DISPATCH),
+            && dispatches(&ir),
         "toSorted on an unproven receiver needs both the Array and dispatch arms:\n{ir}"
     );
     assert!(
@@ -223,7 +225,7 @@ fn unproven_reduce_right_with_three_arguments_is_plain_dispatch() {
         )],
     );
     assert!(
-        ir.contains(DISPATCH) && !ir.contains("call double @js_array_reduce_right("),
+        dispatches(&ir) && !ir.contains("call double @js_array_reduce_right("),
         "an out-of-arity reduceRight must stay a method call:\n{ir}"
     );
 }
@@ -255,7 +257,7 @@ fn proven_receivers_keep_the_direct_builtin_call() {
         "a proven Date calls the getter once, with no kind check:\n{ir}"
     );
     // #10943 CHANGED THIS CLAIM, deliberately. What stood here was
-    // `!ir.contains(DISPATCH)` — "a proven receiver must not pay for method
+    // `!dispatches(&ir)` — "a proven receiver must not pay for method
     // dispatch" — and that premise is the bug: proving the receiver's KIND
     // proves nothing about an own property, so `d.getTime = () => "own"` ran
     // `Date.prototype.getTime` and returned a real timestamp. The dispatcher
@@ -294,7 +296,198 @@ fn zero_argument_search_methods_compile_on_any_receiver_and_on_a_string() {
     assert!(
         ir.contains("call i32 @js_string_ends_with(")
             && ir.contains("call i32 @js_string_starts_with(")
-            && ir.contains(DISPATCH),
+            && dispatches(&ir),
         "an omitted searchString is `undefined`, not a compile error:\n{ir}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #11493: a receiver that PASSES the kind check can still own the method.
+// ---------------------------------------------------------------------------
+
+const OWN_TEST: &str = "call i32 @js_receiver_may_own_named_method(";
+const OWN_FLAG: &str = "@PERRY_OWN_NAMED_PROP_INSTALLED";
+const MAKE: &str = "perry_fn_kind_guard_ts__make";
+
+/// Every register a call to `callee` assigns, in program order.
+fn call_results(ir: &str, callee: &str) -> Vec<String> {
+    let marker = format!(" = call double @{callee}(");
+    ir.lines()
+        .filter(|line| line.contains(&marker))
+        .filter_map(|line| line.trim_start().split(" = ").next())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn unproven_date_receiver_asks_the_own_override_test_before_the_builtin() {
+    // `const d: any = new Date(0); d.getTime = () => 42; d.getTime()` passed
+    // the Date check and returned 0: nothing between that check and the
+    // builtin asked whether `d` owns `getTime`.
+    let ir = main_ir(
+        "kind_guard_own_get_time.ts",
+        vec![method_call(any_value(), "getTime", Vec::new())],
+    );
+    assert!(
+        ir.contains(OWN_FLAG) && ir.contains(OWN_TEST),
+        "a Date receiver must take the own-override test before the builtin:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches(DISPATCH).count(),
+        1,
+        "an own getTime and a non-Date receiver share the one dispatch arm:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches(GET_TIME).count(),
+        1,
+        "the kind check still reads the time value the builtin arm returns:\n{ir}"
+    );
+    // The predicate may allocate. The receiver has to be in a rooted slot
+    // across it, and both the predicate and the dispatcher read it back.
+    let recv = call_results(&ir, MAKE).remove(0);
+    crate::testing::temp_slots::assert_rooted_across(
+        &ir,
+        &recv,
+        "js_receiver_may_own_named_method",
+        "the own-override test",
+    );
+    crate::testing::temp_slots::assert_rooted_across(
+        &ir,
+        &recv,
+        "js_typed_feedback_native_call_method_by_id",
+        "the dispatch arm below the own-override test",
+    );
+}
+
+#[test]
+fn unproven_date_setter_roots_its_argument_across_the_own_override_test() {
+    // A lone argument has no collecting operand after it, so before #11493 it
+    // stayed an SSA register. The own-override test is a call that may
+    // collect, so it is rooted now, and the builtin reads it from the root.
+    let ir = main_ir(
+        "kind_guard_own_set_utc_hours.ts",
+        vec![method_call(any_value(), "setUTCHours", vec![any_value()])],
+    );
+    let results = call_results(&ir, MAKE);
+    assert_eq!(results.len(), 2, "receiver and argument:\n{ir}");
+    assert!(
+        crate::testing::temp_slots::temp_root_slot_holding(&ir, &results[1]).is_some(),
+        "the argument must be rooted across the own-override test:\n{ir}"
+    );
+    assert!(
+        ir.contains(OWN_TEST) && ir.contains("call double @js_date_apply_setter("),
+        "the setter stays behind the Date check and the own-override test:\n{ir}"
+    );
+    crate::testing::temp_slots::assert_rooted_across(
+        &ir,
+        &results[0],
+        "js_date_apply_setter",
+        "the setter below the own-override test",
+    );
+}
+
+#[test]
+fn unproven_array_receiver_asks_the_own_override_test_from_its_header() {
+    let ir = main_ir(
+        "kind_guard_own_to_sorted.ts",
+        vec![method_call(any_value(), "toSorted", vec![Expr::Undefined])],
+    );
+    assert!(
+        ir.contains(OWN_TEST) && ir.contains("load i16"),
+        "a plain array tests its own named-property header bits before the \
+         builtin, and asks the predicate only when they are set:\n{ir}"
+    );
+    assert!(
+        !ir.contains(OWN_FLAG),
+        "an array answers from its own header, not the global install flag:\n{ir}"
+    );
+}
+
+#[test]
+fn unproven_to_locale_string_asks_the_own_override_test_for_a_date_only() {
+    let ir = main_ir(
+        "kind_guard_own_to_locale_string.ts",
+        vec![method_call(any_value(), "toLocaleString", Vec::new())],
+    );
+    assert!(
+        ir.contains(OWN_TEST),
+        "a Date receiver of toLocaleString() may own it:\n{ir}"
+    );
+    assert_eq!(
+        ir.matches(OWN_TEST).count(),
+        1,
+        "only the Date arm asks; primitives and Symbols own nothing:\n{ir}"
+    );
+}
+
+#[test]
+fn unproven_number_method_skips_the_own_override_test() {
+    // A number is a primitive: nothing can shadow its builtin on the receiver,
+    // so its guard stays the inline tag test and nothing is rooted for it.
+    let ir = main_ir(
+        "kind_guard_own_to_fixed.ts",
+        vec![method_call(any_value(), "toFixed", vec![Expr::Number(2.0)])],
+    );
+    assert!(
+        !ir.contains(OWN_FLAG) && !ir.contains(OWN_TEST),
+        "a Number receiver needs no own-override test:\n{ir}"
+    );
+}
+
+#[test]
+fn proven_date_names_outside_the_old_list_are_guarded() {
+    // A proven Date reaches the chain's direct builtin for every name
+    // `date_builtin` knows, so every one of them needs the #10943 diamond.
+    // `setTime` and `getUTCHours` were missing from the hand-kept list.
+    for name in ["setTime", "getUTCHours", "toUTCString", "toLocaleString"] {
+        assert!(
+            super::is_direct_date_builtin_name(name),
+            "{name} lowers to a direct Date builtin"
+        );
+    }
+    let ir = main_ir(
+        "kind_guard_proven_set_time.ts",
+        vec![
+            method_call(
+                Expr::DateNew(Vec::new()),
+                "setTime",
+                vec![Expr::Number(1.0)],
+            ),
+            method_call(Expr::DateNew(Vec::new()), "getUTCHours", Vec::new()),
+        ],
+    );
+    assert_eq!(
+        ir.matches(OWN_TEST).count(),
+        2,
+        "each proven Date call pays one own-override test:\n{ir}"
+    );
+}
+
+#[test]
+fn folded_date_formatters_are_guarded_and_a_numeric_to_locale_string_is_not() {
+    let ir = main_ir(
+        "kind_guard_folded_formatters.ts",
+        vec![
+            Stmt::Expr(Expr::DateToDateString(Box::new(Expr::DateNew(Vec::new())))),
+            Stmt::Expr(Expr::DateGetTimezoneOffset(Box::new(Expr::DateNew(
+                Vec::new(),
+            )))),
+        ],
+    );
+    assert_eq!(
+        ir.matches(OWN_TEST).count(),
+        2,
+        "each folded Date formatter pays one own-override test:\n{ir}"
+    );
+    // `(12345).toLocaleString()` shares the Date node; a number owns nothing.
+    let ir = main_ir(
+        "kind_guard_folded_number_locale.ts",
+        vec![Stmt::Expr(Expr::DateToLocaleString(Box::new(
+            Expr::Number(12345.0),
+        )))],
+    );
+    assert!(
+        !ir.contains(OWN_FLAG) && !ir.contains(OWN_TEST),
+        "a numeric toLocaleString keeps the plain fold:\n{ir}"
     );
 }

@@ -43,13 +43,17 @@ pub use super::class_handles::{
 };
 use super::*;
 
-mod accessor_attrs;
 mod builtin_alias_construct;
 mod class_meta;
 mod construct;
 #[cfg(feature = "regex-engine")]
 pub(crate) use construct::construct_two_rooted;
 pub(crate) use construct::{construct_rooted_arguments, scan_current_new_target_root_mut};
+mod decl_accessors;
+pub(crate) use decl_accessors::{
+    class_chain_getter_value, class_chain_setter_apply, decl_prototype_own_accessor,
+    install_decl_prototype_accessor,
+};
 pub mod decl_prototype_table;
 mod dispatch;
 pub(crate) mod evaluation_heritage;
@@ -64,14 +68,15 @@ mod prototype_methods;
 pub(crate) mod prototype_objects;
 mod registration;
 mod state;
+mod static_accessor_attrs;
+pub(crate) mod verdict_classes;
 mod vm_brand;
 
-// ── accessor_attrs.rs ───────────────────────────────────────────────────────
-pub(crate) use accessor_attrs::{
-    class_accessor_attrs, class_accessor_attrs_in_use, class_accessor_descriptor,
-    class_declared_accessor_ptrs, class_enumerable_accessor_names,
-    class_prototype_enumerable_accessor, class_set_accessor_attrs,
-    decl_prototype_enumerable_key_snapshot, decl_prototype_keys_with_enumerable_accessors,
+// ── static_accessor_attrs.rs ────────────────────────────────────────────────
+pub(crate) use static_accessor_attrs::{
+    set_static_accessor_attrs, static_accessor_attrs, static_accessor_attrs_in_use,
+    static_accessor_descriptor, static_declared_accessor_ptrs, static_enumerable_accessor_names,
+    CLASS_ACCESSOR_DEFAULT_ATTRS,
 };
 
 // ── state.rs ────────────────────────────────────────────────────────────────
@@ -79,37 +84,40 @@ pub(crate) use state::async_resource_prototype_value;
 #[cfg(test)]
 pub(crate) use state::class_decl_prototype_object_root_store;
 pub(crate) use state::{
-    class_decl_prototype_method_names, class_decl_prototype_object, class_decl_prototype_value,
-    class_decl_prototype_value_for_instance_class, class_delete_own_dynamic_prop,
-    class_dynamic_prop_root_store, class_has_own_dynamic_prop, class_id_for_decl_prototype_object,
-    class_is_key_deleted, class_mark_key_deleted, class_object_value_for_cid,
-    class_object_value_root_store, class_own_dynamic_prop_names, class_own_enumerable_field_names,
-    class_own_static_field_value, class_own_string_member_names, class_parent_closure,
-    class_parent_closure_root_store, class_prototype_method_is_enumerable,
-    class_prototype_method_set_enumerable, class_prototype_method_value_cache_root_store,
-    class_prototype_object_addr_index_contains, class_prototype_object_addr_index_rekey,
-    class_prototype_object_root_store, class_ref_dynamic_prop_root_store,
-    class_register_declared_static_global_slot, class_static_defined_attrs, class_static_prototype,
-    class_static_prototype_is_nulled, class_static_prototype_root_clear,
-    class_static_prototype_root_store, class_static_set_defined_attrs, class_unmark_key_deleted,
+    builtin_parent_ctor_in_chain, class_decl_prototype_method_names, class_decl_prototype_object,
+    class_decl_prototype_value, class_decl_prototype_value_for_instance_class,
+    class_delete_own_dynamic_prop, class_dynamic_prop_root_store, class_has_own_dynamic_prop,
+    class_id_for_decl_prototype_object, class_is_key_deleted, class_mark_key_deleted,
+    class_object_value_for_cid, class_object_value_root_store, class_own_dynamic_prop_names,
+    class_own_enumerable_field_names, class_own_static_field_value, class_own_string_member_names,
+    class_parent_closure, class_parent_closure_root_store, class_prototype_member_names,
+    class_prototype_method_is_enumerable, class_prototype_method_set_enumerable,
+    class_prototype_method_value_cache_root_store, class_prototype_object_addr_index_contains,
+    class_prototype_object_addr_index_rekey, class_prototype_object_root_store,
+    class_ref_dynamic_prop_root_store, class_register_declared_static_global_slot,
+    class_static_defined_attrs, class_static_prototype, class_static_prototype_is_nulled,
+    class_static_prototype_root_clear, class_static_prototype_root_store,
+    class_static_set_defined_attrs, class_unmark_key_deleted, decl_prototype_identity_id,
     global_object_prototype_bits, is_bound_native_constructor_closure_value,
     is_non_constructable_builtin_function_value, parent_closure_in_chain,
     throw_non_constructable_builtin_function,
 };
 pub use state::{
-    ClassVTable, VTableMethodEntry, CLASS_DECL_PROTOTYPE_OBJECTS, CLASS_DYNAMIC_PARENT_VALUE,
-    CLASS_METHOD_BIND_LENGTHS, CLASS_OBJECT_VALUES, CLASS_PARENT_CLOSURES,
-    CLASS_PROTOTYPE_METHOD_NONENUM, CLASS_PROTOTYPE_OBJECTS, CLASS_STATIC_ACCESSORS,
-    CLASS_STATIC_METHODS, CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_STATIC_PROTOTYPES,
-    CLASS_STRING_MEMBER_ORDERS, CLASS_SYMBOL_ACCESSORS, CLASS_SYMBOL_MEMBER_ORDERS,
-    CLASS_SYMBOL_METHODS, CLASS_VTABLE_REGISTRY, FUNCTION_CLASS_IDS, REGISTERED_CLASS_IDS,
+    AccessorDecl, ClassVTable, VTableMethodEntry, CLASS_DECL_PROTOTYPE_OBJECTS,
+    CLASS_DYNAMIC_PARENT_VALUE, CLASS_METHOD_BIND_LENGTHS, CLASS_OBJECT_VALUES,
+    CLASS_PARENT_CLOSURES, CLASS_PROTOTYPE_METHOD_NONENUM, CLASS_PROTOTYPE_OBJECTS,
+    CLASS_STATIC_ACCESSORS, CLASS_STATIC_METHODS, CLASS_STATIC_METHOD_BIND_LENGTHS,
+    CLASS_STATIC_PROTOTYPES, CLASS_STRING_MEMBER_ORDERS, CLASS_SYMBOL_ACCESSORS,
+    CLASS_SYMBOL_MEMBER_ORDERS, CLASS_SYMBOL_METHODS, CLASS_VTABLE_REGISTRY, FUNCTION_CLASS_IDS,
+    REGISTERED_CLASS_IDS,
 };
 
 // ── prototype_objects.rs ────────────────────────────────────────────────────
 pub(crate) use prototype_objects::{
     class_prototype_object, ensure_function_prototype_object, function_class_id,
     function_value_for_class_id, instance_class_prototype_object, object_proto_chain_symbol_slot,
-    resolve_proto_chain_field, resolve_proto_chain_field_with_receiver, resolve_proto_chain_symbol,
+    resolve_proto_chain_field, resolve_proto_chain_field_noting_miss,
+    resolve_proto_chain_field_with_receiver, resolve_proto_chain_symbol,
     synthetic_class_prototype_object, SYNTHETIC_CLASS_ID_BASE,
 };
 pub use prototype_objects::{
@@ -128,8 +136,9 @@ pub use class_meta::{
     class_source_for_id, declared_class_outranks_anon_shape, is_anon_shape_class_id,
     js_compression_stream_new, js_decompression_stream_new, js_register_anon_shape_class_id,
     js_register_class_id, js_register_class_length, js_register_class_name,
-    js_register_class_source, js_text_decoder_stream_new, js_text_encoder_stream_new,
-    js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS, CLASS_NAMES,
+    js_register_class_source, js_register_class_source_static, js_text_decoder_stream_new,
+    js_text_encoder_stream_new, js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS,
+    CLASS_NAMES,
 };
 pub(crate) use class_meta::{
     identify_global_builtin_constructor, report_dispatch_miss,
@@ -225,6 +234,7 @@ pub(crate) use parent_static::{
     class_static_accessor_setter_apply, class_symbol_getter_value, class_symbol_setter_apply,
     dynamic_value_class_id, get_parent_class_id, lookup_class_symbol_method_in_chain,
     lookup_static_method_in_chain, register_class, register_class_dynamic_static_accessor,
+    static_accessor_in_chain,
 };
 pub use parent_static::{
     is_class_object_ptr, is_class_object_value, is_registered_class_prototype_object,
@@ -251,11 +261,17 @@ pub(crate) fn class_registry_census() -> Vec<crate::gc::census::SideTableRow> {
             let mut entries = 0usize;
             let mut inner = 0usize;
             for vt in m.values() {
-                entries += vt.methods.len() + vt.getters.len() + vt.setters.len();
-                inner += map_bytes(&vt.methods) + map_bytes(&vt.getters) + map_bytes(&vt.setters);
+                entries += vt.methods.len() + vt.accessors.len() + vt.private_accessors.len();
+                inner += map_bytes(&vt.methods)
+                    + map_bytes(&vt.accessors)
+                    + map_bytes(&vt.private_accessors);
                 inner += vt.methods.keys().map(|k| k.capacity()).sum::<usize>();
-                inner += vt.getters.keys().map(|k| k.capacity()).sum::<usize>();
-                inner += vt.setters.keys().map(|k| k.capacity()).sum::<usize>();
+                inner += vt.accessors.keys().map(|k| k.capacity()).sum::<usize>();
+                inner += vt
+                    .private_accessors
+                    .keys()
+                    .map(|k| k.capacity())
+                    .sum::<usize>();
             }
             rows.push((
                 "class.vtables(methods+accessors)",
@@ -332,10 +348,8 @@ pub(crate) fn class_registry_census() -> Vec<crate::gc::census::SideTableRow> {
             map_bytes(&slots) + inner,
         ));
     });
-    if let Ok(g) = super::class_meta_registry::CLASS_REGISTRY.read() {
-        if let Some(m) = g.as_ref() {
-            rows.push(("class.parent_registry", m.len(), map_bytes(m)));
-        }
+    if let Some((entries, bytes)) = super::class_meta_registry::parent_map_census() {
+        rows.push(("class.parent_registry", entries, bytes));
     }
     rows
 }

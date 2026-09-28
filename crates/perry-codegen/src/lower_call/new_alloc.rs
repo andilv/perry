@@ -142,6 +142,123 @@ pub(super) struct InstanceAlloc {
     pub(super) typed_layout_baked: bool,
 }
 
+/// The number of distinct static keys the constructor chain of `class` stores
+/// into `this` that no class of the chain declares as a field. Walks each
+/// constructor body's statements (branches, loops and `try` included; nested
+/// functions excluded, since their `this` is not the instance). Capped, so a
+/// generated constructor cannot make an instance arbitrarily wide.
+pub(crate) fn constructor_added_key_count(ctx: &FnCtx<'_>, class: &perry_hir::Class) -> u32 {
+    constructor_added_key_count_in(class, &|name| ctx.classes.get(name).copied())
+}
+
+/// [`constructor_added_key_count`] over any class table: module init
+/// (`codegen/mod.rs`) derives the same count from its own table to mint the
+/// wide birth shape the inline allocator stamps.
+pub(crate) fn constructor_added_key_count_in<'c>(
+    class: &'c perry_hir::Class,
+    lookup: &dyn Fn(&str) -> Option<&'c perry_hir::Class>,
+) -> u32 {
+    const SLACK_CAP: usize = 64;
+    let mut chain: Vec<&perry_hir::Class> = vec![class];
+    let mut parent = class.extends_name.as_deref();
+    while let Some(name) = parent {
+        match lookup(name) {
+            Some(p) if chain.len() < 32 => {
+                chain.push(p);
+                parent = p.extends_name.as_deref();
+            }
+            _ => break,
+        }
+    }
+    let declared: std::collections::HashSet<&str> = chain
+        .iter()
+        .flat_map(|c| c.fields.iter().map(|f| f.name.as_str()))
+        .collect();
+    let mut added: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn visit_expr(
+        e: &perry_hir::Expr,
+        declared: &std::collections::HashSet<&str>,
+        added: &mut std::collections::HashSet<String>,
+    ) {
+        let key = match e {
+            perry_hir::Expr::PropertySet {
+                object, property, ..
+            } if matches!(object.as_ref(), perry_hir::Expr::This) => Some(property.as_str()),
+            perry_hir::Expr::PutValueSet { target, key, .. }
+                if matches!(target.as_ref(), perry_hir::Expr::This) =>
+            {
+                match key.as_ref() {
+                    perry_hir::Expr::String(k) => Some(k.as_str()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(k) = key {
+            let first = k.as_bytes().first().copied().unwrap_or(b'0');
+            if !declared.contains(k) && first != b'#' && !first.is_ascii_digit() {
+                added.insert(k.to_string());
+            }
+        }
+        if matches!(e, perry_hir::Expr::Closure { .. }) {
+            return;
+        }
+        perry_hir::walker::walk_expr_children(e, &mut |c| visit_expr(c, declared, added));
+    }
+    fn visit_stmts(
+        stmts: &[perry_hir::Stmt],
+        declared: &std::collections::HashSet<&str>,
+        added: &mut std::collections::HashSet<String>,
+    ) {
+        use perry_hir::Stmt;
+        for s in stmts {
+            match s {
+                Stmt::Expr(e) => visit_expr(e, declared, added),
+                Stmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    visit_stmts(then_branch, declared, added);
+                    if let Some(eb) = else_branch {
+                        visit_stmts(eb, declared, added);
+                    }
+                }
+                Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => {
+                    visit_stmts(body, declared, added)
+                }
+                Stmt::For { body, .. } => visit_stmts(body, declared, added),
+                Stmt::Labeled { body, .. } => {
+                    visit_stmts(std::slice::from_ref(body.as_ref()), declared, added)
+                }
+                Stmt::Try {
+                    body,
+                    catch,
+                    finally,
+                } => {
+                    visit_stmts(body, declared, added);
+                    if let Some(c) = catch {
+                        visit_stmts(&c.body, declared, added);
+                    }
+                    if let Some(f) = finally {
+                        visit_stmts(f, declared, added);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for c in &chain {
+        if let Some(ctor) = &c.constructor {
+            visit_stmts(&ctor.body, &declared, &mut added);
+        }
+        if added.len() >= SLACK_CAP {
+            break;
+        }
+    }
+    added.len().min(SLACK_CAP) as u32
+}
+
 pub(super) fn emit_instance_alloc(
     ctx: &mut FnCtx<'_>,
     class_name: &str,
@@ -216,6 +333,27 @@ fn emit_instance_alloc_inner(
     // enumeration, and the runtime treats header field_count as alloc_limit.
     if class.alloc_width_hint > field_count {
         field_count = class.alloc_width_hint;
+    }
+    // In-object slack for KEY-ADDS: a constructor chain that stores keys the
+    // class does not declare (`this.pos = pos` in a class with no field
+    // declarations, tsc's and Zod's normal form) would otherwise spill every
+    // key past INLINE_SLOT_FLOOR to overflow storage. The in-loop inline
+    // allocator below bakes `field_count` at compile time and never consults
+    // the runtime's learned width, so without this every instance of such a
+    // class is born two slots wide forever (measured: 8 of 10 constructor
+    // adds overflowed). Capacity only, exactly like `alloc_width_hint`: the
+    // keys stay authoritative for enumeration, and a width above the keys
+    // count routes the allocation to the outlined entry, which installs an
+    // exact descriptor and also honours the learned width.
+    let slack = constructor_added_key_count(ctx, class);
+    if slack > 0 {
+        field_count = field_count.max(
+            ctx.class_field_counts
+                .get(class_name)
+                .copied()
+                .unwrap_or(field_count)
+                .saturating_add(slack),
+        );
     }
 
     // Allocate the object with the per-class id and (if applicable)
@@ -378,11 +516,41 @@ fn emit_instance_alloc_inner(
         // allocation's live-slot bound exactly equals the module-init keys
         // count used to mint that id. Width-hinted/mismatched allocations use
         // the outlined entry point, which installs an exact local descriptor.
-        let descriptor_facts_exact = inline_shape_descriptor_facts_exact(
+        // A class whose constructor adds keys is born WIDE: module init mints
+        // its birth ShapeId with the widened live bound and composes the
+        // header image for the widened size (`codegen/mod.rs`). The inline
+        // allocator may stamp that image only when it is byte-for-byte the
+        // one this site would build; and no site may stamp a module image
+        // whose object SIZE differs from its own, since the image's ShapeId
+        // then names a live bound this allocation may not have.
+        let site_total =
+            crate::target_layout::inline_alloc_total_size_bytes(ctx.target_triple, field_count);
+        let module_image = ctx
+            .class_header_image_globals
+            .get(class_name)
+            .map(|(_, packed, image_cid)| (*packed, *image_cid));
+        let image_size_agrees = module_image.is_none_or(|(packed, _)| packed >> 32 == site_total);
+        let wide_birth_image = slack > 0
+            && module_image
+                == Some((
+                    crate::target_layout::inline_alloc_gc_packed(
+                        ctx.target_triple,
+                        field_count,
+                        crate::target_layout::InlineTypedLayout::None,
+                    ),
+                    cid,
+                ));
+        let descriptor_facts_exact = (inline_shape_descriptor_facts_exact(
             ctx.class_field_counts.get(class_name).copied(),
             field_count,
-        );
-        if !descriptor_facts_exact || (!force_inline_new && !new_site_is_in_loop(ctx)) {
+        ) && image_size_agrees)
+            || wide_birth_image;
+        // ILP32 (wasm32 WASI, #11378): the inline bump below reads
+        // `InlineArenaState` at LP64 offsets; take the outlined call.
+        if !descriptor_facts_exact
+            || (!force_inline_new && !new_site_is_in_loop(ctx))
+            || crate::codegen::helpers::ilp32_target()
+        {
             let keys_slot = if let Some(s) = ctx.class_keys_slots.get(class_name).cloned() {
                 s
             } else {
@@ -464,8 +632,13 @@ fn emit_instance_alloc_inner(
             // (`layout_set_typed_unknown`), and a constant cannot express "it
             // depends". Computed here, before `ctx.block()` takes its mutable
             // borrow.
-            let inline_typed_layout =
-                super::typed_shape_init::layout_at_allocation(ctx, class_name, field_count);
+            // A wide birth carries no typed layout (the module image was
+            // composed without one); its stores settle the layout per slot.
+            let inline_typed_layout = if wide_birth_image {
+                crate::target_layout::InlineTypedLayout::None
+            } else {
+                super::typed_shape_init::layout_at_allocation(ctx, class_name, field_count)
+            };
             *typed_layout_baked = inline_typed_layout.is_baked();
             let (layout_bits, typed_intact_bits) = match inline_typed_layout {
                 crate::target_layout::InlineTypedLayout::None => (GC_LAYOUT_POINTER_FREE, 0),

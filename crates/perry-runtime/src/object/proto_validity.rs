@@ -67,9 +67,14 @@
 //!    into one word is what lets a cached entry re-prove itself with ONE load
 //!    and ONE compare instead of two of each.
 //!
-//! A plain value store to an existing key deliberately does NOT invalidate: a
-//! cache entry records (holder, slot) and LOADS the value on every hit, so a
-//! new value is seen without any invalidation at all.
+//! 4. A plain value store to an EXISTING key of a marked object bumps it too
+//!    ([`note_marked_value_write`], owner decision D3(b)): an inherited
+//!    method-site entry (`object::method_site`) memoizes the method CLOSURE,
+//!    not (holder, slot), so a replaced value must invalidate it. Store caches
+//!    never learn a marked object's shape ([`store_cache_may_learn`]), so every
+//!    such store reaches a runtime funnel that calls it. Entries that record
+//!    (holder, slot) and load the value on every hit do not need this, and
+//!    must not assume the word stays put across such a store either.
 //!
 //! # Why the counter is global, and what that costs
 //!
@@ -105,6 +110,9 @@ per_test_global! {
     /// Monotonic counter standing for "nothing structural has changed on any
     /// object somebody inherits from, and no semantic property event has
     /// happened". Starts at 1 so a zeroed cache entry never matches.
+    /// Read by emitted code (the key-add hit, `perry-codegen`'s
+    /// `put_value_store_ic.rs`) as `@PERRY_PROTO_VALIDITY`.
+    #[cfg_attr(not(test), export_name = "PERRY_PROTO_VALIDITY")]
     static PROTO_VALIDITY: AtomicU64 = AtomicU64::new(1);
 }
 
@@ -165,7 +173,7 @@ pub(crate) fn any_prototype_marked() -> bool {
 /// re-reading through a pointer the allocation may have moved.
 #[inline]
 pub(crate) unsafe fn mark_object_as_prototype(obj: usize) -> Option<u64> {
-    if let Some(meta) = ensure_meta_for_mark(obj) {
+    if let Some(meta) = ensure_meta_for_mark(obj, crate::object::OBJECT_META_FLAG_IS_PROTOTYPE) {
         ANY_PROTOTYPE_MARKED.store(true, Ordering::Relaxed);
         // GC_STORE_AUDIT(POINTER_FREE): scalar classification bit in the meta
         // record's flags word, never a heap reference.
@@ -182,9 +190,40 @@ pub(crate) unsafe fn mark_object_as_prototype(obj: usize) -> Option<u64> {
     None
 }
 
-/// Next prototype serial. Starts at 1 so 0 can mean "none assigned"; a `u64`
-/// counter cannot be exhausted by any real program.
-static PROTOTYPE_SERIAL_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Serials below this are reserved for INTRINSIC prototypes, assigned at
+/// creation (`assign_intrinsic_prototype_serial`) so a receiver kind's base
+/// shape can name its prototype before that object exists
+/// (`closure::shape::INTRINSIC_SERIAL_*`).
+pub(crate) const FIRST_DYNAMIC_PROTOTYPE_SERIAL: u64 = 64;
+
+/// Next prototype serial. 0 means "none assigned"; `1..64` are intrinsic; a
+/// `u64` counter cannot be exhausted by any real program.
+static PROTOTYPE_SERIAL_NEXT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(FIRST_DYNAMIC_PROTOTYPE_SERIAL);
+
+/// Mark the freshly created intrinsic prototype `obj` and give it the
+/// reserved `serial` (below [`FIRST_DYNAMIC_PROTOTYPE_SERIAL`]). Every shape
+/// minted for a receiver inheriting from it — a base Function shape minted
+/// before `obj` existed, or an ordinary object whose `meta.prototype` is
+/// `obj` — then names the same `proto_id`.
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader` with no serial assigned yet.
+pub(crate) unsafe fn assign_intrinsic_prototype_serial(obj: usize, serial: u64) {
+    debug_assert!(serial != 0 && serial < FIRST_DYNAMIC_PROTOTYPE_SERIAL);
+    if let Some(meta) = ensure_meta_for_mark(obj, crate::object::OBJECT_META_FLAG_IS_PROTOTYPE) {
+        ANY_PROTOTYPE_MARKED.store(true, Ordering::Relaxed);
+        // GC_STORE_AUDIT(POINTER_FREE): scalar classification bit.
+        (*meta).flags |= crate::object::OBJECT_META_FLAG_IS_PROTOTYPE;
+        debug_assert!(
+            (*meta).proto_serial == 0 || (*meta).proto_serial == serial,
+            "intrinsic prototype already carried serial {}",
+            (*meta).proto_serial
+        );
+        // GC_STORE_AUDIT(POINTER_FREE): a scalar serial, never a reference.
+        (*meta).proto_serial = serial;
+    }
+}
 
 /// The serial a `[[Prototype]]` of NULL stands for. Distinct from every
 /// assigned serial, and from 0 ("none").
@@ -193,21 +232,24 @@ pub(crate) const NULL_PROTOTYPE_SERIAL: u64 = u64::MAX;
 /// Mark a receiver a shape-keyed read cache must refuse whatever its ShapeId
 /// says: `process.env` or an `arguments` object, whose reads are answered by
 /// something other than the object's shape. Called from the single writer of
-/// each of those two registries, in the same breath as the insert, so "in the
-/// registry" and "carries the flag" are one statement, not two that can drift.
+/// each of those two facts (the `process.env` registry insert, the
+/// `ObjectMeta::arguments` store), in the same breath as it records them, so
+/// "is one" and "carries the flag" are one statement, not two that can drift.
 ///
 /// # Safety
 /// As [`mark_object_as_prototype`]: allocates, and may move the owner.
 pub(crate) unsafe fn mark_exotic_read_receiver(obj: usize) {
-    if let Some(meta) = ensure_meta_for_mark(obj) {
+    if let Some(meta) =
+        ensure_meta_for_mark(obj, crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER)
+    {
         // GC_STORE_AUDIT(POINTER_FREE): scalar classification bit.
         (*meta).flags |= crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER;
     }
 }
 
 /// Does this object carry [`mark_exotic_read_receiver`]'s flag? For the
-/// `debug_assert`s that keep the flag and the two registries from drifting
-/// apart; a read cache that has already loaded `meta` tests the bit directly.
+/// `debug_assert`s that keep the flag and the two facts it summarizes from
+/// drifting apart; a read cache that has already loaded `meta` tests the bit directly.
 ///
 /// # Safety
 /// `obj` is a live heap address, or 0.
@@ -226,10 +268,22 @@ pub(crate) unsafe fn object_is_exotic_read_receiver(obj: usize) -> bool {
 /// its reader then answers `false` for an object the writer marked. The
 /// complete map is on `gc::OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC`.
 ///
+/// A receiver that does not yet carry `flag` first moves onto a PRIVATE shape
+/// lineage (`transition_object_shape_semantics`: a counter-unique semantic
+/// generation, which every later append, delete and descriptor transition
+/// inherits). "This object is a prototype" and "this object's reads are not
+/// answered by its shape" are thereby facts of its SHAPE: no ShapeId a marked
+/// object carries is ever carried by an unmarked one, so a shape-keyed site
+/// memo primed on an unmarked receiver can never match a marked one, and one
+/// that refuses to prime on a marked receiver never learns a marked shape.
+/// The transition runs BEFORE the flag is set, so the stamp funnel does not
+/// count it as a structural change of a marked prototype: nothing recorded a
+/// verdict through this object yet, so no validity word needs to move.
+///
 /// # Safety
 /// `obj` is a live heap address, or 0. This ALLOCATES and may move the owner,
 /// so callers must not be holding bare pointers across it.
-unsafe fn ensure_meta_for_mark(obj: usize) -> Option<*mut crate::object::ObjectMeta> {
+unsafe fn ensure_meta_for_mark(obj: usize, flag: u64) -> Option<*mut crate::object::ObjectMeta> {
     if obj == 0 || !crate::value::addr_class::is_plausible_heap_addr(obj) {
         return None;
     }
@@ -240,13 +294,21 @@ unsafe fn ensure_meta_for_mark(obj: usize) -> Option<*mut crate::object::ObjectM
     let object = obj as *mut crate::object::ObjectHeader;
     let scope = crate::gc::RuntimeHandleScope::new();
     let handle = scope.root_raw_mut_ptr(object);
-    let (meta, _obj) = handle
+    let (meta, object) = handle
         .across_mut::<crate::object::ObjectHeader, _>(|| crate::object::object_meta_ensure(object));
     if meta.is_null() {
-        None
-    } else {
-        Some(meta)
+        return None;
     }
+    if (*meta).flags & flag == 0 {
+        // The transition may allocate a descriptor, and so move the owner;
+        // the meta record is reached through the owner again afterwards.
+        let (_, object) = handle.across_mut::<crate::object::ObjectHeader, _>(|| {
+            crate::object::shapes::transition_object_shape_semantics(object)
+        });
+        let meta = (*object).meta;
+        return (!meta.is_null()).then_some(meta);
+    }
+    Some(meta)
 }
 
 /// # Safety
@@ -331,3 +393,46 @@ pub(crate) unsafe fn note_object_shape_stamped(obj: usize, previous: u32, publis
 #[cfg(test)]
 #[path = "proto_validity_tests.rs"]
 mod tests;
+
+static MARKED_VALUE_WRITE_BUMPS: AtomicU64 = AtomicU64::new(0);
+
+/// Bumps taken by [`note_marked_value_write`] (diagnostics, tests).
+pub(crate) fn marked_value_write_bumps() -> u64 {
+    MARKED_VALUE_WRITE_BUMPS.load(Ordering::Relaxed)
+}
+
+/// A value was written into an EXISTING slot of `obj`. When `obj` is a marked
+/// prototype this invalidates every cached inherited verdict: a method-call
+/// site memoizes the CLOSURE an inherited key resolves to (owner decision
+/// D3(b)), so a plain store over it must move the word just as a structural
+/// change does. Unmarked objects — nearly every store — pay the latch load,
+/// and a meta-null test once anything is marked.
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader`.
+#[inline]
+pub(crate) unsafe fn note_marked_value_write(obj: *const crate::object::ObjectHeader) {
+    if !any_prototype_marked() {
+        return;
+    }
+    let meta = (*obj).meta;
+    if !meta.is_null() && (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE != 0 {
+        MARKED_VALUE_WRITE_BUMPS.fetch_add(1, Ordering::Relaxed);
+        bump_proto_validity();
+    }
+}
+
+/// Whether a store cache may LEARN `obj`'s shape: never for a marked
+/// prototype, so every write to one reaches a runtime funnel that calls
+/// [`note_marked_value_write`].
+///
+/// # Safety
+/// `obj` is a live `ObjectHeader`.
+#[inline]
+pub(crate) unsafe fn store_cache_may_learn(obj: *const crate::object::ObjectHeader) -> bool {
+    if !any_prototype_marked() {
+        return true;
+    }
+    let meta = (*obj).meta;
+    meta.is_null() || (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE == 0
+}

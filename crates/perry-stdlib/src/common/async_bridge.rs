@@ -1,11 +1,10 @@
 //! Async bridge: settles Perry Promises from native work, on the thread that
 //! owns the JS heap.
 //!
-//! Native work — a turnloop pool job, a plain OS thread, or, in a build with
-//! the `async-runtime` feature, a tokio task — never builds a JSValue. It
-//! queues either finished bits (`queue_promise_resolution`) or a converter
-//! (`queue_deferred_resolution`), and `js_stdlib_process_pending` settles the
-//! promise on the main thread.
+//! Native work — a turnloop pool job or a plain OS thread — never builds a
+//! JSValue. It queues either finished bits (`queue_promise_resolution`) or a
+//! converter (`queue_deferred_resolution`), and `js_stdlib_process_pending`
+//! settles the promise on the main thread.
 //!
 //! IMPORTANT: perry-runtime uses thread-local arenas for memory allocation.
 //! This means JSValue objects created on worker threads will be allocated
@@ -16,39 +15,53 @@
 //! 2. Store raw Rust data and use deferred conversion callbacks
 //! 3. The conversion callbacks run on the main thread during js_stdlib_process_pending
 //!
-//! # No tokio here (turnloop P8 lane L)
+//! # One queue, many agents (#11433)
 //!
-//! This module is compiled under `async-bridge` and contains no tokio. The
-//! tokio current-thread runtime and everything that drives it live in
-//! `super::tokio_bridge`, which only `async-runtime` compiles — the features
-//! whose code hands it tokio futures (bundled net/tls/ws sockets, reqwest
-//! fetch, the container engine) and the `perry_ffi_spawn_async` /
-//! `_with_reactor` C ABI that perry-ext-net / perry-ext-http still use. A
-//! program that needs none of those (crypto, bcrypt, argon2, zlib, readline,
-//! nodemailer, worker_threads, a UI app) links no tokio at all. The tokio
-//! half's public names are re-exported below so no caller's path changed.
+//! "The main thread" above means *the agent that owns the promise*. Since
+//! turnloop P9 a `node:worker_threads` Worker (and a `perry/thread` worker) is
+//! an agent with its own heap, its own loop, and its own call to
+//! `js_stdlib_process_pending` from its await loop. The two queues below are
+//! process-global, so every entry carries the [`AgentId`] it belongs to and a
+//! pump settles only its own agent's entries, leaving the rest for their
+//! owner — the model `perry_runtime::agent` already applies to timers and
+//! thread results. Before this, whichever agent pumped first took everything:
+//! the primary agent settled a Worker's `fetch` promise (running the Worker's
+//! continuation on the main thread, against the main heap) and the Worker
+//! settled the primary agent's, which is how
+//! `test_gap_turnloop_p9_worker_agent_net` printed `immediate 000undefined`,
+//! lost messages, and threw `Invalid response handle` about half the time.
+//!
+//! The owner is the agent current at *enqueue* time. A producer that queues
+//! from a thread with no agent of its own — a pool job, a fallback OS thread —
+//! would read as the primary agent there, so the spawn helpers capture the
+//! submitting agent and re-assert it around the job with
+//! [`ResolutionOwnerScope`].
+//!
+//! # No tokio
+//!
+//! This is the only async bridge perry-stdlib has. Turnloop P8 lane L split
+//! the tokio current-thread runtime out of this module into a sibling
+//! `tokio_bridge` behind an `async-runtime` feature; the final tokio lane
+//! deleted both, together with the `perry_ffi_spawn_async` /
+//! `_with_reactor` C ABI that was their last user. Every program links no
+//! tokio: CPU work goes to turnloop's pool (`pool_for_promise_deferred`),
+//! I/O to the owning agent's turnloop loop.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use std::sync::LazyLock as Lazy;
 
-#[cfg(feature = "async-runtime")]
-pub(crate) use super::tokio_bridge::spawn_native;
-#[cfg(feature = "async-runtime")]
-pub use super::tokio_bridge::{
-    block_on, drive_pending, run_one_tick, runtime, spawn, spawn_for_promise,
-    spawn_for_promise_deferred, spawn_for_promise_deferred_with_error, RUNTIME,
-};
+use perry_runtime::agent::{current_agent, AgentId};
 
-/// Issue #859: pin a Promise so the GC can't sweep it while a tokio
-/// worker is computing its eventual resolution.
+/// Issue #859: pin a Promise so the GC can't sweep it while a pool
+/// job or native thread is computing its eventual resolution.
 ///
 /// Without pinning, the await chain has no path back to the Promise:
 /// `P.next = N` is a forward edge, and after the user code yields, all
-/// JS-side roots reach only `N`. The tokio future holds `promise_ptr`
+/// JS-side roots reach only `N`. The native job holds `promise_ptr`
 /// as `usize`, invisible to the GC. So `js_promise_new()` in a native
-/// binding + `spawn_for_promise(...)` opens a window where `P` is
+/// binding + a pool submission opens a window where `P` is
 /// unreachable; if GC fires during that window, `P` is swept, and
 /// when the worker finally calls `js_promise_resolve(P, ...)` it
 /// dereferences freed (and possibly OS-reclaimed) memory → SIGBUS.
@@ -126,7 +139,7 @@ pub unsafe fn js_promise_new_for_native_resolution() -> *mut perry_runtime::Prom
     perry_runtime::js_promise_new_cross_thread()
 }
 
-/// Count of in-flight `perry_ffi_spawn_blocking[_with_reactor]` tasks
+/// Count of in-flight `perry_ffi_spawn_blocking` tasks
 /// dispatched by external native bindings (perry-ext-argon2 /
 /// -bcrypt / etc. via perry-ffi). Each spawn `fetch_add(1)`s before
 /// the closure runs; the closure-trampoline `fetch_sub(1)`s after it
@@ -136,7 +149,7 @@ pub unsafe fn js_promise_new_for_native_resolution() -> *mut perry_runtime::Prom
 /// queued its result.
 ///
 /// Issue #591: without this counter, `await argon2.hash(pw)` returns
-/// a Promise whose resolution is queued from a tokio worker AFTER
+/// a Promise whose resolution is queued from a worker thread AFTER
 /// `main()` returns. The runtime saw zero active handles (no WS,
 /// net, readline) and exited before the resolution drained, so the
 /// `.then` / `await` never fired and the program ran past the await
@@ -146,8 +159,8 @@ pub static EXT_BLOCKING_TASKS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Owns exactly one `EXT_BLOCKING_TASKS_INFLIGHT` increment, released on drop.
 ///
 /// Create it BEFORE spawning and move it into the task: the decrement then runs
-/// on completion, on error, when the task panics (tokio drops the future while
-/// unwinding) and when the task is dropped before its first poll (runtime
+/// on completion, on error, when the task panics (the job is dropped while
+/// unwinding) and when the task is dropped before it runs (pool
 /// shutdown). The hand-written `fetch_add` / `fetch_sub` pairs it replaces
 /// leaked an increment on the last two paths, which pinned the event loop alive
 /// forever. Drop also notifies the main thread so the loop re-evaluates its
@@ -189,6 +202,71 @@ static PENDING_DEFERRED_LEN: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static GC_SCANNER_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The agent a job running on this (agent-less) thread settles promises
+    /// for. Set only by [`ResolutionOwnerScope`].
+    static RESOLUTION_OWNER: std::cell::Cell<Option<AgentId>> = const { std::cell::Cell::new(None) };
+}
+
+/// The agent a resolution queued from this thread belongs to: the
+/// [`ResolutionOwnerScope`] in force, or the calling agent. Also what a spawn
+/// helper captures as the owner of the job it is about to hand off.
+pub(crate) fn resolution_owner() -> AgentId {
+    RESOLUTION_OWNER
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(current_agent)
+}
+
+/// While alive, resolutions queued on this thread belong to `agent`.
+///
+/// For native work that runs OFF the agent that created its promise (a
+/// turnloop pool job, a fallback OS thread): capture [`current_agent`] where
+/// the promise is created, and enter the scope around the job. Without it the
+/// job's thread reads as the primary agent, and a Worker's promise would be
+/// settled by the main thread.
+pub(crate) struct ResolutionOwnerScope {
+    previous: Option<AgentId>,
+}
+
+impl ResolutionOwnerScope {
+    pub(crate) fn enter(agent: AgentId) -> Self {
+        let previous = RESOLUTION_OWNER.with(|slot| slot.replace(Some(agent)));
+        Self { previous }
+    }
+}
+
+impl Drop for ResolutionOwnerScope {
+    fn drop(&mut self) {
+        RESOLUTION_OWNER.with(|slot| slot.set(self.previous));
+    }
+}
+
+/// `perry_runtime::agent::retire_agent` hook: the agent's heap is going away,
+/// so nothing can ever settle its queued promises. Drop them (their promise
+/// addresses would dangle), and republish the lengths so the survivors'
+/// keep-alive predicate stops counting them.
+fn purge_agent_resolutions(agent: AgentId) {
+    {
+        let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
+        pending.retain(|resolution| resolution.owner != agent);
+        PENDING_RESOLUTIONS_LEN.store(pending.len(), Ordering::Release);
+    }
+    // Converters are dropped outside the lock: a boxed closure's captures may
+    // run arbitrary Drop code.
+    let dropped: Vec<DeferredResolution> = {
+        let mut pending = PENDING_DEFERRED.lock().unwrap();
+        let (dead, live): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|resolution| resolution.owner == agent);
+        *pending = live;
+        PENDING_DEFERRED_LEN.store(pending.len(), Ordering::Release);
+        dead
+    };
+    drop(dropped);
+}
+
+fn ensure_retire_hook_registered() {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| perry_runtime::agent::register_retire_hook(purge_agent_resolutions));
 }
 
 pub(crate) fn ensure_gc_scanner_registered() {
@@ -200,12 +278,15 @@ pub(crate) fn ensure_gc_scanner_registered() {
             "stdlib:async_bridge",
             scan_pending_native_async_resolution_roots_mut,
         );
+        ensure_retire_hook_registered();
         registered.set(true);
     });
 }
 
 /// A pending promise resolution (for simple values that don't need conversion)
 struct PendingResolution {
+    /// The agent whose heap `promise_ptr` (and any heap `result_bits`) is in.
+    owner: AgentId,
     /// Pointer to the Promise object (as usize for Send)
     promise_ptr: usize,
     /// True if resolved successfully, false if rejected
@@ -217,6 +298,8 @@ struct PendingResolution {
 /// A deferred promise resolution with a conversion callback
 /// The converter function runs on the main thread to safely create JSValues
 struct DeferredResolution {
+    /// The agent whose heap `promise_ptr` is in, and on which `converter` runs.
+    owner: AgentId,
     /// Pointer to the Promise object (as usize for Send)
     promise_ptr: usize,
     /// True if resolved successfully, false if rejected
@@ -227,21 +310,24 @@ struct DeferredResolution {
 }
 
 /// Mutable GC scanner for native async completions waiting in stdlib's
-/// main-thread pump. Promise pointers are raw heap pointers; simple
-/// result bits may be NaN-boxed heap values.
+/// pump. Promise pointers are raw heap pointers; simple result bits may be
+/// NaN-boxed heap values. A collection runs on the agent whose heap it
+/// collects, so it visits only that agent's entries: another agent's promise
+/// is in another heap, which this collector must neither mark nor rewrite.
 pub fn scan_pending_native_async_resolution_roots_mut(
     visitor: &mut perry_runtime::gc::RuntimeRootVisitor<'_>,
 ) {
+    let agent = current_agent();
     {
         let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
-        for resolution in pending.iter_mut() {
+        for resolution in pending.iter_mut().filter(|r| r.owner == agent) {
             visitor.visit_usize_slot(&mut resolution.promise_ptr);
             visitor.visit_nanbox_u64_slot(&mut resolution.result_bits);
         }
     }
     {
         let mut pending = PENDING_DEFERRED.lock().unwrap();
-        for resolution in pending.iter_mut() {
+        for resolution in pending.iter_mut().filter(|r| r.owner == agent) {
             visitor.visit_usize_slot(&mut resolution.promise_ptr);
         }
     }
@@ -265,6 +351,7 @@ pub fn queue_promise_resolution(promise_ptr: usize, is_success: bool, result_bit
     {
         let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
         pending.push(PendingResolution {
+            owner: resolution_owner(),
             promise_ptr,
             is_success,
             result_bits,
@@ -294,6 +381,7 @@ where
     {
         let mut pending = PENDING_DEFERRED.lock().unwrap();
         pending.push(DeferredResolution {
+            owner: resolution_owner(),
             promise_ptr,
             is_success,
             converter: Box::new(converter),
@@ -325,13 +413,8 @@ pub fn ensure_pump_registered() {
             fn js_stdlib_init_dispatch();
         }
         ensure_gc_scanner_registered();
-        // The tokio half (turnloop P8 lane L): a build that carries the
-        // runtime installs its wait-driver here, before any async work spawns,
-        // so the first `js_wait_for_event` after a spawn already drives it. A
-        // build without `async-runtime` installs nothing: the primary agent
-        // parks in its own turnloop loop, which `js_notify_main_thread` wakes.
-        #[cfg(feature = "async-runtime")]
-        super::tokio_bridge::install_wait_driver();
+        // No wait-driver is installed: the primary agent parks in its own
+        // turnloop loop, which `js_notify_main_thread` wakes.
         unsafe {
             js_register_stdlib_pump(js_stdlib_process_pending);
             js_register_stdlib_has_active(js_stdlib_has_active_handles);
@@ -356,13 +439,20 @@ pub fn ensure_pump_registered() {
 pub extern "C" fn js_stdlib_process_pending() -> i32 {
     let mut count = 0i32;
 
+    // Only this agent's entries (#11433): another agent's promise lives in
+    // another heap and must be settled — and its converter run — there.
+    let agent = current_agent();
+
     // Process simple resolutions first
     let simple_resolutions: Vec<PendingResolution> = {
         let mut pending = PENDING_RESOLUTIONS.lock().unwrap();
-        let n = pending.len();
-        count += n as i32;
-        PENDING_RESOLUTIONS_LEN.store(0, Ordering::Release);
-        pending.drain(..).collect()
+        let (mine, theirs): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|resolution| resolution.owner == agent);
+        *pending = theirs;
+        count += mine.len() as i32;
+        PENDING_RESOLUTIONS_LEN.store(pending.len(), Ordering::Release);
+        mine
     };
     for resolution in simple_resolutions {
         let scope = perry_runtime::gc::RuntimeHandleScope::new();
@@ -396,10 +486,13 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     // Process deferred resolutions - these run converter functions on the main thread
     let deferred_resolutions: Vec<DeferredResolution> = {
         let mut pending = PENDING_DEFERRED.lock().unwrap();
-        let n = pending.len();
-        count += n as i32;
-        PENDING_DEFERRED_LEN.store(0, Ordering::Release);
-        pending.drain(..).collect()
+        let (mine, theirs): (Vec<_>, Vec<_>) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|resolution| resolution.owner == agent);
+        *pending = theirs;
+        count += mine.len() as i32;
+        PENDING_DEFERRED_LEN.store(pending.len(), Ordering::Release);
+        mine
     };
 
     for resolution in deferred_resolutions {
@@ -434,23 +527,9 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
         }
     }
 
-    // Process pending WebSocket events (server/client listener callbacks).
-    // External WebSocket implementations register their own pump with runtime.
-    #[cfg(feature = "websocket")]
-    {
-        count += unsafe { crate::ws::js_ws_process_pending() };
-    }
-
-    // Process pending bundled raw TCP socket events (net.Socket).
-    // External net implementations register their own pump with runtime.
-    #[cfg(all(
-        feature = "bundled-net",
-        not(target_os = "ios"),
-        not(target_os = "android")
-    ))]
-    {
-        count += unsafe { crate::net::js_net_process_pending() };
-    }
+    // WebSocket and raw TCP socket events are pumped by perry-ext-ws /
+    // perry-ext-net, which register their own pumps with the runtime (the
+    // bundled copies that drained here were deleted in tokio lane L4).
 
     #[cfg(all(
         feature = "tls-runtime",
@@ -491,6 +570,24 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     count
 }
 
+/// Whether a queued resolution belongs to the calling agent. Asked only when
+/// the length mirrors are non-zero. Another agent's entry keeps THAT agent
+/// alive; counting it here would hold this one open (and spin its wait, since
+/// it can never drain the entry) until the owner gets round to it.
+fn has_own_pending_resolution() -> bool {
+    let agent = current_agent();
+    PENDING_RESOLUTIONS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|resolution| resolution.owner == agent)
+        || PENDING_DEFERRED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|resolution| resolution.owner == agent)
+}
+
 /// Returns 1 if the stdlib has active event sources that need the event
 /// loop to keep running (active WS servers, pending events, etc.).
 /// Registered with perry-runtime via js_register_stdlib_has_active()
@@ -505,8 +602,9 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
         return 1;
     }
     // Check for pending stdlib resolutions (turnloop P0: O(1) length mirrors).
-    if PENDING_RESOLUTIONS_LEN.load(Ordering::Acquire) != 0
-        || PENDING_DEFERRED_LEN.load(Ordering::Acquire) != 0
+    if (PENDING_RESOLUTIONS_LEN.load(Ordering::Acquire) != 0
+        || PENDING_DEFERRED_LEN.load(Ordering::Acquire) != 0)
+        && has_own_pending_resolution()
     {
         return 1;
     }
@@ -524,32 +622,9 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
     if crate::turnloop_smtp::has_pending() {
         return 1;
     }
-    // Check for active WebSocket servers/connections
-    #[cfg(feature = "websocket")]
-    {
-        // #854: removed an unused `js_ws_process_pending` extern decl here —
-        // this block only checks for active handles; the drain path with its
-        // own extra decl lives earlier in the pump.
-        // If there are pending WS events, keep running
-        // (we don't drain here — just check)
-        let has_ws = crate::ws::js_ws_has_active_handles();
-        if has_ws != 0 {
-            return 1;
-        }
-    }
-    // Check bundled raw TCP sockets. External net implementations register
-    // their own keepalive contributor with runtime and remain invisible here.
-    #[cfg(all(
-        feature = "bundled-net",
-        not(target_os = "ios"),
-        not(target_os = "android")
-    ))]
-    {
-        let has_net = crate::net::js_net_has_active_handles();
-        if has_net != 0 {
-            return 1;
-        }
-    }
+    // Active WebSocket / raw TCP handles keep the loop alive through the
+    // keepalive contributors perry-ext-ws / perry-ext-net register with the
+    // runtime (the bundled copies checked here were deleted in tokio lane L4).
     #[cfg(all(
         feature = "tls-runtime",
         not(target_os = "ios"),
@@ -604,8 +679,8 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
 /// turnloop P4: run `work` on turnloop's shared blocking pool and settle
 /// `promise_ptr` from its result, on the thread that owns the JS heap.
 ///
-/// This is `spawn_for_promise_deferred`'s contract with the tokio runtime
-/// taken out of the middle. The two halves are the same as before — owned Rust
+/// This is the retired tokio `spawn_for_promise_deferred`'s contract with the
+/// tokio runtime taken out of the middle. The two halves are the same as before — owned Rust
 /// data on the worker, JSValue construction on the main thread — but now the
 /// split is a trait bound rather than a convention: `work` is `Send` and
 /// returns `Result<T, String>`, and `converter` runs inside the completion
@@ -691,9 +766,36 @@ pub unsafe fn reject_promise_later(promise_ptr: *mut u8, message: String) {
     queue_rejection_string(ptr, message);
 }
 
+/// Serializes the unit tests that populate or drain `PENDING_RESOLUTIONS` /
+/// `PENDING_DEFERRED` (#11417). Both queues are process-global and every pump
+/// drains all of them, so a concurrent test's `clear_pending()` or pump takes
+/// entries another test just queued — the resolution then settles (or is
+/// scanned) on the wrong thread, or not at all.
+///
+/// The same holds for every OTHER queue [`js_stdlib_process_pending`] drains:
+/// a pump in one of these tests also consumes the process-global TLS event
+/// queue, so the TLS tests that snapshot that queue take this lock too
+/// (#11472 — a concurrent pump ate a `listening` event).
+#[cfg(test)]
+static PENDING_QUEUE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn pending_queue_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PENDING_QUEUE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Take the queues for this test and start it from empty.
+    fn own_pending_queues() -> std::sync::MutexGuard<'static, ()> {
+        let guard = pending_queue_test_lock();
+        clear_pending();
+        guard
+    }
 
     fn clear_pending() {
         let mut resolutions = PENDING_RESOLUTIONS.lock().unwrap();
@@ -707,7 +809,7 @@ mod tests {
 
     #[test]
     fn stdlib_pump_releases_the_native_async_token_of_a_deferred_resolution() {
-        clear_pending();
+        let _queues = own_pending_queues();
         // perry-ffi's `JsPromise::new()` mints the promise through this shim,
         // which registers a native async token keyed by the promise address.
         let promise = crate::perry_ffi_async::perry_ffi_promise_new();
@@ -732,7 +834,7 @@ mod tests {
     /// with the message as a JS string — instead of a spawned tokio task.
     #[test]
     fn reject_promise_later_rejects_with_the_message_on_the_next_pump() {
-        clear_pending();
+        let _queues = own_pending_queues();
         let promise = perry_runtime::js_promise_new_cross_thread();
         unsafe { reject_promise_later(promise as *mut u8, "Invalid password".to_string()) };
         assert_eq!(
@@ -750,14 +852,66 @@ mod tests {
         assert_eq!(text.as_deref(), Some("Invalid password"));
     }
 
+    /// #11433: a resolution queued by another agent (a Worker) is neither
+    /// settled, nor scanned, nor counted as keep-alive work by this agent's
+    /// pump, and is purged when its agent retires. The fake addresses are never
+    /// dereferenced — which is the point: before the owner tag, this pump would
+    /// have "settled" a promise living in the Worker's heap.
+    #[test]
+    fn a_pump_leaves_another_agents_resolutions_for_their_owner() {
+        let _queues = own_pending_queues();
+        let foreign = std::thread::spawn(perry_runtime::agent::enter_worker_agent)
+            .join()
+            .unwrap();
+        assert_ne!(foreign, current_agent());
+        let foreign_promise = 0x2345_5000usize;
+        let foreign_deferred = 0x2345_6000usize;
+        {
+            let _scope = ResolutionOwnerScope::enter(foreign);
+            queue_promise_resolution(foreign_promise, true, TAG_UNDEFINED_BITS);
+            queue_deferred_resolution(foreign_deferred, true, || {
+                panic!("another agent's converter must never run here")
+            });
+        }
+        assert_eq!(js_stdlib_process_pending_resolutions_only(), 0);
+        assert_eq!(PENDING_RESOLUTIONS.lock().unwrap().len(), 1);
+        assert_eq!(PENDING_DEFERRED.lock().unwrap().len(), 1);
+        assert!(!has_own_pending_resolution());
+
+        let mut emitted = Vec::new();
+        {
+            let mut mark = |value: f64| emitted.push(value.to_bits());
+            let mut visitor = perry_runtime::gc::RuntimeRootVisitor::for_copy(&mut mark);
+            scan_pending_native_async_resolution_roots_mut(&mut visitor);
+        }
+        assert!(
+            emitted.is_empty(),
+            "this agent's collector visited another heap's promise: {emitted:x?}"
+        );
+
+        purge_agent_resolutions(foreign);
+        assert!(PENDING_RESOLUTIONS.lock().unwrap().is_empty());
+        assert!(PENDING_DEFERRED.lock().unwrap().is_empty());
+        assert_eq!(PENDING_RESOLUTIONS_LEN.load(Ordering::Acquire), 0);
+        assert_eq!(PENDING_DEFERRED_LEN.load(Ordering::Acquire), 0);
+    }
+
+    const TAG_UNDEFINED_BITS: u64 = 0x7FFC_0000_0000_0001;
+
+    /// The resolution half of the pump, without the unrelated subsystems
+    /// (`worker_threads`, readline, …) whose own queues it also drains.
+    fn js_stdlib_process_pending_resolutions_only() -> i32 {
+        let before =
+            PENDING_RESOLUTIONS.lock().unwrap().len() + PENDING_DEFERRED.lock().unwrap().len();
+        js_stdlib_process_pending();
+        let after =
+            PENDING_RESOLUTIONS.lock().unwrap().len() + PENDING_DEFERRED.lock().unwrap().len();
+        (before - after) as i32
+    }
+
     #[test]
     fn stdlib_bridge_does_not_hard_reference_extension_pumps() {
-        // Both halves: the tokio one is its own file since lane L.
-        let source = [
-            include_str!("async_bridge.rs"),
-            include_str!("tokio_bridge.rs"),
-        ]
-        .concat();
+        let source = include_str!("async_bridge.rs");
         let extension_symbols = [
             "js_ws_process_pending",
             "js_ws_has_pending",
@@ -782,16 +936,18 @@ mod tests {
 
     #[test]
     fn async_bridge_pending_resolution_scanner_emits_promise_and_result_roots() {
-        clear_pending();
+        let _queues = own_pending_queues();
         let promise_ptr = 0x1234_5000usize;
         let deferred_promise_ptr = 0x1234_6000usize;
         let result_bits = 0x7FFD_0000_1234_7000u64;
         PENDING_RESOLUTIONS.lock().unwrap().push(PendingResolution {
+            owner: current_agent(),
             promise_ptr,
             is_success: true,
             result_bits,
         });
         PENDING_DEFERRED.lock().unwrap().push(DeferredResolution {
+            owner: current_agent(),
             promise_ptr: deferred_promise_ptr,
             is_success: true,
             converter: Box::new(|| 0),

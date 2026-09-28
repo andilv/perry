@@ -220,6 +220,7 @@ pub fn closure_mark_key_deleted(ptr: usize, key: &str) {
     if let Ok(mut map) = get_closure_deleted_keys().lock() {
         map.entry(ptr).or_default().insert(key.to_string());
     }
+    super::shape::note_function_own_state_changed(ptr);
 }
 
 /// True if `key` was previously `delete`d off the closure at `ptr`.
@@ -283,6 +284,7 @@ pub fn closure_set_static_prototype(closure_ptr: usize, proto_bits: u64) {
     if slot_addr != 0 {
         crate::gc::runtime_write_barrier_external_slot(closure_ptr, slot_addr, proto_bits);
     }
+    super::shape::note_function_own_state_changed(closure_ptr);
 }
 
 /// Look up the static prototype object bits recorded for a closure, if any.
@@ -433,6 +435,64 @@ pub(crate) fn prune_dead_closure_side_table_owners(is_dead_closure: &dyn Fn(usiz
     }
 }
 
+/// Thread-heap teardown (#11319): drop every entry of the PROCESS-GLOBAL
+/// closure side tables whose owner lies in one of `ranges` — the blocks an
+/// exiting thread's arena is about to free.
+///
+/// The tables outlive the thread that inserted an entry, but the young log
+/// that names the entry is thread-local and dies with it, and the owner's
+/// memory goes back to the allocator. [`prune_dead_closure_side_table_owners`]
+/// cannot reach these entries (a foreign address does not attribute), so
+/// without this they leak for the life of the process — and once another
+/// thread's arena reuses the address range, a stale entry reads as THAT
+/// thread's young owner: its minor's rule-2 re-derivation finds a relevant
+/// key its log never noted (the young_log.rs rule-1 abort), and a new closure
+/// allocated at the recycled address inherits the dead one's props.
+///
+/// Only the mutexed process-global tables are touched: this runs from a TLS
+/// destructor, where the thread-local tables (young log, box captures) may
+/// already be gone, and they die with the thread anyway.
+pub(crate) fn release_closure_side_table_owners_in_ranges(ranges: &[(usize, usize)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    // Arena blocks never overlap, so a start-sorted list answers membership
+    // with one binary search per owner.
+    let mut ranges = ranges.to_vec();
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+    let in_ranges = |owner: usize| {
+        let after = ranges.partition_point(|&(start, _)| start <= owner);
+        after > 0 && owner < ranges[after - 1].1
+    };
+    if let Ok(mut props) = get_closure_props().lock() {
+        props.retain(|owner, _| !in_ranges(*owner));
+    }
+    if let Ok(mut prototypes) = get_closure_prototypes().lock() {
+        prototypes.retain(|owner, _| !in_ranges(*owner));
+    }
+    if let Ok(mut deleted) = get_closure_deleted_keys().lock() {
+        deleted.retain(|owner, _| !in_ranges(*owner));
+    }
+    #[cfg(feature = "wasm-host")]
+    let removed = if let Ok(mut externals) = get_wasm_funcref_externals().lock() {
+        let mut removed = Vec::new();
+        externals.retain(|owner, handle| {
+            let keep = !in_ranges(*owner);
+            if !keep {
+                removed.push(*handle);
+            }
+            keep
+        });
+        removed
+    } else {
+        Vec::new()
+    };
+    #[cfg(feature = "wasm-host")]
+    for external in removed {
+        drop_wasm_funcref_external(external);
+    }
+}
+
 /// [`prune_dead_closure_side_table_owners`] for a MINOR: only a young owner
 /// can be dead, and a young owner is always in the young log (it was noted
 /// at insert and is re-logged by every minor-scoped walk while it stays
@@ -559,6 +619,26 @@ pub(crate) fn visit_closure_static_prototype_slot_mut(
     }
 }
 
+fn closure_side_table_owners() -> Vec<usize> {
+    let mut owners: Vec<usize> = Vec::new();
+    if let Ok(props) = get_closure_props().lock() {
+        owners.extend(props.keys().copied());
+    }
+    if let Ok(prototypes) = get_closure_prototypes().lock() {
+        owners.extend(prototypes.keys().copied());
+    }
+    if let Ok(deleted) = get_closure_deleted_keys().lock() {
+        owners.extend(deleted.keys().copied());
+    }
+    #[cfg(feature = "wasm-host")]
+    if let Ok(externals) = get_wasm_funcref_externals().lock() {
+        owners.extend(externals.keys().copied());
+    }
+    owners.sort_unstable();
+    owners.dedup();
+    owners
+}
+
 /// Mutable GC scanner for closure dynamic-property side-table metadata.
 ///
 /// The side table is keyed by closure address. The key itself is metadata
@@ -582,22 +662,7 @@ pub fn scan_closure_dynamic_props_roots_mut(visitor: &mut crate::gc::RuntimeRoot
         scan_closure_side_tables_young(visitor);
         return;
     }
-    let mut owners: Vec<usize> = Vec::new();
-    if let Ok(props) = get_closure_props().lock() {
-        owners.extend(props.keys().copied());
-    }
-    if let Ok(prototypes) = get_closure_prototypes().lock() {
-        owners.extend(prototypes.keys().copied());
-    }
-    if let Ok(deleted) = get_closure_deleted_keys().lock() {
-        owners.extend(deleted.keys().copied());
-    }
-    #[cfg(feature = "wasm-host")]
-    if let Ok(externals) = get_wasm_funcref_externals().lock() {
-        owners.extend(externals.keys().copied());
-    }
-    owners.sort_unstable();
-    owners.dedup();
+    let owners = closure_side_table_owners();
     let table_len = owners.len() as u64;
     // A full walk is authoritative: rebuild the log from what it finds.
     // Notes made by owner-move hooks while the walk runs land in the emptied
@@ -630,25 +695,11 @@ pub fn scan_closure_dynamic_props_roots_mut(visitor: &mut crate::gc::RuntimeRoot
 /// which is also what closes the pre-#9754 gap where an entry re-keyed
 /// mid-walk was skipped by the mark pass and only rewritten later.
 fn scan_closure_side_tables_young(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    let table_len = {
-        let props = get_closure_props().lock().map(|m| m.len()).unwrap_or(0);
-        let prototypes = get_closure_prototypes()
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let deleted = get_closure_deleted_keys()
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        #[cfg(feature = "wasm-host")]
-        let externals = get_wasm_funcref_externals()
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        #[cfg(not(feature = "wasm-host"))]
-        let externals = 0;
-        (props + prototypes + deleted + externals) as u64
-    };
+    // Count the same distinct owners as the full walk, not map memberships.
+    // Enumerating them is diagnostic work: ordinary minor collections must
+    // retain the young log's ability to skip the full owner population.
+    let table_len = (cfg!(test) || crate::gc::gc_diag_enabled())
+        .then(|| closure_side_table_owners().len() as u64);
     #[cfg(any(debug_assertions, test))]
     debug_assert_closure_young_log_complete();
     let mut logged = 0u64;
@@ -670,16 +721,18 @@ fn scan_closure_side_tables_young(visitor: &mut crate::gc::RuntimeRootVisitor<'_
     }
     let kept_len = kept.len() as u64;
     CLOSURE_YOUNG_OWNERS.with(|log| log.borrow_mut().extend(kept));
-    crate::gc::young_log::note_walk(
-        CLOSURE_YOUNG_LOG_NAME,
-        crate::gc::young_log::YoungLogWalk {
-            partial: true,
-            logged,
-            visited,
-            kept: kept_len,
-            table_len,
-        },
-    );
+    if let Some(table_len) = table_len {
+        crate::gc::young_log::note_walk(
+            CLOSURE_YOUNG_LOG_NAME,
+            crate::gc::young_log::YoungLogWalk {
+                partial: true,
+                logged,
+                visited,
+                kept: kept_len,
+                table_len,
+            },
+        );
+    }
 }
 
 /// Rule 2 of `gc/young_log.rs`: re-derive the relevant owners from the three
@@ -818,80 +871,62 @@ fn scan_closure_owner(
     (current_owner, relevant)
 }
 
-/// Check if a raw pointer points to a ClosureHeader by checking CLOSURE_MAGIC at offset 12.
-/// Safe to call with any non-null, sufficiently aligned pointer >= 0x10000.
+/// Is `ptr` a live function object (`GC_TYPE_CLOSURE` cell)? Safe for an
+/// ARBITRARY word: it proves ownership before trusting any header byte.
+///
+/// Two terms, cheapest and most selective first:
+///
+/// 1. the word at +4 is an exotic-band ShapeId. Every closure is born with one
+///    (`closure::shape`), and shape rule 3 keeps every non-object kind's +4
+///    below the ShapeId range, while an `ObjectHeader`'s +4 is an ordinary- or
+///    dictionary-band id — so arrays, strings, Maps, plain objects and class
+///    instances all fail here with one load, the job the old "CLOS" magic did;
+/// 2. ownership, then the authoritative kind byte: arena page membership
+///    (`classify_heap_generation`, the page-class table — the same proof the
+///    pre-shape predicate used) or, for a cell in no arena, an exact
+///    malloc-registry hit (`try_read_tracked_gc_header`); then the GcHeader
+///    type byte says CLOSURE and the cell is not an evacuated stub. The
+///    general tracked resolver's range search measured 17% of a `fn.length`
+///    read, which is why the arena case does not take it.
 pub fn is_closure_ptr(ptr: usize) -> bool {
-    // Reject the native / Web-Fetch small-handle band (see
-    // `value::addr_class` for the band map). Fetch handles, node:http
-    // handles, and revocable-proxy ids are NaN-boxed POINTER_TAG values
-    // holding a small registry id, not heap pointers — a real closure is
-    // always a heap allocation above the band. The old 0x10000 floor let a
-    // 0x40000 Headers handle through, so the `*(ptr + 12)` CLOSURE_MAGIC
-    // probe below dereferenced unmapped low memory and SIGSEGVd on Linux
-    // (macOS masked it via the much higher is_valid_obj_ptr heap floor).
+    // Reject the native / Web-Fetch small-handle band (see `value::addr_class`)
+    // and anything outside the platform heap range BEFORE the +4 load: fetch
+    // handles, proxy ids and mis-boxed words are not heap addresses.
     if crate::value::addr_class::is_handle_band(ptr) {
         return false;
     }
-    // #wall2: reject any address outside the platform heap range BEFORE the
-    // `*(ptr + 12)` magic probe. The handle-band check only covers the low
-    // small-id bands; a MIS-BOXED value like `0x4_0000_0000` (i32 4 << 32 — a
-    // Next.js route-module options object whose codegen boxing went wrong) is
-    // aligned and above the handle band, so it passed both guards and the magic
-    // read dereferenced unmapped memory → SIGSEGV (the Next.js startup crash
-    // after app-page-turbo loads). `is_valid_obj_ptr` is the real heap floor
-    // (macOS: 0x2000_0000_0000); a non-heap address is definitively not a
-    // closure, so return false instead of faulting.
     if !crate::value::addr_class::is_valid_obj_ptr(ptr as *const u8) {
         return false;
     }
     if !ptr.is_multiple_of(std::mem::align_of::<ClosureHeader>()) {
         return false;
     }
-    // Read the type tag BEFORE consulting the arena. The answer is the same
-    // conjunction either way — arena ownership AND the exact magic — but this
-    // is the selective, cheap term and it used to run last.
-    //
-    // Measured on `claude-code --help` (uretprobe + a tag read at the uprobe,
-    // 2,240,934 calls): the tag test partitions the calls 231,704 true /
-    // 2,009,230 false, which is bit for bit the partition the whole function
-    // produces. In that entire run it alone decided every answer, while
-    // `classify_heap_generation` and the GC-header read ran on 100% of calls to
-    // change none of them.
-    //
-    // The load is safe exactly where it is now, because the three checks above
-    // are the only guard it has ever had: the `Unknown` arm below performed
-    // this same read with nothing else in front of it, and `Unknown` means "in
-    // no arena this process knows about" — the LEAST known case, not the most.
-    // Arena ownership was never what made the load safe; it is what
-    // disambiguates a coincidental "CLOS", which is why it stays below.
-    let type_tag = unsafe { *((ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32) };
-    if type_tag != CLOSURE_MAGIC {
+    let shape = unsafe { *((ptr as *const u8).add(super::CLOSURE_SHAPE_OFFSET) as *const u32) };
+    if !crate::object::shapes::is_exotic_shape_id(shape) {
         return false;
     }
-    // Arena ownership gives us an authoritative discriminator. Do not let a
-    // coincidental CLOSURE_MAGIC in another managed cell's payload win: in
-    // particular, ErrorHeader has padding at the closure tag offset and an
-    // arena slot reused after a closure can retain "CLOS" in those bytes.
-    // Headerless/external allocations remain on the exact-magic fallback.
-    if !matches!(
+    let (obj_type, gc_flags) = if matches!(
         crate::arena::classify_heap_generation(ptr),
         crate::arena::HeapGeneration::Unknown
     ) {
+        let Some(header) = (unsafe { crate::value::addr_class::try_read_tracked_gc_header(ptr) })
+        else {
+            return false;
+        };
+        let header = unsafe { header.as_ref() };
+        (header.obj_type, header.gc_flags)
+    } else {
         let Some(header) = (unsafe { crate::value::addr_class::try_read_gc_header(ptr) }) else {
             return false;
         };
-        if header.obj_type != crate::gc::GC_TYPE_CLOSURE
-            || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-        {
-            return false;
-        }
-    }
-    true
+        (header.obj_type, header.gc_flags)
+    };
+    obj_type == crate::gc::GC_TYPE_CLOSURE && gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
 }
 
 /// C-ABI predicate: returns 1 when `value_bits` (a NaN-boxed JSValue passed as
 /// raw bits) is a closure/function — a `POINTER_TAG` value whose pointee
-/// carries `CLOSURE_MAGIC` — and 0 for objects, arrays, strings, numbers, and
+/// is a `GC_TYPE_CLOSURE` cell — and 0 for objects, arrays, strings, numbers, and
 /// everything else. Exposed for external wrapper crates that link the runtime
 /// only by C ABI (e.g. perry-ext-http's `parse_listen_args`, #2041),
 /// which need to tell a callback argument apart from an options-object
@@ -932,7 +967,13 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
         }
     }
 
-    if let Some(acc) = crate::object::get_accessor_descriptor(ptr, prop) {
+    // A closure on its base Function shape has no accessor and no deleted
+    // key: every funnel that installs either moves it to FunctionDictionary
+    // (`closure::shape`). So the shape answers those two side-table probes.
+    let on_base = unsafe { super::shape::closure_on_base_shape(ptr as *const ClosureHeader) };
+    if on_base {
+        // fall through to the data lookups below
+    } else if let Some(acc) = crate::object::get_accessor_descriptor(ptr, prop) {
         if acc.get == 0 {
             return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
@@ -965,7 +1006,7 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
         return unsafe { crate::closure::reify_function_method_value(receiver, method) };
     }
     // Function length is an own intrinsic property.
-    if prop == "length" && !closure_is_key_deleted(ptr, "length") {
+    if prop == "length" && (on_base || !closure_is_key_deleted(ptr, "length")) {
         let value = crate::value::js_nanbox_pointer(ptr as i64);
         if let Some(arity) = unsafe { crate::object::bound_native_callable_value_arity(value) } {
             return arity as f64;
@@ -984,7 +1025,7 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
     // already-bound target) gets it for free through this one seam. Once
     // cached, the `closure_props` lookup above intercepts before this runs
     // again.
-    if prop == "name" && !closure_is_key_deleted(ptr, "name") {
+    if prop == "name" && (on_base || !closure_is_key_deleted(ptr, "name")) {
         let func_ptr = unsafe { (*(ptr as *const ClosureHeader)).func_ptr };
         if func_ptr == crate::closure::BOUND_FUNCTION_FUNC_PTR {
             return unsafe { crate::closure::bound_function_lazy_name(ptr) };
@@ -1083,38 +1124,53 @@ pub fn closure_get_dynamic_prop(ptr: usize, prop: &str) -> f64 {
     // installed via `Object.defineProperty(Function.prototype, k, {...})`,
     // must be readable through any closure (`fn.property`, `boundFn.property`,
     // `Function.indicator`).
-    if let Some(proto_ptr) = function_prototype_fallback_target(ptr, prop) {
-        // A defineProperty accessor on Function.prototype
-        // (`{ get: () => 12 }`) is invoked with the reading
-        // closure as receiver.
-        if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
-            if acc.get != 0 {
-                let getter =
-                    (acc.get & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
-                if !getter.is_null() {
-                    let receiver = crate::value::js_nanbox_pointer(ptr as i64);
-                    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-                    let prev =
-                        this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
-                    let result = crate::closure::js_closure_call0(getter);
-                    crate::object::js_implicit_this_set(prev.get_nanbox_f64());
-                    return result;
-                }
+    let receiver = f64::from_bits(crate::value::js_nanbox_pointer(ptr as i64).to_bits());
+    function_prototype_inherited_get(ptr, prop, receiver)
+        .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+}
+
+/// `[[Get]]` of `prop` on the real `%Function.prototype%` object, for a
+/// function-object receiver whose own/static lookup already missed — a
+/// user method or expando (`Function.prototype.myHelper = fn`) or a
+/// `defineProperty` data/accessor property. An accessor's getter runs with
+/// `receiver` as `this`. `self_ptr` is the receiver's heap pointer, or 0 for
+/// a receiver with none (a ClassRef constructor, #11492), and only guards
+/// against Function.prototype reading itself. `None` means nothing is
+/// installed there, so the caller keeps its own miss result.
+pub(crate) fn function_prototype_inherited_get(
+    self_ptr: usize,
+    prop: &str,
+    receiver: f64,
+) -> Option<f64> {
+    let proto_ptr = function_prototype_fallback_target(self_ptr, prop)?;
+    // A defineProperty accessor on Function.prototype
+    // (`{ get: () => 12 }`) is invoked with the reading
+    // function as receiver.
+    if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
+        if acc.get != 0 {
+            let getter =
+                (acc.get & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
+            if !getter.is_null() {
+                let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+                let prev =
+                    this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
+                let result = crate::closure::js_closure_call0(getter);
+                crate::object::js_implicit_this_set(prev.get_nanbox_f64());
+                return Some(result);
             }
-            return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
-        {
-            let key_hdr = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
-            let v = crate::object::js_object_get_field_by_name(
-                proto_ptr as *const crate::object::ObjectHeader,
-                key_hdr as *const crate::StringHeader,
-            );
-            if !v.is_undefined() {
-                return f64::from_bits(v.bits());
-            }
-        }
+        return Some(f64::from_bits(crate::value::TAG_UNDEFINED));
     }
-    f64::from_bits(crate::value::TAG_UNDEFINED)
+    let key_hdr = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
+    let v = crate::object::js_object_get_field_by_name(
+        proto_ptr as *const crate::object::ObjectHeader,
+        key_hdr as *const crate::StringHeader,
+    );
+    if v.is_undefined() {
+        None
+    } else {
+        Some(f64::from_bits(v.bits()))
+    }
 }
 
 /// Resolve the real, mutable `%Function.prototype%` object pointer for a
@@ -1213,6 +1269,9 @@ pub(crate) fn closure_set_via_function_prototype_descriptor(
 
 /// Set a dynamic property on a closure.
 pub fn closure_set_dynamic_prop(ptr: usize, prop: &str, value: f64) {
+    if !super::shape::is_intrinsic_function_key(prop) {
+        super::shape::note_function_own_state_changed(ptr);
+    }
     note_young_closure_owner(ptr, value.to_bits());
     if let Ok(mut props) = get_closure_props().lock() {
         let closure_props = props.entry(ptr).or_default();
@@ -1242,6 +1301,7 @@ pub fn closure_get_own_dynamic_prop(ptr: usize, prop: &str) -> Option<f64> {
 /// Built-in synthesized slots (`name`/`length`/`prototype`) are handled by
 /// `closure_mark_key_deleted` instead, since they have no map entry to drop.
 pub fn closure_delete_own_dynamic_prop(ptr: usize, prop: &str) -> bool {
+    super::shape::note_function_own_state_changed(ptr);
     if let Ok(mut props) = get_closure_props().lock() {
         if let Some(closure_props) = props.get_mut(&ptr) {
             return closure_props.remove(prop).is_some();
@@ -1371,10 +1431,7 @@ pub extern "C" fn js_closure_unbind_this(val: f64) -> f64 {
         let new_closure = js_closure_alloc(func_ptr, raw_count);
         let source_bits = val_handle.get_nanbox_f64().to_bits();
         let source_ptr = (source_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-        let source_type_tag = std::ptr::read_volatile(
-            (source_ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32,
-        );
-        if source_type_tag != CLOSURE_MAGIC {
+        if !closure_kind_probe(source_ptr) {
             return val_handle.get_nanbox_f64();
         }
         let src_captures = closure_capture_slots_mut(source_ptr as *mut ClosureHeader);
@@ -1549,11 +1606,10 @@ mod tests_1802 {
         }
     }
 
-    /// A managed cell's GC kind must outrank bytes that merely look like a
-    /// closure tag. ErrorHeader's bytes 12..16 are padding on 64-bit targets;
-    /// reused arena storage can therefore retain CLOSURE_MAGIC there.
+    /// A managed cell's GC kind must outrank a +4 word that merely looks like
+    /// a Function ShapeId (forged into an ErrorHeader's `error_kind` here).
     #[test]
-    fn managed_error_with_closure_magic_in_padding_is_not_a_closure() {
+    fn managed_error_with_a_function_shape_word_is_not_a_closure() {
         unsafe {
             let message = crate::string::js_string_from_bytes(b"survives".as_ptr(), 8);
             let error = crate::error::js_error_new_with_message(message);
@@ -1561,12 +1617,15 @@ mod tests_1802 {
             // an ErrorHeader's padding on purpose, so the assertion below proves
             // the GC kind outranks look-alike bytes. No heap pointer is stored,
             // so there is nothing for a barrier to track.
-            std::ptr::write_unaligned(
-                (error as *mut u8).add(CLOSURE_TYPE_TAG_OFFSET) as *mut u32,
-                CLOSURE_MAGIC,
-            );
+            let word = (error as *mut u8).add(super::super::CLOSURE_SHAPE_OFFSET) as *mut u32;
+            let saved = word.read();
+            word.write(super::super::shape::function_base_shape(
+                super::super::shape::FunctionProtoKind::Function,
+            ));
 
             assert!(!is_closure_ptr(error as usize));
+            // GC_STORE_AUDIT(POINTER_FREE): restores the scalar error_kind word.
+            word.write(saved);
             assert_eq!((*error).message, message);
 
             let key = crate::string::js_string_from_bytes(b"message".as_ptr(), 7);
@@ -1652,10 +1711,7 @@ pub(crate) fn clone_closure_rebind_this(closure_bits: u64, recv_box: f64) -> u64
         let new_closure = js_closure_alloc(func_ptr, raw_count);
         let source_bits = closure_handle.get_nanbox_u64();
         let source_ptr = (source_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-        let source_type_tag = std::ptr::read_volatile(
-            (source_ptr as *const u8).add(CLOSURE_TYPE_TAG_OFFSET) as *const u32,
-        );
-        if source_type_tag != CLOSURE_MAGIC {
+        if !closure_kind_probe(source_ptr) {
             return source_bits;
         }
         let src_captures = closure_capture_slots_mut(source_ptr as *mut ClosureHeader);

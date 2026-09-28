@@ -366,6 +366,23 @@ pub(crate) unsafe fn chain_store_proven(
         && entry.vtable_gen == crate::object::class_registry::vtable_generation()
 }
 
+/// The one word a key-add memo's chain verdict is keyed on: `proto_validity`.
+/// It moves when a MARKED prototype object changes structurally or gains a
+/// descriptor, and when an instance accessor is registered for a class a
+/// verdict walked (`mark_verdict_class_chain`). The memo
+/// (`proxy::put_value::packed_add`) records it; its emitted hit reloads it
+/// from `PERRY_PROTO_VALIDITY`.
+#[inline]
+pub(crate) fn verdict_generation() -> u64 {
+    crate::object::proto_validity::proto_validity()
+}
+
+/// Mark `class_id`'s class chain as walked by a verdict, before the verdict's
+/// generation is read (see `class_registry::mark_class_chain_for_verdicts`).
+pub(crate) fn mark_verdict_class_chain(class_id: u32) {
+    crate::object::class_registry::verdict_classes::mark_class_chain_for_verdicts(class_id);
+}
+
 /// Count a store the lane served.
 #[inline]
 pub(crate) fn note_chain_store_hit() {
@@ -664,7 +681,7 @@ pub(crate) unsafe fn chain_store_after_miss(
 ///
 /// # Safety
 /// `receiver` is a live ordinary object the caller holds rooted.
-unsafe fn mark_chain_hops(scope: &crate::gc::RuntimeHandleScope, receiver: f64) -> bool {
+pub(crate) unsafe fn mark_chain_hops(scope: &crate::gc::RuntimeHandleScope, receiver: f64) -> bool {
     let mut hop = scope.root_nanbox_f64(crate::object::js_object_get_prototype_of(receiver));
     for _ in 0..64 {
         let bits = hop.get_nanbox_f64().to_bits();

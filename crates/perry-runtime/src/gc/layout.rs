@@ -648,6 +648,27 @@ pub(crate) unsafe fn layout_finish_deferred_boxed_object(user_ptr: usize, saw_po
     layout_mark_unknown(user_ptr as *mut u8);
 }
 
+/// Settle a FRESH closure/object whose every payload slot is a word the
+/// tag-checked scan understands (NaN-boxed values, raw heap pointers, 0) into
+/// `GC_LAYOUT_UNKNOWN` — the #7630 state for a payload a pointer mask cannot
+/// improve on. The caller has written the slots directly and owns the
+/// barrier (`runtime_write_barrier_newborn_slots`). Unlike
+/// [`layout_mark_unknown`] this touches no side table: a fresh birth whose
+/// state is still `GC_LAYOUT_POINTER_FREE` has no mask, no typed descriptor
+/// and no representation feedback to retire.
+pub(crate) unsafe fn layout_init_unknown_fresh(user_ptr: *mut u8) {
+    let Some(header) = layout_header_for_user(user_ptr as usize) else {
+        return;
+    };
+    debug_assert_eq!(
+        (*header)._reserved & GC_LAYOUT_STATE_MASK,
+        GC_LAYOUT_POINTER_FREE,
+        "layout_init_unknown_fresh is for a fresh pointer-free birth only"
+    );
+    header_clear_typed_layout_intact(header);
+    set_layout_state(header, GC_LAYOUT_UNKNOWN);
+}
+
 pub(crate) unsafe fn layout_mark_unknown(user_ptr: *mut u8) {
     let Some(header) = layout_header_for_user(user_ptr as usize) else {
         return;
@@ -1848,8 +1869,8 @@ pub(super) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSlotItera
             // DIVERGENT AND UNREACHABLE (#10868 step 2.5 stage 1): the
             // authoritative meta enumerator is layout_slot_visit ObjectMeta
             // rewrite arm, which does not delegate here. This iterator has
-            // four edge sources and the record has six pointer words, so
-            // expando and dictionary_keys are absent below.
+            // four edge sources and the record has seven pointer words, so
+            // expando, dictionary_keys and arguments are absent below.
             // Prototype and the private-evaluation brand are explicit prefix
             // edges. Keep the brand out of the payload selection: its class
             // object can be reachable only through this metadata record, so

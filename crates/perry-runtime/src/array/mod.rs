@@ -2,6 +2,9 @@
 mod alloc;
 mod buffer_receiver;
 mod concat_reverse;
+/// #10593: a retargeted array's prototype is a per-array fact.
+#[cfg(test)]
+mod custom_proto_scope_tests;
 mod element_shape;
 mod fill_extend;
 mod flat_clone;
@@ -86,8 +89,8 @@ mod tests;
 mod typed_array_receiver_tests;
 
 pub(crate) use self::alloc::{
-    array_length_range_error, js_array_alloc_key_list, js_array_alloc_pointer_elements,
-    js_array_alloc_with_length_exact,
+    array_length_range_error, js_array_alloc_key_list, js_array_alloc_key_list_reserved,
+    js_array_alloc_pointer_elements, js_array_alloc_with_length_exact,
 };
 pub use self::alloc::{
     js_array_alloc, js_array_alloc_literal, js_array_alloc_with_length,
@@ -114,9 +117,9 @@ pub(crate) use self::element_shape::{
     test_element_shape_record_exists, test_seed_element_shape_record, test_serialize,
 };
 pub use self::flat_clone::{
-    js_array_clone, js_array_clone_for_spread, js_array_entries, js_array_flat,
-    js_array_flat_depth, js_array_keys, js_array_values, js_arraylike_flat,
-    js_short_packed_spread_values,
+    js_array_clone, js_array_clone_for_spread, js_array_destructure_needs_iterator,
+    js_array_entries, js_array_flat, js_array_flat_depth, js_array_keys, js_array_values,
+    js_arraylike_flat, js_short_packed_spread_values,
 };
 pub use self::from_concat::{
     array_from_full, array_of_full, js_array_concat_variadic, js_array_from_mapped,
@@ -164,8 +167,8 @@ pub use self::immutable::{
 };
 pub(crate) use self::indexing::{
     array_custom_prototype, array_has_own_index, array_iteration_is_exotic,
-    array_iteration_is_exotic_cleaned, array_iteration_is_exotic_resolved,
-    array_prototype_has_index_flag, array_spec_get, array_spec_has_index, array_spec_set,
+    array_iteration_is_exotic_cleaned, array_iteration_is_exotic_resolved, array_spec_get,
+    array_spec_has_index, array_spec_set,
 };
 pub use self::indexing::{
     js_array_get_element, js_array_get_element_f64, js_array_get_f64, js_array_get_f64_unchecked,
@@ -180,9 +183,9 @@ pub(crate) use self::indexing::{
 #[cfg(test)]
 pub(crate) use self::indexing_support::test_keys_array_slot_fallbacks;
 pub(crate) use self::indexing_support::{
-    array_iteration_not_pristine, array_proto_iterator_modified, invalidate_array_index_fast_path,
-    keys_array_len_capped_to_capacity, keys_array_slot, note_array_index_write,
-    note_array_iteration_not_pristine, note_array_proto_iterator_write,
+    array_index_fast_path_invalid_for, array_iteration_not_pristine, array_proto_iterator_modified,
+    invalidate_array_index_fast_path, keys_array_len_capped_to_capacity, keys_array_slot,
+    note_array_index_write, note_array_iteration_not_pristine, note_array_proto_iterator_write,
     note_object_prototype_index_write, object_prototype_has_index_flag,
     PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED,
 };
@@ -218,7 +221,8 @@ pub use self::numeric_range::{
 };
 pub use self::prototype_addr::scan_prototype_addr_cache_roots_mut;
 pub(crate) use self::prototype_addr::{
-    array_prototype_addr, object_prototype_addr, object_prototype_addr_matches,
+    array_prototype_addr, function_prototype_addr, object_prototype_addr,
+    object_prototype_addr_matches, prime_prototype_addr_cache,
 };
 #[cfg(test)]
 pub(crate) use self::prototype_addr::{
@@ -304,9 +308,10 @@ pub(crate) use self::named_props::{
     array_has_named_properties_resolved, array_has_sparse_index_properties_resolved,
     array_named_property_delete, array_named_property_delete_by_name, array_named_property_get,
     array_named_property_get_by_name, array_named_property_has, array_named_property_names,
-    array_named_property_set, array_named_props_reserve, carry_named_props_reserve,
-    prune_dead_full_array_named_property_owners, transfer_full_array_named_props_owner,
-    visit_array_named_props_slots,
+    array_named_property_set, array_named_props_reserve, array_named_props_slot,
+    carry_named_props_reserve, ensure_named_props_slot,
+    prune_dead_full_array_named_property_owners, store_named_props_word,
+    transfer_full_array_named_props_owner, visit_array_named_props_slots,
 };
 
 // Sole caller is the regex-engine-gated `regex::perex_results`, so the helpers

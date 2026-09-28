@@ -114,7 +114,7 @@ pub(super) fn emit_string_pool(
     // `perry_plugin_unload` will `dlclose`. See `runtime_decls`.
     output_type: &str,
     class_keys_init_data: &[(String, String, u32, Vec<u64>, Vec<u64>)],
-    class_header_image_inits: &std::collections::HashMap<String, (u32, u64)>,
+    class_header_image_inits: &std::collections::HashMap<String, (u32, u64, u32)>,
     class_ids: &HashMap<String, u32>,
     classes: &HashMap<String, &perry_hir::Class>,
     // Imported class stubs: their ShapeId slots are registered so they follow
@@ -486,6 +486,11 @@ pub(super) fn emit_string_pool(
     } else {
         "js_register_function_source"
     };
+    let register_class_source_fn = if strings_outlive_registry {
+        "js_register_class_source_static"
+    } else {
+        "js_register_class_source"
+    };
 
     // Register display names for top-level user functions so
     // `console.log(myFn)` prints `[Function: myFn]` instead of
@@ -531,6 +536,75 @@ pub(super) fn emit_string_pool(
                 (I32, if *is_non_strict_ordinary { "1" } else { "0" }),
             ],
         );
+    }
+
+    // #11420: every input to a class's birth [[Prototype]] identity
+    // (`shapes::class_proto_id`: the anon-shape set and the generic-origin
+    // edge) must be registered BEFORE the keys loop below mints the class's
+    // ShapeId. The mint records `class_proto_id(cid)` in the descriptor, and
+    // `try_birth_stamp_preinstalled_shape` compares it with
+    // `object_proto_id(obj)` at every allocation. Registered after the mint,
+    // the two disagreed for EVERY object literal: each allocation declined
+    // the module-init ShapeId and was stamped with a second, freshly minted
+    // one, so every guarded class-field read of a literal (a literal method's
+    // `this.a`, `it.n` on a returned `{ n, warm }`) missed its shape check
+    // and fell to the by-name lookup, ~900 instructions per read.
+    // #7575: register the GENERIC class a monomorphized specialization came
+    // from. `class Gen<T> {}` + `new Gen<number>()` emits a second class
+    // `Gen$num` carrying its own class id, and the instance is stamped with
+    // that id — but `x instanceof Gen` resolves the RHS to the GENERIC's id,
+    // which is in no parent chain, so the walk answered `false` for the class
+    // the user wrote. This is a distinct edge from the parent one on purpose:
+    // `CLASS_REGISTRY`'s chain also resolves `super()`, static-method lookup
+    // and vtable dispatch, so it must keep pointing at the real base.
+    let mut origin_pairs: Vec<(u32, u32)> = Vec::new();
+    for (name, &cid) in class_ids.iter() {
+        let Some(class) = classes.get(name) else {
+            continue;
+        };
+        let Some(generic_name) = &class.specialized_from else {
+            continue;
+        };
+        if let Some(&generic_cid) = class_ids.get(generic_name) {
+            if generic_cid != 0 && generic_cid != cid {
+                origin_pairs.push((cid, generic_cid));
+            }
+        }
+    }
+    origin_pairs.sort_unstable();
+    for (cid, generic_cid) in origin_pairs {
+        chunker.roll_if_full();
+        let blk = chunker.current_block();
+        blk.call_void(
+            "js_register_class_generic_origin",
+            &[(I32, &cid.to_string()), (I32, &generic_cid.to_string())],
+        );
+    }
+
+    // Mark each `__AnonShape_<hash>` class id. `({ x: 1 }).constructor ===
+    // Object` duck-checks (date-fns / drizzle / lodash) resolve through it,
+    // and it is what makes `class_proto_id` answer the ordinary object
+    // prototype an anon shape's instances are born with.
+    {
+        let mut anon_shape_ids: Vec<u32> = Vec::new();
+        for (class_name, class) in classes.iter() {
+            if *class_name != class.name || !class_name.starts_with("__AnonShape_") {
+                continue;
+            }
+            if let Some(cid) = class_ids.get(class_name).copied().filter(|&c| c != 0) {
+                anon_shape_ids.push(cid);
+            }
+        }
+        anon_shape_ids.sort_unstable();
+        anon_shape_ids.dedup();
+        for cid in anon_shape_ids {
+            chunker.roll_if_full();
+            let blk = chunker.current_block();
+            blk.call_void(
+                "js_register_anon_shape_class_id",
+                &[(crate::types::I32, &cid.to_string())],
+            );
+        }
     }
 
     // Build per-class keys arrays via js_build_class_keys_array,
@@ -612,7 +686,7 @@ pub(super) fn emit_string_pool(
         let typed_side_mask =
             class_header_image_inits
                 .get(global_name)
-                .is_some_and(|&(_, packed)| {
+                .is_some_and(|&(_, packed, _)| {
                     ((packed >> 16) & GC_LAYOUT_AND_INTACT_MASK) == GC_SIDE_MASK_AND_INTACT
                 });
         let shape_id = if typed_side_mask {
@@ -644,11 +718,26 @@ pub(super) fn emit_string_pool(
         } else {
             // The class id rides along: a birth shape names the prototype
             // its class implies ([[Prototype]] is a shape fact).
-            blk.call(
-                I32,
-                "js_object_shape_id_for_class_keys",
-                &[(I64, &arr), (I32, &fc_str), (I32, &cid_str)],
-            )
+            // A class born WIDE (constructor key-add slack) gets a birth
+            // shape whose live bound is the widened slot count its header
+            // image allocates (`codegen/mod.rs`, `birth_live`).
+            match class_header_image_inits.get(global_name) {
+                Some(&(_, _, birth_live)) if birth_live > *field_count => blk.call(
+                    I32,
+                    "js_object_shape_id_for_class_keys_live",
+                    &[
+                        (I64, &arr),
+                        (I32, &fc_str),
+                        (I32, &birth_live.to_string()),
+                        (I32, &cid_str),
+                    ],
+                ),
+                _ => blk.call(
+                    I32,
+                    "js_object_shape_id_for_class_keys",
+                    &[(I64, &arr), (I32, &fc_str), (I32, &cid_str)],
+                ),
+            }
         };
         let shape_global = format!(
             "@{}",
@@ -664,7 +753,7 @@ pub(super) fn emit_string_pool(
         // allocator). The packed word came from
         // `target_layout::inline_alloc_gc_packed`, the same derivation the
         // site performs and cross-checks before it trusts this global.
-        if let Some(&(image_class_id, gc_packed)) = class_header_image_inits.get(global_name) {
+        if let Some(&(image_class_id, gc_packed, _)) = class_header_image_inits.get(global_name) {
             let image_global = format!(
                 "@{}",
                 crate::typed_shape::header_image_global_name_from_keys_global(global_name)
@@ -752,38 +841,6 @@ pub(super) fn emit_string_pool(
         blk.call_void(
             "js_register_class_parent",
             &[(I32, &cid.to_string()), (I32, &parent_cid.to_string())],
-        );
-    }
-
-    // #7575: register the GENERIC class a monomorphized specialization came
-    // from. `class Gen<T> {}` + `new Gen<number>()` emits a second class
-    // `Gen$num` carrying its own class id, and the instance is stamped with
-    // that id — but `x instanceof Gen` resolves the RHS to the GENERIC's id,
-    // which is in no parent chain, so the walk answered `false` for the class
-    // the user wrote. This is a distinct edge from the parent one on purpose:
-    // `CLASS_REGISTRY`'s chain also resolves `super()`, static-method lookup
-    // and vtable dispatch, so it must keep pointing at the real base.
-    let mut origin_pairs: Vec<(u32, u32)> = Vec::new();
-    for (name, &cid) in class_ids.iter() {
-        let Some(class) = classes.get(name) else {
-            continue;
-        };
-        let Some(generic_name) = &class.specialized_from else {
-            continue;
-        };
-        if let Some(&generic_cid) = class_ids.get(generic_name) {
-            if generic_cid != 0 && generic_cid != cid {
-                origin_pairs.push((cid, generic_cid));
-            }
-        }
-    }
-    origin_pairs.sort_unstable();
-    for (cid, generic_cid) in origin_pairs {
-        chunker.roll_if_full();
-        let blk = chunker.current_block();
-        blk.call_void(
-            "js_register_class_generic_origin",
-            &[(I32, &cid.to_string()), (I32, &generic_cid.to_string())],
         );
     }
 
@@ -1191,7 +1248,6 @@ pub(super) fn emit_string_pool(
     // and similar method-less marker classes hit this.
     {
         let mut all_class_ids: Vec<u32> = Vec::new();
-        let mut anon_shape_ids: Vec<u32> = Vec::new();
         // Also collect `(cid, name)` pairs so we can mirror Perry's
         // user-visible class name into the runtime — V8 reads it back as
         // `metatype.name` (#1021 NestJS module token factory).
@@ -1212,9 +1268,9 @@ pub(super) fn emit_string_pool(
             // `js_object_get_field_by_name` resolves `.constructor` to
             // the global `Object` constructor instead of the synthetic
             // class ref.
-            if class_name.starts_with("__AnonShape_") {
-                anon_shape_ids.push(cid);
-            } else {
+            // Anon-shape ids are registered BEFORE the class ShapeIds are
+            // minted (#11420, above the keys loop), not here.
+            if !class_name.starts_with("__AnonShape_") {
                 named_classes.push((cid, class_name.clone()));
             }
         }
@@ -1225,16 +1281,6 @@ pub(super) fn emit_string_pool(
             let blk = chunker.current_block();
             blk.call_void(
                 "js_register_class_id",
-                &[(crate::types::I32, &cid.to_string())],
-            );
-        }
-        anon_shape_ids.sort_unstable();
-        anon_shape_ids.dedup();
-        for cid in anon_shape_ids {
-            chunker.roll_if_full();
-            let blk = chunker.current_block();
-            blk.call_void(
-                "js_register_anon_shape_class_id",
                 &[(crate::types::I32, &cid.to_string())],
             );
         }
@@ -1261,14 +1307,15 @@ pub(super) fn emit_string_pool(
     }
     // #9413: mirror each class's retained source text into the runtime so
     // `Function.prototype.toString` on a class REF (an INT32 immediate, not a
-    // ClosureHeader) answers with the class source. Same shape as the
-    // `js_register_function_source_static` loop above.
+    // ClosureHeader) answers with the class source. Same shape, and the same
+    // output-kind spelling choice, as the function-source loop above (#11501:
+    // an executable lends its rodata instead of copying every class body).
     for (cid, source) in &class_source_constants {
         chunker.roll_if_full();
         let blk = chunker.current_block();
         let const_ref = source.pointer(blk);
         blk.call_void(
-            "js_register_class_source",
+            register_class_source_fn,
             &[
                 (crate::types::I32, &cid.to_string()),
                 (crate::types::PTR, &const_ref),

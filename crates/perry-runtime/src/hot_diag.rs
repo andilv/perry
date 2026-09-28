@@ -13,6 +13,18 @@
 //! replaces the previous one (write to `<path>.tmp`, then rename). Both
 //! instruments are diagnostic only: nothing may branch on them for behaviour,
 //! and when the variable is unset every probe is one relaxed atomic load.
+//!
+//! Every instrument here is compiled in only with the `hot-diag` cargo feature
+//! (#10572). Without it each `*_on()` is a constant `false`, so the probes,
+//! tables and renderers behind them are not linked, and `gc_init` aborts at
+//! startup if one of [`HOT_DIAG_KNOBS`] is set — an instrument that silently
+//! wrote nothing would read as "never happened". The auto-optimize rebuild adds
+//! the feature when one of the knobs (or `PERRY_GC_INSTRUMENTS=1`) is set while
+//! compiling.
+
+// Without `hot-diag` the probes below have no armed caller. `allow` rather
+// than a cascade of cfgs keeps them compiled, so they cannot rot unbuilt.
+#![cfg_attr(not(feature = "hot-diag"), allow(dead_code, unused_imports))]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -35,6 +47,47 @@ pub(crate) fn sink_from_env(name: &str) -> Option<Sink> {
         "1" | "stderr" | "on" | "true" | "yes" => Some(Sink::Stderr),
         path => Some(Sink::File(path.to_string())),
     }
+}
+
+/// Run-time knobs served by the `hot-diag` cargo feature. Must match
+/// `HOT_DIAG_KNOBS` in the compiler's `optimized_libs/freshness.rs` (pinned by
+/// `hot_diag_knobs_match_the_runtime`).
+// Read only by the feature-off startup check below.
+#[cfg_attr(feature = "hot-diag", allow(dead_code))]
+pub(crate) const HOT_DIAG_KNOBS: &[&str] = &[
+    "PERRY_REGEX_DIAG",
+    "PERRY_IC_DIAG",
+    "PERRY_LAYOUT_DIAG",
+    "PERRY_ENUM_DIAG",
+    "PERRY_BUFFER_DIAG",
+    "PERRY_RECEIVER_REPR_DIAG",
+];
+
+/// Startup check for binaries built without the instruments: a knob that
+/// would arm one (same spelling rules as [`sink_from_env`]) aborts.
+#[cfg(not(feature = "hot-diag"))]
+pub(crate) fn refuse_knobs_without_hot_diag() {
+    if let Some(knob) = HOT_DIAG_KNOBS
+        .iter()
+        .copied()
+        .find(|knob| sink_from_env(knob).is_some())
+    {
+        hot_diag_unavailable(knob);
+    }
+}
+
+#[cfg(not(feature = "hot-diag"))]
+#[cold]
+#[inline(never)]
+fn hot_diag_unavailable(knob: &str) -> ! {
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "perry: {knob} is set, but this binary was built without the hot-path \
+         diagnostics (cargo feature `hot-diag`). Recompile with {knob} set while \
+         compiling (or with PERRY_GC_INSTRUMENTS=1) so the instrument is linked in."
+    );
+    std::process::abort()
 }
 
 /// A failed file write used to be swallowed (`if ... .is_ok()`), so an
@@ -94,10 +147,15 @@ fn regex_sink() -> &'static Option<Sink> {
 /// Is the regex instrument armed? One relaxed load once initialised.
 #[inline]
 pub fn regex_on() -> bool {
-    if REGEX_SINK.get().is_none() {
-        regex_sink();
+    #[cfg(not(feature = "hot-diag"))]
+    return false;
+    #[cfg(feature = "hot-diag")]
+    {
+        if REGEX_SINK.get().is_none() {
+            regex_sink();
+        }
+        REGEX_ON.load(Ordering::Relaxed)
     }
-    REGEX_ON.load(Ordering::Relaxed)
 }
 
 #[derive(Default)]
@@ -194,18 +252,17 @@ pub struct RegexDiag {
     pub new_site_verify_bytes: u64,
     /// Address-keyed side-table inserts performed per construction. This was
     /// two (`REGEX_POINTERS` plus the source table) before the header's string
-    /// slots became traced edges; only `REGEX_POINTERS` remains.
+    /// slots became traced edges, then one (`REGEX_SOURCE_TABLE`), and is zero
+    /// since #11503 made RegExp identity the header's own GC kind and magic.
     pub new_side_table_inserts: u64,
-    /// Split of the above by table. The source counters are retained as zeroed
-    /// before/after controls for the #9908 measurement; `REGEX_POINTERS` is
-    /// still the registry the copied-minor finaliser enumerates.
+    /// Split of the above by table, plus the death and evacuation sides. All
+    /// are retained as zeroed after-controls for the #9908 measurement: no
+    /// RegExp construction, death or move touches an address-keyed owner
+    /// table any more.
     pub pointer_table_inserts: u64,
     pub source_table_inserts: u64,
-    /// The death side. `source_table_removals` is the zeroed after-control;
-    /// `regex_header_clear_dead_for_gc` now removes only `REGEX_POINTERS`.
     pub pointer_table_removals: u64,
     pub source_table_removals: u64,
-    /// Evacuation rekeys of the remaining pointer registry.
     pub side_table_rekeys: u64,
     /// Constructions answered from the LITERAL-SITE table — identity by the
     /// compiler-emitted site global's address, so neither the pattern's
@@ -509,10 +566,15 @@ pub fn layout_on() -> bool {
     if let Some(armed) = LAYOUT_TEST_ARMED.with(std::cell::Cell::get) {
         return armed;
     }
-    if LAYOUT_SINK.get().is_none() {
-        layout_sink();
+    #[cfg(not(feature = "hot-diag"))]
+    return false;
+    #[cfg(feature = "hot-diag")]
+    {
+        if LAYOUT_SINK.get().is_none() {
+            layout_sink();
+        }
+        LAYOUT_ON.load(Ordering::Relaxed)
     }
-    LAYOUT_ON.load(Ordering::Relaxed)
 }
 
 /// Which of the three dynamically learned mask paths inserted a new key.
@@ -764,10 +826,15 @@ impl Drop for LayoutDiagTestGuard {
 /// Is the IC-miss instrument armed? One relaxed load once initialised.
 #[inline]
 pub fn ic_on() -> bool {
-    if IC_SINK.get().is_none() {
-        ic_sink();
+    #[cfg(not(feature = "hot-diag"))]
+    return false;
+    #[cfg(feature = "hot-diag")]
+    {
+        if IC_SINK.get().is_none() {
+            ic_sink();
+        }
+        IC_ON.load(Ordering::Relaxed)
     }
-    IC_ON.load(Ordering::Relaxed)
 }
 
 /// Why `js_object_get_field_ic_miss` answered the way it did. The order is
@@ -1182,10 +1249,15 @@ fn enum_sink() -> &'static Option<Sink> {
 /// Is the enumeration/concat execution counter armed?
 #[inline]
 pub fn enum_on() -> bool {
-    if ENUM_SINK.get().is_none() {
-        enum_sink();
+    #[cfg(not(feature = "hot-diag"))]
+    return false;
+    #[cfg(feature = "hot-diag")]
+    {
+        if ENUM_SINK.get().is_none() {
+            enum_sink();
+        }
+        ENUM_ON.load(Ordering::Relaxed)
     }
-    ENUM_ON.load(Ordering::Relaxed)
 }
 
 /// What actually runs at the two allocation sites the byte-share ranking put
@@ -1349,10 +1421,15 @@ fn buffer_sink() -> &'static Option<Sink> {
 /// Is the buffer-probe instrument armed? One relaxed load once initialised.
 #[inline]
 pub fn buffer_on() -> bool {
-    if BUFFER_SINK.get().is_none() {
-        buffer_sink();
+    #[cfg(not(feature = "hot-diag"))]
+    return false;
+    #[cfg(feature = "hot-diag")]
+    {
+        if BUFFER_SINK.get().is_none() {
+            buffer_sink();
+        }
+        BUFFER_ON.load(Ordering::Relaxed)
     }
-    BUFFER_ON.load(Ordering::Relaxed)
 }
 
 // Plain relaxed atomics rather than the thread-local `RefCell` the other
@@ -1476,7 +1553,7 @@ fn buffer_dump() {
 
 /// Receiver-route admission census names, indexed by the route number the
 /// emitted call passes. **Must match `receiver_range::Route` in perry-codegen.**
-const RECV_ROUTE_NAMES: [&str; 8] = [
+const RECV_ROUTE_NAMES: [&str; 11] = [
     "generic",
     "generic_mru_hit",
     "generic_way_hit",
@@ -1485,11 +1562,39 @@ const RECV_ROUTE_NAMES: [&str; 8] = [
     "class_write",
     "in_presence",
     "cached_field_index",
+    "generic_spill_hit",
+    // Counted by the RUNTIME (`recv_route_note_runtime`), not emitted code:
+    // a spill-located read a latched megamorphic site's slow entry answered
+    // from the receiver's shape (S5).
+    "rt_mega_spill_answer",
+    // Also runtime-counted: a read of an own SPILL-located key that reached
+    // the miss handler's key scan (primed or not) — the spill reads the
+    // inline routes did not serve.
+    "rt_spill_miss",
 ];
 
-static RECV_ROUTES: [std::sync::atomic::AtomicU64; 8] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// The runtime-counted routes: see [`RECV_ROUTE_NAMES`].
+pub(crate) const RT_ROUTE_MEGA_SPILL: u32 = 9;
+pub(crate) const RT_ROUTE_SPILL_MISS: u32 = 10;
+
+static RECV_ROUTES: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 static RECV_ROUTES_REPORT: std::sync::Once = std::sync::Once::new();
+/// Set by the first emitted `js_recv_route_note`, i.e. only in a binary
+/// compiled with `PERRY_RECV_ROUTE_COUNT=1`; the runtime-counted routes are a
+/// relaxed load and a not-taken branch everywhere else.
+static RECV_ROUTES_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Count a runtime-side route in a census build (see
+/// [`RECV_ROUTES_ARMED`]); nothing otherwise.
+#[inline]
+pub(crate) fn recv_route_note_runtime(route: u32) {
+    if RECV_ROUTES_ARMED.load(Ordering::Relaxed) {
+        if let Some(counter) = RECV_ROUTES.get(route as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// Receiver-route admission census (S4 of the parity read plan): one call per
 /// execution of an inline property route that passed its receiver test.
@@ -1500,6 +1605,7 @@ static RECV_ROUTES_REPORT: std::sync::Once = std::sync::Once::new();
 #[no_mangle]
 pub extern "C" fn js_recv_route_note(route: u32) {
     RECV_ROUTES_REPORT.call_once(|| unsafe {
+        RECV_ROUTES_ARMED.store(true, Ordering::Relaxed);
         libc::atexit(recv_route_report);
     });
     if let Some(counter) = RECV_ROUTES.get(route as usize) {

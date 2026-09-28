@@ -33,14 +33,9 @@ pub(crate) fn register_class(class_id: u32, parent_class_id: u32) {
     // Parent linking changes what a class chain can intercept — flush cached
     // store plans (`object::prop_plan`).
     crate::object::prop_plan::prop_plan_epoch_bump();
-    // Publish into the dense mirror BEFORE the map, so no reader can observe
-    // the edge through the map without it also being visible densely.
-    crate::object::class_meta_registry::parent_dense_store(class_id, parent_class_id);
-    let mut registry = CLASS_REGISTRY.write().unwrap();
-    if registry.is_none() {
-        *registry = Some(crate::fast_hash::new_ptr_hash_map());
-    }
-    registry.as_mut().unwrap().insert(class_id, parent_class_id);
+    // An in-window child's edge goes to the dense table only, everything else
+    // to the map (#11502) — no write lock for the common case.
+    crate::object::class_meta_registry::publish_parent_edge(class_id, parent_class_id);
 }
 
 /// Public registration entry point used by codegen module init.
@@ -463,7 +458,9 @@ pub(crate) fn class_object_own_field_bytes(
             if !crate::string::js_string_key_matches_bytes(k, want) {
                 continue;
             }
-            let v = crate::object::js_object_get_field(obj, i as u32);
+            // An own ACCESSOR's slot holds its pair, not a value: it reads as
+            // absent here, and the caller's `[[Get]]` runs the getter.
+            let v = crate::object::key_attrs::object_slot_data(obj, i as u32);
             if v.bits() == TAG_UNDEFINED {
                 return None;
             }
@@ -718,15 +715,7 @@ pub unsafe extern "C" fn js_register_class_computed_method(
                 if registry.is_none() {
                     *registry = Some(crate::fast_hash::new_ptr_hash_map());
                 }
-                let vtable = registry
-                    .as_mut()
-                    .unwrap()
-                    .entry(class_id)
-                    .or_insert_with(|| ClassVTable {
-                        methods: HashMap::new(),
-                        getters: HashMap::new(),
-                        setters: HashMap::new(),
-                    });
+                let vtable = registry.as_mut().unwrap().entry(class_id).or_default();
                 vtable.methods.insert(
                     method_name.to_string(),
                     VTableMethodEntry {
@@ -770,15 +759,7 @@ pub unsafe extern "C" fn js_register_class_computed_method(
         if registry.is_none() {
             *registry = Some(crate::fast_hash::new_ptr_hash_map());
         }
-        let vtable = registry
-            .as_mut()
-            .unwrap()
-            .entry(class_id)
-            .or_insert_with(|| ClassVTable {
-                methods: HashMap::new(),
-                getters: HashMap::new(),
-                setters: HashMap::new(),
-            });
+        let vtable = registry.as_mut().unwrap().entry(class_id).or_default();
         vtable.methods.insert(
             name.clone(),
             VTableMethodEntry {
@@ -845,6 +826,7 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
         VTABLE_GEN.fetch_add(1, Ordering::Release);
         return;
     }
+    super::verdict_classes::note_verdict_class_accessor_change(class_id as u32);
     if let Some(name) = property_key_string(property_key) {
         super::registration::record_class_string_member_order(
             class_id,
@@ -860,21 +842,11 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
             if registry.is_none() {
                 *registry = Some(crate::fast_hash::new_ptr_hash_map());
             }
-            let vtable = registry
-                .as_mut()
-                .unwrap()
-                .entry(class_id)
-                .or_insert_with(|| ClassVTable {
-                    methods: HashMap::new(),
-                    getters: HashMap::new(),
-                    setters: HashMap::new(),
-                });
-            if getter_ptr != 0 {
-                vtable.getters.insert(name.clone(), getter_ptr as usize);
-            }
-            if setter_ptr != 0 {
-                vtable.setters.insert(name, setter_ptr as usize);
-            }
+            let vtable = registry.as_mut().unwrap().entry(class_id).or_default();
+            vtable.declare_accessor_half(&name, getter_ptr as usize, false);
+            vtable.declare_accessor_half(&name, setter_ptr as usize, true);
+            drop(registry);
+            super::decl_accessors::note_instance_accessor_registered(class_id, &name);
         } else {
             let mut guard = CLASS_STATIC_ACCESSORS.write().unwrap();
             if guard.is_none() {
@@ -1280,7 +1252,7 @@ pub(crate) fn class_has_instance_getter(class_id: u32, name: &str) -> bool {
     let mut depth = 0usize;
     while cid != 0 && depth < 32 {
         if let Some(vt) = reg.get(&cid) {
-            if vt.getters.contains_key(name) {
+            if vt.declares_getter(name) {
                 return true;
             }
         }
@@ -1314,7 +1286,7 @@ pub(crate) fn class_chain_has_instance_accessor(class_id: u32, name: &str) -> bo
     let mut depth = 0usize;
     while cid != 0 && depth < 32 {
         if let Some(vt) = reg.get(&cid) {
-            if vt.getters.contains_key(name) || vt.setters.contains_key(name) {
+            if vt.accessor_decl(name).is_some() {
                 return true;
             }
         }
@@ -1335,34 +1307,8 @@ pub(crate) unsafe fn class_instance_setter_apply(
     receiver: f64,
     value: f64,
 ) -> bool {
-    let guard = match CLASS_VTABLE_REGISTRY.read() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    let Some(reg) = guard.as_ref() else {
-        return false;
-    };
-    let mut cid = class_id;
-    let mut depth = 0usize;
-    while cid != 0 && depth < 32 {
-        if let Some(vtable) = reg.get(&cid) {
-            if let Some(&setter_ptr) = vtable.setters.get(name) {
-                if setter_ptr != 0 {
-                    let f: extern "C" fn(f64, f64) -> f64 = std::mem::transmute(setter_ptr);
-                    let _ = f(receiver, value);
-                }
-                return true;
-            }
-        }
-        match get_parent_class_id(cid) {
-            Some(p) if p != 0 && p != cid => {
-                cid = p;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-    false
+    // Charter step 3: the accessor is a property of the class prototype chain.
+    super::decl_accessors::class_chain_setter_apply(class_id, name, receiver, value).is_some()
 }
 
 /// Spec `Function.prototype.length` for a class method named `name` — the
@@ -1893,6 +1839,24 @@ pub unsafe extern "C" fn js_class_static_method_call(
             return result;
         }
     }
+    // #11492: the constructor chain ends at %Function.prototype% — a user
+    // method installed there (`Function.prototype.myHelper = fn`) is callable
+    // as `C.myHelper()` with `this` = the class, exactly as on a closure.
+    let fn_proto_member = if crate::object::class_prototype_ref_id(receiver).is_none() {
+        crate::closure::function_prototype_inherited_get(0, name, receiver)
+    } else {
+        None
+    };
+    if let Some(member) = fn_proto_member {
+        if crate::collection_iter::is_callable(member) {
+            let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
+            let prev_this =
+                this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
+            let result = crate::closure::js_native_call_value(member, args_ptr, args_len);
+            crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
+            return result;
+        }
+    }
     // True miss: no static method and no callable static field resolved on the
     // class chain. Keep the two compatibility no-ops introduced for Effect's
     // schema initialization (#687), but otherwise follow JavaScript semantics:
@@ -1916,7 +1880,7 @@ pub unsafe extern "C" fn js_class_static_method_call(
 }
 
 // `get_parent_class_id` now lives in `object::class_meta_registry` next to the
-// dense mirror it reads; it is re-exported through `object::mod` unchanged.
+// dense parent table it reads; it is re-exported through `object::mod` unchanged.
 pub(crate) use crate::object::class_meta_registry::get_parent_class_id;
 
 /// Look up a method by name in the class vtable, walking the parent chain.

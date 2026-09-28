@@ -68,6 +68,10 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // barrier. Persistent shadow-slot updates use zero as an authoritative
     // fast skip before calling the TLS-backed root barrier.
     module.add_external_global("PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT", I32);
+    // The key-add hit's chain-verdict generation and the store census
+    // (expr/put_value_store_ic.rs, expr/store_census.rs).
+    module.add_external_global("PERRY_PROTO_VALIDITY", I64);
+    module.add_external_global("PERRY_STORE_CENSUS", I64);
     // #10943: has ANY named property ever been installed on a non-ordinary
     // cell in this process? Zero is the own-override guard's own proof that a
     // proven Map/Set/Date receiver cannot be shadowing its builtin, and the
@@ -231,6 +235,30 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         DOUBLE,
         &[I64, DOUBLE, I32, I32, I64, I32, I32],
     );
+    // S2 (deferred-collection RFC): the two full-outline class-field ICs as a
+    // GC-leaf hit (`_fast`, same operands as the full helper) plus a
+    // collecting miss continuation (`_fast_miss`, the same operands; the SET
+    // miss takes the fast entry's status first).
+    module.declare_function(
+        "js_class_field_get_ic_fast",
+        DOUBLE,
+        &[I64, DOUBLE, I32, I32, I64, I32, I32],
+    );
+    module.declare_function(
+        "js_class_field_get_ic_fast_miss",
+        DOUBLE,
+        &[I64, DOUBLE, I32, I32, I64, I32, I32],
+    );
+    module.declare_function(
+        "js_class_field_set_ic_fast",
+        I32,
+        &[I64, DOUBLE, I32, I32, I64, I32, DOUBLE, I32],
+    );
+    module.declare_function(
+        "js_class_field_set_ic_fast_miss",
+        VOID,
+        &[I32, I64, DOUBLE, I32, I32, I64, I32, DOUBLE, I32],
+    );
     module.declare_function(
         "js_typed_feedback_native_call_method",
         DOUBLE,
@@ -386,6 +414,14 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // single call for oversized modules. Args: (obj_bits, key_handle, site_id,
     // per-site IC cache global) -> field value.
     module.declare_function("js_object_get_field_ic", DOUBLE, &[I64, I64, I64, PTR]);
+    // S2: its MRU hit as a GC-leaf call answering TAG_HOLE on a decline, and
+    // the collecting rest of the ladder. Same operands as the full helper.
+    module.declare_function("js_object_get_field_ic_fast", DOUBLE, &[I64, I64, I64, PTR]);
+    module.declare_function(
+        "js_object_get_field_ic_fast_miss",
+        DOUBLE,
+        &[I64, I64, I64, PTR],
+    );
     // T1: the two exits of the inline generic-get tower. Every guard failure —
     // SSO / INT32 class ref / nullish / non-object receiver / overflow slot /
     // deleted slot / named prefix / miss+prime — branches to one of these
@@ -584,6 +620,20 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // value, or `TAG_HOLE` for a decline. A pure state read (see
     // `gc_call_effects.rs`).
     module.declare_function("js_inherited_read_cache_hit_f64", DOUBLE, &[PTR, PTR]);
+    // The per-agent pointer block (`expr/agent_ptr.rs`), read inline on ELF
+    // executables through the initial-exec TLS model; its slot-1 accessor,
+    // and the method-call site's miss entry (`expr/method_site.rs`).
+    module.add_external_tls_global(
+        crate::expr::agent_ptr::AGENT_PTRS_SYMBOL,
+        &format!("[{} x ptr]", crate::expr::agent_ptr::AGENT_PTR_SLOTS),
+        "initialexec",
+    );
+    module.declare_function("perry_implicit_this_cell", PTR, &[]);
+    module.declare_function(
+        "js_method_site_miss",
+        DOUBLE,
+        &[PTR, I64, DOUBLE, I64, PTR, I64],
+    );
     module.declare_function(
         "js_put_value_set_dyn_ic",
         DOUBLE,
@@ -596,6 +646,12 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_put_value_set_packed_miss",
         DOUBLE,
         &[DOUBLE, I64, DOUBLE, I32, PTR, PTR],
+    );
+    // S2: the GC-leaf existing-key way store of a full-outline store site.
+    module.declare_function(
+        "js_put_value_set_packed_fast",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR],
     );
     // #9708: takes the site's cache SLOT plus the way index to prime.
     module.declare_function(

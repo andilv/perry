@@ -330,12 +330,10 @@ fn a_call_inside_a_try_region_invokes_with_the_convention() {
 fn unsupported_targets_keep_the_default_convention() {
     // Same predicate family as the RS4GC target-awareness: watchOS arm64_32
     // and ARM64 Windows never see the convention, everything the runtime can
-    // walk does.
-    for triple in [
-        "arm64_32-apple-watchos",
-        "aarch64-pc-windows-msvc",
-        "aarch64-w64-mingw32",
-    ] {
+    // walk does. (arm64_32 is refused by `compile_module` before this gate
+    // until #11378 — `target_layout::ilp32_codegen_refusal` — so it cannot be
+    // compiled here; put it back in this list when that refusal is lifted.)
+    for triple in ["aarch64-pc-windows-msvc", "aarch64-w64-mingw32"] {
         let ir = compile_ir_for(&recursive_module(), Some(triple));
         assert!(
             ir.contains("$spec_i32(i32"),
@@ -434,6 +432,7 @@ fn the_clone_entry_is_shrink_wrapped_frameless() {
         "spec_preserve_none_asm",
         crate::codegen::helpers::native_stack_roots_enabled(),
     )
+    .map(crate::inprocess::single_piece)
     .expect("in-process -O3 -S pipeline");
     let asm = String::from_utf8(asm_bytes).expect("assembly is UTF-8");
 

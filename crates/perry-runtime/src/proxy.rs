@@ -33,11 +33,12 @@ pub(crate) use has_delete::reflect_ordinary_delete_property_key;
 pub use has_delete::{js_proxy_delete, js_proxy_has};
 mod invariants;
 mod put_value;
+pub(crate) use put_value::note_packed_add_carriers;
 pub use put_value::{js_proxy_set, js_put_value_set};
 pub(crate) use put_value::{
     js_put_value_set_ic_miss, proxy_set_with_receiver, IC_SLOT_OVERFLOW_BIT,
 };
-pub use put_value::{js_put_value_set_packed_miss, PACKED_SET_EMPTY};
+pub use put_value::{js_put_value_set_packed_miss, PackedSetSite, PACKED_SET_EMPTY};
 pub(crate) use put_value::{packed_set_cache_resolve, PackedSetWaysSlot, PACKED_SET_CHAIN_WORD};
 pub use put_value::{write_pic_way_entry, WritePicCache, WritePicCacheSlot, WRITE_PIC_WORDS};
 mod json;
@@ -447,7 +448,9 @@ fn target_callable_at_creation(target: f64) -> bool {
                 .map(|e| e.callable)
                 .unwrap_or(false)
         }),
-        None => crate::object::value_is_callable(target),
+        None => {
+            crate::object::is_class_object_value(target) || crate::object::value_is_callable(target)
+        }
     }
 }
 
@@ -2384,41 +2387,9 @@ fn class_super_accessor_set(
     receiver: f64,
 ) -> Option<bool> {
     let key_name = property_key_to_rust_string(key)?;
-    let registry = crate::object::CLASS_VTABLE_REGISTRY.read().ok()?;
-    let reg = registry.as_ref()?;
-    let mut cid = parent_class_id;
-    let mut depth = 0usize;
-    while cid != 0 && depth < 32 {
-        if let Some(vtable) = reg.get(&cid) {
-            let setter_alias = format!("__set_{}", key_name);
-            if let Some(&setter_ptr) = vtable
-                .setters
-                .get(&key_name)
-                .or_else(|| vtable.setters.get(&setter_alias))
-            {
-                let f: extern "C" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(setter_ptr) };
-                let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-                let prev_this =
-                    this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
-                let _ = f(receiver, value);
-                crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
-                return Some(true);
-            }
-            let getter_alias = format!("__get_{}", key_name);
-            if vtable.getters.contains_key(&key_name) || vtable.getters.contains_key(&getter_alias)
-            {
-                return Some(false);
-            }
-        }
-        match crate::object::get_parent_class_id(cid) {
-            Some(parent) if parent != 0 && parent != cid => {
-                cid = parent;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-    None
+    // Charter step 3: the accessor is a property of the parent's prototype
+    // chain. `Some(false)`: getter-only, the write is refused.
+    unsafe { crate::object::class_chain_setter_apply(parent_class_id, &key_name, receiver, value) }
 }
 
 fn receiver_super_parent_class_id(receiver: f64) -> Option<u32> {
@@ -3296,10 +3267,10 @@ mod tests {
             "perry-codegen emits 0x200 for this bit"
         );
         // It ADMITS a receiver, so it must not appear in the mask that REJECTS
-        // one (`WRITE_PIC_BLOCKING_FLAGS = 0x1987`) — a collision would make
+        // one (`WRITE_PIC_BLOCKING_FLAGS = 0x1180`) — a collision would make
         // every marked object permanently ineligible.
-        assert_eq!(crate::gc::OBJ_FLAG_PLAIN_ORDINARY & 0x1987, 0);
-        assert_ne!(crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF & 0x1987, 0);
+        assert_eq!(crate::gc::OBJ_FLAG_PLAIN_ORDINARY & 0x1180, 0);
+        assert_ne!(crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF & 0x1180, 0);
         // Bit 9 is shared with the array-only arguments-object flag, disjoint
         // by `obj_type`; and it must not collide with any object-meaningful
         // flag or with the survival-age / layout-state fields the GC owns.

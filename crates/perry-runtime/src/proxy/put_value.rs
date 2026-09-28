@@ -170,6 +170,21 @@ pub extern "C" fn js_put_value_set(
         if unsafe { crate::object::try_existing_own_data_overwrite(obj, key_ptr, value) } {
             return value;
         }
+        // Charter step 3: a key this receiver shape inherits as an accessor
+        // runs its setter from the inherited-access table.
+        if crate::value::addr_class::is_above_handle_band(obj as usize) {
+            if let Some(interned) = unsafe {
+                crate::object::chain_store::interned_key_for_store(f64::from_bits(key_bits))
+            } {
+                if unsafe {
+                    crate::object::inherited_read_cache::inherited_write_through(
+                        obj, interned, value,
+                    )
+                } {
+                    return value;
+                }
+            }
+        }
     }
 
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -341,13 +356,56 @@ pub extern "C" fn js_put_value_set(
     };
     if !ok && strict != 0 {
         let key_name = key_to_rust_string(property_key).unwrap_or_else(|| "property".to_string());
+        let receiver = receiver_handle.get_nanbox_f64();
+        if let Some(class_name) = getter_only_accessor_owner_name(receiver, &key_name) {
+            crate::collection_iter::throw_type_error(&format!(
+                "Cannot set property {key_name} of #<{class_name}> which has only a getter"
+            ));
+        }
         crate::error::throw_immutable_write(0, &key_name);
     }
     value_handle.get_nanbox_f64()
 }
 
+/// For a refused strict write: when the key resolves on `receiver`'s chain to
+/// an accessor with no setter, the receiver's constructor name for node's
+/// "which has only a getter" message. Cold (only on a throw).
+#[cold]
+fn getter_only_accessor_owner_name(receiver: f64, key: &str) -> Option<String> {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let cur = scope.root_nanbox_f64(receiver);
+    for _ in 0..64 {
+        let v = cur.get_nanbox_f64();
+        let js = crate::JSValue::from_bits(v.to_bits());
+        if !js.is_pointer() {
+            return None;
+        }
+        let addr = js.as_pointer::<u8>() as usize;
+        if let Some(acc) = crate::object::get_accessor_descriptor(addr, key) {
+            if acc.set != 0 {
+                return None;
+            }
+            let recv = crate::JSValue::from_bits(receiver.to_bits());
+            let class_id =
+                crate::object::js_object_get_class_id(recv.as_pointer::<crate::ObjectHeader>());
+            return Some(
+                crate::object::class_name_for_id(class_id).unwrap_or_else(|| "Object".to_string()),
+            );
+        }
+        if crate::object::get_property_attrs(addr, key).is_some() {
+            return None;
+        }
+        cur.set_nanbox_f64(crate::object::js_object_get_prototype_of(v));
+    }
+    None
+}
+
+#[path = "put_value/packed_add.rs"]
+mod packed_add;
 #[path = "put_value/packed_set.rs"]
 mod packed_set;
+pub(crate) use packed_add::note_packed_add_carriers;
+pub use packed_add::PackedSetSite;
 pub use packed_set::{js_put_value_set_packed_miss, PACKED_SET_EMPTY};
 pub(crate) use packed_set::{packed_set_cache_resolve, PackedSetWaysSlot, PACKED_SET_CHAIN_WORD};
 
@@ -480,11 +538,12 @@ pub extern "C" fn js_put_value_set_ic_miss(
         let Some(gc_header) = crate::value::addr_class::try_read_gc_header(obj_addr) else {
             return result;
         };
-        const BLOCKING_FLAGS: u16 = crate::gc::OBJ_FLAG_FROZEN
-            | crate::gc::OBJ_FLAG_SEALED
-            | crate::gc::OBJ_FLAG_NO_EXTEND
-            | crate::gc::OBJ_FLAG_HAS_DESCRIPTORS
-            | crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO
+        // Charter step 3 (#10871): no integrity or descriptor bit. Whether
+        // THIS key may be overwritten is a fact of the receiver's keys (its
+        // attribute entry, `key_attrs.rs`), checked per key below before
+        // anything is primed; every attribute or integrity change moves the
+        // ShapeId, so the primed token pins it.
+        const BLOCKING_FLAGS: u16 = crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO
             // A generated hit cannot update/downgrade a typed layout without
             // calling the runtime. The miss store clears this bit; prime only
             // once that per-object downgrade is visible.
@@ -549,6 +608,15 @@ pub extern "C" fn js_put_value_set_ic_miss(
         let Some(idx) = own_idx else {
             return result;
         };
+        // Charter step 3: an accessor or a non-writable key (a frozen
+        // object's keys are all non-writable) is never primed.
+        if !crate::object::key_attrs::entry_is_plain_writable_data(
+            crate::object::key_attrs::keys_entry(keys, idx),
+        ) {
+            #[cfg(feature = "attr-census")]
+            crate::object::attr_census::note_global("ic.write_prime_declined.not_plain_key");
+            return result;
+        }
         // #9287: a slot past the inline region primes too, carrying
         // IC_SLOT_OVERFLOW_BIT exactly like the dynamic-key IC's stub entries.
         // A way hit on such a slot is served by `dyn_ic_try_store` —
@@ -570,6 +638,11 @@ pub extern "C" fn js_put_value_set_ic_miss(
         // The descriptor above already proves this stamp is live, so the
         // token comes from the header word rather than from a second full
         // lookup-and-copy of the same id (see `dyn_ic_try_store`).
+        // D3(b): a marked prototype's shape is never learned by a store cache,
+        // so every write to it reaches a funnel that bumps PERRY_PROTO_VALIDITY.
+        if !crate::object::proto_validity::store_cache_may_learn(obj) {
+            return result;
+        }
         let shape_token = crate::object::shapes::PIC_ID_TOKEN_BIT
             | crate::object::shapes::object_shape_stamp(obj) as u64;
 
@@ -1190,6 +1263,11 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
         // The descriptor above already proves this stamp is live, so the
         // token comes from the header word rather than from a second full
         // lookup-and-copy of the same id (see `dyn_ic_try_store`).
+        // D3(b): a marked prototype's shape is never learned by a store cache,
+        // so every write to it reaches a funnel that bumps PERRY_PROTO_VALIDITY.
+        if !crate::object::proto_validity::store_cache_may_learn(obj) {
+            return result;
+        }
         let shape_token = crate::object::shapes::PIC_ID_TOKEN_BIT
             | crate::object::shapes::object_shape_stamp(obj) as u64;
         let key_bits = key.to_bits() as i64;
@@ -1414,9 +1492,7 @@ fn object_array_numeric_write_slots(
     if array_gc.obj_type != crate::gc::GC_TYPE_ARRAY
         || array_gc.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || array_gc._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
-        || crate::array::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != 0
+        || crate::array::array_index_fast_path_invalid_for(array_gc._reserved)
     {
         trace_object_array_numeric_write_rejection(
             "array kind, forwarding, descriptor, or index-fast-path state",

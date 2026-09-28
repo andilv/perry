@@ -258,7 +258,9 @@ mod owner_index_tests {
     #[test]
     fn index_mirrors_tables_across_install_redefine_and_delete() {
         let _lock = crate::gc::global_side_table_test_lock();
-        let obj = crate::object::js_object_alloc(0, 0);
+        // An array owner: its attributes still live in these tables (an
+        // ordinary object's live with its keys, charter step 3).
+        let obj = crate::array::js_array_alloc(0);
         let addr = obj as usize;
 
         set_property_attrs(addr, "a".to_string(), PropertyAttrs::new(true, true, true));
@@ -302,11 +304,13 @@ mod owner_index_tests {
     #[test]
     fn accessor_keys_for_obj_agrees_with_a_full_scan() {
         let _lock = crate::gc::global_side_table_test_lock();
-        let obj = crate::object::js_object_alloc(0, 0);
+        // Array owners: an ordinary object's accessors live in its key slots
+        // (charter step 3), an array's still live in these tables.
+        let obj = crate::array::js_array_alloc(0);
         let addr = obj as usize;
         // A second owner with its own accessors: the whole point of the index
         // is that this one's keys never leak into the first one's answer.
-        let other = crate::object::js_object_alloc(0, 0);
+        let other = crate::array::js_array_alloc(0);
         let other_addr = other as usize;
 
         for k in ["z", "m", "a"] {
@@ -332,8 +336,9 @@ mod owner_index_tests {
     #[test]
     fn transfer_moves_both_tables_and_the_index() {
         let _lock = crate::gc::global_side_table_test_lock();
-        let old = crate::object::js_object_alloc(0, 0) as usize;
-        let new = crate::object::js_object_alloc(0, 0) as usize;
+        // Array owners: an ordinary object's descriptors live with its keys.
+        let old = crate::array::js_array_alloc(0) as usize;
+        let new = crate::array::js_array_alloc(0) as usize;
 
         set_property_attrs(old, "p".to_string(), PropertyAttrs::new(true, true, true));
         set_accessor_descriptor(old, "acc".to_string(), AccessorDescriptor::default());
@@ -504,8 +509,9 @@ mod string_wrapper_index_attrs_tests {
         }
         assert_eq!(
             test_property_descriptor_entry_count(obj),
-            1,
-            "only `length` is stored; the 11 index descriptors are synthesized"
+            0,
+            "nothing is stored: the 11 index descriptors are synthesized, and \
+             `length`'s attributes live with the wrapper's keys (charter step 3)"
         );
     }
 

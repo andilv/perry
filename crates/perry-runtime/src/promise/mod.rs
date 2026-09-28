@@ -29,6 +29,10 @@ pub mod microtasks;
 pub mod native_async;
 pub mod reactions;
 pub mod rejection;
+#[cfg(test)]
+mod rejection_loop_tests;
+#[cfg(test)]
+mod resolving_function_kind_tests;
 pub mod scanners;
 pub mod spec_combinators;
 pub mod subclass;
@@ -242,14 +246,13 @@ extern "C" fn mt_profile_atexit() {
         crate::timer::PROFILE_INTERVAL_TIMERS_FIRED.load(Ordering::Relaxed),
     );
     eprintln!(
-        "[mt-profile] event_notify={{sent:{},during_drain:{},drain_suppressed:{}}} event_wait={{total:{},fast:{},zero:{},driver:{},condvar:{}}}",
+        "[mt-profile] event_notify={{sent:{},during_drain:{},drain_suppressed:{}}} event_wait={{total:{},fast:{},zero:{},condvar:{}}}",
         crate::event_pump::PROFILE_NOTIFY_COUNT.load(Ordering::Relaxed),
         crate::event_pump::PROFILE_NOTIFY_DURING_DRAIN_COUNT.load(Ordering::Relaxed),
         crate::event_pump::PROFILE_NOTIFY_DRAIN_SUPPRESSED_COUNT.load(Ordering::Relaxed),
         crate::event_pump::PROFILE_WAIT_COUNT.load(Ordering::Relaxed),
         crate::event_pump::PROFILE_WAIT_FAST_COUNT.load(Ordering::Relaxed),
         crate::event_pump::PROFILE_WAIT_ZERO_COUNT.load(Ordering::Relaxed),
-        crate::event_pump::PROFILE_WAIT_DRIVER_COUNT.load(Ordering::Relaxed),
         crate::event_pump::PROFILE_WAIT_CONDVAR_COUNT.load(Ordering::Relaxed),
     );
     let q = MT_TIME_NS_QUEUE.load(Ordering::Relaxed);
@@ -710,52 +713,7 @@ pub(crate) static TASK_QUEUE: RefCell<std::collections::VecDeque<Task>>
     pub(crate) static ASYNC_BOX_EXECUTION_REFS: std::cell::RefCell<Vec<*mut crate::r#box::AsyncBoxActivation>> =
         const { std::cell::RefCell::new(Vec::new()) };
 
-    /// Defensive re-entry guard for the async step driver (issue #712).
-    ///
-    /// Tracks consecutive `is_error=true` AsyncStep dispatches from the
-    /// SAME step closure. The original report (v0.5.836) produced 5.7M
-    /// identical "value is not a function" lines because the throw
-    /// closure's `__gen_state = post_catch_state` transitioned to a
-    /// state that re-evaluated the same failing `await` expression —
-    /// the catch arm re-fired, AsyncStepChain re-enqueued, repeat.
-    ///
-    /// A correct async state machine alternates: on a throwing await
-    /// the runner gets ONE is_error=true entry per throw, immediately
-    /// followed by is_error=false entries that resume the post-catch
-    /// states. Programs that legitimately throw 1M+ times in a loop
-    /// (e.g. `for (i of bigArr) try { await fail() } catch {}`)
-    /// interleave is_error=false steps between the catches, so the
-    /// consecutive count never grows beyond 1.
-    ///
-    /// On exceed: reject `next` with a synthesized TypeError and skip
-    /// the step dispatch. This bounds the worst-case loop at
-    /// `ASYNC_STEP_REENTRY_BOUND` iterations instead of unbounded.
-    pub(crate) static ASYNC_STEP_GUARD: std::cell::Cell<AsyncStepGuard>
-        = const { std::cell::Cell::new(AsyncStepGuard { consecutive_error_count: 0 }) };
 }
-
-/// Defensive guard state for the async step driver. See `ASYNC_STEP_GUARD`.
-///
-/// #8193: this used to carry a `last_closure: usize` — the address of the
-/// closure that took the last erroring step. The same-closure check that read
-/// it was deleted when #712/#921/#922 showed a runaway loop ALTERNATES between
-/// two closures, so the field became write-only. It was not inert, though: it
-/// was a raw heap address that `scan_promise_roots_mut` REKEYED without
-/// marking, and nothing pruned it when the closure died — the #8040 shape (see
-/// `gc::dead_owner`). The fix for state nobody reads is to delete it, not to
-/// maintain it correctly.
-#[derive(Copy, Clone)]
-pub(crate) struct AsyncStepGuard {
-    pub consecutive_error_count: u32,
-}
-
-/// Upper bound on consecutive same-closure is_error=true AsyncStep
-/// dispatches before the runner rejects the Promise as a runaway loop.
-/// Picked well above any legitimate throw-in-a-loop pattern (those
-/// interleave is_error=false steps so the count resets each iteration)
-/// and well below the 5.7M observed in #712 — high enough to avoid
-/// false positives, low enough to terminate quickly when the bug fires.
-pub(crate) const ASYNC_STEP_REENTRY_BOUND: u32 = 10_000;
 
 pub(crate) fn enqueue_queue_microtask(callback: i64) {
     let scope = crate::gc::RuntimeHandleScope::new();

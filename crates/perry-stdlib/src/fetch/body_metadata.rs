@@ -572,13 +572,7 @@ pub unsafe extern "C" fn js_request_blob(handle: f64) -> *mut perry_runtime::Pro
             let blob_id = alloc_blob(BlobData::blob(body, content_type));
             perry_runtime::js_promise_resolve(promise, handle_to_f64(blob_id));
         }
-        Err(err_msg) if err_msg == BODY_ALREADY_USED_MESSAGE => {
-            reject_fetch_type_error(promise, BODY_ALREADY_USED_MESSAGE);
-        }
-        Err(err_msg) => {
-            let err_nan = f64::from_bits(fetch_error_bits(err_msg));
-            perry_runtime::js_promise_reject(promise, err_nan);
-        }
+        Err(err) => reject_request_body(promise, err),
     }
     promise
 }
@@ -589,13 +583,7 @@ pub unsafe extern "C" fn js_request_bytes(handle: f64) -> *mut perry_runtime::Pr
     let promise = perry_runtime::js_promise_new();
     match consume_request_body(handle) {
         Ok(body) => resolve_bytes_promise(promise, body),
-        Err(err_msg) if err_msg == BODY_ALREADY_USED_MESSAGE => {
-            reject_fetch_type_error(promise, BODY_ALREADY_USED_MESSAGE);
-        }
-        Err(err_msg) => {
-            let err_nan = f64::from_bits(fetch_error_bits(err_msg));
-            perry_runtime::js_promise_reject(promise, err_nan);
-        }
+        Err(err) => reject_request_body(promise, err),
     }
     promise
 }
@@ -613,13 +601,7 @@ pub unsafe extern "C" fn js_request_form_data(handle: f64) -> *mut perry_runtime
             }
             Err(message) => reject_fetch_type_error(promise, message),
         },
-        Err(err_msg) if err_msg == BODY_ALREADY_USED_MESSAGE => {
-            reject_fetch_type_error(promise, BODY_ALREADY_USED_MESSAGE);
-        }
-        Err(err_msg) => {
-            let err_nan = f64::from_bits(fetch_error_bits(err_msg));
-            perry_runtime::js_promise_reject(promise, err_nan);
-        }
+        Err(err) => reject_request_body(promise, err),
     }
     promise
 }
@@ -859,6 +841,7 @@ mod tests {
 
     #[test]
     fn selects_urlencoded_and_multipart_parsers_from_content_type() {
+        let _band = crate::fetch::handle_band_test_lock();
         let encoded = form_data_from_body(
             b"name=Perry+TS&name=second",
             "application/x-www-form-urlencoded; charset=UTF-8",
@@ -889,6 +872,7 @@ mod tests {
 
     #[test]
     fn appended_blob_becomes_a_file_and_serializes_binary_multipart() {
+        let _band = crate::fetch::handle_band_test_lock();
         let blob_id = alloc_blob(BlobData::blob(
             vec![0, 0xff, b'\r', b'\n'],
             "application/octet-stream".to_string(),
@@ -948,6 +932,7 @@ mod tests {
 
     #[test]
     fn request_owns_serialized_form_data_and_default_content_type() {
+        let _band = crate::fetch::handle_band_test_lock();
         let form = js_form_data_new();
         unsafe {
             js_form_data_append(

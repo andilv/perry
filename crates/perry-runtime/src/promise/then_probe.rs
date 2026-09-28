@@ -210,7 +210,12 @@ unsafe fn proto_signature(proto_addr: usize) -> Option<(usize, u32, u16, u32)> {
         if len > cap {
             return None;
         }
-        len
+        // The RECEIVER's key count, from its shape — never the array's header
+        // length. A canonical backing serves every list on its growth chain,
+        // so a delete can return `Object.prototype` to a prefix of the same
+        // backing and a re-add to the longer list, with the address and the
+        // header length both unchanged (`ObjectKeys`).
+        keys_view.count()
     };
     Some((keys_addr, keys_len, header._reserved, (*obj).class_id))
 }
@@ -633,7 +638,7 @@ fn class_id_admissible(class_id: u32) -> bool {
 /// registries are the entire input to `resolve_proto_chain_field_with_receiver`,
 /// `lookup_prototype_method`, `lookup_class_method_in_chain` and the
 /// `CLASS_VTABLE_REGISTRY` getter/method dispatch in the dynamic getter.
-fn class_registry_inert(class_id: u32) -> bool {
+pub(crate) fn class_registry_inert(class_id: u32) -> bool {
     if crate::object::get_parent_class_id(class_id).is_some() {
         return false;
     }

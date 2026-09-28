@@ -312,6 +312,8 @@ pub(crate) fn test_map_side_deallocation_snapshot() -> (u64, u64) {
 }
 
 mod store;
+mod string_key;
+
 use store::*;
 pub(crate) use store::{
     drop_map_store_at_thread_exit, finalize_dead_copied_minor_from_space_maps,
@@ -319,7 +321,10 @@ pub(crate) use store::{
     release_current_thread_map_side_allocations,
 };
 #[cfg(test)]
-pub(crate) use store::{test_from_space_map_finalizations, test_map_side_allocation};
+pub(crate) use store::{
+    test_from_space_map_finalizations, test_map_side_allocation, test_map_store_word,
+};
+use string_key::StrKey;
 
 #[cfg(test)]
 thread_local! {
@@ -936,7 +941,7 @@ pub struct MapHeader {
     /// Extent of the entries array actually written: raw entry indices run
     /// `0..used`. `size` stays the LIVE count, so `used - size` is the number
     /// of tombstoned entries awaiting compaction. Codegen reads it at offset
-    /// 32 (pinned below).
+    /// 32 on LP64 (pinned below).
     pub used: u32,
     /// Bumped by every operation that moves an entry to a LOWER raw index
     /// (`compact_map_entries`) or discards the extent (`clear`). A raw-index
@@ -948,6 +953,7 @@ pub struct MapHeader {
     pub compaction_epoch: u32,
 }
 
+#[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(std::mem::offset_of!(MapHeader, size) == 0);
     assert!(std::mem::offset_of!(MapHeader, capacity) == 4);
@@ -955,6 +961,19 @@ const _: () = {
     assert!(std::mem::offset_of!(MapHeader, used) == 32);
     assert!(std::mem::offset_of!(MapHeader, compaction_epoch) == 36);
     assert!(std::mem::size_of::<MapHeader>() == 40);
+};
+
+// ILP32 (wasm32, arm64_32): the three pointer fields are 4 bytes. Codegen's
+// inline entry read above assumes the LP64 offsets, which is one reason ILP32
+// codegen is refused until #11378 makes it target-derived.
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(std::mem::offset_of!(MapHeader, size) == 0);
+    assert!(std::mem::offset_of!(MapHeader, capacity) == 4);
+    assert!(std::mem::offset_of!(MapHeader, entries) == 8);
+    assert!(std::mem::offset_of!(MapHeader, used) == 20);
+    assert!(std::mem::offset_of!(MapHeader, compaction_epoch) == 24);
+    assert!(std::mem::size_of::<MapHeader>() == 28);
 };
 
 /// The tombstone a deleted entry's KEY slot takes. Never a legal stored key:
@@ -1472,6 +1491,20 @@ unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
             }
             return -1;
         }
+        if let Some(i) = find_identical_key(entries, used, key_bits) {
+            return i;
+        }
+        // A string key is decoded once and each entry rejected by tag and
+        // length, instead of paying the generic comparison per entry (#10697).
+        if let Some(skey) = StrKey::decode(key_bits) {
+            for i in 0..used {
+                let entry_bits = ptr::read(entries.add((i as usize) * 2)).to_bits();
+                if skey.matches(key_bits, entry_bits) {
+                    return i as i32;
+                }
+            }
+            return -1;
+        }
         for i in 0..used {
             let entry_key = ptr::read(entries.add((i as usize) * 2));
             if entry_key.to_bits() == MAP_HOLE_KEY_BITS {
@@ -1502,20 +1535,32 @@ unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
     // string and SSO collide into the same bucket). Index values are
     // u32 entry offsets — pointer-stable across `rewrite_map_fields`.
     if is_string_like(key_bits) {
-        if let Some(h) = string_content_hash(key_bits) {
-            let entries = entries_ptr(map);
-            if let Some(slot) = (*map).store.as_ref().map(|store| &store.strings) {
-                {
-                    // FNV-1a collisions are rare but possible; validate
-                    // each candidate via `jsvalue_eq` (memcmp on bytes).
-                    for cand_idx in slot.candidates(h) {
-                        if cand_idx >= used {
-                            continue;
-                        }
-                        let cand_key = ptr::read(entries.add((cand_idx as usize) * 2));
-                        if jsvalue_eq(cand_key, key) {
-                            return cand_idx as i32;
-                        }
+        let entries = entries_ptr(map);
+        if let Some(slot) = (*map).store.as_ref().map(|store| &store.strings) {
+            // FNV-1a collisions are rare but possible; validate each
+            // candidate by content.
+            if let Some(skey) = StrKey::decode(key_bits) {
+                for cand_idx in slot.candidates(skey.content_hash()) {
+                    if cand_idx >= used {
+                        continue;
+                    }
+                    let cand_bits = ptr::read(entries.add((cand_idx as usize) * 2)).to_bits();
+                    if skey.matches(key_bits, cand_bits) {
+                        return cand_idx as i32;
+                    }
+                }
+                return -1;
+            }
+            // A pointer-tagged string-like key (a symbol among them) keeps
+            // the generic comparison and its symbol guard.
+            if let Some(h) = string_content_hash(key_bits) {
+                for cand_idx in slot.candidates(h) {
+                    if cand_idx >= used {
+                        continue;
+                    }
+                    let cand_key = ptr::read(entries.add((cand_idx as usize) * 2));
+                    if jsvalue_eq(cand_key, key) {
+                        return cand_idx as i32;
                     }
                 }
                 return -1;
@@ -1554,37 +1599,50 @@ unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
     -1
 }
 
+/// The entry whose key bits equal `key_bits`, if any, in a small map's
+/// `0..used` extent.
+///
+/// A Map never holds two SameValueZero-equal keys, so a bit-identical entry
+/// is THE match, wherever it sits — no earlier entry can be content-equal to
+/// it. The common string-keyed shape looks keys up with the very value they
+/// were inserted with (`counts.set(k, …)` for a `k` read from the same array
+/// or literal), and this pass finds those at a few instructions per entry
+/// before any entry pays for a content comparison (#10697). `key_bits` is
+/// already SameValueZero-normalized, as every stored key is.
+#[inline(always)]
+unsafe fn find_identical_key(entries: *const f64, used: u32, key_bits: u64) -> Option<i32> {
+    (0..used)
+        .find(|&i| ptr::read(entries.add((i as usize) * 2)).to_bits() == key_bits)
+        .map(|i| i as i32)
+}
+
 unsafe fn find_string_key_index(map: *const MapHeader, key: *const StringHeader) -> i32 {
     let used = (*map).used;
     let key_value = boxed_heap_string_key(key);
     let key_bits = key_value.to_bits();
 
-    if used <= SIDE_TABLE_THRESHOLD {
+    if let Some(skey) = StrKey::decode(key_bits) {
         let entries = entries_ptr(map);
-        for i in 0..used {
-            let entry_key = ptr::read(entries.add((i as usize) * 2));
-            if entry_key.to_bits() == MAP_HOLE_KEY_BITS {
-                continue;
+        if used <= SIDE_TABLE_THRESHOLD {
+            if let Some(i) = find_identical_key(entries, used, key_bits) {
+                return i;
             }
-            if jsvalue_eq(entry_key, key_value) {
-                return i as i32;
+            for i in 0..used {
+                let entry_bits = ptr::read(entries.add((i as usize) * 2)).to_bits();
+                if skey.matches(key_bits, entry_bits) {
+                    return i as i32;
+                }
             }
+            return -1;
         }
-        return -1;
-    }
-
-    if let Some(h) = string_content_hash(key_bits) {
-        let entries = entries_ptr(map);
         if let Some(slot) = (*map).store.as_ref().map(|store| &store.strings) {
-            {
-                for cand_idx in slot.candidates(h) {
-                    if cand_idx >= used {
-                        continue;
-                    }
-                    let cand_key = ptr::read(entries.add((cand_idx as usize) * 2));
-                    if jsvalue_eq(cand_key, key_value) {
-                        return cand_idx as i32;
-                    }
+            for cand_idx in slot.candidates(skey.content_hash()) {
+                if cand_idx >= used {
+                    continue;
+                }
+                let cand_bits = ptr::read(entries.add((cand_idx as usize) * 2)).to_bits();
+                if skey.matches(key_bits, cand_bits) {
+                    return cand_idx as i32;
                 }
             }
             return -1;

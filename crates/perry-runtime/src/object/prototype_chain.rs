@@ -477,10 +477,8 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                 None
             }
         });
-    let obj_ptr = obj_ptr as usize;
-    let proto_bits = prototype_handle.get_heap_word_u64();
-    if !ARRAY_TARGET_PROTO_RECORDED.load(Ordering::Relaxed)
-        && obj_ptr >= crate::gc::GC_HEADER_SIZE + 0x1000
+    let mut obj_ptr = obj_ptr as usize;
+    if obj_ptr >= crate::gc::GC_HEADER_SIZE + 0x1000
         && crate::value::addr_class::is_above_handle_band(obj_ptr)
         && crate::object::is_valid_obj_ptr(obj_ptr as *const u8)
     {
@@ -489,11 +487,34 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                 (obj_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
             (*hdr).obj_type
         };
-        if obj_type == crate::gc::GC_TYPE_ARRAY || obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
+        if obj_type == crate::gc::GC_TYPE_ARRAY {
+            // #10593: a retargeted ordinary array is a PER-ARRAY fact. The
+            // registry insert below sets `GC_ARRAY_CUSTOM_PROTO` on this
+            // array's own header, and every inline element guard tests that
+            // bit next to the global byte, so only THIS array leaves the fast
+            // path. The runtime latch stays: it only gates the slow paths'
+            // per-array side-table probe.
+            ARRAY_TARGET_PROTO_RECORDED.store(true, Ordering::Relaxed);
+            // `Array.prototype` itself heads every default chain, so a new
+            // `[[Prototype]]` there IS global. Resolving its address can
+            // bootstrap `globalThis` (allocation), so do it with the owner
+            // rooted and reload the owner afterwards.
+            let (array_prototype, owner) =
+                owner_handle.across_mut::<u8, _>(crate::array::array_prototype_addr);
+            obj_ptr = owner as usize;
+            if array_prototype != 0 && array_prototype == obj_ptr {
+                crate::array::invalidate_array_index_fast_path();
+            }
+        } else if obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
+            // A lazy JSON array's materialized storage is a SEPARATE
+            // `GC_TYPE_ARRAY` allocation that does not carry the owner's bit,
+            // so keep the conservative process-wide invalidation here.
             ARRAY_TARGET_PROTO_RECORDED.store(true, Ordering::Relaxed);
             crate::array::invalidate_array_index_fast_path();
         }
     }
+    let obj_ptr = obj_ptr;
+    let proto_bits = prototype_handle.get_heap_word_u64();
     // A per-instance prototype override invalidates class-keyed interception
     // verdicts (the overridden chain can differ from the class chain), and the
     // object itself must never satisfy a class-keyed plan again.
@@ -818,6 +839,38 @@ pub(crate) fn object_has_individual_class_prototype(obj_ptr: usize) -> bool {
     )
 }
 
+/// #11391: `new F()` records F's `.prototype` of that moment as the instance's
+/// `[[Prototype]]` (a class-default link, so no override flag) and also stamps
+/// F's synthetic class id. The class-id walk reads F's CURRENT `.prototype`
+/// (`CLASS_PROTOTYPE_OBJECTS[F]`). After `F.prototype = other` the two name
+/// different objects, and only the recorded one is on the instance's chain:
+/// `o.b` answered from `other`, an object `o` does not inherit from.
+///
+/// True exactly when they differ. When they name the same object the class-id
+/// walk reads the right one, and its arms (decl-proto accessors, evaluated
+/// parents) stay in charge. Declared class ids are excluded by
+/// `synthetic_class_prototype_object`: their entry is a parent class object,
+/// never a prototype, so the comparison would be meaningless.
+pub(crate) fn class_default_prototype_superseded(obj_ptr: usize) -> bool {
+    let Some(recorded) = object_static_prototype(obj_ptr) else {
+        return false;
+    };
+    // Only an ordinary object carries a class id at the `ObjectHeader` offset.
+    let Some(obj) = (unsafe { meta_capable_object(obj_ptr) }) else {
+        return false;
+    };
+    let class_id = unsafe { (*obj).class_id };
+    if class_id == 0 {
+        return false;
+    }
+    let recorded = crate::value::JSValue::from_bits(recorded);
+    if !recorded.is_pointer() {
+        return false;
+    }
+    let current = crate::object::class_registry::synthetic_class_prototype_object(class_id);
+    !current.is_null() && current as usize != recorded.as_pointer::<u8>() as usize
+}
+
 pub(crate) fn default_object_prototype_bits() -> Option<u64> {
     let object_ctor = super::js_get_global_this_builtin_value(b"Object".as_ptr(), 6);
     let ctor_bits = object_ctor.to_bits();
@@ -888,6 +941,45 @@ pub(crate) fn prune_dead_object_prototype_owners(is_dead_owner: &dyn Fn(usize) -
             OBJECT_PROTOTYPES_NONEMPTY.store(false, Ordering::Release);
         }
     }
+}
+
+/// #11471: thread-exit release for `OBJECT_PROTOTYPES`. Death pruning above
+/// only attributes the collecting thread's heap, so an exiting thread's
+/// entries (owner in its arena, or a prototype value from it) would outlive
+/// its blocks and a fresh object at a reused address would inherit the dead
+/// owner's prototype. Runs from `Arena::drop` (TLS destructor): one plain
+/// process-global lock, no thread-locals, no allocation. The owner's header
+/// bit (`set_residual_proto_owner_bit`) lives in the freed memory itself.
+pub(crate) fn release_object_prototypes_in_freed_ranges(
+    freed: &crate::arena::thread_exit::FreedRanges,
+) {
+    if !OBJECT_PROTOTYPES_NONEMPTY.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(registry) = OBJECT_PROTOTYPES.get() else {
+        return;
+    };
+    let mut map = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.retain(|&owner, bits| !freed.contains(owner) && !freed.holds_bits(*bits));
+    // Same latch release as the death prune, under the same lock (#7737).
+    if map.is_empty() {
+        OBJECT_PROTOTYPES_NONEMPTY.store(false, Ordering::Release);
+    }
+}
+
+/// Test probe (#11471): does the residual registry hold an entry for `owner`?
+/// Exported unmangled because this module is crate-private.
+#[doc(hidden)]
+#[no_mangle]
+pub extern "C" fn perry_thread_exit_probe_object_prototype_recorded(owner: usize) -> bool {
+    OBJECT_PROTOTYPES.get().is_some_and(|registry| {
+        registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&owner)
+    })
 }
 
 /// Can the residual owner registry hold an entry at all?

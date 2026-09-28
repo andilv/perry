@@ -1000,7 +1000,7 @@ pub(crate) fn get_field_by_name_object_tail(
                     if key_bytes == b"asymmetricKeyType" {
                         let label = match asym_type {
                             1 => b"rsa".as_slice(),
-                            2 => b"ec".as_slice(),
+                            2 | 5 | 6 => b"ec".as_slice(),
                             3 => b"ed25519".as_slice(),
                             4 => b"x25519".as_slice(),
                             _ => b"".as_slice(),
@@ -1014,12 +1014,21 @@ pub(crate) fn get_field_by_name_object_tail(
                         }
                     }
                     if key_bytes == b"asymmetricKeyDetails" {
-                        let details = js_object_alloc(0, if asym_type == 2 { 1 } else { 0 });
-                        if asym_type == 2 {
+                        // 2/5/6: EC over P-256/P-384/P-521 (perry-stdlib's ec_sign).
+                        let curve: &[u8] = match asym_type {
+                            2 => b"prime256v1",
+                            5 => b"secp384r1",
+                            6 => b"secp521r1",
+                            _ => b"",
+                        };
+                        let details = js_object_alloc(0, if curve.is_empty() { 0 } else { 1 });
+                        if !curve.is_empty() {
                             let name =
                                 crate::string::js_string_from_bytes(b"namedCurve".as_ptr(), 10);
-                            let val =
-                                crate::string::js_string_from_bytes(b"prime256v1".as_ptr(), 10);
+                            let val = crate::string::js_string_from_bytes(
+                                curve.as_ptr(),
+                                curve.len() as u32,
+                            );
                             js_object_set_field_by_name(
                                 details,
                                 name,
@@ -1235,26 +1244,35 @@ pub(crate) fn get_field_by_name_object_tail(
 
         if keys.is_null() {
             // #9131; see `prototype_override::inherited_field_if_overridden`.
-            // A miss returns None so the synthesized arms below stay reachable
-            // (#9244).
-            if let Some(v) = super::prototype_override::inherited_field_if_overridden(obj, key) {
-                return v;
-            }
+            // A miss is not a `Hit` so the synthesized arms below stay
+            // reachable (#9244).
+            let (chain_walked, class_walk) =
+                match super::prototype_override::inherited_field_if_overridden(obj, key) {
+                    super::prototype_override::InheritedRead::Hit(v) => return v,
+                    read => (read.walked(), read.class_prototype_answers()),
+                };
             // #809: an object with no own keys (e.g. an `Object.create(proto)`
             // result, or a `Function.prototype = obj` instance) still has to
             // resolve inherited props/methods. Pre-fix this returned undefined
             // here — BEFORE the `class_id` prototype-walk below — so
             // `Object.create(P).m()` threw `TypeError: m is not a function`.
             let class_id = (*obj).class_id;
+            let mut proto_read_miss = 0u64;
             if class_id != 0 {
                 let receiver =
                     f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
-                if let Some(v) =
-                    super::super::class_registry::resolve_proto_chain_field_with_receiver(
-                        class_id, key, receiver,
-                    )
-                {
-                    return v;
+                // #11391: not when the recorded chain replaced this walk's.
+                if class_walk {
+                    if let Some(v) =
+                        super::super::class_registry::resolve_proto_chain_field_noting_miss(
+                            class_id,
+                            key,
+                            receiver,
+                            &mut proto_read_miss,
+                        )
+                    {
+                        return v;
+                    }
                 }
                 let key_bytes = std::slice::from_raw_parts(
                     (key as *const u8).add(std::mem::size_of::<crate::StringHeader>()),
@@ -1271,32 +1289,21 @@ pub(crate) fn get_field_by_name_object_tail(
                 // `CLASS_PROTOTYPE_METHODS` walk reached further down
                 // — see the matching arm at line ~4083.
                 if let Ok(name) = std::str::from_utf8(key_bytes) {
-                    if let Some(v) = lookup_prototype_method(class_id, name) {
+                    if let Some(v) = class_walk
+                        .then(|| lookup_prototype_method(class_id, name))
+                        .flatten()
+                    {
                         return JSValue::from_bits(v.to_bits());
                     }
-                    // Native class vtable accessors and methods are exposed
-                    // from the class, not from own fields, so keyless
-                    // receivers need the same fallback as shaped receivers.
-                    if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
-                        if let Some(ref reg) = *registry {
-                            let mut cid = class_id;
-                            let mut depth = 0usize;
-                            while depth < 32 {
-                                if let Some(vtable) = reg.get(&cid) {
-                                    if let Some(&getter_ptr) = vtable.getters.get(name) {
-                                        let v = call_class_getter(getter_ptr, obj);
-                                        return JSValue::from_bits(v.to_bits());
-                                    }
-                                }
-                                match get_parent_class_id(cid) {
-                                    Some(p) if p != 0 && p != cid => {
-                                        cid = p;
-                                        depth += 1;
-                                    }
-                                    _ => break,
-                                }
-                            }
-                        }
+                    // Class accessors are properties of the class prototype
+                    // (charter step 3), so keyless receivers need the same
+                    // fallback as shaped receivers.
+                    if let Some((v, _)) = super::super::class_registry::class_chain_getter_value(
+                        class_id,
+                        name,
+                        || super::accessors::class_getter_this(obj),
+                    ) {
+                        return v;
                     }
                     if lookup_class_method_in_chain(class_id, name).is_some() {
                         let heap_name = {
@@ -1338,12 +1345,19 @@ pub(crate) fn get_field_by_name_object_tail(
             }
             // #2820: a keyless object (`{}`, `Object.create(...)`) may still
             // carry an explicit `Object.setPrototypeOf` prototype — walk it so
-            // inherited reads resolve.
+            // inherited reads resolve. Not a second time (#10877).
             if !key.is_null() {
-                if let Some(v) =
-                    super::super::prototype_chain::resolve_inherited_field(obj as usize, key)
+                if !chain_walked
+                    && !super::prototype_override::static_prototype_already_read(
+                        obj,
+                        proto_read_miss,
+                    )
                 {
-                    return v;
+                    if let Some(v) =
+                        super::super::prototype_chain::resolve_inherited_field(obj as usize, key)
+                    {
+                        return v;
+                    }
                 }
                 if let Some(v) = super::accessors::array_subclass_prototype_field(obj, key) {
                     return v;
@@ -1622,9 +1636,13 @@ pub(crate) fn get_field_by_name_object_tail(
         }
 
         // Shaped-receiver own-key miss; same rule as the keyless arm above.
-        if let Some(v) = super::prototype_override::inherited_field_if_overridden(obj, key) {
-            return v;
-        }
+        let (chain_walked, class_walk) =
+            match super::prototype_override::inherited_field_if_overridden(obj, key) {
+                super::prototype_override::InheritedRead::Hit(v) => return v,
+                read => (read.walked(), read.class_prototype_answers()),
+            };
+        // Set by the class-chain walk below; see `static_prototype_already_read`.
+        let mut proto_read_miss = 0u64;
 
         // Key not found in the keys_array — fall back to the class
         // vtable's getter map. Refs #486 (hono): cross-module class
@@ -1638,34 +1656,15 @@ pub(crate) fn get_field_by_name_object_tail(
         // method dispatch.
         let class_id = (*obj).class_id;
         if class_id != 0 {
-            if let Ok(registry) = CLASS_VTABLE_REGISTRY.read() {
-                if let Some(ref reg) = *registry {
-                    // Walk the class -> parent chain so a getter declared
-                    // on a base class is also found when the receiver is
-                    // a subclass instance. `get_parent_class_id` reads
-                    // CLASS_REGISTRY (populated by `js_register_class_parent`).
-                    let mut cid = class_id;
-                    let mut depth = 0usize;
-                    while depth < 32 {
-                        if let Some(vtable) = reg.get(&cid) {
-                            if let Ok(name) = std::str::from_utf8(key_bytes) {
-                                if let Some(&getter_ptr) = vtable.getters.get(name) {
-                                    // Getters take `this` as f64 (NaN-boxed
-                                    // POINTER_TAG), matching the codegen
-                                    // calling convention for class methods.
-                                    let v = call_class_getter(getter_ptr, obj);
-                                    return JSValue::from_bits(v.to_bits());
-                                }
-                            }
-                        }
-                        match get_parent_class_id(cid) {
-                            Some(p) if p != 0 && p != cid => {
-                                cid = p;
-                                depth += 1;
-                            }
-                            _ => break,
-                        }
-                    }
+            // Class accessors (a base class's included) are accessor
+            // properties of the class prototype chain (charter step 3).
+            if let Ok(name) = std::str::from_utf8(key_bytes) {
+                if let Some((v, _)) =
+                    super::super::class_registry::class_chain_getter_value(class_id, name, || {
+                        super::accessors::class_getter_this(obj)
+                    })
+                {
+                    return v;
                 }
             }
 
@@ -1674,10 +1673,15 @@ pub(crate) fn get_field_by_name_object_tail(
             // found, the method is an own-property of the proto
             // object — return its value directly. `pipe`, `[Equal.symbol]`,
             // etc. on Effect's EffectPrototype reach here.
-            {
+            if class_walk {
                 let receiver =
                     f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
-                if let Some(v) = resolve_proto_chain_field_with_receiver(class_id, key, receiver) {
+                if let Some(v) = super::super::class_registry::resolve_proto_chain_field_noting_miss(
+                    class_id,
+                    key,
+                    receiver,
+                    &mut proto_read_miss,
+                ) {
                     return v;
                 }
             }
@@ -1690,7 +1694,10 @@ pub(crate) fn get_field_by_name_object_tail(
             // this arm covers methods that only exist as prototype
             // assignments (never declared inside the `class` block).
             if let Ok(name) = std::str::from_utf8(key_bytes) {
-                if let Some(v) = lookup_prototype_method(class_id, name) {
+                if let Some(v) = class_walk
+                    .then(|| lookup_prototype_method(class_id, name))
+                    .flatten()
+                {
                     return JSValue::from_bits(v.to_bits());
                 }
                 if class_id == crate::builtins::CONSOLE_INSTANCE_CLASS_ID
@@ -1761,11 +1768,16 @@ pub(crate) fn get_field_by_name_object_tail(
         // #2820: before giving up, walk an explicit `Object.setPrototypeOf`
         // prototype chain recorded for this object so inherited property reads
         // (`obj.x` where `x` is an own property of the set prototype) resolve.
+        // Not a second time (#10877).
         if !key.is_null() {
-            if let Some(v) =
-                super::super::prototype_chain::resolve_inherited_field(obj as usize, key)
+            if !chain_walked
+                && !super::prototype_override::static_prototype_already_read(obj, proto_read_miss)
             {
-                return v;
+                if let Some(v) =
+                    super::super::prototype_chain::resolve_inherited_field(obj as usize, key)
+                {
+                    return v;
+                }
             }
             if let Some(v) = super::accessors::array_subclass_prototype_field(obj, key) {
                 return v;

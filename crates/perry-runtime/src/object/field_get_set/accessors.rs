@@ -123,6 +123,10 @@ pub(crate) unsafe fn own_data_field_by_name(
     // preserves #1781's SSO-key acceptance (its byte resolver is SSO-aware).
     if let Some(islot) = crate::object::keys_find_slot_by_key_ptr(keys, key_count as u32, key) {
         let i = islot as usize;
+        // An accessor key's slot holds its accessor pair, never a data value.
+        if crate::object::key_attrs::key_is_accessor_at(keys, islot) {
+            return Some(JSValue::undefined());
+        }
         {
             if i < alloc_limit {
                 return Some(js_object_get_field(obj, i as u32));
@@ -445,6 +449,14 @@ pub(crate) fn accessor_receiver_override_end(prev: Option<f64>) {
     ACCESSOR_RECEIVER_OVERRIDE.with(|c| c.set(prev));
 }
 
+/// Whether an inherited walk has armed a receiver that the next class getter
+/// would take as `this` (#10498: the class-accessor cache neither records nor
+/// serves under one).
+#[inline]
+pub(crate) fn accessor_receiver_override_armed() -> bool {
+    ACCESSOR_RECEIVER_OVERRIDE.with(|c| c.get().is_some())
+}
+
 /// `this` to pass to a class getter (vtable `getters`) found while resolving a
 /// property. When the getter was reached by walking a prototype chain, `obj` is
 /// the PROTOTYPE the getter lives on — bind the original instance stashed by
@@ -454,16 +466,6 @@ pub(crate) unsafe fn class_getter_this(obj: *const ObjectHeader) -> f64 {
     ACCESSOR_RECEIVER_OVERRIDE
         .with(|c| c.take())
         .unwrap_or_else(|| f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits()))
-}
-
-/// Run the class vtable getter `getter_ptr` found while resolving a property
-/// of `obj`, with `this` from [`class_getter_this`] and the body isolated from
-/// the enclosing inherited-property resolution (#11201).
-pub(crate) unsafe fn call_class_getter(getter_ptr: usize, obj: *const ObjectHeader) -> f64 {
-    let this_f64 = class_getter_this(obj);
-    let _boundary = crate::object::prototype_chain::UserCodeResolutionBoundary::enter();
-    let f: extern "C" fn(f64) -> f64 = std::mem::transmute(getter_ptr);
-    f(this_f64)
 }
 
 pub(crate) unsafe fn invoke_accessor_getter(get_bits: u64, receiver: f64) -> JSValue {

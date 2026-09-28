@@ -147,6 +147,29 @@ fn last_load_error(path: &str) -> String {
     format!("LoadLibraryW failed for {}: Win32 error {}", path, err)
 }
 
+// WASI (#11377) has no dynamic loading: every load fails through the ordinary
+// "load failed" path, so the other helpers are never reached with a handle.
+#[cfg(target_os = "wasi")]
+type RawLibHandle = *mut libc::c_void;
+
+#[cfg(target_os = "wasi")]
+unsafe fn open_library(_path: &str) -> Option<RawLibHandle> {
+    None
+}
+
+#[cfg(target_os = "wasi")]
+unsafe fn lookup_symbol(_handle: RawLibHandle, _name: &str) -> Option<*mut libc::c_void> {
+    None
+}
+
+#[cfg(target_os = "wasi")]
+unsafe fn close_library(_handle: RawLibHandle) {}
+
+#[cfg(target_os = "wasi")]
+fn last_load_error(path: &str) -> String {
+    format!("cannot load native plugin {path}: WASI has no dynamic libraries")
+}
+
 struct PluginMetadata {
     name: String,
     version: String,
@@ -307,6 +330,37 @@ pub fn scan_plugin_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     for value in reg.config.values_mut() {
         visitor.visit_nanbox_u64_slot(value);
     }
+}
+
+/// Thread-exit release (#11471): drop every plugin registration (hook, tool,
+/// service, route, event handler) whose closure, and every config value that,
+/// lies in the exiting thread's freed arena blocks. The registration FFI is
+/// callable from any thread with no check, and the registry is scanned as a
+/// GC root and invoked by `emit_hook`/`invoke_tool`, so a left-behind entry
+/// would name whatever the recycled address holds next. Plugin entries and
+/// library handles are left alone: they hold no heap address.
+///
+/// Runs in the exiting thread's TLS destructor: a plain poison-tolerant lock
+/// (not `lock_gc_root_registry`, which touches a thread-local), no JS.
+pub(crate) fn release_plugin_registry_in_freed_ranges(
+    freed: &crate::arena::thread_exit::FreedRanges,
+) {
+    let mut reg = REGISTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for hooks in reg.hooks.values_mut() {
+        hooks.retain(|h| !freed.holds_bits(h.handler_closure));
+    }
+    reg.hooks.retain(|_, v| !v.is_empty());
+    reg.tools.retain(|t| !freed.holds_bits(t.handler_closure));
+    reg.services
+        .retain(|s| !freed.holds_bits(s.start_fn) && !freed.holds_bits(s.stop_fn));
+    reg.routes.retain(|r| !freed.holds_bits(r.handler_closure));
+    for handlers in reg.events.values_mut() {
+        handlers.retain(|e| !freed.holds_bits(e.handler_closure));
+    }
+    reg.events.retain(|_, v| !v.is_empty());
+    reg.config.retain(|_, value| !freed.holds_bits(*value));
 }
 
 // ============================================================================

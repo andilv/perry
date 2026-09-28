@@ -191,6 +191,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./scripts/check_changeset_fragment.sh --self-test
 
+      - name: Cargo test scope regression tests
+        run: python3 -m unittest discover -s tests -p 'test_ci_test_scope.py' -v
+
       - name: Docs catalog toolchain tests
         run: python3 docs/scripts/test_i18n_toolchain.py
 
@@ -225,6 +228,11 @@ jobs:
         run: |
           python3 tests/test_release_pipeline.py
           node --test scripts/publish/platform-visibility.test.mjs
+
+      # #11560: the parity harness gave auto-optimize compiles of plain fixtures
+      # the 300s budget, so the full tier killed ~36 per run mid-rebuild.
+      - name: Parity harness compile-budget regression
+        run: ./tests/test_parity_compile_budget.sh
 
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-08-20 --profile minimal --component rustfmt --component clippy
@@ -412,16 +420,12 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/subsystem_slots.py
 
-      # turnloop migration (docs/turnloop/): Perry is moving off tokio, and the
-      # only record of what is left used to be eight lane reports written at
-      # eight different commits — which had already gone stale in both
-      # directions by the time P8 read them. This re-derives the remaining
-      # surface from the tree: every (workspace crate -> tokio-family crate)
-      # manifest edge and every tokio-family package in Cargo.lock, compared
-      # strictly against scripts/tokio_inventory.json. A NEW edge fails, and so
-      # does a STALE entry, so a lane that removes an edge must delete its own
-      # line and the file can never describe a tree that is gone.
-      - name: tokio dependency inventory
+      # tokio was removed from the workspace (final tokio lane; turnloop is the
+      # only event loop, including in tests). This fails on ANY tokio manifest
+      # edge (normal/dev/build, any target), ANY tokio package in Cargo.lock
+      # and ANY non-comment `tokio::` in crates/* — no allowlist. The self-test
+      # plants each of those and proves the gate still goes red.
+      - name: tokio ban (no tokio in the workspace)
         if: ${{ !cancelled() }}
         run: |
           python3 scripts/tokio_inventory.py --self-test
@@ -512,6 +516,33 @@ jobs:
         run: |
           python3 scripts/gc_runtime_root_holders.py --self-test
           python3 scripts/gc_runtime_root_holders.py
+
+      # #11471. The other half of the census above: a process-global cache
+      # KEYED by (or holding) a heap address is not a GC root, so that audit
+      # cannot see it, yet it goes stale the moment its thread exits and
+      # `Arena::drop` hands the blocks to another thread's arena. #11319,
+      # #11462 and #11470 were all this shape, each found by chasing a flake.
+      # Every such static must carry a thread-exit verdict; a new unclassified
+      # one fails, and so does a stale entry. Build-free, so it lives in `lint`.
+      - name: Thread-exit custody of address-keyed globals (#11471)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/thread_exit_address_globals.py --self-test
+          python3 scripts/thread_exit_address_globals.py
+
+      # #11511. The holder audit above proves a table is SCANNED, not that it
+      # ever SHRINKS. The Web Fetch handle registries were `remove`d only in
+      # tests, so a server leaked every request/response until the id band ran
+      # out and panicked (#11164/#11165). Every map-like static in the runtime,
+      # stdlib, ffi and ext crates must have a production removal path or a
+      # written verdict; a new unclassified one fails, and so does a stale
+      # entry. `--self-test` plants a test-only-removal registry and requires
+      # it to fail. Build-free, so it lives in `lint`.
+      - name: Registry lifetime audit (#11511)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/registry_lifetime_check.py --self-test
+          python3 scripts/registry_lifetime_check.py
 
       # #8821. The poll-reach audit is static, build-free and sub-second, but it
       # lived ONLY in `gc-root-dominance.yml`, which is label-gated behind
@@ -662,6 +693,11 @@ jobs:
       - name: GC evacuation-liveness assert can say no
         if: ${{ !cancelled() }}
         run: python3 scripts/gc_evacuation_liveness_assert.py --self-test
+
+      - name: Native runtime ABI consistency
+        run: |
+          python3 scripts/runtime_abi_check.py --self-test
+          python3 scripts/runtime_abi_check.py --check-native
 
       # Node is a correctness input (see CLAUDE.md "TypeScript Parity Status"):
       # an oracle that cannot run a gap test drops it from the gate instead of
@@ -3109,10 +3145,15 @@ jobs:
       matrix:
         shard: ${{ fromJSON(needs.plan.outputs.plan).parity.shards }}
     runs-on: ubuntu-latest
-    # A healthy shard must finish well below this cap after the 12-way split.
-    # 210 is a hang backstop with cold-cache/host-contention margin, not a
+    # A hang backstop with cold-cache/host-contention margin, not a
     # performance budget; a cancelled shard makes full-suite-gate fail.
-    timeout-minutes: 210
+    # #11560: auto-optimize rebuilds a runtime+stdlib per distinct feature set
+    # (~370 rebuilds of ~280s across the 12 shards), so the harness alone runs
+    # 2h06m-3h05m per shard (09-27 full run) and shard 3's job took 3h24m of
+    # the old 210 -- six minutes of margin, before #11563 let the rebuilds that
+    # used to be killed at 300s run to completion. The shard count is the real
+    # lever; this cap only keeps a slow-but-healthy shard from being cancelled.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Rust toolchain
@@ -4175,6 +4216,20 @@ jobs:
       - name: Lint docs/src markdown fences (repo-wide)
         if: matrix.os == 'macos-14'
         run: cargo run --release --quiet -p perry-doc-tests -- --lint docs/src
+
+      # #11560: the uuid / nanoid / validator / fastify / mysql2 / ioredis
+      # native bindings are gone, so the doc examples that import those
+      # packages compile the real package source from the repo-root
+      # node_modules (docs/examples resolves upward to it). Without an install
+      # the imports are unresolved and the link fails on `_fastify` /
+      # `_nanoid` / `_uuidv4` (every full run since 09-20).
+      - name: Setup Node.js for the doc examples' npm packages
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+
+      - name: Install the npm packages the doc examples import
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Run non-gallery doc-example tests (blocking)
         run: ${{ matrix.cmd_exclude_gallery }}

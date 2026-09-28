@@ -281,8 +281,11 @@ fn lower_guarded_numeric_add(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String>
 /// respectively).
 ///
 /// The bitwise operators take the same guard (#10418): their numeric arm is
-/// `ToInt32 <op> ToInt32`, which `toint32_wrap` computes for every Number
-/// (NaN and ±Infinity included), with the shift count masked to 5 bits.
+/// `ToInt32 <op> ToInt32` with the shift count masked to 5 bits. Their test
+/// is a range test rather than a tag test (#10511) — see
+/// [`emit_is_int64_exact_number`] — so once any operand needs a guard, every
+/// operand is range-tested and the numeric arm's ToInt32 is a single
+/// `fptosi`. With no guard at all, `toint32_wrap` covers every Number.
 fn lower_guarded_numeric_arith(
     ctx: &mut FnCtx<'_>,
     op: BinaryOp,
@@ -295,14 +298,21 @@ fn lower_guarded_numeric_arith(
         .iter()
         .map(|leaf| !crate::type_analysis::expr_produces_canonical_raw_f64(ctx, leaf))
         .collect();
+    let range_guard = is_bitwise_op(op) && needs_test.contains(&true);
 
     with_operands_rooted(ctx, &leaves, |ctx, values| {
         let mut cond: Option<String> = None;
         for (value, is_tested) in values.iter().zip(needs_test.iter()) {
-            if !is_tested {
+            let is_num = if range_guard {
+                // A proven Number is tested too: NaN, ±Infinity and
+                // |v| >= 2^63 need the helper's ToInt32, and the compare is
+                // two instructions where `toint32_wrap` is ~25.
+                emit_is_int64_exact_number(ctx, value)
+            } else if *is_tested {
+                crate::stmt::emit_js_value_is_number(ctx, value)
+            } else {
                 continue;
-            }
-            let is_num = crate::stmt::emit_js_value_is_number(ctx, value);
+            };
             cond = Some(match cond {
                 Some(prev) => ctx.block().and(I1, &prev, &is_num),
                 None => is_num,
@@ -313,9 +323,17 @@ fn lower_guarded_numeric_arith(
             BinaryOp::Mul => ctx.block().fmul(l, r),
             BinaryOp::Div => ctx.block().fdiv(l, r),
             _ => {
+                // Under the range guard both operands are Numbers with
+                // |v| < 2^63, where truncating to i64 and keeping the low 32
+                // bits IS ToInt32 (#11384). Otherwise take the guarded
+                // hardware fast path with its exact cold arm (#10897).
+                let (li, ri) = if range_guard {
+                    let blk = ctx.block();
+                    (blk.toint32_fast(l), blk.toint32_fast(r))
+                } else {
+                    (ctx.toint32_wrap(l), ctx.toint32_wrap(r))
+                };
                 let blk = ctx.block();
-                let li = blk.toint32_wrap(l);
-                let ri = blk.toint32_wrap(r);
                 let v = match op {
                     BinaryOp::BitAnd => blk.and(I32, &li, &ri),
                     BinaryOp::BitOr => blk.or(I32, &li, &ri),
@@ -370,6 +388,25 @@ fn lower_guarded_numeric_arith(
             .block()
             .phi(DOUBLE, &[(&fast_val, &fast_end), (&slow_val, &slow_end)]))
     })
+}
+
+/// `|v| < 2^63` as an `i1`: the bitwise operators' guard (#10511).
+///
+/// One ordered compare answers both questions the numeric arm needs. Every
+/// NaN-boxed tag is a NaN bit pattern and NaN is unordered, so a tagged value
+/// (string, object, BigInt, int32 box, undefined …) fails it exactly as it
+/// fails `emit_js_value_is_number`. And for every Number that passes,
+/// truncating to i64 is exact, so ToInt32 is `fptosi` plus a `trunc` that
+/// keeps the low 32 bits — one `cvttsd2si` instead of `toint32_wrap`'s
+/// exponent/mantissa tower. The Numbers it turns away (NaN, ±Infinity,
+/// |v| >= 2^63) are the ones ToInt32 has to special-case, and the cold arm's
+/// helper already does.
+fn emit_is_int64_exact_number(ctx: &mut FnCtx<'_>, value: &str) -> String {
+    const TWO_POW_63: &str = "0x43E0000000000000";
+    let magnitude = ctx
+        .block()
+        .call(DOUBLE, "llvm.fabs.f64", &[(DOUBLE, value)]);
+    ctx.block().fcmp("olt", &magnitude, TWO_POW_63)
 }
 
 /// `PERRY_GUARDED_ARITH=0` restores the unconditional dynamic helper for
@@ -1521,17 +1558,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 | BinaryOp::Shr => {
                     let l_safe = is_known_i32_range(ctx, left);
                     let r_safe = is_known_i32_range(ctx, right);
-                    let blk = ctx.block();
                     let li = if l_safe {
-                        blk.toint32_fast(&l)
+                        ctx.block().toint32_fast(&l)
                     } else {
-                        blk.toint32_wrap(&l)
+                        ctx.toint32_wrap(&l)
                     };
                     let ri = if r_safe {
-                        blk.toint32_fast(&r)
+                        ctx.block().toint32_fast(&r)
                     } else {
-                        blk.toint32_wrap(&r)
+                        ctx.toint32_wrap(&r)
                     };
+                    let blk = ctx.block();
                     let v = match op {
                         BinaryOp::BitAnd => blk.and(I32, &li, &ri),
                         BinaryOp::BitOr => blk.or(I32, &li, &ri),
@@ -1553,17 +1590,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 BinaryOp::UShr => {
                     let l_safe = is_known_i32_range(ctx, left);
                     let r_safe = is_known_i32_range(ctx, right);
-                    let blk = ctx.block();
                     let li = if l_safe {
-                        blk.toint32_fast(&l)
+                        ctx.block().toint32_fast(&l)
                     } else {
-                        blk.toint32_wrap(&l)
+                        ctx.toint32_wrap(&l)
                     };
                     let ri = if r_safe {
-                        blk.toint32_fast(&r)
+                        ctx.block().toint32_fast(&r)
                     } else {
-                        blk.toint32_wrap(&r)
+                        ctx.toint32_wrap(&r)
                     };
+                    let blk = ctx.block();
                     let v = blk.lshr(I32, &li, &ri);
                     blk.uitofp(I32, &v, DOUBLE)
                 }

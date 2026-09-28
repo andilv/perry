@@ -261,9 +261,9 @@ impl FieldLookupCaches {
 // reach the cross-module helpers via their own `use super::*;`.
 pub use accessors::js_object_get_field;
 pub(crate) use accessors::{
-    accessor_receiver_override_begin, accessor_receiver_override_end,
-    accessor_receiver_override_take, array_prototype_property_value,
-    builtin_reflection_accessor_read, call_class_getter, invoke_accessor_getter,
+    accessor_receiver_override_armed, accessor_receiver_override_begin,
+    accessor_receiver_override_end, accessor_receiver_override_take,
+    array_prototype_property_value, builtin_reflection_accessor_read, invoke_accessor_getter,
     invoke_accessor_setter, is_typed_array_prototype, object_field_at_with_live,
     ordinary_object_prototype_property_value, own_data_field_by_name,
     primitive_builtin_prototype_property, primitive_object_prototype_accessor,
@@ -337,6 +337,11 @@ pub use ic_slot::{
     pic_arena_bytes, pic_slot_peek, pic_slot_resolve, pic_slot_resolve_init, pic_slots_resolved,
 };
 pub use ic_slow::{js_object_get_field_ic_nonptr, js_object_get_field_ic_slow};
+/// S2 of the deferred-collection RFC: the full-outline read as a GC-leaf hit
+/// plus a collecting miss continuation.
+#[path = "field_get_set/ic_miss/outline_split.rs"]
+mod outline_split;
+pub use outline_split::{js_object_get_field_ic_fast, js_object_get_field_ic_fast_miss};
 
 #[cfg(test)]
 mod buffer_ic_miss_tests {

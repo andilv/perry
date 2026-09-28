@@ -770,6 +770,24 @@ fn inline_slot_floor_matches_codegen() {
     );
 }
 
+/// S5: the emitted `pic.spill.hit` loads `ObjectMeta.spill` at a literal
+/// offset and a spill element past a literal `ArrayHeader` size
+/// (`perry-codegen/src/target_layout.rs`: `OBJECT_META_SPILL_OFFSET_BYTES`,
+/// `ARRAY_HEADER_SIZE_BYTES`). Pin both numbers here.
+#[test]
+fn spill_layout_matches_codegen() {
+    assert_eq!(
+        std::mem::offset_of!(crate::object::ObjectMeta, spill),
+        32,
+        "perry-codegen's OBJECT_META_SPILL_OFFSET_BYTES is 32; update both sides together"
+    );
+    assert_eq!(
+        std::mem::size_of::<crate::array::ArrayHeader>(),
+        8,
+        "perry-codegen's ARRAY_HEADER_SIZE_BYTES is 8; update both sides together"
+    );
+}
+
 /// #7916: lowering the floor must not change what `{}` + by-name growth does,
 /// only where the inline/overflow boundary sits. Fields placed past the
 /// boundary go to overflow storage and must still read back — the property
@@ -861,7 +879,7 @@ fn text_encoding_stream_globals_construct_readable_writable_shape() {
             );
 
             let ctor_ptr = ctor.as_pointer::<crate::closure::ClosureHeader>();
-            assert_eq!((*ctor_ptr).type_tag, crate::closure::CLOSURE_MAGIC);
+            assert!(crate::closure::closure_kind_probe(ctor_ptr as usize));
 
             let class_id = match ctor_name {
                 "TextEncoderStream" => crate::object::class_registry::CLASS_ID_TEXT_ENCODER_STREAM,

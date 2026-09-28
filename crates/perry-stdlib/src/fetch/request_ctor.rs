@@ -38,6 +38,19 @@ pub unsafe extern "C" fn js_request_new(
         throw_fetch_type_error(&format!("'{raw_method}' HTTP method is unsupported."));
     }
     let method = normalize_method(&raw_method);
+    // Copy every string argument now: taking or draining the body stream below
+    // can run JS, which may move heap strings. Root `signal` for the same reason.
+    let referrer = string_from_header(referrer_ptr).unwrap_or_else(|| "about:client".to_string());
+    let referrer_policy = string_from_header(referrer_policy_ptr).unwrap_or_default();
+    let mode = string_from_header(mode_ptr).unwrap_or_else(|| "cors".to_string());
+    let credentials =
+        string_from_header(credentials_ptr).unwrap_or_else(|| "same-origin".to_string());
+    let cache = string_from_header(cache_ptr).unwrap_or_else(|| "default".to_string());
+    let redirect = string_from_header(redirect_ptr).unwrap_or_else(|| "follow".to_string());
+    let integrity = string_from_header(integrity_ptr).unwrap_or_default();
+    let duplex = string_from_header(duplex_ptr).unwrap_or_else(|| "half".to_string());
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    let signal_root = scope.root_nanbox_f64(signal);
     // A Buffer / Uint8Array / typed-array / ArrayBuffer body reaches us as a
     // BufferHeader/TypedArrayHeader pointer (codegen ran the value through
     // `js_get_string_pointer_unified`), NOT a StringHeader — the same for both
@@ -85,9 +98,11 @@ pub unsafe extern "C" fn js_request_new(
     {
         throw_fetch_type_error("Request with GET/HEAD method cannot have body.");
     }
-    let body = pending_stream_id
-        .map(crate::streams::drain_readable_into_bytes)
-        .or(non_stream_body);
+    let (body, body_error) = match pending_stream_id.map(drain_body_stream) {
+        Some((bytes, error)) => (Some(bytes), error),
+        None => (non_stream_body, None),
+    };
+    let body_error = body_error.map(|error| scope.root_nanbox_f64(error));
     let headers_id_in = handle_id(headers_handle);
     let mut headers = if headers_id_in != 0 {
         HEADERS_REGISTRY
@@ -110,7 +125,7 @@ pub unsafe extern "C" fn js_request_new(
     // lock: the scanner takes that same lock during a collection on this
     // thread, and a collection triggered by the allocation under the guard
     // would deadlock.
-    let signal = body_metadata::signal_or_default(signal);
+    let signal = body_metadata::signal_or_default(signal_root.get_nanbox_f64());
     let id = alloc_fetch_handle_id();
     let record = RequestRecord {
         url,
@@ -119,18 +134,18 @@ pub unsafe extern "C" fn js_request_new(
         body_used: false,
         headers,
         destination: String::new(),
-        referrer: string_from_header(referrer_ptr).unwrap_or_else(|| "about:client".to_string()),
-        referrer_policy: string_from_header(referrer_policy_ptr).unwrap_or_default(),
-        mode: string_from_header(mode_ptr).unwrap_or_else(|| "cors".to_string()),
-        credentials: string_from_header(credentials_ptr)
-            .unwrap_or_else(|| "same-origin".to_string()),
-        cache: string_from_header(cache_ptr).unwrap_or_else(|| "default".to_string()),
-        redirect: string_from_header(redirect_ptr).unwrap_or_else(|| "follow".to_string()),
-        integrity: string_from_header(integrity_ptr).unwrap_or_default(),
+        referrer,
+        referrer_policy,
+        mode,
+        credentials,
+        cache,
+        redirect,
+        integrity,
         keepalive: body_metadata::bool_from_js(keepalive),
-        duplex: string_from_header(duplex_ptr).unwrap_or_else(|| "half".to_string()),
+        duplex,
         signal,
         cached_headers_id: None,
+        body_error: body_error.map(|error| error.get_nanbox_f64()),
     };
     super::gc::ensure_gc_registered();
     REQUEST_REGISTRY.lock().unwrap().insert(id, record);
@@ -197,8 +212,16 @@ pub unsafe extern "C" fn js_request_new_from_init(url_ptr: *const StringHeader, 
 
     // `headers`: build a fresh Headers store from whatever the init carries
     // (a Headers handle, a plain object, or an iterable of `[name, value]`).
+    // Only `undefined` means "absent". `headers: null` is a HeadersInit that
+    // fails conversion — `new Headers(null)` throws a TypeError, and so does
+    // `new Request(url, { headers: null })` in Node — so it must reach
+    // `js_headers_init_from_value`, which raises it. #10380 routed every
+    // literal RequestInit through this function, and folding null into the
+    // absent case turned that TypeError into a silently header-less request
+    // (#11560). `request_copy.rs`'s override path already tests exactly
+    // `TAG_UNDEFINED`.
     let headers_val = field(b"headers");
-    let headers_handle = if matches!(headers_val.to_bits(), TAG_UNDEFINED | TAG_NULL) {
+    let headers_handle = if headers_val.to_bits() == TAG_UNDEFINED {
         0.0
     } else {
         let h = js_headers_new();
@@ -213,10 +236,27 @@ pub unsafe extern "C" fn js_request_new_from_init(url_ptr: *const StringHeader, 
         keepalive
     };
 
-    js_request_new(
+    // Reflective Request construction also reaches this path (#10380).
+    // Keep its BodyInit conversion: a ReadableStream is a handle whose
+    // bytes must be drained, rather than interpreted as a string pointer.
+    let body_value = field(b"body");
+    let (body_ptr, content_type) = if matches!(body_value.to_bits(), TAG_UNDEFINED | TAG_NULL) {
+        // No conversion happened here: pending metadata can belong to an
+        // outer Response whose init getter is constructing this Request.
+        (std::ptr::null(), None)
+    } else {
+        let outer_content_type = take_pending_fetch_body_content_type();
+        let ptr = js_response_body_init_ptr(body_value) as *const StringHeader;
+        // Consume our metadata while restoring any enclosing constructor's.
+        // Later getters and stream pulls can perform more nested conversions.
+        let content_type = take_pending_fetch_body_content_type();
+        set_pending_fetch_body_content_type(outer_content_type);
+        (ptr, content_type)
+    };
+    let result = js_request_new(
         url_ptr,
         str_field(b"method"),
-        str_field(b"body"),
+        body_ptr,
         headers_handle,
         str_field(b"referrer"),
         str_field(b"referrerPolicy"),
@@ -228,5 +268,14 @@ pub unsafe extern "C" fn js_request_new_from_init(url_ptr: *const StringHeader, 
         keepalive,
         str_field(b"duplex"),
         field(b"signal"),
-    )
+    );
+    if let Some(content_type) = content_type {
+        let mut registry = REQUEST_REGISTRY.lock().unwrap();
+        if let Some(request) = registry.get_mut(&handle_id(result)) {
+            if !request.headers.has("content-type") {
+                request.headers.set("content-type", content_type);
+            }
+        }
+    }
+    result
 }

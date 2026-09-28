@@ -89,6 +89,55 @@ unsafe fn keys_array_may_carry_to_json(keys_view: crate::object::ObjectKeys) -> 
     false
 }
 
+/// [`keys_array_may_carry_to_json`] fused with the other question a member's
+/// walk asks of the same keys — does any key need ECMA-262 index ordering
+/// (`ecma_own_key_order`) — so the array is scanned once, not twice (#10696).
+/// `None` when a key may carry a `toJSON` or the array is not a well-formed
+/// keys array (the caller then takes the general path); otherwise whether
+/// any key is a canonical array index.
+unsafe fn member_keys_scan(keys_view: crate::object::ObjectKeys) -> Option<bool> {
+    let keys = keys_view.arr();
+    if keys.is_null() {
+        return Some(false);
+    }
+    let keys_addr = keys as usize;
+    if keys_addr & 0x7 != 0 {
+        return None;
+    }
+    let keys_gc = crate::value::addr_class::try_read_gc_header(keys_addr)?;
+    let key_count = keys_view.count() as usize;
+    if keys_gc.obj_type != crate::gc::GC_TYPE_ARRAY
+        || key_count > (*keys).capacity as usize
+        || key_count > (*keys).length as usize
+        || key_count > 4096
+    {
+        return None;
+    }
+    let elements =
+        crate::array::array_elements_ptr(keys as *const crate::ArrayHeader) as *const f64;
+    let mut has_index_key = false;
+    let mut inline = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    for i in 0..key_count {
+        let stored = JSValue::from_bits((*elements.add(i)).to_bits());
+        let Some(bytes) = crate::string::js_string_key_bytes(stored, &mut inline) else {
+            continue;
+        };
+        match bytes.first() {
+            // Every marker is longer than an inline string, so testing inline
+            // keys too answers exactly what `key_may_carry_to_json` does.
+            Some(b't' | b'_') if key_bytes_may_carry_to_json(bytes) => return None,
+            Some(first) if first.is_ascii_digit() && !has_index_key => {
+                has_index_key = std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(crate::object::canonical_array_index)
+                    .is_some();
+            }
+            _ => {}
+        }
+    }
+    Some(has_index_key)
+}
+
 // All forwarding markers are longer than the inline-string representation.
 // Keep the short-string and leading-byte exclusions tied to their constants.
 const _: () = {
@@ -453,6 +502,9 @@ struct ClassChainToJsonEntry {
     semantic_epoch: u64,
     surface_gen: u64,
     may_have: bool,
+    /// [`class_is_plain_record_uncached`]'s answer, filled under the same
+    /// generations (#10529). Implies `!may_have`.
+    plain_record: bool,
 }
 
 /// Sized for the distinct object-literal SHAPES a serialization walk touches,
@@ -471,6 +523,7 @@ const EMPTY_CLASS_CHAIN_TOJSON: ClassChainToJsonEntry = ClassChainToJsonEntry {
     semantic_epoch: 0,
     surface_gen: 0,
     may_have: false,
+    plain_record: false,
 };
 
 crate::perry_thread_local! {
@@ -496,6 +549,12 @@ fn class_chain_tojson_slot(class_id: u32) -> usize {
 
 #[inline]
 fn class_chain_may_have_to_json(class_id: u32) -> bool {
+    class_chain_to_json_entry(class_id).may_have
+}
+
+/// The memo entry for `class_id`, refilled when any keyed generation moved.
+#[inline]
+fn class_chain_to_json_entry(class_id: u32) -> ClassChainToJsonEntry {
     debug_assert_ne!(class_id, 0, "class id 0 is answered by the caller");
     let vtable_gen = crate::object::vtable_generation();
     let semantic_epoch = crate::object::prop_plan::prop_plan_semantic_epoch();
@@ -507,9 +566,50 @@ fn class_chain_may_have_to_json(class_id: u32) -> bool {
         && entry.semantic_epoch == semantic_epoch
         && entry.surface_gen == surface_gen
     {
-        return entry.may_have;
+        return entry;
     }
     class_chain_to_json_memo_fill(class_id, vtable_gen, semantic_epoch, surface_gen, slot)
+}
+
+/// Is an instance of `class_id` serialized by `JSON.stringify` exactly like a
+/// `class_id == 0` plain object — own enumerable data fields only, nothing
+/// reachable through the class? (#10529, #10696)
+///
+/// HIR lowers closed-shape object literals to synthetic `__AnonShape_<hash>`
+/// classes, so `class_id != 0` is true of essentially every literal. The
+/// plain-data emitters (`stringify_flat`, `stringify_record_output`,
+/// `stringify_nested_records`, `stringify_data_record`, the shape template)
+/// used `class_id != 0` as their "might have a prototype `toJSON` or private
+/// elements" gate, which declined every literal and left them serving only
+/// `JSON.parse` output. This is the precise form of that gate. It rides the
+/// per-class memo above, so it costs one slot compare per object.
+///
+/// Per-instance facts (an own `toJSON` key, `Object.setPrototypeOf`,
+/// descriptors, `Object.prototype.toJSON`) are NOT covered: callers keep
+/// checking those exactly as they do for `class_id == 0`.
+#[inline]
+pub(super) fn class_is_plain_record(class_id: u32) -> bool {
+    class_id == 0 || class_chain_to_json_entry(class_id).plain_record
+}
+
+/// A registered anon shape whose class surface is empty — the same proof the
+/// thenable probe uses (`promise::then_probe::class_registry_inert`: no
+/// vtable, no prototype object of either flavour, no parent edge) — plus no
+/// registered class name, which a declared class whose per-module id collides
+/// with an anon-shape id carries (`declared_class_outranks_anon_shape`). Anon
+/// shapes carry no private elements or runtime-internal keys; those only come
+/// from declared classes.
+///
+/// Staleness is safe in the direction that matters: the anon-shape set is
+/// insert-only, and a vtable entry, prototype object or parent edge appearing
+/// later moves one of the generations this is memoized under. A stale `false`
+/// only keeps the general walk.
+fn class_is_plain_record_uncached(class_id: u32, may_have: bool) -> bool {
+    !may_have
+        && class_id != crate::object::NATIVE_MODULE_CLASS_ID
+        && crate::object::is_anon_shape_class_id(class_id)
+        && crate::promise::then_probe::class_registry_inert(class_id)
+        && crate::object::class_name_for_id(class_id).is_none()
 }
 
 #[cold]
@@ -520,20 +620,20 @@ fn class_chain_to_json_memo_fill(
     semantic_epoch: u64,
     surface_gen: u64,
     slot: usize,
-) -> bool {
+) -> ClassChainToJsonEntry {
     #[cfg(test)]
     CLASS_CHAIN_TOJSON_RECOMPUTES.with(|count| count.set(count.get() + 1));
     let may_have = class_chain_may_have_to_json_uncached(class_id);
-    CLASS_CHAIN_TOJSON_MEMO.with(|table| {
-        table[slot].set(ClassChainToJsonEntry {
-            class_id,
-            vtable_gen,
-            semantic_epoch,
-            surface_gen,
-            may_have,
-        })
-    });
-    may_have
+    let entry = ClassChainToJsonEntry {
+        class_id,
+        vtable_gen,
+        semantic_epoch,
+        surface_gen,
+        may_have,
+        plain_record: class_is_plain_record_uncached(class_id, may_have),
+    };
+    CLASS_CHAIN_TOJSON_MEMO.with(|table| table[slot].set(entry));
+    entry
 }
 
 #[cfg(test)]
@@ -620,13 +720,126 @@ pub(super) unsafe fn to_json_definitely_absent_after_own_keys(ptr: *const u8) ->
 /// Once its constructor property is cached, even a dirty verdict is recomputed
 /// with direct reads only; class/prototype overrides still decline normally.
 pub(super) unsafe fn to_json_definitely_absent_without_gc(ptr: *const u8) -> bool {
-    if (*(ptr as *const crate::ObjectHeader)).class_id != 0
+    if !class_is_plain_record((*(ptr as *const crate::ObjectHeader)).class_id)
         || (OBJECT_PROTO_TOJSON_STATE.with(|c| c.get()) == PROTO_TOJSON_DIRTY
             && CACHED_OBJECT_PROTO_BITS.with(|c| c.get()) == 0)
     {
         return false;
     }
     to_json_definitely_absent(ptr)
+}
+
+/// Could `ptr` (a validated `GC_TYPE_OBJECT`) resolve a `toJSON` from
+/// anywhere but an own key — its class chain, a recorded
+/// `Object.setPrototypeOf` prototype, or `Object.prototype`? Own keys are the
+/// caller's business: an own callable `toJSON` is a closure-valued field.
+///
+/// Never allocates or collects, so a caller may hold `ptr` unrooted across
+/// it: while the default-prototype cache is still cold (its first lookup can
+/// populate globalThis) it answers `true`, sending the caller to the rooted
+/// probe. Once that cache is warm, even a dirty verdict is recomputed with
+/// direct reads only (see `to_json_definitely_absent_without_gc`).
+///
+/// `class_plain_record` is [`class_is_plain_record`] of `ptr`'s class, which
+/// the caller also needs for itself.
+#[inline]
+pub(super) unsafe fn inherited_to_json_possible_without_gc(
+    ptr: *const u8,
+    class_plain_record: bool,
+) -> bool {
+    !class_plain_record
+        || crate::object::prototype_chain::object_static_prototype(ptr as usize).is_some()
+        || (OBJECT_PROTO_TOJSON_STATE.with(|c| c.get()) == PROTO_TOJSON_DIRTY
+            && CACHED_OBJECT_PROTO_BITS.with(|c| c.get()) == 0)
+        || object_proto_may_have_to_json()
+}
+
+/// An object-valued member the walk may serialize by walking it directly,
+/// with the shape facts that walk needs: an ordinary object that no `toJSON`
+/// can reach (#10696).
+///
+/// Otherwise every nested object pays two dispatch chains that both end at
+/// that same walk: `member_to_json` (buffer, typed array, RegExp, boxed
+/// primitive, GC type, then the `toJSON` proof) and `stringify_value_depth`
+/// (handle band, boxed primitive, RegExp, Date, Temporal, raw JSON, buffer,
+/// typed array, Symbol, Array-subclass backing, GC type). Each exclusion is
+/// decided here instead:
+///
+/// - buffers and small typed arrays carry no `GcHeader`, so their registries
+///   rule them out BEFORE the header read, in `member_to_json`'s order;
+/// - a validated, unforwarded `GC_TYPE_OBJECT` header excludes the handle
+///   band and the RegExp, Date, Temporal and Symbol cells, which carry their
+///   own GC types;
+/// - [`class_is_plain_record`] excludes the reserved boxed-primitive and
+///   raw-JSON class ids, native module namespaces and every declared class,
+///   and implies no class chain can produce a `toJSON`;
+/// - a null meta record means no recorded prototype (a shaped object answers
+///   `object_static_prototype` from its meta record alone) and no
+///   Array-subclass elements backing (`subclass_elements::elements_of`);
+/// - no own key is `toJSON` or a native-forwarding marker, and
+///   `Object.prototype` has no `toJSON` — the stringify-wide half, which also
+///   declines while a `toJSON` result's one-shot suppression is armed.
+///
+/// Never allocates, collects or calls user code (the `Object.prototype`
+/// verdict is consulted only once its cache is warm), so the facts are still
+/// valid when the caller starts the member's walk. Any doubt returns `None`
+/// and the caller takes the general member path.
+///
+/// `global_proof` is the walk's copy of the stringify-wide half, with the
+/// shape template's `data_record_global_proof` contract: established here on
+/// first use, and cleared by the walk before anything that can run user code.
+/// Only user code can give `Object.prototype` a `toJSON`, so between those
+/// points one verdict serves every member instead of revalidating the
+/// prototype's signature per object.
+pub(super) unsafe fn plain_object_member(
+    bits: u64,
+    global_proof: &mut bool,
+) -> Option<(*const u8, PlainMember)> {
+    if bits & crate::value::TAG_MASK != POINTER_TAG {
+        return None;
+    }
+    let addr = (bits & POINTER_MASK) as usize;
+    if crate::buffer::is_registered_buffer(addr)
+        || crate::typedarray::lookup_typed_array_kind(addr).is_some()
+    {
+        return None;
+    }
+    let header = crate::value::addr_class::try_read_gc_header(addr)?;
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    {
+        return None;
+    }
+    let obj = addr as *const crate::ObjectHeader;
+    if !(*obj).meta.is_null() || !class_is_plain_record((*obj).class_id) {
+        return None;
+    }
+    let (keys, live_slots) = crate::object::object_keys_and_live_slot_count(obj);
+    let has_index_key = member_keys_scan(keys)?;
+    if !*global_proof {
+        *global_proof = data_record_global_to_json_absent_without_gc();
+        if !*global_proof {
+            return None;
+        }
+    }
+    Some((
+        obj.cast(),
+        PlainMember {
+            keys,
+            live_slots,
+            has_index_key,
+        },
+    ))
+}
+
+/// What [`plain_object_member`] resolved about a member it admitted, for that
+/// member's walk to reuse: its keys and live inline-slot bound (one shape
+/// probe), and whether any key needs ECMA-262 index ordering.
+#[derive(Clone, Copy)]
+pub(super) struct PlainMember {
+    pub(super) keys: crate::object::ObjectKeys,
+    pub(super) live_slots: u32,
+    pub(super) has_index_key: bool,
 }
 
 /// Establish the stringify-wide part of the plain-data record proof.
@@ -676,12 +889,8 @@ pub(crate) fn set_to_json_key_str(key: &str) {
 /// for the element about to be serialized.
 #[inline]
 pub(crate) fn set_to_json_key_index(index: usize) {
-    use std::fmt::Write;
-    TO_JSON_KEY.with(|c| {
-        let mut s = c.borrow_mut();
-        s.clear();
-        let _ = write!(s, "{index}");
-    });
+    let mut digits = itoa::Buffer::new();
+    set_to_json_key_str(digits.format(index));
 }
 
 /// Record a NaN-boxed JS string value as the pending `toJSON` key. The

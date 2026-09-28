@@ -105,9 +105,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         let name = b"globalThis";
         let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         let value = crate::value::js_nanbox_pointer(singleton() as i64);
-        js_object_set_field_by_name(singleton(), key, value);
-        super::super::set_builtin_property_attrs(
-            singleton() as usize,
+        super::super::define_builtin_data_property(
+            singleton(),
+            key,
+            value,
             "globalThis".to_string(),
             super::super::PropertyAttrs::new(true, false, true),
         );
@@ -120,9 +121,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         let name = b"global";
         let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         let value = crate::value::js_nanbox_pointer(singleton() as i64);
-        js_object_set_field_by_name(singleton(), key, value);
-        super::super::set_builtin_property_attrs(
-            singleton() as usize,
+        super::super::define_builtin_data_property(
+            singleton(),
+            key,
+            value,
             "global".to_string(),
             super::super::PropertyAttrs::new(true, true, true),
         );
@@ -182,9 +184,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
                     );
                 }
             }
-            js_object_set_field_by_name(singleton(), name_key, ctor_value);
-            super::super::set_builtin_property_attrs(
-                singleton() as usize,
+            super::super::define_builtin_data_property(
+                singleton(),
+                name_key,
+                ctor_value,
                 name.to_string(),
                 super::super::PropertyAttrs::new(true, false, true),
             );
@@ -346,9 +349,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         };
         if !proto_obj.is_null() {
             let proto_value = crate::value::js_nanbox_pointer(proto_obj as i64);
-            js_object_set_field_by_name(closure_ptr as *mut ObjectHeader, proto_key, proto_value);
-            super::super::set_builtin_property_attrs(
-                closure_ptr as usize,
+            super::super::define_builtin_data_property(
+                closure_ptr as *mut ObjectHeader,
+                proto_key,
+                proto_value,
                 "prototype".to_string(),
                 super::super::PropertyAttrs::new(false, false, false),
             );
@@ -356,16 +360,18 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
                 b"constructor".as_ptr(),
                 "constructor".len() as u32,
             );
-            js_object_set_field_by_name(proto_obj, ctor_key, ctor_value);
-            super::super::set_builtin_property_attrs(
-                proto_obj as usize,
+            super::super::define_builtin_data_property(
+                proto_obj,
+                ctor_key,
+                ctor_value,
                 "constructor".to_string(),
                 super::super::PropertyAttrs::new(true, false, true),
             );
             if is_web_fetch_constructor(name) {
-                js_object_set_field_by_name(proto_obj, ctor_key, ctor_value);
-                super::super::set_builtin_property_attrs(
-                    proto_obj as usize,
+                super::super::define_builtin_data_property(
+                    proto_obj,
+                    ctor_key,
+                    ctor_value,
                     "constructor".to_string(),
                     super::super::PropertyAttrs::new(true, false, true),
                 );
@@ -373,9 +379,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
             if name == "Array" {
                 let constructor_key =
                     crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
-                js_object_set_field_by_name(proto_obj, constructor_key, ctor_value);
-                super::super::set_builtin_property_attrs(
-                    proto_obj as usize,
+                super::super::define_builtin_data_property(
+                    proto_obj,
+                    constructor_key,
+                    ctor_value,
                     "constructor".to_string(),
                     super::super::PropertyAttrs::new(true, false, true),
                 );
@@ -399,6 +406,17 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
             // entry point — works in tandem with `.call`/`.apply` since
             // those arms (#970) rebind IMPLICIT_THIS before forwarding.
             populate_builtin_prototype_methods(name, proto_obj);
+            if name == "Function" {
+                // SAFETY: `proto_obj` is the live, just-populated prototype.
+                unsafe {
+                    crate::object::proto_validity::assign_intrinsic_prototype_serial(
+                        proto_obj as usize,
+                        crate::closure::shape::INTRINSIC_SERIAL_FUNCTION,
+                    );
+                }
+                crate::closure::shape::FUNCTION_PROTOTYPE_PTR
+                    .store(proto_obj as i64, std::sync::atomic::Ordering::Release);
+            }
             install_error_prototype_data_properties(name, proto_obj);
             // ECMA-262 20.5.6.3: the [[Prototype]] of each NativeError prototype
             // object is %Error.prototype% (not %Object.prototype%). `Error` is
@@ -519,9 +537,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
                         b"BYTES_PER_ELEMENT".as_ptr(),
                         b"BYTES_PER_ELEMENT".len() as u32,
                     );
-                    js_object_set_field_by_name(target, bpe_key, bytes);
-                    super::super::set_builtin_property_attrs(
-                        target as usize,
+                    super::super::define_builtin_data_property(
+                        target,
+                        bpe_key,
+                        bytes,
                         "BYTES_PER_ELEMENT".to_string(),
                         bpe_attrs,
                     );
@@ -531,9 +550,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         let name_bytes = name.as_bytes();
         let name_key =
             crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
-        js_object_set_field_by_name(singleton(), name_key, ctor_value);
-        super::super::set_builtin_property_attrs(
-            singleton() as usize,
+        super::super::define_builtin_data_property(
+            singleton(),
+            name_key,
+            ctor_value,
             name.to_string(),
             super::super::PropertyAttrs::new(true, false, true),
         );
@@ -562,10 +582,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
             );
         }
     }
-    // The hidden `%AsyncFunction%` tower is allocated before the constructor
-    // loop, but its two parents are the `Function` values installed by that
+    // The hidden async/generator towers are allocated before the constructor
+    // loop, but their parents are the `Function` values installed by that
     // loop. Complete those links now that both are available.
-    wire_async_function_intrinsic_parents();
+    wire_function_intrinsic_parents();
     // Callable global functions: ClosureHeader-backed values with real
     // dispatch so direct property reads and rebound calls match bare calls.
     for name in GLOBAL_THIS_BUILTIN_FUNCTIONS.iter().copied() {
@@ -662,9 +682,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         let name_key =
             crate::string::js_string_from_bytes(name_bytes.as_ptr(), name_bytes.len() as u32);
         let fn_value = crate::value::js_nanbox_pointer(closure_ptr as i64);
-        js_object_set_field_by_name(singleton(), name_key, fn_value);
-        super::super::set_builtin_property_attrs(
-            singleton() as usize,
+        super::super::define_builtin_data_property(
+            singleton(),
+            name_key,
+            fn_value,
             name.to_string(),
             super::super::PropertyAttrs::new(true, enumerable, true),
         );
@@ -739,9 +760,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
             }
             crate::value::js_nanbox_pointer(ns_obj as i64)
         };
-        js_object_set_field_by_name(singleton(), name_key, ns_value);
-        super::super::set_builtin_property_attrs(
-            singleton() as usize,
+        super::super::define_builtin_data_property(
+            singleton(),
+            name_key,
+            ns_value,
             name.to_string(),
             super::super::PropertyAttrs::new(true, false, true),
         );
@@ -815,18 +837,20 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
         let non_writable = super::super::PropertyAttrs::new(false, false, false);
         for (name, value) in [("NaN", f64::NAN), ("Infinity", f64::INFINITY)] {
             let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-            js_object_set_field_by_name(singleton(), key, value);
-            super::super::set_builtin_property_attrs(
-                singleton() as usize,
+            super::super::define_builtin_data_property(
+                singleton(),
+                key,
+                value,
                 name.to_string(),
                 non_writable,
             );
         }
         let undef_key = crate::string::js_string_from_bytes(b"undefined".as_ptr(), 9);
         let undef_val = f64::from_bits(crate::value::TAG_UNDEFINED);
-        js_object_set_field_by_name(singleton(), undef_key, undef_val);
-        super::super::set_builtin_property_attrs(
-            singleton() as usize,
+        super::super::define_builtin_data_property(
+            singleton(),
+            undef_key,
+            undef_val,
             "undefined".to_string(),
             super::super::PropertyAttrs::new(false, false, false),
         );
@@ -835,6 +859,10 @@ pub(crate) fn populate_global_this_builtins(singleton_at_entry: *mut ObjectHeade
     // same function object as `Array.prototype.toString`. Alias it now that
     // both the Array constructor and the TypedArray intrinsic are set up.
     alias_typed_array_proto_to_string(singleton());
+    // #10497: memoize the intrinsic prototype identities while every
+    // `globalThis.<Builtin>` still names its intrinsic — before any user code
+    // can reassign the writable `globalThis.Function`.
+    crate::array::prime_prototype_addr_cache();
     // The bootstrap's own cost, and the evidence that the `ImmortalLayoutScope`
     // above actually did its job. `slot_masks`/`typed` are the live entry
     // counts of the two per-object layout side tables: they must still read
@@ -900,13 +928,10 @@ fn alias_typed_array_proto_to_string(singleton_at_entry: *mut ObjectHeader) {
     let to_string_handle = scope.root_nanbox_u64(to_string_fn.bits());
 
     let ts_key2 = crate::string::js_string_from_bytes(b"toString".as_ptr(), 8);
-    js_object_set_field_by_name(
+    super::super::define_builtin_data_property(
         ta_proto_handle.get_raw_mut_ptr::<ObjectHeader>(),
         ts_key2,
         f64::from_bits(to_string_handle.get_nanbox_u64()),
-    );
-    super::super::set_builtin_property_attrs(
-        ta_proto_handle.get_raw_mut_ptr::<ObjectHeader>() as usize,
         "toString".to_string(),
         super::super::PropertyAttrs::new(true, false, true),
     );
@@ -1009,9 +1034,10 @@ fn install_error_static_methods(ctor: *mut crate::closure::ClosureHeader) {
 
     let key = crate::string::js_string_from_bytes(b"captureStackTrace".as_ptr(), 17);
     let value = crate::value::js_nanbox_pointer(closure as i64);
-    js_object_set_field_by_name(ctor as *mut ObjectHeader, key, value);
-    super::super::set_builtin_property_attrs(
-        ctor as usize,
+    super::super::define_builtin_data_property(
+        ctor as *mut ObjectHeader,
+        key,
+        value,
         "captureStackTrace".to_string(),
         super::super::PropertyAttrs::new(true, false, true),
     );
@@ -1036,9 +1062,10 @@ fn install_error_static_methods(ctor: *mut crate::closure::ClosureHeader) {
     // frame count. Node's default is 10; Perry's stacks are coarse but the
     // property must read as a number and be writable.
     let limit_key = crate::string::js_string_from_bytes(b"stackTraceLimit".as_ptr(), 15);
-    js_object_set_field_by_name(ctor as *mut ObjectHeader, limit_key, 10.0);
-    super::super::set_builtin_property_attrs(
-        ctor as usize,
+    super::super::define_builtin_data_property(
+        ctor as *mut ObjectHeader,
+        limit_key,
+        10.0,
         "stackTraceLimit".to_string(),
         super::super::PropertyAttrs::new(true, true, true),
     );
@@ -1061,9 +1088,10 @@ fn install_error_static_fn(
     super::super::native_module::set_bound_native_closure_name(closure, name);
     let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
     let value = crate::value::js_nanbox_pointer(closure as i64);
-    js_object_set_field_by_name(ctor as *mut ObjectHeader, key, value);
-    super::super::set_builtin_property_attrs(
-        ctor as usize,
+    super::super::define_builtin_data_property(
+        ctor as *mut ObjectHeader,
+        key,
+        value,
         name.to_string(),
         super::super::PropertyAttrs::new(true, false, true),
     );

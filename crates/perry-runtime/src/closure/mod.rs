@@ -10,6 +10,7 @@ mod box_captures;
 mod dispatch;
 mod dynamic_props;
 mod registry;
+pub(crate) mod shape;
 mod unbox;
 mod v8_stubs;
 mod wide_call;
@@ -25,9 +26,12 @@ pub use alloc::{
     js_closure_set_capture_f64, js_closure_set_capture_ptr, note_closure_capture_slot,
     rebuild_closure_layout_and_barriers, scan_singleton_closure_roots_mut, ClosureHeader,
     CLOSURE_ALLOC_COUNT, CLOSURE_CAP_SINGLETON_HIT, CLOSURE_CAP_SINGLETON_MISS,
-    CLOSURE_TYPE_TAG_OFFSET,
+    CLOSURE_SHAPE_OFFSET,
 };
-pub(crate) use alloc::{gc_capture_slot_range, singleton_closure_if_cached};
+pub(crate) use alloc::{
+    closure_install_boxed_captures, gc_capture_slot_range, singleton_closure_if_cached,
+};
+pub use shape::closure_kind_probe;
 
 pub(crate) use registry::closure_registry_census;
 pub(crate) use registry::DispatchKind;
@@ -39,6 +43,10 @@ pub(crate) fn closure_side_table_census() -> Vec<crate::gc::census::SideTableRow
     rows.extend(dynamic_props::dynamic_props_census());
     rows
 }
+pub(crate) use registry::{
+    body_receives_primitive_this, closure_body_is_non_constructor, register_closure_body_builtin,
+    register_closure_body_non_constructor,
+};
 pub use registry::{
     build_rest_array, build_rest_array_rooted, closure_arity, closure_is_arrow,
     closure_is_bound_method, closure_length, dispatch_rest_bundled, dispatch_with_arity,
@@ -51,12 +59,13 @@ pub use registry::{
     js_register_closure_synthetic_arguments, js_register_closure_trusted_direct,
     lookup_closure_arity, lookup_closure_length, lookup_closure_rest, lookup_closure_rest_full,
     real_capture_count, resolve_strategy, DispatchStrategy, BOUND_FUNCTION_FUNC_PTR,
-    BOUND_METHOD_FUNC_PTR, CAPTURES_THIS_FLAG, CLOSURE_MAGIC, NO_THIS_REBIND_FLAG,
+    BOUND_METHOD_FUNC_PTR, CAPTURES_THIS_FLAG, NO_THIS_REBIND_FLAG,
 };
 
 pub(crate) use dispatch::{
-    bound_function_lazy_name, bound_method_source_func_ptr, coerce_call_this, rebind_explicit_this,
-    rebind_explicit_this_allocates, reify_function_method_value, reset_throw_not_callable_counter,
+    bound_function_lazy_name, bound_function_length, bound_method_source_func_ptr,
+    coerce_call_this, rebind_explicit_this, rebind_explicit_this_allocates,
+    reify_function_method_value, reset_throw_not_callable_counter,
 };
 pub use dispatch::{
     clean_closure_ptr, dispatch_bound_function, dispatch_bound_method, get_valid_func_ptr,
@@ -83,9 +92,10 @@ pub(crate) use dynamic_props::test_clear_closure_side_tables;
 pub(crate) use dynamic_props::{
     clear_closure_side_tables_for_dead_ptr, clone_closure_rebind_this,
     closure_dynamic_props_owner_moved, closure_dynamic_side_tables_nonempty,
-    closure_set_via_function_prototype_descriptor, prune_dead_closure_side_table_owners,
-    prune_dead_closure_side_table_owners_young, visit_closure_dynamic_prop_value_slots_mut,
-    visit_closure_static_prototype_slot_mut,
+    closure_set_via_function_prototype_descriptor, function_prototype_fallback_target,
+    function_prototype_inherited_get, prune_dead_closure_side_table_owners,
+    prune_dead_closure_side_table_owners_young, release_closure_side_table_owners_in_ranges,
+    visit_closure_dynamic_prop_value_slots_mut, visit_closure_static_prototype_slot_mut,
 };
 pub use dynamic_props::{
     closure_delete_own_dynamic_prop, closure_dynamic_props_snapshot, closure_get_dynamic_prop,

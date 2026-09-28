@@ -949,6 +949,8 @@ pub fn run_with_parse_cache(
         format,
     )?;
 
+    collect_modules::collect_declared_addons(&mut ctx, args.target.as_deref())?;
+
     // "Just works" transparency (#466 follow-up): when perry auto-preferred a
     // bundled PARTIAL well-known binding over a `node_modules/<pkg>` copy the
     // user actually installed, say so once per package. The build still
@@ -1147,6 +1149,11 @@ pub fn run_with_parse_cache(
         found
     });
     perry_codegen::set_program_has_worker(program_has_worker);
+    // #11394: every method name the program writes onto a builtin prototype;
+    // codegen routes those calls through a lookup-first runtime entry.
+    perry_codegen::set_program_patched_proto_methods(perry_hir::patched_prototype_methods(
+        &ctx.patched_builtins,
+    ));
     if program_has_worker && verbose > 0 {
         eprintln!(
             "  #10399: program constructs a worker_threads Worker — \
@@ -1161,15 +1168,26 @@ pub fn run_with_parse_cache(
     // wrapper called from the entry prologue, so the provider's export
     // dispatcher is live for module objects the runtime creates itself (a
     // CommonJS `require('net')` goes through `createRequire`, not codegen).
-    // No flip, no provider on the link line: emit nothing.
-    let native_provider_installs: Vec<String> =
-        if std::env::var_os("PERRY_DISABLE_WELL_KNOWN").is_some() {
-            Vec::new()
-        } else {
-            perry_codegen::native_provider_install_symbols(
-                ctx.native_module_imports.iter().map(String::as_str),
-            )
-        };
+    // No flip, no provider on the link line: emit nothing — except for the
+    // bindings whose wrapper is the only provider (`net`), which the flip
+    // routes even with PERRY_DISABLE_WELL_KNOWN=1 (tokio lane L4).
+    // A `tls` import installs the `net` provider too: `tls.connect` is
+    // perry-ext-net's, and its install hook registers it with the runtime
+    // for the `tls` module's dynamic dispatch (tokio lane L4).
+    let imports_tls = ctx
+        .native_module_imports
+        .iter()
+        .any(|m| m.strip_prefix("node:").unwrap_or(m) == "tls");
+    let native_provider_installs: Vec<String> = perry_codegen::native_provider_install_symbols(
+        ctx.native_module_imports
+            .iter()
+            .map(String::as_str)
+            .chain(imports_tls.then_some("net"))
+            .filter(|module| {
+                optimized_libs::well_known_flip_enabled()
+                    || optimized_libs::wrapper_is_sole_provider(module)
+            }),
+    );
 
     // Build a map of all exported enums from all modules (owned data, no borrows)
     // Key: (resolved_path, enum_name) -> Vec<(member_name, EnumValue)>
@@ -7425,35 +7443,6 @@ pub fn run_with_parse_cache(
     } else {
         None
     };
-
-    // #7629 — refuse a link whose wrapper archives bundle a different tokio
-    // compilation than the stdlib archive. Two tokios means two
-    // `tokio::runtime::context::CONTEXT` thread-locals, and the wrapper reads
-    // the one perry-stdlib's runtime never entered: the binary links cleanly
-    // and SIGABRTs at its first socket with "there is no reactor running".
-    // The #507 rebuild already prevents that by construction on the
-    // auto-optimize path; this catches every path that bypasses it.
-    {
-        let report = super::shared_tokio::verify_shared_tokio(
-            stdlib_lib.as_deref(),
-            &optimized_libs.well_known_libs,
-        );
-        if !report.mismatched.is_empty() {
-            let stdlib_path = stdlib_lib.clone().unwrap_or_default();
-            return Err(anyhow!(
-                "{}",
-                super::shared_tokio::mismatch_error_message(&report, &stdlib_path)
-            ));
-        }
-        if verbose > 0 && report.compared_anything() {
-            for checked in &report.checked {
-                eprintln!(
-                    "  shared-tokio: {} bundles {} (matches stdlib)",
-                    checked.name, checked.tokio_id
-                );
-            }
-        }
-    }
 
     // Build & run the per-platform link command. Tier 2.1 final extraction
     // (v0.5.342) — see crates/perry/src/commands/compile/link.rs.

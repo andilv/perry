@@ -325,6 +325,12 @@ fn compute_object_cache_key_with_env(
             "0"
         },
     );
+    // #11394: a module's method calls lower differently when ANY module in the
+    // program writes that method name onto a builtin prototype.
+    h.field(
+        "patched_proto_methods",
+        &perry_codegen::program_patched_proto_methods().join("|"),
+    );
     // #5247: `--debug-symbols` flips per-call `js_set_call_location` emission,
     // which changes the emitted IR (and `.o` bytes). Without this in the key,
     // toggling the flag would serve the previously-cached object and the
@@ -1203,6 +1209,20 @@ fn compute_object_cache_key_with_env(
         env_var("PERRY_OUTLINE_METHOD_DISPATCH")
             .as_deref()
             .unwrap_or(""),
+    );
+    // #11360: a `=1` build emits a census counter bump per store route.
+    // #11489: method-site and agent-pointer access A/B switches.
+    h.field(
+        "env_method_site",
+        env_var("PERRY_METHOD_SITE").as_deref().unwrap_or(""),
+    );
+    h.field(
+        "env_agent_ptr_access",
+        env_var("PERRY_AGENT_PTR_ACCESS").as_deref().unwrap_or(""),
+    );
+    h.field(
+        "env_store_census",
+        env_var("PERRY_STORE_CENSUS").as_deref().unwrap_or(""),
     );
     h.field(
         "env_inline_new",

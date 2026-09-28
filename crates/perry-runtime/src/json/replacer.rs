@@ -437,7 +437,13 @@ pub(crate) unsafe fn stringify_object_with_replacer_pretty(
     let inner_depth = depth + 1;
     // A function replacer only sees own ENUMERABLE keys (EnumerableOwnProperty
     // Names); gated for the common no-descriptor case.
-    let filter_non_enum = crate::object::descriptors_in_use();
+    // A per-object attribute (a builtin accessor installs no process gate)
+    // must filter too: an accessor key's slot holds its accessor pair
+    // (`accessor_pair.rs`), never a value to serialize.
+    let filter_non_enum = crate::object::descriptors_in_use()
+        || crate::object::key_attrs::object_summary(ptr as *const crate::ObjectHeader)
+            & crate::object::key_attrs::SUMMARY_KEY_BITS
+            != 0;
     buf.push('{');
     let mut first = true;
     for f in 0..actual_fields {
@@ -1036,7 +1042,13 @@ pub(crate) unsafe fn stringify_object_pretty(
     let alloc_limit = std::cmp::max(num_fields, crate::object::INLINE_SLOT_FLOOR as u32);
     let actual_fields = keys_len;
     // Only own ENUMERABLE keys are serialized (gated for the common case).
-    let filter_non_enum = crate::object::descriptors_in_use();
+    // A per-object attribute (a builtin accessor installs no process gate)
+    // must filter too: an accessor key's slot holds its accessor pair
+    // (`accessor_pair.rs`), never a value to serialize.
+    let filter_non_enum = crate::object::descriptors_in_use()
+        || crate::object::key_attrs::object_summary(ptr as *const crate::ObjectHeader)
+            & crate::object::key_attrs::SUMMARY_KEY_BITS
+            != 0;
 
     // Collect non-undefined, non-closure fields
     let mut entries: Vec<(String, f64)> = Vec::new();
@@ -1242,7 +1254,13 @@ pub(crate) unsafe fn stringify_object_with_array_replacer(
     // (`get key()`) holds no value in its raw slot, so resolve it through the
     // getter — matching the function-replacer walk (test262
     // replacer-array-duplicates, whose whitelisted key is a getter).
-    let filter_non_enum = crate::object::descriptors_in_use();
+    // A per-object attribute (a builtin accessor installs no process gate)
+    // must filter too: an accessor key's slot holds its accessor pair
+    // (`accessor_pair.rs`), never a value to serialize.
+    let filter_non_enum = crate::object::descriptors_in_use()
+        || crate::object::key_attrs::object_summary(ptr as *const crate::ObjectHeader)
+            & crate::object::key_attrs::SUMMARY_KEY_BITS
+            != 0;
     let mut field_map: Vec<(String, f64)> = Vec::new();
     for f in 0..actual_fields {
         // #9398: tombstoned slot from an O(1) delete — not a key, not
@@ -1849,6 +1867,10 @@ pub unsafe extern "C" fn js_json_stringify_full(
                 );
             });
         }
+    } else if !use_pretty
+        && super::stringify_object::try_stringify_plain_root(value.to_bits(), &mut buf)
+    {
+        // No replacer, compact, and a root no `toJSON` can reach (#10696).
     } else {
         // No replacer. Pre-resolve the ROOT value's own `toJSON` here (same
         // `apply_to_json_keyed` the function-replacer branch above uses) so a
@@ -1859,9 +1881,10 @@ pub unsafe extern "C" fn js_json_stringify_full(
         // value-tojson-result's `arr.toJSON = () => {}` case). Arm the
         // one-shot suppression guard so the walk below doesn't re-invoke
         // `toJSON` on the same (already-resolved) root value.
-        let empty_str = js_string_from_bytes(b"".as_ptr(), 0);
-        let empty_key_f64 = nanbox_string_f64(empty_str);
-        let value_after_to_json = apply_to_json_keyed(value, empty_key_f64);
+        // The root's `toJSON` key is the empty String; it is only ever read
+        // back as bytes, so no string needs to be allocated to carry it.
+        reset_to_json_key();
+        let value_after_to_json = apply_to_json(value);
         let after_bits = value_after_to_json.to_bits();
         if after_bits == TAG_UNDEFINED
             || is_closure_value(after_bits)
@@ -1890,8 +1913,24 @@ pub unsafe extern "C" fn js_json_stringify_full(
             // No replacer, but has spacer — pretty-print
             stringify_value_pretty(value_after_to_json, TYPE_UNKNOWN, &mut buf, &indent_str, 0);
         } else {
+            // The root's `toJSON` lookup just ran and found nothing callable;
+            // hand that verdict to the root's own walk instead of repeating
+            // it there (#10696). The guard repeats `apply_to_json`'s, so the
+            // token names only an object it really probed.
+            if after_bits == value.to_bits() {
+                if let Some(ptr) = extract_pointer(after_bits) {
+                    if !crate::value::addr_class::is_handle_band(ptr as usize)
+                        && ptr_derefable(ptr as usize)
+                        && gc_obj_type(ptr) == crate::gc::GC_TYPE_OBJECT
+                        && !crate::buffer::is_registered_buffer(ptr as usize)
+                    {
+                        TO_JSON_RESOLVED_FOR.with(|c| c.set(ptr as usize));
+                    }
+                }
+            }
             // Plain stringify
             stringify_value(value_after_to_json, TYPE_UNKNOWN, &mut buf);
+            TO_JSON_RESOLVED_FOR.with(|c| c.set(0));
         }
         SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
     }

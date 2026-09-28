@@ -39,8 +39,15 @@ pub(crate) fn set_builtin_closure_length(closure: usize, length: u32) {
     });
 }
 
+/// The recorded spec `.length` of the closure at `closure` — an address the
+/// caller has already proven is a closure (every reader asks from inside its
+/// closure arm; the bind-capture fallback re-checks only the header byte).
 pub(crate) fn builtin_closure_length(closure: usize) -> Option<u32> {
-    BUILTIN_CLOSURE_LENGTH.with(|m| m.borrow().get(&closure).copied())
+    if let Some(len) = BUILTIN_CLOSURE_LENGTH.with(|m| m.borrow().get(&closure).copied()) {
+        return Some(len);
+    }
+    // A bind result carries its length in a capture, not in this table.
+    unsafe { crate::closure::bound_function_length(closure) }
 }
 
 pub(crate) fn set_builtin_closure_non_constructable(closure: usize) {
@@ -50,8 +57,14 @@ pub(crate) fn set_builtin_closure_non_constructable(closure: usize) {
     });
 }
 
+/// Per-instance entries first, then the function-KIND bit (#10521): a closure
+/// whose body is a registered built-in non-constructor answers without an
+/// entry of its own.
 pub(crate) fn builtin_closure_is_non_constructable(closure: usize) -> bool {
     BUILTIN_CLOSURE_NON_CONSTRUCTABLE.with(|m| m.borrow().contains(&closure))
+        || crate::closure::closure_body_is_non_constructor(
+            closure as *const crate::closure::ClosureHeader,
+        )
 }
 
 #[cfg(any(debug_assertions, test))]

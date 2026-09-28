@@ -10,19 +10,81 @@
 //! target-dependent sizes.
 
 /// True when `target_triple` names a 32-bit-pointer (ILP32) target. `arm64_32`
-/// (64-bit registers, 32-bit pointers) is the live case for Perry; the other
-/// 32-bit families are matched defensively so a future target is sized
-/// correctly rather than silently treated as 64-bit.
+/// (64-bit registers, 32-bit pointers) is the live case for Perry.
+///
+/// Decided by an allowlist of 64-bit architectures rather than a list of
+/// 32-bit ones, so a 32-bit family nobody listed (`i586`, `arm-…-gnueabihf`,
+/// `mips`, `powerpc`, …) is sized as ILP32 and refused by
+/// [`ilp32_codegen_refusal`] instead of silently getting LP64 offsets.
 pub fn target_is_ilp32(target_triple: &str) -> bool {
-    target_triple.starts_with("arm64_32")
-        || target_triple.starts_with("armv7")
-        || target_triple.starts_with("thumbv7")
-        || target_triple.starts_with("wasm32")
-        || target_triple.starts_with("i686")
-        || target_triple.starts_with("i386")
-        // x32: 64-bit ISA with 32-bit pointers — the `x86_64` prefix alone
-        // would misclassify it as LP64.
-        || target_triple.ends_with("gnux32")
+    let triple = target_triple.to_ascii_lowercase();
+    let mut parts = triple.split('-');
+    let arch = parts.next().unwrap_or_default();
+    // 64-bit ISAs with a 32-bit-pointer ABI, spelled in the environment:
+    // x86 x32 (`…-gnux32`) and AArch64 ILP32 (`…-gnu_ilp32`).
+    if parts.any(|part| part.ends_with("x32") || part.ends_with("ilp32")) {
+        return true;
+    }
+    let lp64 = matches!(
+        arch,
+        "x86_64"
+            | "x86_64h"
+            | "amd64"
+            | "aarch64"
+            | "aarch64_be"
+            | "arm64"
+            | "arm64e"
+            | "s390x"
+            | "sparc64"
+            | "sparcv9"
+            | "wasm64"
+    ) || [
+        "riscv64",
+        "powerpc64",
+        "ppc64",
+        "mips64",
+        "mipsisa64",
+        "loongarch64",
+    ]
+    .iter()
+    .any(|family| arch.starts_with(family));
+    !lp64
+}
+
+/// Why codegen refuses `target_triple`, or `None` when it can emit for it.
+///
+/// `perry-runtime` compiles for ILP32 targets (#11376), but generated code is
+/// not yet ILP32-correct: the inline shadow-stack frame push/slot stores,
+/// `MapHeader::used` and `HotTls` reads bake in LP64 byte offsets, and runtime
+/// pointers cross the ABI as `i64`. Emitting anyway would miscompile silently
+/// (a shadow root written through the wrong word surfaces cycles later as
+/// `TypeError: value is not a function`), so the refusal is loud until #11378
+/// makes those target-derived. The only ILP32 triple the driver produces is
+/// watchOS `arm64_32`, which is opt-in (`PERRY_WATCHOS_ARM64_32`).
+pub fn ilp32_codegen_refusal(target_triple: &str) -> Option<String> {
+    // The one ILP32 target with a real lowering: wasm32 WASI, behind the
+    // off-by-default `target-wasi` feature (runtime ABI adapters in
+    // `crate::wasm32`, ILP32 shadow-stack/inline-path layouts).
+    if wasm32_lowering(target_triple) {
+        return None;
+    }
+    target_is_ilp32(target_triple).then(|| {
+        format!(
+            "target `{target_triple}` has 32-bit pointers, and Perry's LLVM backend \
+             does not emit ILP32-correct code yet (shadow-stack, Map and HotTls \
+             offsets and the runtime pointer ABI are LP64-only); see \
+             https://github.com/PerryTS/perry/issues/11378"
+        )
+    })
+}
+
+/// True when this compile targets wasm32 WASI AND the compiler was built with
+/// the `target-wasi` feature — the only condition under which any wasm32
+/// lowering runs. Always false in a default build.
+pub fn wasm32_lowering(target_triple: &str) -> bool {
+    cfg!(feature = "target-wasi")
+        && target_triple.starts_with("wasm32")
+        && target_triple.contains("wasi")
 }
 
 /// Exclusive upper bound accepted by the runtime's `is_valid_obj_ptr` for a
@@ -79,8 +141,8 @@ pub(crate) fn heap_addr_lower_bound_inclusive(target_triple: &str) -> u64 {
 /// (`fields = obj + object_header_size_bytes`). It MUST equal the runtime's
 /// `size_of::<ObjectHeader>()`, or inline-constructed objects and runtime-FFI
 /// field access diverge and every property read/write is corrupt. (The closure
-/// header `type_tag` offset has the analogous problem; that one is handled
-/// runtime-side via `perry_runtime::closure::CLOSURE_TYPE_TAG_OFFSET` /
+/// header's field offsets have the analogous problem; those are handled
+/// via `perry_abi::CLOSURE_*` /
 /// `offset_of!`.)
 ///
 /// The value stays an 8-BYTE MULTIPLE, which the f64 field region depends on.
@@ -100,29 +162,39 @@ pub fn object_meta_slot_offset_bytes(target_triple: &str) -> u64 {
     object_header_size_bytes(target_triple) - pointer_size
 }
 
-/// `std::mem::size_of::<perry_runtime::closure::ClosureHeader>()` for the
-/// target.
-///
-/// `ClosureHeader` is `repr(C)` and contains a pointer followed by two `u32`
-/// fields. It is therefore 16 bytes on LP64 and 12 bytes on ILP32. Trusted
-/// exact-arrow bodies use this offset to read compiler-installed raw box
-/// capture pointers directly from their immutable capture slots. Keep the
-/// target derivation here: using the compiler host's pointer width would make
-/// cross-compiled arm64_32 watchOS closures read four bytes past the slot.
-/// Byte offset of `ClosureHeader::type_tag` (the `CLOSURE_MAGIC` slot) for
-/// the target: the header's last 4 bytes (`func_ptr` + `capture_count`
-/// precede it), i.e. 12 on LP64 and 8 on ILP32 — the codegen mirror of the
-/// runtime's `offset_of!`-derived `CLOSURE_TYPE_TAG_OFFSET`.
-pub fn closure_type_tag_offset_bytes(target_triple: &str) -> u64 {
-    closure_header_size_bytes(target_triple) - 4
-}
+/// Byte offset of `ObjectMeta::spill` (a `u64` on every target: the record is
+/// all 8-byte words). **Must equal the runtime's
+/// `offset_of!(ObjectMeta, spill)`**, which `object/meta_record.rs`
+/// const-asserts as 32; `spill_layout_matches_codegen` in the runtime pins
+/// this copy against it.
+pub const OBJECT_META_SPILL_OFFSET_BYTES: u64 = 32;
 
+/// `size_of::<perry_runtime::array::ArrayHeader>()` — the `u32` length and
+/// capacity words — on every target: a spill buffer's elements start right
+/// after it (a spill buffer is private and never shifted, so it has no front
+/// reserve). Pinned by `spill_layout_matches_codegen` in the runtime.
+pub const ARRAY_HEADER_SIZE_BYTES: u64 = 8;
+
+/// `std::mem::size_of::<perry_runtime::closure::ClosureHeader>()` for the
+/// target: `{capture_count: u32, shape_id: u32, func_ptr, props}` — 24 bytes
+/// on LP64 and 16 on ILP32 (`perry_abi::CLOSURE_HEADER_SIZE` is the LP64
+/// value the runtime asserts). Trusted exact-arrow bodies use this offset to
+/// read compiler-installed raw box capture pointers directly from their
+/// immutable capture slots. Keep the target derivation here: using the
+/// compiler host's pointer width would make cross-compiled arm64_32 watchOS
+/// closures read past the slot.
 pub fn closure_header_size_bytes(target_triple: &str) -> u64 {
     if target_is_ilp32(target_triple) {
-        12
-    } else {
         16
+    } else {
+        crate::runtime_abi::CLOSURE_HEADER_SIZE as u64
     }
+}
+
+/// Byte offset of `ClosureHeader::func_ptr` (8 on every target: the u32
+/// capture count and u32 ShapeId precede it).
+pub fn closure_func_ptr_offset_bytes(_target_triple: &str) -> u64 {
+    crate::runtime_abi::CLOSURE_FUNC_PTR_OFFSET as u64
 }
 
 /// Minimum number of inline field slots `perry-runtime` allocates for EVERY
@@ -269,10 +341,100 @@ mod tests {
 
     #[test]
     fn closure_header_size_tracks_target_pointer_width() {
-        assert_eq!(closure_header_size_bytes("aarch64-apple-darwin"), 16);
-        assert_eq!(closure_header_size_bytes("x86_64-unknown-linux-gnu"), 16);
-        assert_eq!(closure_header_size_bytes("arm64_32-apple-watchos"), 12);
-        assert_eq!(closure_header_size_bytes("wasm32-unknown-unknown"), 12);
+        assert_eq!(closure_header_size_bytes("aarch64-apple-darwin"), 24);
+        assert_eq!(closure_header_size_bytes("x86_64-unknown-linux-gnu"), 24);
+        assert_eq!(closure_header_size_bytes("arm64_32-apple-watchos"), 16);
+        assert_eq!(closure_header_size_bytes("wasm32-unknown-unknown"), 16);
+    }
+
+    #[test]
+    fn ilp32_targets_are_refused_and_lp64_targets_are_not() {
+        for triple in [
+            "arm64_32-apple-watchos",
+            "wasm32-unknown-unknown",
+            "i686-unknown-linux-gnu",
+            // Not named anywhere: refused because they are not known 64-bit.
+            "i586-unknown-linux-gnu",
+            "arm-unknown-linux-gnueabihf",
+        ] {
+            let refusal = ilp32_codegen_refusal(triple).unwrap_or_else(|| {
+                panic!("{triple}: ILP32 codegen would miscompile, it must be refused")
+            });
+            assert!(
+                refusal.contains(triple) && refusal.contains("11378"),
+                "{refusal}"
+            );
+        }
+        for triple in [
+            "aarch64-apple-watchos",
+            "arm64-apple-watchos26.0",
+            "x86_64-unknown-linux-gnu",
+        ] {
+            assert_eq!(ilp32_codegen_refusal(triple), None, "{triple}");
+        }
+        // wasm32 WASI has a real lowering, but only in a `target-wasi` build.
+        assert_eq!(
+            ilp32_codegen_refusal("wasm32-unknown-wasip2").is_none(),
+            cfg!(feature = "target-wasi"),
+            "wasm32 WASI is refused exactly when the feature is off"
+        );
+    }
+
+    #[test]
+    fn wasm32_lowering_needs_the_feature_and_a_wasi_triple() {
+        assert_eq!(
+            wasm32_lowering("wasm32-unknown-wasip2"),
+            cfg!(feature = "target-wasi")
+        );
+        assert_eq!(
+            wasm32_lowering("wasm32-wasip1"),
+            cfg!(feature = "target-wasi")
+        );
+        // Browser wasm has its own backend and never reaches this one.
+        assert!(!wasm32_lowering("wasm32-unknown-unknown"));
+        assert!(!wasm32_lowering("x86_64-unknown-linux-gnu"));
+        assert!(!wasm32_lowering("arm64_32-apple-watchos"));
+    }
+
+    /// With the feature, a wasm32 WASI module compiles end to end and its
+    /// runtime calls come out adapted (the i64-handle call below would be a
+    /// link-time signature mismatch without the pass).
+    #[cfg(feature = "target-wasi")]
+    #[test]
+    fn compile_module_lowers_a_wasm32_wasi_module() {
+        let module = perry_hir::Module::new("wasi_smoke");
+        let opts = crate::CompileOptions {
+            target: Some("wasm32-unknown-wasip2".into()),
+            emit_ir_only: true,
+            is_entry_module: true,
+            output_type: "executable".into(),
+            ..Default::default()
+        };
+        let ir = String::from_utf8(crate::compile_module(&module, opts).expect("wasm32 compiles"))
+            .expect("IR is UTF-8");
+        assert!(
+            ir.contains("target triple = \"wasm32-unknown-wasip2\""),
+            "{ir}"
+        );
+        // Every runtime declaration is the runtime's real signature.
+        assert!(
+            ir.contains("declare ptr @js_string_from_bytes(ptr, i32)"),
+            "{ir}"
+        );
+    }
+
+    /// The refusal must be reached by the real entry point, not just exist.
+    #[test]
+    fn compile_module_refuses_an_ilp32_target() {
+        let module = perry_hir::Module::new("ilp32_refusal");
+        let opts = crate::CompileOptions {
+            target: Some("arm64_32-apple-watchos".into()),
+            emit_ir_only: true,
+            ..Default::default()
+        };
+        let err =
+            crate::compile_module(&module, opts).expect_err("an ILP32 target must not be emitted");
+        assert!(err.to_string().contains("11378"), "{err}");
     }
 
     #[test]
@@ -355,10 +517,42 @@ mod tests {
 
     #[test]
     fn ilp32_classification() {
-        assert!(target_is_ilp32("arm64_32-apple-watchos"));
-        // The 64-bit watch target must NOT be treated as ILP32.
-        assert!(!target_is_ilp32("aarch64-apple-watchos"));
-        assert!(!target_is_ilp32("aarch64-apple-darwin"));
-        assert!(!target_is_ilp32("x86_64-pc-windows-msvc"));
+        for ilp32 in [
+            "arm64_32-apple-watchos",
+            "armv7-linux-androideabi",
+            "arm-unknown-linux-gnueabihf",
+            "thumbv7neon-unknown-linux-gnueabihf",
+            "i386-apple-ios",
+            "i586-unknown-linux-gnu",
+            "i686-pc-windows-msvc",
+            "wasm32-wasip2",
+            "mips-unknown-linux-gnu",
+            "powerpc-unknown-linux-gnu",
+            "riscv32imac-unknown-none-elf",
+            "x86_64-unknown-linux-gnux32",
+            "aarch64-unknown-linux-gnu_ilp32",
+        ] {
+            assert!(target_is_ilp32(ilp32), "{ilp32} has 32-bit pointers");
+        }
+        // Every 64-bit spelling Perry's driver produces, plus the other LP64
+        // families. The 64-bit watch target must NOT be treated as ILP32.
+        for lp64 in [
+            "aarch64-apple-watchos",
+            "arm64-apple-watchos26.0",
+            "aarch64-apple-darwin",
+            "arm64-apple-ios17.0",
+            "arm64e-apple-darwin",
+            "aarch64-linux-android",
+            "aarch64-unknown-linux-ohos",
+            "x86_64-pc-windows-msvc",
+            "x86_64h-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "riscv64gc-unknown-linux-gnu",
+            "powerpc64le-unknown-linux-gnu",
+            "s390x-unknown-linux-gnu",
+            "loongarch64-unknown-linux-gnu",
+        ] {
+            assert!(!target_is_ilp32(lp64), "{lp64} has 64-bit pointers");
+        }
     }
 }

@@ -128,9 +128,84 @@ const TYPED_INTACT_I16: &str = "4096";
 const BOXED_TAG_FIRST_TOP16: &str = "32761";
 const BOXED_TAG_SPAN: &str = "7";
 
+/// Words of a site's record `@perry_ic_N_packed_set` (`[4 x i64]`): the
+/// existing-key word, the key-add memo's shapes and guard words, and the
+/// runtime's pointer to further key-add memos (never read here). **Must
+/// equal `perry_runtime::proxy::put_value::packed_add::{PACKED_SET_SITE_WORDS,
+/// ADD_SHAPES_WORD, ADD_GUARD_WORD, ADD_SLOT_BITS}`**; pinned by the runtime's
+/// `packed_set_site_layout_matches_codegen`.
+pub(crate) const PACKED_SET_SITE_WORDS: usize = 4;
+pub(crate) const ADD_SHAPES_WORD: usize = 1;
+pub(crate) const ADD_GUARD_WORD: usize = 2;
+pub(crate) const ADD_SLOT_BITS: u32 = 16;
+/// The site word holding the runtime's `*AddWay` block (0 = none), and how
+/// the emitted code finds the ways of it that it compares after the primary
+/// memo: from the receiver ShapeId's HOME, the top `ADD_WAYS_LOG2` bits of
+/// `sid * ADD_WAY_HASH` (mod 2^32). A way is two words in the primary pair's
+/// format, `{shapes, guard}`, so the site's words
+/// `ADD_SHAPES_WORD..=ADD_GUARD_WORD` are a way too. **Must equal
+/// `perry_runtime::proxy::put_value::packed_add::{ADD_WAYS_WORD,
+/// ADD_WAY_WORDS, ADD_WAYS_LOG2, ADD_WAY_HASH}`** (and `add_way_home`);
+/// pinned by the runtime's `packed_set_site_layout_matches_codegen`.
+pub(crate) const ADD_WAYS_WORD: usize = 3;
+pub(crate) const ADD_WAY_WORDS: usize = 2;
+pub(crate) const ADD_WAYS_LOG2: u32 = 6;
+pub(crate) const ADD_WAY_HASH: u32 = 0x9E37_79B1;
+/// Ways compared from the home on: the home, then the next (mod the block),
+/// where the runtime places a memo whose home an earlier one holds.
+pub(crate) const ADD_WAY_PROBES: usize = 2;
+const ADD_SLOT_MASK: u64 = (1 << ADD_SLOT_BITS) - 1;
+/// Block-name stem of the key-add hit.
+const ADD_STEM: &str = "put.add";
+/// `GC_FLAG_TENURED` (gc_flags byte).
+pub(crate) const ADD_REFUSE_GC_FLAGS: u32 = 0x20;
+/// `_reserved` bits the key-add hit refuses: `OBJ_FLAG_HAS_DESCRIPTORS`
+/// (0x800), `OBJ_FLAG_STABLE_TOMBSTONES` (0x400),
+/// `OBJ_FLAG_PACKED_NUMERIC_PROOF` (0x80). Pinned by the runtime's
+/// `packed_add_refuse_bits_match_codegen`.
+pub(crate) const ADD_REFUSE_RESERVED: u32 = 0x0C80;
+/// `GC_LAYOUT_SIDE_MASK` (0x8000) | `GC_OBJ_TYPED_LAYOUT_INTACT` (0x1000): a
+/// receiver with either bit has a layout record the new shape no longer
+/// describes, which `js_gc_key_add_layout_unknown` retires before the stamp
+/// (the transition lane's `mark_object_dynamic_shape_unknown`).
+pub(crate) const ADD_LAYOUT_RESERVED: u32 = 0x9000;
+
+/// The mask over the GcHeader's first 32-bit word (`obj_type | gc_flags << 8
+/// | _reserved << 16`, little-endian) whose zero admits a key-add receiver.
+fn add_header_refuse_mask() -> i32 {
+    ((ADD_REFUSE_RESERVED << 16) | (ADD_REFUSE_GC_FLAGS << 8)) as i32
+}
+
+/// The hot key-add test over the same word: nothing refused AND no layout
+/// record to retire (`ADD_LAYOUT_RESERVED`). Its zero is the common case; a
+/// non-zero result is sorted out by [`add_header_refuse_mask`] off the hot
+/// path.
+fn add_header_hot_mask() -> i32 {
+    add_header_refuse_mask() | (ADD_LAYOUT_RESERVED << 16) as i32
+}
+
 /// The barrier-census stem. Shared with the census registry
 /// (`barrier_stem_census_tests::VERIFIED_BARRIER_STEMS`).
 pub(crate) const STORE_IC_STEM: &str = "put.pic";
+
+/// #10663: this site takes the outlined call because its function has too many
+/// once-per-call stores for their inline caches to pay off
+/// ([`crate::codegen::helpers::decide_straight_line_store_outline`]).
+///
+/// A site under a loop keeps its cache: `loop_targets` holds one frame per
+/// enclosing loop, plus `switch` frames with an EMPTY continue label, which do
+/// not repeat anything (the `new_site_is_in_loop` discriminator,
+/// `lower_call/new_alloc.rs`). So does every site of a function the hot-loop
+/// pre-passes marked, which is called from a loop one frame out.
+fn straight_line_site_outlined(ctx: &FnCtx<'_>) -> bool {
+    ctx.func.outlines_straight_line_store_ics()
+        && !ctx.func.hot_loop_callee
+        && !ctx.func.alloc_hot
+        && !ctx
+            .loop_targets
+            .iter()
+            .any(|(continue_label, _, _)| !continue_label.is_empty())
+}
 
 /// Emit the static-key store. `obj_box` is the receiver RE-READ after the
 /// RHS; `value_double` is the stored value and `value_bits` the same value as
@@ -163,10 +238,20 @@ pub(crate) fn emit_static_store_ic(
     let obj_bits = ctx.block().bitcast_double_to_i64(obj_box);
     let strict_i32 = if strict { "1" } else { "0" };
 
-    if crate::codegen::full_outline_ic_enabled() {
+    if crate::codegen::full_outline_ic_enabled() || straight_line_site_outlined(ctx) {
+        super::store_census::bump(ctx, super::store_census::PIC_MISS);
         let key_handle = emit_key_handle(ctx, &key_handle_global);
-        return ctx.block().call(
-            DOUBLE,
+        // S2: an existing-key store from an inline way is a GC-leaf call;
+        // everything else takes the collecting miss entry on a cold arm.
+        return super::ic_fast_split::emit_hole_declining_split(
+            ctx,
+            "pset.outline",
+            "js_put_value_set_packed_fast",
+            &[
+                (DOUBLE, obj_box),
+                (DOUBLE, value_double),
+                (PTR, &cache_slot_ref),
+            ],
             "js_put_value_set_packed_miss",
             &[
                 (DOUBLE, obj_box),
@@ -186,7 +271,8 @@ pub(crate) fn emit_static_store_ic(
         super::inline_cache_global_name(ctx, packed_site)
     );
     ctx.typed_parse_rodata.push(format!(
-        "@{packed_name} = private global i64 {PACKED_SET_EMPTY}, align 8"
+        "@{packed_name} = private global [{PACKED_SET_SITE_WORDS} x i64] \
+         [i64 {PACKED_SET_EMPTY}, i64 {PACKED_SET_EMPTY}, i64 0, i64 0], align 8"
     ));
     let packed_ref = format!("@{packed_name}");
 
@@ -204,6 +290,8 @@ pub(crate) fn emit_static_store_ic(
     let store_label = ctx.block_label(store_idx);
     let miss_label = ctx.block_label(miss_idx);
     let merge_label = ctx.block_label(merge_idx);
+    let add_idx = ctx.new_block(&format!("{ADD_STEM}.check"));
+    let add_label = ctx.block_label(add_idx);
 
     // Receiver: POINTER tag AND payload above the handle band, as ONE unsigned
     // range compare. `t = bits - (POINTER_TAG | 0x100000)` is below
@@ -228,22 +316,45 @@ pub(crate) fn emit_static_store_ic(
     let sid = ctx.block().load(I32, &sid_ptr);
     let stamp = ctx.block().trunc(I64, &word, I32);
     let shape_eq = ctx.block().icmp_eq(I32, &sid, &stamp);
-    let ways_entry_idx = ctx.new_block(&format!("{STORE_IC_STEM}.ways"));
-    let ways_entry_label = ctx.block_label(ways_entry_idx);
-    ctx.block()
-        .cond_br(&shape_eq, &kind_label, &ways_entry_label);
+    ctx.block().cond_br(&shape_eq, &kind_label, &add_label);
     let mut word_incoming: Vec<(String, String)> = vec![(word, tok_label.clone())];
 
-    // A word miss: compare the first ways of the site's cache (the read path's
-    // #7753 structure), each in the word's own format, so a hit on any of them
-    // is the same ONE ShapeId compare and flows into the same store. A spill
+    // A word miss: the key-add memo's primary pre-shape next, BEFORE the
+    // existing-key ways. A site that has only ever added keys then pays one
+    // compare of the adjacent word instead of the ways-cache load; a site
+    // with existing-key ways pays that one compare more. The two can never
+    // both match one ShapeId: an existing-key memo names a shape that HAS
+    // the key, an add memo one that lacks it.
+    ctx.current_block = add_idx;
+    let ways_entry_idx = ctx.new_block(&format!("{STORE_IC_STEM}.ways"));
+    let ways_entry_label = ctx.block_label(ways_entry_idx);
+    let add_ways_idx = ctx.new_block(&format!("{ADD_STEM}.ways"));
+    let add_ways_label = ctx.block_label(add_ways_idx);
+    let add_hit_idx = ctx.new_block(&format!("{ADD_STEM}.chain"));
+    let add_hit_label = ctx.block_label(add_hit_idx);
+    let primary_ptr = ctx
+        .block()
+        .gep(I64, &packed_ref, &[(I64, &ADD_SHAPES_WORD.to_string())]);
+    let primary = ctx.block().load_atomic_monotonic(I64, &primary_ptr, 8);
+    let primary_pre = ctx.block().trunc(I64, &primary, I32);
+    let primary_eq = ctx.block().icmp_eq(I32, &sid, &primary_pre);
+    ctx.block()
+        .cond_br(&primary_eq, &add_hit_label, &ways_entry_label);
+    // Each entry: (the memo's shapes word, the address of its pair, block).
+    let mut memo_incoming: Vec<(String, String, String)> =
+        vec![(primary, primary_ptr, add_label.clone())];
+
+    // Compare the first ways of the existing-key cache (the read path's #7753
+    // structure), each in the word's own format, so a hit on any of them is
+    // the same ONE ShapeId compare and flows into the same store. A spill
     // entry is flipped out of the ShapeId range and never matches here. The
     // cache is lazily allocated: a site that has never primed has none.
     ctx.current_block = ways_entry_idx;
     let ways = super::emit_inline_cache_slot(ctx, &cache_name);
     let first_way_idx = ctx.new_block(&format!("{STORE_IC_STEM}.way"));
     let mut way_label = ctx.block_label(first_way_idx);
-    ctx.block().cond_br(&ways.present, &way_label, &miss_label);
+    ctx.block()
+        .cond_br(&ways.present, &way_label, &add_ways_label);
     let mut way_idx = first_way_idx;
     for w in 0..PACKED_SET_INLINE_WAYS {
         ctx.current_block = way_idx;
@@ -255,11 +366,72 @@ pub(crate) fn emit_static_store_ic(
             way_idx = ctx.new_block(&format!("{STORE_IC_STEM}.way"));
             ctx.block_label(way_idx)
         } else {
-            miss_label.clone()
+            add_ways_label.clone()
         };
         ctx.block().cond_br(&way_eq, &kind_label, &next_label);
         word_incoming.push((entry, way_label.clone()));
         way_label = next_label;
+    }
+
+    // The key-add ways at the receiver ShapeId's home in the runtime's block
+    // (`packed_add::add_way_home`) and the one after it: a displaced memo is
+    // placed at its home, or when an earlier memo holds that, at the next
+    // free way from it. Whichever pre-shapes a polymorphic site keeps hot,
+    // each is one or two compares away, the same compare as the primary's.
+    // A hit reads its guard from the same pair.
+    ctx.current_block = add_ways_idx;
+    let block_ptr = ctx
+        .block()
+        .gep(I64, &packed_ref, &[(I64, &ADD_WAYS_WORD.to_string())]);
+    let block_word = ctx.block().load_atomic_monotonic(I64, &block_ptr, 8);
+    let has_block = ctx.block().icmp_ne(I64, &block_word, "0");
+    let add_block = ctx.block().inttoptr(I64, &block_word);
+    let mut add_way_idx = ctx.new_block(&format!("{ADD_STEM}.way"));
+    let mut add_way_label = ctx.block_label(add_way_idx);
+    ctx.block().cond_br(&has_block, &add_way_label, &miss_label);
+    ctx.current_block = add_way_idx;
+    let hashed = ctx
+        .block()
+        .mul(I32, &sid, &(ADD_WAY_HASH as i32).to_string());
+    let home = ctx
+        .block()
+        .lshr(I32, &hashed, &(32 - ADD_WAYS_LOG2).to_string());
+    for probe in 0..ADD_WAY_PROBES {
+        ctx.current_block = add_way_idx;
+        let way = if probe == 0 {
+            home.clone()
+        } else {
+            let next = ctx.block().add(I32, &home, &probe.to_string());
+            ctx.block()
+                .and(I32, &next, &((1u32 << ADD_WAYS_LOG2) - 1).to_string())
+        };
+        let way_wide = ctx.block().zext(I32, &way, I64);
+        let word_index = ctx.block().mul(I64, &way_wide, &ADD_WAY_WORDS.to_string());
+        let pair_ptr = ctx.block().gep(I64, &add_block, &[(I64, &word_index)]);
+        let shapes = ctx.block().load_atomic_monotonic(I64, &pair_ptr, 8);
+        let pre = ctx.block().trunc(I64, &shapes, I32);
+        let way_eq = ctx.block().icmp_eq(I32, &sid, &pre);
+        let next_label = if probe + 1 < ADD_WAY_PROBES {
+            add_way_idx = ctx.new_block(&format!("{ADD_STEM}.way"));
+            ctx.block_label(add_way_idx)
+        } else {
+            miss_label.clone()
+        };
+        let hit_label = if super::store_census::enabled() {
+            // A census build counts a way hit on its own edge.
+            let count_idx = ctx.new_block(&format!("{ADD_STEM}.way.census"));
+            let count_label = ctx.block_label(count_idx);
+            ctx.block().cond_br(&way_eq, &count_label, &next_label);
+            ctx.current_block = count_idx;
+            super::store_census::bump(ctx, super::store_census::ADD_WAY_HIT);
+            ctx.block().br(&add_hit_label);
+            count_label
+        } else {
+            ctx.block().cond_br(&way_eq, &add_hit_label, &next_label);
+            add_way_label.clone()
+        };
+        memo_incoming.push((shapes, pair_ptr, hit_label));
+        add_way_label = next_label;
     }
 
     // The per-object facts the shape does not carry (see the module doc), as
@@ -307,6 +479,7 @@ pub(crate) fn emit_static_store_ic(
     // bookkeeping below is guarded only by live tests of the stored bits and
     // of the receiver's header.
     ctx.block().store(DOUBLE, value_double, &slot_ptr);
+    super::store_census::bump(ctx, super::store_census::PIC_HIT);
     emit_static_store_ic_bookkeeping(
         ctx,
         &handle,
@@ -320,7 +493,33 @@ pub(crate) fn emit_static_store_ic(
     let hit_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
 
+    ctx.current_block = add_hit_idx;
+    let (shapes, pair_ptr) = {
+        let shapes_in: Vec<(&str, &str)> = memo_incoming
+            .iter()
+            .map(|(s, _, l)| (s.as_str(), l.as_str()))
+            .collect();
+        let pairs_in: Vec<(&str, &str)> = memo_incoming
+            .iter()
+            .map(|(_, p, l)| (p.as_str(), l.as_str()))
+            .collect();
+        let shapes = ctx.block().phi(I64, &shapes_in);
+        let pair_ptr = ctx.block().phi(PTR, &pairs_in);
+        (shapes, pair_ptr)
+    };
+    let add_end_label = emit_key_add_hit(
+        ctx,
+        &shapes,
+        &pair_ptr,
+        &handle,
+        value_double,
+        value_bits,
+        &miss_label,
+        &merge_label,
+    );
+
     ctx.current_block = miss_idx;
+    super::store_census::bump(ctx, super::store_census::PIC_MISS);
     let key_handle = emit_key_handle(ctx, &key_handle_global);
     let miss_value = ctx.block().call(
         DOUBLE,
@@ -342,9 +541,182 @@ pub(crate) fn emit_static_store_ic(
         DOUBLE,
         &[
             (value_double, &hit_end_label),
+            (value_double, &add_end_label),
             (&miss_value, &miss_end_label),
         ],
     )
+}
+
+/// The key-add hit: `k` is not own on the receiver, and one of the site's
+/// add memos (`perry_runtime::proxy::put_value::packed_add`) names the
+/// receiver's PRE-shape. Entered from the pre-shape compare that matched,
+/// with that memo's `shapes` word and the address of its `{shapes, guard}`
+/// pair. Returns the label of the block that branches to `merge_label` on a
+/// hit; every refusal branches to `miss_label` with nothing written.
+///
+/// ```text
+///   ONE pre-shape compare       sid == low half of a memo's shapes (caller)
+///   the chain verdict           PROTO_VALIDITY + VTABLE_GEN == guard >> 16
+///   the receiver-kind admission class id / _reserved, as the existing-key hit
+///   per-object facts            ONE test of the GcHeader word: not TENURED,
+///                               no numeric proof, tombstones or descriptor
+///                               flag, and no layout record to retire
+///   the successor ShapeId       high half of shapes -> handle + 4
+///   the store and barrier       slot = guard & 0xFFFF
+/// ```
+///
+/// A receiver with a layout record (side mask or typed layout) leaves the
+/// one test for a cold block that refuses exactly what the hot test refuses
+/// and retires the record before the same store.
+///
+/// Nothing between the caller's re-read of the receiver and the stores can
+/// collect: plain loads, compares, and two stores.
+#[allow(clippy::too_many_arguments)]
+fn emit_key_add_hit(
+    ctx: &mut FnCtx<'_>,
+    shapes: &str,
+    pair_ptr: &str,
+    handle: &str,
+    value_double: &str,
+    value_bits: &str,
+    miss_label: &str,
+    merge_label: &str,
+) -> String {
+    let obj_idx = ctx.new_block(&format!("{ADD_STEM}.object"));
+    let classless_idx = ctx.new_block(&format!("{ADD_STEM}.classless"));
+    let layout_idx = ctx.new_block(&format!("{ADD_STEM}.layout"));
+    let slow_idx = ctx.new_block(&format!("{ADD_STEM}.layout.slow"));
+    let forget_idx = ctx.new_block(&format!("{ADD_STEM}.layout.forget"));
+    let store_idx = ctx.new_block(&format!("{ADD_STEM}.hit.store"));
+    let obj_label = ctx.block_label(obj_idx);
+    let classless_label = ctx.block_label(classless_idx);
+    let layout_label = ctx.block_label(layout_idx);
+    let slow_label = ctx.block_label(slow_idx);
+    let forget_label = ctx.block_label(forget_idx);
+    let store_label = ctx.block_label(store_idx);
+
+    // The chain verdict's generation: the one global prototype-validity word,
+    // against the guard of the memo that matched.
+    let guard_ptr = ctx.block().gep(
+        I64,
+        pair_ptr,
+        &[(I64, &(ADD_GUARD_WORD - ADD_SHAPES_WORD).to_string())],
+    );
+    let guard = ctx.block().load_atomic_monotonic(I64, &guard_ptr, 8);
+    let now = ctx
+        .block()
+        .load_atomic_monotonic(I64, "@PERRY_PROTO_VALIDITY", 8);
+    let recorded = ctx.block().lshr(I64, &guard, &ADD_SLOT_BITS.to_string());
+    let gen_eq = ctx.block().icmp_eq(I64, &now, &recorded);
+    ctx.block().cond_br(&gen_eq, &obj_label, miss_label);
+
+    // The GcHeader's first word (obj_type | gc_flags << 8 | _reserved << 16)
+    // and the receiver-kind admission, as the existing-key hit.
+    ctx.current_block = obj_idx;
+    let hdr_addr = ctx.block().sub(I64, handle, "8");
+    let hdr_ptr = ctx.block().inttoptr(I64, &hdr_addr);
+    let hdr = ctx.block().load(I32, &hdr_ptr);
+    let reserved_i32 = ctx.block().lshr(I32, &hdr, "16");
+    let reserved = ctx.block().trunc(I32, &reserved_i32, I16);
+    let class_ptr = ctx.block().inttoptr(I64, handle);
+    let class_id = ctx.block().load(I32, &class_ptr);
+    let class_biased = ctx.block().add(I32, &class_id, "2");
+    let has_class = ctx.block().icmp_ugt(I32, &class_biased, "2");
+    ctx.block()
+        .cond_br(&has_class, &layout_label, &classless_label);
+
+    ctx.current_block = classless_idx;
+    let admit_bits = ctx.block().and(I16, &reserved, CLASSLESS_ADMIT_MASK_I16);
+    let admitted = ctx.block().icmp_eq(I16, &admit_bits, CLASSLESS_ADMIT_I16);
+    let classless = ctx.block().icmp_eq(I32, &class_id, "0");
+    let plain_ok = ctx.block().and(I1, &admitted, &classless);
+    ctx.block().cond_br(&plain_ok, &layout_label, miss_label);
+
+    // ONE test: nothing refused and no layout record.
+    ctx.current_block = layout_idx;
+    let hot_bits = ctx
+        .block()
+        .and(I32, &hdr, &add_header_hot_mask().to_string());
+    let hot_ok = ctx.block().icmp_eq(I32, &hot_bits, "0");
+    ctx.block().cond_br(&hot_ok, &store_label, &slow_label);
+
+    // Cold: a refused receiver misses; a side-mask or typed-layout receiver's
+    // layout record describes the PRE-shape, so it is retired first, exactly
+    // as the transition lane does. The callee edits side tables only and
+    // cannot collect.
+    ctx.current_block = slow_idx;
+    let refused = ctx
+        .block()
+        .and(I32, &hdr, &add_header_refuse_mask().to_string());
+    let hdr_ok = ctx.block().icmp_eq(I32, &refused, "0");
+    ctx.block().cond_br(&hdr_ok, &forget_label, miss_label);
+
+    ctx.current_block = forget_idx;
+    super::store_census::bump(ctx, super::store_census::ADD_LAYOUT_FORGET);
+    ctx.block()
+        .call_void("js_gc_key_add_layout_unknown", &[(I64, handle)]);
+    // Re-read: the call changed the layout bits the bookkeeping tests.
+    let reserved_addr = ctx.block().sub(I64, handle, "6");
+    let reserved_ptr = ctx.block().inttoptr(I64, &reserved_addr);
+    let reserved_after = ctx.block().load(I16, &reserved_ptr);
+    ctx.block().br(&store_label);
+
+    // The transition: stamp the successor, then store the value, then the
+    // GC's obligations for the bits stored.
+    ctx.current_block = store_idx;
+    let reserved = ctx.block().phi(
+        I16,
+        &[(&reserved, &layout_label), (&reserved_after, &forget_label)],
+    );
+    super::store_census::bump(ctx, super::store_census::ADD_HIT);
+    let post_wide = ctx.block().lshr(I64, shapes, "32");
+    let post = ctx.block().trunc(I64, &post_wide, I32);
+    let sid_addr = ctx.block().add(I64, handle, "4");
+    let sid_ptr = ctx.block().inttoptr(I64, &sid_addr);
+    // GC_STORE_AUDIT(POINTER_FREE): a ShapeId is a number, never a heap reference.
+    ctx.block().store(I32, &post, &sid_ptr);
+    let slot = ctx.block().and(I64, &guard, &ADD_SLOT_MASK.to_string());
+    // The transition lane's fix-up: a POINTER-tagged null is stored as
+    // `undefined` (`fast_paths.rs`).
+    // An SSA constant is fixed up (or not) here, so the bookkeeping below
+    // still recognises it and emits no guard for a constant plain double.
+    let constant = constant_double_bits(value_double).or_else(|| constant_i64_bits(value_bits));
+    let fixed = match constant {
+        Some(bits) if bits == crate::nanbox::POINTER_TAG => ctx
+            .block()
+            .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64),
+        Some(_) => value_double.to_string(),
+        None => {
+            let raw_bits = ctx.block().bitcast_double_to_i64(value_double);
+            let null_ptr = ctx.block().icmp_eq(
+                I64,
+                &raw_bits,
+                &(crate::nanbox::POINTER_TAG as i64).to_string(),
+            );
+            let fixed_bits = ctx.block().select(
+                I1,
+                &null_ptr,
+                I64,
+                crate::nanbox::TAG_UNDEFINED_I64,
+                &raw_bits,
+            );
+            ctx.block().bitcast_i64_to_double(&fixed_bits)
+        }
+    };
+    let header_size = crate::target_layout::object_header_size_bytes(ctx.target_triple).to_string();
+    let fields = ctx.block().add(I64, handle, &header_size);
+    let fields_ptr = ctx.block().inttoptr(I64, &fields);
+    let slot_ptr = ctx.block().gep(DOUBLE, &fields_ptr, &[(I64, &slot)]);
+    // GC_STORE_AUDIT(BARRIERED): the slot write is unconditional; the
+    // bookkeeping below is guarded only by live tests of the stored bits and
+    // of the receiver's header.
+    ctx.block().store(DOUBLE, &fixed, &slot_ptr);
+    emit_static_store_ic_bookkeeping(
+        ctx, handle, &slot, &slot_ptr, &reserved, &fixed, value_bits, "put.pic",
+    );
+    let end = ctx.block().label.clone();
+    ctx.block().br(merge_label);
+    end
 }
 
 /// The GC's obligations after the unconditional slot store. Leaves the

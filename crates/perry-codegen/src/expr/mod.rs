@@ -31,7 +31,10 @@ use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 // `lower_expr` and the foundational types (`FnCtx`, `FlatConstInfo`)
 // remain here. `pub(crate) use` keeps the public surface stable so
 // existing `crate::expr::X` paths resolve unchanged.
+pub(crate) mod agent_ptr;
+pub(crate) mod array_length;
 mod array_literal;
+pub(crate) mod array_proto_guard;
 mod bitset_test;
 pub(crate) mod folded_builtin_override;
 pub(crate) mod hot_tls;
@@ -96,7 +99,7 @@ pub(crate) use helpers::{
     expr_produces_fresh_heap_allocation, expr_produces_non_pointer_bits_by_construction,
     is_global_this_builtin_function_name, is_global_this_builtin_name,
     lower_expr_with_expected_type, lower_js_args_array, store_needs_string_addref,
-    unbox_str_handle, unbox_to_i64,
+    unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
@@ -3007,7 +3010,7 @@ mod bigint_set;
 mod binary;
 #[cfg(test)]
 mod boolean_number_tests;
-mod call_spread;
+pub(crate) mod call_spread;
 pub(crate) mod calls;
 mod child_proc;
 pub(crate) mod class_env;
@@ -3040,6 +3043,9 @@ pub(crate) mod suffix_cursor;
 mod bigint_bitwise_tests;
 mod ptr_numarray_access;
 mod ta_param_f64_read;
+mod toint32;
+#[cfg(test)]
+mod toint32_tests;
 mod u8_buffer_read;
 #[cfg(test)]
 mod unary_bigint_tests;
@@ -3067,10 +3073,12 @@ pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
 pub(crate) mod class_field_inline_guard;
 pub(crate) mod element_shape_guard;
 pub(crate) mod element_shape_reads;
+pub(crate) mod ic_fast_split;
 mod js_runtime;
 mod literals_vars;
 mod logical_collections;
 mod math_simple;
+pub(crate) mod method_site;
 mod misc_methods;
 mod new_dynamic;
 mod objects_arrays_lit;
@@ -3082,6 +3090,7 @@ pub(crate) mod put_value_store_ic;
 pub(crate) mod receiver_range;
 mod static_field_meta;
 mod static_method;
+pub(crate) mod store_census;
 mod string_regex_proc;
 mod super_method;
 pub(crate) mod this_super_call;
@@ -3833,7 +3842,7 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
             return Ok(Some(if is_known_i32_range(ctx, expr) {
                 ctx.block().toint32_fast(&value)
             } else {
-                ctx.block().toint32_wrap(&value)
+                ctx.toint32_wrap(&value)
             }));
         }
         None => return Ok(None),
@@ -3864,12 +3873,12 @@ fn lower_bitwise_operand_i32(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<
             if is_known_i32_range(ctx, expr) {
                 ctx.block().toint32_fast(&lowered.value)
             } else {
-                ctx.block().toint32_wrap(&lowered.value)
+                ctx.toint32_wrap(&lowered.value)
             }
         }
         NativeRep::F32 => {
             let widened = ctx.block().fpext(F32, &lowered.value, DOUBLE);
-            ctx.block().toint32_wrap(&widened)
+            ctx.toint32_wrap(&widened)
         }
         _ => return Ok(None),
     };
@@ -4441,6 +4450,10 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
             );
             Ok(Some(lowered))
         }
+        Expr::Unary {
+            op: UnaryOp::BitNot,
+            operand,
+        } => unary::lower_bitnot_value(ctx, operand),
         Expr::BooleanCoerce(operand) if matches!(operand.as_ref(), Expr::IterResultGetValue) => {
             let value_i32 = ctx.block().call(I32, "js_iter_result_get_value_i1", &[]);
             let value = ctx.block().icmp_ne(I32, &value_i32, "0");

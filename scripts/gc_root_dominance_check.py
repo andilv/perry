@@ -485,6 +485,11 @@ NONCOLLECTING = {
     # per-thread table probe plus one load through the holder; no allocation,
     # no user code, no chain walk (declines answer TAG_HOLE).
     "js_inherited_read_cache_hit_f64",
+    # S2 GC-leaf IC hits (`expr/ic_fast_split.rs`); audit in gc_call_effects.rs.
+    "js_object_get_field_ic_fast",
+    "js_class_field_get_ic_fast",
+    "js_class_field_set_ic_fast",
+    "js_put_value_set_packed_fast",
     "js_transition_ic_spill_append",
     "js_write_barrier_slot",
     "js_gc_register_global_root",
@@ -534,7 +539,10 @@ NONCOLLECTING = {
     "js_write_barrier",                              # gc/barrier.rs:930
     "js_tdz_suppress_begin", "js_tdz_suppress_end",  # box.rs:242/248 counter
     "js_array_note_numeric_write",                   # array/header.rs:1443
-    "js_array_length",                               # array/indexing.rs:537
+    # #11522: the `.length` fast lane only. `js_array_length` itself is NOT
+    # here: its Proxy arm runs the `get` trap and its object arm runs getters
+    # and `valueOf`, so it can collect.
+    "js_array_length_leaf",                          # array/indexing.rs
     # #9480 dispatch probes. `js_object_get_class_id` is address checks,
     # Set/Map registry membership reads, validated GcHeader reads, and one
     # scalar load (object/field_get_set/field_ops.rs). The own-field helper
@@ -1582,7 +1590,7 @@ POLL_CAPABLE_RUNTIME = {
     "js_promise_new_with_executor",
     "js_proxy_construct", "js_proxy_revocable",
     "js_regexp_construct",
-    "js_request_new_from_init",
+    "js_request_new_from_init", "js_request_new_from_input",
     "js_string_concat_chain", "js_string_concat_value",
     "js_string_normalize", "js_string_pad_fill", "js_string_repeat",
     # The `_dyn` half of the replace family. The block comment above deferred

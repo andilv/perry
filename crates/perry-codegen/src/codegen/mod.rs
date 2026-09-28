@@ -211,6 +211,8 @@ mod guarded_undefined_method_tests;
 #[cfg(test)]
 mod hoisted_callback_method_tests;
 #[cfg(test)]
+mod imported_global_order_tests;
+#[cfg(test)]
 mod index_method_clone_tests;
 mod indexed_method_artifacts;
 #[cfg(test)]
@@ -431,6 +433,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let hir = live_cjs_hir.as_ref();
     let progress = CompileProgress::new(&hir.name, module_callable_count(hir));
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
+    if let Some(refusal) = crate::target_layout::ilp32_codegen_refusal(&triple) {
+        anyhow::bail!(refusal);
+    }
     // `PERRY_REGION_DIAG=1`: report step 4b's regions and the statement-level
     // runs it does not reach, when this module's codegen ends.
     let _region_diag = crate::expr::region_guard::ModuleDiag::start(hir);
@@ -442,6 +447,8 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // afresh for every module — including the `false` case, to clear any prior
     // module's decision on this thread.
     set_full_outline_ic(decide_full_outline_ic(module_callable_count(hir)));
+    // Initial-exec TLS only in an image that is never `dlopen`ed.
+    crate::expr::agent_ptr::set_output_is_executable(opts.output_type == "executable");
     // #8595: report the module-entry outlining analysis when asked. Pure
     // diagnostic — no transform yet (see codegen/entry_outline.rs).
     entry_outline::report_entry_outlining(hir);
@@ -451,6 +458,9 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // Native roots are the default lowering wherever the runtime can walk the
     // frames, and the shadow stack elsewhere. Same per-module discipline.
     helpers::set_native_roots_for_target(&triple);
+    // ILP32 (wasm32 WASI only): inline paths that bake in LP64 layouts take
+    // their runtime-call arms or ILP32 offsets. Same per-module discipline.
+    helpers::set_ilp32_for_target(&triple);
 
     // `--opt-report` (#6952): mark the closures that are iterating-builtin
     // callbacks before any region is lowered, so their denials carry the
@@ -2327,12 +2337,31 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         .iter()
         .map(|class| class.name.as_str())
         .collect();
-    let class_header_image_inits: std::collections::HashMap<String, (u32, u64)> = {
-        let mut inits: std::collections::HashMap<String, (u32, u64)> =
+    let class_header_image_inits: std::collections::HashMap<String, (u32, u64, u32)> = {
+        let mut inits: std::collections::HashMap<String, (u32, u64, u32)> =
             std::collections::HashMap::new();
         for (class_name, keys_global) in &class_keys_globals_map {
-            let Some(&field_count) = class_field_counts_map.get(class_name) else {
+            let Some(&key_count) = class_field_counts_map.get(class_name) else {
                 continue;
+            };
+            // In-object slack for constructor key-adds (see
+            // `lower_call::new_alloc::constructor_added_key_count`): such a
+            // class is born with a live bound of keys + slack, minted beside
+            // this image by the string pool (`birth_live`, 0 = the key count).
+            let slack = if imported_stub_names.contains(class_name.as_str()) {
+                0
+            } else {
+                class_table.get(class_name).map_or(0, |class| {
+                    crate::lower_call::new_alloc::constructor_added_key_count_in(class, &|name| {
+                        class_table.get(name).copied()
+                    })
+                })
+            };
+            let birth_live = if slack > 0 { key_count + slack } else { 0 };
+            let field_count = if slack > 0 {
+                key_count + slack
+            } else {
+                key_count
             };
             let Some(&class_id) = class_ids.get(class_name) else {
                 continue;
@@ -2344,7 +2373,7 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             // runtime class two exact identities across modules. Keep the
             // consumer on the canonical structural identity and validate the
             // typed layout after the producer's constructor returns.
-            let typed_layout = if imported_stub_names.contains(class_name.as_str()) {
+            let typed_layout = if imported_stub_names.contains(class_name.as_str()) || slack > 0 {
                 crate::target_layout::InlineTypedLayout::None
             } else {
                 crate::lower_call::typed_shape_init::layout_at_allocation_in(
@@ -2361,24 +2390,27 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                 // Two names (an alias) sharing one keys global must agree on
                 // the word module init writes; if they do not, neither may use
                 // the image — drop the keys global from the table.
-                Some(&(existing_id, existing_gc)) => {
-                    if existing_id != class_id || existing_gc != gc_packed {
-                        inits.insert(keys_global.clone(), (u32::MAX, 0));
+                Some(&(existing_id, existing_gc, existing_live)) => {
+                    if existing_id != class_id
+                        || existing_gc != gc_packed
+                        || existing_live != birth_live
+                    {
+                        inits.insert(keys_global.clone(), (u32::MAX, 0, 0));
                     }
                 }
                 None => {
-                    inits.insert(keys_global.clone(), (class_id, gc_packed));
+                    inits.insert(keys_global.clone(), (class_id, gc_packed, birth_live));
                 }
             }
         }
-        inits.retain(|_, (class_id, _)| *class_id != u32::MAX);
+        inits.retain(|_, (class_id, _, _)| *class_id != u32::MAX);
         inits
     };
     let class_header_images_map: std::collections::HashMap<String, (String, u64, u32)> =
         class_keys_globals_map
             .iter()
             .filter_map(|(class_name, keys_global)| {
-                let &(class_id, gc_packed) = class_header_image_inits.get(keys_global)?;
+                let &(class_id, gc_packed, _) = class_header_image_inits.get(keys_global)?;
                 Some((
                     class_name.clone(),
                     (
@@ -2405,6 +2437,14 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
             .values()
             .map(|object| (object.source_prefix.clone(), object.source_global_id))
             .collect();
+    // #11409: collect before emitting. Candidate maps have randomized order;
+    // declarations must be stable for byte-identical IR and object-cache keys.
+    for candidate in opts.object_literal_method_candidates.values().flatten() {
+        if candidate.source_prefix != module_prefix {
+            imported_object_producers
+                .insert((candidate.source_prefix.clone(), candidate.source_global_id));
+        }
+    }
     for (source_prefix, source_global_id) in &imported_object_producers {
         llmod.add_external_module_state_global(
             &format!("perry_global_{source_prefix}__{source_global_id}"),
@@ -2412,38 +2452,23 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
         );
     }
 
-    for candidate in opts.object_literal_method_candidates.values().flatten() {
-        if candidate.source_prefix != module_prefix
-            && imported_object_producers
-                .insert((candidate.source_prefix.clone(), candidate.source_global_id))
-        {
-            llmod.add_external_module_state_global(
-                &format!(
-                    "perry_global_{}__{}",
-                    candidate.source_prefix, candidate.source_global_id
-                ),
-                DOUBLE,
-            );
-        }
-    }
-
     // #8772: declare the opaque ShapeId slots published by concrete classes
     // in other modules. Local candidates already have a defining global in
-    // this module and must not be redeclared as external.
-    let mut declared_short_spread_shapes = std::collections::HashSet::new();
+    // this module and must not be redeclared as external. Both capability
+    // families share the sorted set so aliases remain deduplicated.
+    let mut imported_shapes = std::collections::BTreeSet::new();
     for candidate in opts.short_spread_method_candidates.values().flatten() {
-        if candidate.source_prefix != module_prefix
-            && declared_short_spread_shapes.insert(candidate.shape_id_global.clone())
-        {
-            llmod.add_external_module_state_global(&candidate.shape_id_global, I32);
+        if candidate.source_prefix != module_prefix {
+            imported_shapes.insert(&candidate.shape_id_global);
         }
     }
     for candidate in opts.object_literal_method_candidates.values().flatten() {
-        if candidate.source_prefix != module_prefix
-            && declared_short_spread_shapes.insert(candidate.shape_id_global.clone())
-        {
-            llmod.add_external_module_state_global(&candidate.shape_id_global, I32);
+        if candidate.source_prefix != module_prefix {
+            imported_shapes.insert(&candidate.shape_id_global);
         }
+    }
+    for shape in imported_shapes {
+        llmod.add_external_module_state_global(shape, I32);
     }
 
     let mut cross_module = CrossModuleCtx {
@@ -3754,7 +3779,15 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // behavior). `emit_ir_only` wants the whole-module text, so it takes the
     // single-text path; the split path avoids materializing the full ~1GB IR
     // string at all (which would defeat the memory win).
-    let n_units = if opts.emit_ir_only {
+    // wasm32 WASI (#11378) takes the single-text path: its runtime-ABI pass
+    // rewrites the whole module text before object emission. Splitting it
+    // needs more than per-unit adaptation: the unit objects must be combined
+    // with `wasm-ld -r` (the host `ld -r` cannot read wasm), each trimmed of
+    // the buffer's trailing NUL, and the closure-ABI rewrite needs the
+    // module-wide set of closure bodies. Until then a large WASI module is
+    // compiled as one unit.
+    let wasm32 = crate::target_layout::wasm32_lowering(&triple);
+    let n_units = if opts.emit_ir_only || wasm32 {
         1
     } else {
         decide_codegen_units(
@@ -3809,14 +3842,22 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // textual); `=diff` builds both arms and diffs them. Unit-split and
     // emit_ir_only paths above stay textual (they fall into the in-process
     // *transport* under these values, so no clang subprocess either way).
-    if let Some(result) =
-        try_native_construction(&mut llmod, opts.target.as_deref(), &module_prefix)
-    {
-        return result;
+    if !wasm32 {
+        if let Some(result) =
+            try_native_construction(&mut llmod, opts.target.as_deref(), &module_prefix)
+        {
+            return result;
+        }
     }
 
     loop {
         let ll_text = llmod.to_ir();
+        #[cfg(feature = "target-wasi")]
+        let ll_text = if wasm32 {
+            crate::wasm32::adapt_runtime_abi(&ll_text)
+        } else {
+            ll_text
+        };
         log::debug!(
             "perry-codegen: emitted {} bytes of LLVM IR for '{}' ({} interned strings)",
             ll_text.len(),

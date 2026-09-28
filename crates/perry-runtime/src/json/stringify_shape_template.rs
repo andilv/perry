@@ -150,7 +150,7 @@ pub(crate) unsafe fn build_shape_prefix_template(first_elem_bits: u64) -> Option
     // array-of-objects fast path is unaffected for them. (#321 — a homogeneous
     // array of `class { toJSON() {…} }` instances must honour the prototype
     // `toJSON`.)
-    if (*obj).class_id != 0 {
+    if !super::stringify_tojson_probe::class_is_plain_record((*obj).class_id) {
         return None;
     }
     // #6519: a URL instance is a class_id-0 object but must serialize as its
@@ -369,16 +369,23 @@ pub(crate) unsafe fn try_emit_shape_element(
         return true;
     }
 
+    // The emit loops below read own fields only. An element can still inherit
+    // a `toJSON` — from `Object.prototype`, its class (the template vetted only
+    // element 0's), or an explicit `Object.setPrototypeOf` — and then it must
+    // take the per-element walk, which probes (#10529). The stringify-wide
+    // half of that proof is the same one the data-record emitter reuses.
+    let global_to_json_absent = *data_record_global_proof
+        || super::stringify_tojson_probe::data_record_global_to_json_absent_without_gc();
+
     // Everything below can recurse into a user callback. A callback can
     // mutate Object.prototype.toJSON, so the next data record must establish
     // a fresh stringify-wide proof before it emits raw fields.
     *data_record_global_proof = false;
-
-    // The callback-free record path above proves that neither the element nor
-    // any child can observe a `toJSON` key. Only publish the array index once a
-    // path that may invoke user code remains.
-    if let Some(index) = array_index_key {
-        set_to_json_key_index(index);
+    if !global_to_json_absent
+        || !super::stringify_tojson_probe::class_is_plain_record((*obj).class_id)
+        || crate::object::prototype_chain::object_static_prototype(obj as usize).is_some()
+    {
+        return false;
     }
 
     // ★ #7268: ROOT THE ELEMENT. The emit loops below call
@@ -427,7 +434,9 @@ pub(crate) unsafe fn try_emit_shape_element(
     // `shape_fields <= alloc_limit` and the branch is never taken. Hoisting it
     // stays sound across a collection because it is a COUNT, not an address:
     // `field_count` is copied verbatim when the object moves.
-    let alloc_limit = object_alloc_limit(obj);
+    // The shape probe above resolved this bound for the same receiver, and
+    // nothing between it and here can allocate or change the shape.
+    let alloc_limit = std::cmp::max(live_inline_slots, crate::object::INLINE_SLOT_FLOOR as u32);
     let field_bits_at = |f: usize| -> u64 {
         // Re-derived per access, deliberately. The pre-#7268 code hoisted
         // `fields_ptr` above the loop, which is exactly the address a `toJSON`
@@ -450,6 +459,7 @@ pub(crate) unsafe fn try_emit_shape_element(
     // detection.
     if template.primitive_only {
         let save_pos = buf.len();
+        let mut called_out = false;
         for f in 0..shape_fields as usize {
             let fb = field_bits_at(f);
             let field_val = f64::from_bits(fb);
@@ -497,16 +507,21 @@ pub(crate) unsafe fn try_emit_shape_element(
             } else if vtag == POINTER_TAG || is_raw_pointer(fb) {
                 set_to_json_key_for_template_field(cur_keys(), f);
                 stringify_value_depth(field_val, TYPE_UNKNOWN, buf, depth + 1);
+                called_out = true;
             } else {
                 // A BigInt field reaches `serialize_bigint` via `write_number`,
                 // which reads the pending `toJSON` key — record it first (#5909).
                 if vtag == BIGINT_TAG {
                     set_to_json_key_for_template_field(cur_keys(), f);
+                    called_out = true;
                 }
                 write_number(buf, field_val);
             }
         }
         buf.push('}');
+        // No callback ran, so the stringify-wide proof still holds for the
+        // next element.
+        *data_record_global_proof = !called_out;
         return true;
     }
 
@@ -527,6 +542,13 @@ pub(crate) unsafe fn try_emit_shape_element(
         }
     }
     if has_pointer_fields {
+        // The element's own `toJSON` is the one reader of its array-index key:
+        // every field below publishes its own key before its value can call
+        // user code, and a declined element is republished by the caller. So
+        // the index is formatted only here, not for every templated element.
+        if let Some(index) = array_index_key {
+            set_to_json_key_index(index);
+        }
         // Through the handle: the pre-scan above is allocation-free today, but
         // `elem_ptr` is the pre-collection address and there is no reason for a
         // second name for this object to exist (#7268).

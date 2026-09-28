@@ -139,6 +139,14 @@ fn lower_map_entry_at_inline(
         let is_pointer = blk.icmp_eq(I64, &top16, POINTER_TAG_TOP16_I64);
         let above_band = blk.icmp_ugt(I64, &m_handle, HANDLE_BAND_TOP);
         let plausible = blk.and(I1, &is_pointer, &above_band);
+        // ILP32 (wasm32 WASI): the header reads below use LP64 offsets
+        // (`MAP_HEADER_USED_OFFSET`, an i64 `entries`); every read takes the
+        // runtime helper instead, and LLVM drops the dead fast path (#11378).
+        let plausible = if crate::codegen::helpers::ilp32_target() {
+            "false".to_string()
+        } else {
+            plausible
+        };
         blk.cond_br(&plausible, &head_label, &slow_label);
         (m_handle, i_i32)
     };
@@ -1117,8 +1125,11 @@ pub(crate) fn lower(
             let val_i32 = if val_is_i32 {
                 lower_expr_as_i32(ctx, value)?
             } else {
+                // A byte store is ToInt32 mod 2^8. A bare `fptosi -> i32` is
+                // poison outside int32 range (x86 yields 0x80000000), so
+                // storing 4294967295 wrote 0 instead of 255.
                 let v = lower_expr(ctx, value)?;
-                ctx.block().fptosi(DOUBLE, &v, I32)
+                ctx.toint32_wrap(&v)
             };
             // Slow path accepts either BufferHeader-backed Uint8Arrays or
             // NativeArena typed views.
@@ -1209,8 +1220,11 @@ pub(crate) fn lower(
             let val_i32 = if val_is_i32 {
                 lower_expr_as_i32(ctx, value)?
             } else {
+                // A byte store is ToInt32 mod 2^8. A bare `fptosi -> i32` is
+                // poison outside int32 range (x86 yields 0x80000000), so
+                // storing 4294967295 wrote 0 instead of 255.
                 let v = lower_expr(ctx, value)?;
-                ctx.block().fptosi(DOUBLE, &v, I32)
+                ctx.toint32_wrap(&v)
             };
             let a = lower_expr(ctx, buffer)?;
             let blk = ctx.block();
@@ -1389,9 +1403,8 @@ pub(crate) fn lower(
             // with the array pointer, and the next read decoded the array as a
             // box → `undefined`. Route through the shared boxed-aware writeback.
             crate::lower_array_method::emit_grow_mutator_writeback(ctx, *array_id, &new_box)?;
-            let blk = ctx.block();
-            let len_i32 = blk.call(I32, "js_array_length", &[(I64, &new_handle)]);
-            let len_f64 = blk.uitofp(I32, &len_i32, DOUBLE);
+            let len_i32 = crate::expr::array_length::emit_array_length_i32(ctx, &new_handle);
+            let len_f64 = ctx.block().uitofp(I32, &len_i32, DOUBLE);
             Ok(len_f64)
         }
 

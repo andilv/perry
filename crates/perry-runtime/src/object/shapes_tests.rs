@@ -425,7 +425,12 @@ mod descriptor_tests_8067 {
             let described = object_shape_id(obj);
             assert_ne!(described, structural);
             let described_facts = object_shape_descriptor(obj).unwrap();
-            assert_ne!(described_facts.semantic_generation, 0);
+            // Charter step 3: the attribute is a fact the shape REPORTS — its
+            // keys carry it, and the summary says so.
+            assert_ne!(
+                described_facts.summary & crate::object::key_attrs::SUMMARY_NON_WRITABLE,
+                0
+            );
 
             crate::object::prototype_chain::object_set_static_prototype(
                 obj as usize,
@@ -1234,6 +1239,7 @@ mod prototype_identity_tests {
             ShapeObjectKind::Ordinary,
             0,
             proto_id,
+            0,
         ))
     }
 
@@ -1273,6 +1279,21 @@ mod prototype_identity_tests {
         assert_ne!(u1, u2);
         assert_ne!(u1, PROTO_ID_NULL);
         assert!(u1 >= PROTO_ID_UNIQUE);
+    }
+
+    /// Consecutive unique identities never collide, whatever the counter's
+    /// parity when the test starts. The old `...FE` mask dropped bit 0, so
+    /// serials 2k and 2k+1 shared an identity; minting several in a row always
+    /// covers such a pair.
+    #[test]
+    fn consecutive_unique_identities_never_collide() {
+        let ids: Vec<u64> = (0..8).map(|_| fresh_unique_proto_id()).collect();
+        for (i, a) in ids.iter().enumerate() {
+            assert!(*a >= PROTO_ID_UNIQUE && *a != PROTO_ID_NULL);
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "unique proto ids collided: {ids:x?}");
+            }
+        }
     }
 }
 

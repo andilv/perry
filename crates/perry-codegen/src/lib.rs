@@ -10,6 +10,7 @@ pub(crate) mod boxed_vars;
 pub mod codegen;
 pub(crate) mod collectors;
 pub(crate) mod concat_site_cache;
+pub mod debug_info;
 #[cfg(feature = "llvm-inprocess")]
 pub(crate) mod dialect;
 pub(crate) mod eh_mode;
@@ -48,6 +49,8 @@ pub mod native_emit;
 #[cfg(all(test, feature = "llvm-inprocess"))]
 mod native_root_coverage;
 pub(crate) mod native_value;
+/// The runtime layout facts generated code bakes in (`perry-abi`).
+pub(crate) use perry_abi as runtime_abi;
 pub(crate) mod nm_install;
 pub use nm_install::native_provider_install_symbols;
 pub mod opt_report;
@@ -79,6 +82,8 @@ pub mod typed_feedback_profile;
 pub(crate) mod typed_shape;
 pub mod types;
 pub mod unit_cache;
+#[cfg(feature = "target-wasi")]
+mod wasm32;
 
 pub use codegen::{
     compile_module, context_free_ctor_abi, context_free_ctor_param_count,
@@ -98,6 +103,10 @@ pub use collectors::CjsPreambleCensus;
 // codegen run, which a 10 MB bundle does not reach in a usable time.
 pub use collectors::segview::{
     segview_diag_enabled, segview_lowering_enabled, segview_rewrite_module, SegViewDiag,
+};
+// #11394: whole-program set of methods written onto a builtin prototype.
+pub use lower_call::property_get::patched_proto::{
+    program_patched_proto_methods, set_program_patched_proto_methods,
 };
 
 /// Return the guarded proven-`this` method-clone capabilities a native module

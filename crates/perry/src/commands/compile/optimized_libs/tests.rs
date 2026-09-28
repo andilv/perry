@@ -70,6 +70,9 @@ fn minimal_auto_workspace(dir: &Path) {
     );
 }
 
+mod cache_compat;
+use cache_compat::matching_runtime_archive;
+
 #[test]
 fn auto_optimized_archives_are_fresh_when_newer_than_sources() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -82,7 +85,7 @@ fn auto_optimized_archives_are_fresh_when_newer_than_sources() {
     let stdlib = dir
         .path()
         .join("target/perry-auto/release/libperry_stdlib.a");
-    write_file(&runtime, b"!<arch>\n");
+    write_file(&runtime, &matching_runtime_archive());
     write_file(&stdlib, b"!<arch>\n");
     let stamp = dir.path().join("target/perry-auto/.perry-auto-build.stamp");
     write_file(&stamp, b"test-stamp");
@@ -146,7 +149,7 @@ fn build_optimized_libs_reuses_fresh_auto_archives_without_cargo() {
     let stdlib = release_dir.join("libperry_stdlib.a");
     std::fs::create_dir_all(&release_dir).expect("mkdir release dir");
     std::thread::sleep(std::time::Duration::from_millis(10));
-    write_file(&runtime, b"!<arch>\n");
+    write_file(&runtime, &matching_runtime_archive());
     write_file(&stdlib, b"!<arch>\n");
     let cross_features = auto_optimized_cross_features(&ctx, &features, &[]);
     let source_fingerprint = auto_optimized_source_fingerprint(&workspace_root, &[]);
@@ -183,7 +186,7 @@ fn auto_optimized_archives_are_stale_when_runtime_source_is_newer() {
     let stdlib = dir
         .path()
         .join("target/perry-auto/release/libperry_stdlib.a");
-    write_file(&runtime, b"!<arch>\n");
+    write_file(&runtime, &matching_runtime_archive());
     write_file(&stdlib, b"!<arch>\n");
     let stamp = dir.path().join("target/perry-auto/.perry-auto-build.stamp");
     write_file(&stamp, b"test-stamp");
@@ -214,7 +217,7 @@ fn auto_optimized_freshness_ignores_nested_target_dirs() {
     let stdlib = dir
         .path()
         .join("target/perry-auto/release/libperry_stdlib.a");
-    write_file(&runtime, b"!<arch>\n");
+    write_file(&runtime, &matching_runtime_archive());
     write_file(&stdlib, b"!<arch>\n");
     let stamp = dir.path().join("target/perry-auto/.perry-auto-build.stamp");
     write_file(&stamp, b"test-stamp");
@@ -449,7 +452,7 @@ fn runtime_source_edit_rotates_build_stamp_and_fails_freshness() {
         .join("target/perry-auto/release/libperry_stdlib.a");
     let stamp_path = dir.path().join("target/perry-auto/.perry-auto-build.stamp");
     std::thread::sleep(std::time::Duration::from_millis(10));
-    write_file(&runtime, b"!<arch>\n");
+    write_file(&runtime, &matching_runtime_archive());
     write_file(&stdlib, b"!<arch>\n");
     write_file(&stamp_path, stamp_before.as_bytes());
 
@@ -472,83 +475,97 @@ fn runtime_source_edit_rotates_build_stamp_and_fails_freshness() {
     );
 }
 
-/// Closes #507. The well-known flip's "shared tokio" allowlist
-/// must match the set of perry-ext-* crates whose own
-/// `Cargo.toml` pulls tokio. If a new wrapper is added that uses
-/// tokio for I/O without being added here, programs importing it
-/// will panic with "there is no reactor running" the first time
-/// the wrapper calls `Handle::current()` on a tokio worker.
+/// #507's co-build set (formerly "shared tokio"): the network wrappers are
+/// rebuilt in the stdlib's cargo invocation.
 #[test]
-fn net_needs_shared_tokio() {
-    assert!(binding_needs_shared_tokio("net"));
+fn net_cobuilds_with_stdlib() {
+    assert!(binding_cobuilds_with_stdlib("net"));
 }
 
-/// turnloop P8 lane L: only wrappers that still bundle tokio make the driver
-/// select perry-stdlib's `async-runtime`. perry-ext-net / -ws / -http run on
-/// turnloop, and perry-ext-mongodb, the last wrapper that bundled tokio, was
-/// deleted (#11337), so no well-known module selects it any more.
+/// The final tokio lane deleted perry-stdlib's `async-runtime` feature (the
+/// tokio current-thread runtime) and tokio with it. No import may select it
+/// again: not through the module → feature table, and not through the
+/// workspace manifest, whose declared-feature filter must drop it (and any
+/// `tokio` optional-dependency feature) as unknown. The Cargo.lock half of the
+/// same invariant is `scripts/tokio_inventory.py`.
 #[test]
-fn only_tokio_bundling_wrappers_select_async_runtime() {
-    for module in [
+fn no_feature_selection_reaches_tokio() {
+    let mut modules: Vec<String> = [
         "net",
-        "ws",
+        "tls",
         "http",
         "https",
         "http2",
-        "undici",
-        "nodemailer",
-        "bcrypt",
+        "ws",
+        "dgram",
+        "dns",
         "zlib",
-        "mongodb",
-    ] {
-        assert!(!binding_bundles_tokio(module), "{module} carries no tokio");
-    }
+        "crypto",
+        "child_process",
+        "worker_threads",
+        "readline",
+        "stream",
+        "streams",
+        "fs/promises",
+        "bcrypt",
+        "argon2",
+        "sharp",
+        "nodemailer",
+        "undici",
+        "perry/container",
+    ]
+    .iter()
+    .map(|m| m.to_string())
+    .collect();
     for binding in super::super::well_known::iter_well_known() {
-        let module = binding
-            .package
-            .strip_prefix("node:")
-            .unwrap_or(&binding.package);
+        modules.push(binding.package.clone());
+    }
+    let imports: BTreeSet<String> = modules.iter().cloned().collect();
+    let mut selected = compute_required_features(&imports, true, true);
+    for module in &modules {
+        selected.extend(crate::commands::stdlib_features::module_to_features(module));
+    }
+    for feature in &selected {
         assert!(
-            !binding_bundles_tokio(module),
-            "{module}: no well-known wrapper bundles tokio since #11337"
+            *feature != "async-runtime" && !feature.contains("tokio"),
+            "`{feature}` selects tokio, which was removed from the workspace"
         );
     }
-}
 
-/// Every wrapper that bundles tokio must also be co-built with the stdlib
-/// archive, or the #7629 link check would refuse its default build.
-#[test]
-fn every_tokio_bundling_wrapper_is_co_built() {
-    for binding in super::super::well_known::iter_well_known() {
-        let module = binding
-            .package
-            .strip_prefix("node:")
-            .unwrap_or(&binding.package);
-        if binding_bundles_tokio(module) {
-            assert!(
-                binding_needs_shared_tokio(module),
-                "{module} bundles tokio but is not co-built with perry-stdlib"
-            );
-        }
-    }
-}
-
-#[test]
-fn cpu_only_wrappers_do_not_need_shared_tokio() {
-    // bcrypt / argon2 / sharp / dotenv all route through
-    // perry-stdlib's `spawn_blocking` shim; their own crate has
-    // no tokio dep, so there's no CONTEXT collision risk.
-    assert!(!binding_needs_shared_tokio("bcrypt"));
-    assert!(!binding_needs_shared_tokio("argon2"));
-    assert!(!binding_needs_shared_tokio("sharp"));
-    assert!(!binding_needs_shared_tokio("dotenv"));
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut cross = vec![
+        "perry-stdlib/async-runtime".to_string(),
+        "perry-stdlib/tokio".to_string(),
+        "perry-stdlib/async-bridge".to_string(),
+    ];
+    let dropped = retain_workspace_declared_features(&workspace_root, &mut cross);
+    assert_eq!(
+        dropped,
+        ["perry-stdlib/async-runtime", "perry-stdlib/tokio"],
+        "perry-stdlib must declare neither `async-runtime` nor a `tokio` dependency"
+    );
+    assert_eq!(
+        cross,
+        ["perry-stdlib/async-bridge"],
+        "the bridge is the one that stays"
+    );
 }
 
 #[test]
-fn undici_needs_shared_tokio() {
+fn cpu_only_wrappers_are_not_co_built() {
+    // bcrypt / argon2 / sharp / dotenv all route through perry-stdlib's
+    // `spawn_blocking` / pool shims; their workspace-built archive links as-is.
+    assert!(!binding_cobuilds_with_stdlib("bcrypt"));
+    assert!(!binding_cobuilds_with_stdlib("argon2"));
+    assert!(!binding_cobuilds_with_stdlib("sharp"));
+    assert!(!binding_cobuilds_with_stdlib("dotenv"));
+}
+
+#[test]
+fn undici_cobuilds_with_stdlib() {
     // perry-ext-undici is network-I/O-family glue over the native fetch
-    // stack; it rides the shared build (see the freshness.rs comment).
-    assert!(binding_needs_shared_tokio("undici"));
+    // stack; it rides the co-build (see the freshness.rs comment).
+    assert!(binding_cobuilds_with_stdlib("undici"));
 }
 
 /// The emitted-FFI → link derivation resolves to real well-known bindings.
@@ -565,13 +582,13 @@ fn ext_prefix_binding_keys_resolve_to_wrapper_crates() {
     }
 }
 
-/// The auto-build selection split: undici carries its own tokio and
-/// must ride the shared auto-optimize invocation, while node-forge is CPU-only
+/// The auto-build selection split: undici rides the co-built auto-optimize
+/// invocation, while node-forge is CPU-only
 /// (routes async through perry-stdlib's spawn_blocking shim) and is auto-built
 /// by the isolated leaf-build path in the driver's CPU-only branch.
 #[test]
 fn ext_binding_build_routing_split() {
-    assert!(binding_needs_shared_tokio("undici"));
+    assert!(binding_cobuilds_with_stdlib("undici"));
 }
 
 #[test]
@@ -596,7 +613,9 @@ fn direct_tls_without_external_transport_keeps_legacy_umbrella() {
 fn unknown_modules_default_to_workspace_path() {
     // Defensive default: if a module isn't in the allowlist,
     // treat it as CPU-only (existing v0.5.586 behavior).
-    assert!(!binding_needs_shared_tokio("definitely-not-a-real-package"));
+    assert!(!binding_cobuilds_with_stdlib(
+        "definitely-not-a-real-package"
+    ));
 }
 
 #[test]
@@ -692,7 +711,7 @@ fn node_test_gate_keys_the_auto_optimize_cache() {
 }
 
 #[test]
-fn shared_tokio_wrapper_set_keys_the_auto_optimize_target_dir() {
+fn co_built_wrapper_set_keys_the_auto_optimize_target_dir() {
     // #9470 / #9094: wrapper selection is expressed with Cargo `-p` args,
     // not stdlib features. Two otherwise-identical compilations therefore
     // used to share one perry-auto target dir. Once the wrapper build released
@@ -710,12 +729,16 @@ fn shared_tokio_wrapper_set_keys_the_auto_optimize_target_dir() {
         Some("#466".to_string()),
     )];
 
-    let without_wrapper = auto_optimized_cache_key("async-runtime", true, false, None, &ctx, &[]);
-    let with_mysql = auto_optimized_cache_key("async-runtime", true, false, None, &ctx, &mysql);
-    let with_axios = auto_optimized_cache_key("async-runtime", true, false, None, &ctx, &axios);
+    let without_wrapper = auto_optimized_cache_key("async-bridge", true, false, None, &ctx, &[]);
+    let with_mysql = auto_optimized_cache_key("async-bridge", true, false, None, &ctx, &mysql);
+    let with_axios = auto_optimized_cache_key("async-bridge", true, false, None, &ctx, &axios);
 
     assert_ne!(without_wrapper, with_mysql);
     assert_ne!(with_mysql, with_axios);
+    assert!(
+        with_mysql.contains("|cobuild=perry-ext-mysql2:perry_ext_mysql2|"),
+        "the co-built set is keyed under `cobuild=`: {with_mysql}"
+    );
 
     // Aliases can discover the same archive more than once. Multiplicity and
     // tracking prose do not change the Cargo graph, so neither changes its key.
@@ -729,7 +752,7 @@ fn shared_tokio_wrapper_set_keys_the_auto_optimize_target_dir() {
     ];
     assert_eq!(
         with_mysql,
-        auto_optimized_cache_key("async-runtime", true, false, None, &ctx, &duplicate_mysql,)
+        auto_optimized_cache_key("async-bridge", true, false, None, &ctx, &duplicate_mysql,)
     );
 }
 
@@ -913,6 +936,85 @@ fn no_auto_still_resolves_prebuilt_well_known_archives() {
         "expected no-auto well-known libs to include {ws_lib:?}, got {:?}",
         libs.well_known_libs
     );
+}
+
+/// tokio lane L4: a `tls` import routes `net` — the TLS client and every
+/// client TLSSocket method are perry-ext-net's, and bundled `net` is gone.
+#[test]
+fn tls_import_routes_net_wrapper() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut ctx = CompilationContext::new(dir.path().to_path_buf());
+    ctx.native_module_imports.insert("node:tls".to_string());
+    // `well_known_iteration_set` reads PERRY_FORCE_WELL_KNOWN, which other
+    // tests in this binary mutate; hold the env lock across the read.
+    let _guard = env_lock();
+    assert!(well_known_iteration_set(&ctx).contains("net"));
+}
+
+/// tokio lane L4: perry-stdlib's bundled `net` / `ws` copies are deleted, so
+/// PERRY_DISABLE_WELL_KNOWN=1 must still put those two wrappers on the link
+/// line (there is no copy to revert to) while every other binding keeps
+/// reverting to perry-stdlib.
+#[test]
+fn disabled_flip_still_routes_sole_provider_wrappers() {
+    let _guard = env_lock();
+    let saved: Vec<_> = [
+        "PERRY_LIB_DIR",
+        "PERRY_RUNTIME_DIR",
+        "PERRY_DISABLE_WELL_KNOWN",
+    ]
+    .iter()
+    .map(|k| (*k, std::env::var(k).ok()))
+    .collect();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut archives = Vec::new();
+    for module in ["net", "ws", "events"] {
+        let binding = super::super::well_known::lookup_well_known(module).expect("binding");
+        let lib = dir
+            .path()
+            .join(super::super::well_known::ext_staticlib_filename(
+                &binding.lib,
+                rust_target_triple(None),
+            ));
+        std::fs::write(&lib, b"!<arch>\n").expect("write fake archive");
+        archives.push(lib);
+    }
+    set_env_var("PERRY_LIB_DIR", dir.path().to_str());
+    set_env_var("PERRY_RUNTIME_DIR", None);
+    set_env_var("PERRY_DISABLE_WELL_KNOWN", Some("1"));
+
+    let mut ctx = CompilationContext::new(dir.path().to_path_buf());
+    for module in ["net", "ws", "events"] {
+        ctx.native_module_imports.insert(module.to_string());
+    }
+    let libs = resolve_no_auto_optimized_libs(&ctx, None, OutputFormat::Json, 0);
+    let routed = super::retain_routed(well_known_iteration_set(&ctx));
+
+    for (key, value) in &saved {
+        set_env_var(key, value.as_deref());
+    }
+
+    assert!(
+        libs.well_known_libs.contains(&archives[0]),
+        "net: {libs:?}",
+        libs = libs.well_known_libs
+    );
+    assert!(
+        libs.well_known_libs.contains(&archives[1]),
+        "ws: {libs:?}",
+        libs = libs.well_known_libs
+    );
+    assert!(
+        !libs.well_known_libs.contains(&archives[2]),
+        "events has a perry-stdlib copy and must revert under the disabled flip"
+    );
+    assert_eq!(
+        routed,
+        std::collections::BTreeSet::from(["net".to_string(), "ws".to_string()])
+    );
+    assert!(super::wrapper_is_sole_provider("node:net"));
+    assert!(!super::wrapper_is_sole_provider("tls"));
 }
 
 /// #10466 — the flip side of the test above: when the program DOES import
@@ -1567,6 +1669,17 @@ fn gc_instrument_knobs_match_the_runtime() {
     let end = start + src[start..].find("];").unwrap();
     let runtime: Vec<&str> = src[start..end].split('"').skip(1).step_by(2).collect();
     assert_eq!(runtime, super::freshness::GC_INSTRUMENT_KNOBS);
+}
+
+#[test]
+fn hot_diag_knobs_match_the_runtime() {
+    // #10572: same pairing as the GC instruments, for `hot_diag`'s probes.
+    let root = super::super::find_perry_workspace_root().unwrap();
+    let src = std::fs::read_to_string(root.join("crates/perry-runtime/src/hot_diag.rs")).unwrap();
+    let start = src.find("HOT_DIAG_KNOBS: &[&str] = &[").unwrap();
+    let end = start + src[start..].find("];").unwrap();
+    let runtime: Vec<&str> = src[start..end].split('"').skip(1).step_by(2).collect();
+    assert_eq!(runtime, super::freshness::HOT_DIAG_KNOBS);
 }
 
 // #11174: a no-auto HTTP rebuild bundles runtime code into the stdlib archive.

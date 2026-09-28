@@ -63,7 +63,13 @@ pub fn native_units_mode() -> NativeMode {
     match std::env::var("PERRY_LLVM_INPROCESS").as_deref() {
         Ok("0" | "off" | "false" | "1" | "on" | "true") => NativeMode::Off,
         Ok("diff") => NativeMode::Diff,
-        Ok("native") | Err(_) => NativeMode::Native,
+        Ok("native") => NativeMode::Native,
+        // #9856: `--debug-symbols` line markers are turned into DWARF by a
+        // pass over module TEXT (`crate::debug_info`), which native
+        // construction never materializes — keep debug builds on the text
+        // transport.
+        Err(_) if std::env::var_os("PERRY_DEBUG_SYMBOLS").is_some() => NativeMode::Off,
+        Err(_) => NativeMode::Native,
         Ok(_) => NativeMode::Off,
     }
 }
@@ -591,7 +597,7 @@ pub fn compile_module_units_native(
                 stats.emit_secs,
             );
         }
-        let obj = crate::linker::finish_native_emission(unit_bytes, &effective_target, &args)
+        let obj = crate::linker::finish_native_pieces(unit_bytes, &effective_target, &args)
             .with_context(|| format!("unit {i}"))?;
         if let Some((cache, key)) = checkpoint {
             cache.store(i, unit_total, key, &obj);
@@ -913,8 +919,8 @@ pub fn compile_module_native(
             &args,
             native_roots,
         ) {
-            Ok(bytes) => {
-                return crate::linker::finish_native_emission(bytes, &effective_target, &args);
+            Ok(pieces) => {
+                return crate::linker::finish_native_pieces(pieces, &effective_target, &args);
             }
             Err(error) => {
                 let Some(violations) = crate::inprocess::rs4gc_budget_retry(&error) else {
@@ -1586,13 +1592,13 @@ fn compile_module_diff_once(
     match native {
         Err(e) => {
             eprintln!("perry: [ir-diff] native construction FAILED (text arm still used): {e:#}");
-            let bytes = crate::inprocess::optimize_and_emit_module(
+            let pieces = crate::inprocess::optimize_and_emit_module(
                 &m_text,
                 &effective_target,
                 &args,
                 native_roots,
             )?;
-            crate::linker::finish_native_emission(bytes, &effective_target, &args)
+            crate::linker::finish_native_pieces(pieces, &effective_target, &args)
         }
         Ok(m_native) => {
             debug_dump(&m_native, module_prefix);
@@ -1623,21 +1629,21 @@ fn compile_module_diff_once(
                 eprintln!(
                     "perry: [ir-diff] OK — native and text arms emit byte-identical objects \
                      ({} bytes)",
-                    bytes_text.len()
+                    bytes_text.iter().map(Vec::len).sum::<usize>()
                 );
             } else {
                 eprintln!(
                     "perry: [ir-diff] MISMATCH — object bytes differ (text {} vs native {}); \
                      set PERRY_LLVM_DIFF_DIR to dump both arms' pre-opt IR",
-                    bytes_text.len(),
-                    bytes_native.len()
+                    bytes_text.iter().map(Vec::len).sum::<usize>(),
+                    bytes_native.iter().map(Vec::len).sum::<usize>()
                 );
                 if let Some(dir) = &dump_dir {
                     let _ = std::fs::create_dir_all(dir);
                     let _ = std::fs::write(format!("{dir}/text_arm.ll"), &pre_text);
                     let _ = std::fs::write(format!("{dir}/native_arm.ll"), &pre_native);
-                    let _ = std::fs::write(format!("{dir}/text_arm.o"), &bytes_text);
-                    let _ = std::fs::write(format!("{dir}/native_arm.o"), &bytes_native);
+                    let _ = std::fs::write(format!("{dir}/text_arm.o"), bytes_text.concat());
+                    let _ = std::fs::write(format!("{dir}/native_arm.o"), bytes_native.concat());
                     eprintln!("perry: [ir-diff] arms dumped under {dir}");
                 }
             }
@@ -1647,7 +1653,7 @@ fn compile_module_diff_once(
             // file type` (#7982) — the diff arm shared the native arm's bug
             // and was never reached in CI, because the native arm failed
             // first.
-            crate::linker::finish_native_emission(bytes_text, &effective_target, &args)
+            crate::linker::finish_native_pieces(bytes_text, &effective_target, &args)
         }
     }
 }

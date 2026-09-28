@@ -73,6 +73,71 @@ fn canonicalize_raw_f64_numeric_store_value(
     )
 }
 
+/// #10907: store a numeric value into a raw-f64 class-field slot without
+/// paying the out-of-line `js_array_numeric_value_to_raw_f64` call on the
+/// common path.
+///
+/// Used where the stored value is NOT already known to be a plain finite
+/// double: the strict guarded arm's fast block (reached both from the inline
+/// precheck and from `js_typed_feedback_class_field_set_guard`, which also
+/// admits INT32-boxed / non-finite numbers) and the scalar-replaced field
+/// stores. Canonicalizing unconditionally made every `o.f = <number>` into a
+/// `: number` field ~31 instructions dearer than the same store into a `: any`
+/// field. The call is the identity on any finite double and on any value
+/// `expr_produces_canonical_raw_f64` admits, so it is skipped statically for
+/// the latter and, otherwise, kept only on the arm an inline plain-finite test
+/// of the bits cannot rule out.
+///
+/// Each arm does its own store instead of merging through a `phi`: a phi
+/// operand is never re-materialised by `root_reload`, while an ordinary store
+/// operand is, so this keeps the value's uses in the shape the rooting passes
+/// and `gc_root_dominance_check.py` already understand. Leaves
+/// `ctx.current_block` on a block with no terminator.
+fn emit_raw_f64_class_field_slot_store(
+    ctx: &mut FnCtx<'_>,
+    value: &Expr,
+    value_double: &str,
+    slot_ptr: &str,
+) {
+    if crate::type_analysis::expr_produces_canonical_raw_f64(ctx, value) {
+        // GC_STORE_AUDIT(POINTER_FREE): canonical raw f64 by construction —
+        // never a NaN-boxed heap pointer.
+        ctx.block().store(DOUBLE, value_double, slot_ptr);
+        return;
+    }
+    let plain_idx = ctx.new_block("class_field_set.raw_plain");
+    let canon_idx = ctx.new_block("class_field_set.raw_canonicalize");
+    let join_idx = ctx.new_block("class_field_set.raw_join");
+    let plain_label = ctx.block_label(plain_idx);
+    let canon_label = ctx.block_label(canon_idx);
+    let join_label = ctx.block_label(join_idx);
+    {
+        let blk = ctx.block();
+        let value_bits = blk.bitcast_double_to_i64(value_double);
+        let finite =
+            crate::expr::class_field_inline_guard::emit_plain_finite_number_check(blk, &value_bits);
+        blk.cond_br(&finite, &plain_label, &canon_label);
+    }
+    ctx.current_block = plain_idx;
+    {
+        let blk = ctx.block();
+        // GC_STORE_AUDIT(POINTER_FREE): the plain-finite test proved a genuine
+        // unboxed double (every NaN-box tag has the all-ones exponent).
+        blk.store(DOUBLE, value_double, slot_ptr);
+        blk.br(&join_label);
+    }
+    ctx.current_block = canon_idx;
+    {
+        let blk = ctx.block();
+        let canonical = canonicalize_raw_f64_numeric_store_value(blk, value_double);
+        // GC_STORE_AUDIT(POINTER_FREE): the canonicalizer returns a raw number
+        // (NaN for anything non-numeric), never a heap pointer.
+        blk.store(DOUBLE, &canonical, slot_ptr);
+        blk.br(&join_label);
+    }
+    ctx.current_block = join_idx;
+}
+
 /// Lower the receiver/value pair for the class-field and setter fast paths.
 ///
 /// `root_reload` already repairs the common bare-local / `this` receiver, and
@@ -163,6 +228,7 @@ fn lower_runtime_property_set_by_name(
     // for sloppy.
     assignment_strict: bool,
 ) -> Result<String> {
+    super::store_census::bump(ctx, super::store_census::BY_NAME_RUNTIME);
     if !assignment_strict {
         return lower_put_value_property_set_by_name(ctx, object, property, value, false);
     }
@@ -225,6 +291,7 @@ pub(crate) fn lower_put_value_property_set_by_name(
     value: &Expr,
     assignment_strict: bool,
 ) -> Result<String> {
+    super::store_census::bump(ctx, super::store_census::BY_NAME_PUT_VALUE);
     rooting::with_operands_rooted_across(
         ctx,
         &[object],
@@ -507,12 +574,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                         && is_numeric_expr(ctx, value)
                         && !expr_may_return_boxed_value_from_raw_f64_fallback(ctx, value);
                     let val_double = lower_expr(ctx, value)?;
-                    let stored_value = if numeric_store {
-                        canonicalize_raw_f64_numeric_store_value(ctx.block(), &val_double)
+                    if numeric_store {
+                        emit_raw_f64_class_field_slot_store(ctx, value, &val_double, &slot);
                     } else {
-                        val_double.clone()
-                    };
-                    ctx.block().store(DOUBLE, &stored_value, &slot);
+                        ctx.block().store(DOUBLE, &val_double, &slot);
+                    }
                     // #6968: bind the field alloca as a precise GC root, the
                     // same treatment `emit_shadow_slot_update_for_expr` gives
                     // an ordinary pointer-typed local. Skipped for a
@@ -558,7 +624,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                         ],
                     );
                     if numeric_store {
-                        let lowered_f64 = LoweredValue::f64(stored_value.clone());
+                        let lowered_f64 = LoweredValue::f64(val_double.clone());
                         ctx.record_lowered_value_with_access_mode(
                             "ScalarObjectFieldSet",
                             Some(*id),
@@ -653,12 +719,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                         && !expr_may_return_boxed_value_from_raw_f64_fallback(ctx, value);
                     let val_double = lower_expr(ctx, value)?;
                     if let Some(slot) = maybe_slot {
-                        let stored_value = if numeric_store {
-                            canonicalize_raw_f64_numeric_store_value(ctx.block(), &val_double)
+                        if numeric_store {
+                            emit_raw_f64_class_field_slot_store(ctx, value, &val_double, &slot);
                         } else {
-                            val_double.clone()
-                        };
-                        ctx.block().store(DOUBLE, &stored_value, &slot);
+                            ctx.block().store(DOUBLE, &val_double, &slot);
+                        }
                         // #6968: see the `ScalarObjectFieldSet` path above —
                         // an inlined constructor's `this.f = …` writes the
                         // same kind of unrooted per-field alloca.
@@ -696,7 +761,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                             ],
                         );
                         if numeric_store {
-                            let lowered_f64 = LoweredValue::f64(stored_value.clone());
+                            let lowered_f64 = LoweredValue::f64(val_double.clone());
                             ctx.record_lowered_value_with_access_mode(
                                 "ScalarThisFieldSet",
                                 Some(target_id),
@@ -770,6 +835,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                             object,
                             value,
                             |ctx, recv_box, val_double| {
+                                super::store_census::bump(ctx, super::store_census::CFIELD_SETTER);
                                 let _ = ctx.block().call(
                                     DOUBLE,
                                     &fn_name,
@@ -800,10 +866,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                 // setter that throws does so because of its own body, not because
                 // of the assignment's `Throw` flag.
                 if !assignment_strict {
-                    if matches!(object.as_ref(), Expr::LocalGet(_) | Expr::This) {
+                    // A class whose instances outgrow the birth shape misses
+                    // the class guard on every store (see
+                    // `class_instances_grow_past_layout`); the generic tail
+                    // below serves it from the shapes it sees.
+                    if matches!(object.as_ref(), Expr::LocalGet(_) | Expr::This)
+                        && !crate::expr::class_field_inline_guard::class_instances_grow_past_layout(
+                            ctx,
+                            &class_name,
+                        )
+                    {
                         if let Some(result) =
                             try_lower_sloppy_class_field_store(ctx, object, property, value)?
                         {
+                            super::store_census::bump(ctx, super::store_census::CFIELD_SLOPPY);
                             return Ok(result);
                         }
                     }
@@ -827,6 +903,64 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                         ctx.class_ids.get(&class_name),
                         ctx.class_keys_globals.get(&class_name).cloned(),
                     ) {
+                        // The store twin of #11161's read routing: a subclass
+                        // the write guard cannot name (the hierarchy is wider
+                        // than the arm cap, or a subclass moves the field)
+                        // fails the guard on EVERY store and pays the guard
+                        // call and `js_class_field_set_fallback` behind it —
+                        // measured on Zod 3.23, 24,600 of 77,200 executed
+                        // class-field stores per 200 parses. The generic
+                        // static-key store serves such a site from the
+                        // ShapeIds it actually sees. A receiver the compiler
+                        // proved (ptr-shape) and a raw-f64 field keep the
+                        // class route: both depend on the declared class.
+                        let route_raw_f64 = crate::type_analysis::class_field_declared_type(
+                            ctx,
+                            &class_name,
+                            property,
+                        )
+                        .as_ref()
+                        .is_some_and(crate::typed_shape::type_is_raw_f64_candidate);
+                        let route_proven = ctx
+                            .ptr_shape_receiver_fact(object.as_ref())
+                            .is_some_and(|fact| fact.class_name == class_name);
+                        if !route_proven
+                            && crate::expr::class_field_inline_guard::class_instances_grow_past_layout(
+                                ctx,
+                                &class_name,
+                            )
+                        {
+                            return lower_put_value_property_set_by_name(
+                                ctx,
+                                object,
+                                property,
+                                value,
+                                assignment_strict,
+                            );
+                        }
+                        if !route_raw_f64 && !route_proven {
+                            let route_arms =
+                                crate::expr::class_field_inline_guard::class_field_subclass_arms(
+                                    ctx,
+                                    &class_name,
+                                    property,
+                                    field_index,
+                                    false,
+                                );
+                            if !crate::expr::class_field_inline_guard::class_field_arms_cover_every_subclass(
+                                ctx,
+                                &class_name,
+                                &route_arms,
+                            ) {
+                                return lower_put_value_property_set_by_name(
+                                    ctx,
+                                    object,
+                                    property,
+                                    value,
+                                    assignment_strict,
+                                );
+                            }
+                        }
                         return with_class_store_operands(
                             ctx,
                             object,
@@ -896,6 +1030,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                             blk.cond_br(&finite, &store_label, &side_exit_label);
                                         }
                                         ctx.current_block = store_idx;
+                                        super::store_census::bump(
+                                            ctx,
+                                            super::store_census::CFIELD_LOOP_RAW,
+                                        );
                                         {
                                             let header_skip =
                                                 crate::target_layout::object_header_size_bytes(
@@ -991,6 +1129,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                     .unwrap_or(false);
                                 if ptr_shape_proven {
                                     ctx.note_ptr_shape_consumed(object.as_ref(), "ptr_shape_set");
+                                    super::store_census::bump(
+                                        ctx,
+                                        super::store_census::CFIELD_SHAPE_PROVEN,
+                                    );
                                     let header_skip =
                                         crate::target_layout::object_header_size_bytes(
                                             ctx.target_triple,
@@ -1178,8 +1320,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                         let key_bits = blk.bitcast_double_to_i64(&key_box);
                                         blk.and(I64, &key_bits, POINTER_MASK_I64)
                                     };
-                                    ctx.block().call_void(
-                                        "js_class_field_set_ic",
+                                    super::store_census::bump(
+                                        ctx,
+                                        super::store_census::CFIELD_IC_CALL,
+                                    );
+                                    // S2: guard + store is a GC-leaf call; only
+                                    // a decline takes the collecting call.
+                                    crate::expr::ic_fast_split::emit_class_field_set_split(
+                                        ctx,
                                         &[
                                             (I64, &site_id),
                                             (DOUBLE, &recv_box),
@@ -1276,6 +1424,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                 &subclass_arms,
                                 &keys_global_name,
                             );
+                                super::store_census::bump(ctx, super::store_census::CFIELD_IC_CALL);
                                 let guard_ok = ctx.block().call(
                                     I32,
                                     "js_typed_feedback_class_field_set_guard",
@@ -1295,6 +1444,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                     .cond_br(&guard_pass, &fast_label, &fallback_label);
 
                                 ctx.current_block = fast_idx;
+                                super::store_census::bump(
+                                    ctx,
+                                    super::store_census::CFIELD_GUARD_STORE,
+                                );
                                 // #5334 lever D: a value that is a non-pointer by
                                 // construction (number / bool / undefined / null /
                                 // comparison / arithmetic) creates no parent→child heap
@@ -1340,16 +1493,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                         // Guarded raw-f64 slots are pointer-free by typed
                                         // shape descriptor; non-number writes miss the
                                         // guard and use the boxed setter fallback.
-                                        let blk = ctx.block();
-                                        let numeric_value =
-                                            canonicalize_raw_f64_numeric_store_value(
-                                                blk,
-                                                &val_double,
-                                            );
+                                        // #10907: canonicalize only off the
+                                        // plain-finite path.
+                                        //
                                         // GC_STORE_AUDIT(POINTER_FREE): typed raw-f64 class
                                         // slots contain numbers only.
-                                        blk.store(DOUBLE, &numeric_value, &field_ptr);
-                                        Some(numeric_value)
+                                        emit_raw_f64_class_field_slot_store(
+                                            ctx,
+                                            value,
+                                            &val_double,
+                                            &field_ptr,
+                                        );
+                                        Some(val_double.clone())
                                     } else {
                                         // #5334 lever D: skip the barrier when the value
                                         // is a non-pointer by construction. #7469 extends
@@ -1462,6 +1617,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                                 }
 
                                 ctx.current_block = fallback_idx;
+                                super::store_census::bump(
+                                    ctx,
+                                    super::store_census::CFIELD_GUARD_FALLBACK,
+                                );
                                 let blk = ctx.block();
                                 // #5334 lever A: the guard already ran and FAILED in the
                                 // entry block, so this cold arm is a pure guard-miss

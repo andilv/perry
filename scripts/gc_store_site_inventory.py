@@ -603,6 +603,7 @@ STEM_EMITTER_ARG_INDEX = {
     "emit_write_barrier_slot_value_and_generation_tested": 5,
     "emit_jsvalue_slot_store_pointer_tested": 11,
     "emit_guarded_inbounds_array_store": 4,
+    "emit_guarded_inbounds_array_store_keyed": 4,
     # The static-key store IC (`expr/put_value_store_ic.rs`): its bookkeeping
     # emitter takes the stem after the value.
     "emit_static_store_ic_bookkeeping": 7,
@@ -611,7 +612,10 @@ STEM_EMITTER_ARG_INDEX = {
 # Emitter wrappers that forward a caller-supplied stem: their INTERNAL emitter
 # call passes an identifier, and the stem literal lives at THEIR call sites
 # (which the census scans through the same table above).
-STEM_FORWARDERS = {"emit_guarded_inbounds_array_store"}
+STEM_FORWARDERS = {
+    "emit_guarded_inbounds_array_store",
+    "emit_guarded_inbounds_array_store_keyed",
+}
 
 STEM_REGISTRY_PATH = "crates/perry-codegen/src/expr/barrier_stem_census_tests.rs"
 STEM_REGISTRY_HEADER = "VERIFIED_BARRIER_STEMS"
@@ -643,9 +647,10 @@ CODEGEN_BARRIERED_BINDINGS = {
     # the unconditional element store inside `emit_dynamic_pointer_push_store`,
     # which the same `apush`-stem caller barriers after its layout bookkeeping.
     "crates/perry-codegen/src/expr/array_push.rs": ("apush", 2),
-    # The static-key store IC: one unconditional slot store, discharged by the
-    # `put.pic`-stem bookkeeping emitted right after it.
-    "crates/perry-codegen/src/expr/put_value_store_ic.rs": ("put.pic", 1),
+    # The static-key store IC: two unconditional slot stores (the existing-key
+    # hit and the key-add hit), each discharged by the `put.pic`-stem
+    # bookkeeping emitted right after it.
+    "crates/perry-codegen/src/expr/put_value_store_ic.rs": ("put.pic", 2),
 }
 
 RUNTIME_MARKER_RE = re.compile(r"GC_STORE_AUDIT\((BARRIERED|EXTERNAL_BARRIERED)\)")
@@ -1620,11 +1625,14 @@ def run_self_tests() -> int:
                 "// GC_STORE_AUDIT(BARRIERED): planted\n"
                 "// GC_STORE_AUDIT(BARRIERED): planted store\n" + codegen_calls
             ),
-            # The static-key store IC: one bound marker and one stem-literal
-            # call, so V-P1 tracks the real binding table.
+            # The static-key store IC: two bound markers (the existing-key and
+            # the key-add store) and their stem-literal calls, so V-P1 tracks
+            # the real binding table.
             "crates/perry-codegen/src/expr/put_value_store_ic.rs": (
                 "// GC_STORE_AUDIT(BARRIERED): planted\n"
+                "// GC_STORE_AUDIT(BARRIERED): planted add\n"
                 "fn lower_store(ctx: &mut FnCtx) {\n"
+                "    emit_static_store_ic_bookkeeping(ctx, a, b, c, d, e, f, \"put.pic\");\n"
                 "    emit_static_store_ic_bookkeeping(ctx, a, b, c, d, e, f, \"put.pic\");\n"
                 "}\n"
             ),

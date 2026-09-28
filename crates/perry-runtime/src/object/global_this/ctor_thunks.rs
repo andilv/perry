@@ -173,19 +173,45 @@ pub(crate) extern "C" fn uri_error_constructor_call_thunk(
 /// Whether `value` is the %Function.prototype% intrinsic object. It is the
 /// one ordinary-object-shaped value that is itself a Function: callable
 /// (returns `undefined`), tagged `[object Function]`, but NOT a constructor.
-/// Only consulted on slow paths (failed call dispatch, `Object.prototype.
-/// toString`), so the per-call re-resolution through the global registry is
-/// fine — and safer than caching a raw pointer across GC cycles.
+///
+/// #10497: answered by comparing against THIS realm's memoized intrinsic
+/// address (`array::prototype_addr`'s `Function` row) — one TLS load, a header
+/// probe for forwarding, and a compare. It used to re-resolve
+/// `globalThis.Function` BY NAME and read its `prototype` dynamic property on
+/// every call ("safer than holding a raw pointer across GC cycles"), and the
+/// universal method dispatcher's own-override check reaches this through
+/// `js_object_has_own` on every dispatched call: 5.4% of Perry's excess
+/// instructions over Node across 14 packages (#11464). The raw-pointer
+/// concern is what the memo's registered root scanner and forwarding-chain
+/// healing already answer for `Array.prototype` / `Object.prototype` (#6981),
+/// per thread so each `perry/thread` agent compares against its own realm
+/// (#7988).
+///
+/// #10602: `js_new_function_construct` and `is_constructor_value` also ask on
+/// every `new F()`; they now pay the compare instead of the lookup.
 pub(crate) fn is_function_prototype_object_value(value: f64) -> bool {
     let jv = JSValue::from_bits(value.to_bits());
     if !jv.is_pointer() {
         return false;
     }
-    let proto = builtin_prototype_value("Function");
-    proto.to_bits() == value.to_bits()
+    let addr = (value.to_bits() & crate::value::POINTER_MASK) as usize;
+    addr != 0 && addr == crate::array::function_prototype_addr()
 }
 
+/// `<name>.prototype` of this realm's builtin constructor `name`.
+///
+/// `"Function"` is answered from the memoized intrinsic (#10497) — the same
+/// object the by-name walk below finds, unless user code has reassigned the
+/// writable `globalThis.Function`, in which case the memo is the spec's
+/// %Function.prototype% and the walk would not be. Every other name keeps
+/// the walk.
 pub(crate) fn builtin_prototype_value(name: &str) -> f64 {
+    if name == "Function" {
+        let addr = crate::array::function_prototype_addr();
+        if addr != 0 {
+            return crate::value::js_nanbox_pointer(addr as i64);
+        }
+    }
     let ctor = js_get_global_this_builtin_value(name.as_ptr(), name.len());
     let ctor_bits = ctor.to_bits();
     if (ctor_bits >> 48) != 0x7FFD {
@@ -509,5 +535,79 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    // #10602: the header pre-check is sound only while %Function.prototype%
+    // stays an ordinary object; if it ever became a closure the predicate
+    // would silently answer `false` for it and `new Function.prototype()`
+    // would stop throwing. Pin both halves of that contract.
+    #[test]
+    fn function_prototype_is_an_ordinary_object_and_closures_are_not_it() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let proto = scope.root_nanbox_f64(super::builtin_prototype_value("Function"));
+        let header = unsafe {
+            crate::value::addr_class::try_read_gc_header(closure_addr(proto.get_nanbox_f64()))
+        }
+        .expect("Function.prototype must be a heap object");
+        assert_eq!(header.obj_type, crate::gc::GC_TYPE_OBJECT);
+        assert!(super::is_function_prototype_object_value(
+            proto.get_nanbox_f64()
+        ));
+
+        let function_ctor = scope.root_nanbox_f64(crate::object::js_get_global_this_builtin_value(
+            b"Function".as_ptr(),
+            8,
+        ));
+        assert!(!super::is_function_prototype_object_value(
+            function_ctor.get_nanbox_f64()
+        ));
+        let object_proto = scope.root_nanbox_f64(super::builtin_prototype_value("Object"));
+        assert!(!super::is_function_prototype_object_value(
+            object_proto.get_nanbox_f64()
+        ));
+    }
+
+    // #10497: the predicate and `builtin_prototype_value("Function")` answer
+    // from the per-realm memo now. Pin that the memo names exactly the object
+    // the by-name walk they replaced finds — `globalThis.Function.prototype`
+    // read through the constructor's dynamic `prototype` property — so a wrong
+    // row (Array's, Object's, or nothing) cannot pass as "fast".
+    #[test]
+    fn function_prototype_memo_is_the_by_name_intrinsic() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let ctor = scope.root_nanbox_f64(crate::object::js_get_global_this_builtin_value(
+            b"Function".as_ptr(),
+            8,
+        ));
+        let walked = scope.root_nanbox_f64(crate::closure::closure_get_dynamic_prop(
+            closure_addr(ctor.get_nanbox_f64()),
+            "prototype",
+        ));
+        assert!(
+            crate::value::JSValue::from_bits(walked.get_nanbox_u64()).is_pointer(),
+            "the by-name walk must find a real Function.prototype, or the \
+             comparison below is vacuous"
+        );
+        assert_eq!(
+            super::builtin_prototype_value("Function").to_bits(),
+            walked.get_nanbox_u64()
+        );
+        assert_eq!(
+            crate::array::function_prototype_addr(),
+            closure_addr(walked.get_nanbox_f64())
+        );
+        assert!(super::is_function_prototype_object_value(
+            walked.get_nanbox_f64()
+        ));
+        assert_ne!(
+            crate::array::function_prototype_addr(),
+            crate::array::object_prototype_addr()
+        );
+        assert_ne!(
+            crate::array::function_prototype_addr(),
+            crate::array::array_prototype_addr()
+        );
     }
 }

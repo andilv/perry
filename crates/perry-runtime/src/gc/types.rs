@@ -19,6 +19,7 @@ pub const GC_TYPE_ARRAY: u8 = 1;
 pub const GC_TYPE_OBJECT: u8 = 2;
 pub const GC_TYPE_STRING: u8 = 3;
 pub const GC_TYPE_CLOSURE: u8 = 4;
+const _: () = assert!(GC_TYPE_CLOSURE == crate::codegen_abi::GC_TYPE_CLOSURE);
 pub const GC_TYPE_PROMISE: u8 = 5;
 pub const GC_TYPE_BIGINT: u8 = 6;
 pub const GC_TYPE_ERROR: u8 = 7;
@@ -336,7 +337,10 @@ pub(crate) enum GcMoveHookKind {
     SetSideTables,
     /// Rekey a movable exotic cell's address-keyed expando side table after a
     /// move. Used by `GC_TYPE_PROMISE`, whose `status`/`value` expandos
-    /// (#5142) live in `object::exotic_expando` keyed by the promise address.
+    /// (#5142) live in `object::exotic_expando` keyed by the promise address,
+    /// and by `GC_TYPE_REGEXP`, whose user-assigned properties live there too.
+    /// A dead owner's entry is dropped by the `gc::dead_owner` fan-out
+    /// (`prune_dead_exotic_expando_owners`), not by a per-type hook.
     ExoticExpandoOwner,
     /// Rekey the Node diagnostic record keyed by the ErrorHeader address after
     /// a move. Errors are movable; without this a moved error loses its
@@ -344,10 +348,6 @@ pub(crate) enum GcMoveHookKind {
     /// live on the Error's traced `ObjectMeta` edge and need no side-table
     /// rekeying.
     ErrorSideTables,
-    /// Rekey the RegExp identity registry plus its exotic expando owner entry.
-    /// `GC_TYPE_REGEXP` is movable, and both tables use the payload address as
-    /// their key.
-    RegExpSideTables,
     /// Rekey a lazy JSON array's tape registration. `json_tape_store` keys a
     /// tape by its owner's address, which is precisely what kept
     /// `GC_TYPE_LAZY_ARRAY` immovable and old-gen until this existed.
@@ -392,11 +392,6 @@ pub(crate) enum GcFinalizeHookKind {
     /// #7539: free a dead lazy JSON array's tape bytes, which
     /// `json_tape_store` owns outside the GC heap.
     LazyArrayTape,
-    /// Release a dead RegExp cell's header-owned compiled programs and drop
-    /// its entries from every payload-address-keyed registry. Moved arena
-    /// stubs use only the move-hook dead-owner fan-out so ownership transfers
-    /// to the relocated header instead of being released with the old copy.
-    RegExpSideTables,
 }
 
 #[allow(dead_code)]
@@ -812,9 +807,9 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         GcExternalBytePolicy::InlinePayload,
         GcLargeObjectPolicy::MallocTracked,
         false,
-        GcMoveHookKind::RegExpSideTables,
+        GcMoveHookKind::ExoticExpandoOwner,
         GcRewriteHookKind::None,
-        GcFinalizeHookKind::RegExpSideTables,
+        GcFinalizeHookKind::None,
     )),
     Some(gc_type_info_entry(
         GC_TYPE_REGEX_PROGRAM,
@@ -937,9 +932,6 @@ pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user
                 old_user, new_user,
             );
         }
-        GcMoveHookKind::RegExpSideTables => {
-            crate::regex::regex_header_moved_for_gc(old_user, new_user);
-        }
         GcMoveHookKind::LazyArrayTape => {
             crate::json_tape_store::owner_moved(old_user, new_user);
         }
@@ -972,9 +964,6 @@ pub(crate) fn gc_type_clear_dead_payload_side_tables(obj_type: u8, user_ptr: usi
             // `finalize_dead_copied_minor_from_space_lazy_tapes`. Releasing it
             // a third time here would be sound (the release is idempotent) but
             // would hide which pass actually owns the reclaim.
-        }
-        GcMoveHookKind::RegExpSideTables => {
-            crate::regex::regex_header_clear_dead_for_gc(user_ptr);
         }
         GcMoveHookKind::None
         | GcMoveHookKind::MapForeachStack
@@ -1030,9 +1019,6 @@ pub(crate) unsafe fn gc_type_finalize_unmarked_payload(obj_type: u8, user_ptr: *
         }
         GcFinalizeHookKind::LazyArrayTape => {
             crate::json_tape_store::release(user_ptr as usize);
-        }
-        GcFinalizeHookKind::RegExpSideTables => {
-            crate::regex::regex_header_finalize_for_gc(user_ptr as *mut crate::regex::RegExpHeader);
         }
     }
 }
@@ -1181,6 +1167,8 @@ pub const GC_FLAG_HAS_SURVIVED: u8 = 0x40;
 /// breaks ABI everywhere; deferred until/unless a future phase
 /// genuinely needs more bits).
 pub const GC_FLAG_FORWARDED: u8 = 0x80;
+const _: () = assert!(GC_FLAG_FORWARDED == crate::codegen_abi::GC_FLAG_FORWARDED);
+const _: () = assert!(GC_HEADER_SIZE == crate::codegen_abi::GC_HEADER_SIZE);
 
 /// Read the forwarding address embedded in a forwarded object's user
 /// payload. Caller must verify `gc_flags & GC_FLAG_FORWARDED` is set;
@@ -1329,6 +1317,23 @@ pub(crate) const GC_ARRAY_RAW_F64_LAYOUT: u16 = 0x80;
 /// absent) has no code path that can produce it, because the only writer of the
 /// entry is also the only writer of the bit, under one lock.
 pub(crate) const GC_RESIDUAL_PROTO_OWNER: u16 = 0x40;
+/// #10593: the same bit, read on a `GC_TYPE_ARRAY` as "THIS array's
+/// `[[Prototype]]` was retargeted". Arrays are never meta-capable, so every
+/// `Object.setPrototypeOf(arr, p)` records into the residual registry and sets
+/// the bit; it rides growth and every GC relocation for the reasons given
+/// above, and it is set-only, so a later reset to `Array.prototype` leaves the
+/// array (conservatively) on the slow path.
+///
+/// This is what the inline element guards consult per receiver instead of the
+/// process-wide `PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED` byte, which used to
+/// be flipped by the first retargeted array and then stood the index fast path
+/// — and with it the cheap element-store barrier — down for EVERY array in the
+/// program (a 33x whole-program cliff from one line of setup). The byte now
+/// only carries the genuinely global facts: an index on `Array.prototype` or
+/// `Object.prototype`, a retargeted `Array.prototype`, or a retargeted lazy
+/// JSON array (whose materialized storage is a separate allocation that does
+/// not carry this bit).
+pub(crate) const GC_ARRAY_CUSTOM_PROTO: u16 = GC_RESIDUAL_PROTO_OWNER;
 /// Array was synthesized for a function's `arguments` binding. This is only
 /// meaningful for `GC_TYPE_ARRAY`; it lets `util.types.isArgumentsObject`
 /// distinguish Perry's internal `arguments` arrays from user rest arrays.
@@ -1385,7 +1390,7 @@ pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
 /// |---|---|---|---|
 /// | 0..2 | `OBJ_FLAG_FROZEN` / `SEALED` / `NO_EXTEND` | same | |
 /// | 3..5 | | | `GC_COPY_SURVIVAL_AGE_MASK` |
-/// | 6 | `OBJ_FLAG_NULL_PROTO` | | `GC_RESIDUAL_PROTO_OWNER` (non-object) |
+/// | 6 | `OBJ_FLAG_NULL_PROTO` | `GC_ARRAY_CUSTOM_PROTO` (alias) | `GC_RESIDUAL_PROTO_OWNER` (non-object) |
 /// | 7 | `OBJ_FLAG_PACKED_NUMERIC_PROOF` | `GC_ARRAY_RAW_F64_LAYOUT` | |
 /// | 8 | `OBJ_FLAG_TYPED_ARRAY_PROTO` | `GC_ARRAY_NAMED_PROPS` | |
 /// | 9 | `OBJ_FLAG_PLAIN_ORDINARY` | `GC_ARRAY_ARGUMENTS_OBJECT` | |

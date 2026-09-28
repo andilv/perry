@@ -282,12 +282,15 @@ fn test_live_owner_descriptor_entries_survive_full_gc() {
 #[test]
 fn test_tenured_owner_descriptor_entries_survive_minor_gc() {
     let _guard = GcTestIsolationGuard::new();
-    let (obj, _) = unsafe { alloc_old_test_object(0) };
-    let addr = obj as usize;
-    crate::object::set_property_attrs(
+    // An array owner: an ordinary object's attributes AND accessor pairs
+    // live with its keys and slots (charter step 3); an array's are still
+    // owner-keyed, which is the table this test is about.
+    let (arr, _) = unsafe { alloc_old_test_array(0) };
+    let addr = arr as usize;
+    crate::object::set_accessor_descriptor(
         addr,
         "oldKey".to_string(),
-        crate::object::PropertyAttrs::new(false, true, true),
+        crate::object::AccessorDescriptor::default(),
     );
 
     // MINOR traces never mark the old generation — an unmarked old-gen
@@ -296,7 +299,11 @@ fn test_tenured_owner_descriptor_entries_survive_minor_gc() {
     let _ = gc_collect_minor();
 
     assert!(
-        crate::object::get_property_attrs(addr, "oldKey").is_some(),
+        crate::state::state()
+            .descriptors
+            .accessor_descriptors
+            .borrow()
+            .contains_key(&(addr, "oldKey".to_string())),
         "an old-gen owner's descriptor entry must survive a minor GC — \
          minor-trace deadness is not trustworthy for tenured objects"
     );
@@ -495,68 +502,6 @@ fn test_object_dead_payload_arm_clears_keys_index() {
 }
 
 #[test]
-fn test_dead_arguments_object_entry_pruned_on_full_gc() {
-    // `js_arguments_object_alloc` reaches `js_object_set_field_by_name`, which
-    // resolves the process-global memoized `Object.prototype` address; a MISS
-    // runs the lazy `globalThis` bootstrap inside this test — see
-    // `with_realm_bootstrapped` (#7975).
-    let _guard = GcTestIsolationGuard::with_realm_bootstrapped();
-    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
-    let obj = crate::object::js_arguments_object_alloc(undefined, undefined, 0);
-    let addr = obj as usize;
-    assert!(crate::object::test_arguments_object_registered(addr));
-
-    full_gc_with_no_block_persistence();
-
-    assert!(
-        !crate::object::test_arguments_object_registered(addr),
-        "dead arguments object's ARGUMENTS_OBJECTS entry must be pruned \
-         (one insert per call of any function referencing `arguments`)"
-    );
-}
-
-/// The mapped-arguments capture boxes are raw (non-GC) allocations whose
-/// pointers now get a strong (validated) visit; the entry itself must be
-/// rekeyed when the owning object moves in a copied minor, with the box
-/// pointer intact and readable.
-#[test]
-fn test_arguments_entry_rekeys_and_mapped_box_survives_copied_minor() {
-    let _guard = CopyingNurseryTestGuard::new(1);
-    gc_register_mutable_root_scanner(crate::object::scan_arguments_object_roots_mut);
-
-    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
-    let obj = crate::object::js_arguments_object_alloc(undefined, undefined, 0);
-    let addr = obj as usize;
-    let boxed = crate::r#box::js_box_alloc(42.0);
-    crate::object::js_arguments_object_map_index(obj, 0, boxed);
-    assert_eq!(
-        crate::object::test_arguments_mapped_box(addr, 0),
-        Some(boxed as usize)
-    );
-    js_shadow_slot_set(0, ptr_bits(addr));
-
-    let _ = gc_collect_minor();
-
-    let moved = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
-    assert_ne!(moved, addr, "test premise: the owner must actually move");
-    assert!(
-        crate::object::test_arguments_object_registered(moved),
-        "arguments metadata must be rekeyed to the owner's post-move address"
-    );
-    assert!(
-        !crate::object::test_arguments_object_registered(addr),
-        "the stale pre-move key must be gone"
-    );
-    assert_eq!(
-        crate::object::test_arguments_mapped_box(moved, 0),
-        Some(boxed as usize),
-        "mapped box pointer must survive the move (boxes are non-GC \
-         allocations; the strong visit is a validated no-op for them)"
-    );
-    assert_eq!(crate::r#box::js_box_get(boxed), 42.0);
-}
-
-#[test]
 fn test_dead_owner_prototype_vm_expando_and_filehandle_entries_pruned() {
     let _guard = GcTestIsolationGuard::new();
 
@@ -642,6 +587,8 @@ fn test_dom_exception_set_cleared_with_error_side_tables() {
 }
 
 mod meta_and_shape_records;
+#[cfg(feature = "regex-engine")]
+mod regexp_expandos;
 
 // ── FUNCTION_CLASS_IDS (#8040) ──────────────────────────────────────────────
 //

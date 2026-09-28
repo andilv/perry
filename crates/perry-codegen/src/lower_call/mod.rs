@@ -48,7 +48,7 @@ mod console_promise;
 /// inherited user method. It is the other side of every own-override
 /// diamond, including the one `expr/folded_builtin_override.rs` emits for
 /// the builtin calls HIR folded before this module could see them.
-pub(crate) use console_promise::emit_native_method_str_dispatch;
+pub(crate) use console_promise::emit_native_method_str_dispatch_plain;
 /// Rooting and evaluation-order coverage for the `console.*` arms slice 6
 /// repaired (#7649) — see the module header for why these assert on IR.
 #[cfg(test)]
@@ -84,6 +84,8 @@ pub(crate) use method_override::emit_inline_direct_method_shape_guard;
 mod named_import_install_tests;
 mod namespace_call;
 mod native;
+#[cfg(test)]
+mod native_abi_tests;
 mod native_module_dispatch;
 #[cfg(test)]
 mod native_module_rooting_tests;
@@ -188,7 +190,8 @@ pub(crate) use new_helpers::{
 // `expr/this_super_call.rs`, which are the two places a derived constructor can
 // reach the base.
 pub(crate) use new_helpers::{
-    emit_native_instance_base_init, native_instance_base_in_chain, NativeInstanceBase,
+    emit_native_instance_base_init, exotic_builtin_base_in_chain, native_instance_base_in_chain,
+    NativeInstanceBase,
 };
 // `extract_options_fields` is consumed by `expr.rs` as
 // `crate::lower_call::extract_options_fields` — keep that path stable.

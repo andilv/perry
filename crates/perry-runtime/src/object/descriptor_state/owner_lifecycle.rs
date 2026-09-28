@@ -126,6 +126,21 @@ fn remove_descriptor_owner_entries(st: &crate::state::RuntimeState, owner: usize
 /// with it the silent no-op this function performed for a HEAP owner while no
 /// handle had ever taken a descriptor.
 pub(crate) fn clear_object_descriptors(obj: usize) {
+    // Charter step 3: an ordinary object's attributes live with its keys; its
+    // accessor closures still live in the tables and are dropped below.
+    if unsafe { super::super::key_attrs::attrs_live_in_keys_for_install(obj) }
+        && unsafe { super::super::key_attrs::object_summary(obj as *const ObjectHeader) } != 0
+    {
+        // The accessor pairs live in the keys' slots: clear those first, or
+        // the slots would read as data once the entries say "default".
+        for key in unsafe {
+            super::super::key_attrs::object_accessor_key_names(obj as *const ObjectHeader)
+        } {
+            clear_accessor_descriptor(obj, &key);
+        }
+        super::super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
+        note_descriptor_target_edits(obj, &[super::AttrsEdit::ClearAll]);
+    }
     let st = state();
     let owned_any = st
         .descriptors
@@ -256,7 +271,7 @@ pub(crate) fn transfer_descriptor_owner(old_owner: usize, new_owner: usize) {
     // carry the source's descriptor state must not silently acquire
     // descriptors behind an unchanged header and shape.
     if object_has_descriptors(old_owner) && !object_has_descriptors(new_owner) {
-        note_descriptor_target(new_owner);
+        note_descriptor_target_edits(new_owner, &[]);
     }
 }
 

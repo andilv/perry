@@ -174,6 +174,11 @@ pub struct LlFunction {
     /// FP-chain walker steps over the spilled frame exactly as it does the
     /// runtime's own.
     force_shadow_frame: bool,
+    /// #10663: outline this function's static-key store inline caches at
+    /// sites outside any loop (`expr/put_value_store_ic.rs`). Set for a body
+    /// with so many once-per-call stores that the inline caches' code
+    /// dominates it (`codegen/helpers::decide_straight_line_store_outline`).
+    outline_straight_line_store_ics: bool,
     /// Runtime hooks emitted immediately before each non-pointer `ret`.
     /// Entry/module-init functions use this for process-level diagnostics
     /// that must run regardless of which block reaches the normal epilogue.
@@ -219,6 +224,26 @@ fn shadow_frame_handle_lines(
     handle_reg: &str,
 ) -> Vec<String> {
     use crate::expr::shadow_inline::{SHADOW_STACK_HEADER_SLOTS, SHADOW_STATE_FRAME_TOP_OFFSET};
+    if crate::codegen::helpers::ilp32_target() {
+        // ILP32 (wasm32 WASI, #11378): `ShadowStackState`'s words are 4
+        // bytes, so `frame_top` is the fourth-byte-aligned word at 3 * 4 and
+        // is widened to the i64 handle every other use expects.
+        let top32 = format!("{top_reg}.w");
+        return vec![
+            format!("  store ptr {}, ptr {}", state_reg, state_slot),
+            format!(
+                "  {} = getelementptr inbounds i8, ptr {}, i64 12",
+                top_ptr_reg, state_reg
+            ),
+            format!("  {} = load i32, ptr {}", top32, top_ptr_reg),
+            format!("  {} = zext i32 {} to i64", top_reg, top32),
+            format!(
+                "  {} = sub i64 {}, {}",
+                handle_reg, top_reg, SHADOW_STACK_HEADER_SLOTS
+            ),
+            format!("  store i64 {}, ptr {}", handle_reg, handle_slot),
+        ];
+    }
     vec![
         format!("  store ptr {}, ptr {}", state_reg, state_slot),
         format!(
@@ -289,6 +314,7 @@ impl LlFunction {
             stack_map_requested: false,
             stack_map_slot_count: 0,
             force_shadow_frame: false,
+            outline_straight_line_store_ics: false,
             pre_return_void_calls: Vec::new(),
             pre_return_box_releases: Vec::new(),
             withheld_box_release_slots: Vec::new(),
@@ -350,6 +376,18 @@ impl LlFunction {
     /// Whether this function spills its roots to the shadow frame (#8583).
     pub fn spills_roots_to_shadow_frame(&self) -> bool {
         self.force_shadow_frame
+    }
+
+    /// #10663: see [`Self::outlines_straight_line_store_ics`].
+    pub fn request_straight_line_store_outline(&mut self) {
+        self.outline_straight_line_store_ics = true;
+    }
+
+    /// Whether this function's static-key store sites outside every loop take
+    /// the outlined `js_put_value_set_packed_miss` call instead of the inline
+    /// cache (#10663).
+    pub fn outlines_straight_line_store_ics(&self) -> bool {
+        self.outline_straight_line_store_ics
     }
 
     pub fn enable_shadow_frame(&mut self, slot_count: u32) {

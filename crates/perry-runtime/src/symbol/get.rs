@@ -335,6 +335,13 @@ pub unsafe extern "C" fn js_object_get_symbol_then_field_ic_miss(
 /// receiver is a heap object whose `_req` is a small handle (POINTER-tagged,
 /// not a heap object) that holds the requested symbol in the side table.
 unsafe fn req_handle_symbol_fallback(obj_f64: f64, sym_f64: f64) -> Option<f64> {
+    // #10510: the tail below only ever returns what a small native handle
+    // holds in the symbol side tables. Until one has ever been given a
+    // symbol-keyed property, skip the `"_req"` intern + by-name prototype-chain
+    // walk — it dominated every implicit `ToPrimitive` on a plain object.
+    if !crate::symbol::small_handle_symbol_owner_ever() {
+        return None;
+    }
     let bits = obj_f64.to_bits();
     if (bits >> 48) != 0x7FFD {
         return None;
@@ -806,6 +813,22 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
             let v = js_object_get_symbol_property_with_receiver(closure_f64, sym_f64, receiver_f64);
             if v.to_bits() != TAG_UNDEFINED {
                 return v;
+            }
+        }
+        // #11193: the subclass (or an ancestor) extends a built-in constructor
+        // (`class X extends Array`). The built-in's own symbol statics — the
+        // `get [Symbol.species]` accessor — live on its constructor closure,
+        // which the chain edge (a reserved class id) does not reach. Read it
+        // there with the original receiver, so the inherited species getter
+        // answers `X`, not `Array`. Statics only: a prototype ref shares this
+        // tag, and `X.prototype` must not see the constructor's symbols.
+        if !is_proto_ref_receiver {
+            if let Some(parent_ctor) = crate::object::builtin_parent_ctor_in_chain(class_id) {
+                return js_object_get_symbol_property_with_receiver(
+                    parent_ctor,
+                    sym_f64,
+                    receiver_f64,
+                );
             }
         }
         return f64::from_bits(TAG_UNDEFINED);
@@ -1638,6 +1661,9 @@ mod handle_meta_share_tests {
             // immovable number so a GC can't invalidate the comparison.
             let meta = immovable_meta();
             super::properties::js_object_set_symbol_property(handle, sym, meta);
+            // #10510: the install on a handle owner arms the `_req` fallback,
+            // which is skipped entirely until then.
+            assert!(crate::symbol::small_handle_symbol_owner_ever());
 
             // A heap wrapper that aliases the handle via `_req` but never had
             // its own `[sym]` seeded.

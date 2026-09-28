@@ -12,9 +12,11 @@ mod bare_receiver;
 mod collection_methods;
 mod common_methods;
 mod disposal;
+mod function_shape;
 mod handle_methods;
 mod namespace_override;
 mod object_proto;
+mod patched_proto;
 mod primitive_methods;
 mod proto_dispatch;
 mod string_methods;
@@ -340,13 +342,15 @@ unsafe fn call_primitive_closure_value(
     }
     // OrdinaryCallBindThis: a strict callee observes the raw primitive
     // receiver (`Number.prototype.f = function(){"use strict"; return
-    // typeof this}` must see `"number"` for `(5).f()`); only a sloppy
-    // callee gets the ToObject wrapper — boxed ONCE up front so writes
-    // through `this` land on the wrapper the body later observes.
+    // typeof this}` must see `"number"` for `(5).f()`), and so does a
+    // BUILT-IN (§10.3.1: its [[Call]] takes `thisArg` unchanged and coerces
+    // itself — every primitive prototype thunk accepts the raw primitive
+    // before it looks for a wrapper payload). Only a sloppy USER callee gets
+    // the ToObject wrapper — boxed ONCE up front so writes through `this`
+    // land on the wrapper the body later observes. For a string receiver
+    // that wrapper costs an own index property per UTF-16 code unit (#11509).
     let func_ptr = crate::closure::get_valid_func_ptr(ptr as *const crate::closure::ClosureHeader);
-    let strict_callee =
-        !func_ptr.is_null() && crate::closure::is_registered_strict_function(func_ptr);
-    let this_receiver = if strict_callee {
+    let this_receiver = if crate::closure::body_receives_primitive_this(func_ptr) {
         receiver_h.get_nanbox_f64()
     } else {
         crate::object::js_object_coerce(receiver_h.get_nanbox_f64())
@@ -1262,6 +1266,16 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
             }
         }
     }
+    // A function object on its base Function shape: the key's slot on the
+    // prototype the shape names decides the call (`function_shape`).
+    if !method_name_ptr.is_null() && method_name_len > 0 {
+        let name = std::slice::from_raw_parts(method_name_ptr as *const u8, method_name_len);
+        if let Some(result) =
+            function_shape::try_function_shape_method_call(object, name, args_ptr, args_len)
+        {
+            return result;
+        }
+    }
     // PerformanceObserverEntryList is a native namespace receiver, and typed
     // feedback can dispatch its methods before the generic prototype/native-
     // module tower below. Validate the WebIDL-required filter argument at this
@@ -1295,6 +1309,14 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
     {
         return result;
     }
+    // #10522: `t.unref()` & co. on a pristine timer handle; the guard proves the
+    // tower would resolve the family's own native method (`timer::handle_object`).
+    if !method_name_ptr.is_null() {
+        let name = std::slice::from_raw_parts(method_name_ptr as *const u8, method_name_len);
+        if let Some(result) = crate::timer::try_timer_method_fast_dispatch(object, name) {
+            return result;
+        }
+    }
 
     // Get the method name (parsed early for depth guard logging).
     //
@@ -1305,7 +1327,15 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
         std::borrow::Cow::Borrowed("")
     } else {
         let bytes = std::slice::from_raw_parts(method_name_ptr as *const u8, method_name_len);
-        String::from_utf8_lossy(bytes)
+        // #10502: validate with `str::from_utf8` (ASCII word-at-a-time fast
+        // path) and fall back to the lossy decoder only for invalid bytes.
+        // `from_utf8_lossy` answers the same `Cow` but walks `Utf8Chunks`
+        // chunk by chunk even for a valid name: ~1.5% of a prototype-method
+        // dispatch profile, on every call.
+        match std::str::from_utf8(bytes) {
+            Ok(name) => std::borrow::Cow::Borrowed(name),
+            Err(_) => String::from_utf8_lossy(bytes),
+        }
     };
     let method_name: &str = &method_name_cow;
     let root_scope = crate::gc::RuntimeHandleScope::new();
@@ -1346,7 +1376,9 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
         let candidate = jsval().as_pointer::<ObjectHeader>() as usize;
         if crate::value::addr_class::is_above_handle_band(candidate)
             && crate::object::is_valid_obj_ptr(candidate as *const u8)
-            && super::prototype_chain::object_has_individual_class_prototype(candidate)
+            && (super::prototype_chain::object_has_individual_class_prototype(candidate)
+                // #11391: likewise a `new F()` instance once `F.prototype` moved.
+                || super::prototype_chain::class_default_prototype_superseded(candidate))
         {
             let method_key =
                 crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
@@ -1969,7 +2001,7 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
     // user method and falls through to the native arms — dispatching it by
     // name again is how an earlier attempt recursed until the stack ran out.
     if let Some(result) =
-        crate::object::own_override::call_own_user_method(object(), method_name, &refreshed_args())
+        crate::object::own_override::call_own_user_method(object, method_name, refreshed_args)
     {
         return result;
     }
@@ -2097,8 +2129,7 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
             (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         let gc_type = (*gc_header).obj_type;
 
-        // Issue #618: closure receivers (GC_TYPE_CLOSURE=4 OR
-        // CLOSURE_MAGIC-marked GC_TYPE_OBJECT slot) — look up the method
+        // Issue #618: closure receivers (GC_TYPE_CLOSURE) — look up the method
         // name in the closure's dynamic-prop side-table. If a callable
         // closure is stored there (via the IIFE-namespace pattern
         // `((sql2) => { sql2.identifier = ...; })(sql)`), dispatch
@@ -2106,9 +2137,7 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
         // NULL_OBJECT_BYTES stub for any method call on a closure, so
         // the call result was an empty object stub instead of the
         // dynamic-prop closure's return value.
-        let is_closure = gc_type == crate::gc::GC_TYPE_CLOSURE
-            || *((obj as *const u8).add(crate::closure::CLOSURE_TYPE_TAG_OFFSET) as *const u32)
-                == crate::closure::CLOSURE_MAGIC;
+        let is_closure = gc_type == crate::gc::GC_TYPE_CLOSURE;
         if is_closure {
             let dyn_val = crate::closure::closure_get_dynamic_prop(obj as usize, method_name);
             if dyn_val.to_bits() != crate::value::TAG_UNDEFINED {
@@ -2295,7 +2324,10 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
                     // validates CLOSURE_MAGIC before calling the func
                     // pointer, so non-callable field values (numbers,
                     // strings, booleans) safely return undefined.
-                    let field_val = js_object_get_field(obj as *mut _, i as u32);
+                    // An accessor key's slot holds its accessor pair, never a
+                    // callable (`accessor_pair.rs`).
+                    let field_val =
+                        crate::object::key_attrs::object_slot_data(obj as *const _, i as u32);
                     let bound = crate::closure::clone_closure_rebind_this(
                         field_val.bits(),
                         f64::from_bits(jsval().bits()),

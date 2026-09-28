@@ -41,16 +41,49 @@
 use anyhow::Result;
 
 use crate::nanbox::POINTER_MASK_I64;
-use crate::types::{I1, I16, I32, I64, I8};
+use crate::types::{DOUBLE, I1, I16, I32, I64, I8};
 
 use super::write_barrier::{
-    emit_jsvalue_slot_store_deferred_layout_note_on_block, emit_layout_note_slot_aware_on_block,
-    emit_layout_pointer_bearing_check,
+    emit_jsvalue_slot_store_deferred_layout_note_without_addref_on_block,
+    emit_layout_note_slot_aware_on_block, emit_layout_pointer_bearing_check,
 };
 use super::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_scalar_aware_on_block,
     emit_write_barrier_slot_value_and_generation_tested, FnCtx,
 };
+
+/// The canonical element index a DOUBLE key names, as an `i32`, or `-1` when
+/// it names none (fractional, negative, non-finite, above `i32::MAX`, or any
+/// NaN-boxed non-number such as a string or Symbol key). `-1` is exactly the
+/// value [`emit_guarded_inbounds_array_store`]'s guard declines, so a caller
+/// can hand every key to it and keep ONE slow arm for the rejected ones.
+///
+/// Both numeric encodings are recognised: a plain double and an
+/// `INT32_TAG`-boxed integer (a loop counter that was boxed on the way in).
+/// The conversion never feeds `fptosi` an out-of-range or NaN input, which
+/// would be poison.
+pub(super) fn emit_canonical_element_index_i32(ctx: &mut FnCtx<'_>, idx_double: &str) -> String {
+    let blk = ctx.block();
+    let raw_ge_zero = blk.fcmp("oge", idx_double, "0.0");
+    let raw_le_i32_max = blk.fcmp("ole", idx_double, "2147483647.0");
+    let raw_in_range = blk.and(I1, &raw_ge_zero, &raw_le_i32_max);
+    // `fptosi` is poison for NaN/out-of-range input: convert the
+    // range-sanitized value.
+    let safe_raw = blk.select(I1, &raw_in_range, DOUBLE, idx_double, "0.0");
+    let raw_i32 = blk.fptosi(DOUBLE, &safe_raw, I32);
+    let raw_round_trip = blk.sitofp(I32, &raw_i32, DOUBLE);
+    let raw_is_integral = blk.fcmp("oeq", &raw_round_trip, idx_double);
+    let raw_is_canonical = blk.and(I1, &raw_in_range, &raw_is_integral);
+    let bits = blk.bitcast_double_to_i64(idx_double);
+    let top16 = blk.lshr(I64, &bits, "48");
+    let is_boxed_i32 = blk.icmp_eq(I64, &top16, crate::nanbox::INT32_TAG_TOP16_I64);
+    let boxed_i32 = blk.trunc(I64, &bits, I32);
+    let boxed_nonnegative = blk.icmp_sge(I32, &boxed_i32, "0");
+    let boxed_is_canonical = blk.and(I1, &is_boxed_i32, &boxed_nonnegative);
+    let canonical = blk.or(I1, &raw_is_canonical, &boxed_is_canonical);
+    let idx_i32 = blk.select(I1, &is_boxed_i32, I32, &boxed_i32, &raw_i32);
+    blk.select(I1, &canonical, I32, &idx_i32, "-1")
+}
 
 /// Emit the guarded diamond. `fallback` emits the original slow arm (the
 /// runtime call plus whatever bookkeeping it owns) into the block that is
@@ -70,6 +103,50 @@ pub(super) fn emit_guarded_inbounds_array_store(
     value_is_numeric: bool,
     fallback: impl FnOnce(&mut FnCtx<'_>) -> Result<()>,
 ) -> Result<()> {
+    emit_guarded_inbounds_array_store_keyed(
+        ctx,
+        arr_box,
+        StoreIndex::I32(idx_i32),
+        val_double,
+        block_prefix,
+        layout_note_needed,
+        write_barrier_needed,
+        value_is_numeric,
+        fallback,
+    )
+}
+
+/// The key of a guarded store: an already-materialized `i32`, or a DOUBLE key
+/// whose canonical element index ([`emit_canonical_element_index_i32`]) is
+/// computed only once the receiver has branded as an Array, so a declining
+/// receiver (the untyped route's typed arrays and Buffers) never pays for it.
+#[derive(Clone, Copy)]
+pub(super) enum StoreIndex<'a> {
+    I32(&'a str),
+    CanonicalOfDouble(&'a str),
+}
+
+/// [`emit_guarded_inbounds_array_store`] with a [`StoreIndex`] key.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_guarded_inbounds_array_store_keyed(
+    ctx: &mut FnCtx<'_>,
+    arr_box: &str,
+    index: StoreIndex<'_>,
+    val_double: &str,
+    block_prefix: &str,
+    layout_note_needed: bool,
+    write_barrier_needed: bool,
+    value_is_numeric: bool,
+    fallback: impl FnOnce(&mut FnCtx<'_>) -> Result<()>,
+) -> Result<()> {
+    // An operand may have emitted a throw + unreachable. LlBlock drops
+    // instructions after a terminator; opening the store diamond would then
+    // reference those dropped values from fresh blocks (#11450). Match the
+    // local-array fast path and leave the terminated path untouched.
+    if ctx.block().is_terminated() {
+        return Ok(());
+    }
+
     let deref_idx = ctx.new_block(&format!("{}.deref", block_prefix));
     let fast_idx = ctx.new_block(&format!("{}.fast", block_prefix));
     let slow_idx = ctx.new_block(&format!("{}.slow", block_prefix));
@@ -98,17 +175,30 @@ pub(super) fn emit_guarded_inbounds_array_store(
     }
 
     ctx.current_block = deref_idx;
+    let follow_idx = ctx.new_block(&format!("{}.deref.follow", block_prefix));
+    let follow_label = ctx.block_label(follow_idx);
     let live_deref_idx = ctx.new_block(&format!("{}.deref.live", block_prefix));
     let live_deref_label = ctx.block_label(live_deref_idx);
-    let live_handle = {
+    // A receiver that is not an Array leaves on its brand byte alone, before
+    // the forwarding, integrity, prototype and bounds work below that it would
+    // only fail. On the untyped `obj[i] = v` route (#10513) that is every
+    // typed-array and Buffer store, which declines onto the typed-array tier.
+    {
         let blk = ctx.block();
         let arr_bits = blk.bitcast_double_to_i64(arr_box);
         let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-
         let gc_type_addr = blk.sub(I64, &arr_handle, "8");
         let gc_type_ptr = blk.inttoptr(I64, &gc_type_addr);
         let gc_type = blk.load(I8, &gc_type_ptr);
         let is_array = blk.icmp_eq(I8, &gc_type, "1"); // GC_TYPE_ARRAY
+        blk.cond_br(&is_array, &follow_label, &slow_label);
+    }
+
+    ctx.current_block = follow_idx;
+    let live_handle = {
+        let blk = ctx.block();
+        let arr_bits = blk.bitcast_double_to_i64(arr_box);
+        let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
 
         let gc_flags_addr = blk.sub(I64, &arr_handle, "7");
         let gc_flags_ptr = blk.inttoptr(I64, &gc_flags_addr);
@@ -129,8 +219,8 @@ pub(super) fn emit_guarded_inbounds_array_store(
         // Longer or corrupt chains still take the slow arm.
         let original_arr_ptr = blk.inttoptr(I64, &arr_handle);
         let forwarding_target = blk.load(I64, &original_arr_ptr);
-        let follow_forwarding = blk.and(I1, &is_array, &is_forwarded);
-        let live_handle = blk.select(I1, &follow_forwarding, I64, &forwarding_target, &arr_handle);
+        // `deref` branded the head as an Array.
+        let live_handle = blk.select(I1, &is_forwarded, I64, &forwarding_target, &arr_handle);
 
         let live_top = blk.lshr(I64, &live_handle, "48");
         let live_top_clear = blk.icmp_eq(I64, &live_top, "0");
@@ -145,6 +235,13 @@ pub(super) fn emit_guarded_inbounds_array_store(
     };
 
     ctx.current_block = live_deref_idx;
+    let idx_i32 = match index {
+        StoreIndex::I32(idx) => idx.to_string(),
+        StoreIndex::CanonicalOfDouble(idx_double) => {
+            emit_canonical_element_index_i32(ctx, idx_double)
+        }
+    };
+    let idx_i32 = idx_i32.as_str();
     let reserved = {
         let blk = ctx.block();
         let arr_handle = live_handle.clone();
@@ -167,8 +264,9 @@ pub(super) fn emit_guarded_inbounds_array_store(
         let integrity_bits = blk.and(I16, &reserved, "1031"); // 0x407
         let integrity_clean = blk.icmp_eq(I16, &integrity_bits, "0");
 
-        let invalidated = blk.load_volatile(I8, "@PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED");
-        let default_prototype_chain = blk.icmp_eq(I8, &invalidated, "0");
+        // #10593: the process-wide byte AND this array's own custom-proto bit.
+        let default_prototype_chain =
+            crate::expr::array_proto_guard::emit_array_default_prototype_chain(blk, &reserved);
 
         let arr_ptr = blk.inttoptr(I64, &arr_handle);
         let length = blk.load(I32, &arr_ptr);
@@ -250,12 +348,21 @@ pub(super) fn emit_guarded_inbounds_array_store(
             // Decide that inline with the exact runtime predicate and call the
             // note only when it has work: the ECS `ents[id] = arch` store is a
             // pointer over a pointer into a proof-free array on every iteration.
-            let (value_bits, old_bits) = emit_jsvalue_slot_store_deferred_layout_note_on_block(
-                blk,
-                &element_ptr,
-                val_double,
-            );
-            let new_is_pointer = emit_layout_pointer_bearing_check(blk, &value_bits);
+            let (value_bits, old_bits) =
+                emit_jsvalue_slot_store_deferred_layout_note_without_addref_on_block(
+                    blk,
+                    &element_ptr,
+                    val_double,
+                );
+            // `write_barrier_needed == false` is the caller's proof that the
+            // value carries non-pointer bits by construction
+            // (`array_store_needs_write_barrier`), so its classification is a
+            // constant and only the RETIRED value's needs testing.
+            let new_is_pointer = if write_barrier_needed {
+                emit_layout_pointer_bearing_check(blk, &value_bits)
+            } else {
+                "false".to_string()
+            };
             let old_is_pointer = emit_layout_pointer_bearing_check(blk, &old_bits);
             let classification_changed = blk.icmp_ne(I1, &new_is_pointer, &old_is_pointer);
             let shape_bits = blk.and(I16, &reserved, "2048"); // GC_ARRAY_ELEMENT_SHAPE
@@ -270,6 +377,13 @@ pub(super) fn emit_guarded_inbounds_array_store(
             )
         }
     };
+    if layout_note.is_some() && write_barrier_needed {
+        // The string demote the deferred store leaves to its caller, with the
+        // helper's own `STRING_TAG` test hoisted inline. A value with
+        // non-pointer bits by construction (no barrier needed) cannot be a
+        // heap string, so it needs neither the test nor the call.
+        super::helpers::emit_string_addref_if_heap_string(ctx, val_double);
+    }
     if let Some((old_bits, note_needed)) = layout_note {
         let note_idx = ctx.new_block(&format!("{}.laynote", block_prefix));
         let note_done_idx = ctx.new_block(&format!("{}.laynote.done", block_prefix));
@@ -342,4 +456,78 @@ pub(super) fn emit_guarded_inbounds_array_store(
 
     ctx.current_block = merge_idx;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use perry_hir::{types::Type, Expr, Stmt};
+
+    fn store_ir(value: Expr, ty: Type) -> String {
+        let mut module = perry_hir::Module::new("terminated_guarded_store");
+        module.init = vec![Stmt::Let {
+            id: 1,
+            name: "items".into(),
+            ty,
+            mutable: true,
+            init: Some(Expr::Array(vec![])),
+        }];
+        module.functions.push(perry_hir::Function {
+            id: 2,
+            name: "store".into(),
+            type_params: vec![],
+            params: vec![],
+            return_type: Type::Any,
+            body: vec![Stmt::Expr(Expr::IndexSet {
+                object: Box::new(Expr::LocalGet(1)),
+                index: Box::new(Expr::Integer(0)),
+                value: Box::new(value),
+            })],
+            is_async: false,
+            is_generator: false,
+            is_strict: true,
+            is_exported: false,
+            captures: vec![],
+            decorators: vec![],
+            was_plain_async: false,
+            was_unrolled: false,
+        });
+        String::from_utf8(
+            crate::compile_module(&module, crate::temp_root_coverage::entry_opts())
+                .expect("store module compiles"),
+        )
+        .unwrap()
+    }
+
+    // Since the unresolved Worker continues in a predecessor-less block
+    // (#11450, dyn_extern_i18n.rs), the store after it is emitted as dead
+    // code rather than skipped; the `is_terminated` guards above stay as the
+    // defense for any other operand that ends its block. Either way the
+    // emitted module must parse and verify.
+    #[test]
+    fn throwing_operand_store_emits_valid_ir() {
+        for (ty, block) in [
+            (Type::Array(Box::new(Type::Any)), "idxset.recv_global.deref"),
+            (Type::Any, "tav.set.fast"),
+        ] {
+            let live = store_ir(Expr::Number(42.0), ty.clone());
+            assert!(live.contains(block), "store arm {block} not exercised");
+            let dead = store_ir(
+                Expr::WorkerNew {
+                    paths: vec![],
+                    filename: Box::new(Expr::String("unresolved-worker".into())),
+                    options: None,
+                    is_eval: false,
+                    partial: false,
+                },
+                ty,
+            );
+            assert!(dead.contains("call void @js_throw_error_with_code("));
+            let llvm = inkwell::context::Context::create();
+            let parsed = crate::inprocess::parse_ir_text(&llvm, &dead, block)
+                .unwrap_or_else(|e| panic!("{block}: {e:#}\n{dead}"));
+            parsed
+                .verify()
+                .unwrap_or_else(|e| panic!("{block}: LLVM verifier: {}\n{dead}", e.to_string()));
+        }
+    }
 }

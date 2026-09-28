@@ -97,6 +97,7 @@ use perry_hir::types::Type;
 use perry_hir::{Expr, Function, Module, ModuleInitKind, Param, Stmt};
 
 mod harness_self_tests;
+mod ic_fast_split;
 mod mechanics;
 mod specialized_calls;
 
@@ -542,6 +543,7 @@ pub(crate) fn assembly_for(ir: &str, target: &str) -> String {
         &["-O0".to_string(), "-S".to_string()],
         true,
     )
+    .map(crate::inprocess::single_piece)
     .unwrap_or_else(|e| panic!("assembly emission failed for {target}: {e:#}"));
     String::from_utf8(bytes).expect("assembler text should be UTF-8")
 }

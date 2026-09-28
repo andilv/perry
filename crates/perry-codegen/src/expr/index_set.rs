@@ -37,7 +37,7 @@ use crate::native_value::{
 };
 use crate::rooting;
 use crate::type_analysis::{is_array_expr, is_numeric_expr, is_string_expr, receiver_class_name};
-use crate::types::{DOUBLE, I1, I32, I64};
+use crate::types::{DOUBLE, I32, I64};
 
 use super::index_set_packed_loop::lower_packed_numeric_loop_index_set;
 use super::index_set_typed_array::lower_inline_dyn_typed_array_set;
@@ -319,28 +319,8 @@ fn lower_array_index_set_via_runtime_key(
             // side has done this since #7286 (`aidx.canonical`). A rejected key
             // becomes index -1, which the guarded in-bounds store declines
             // onto the same helper arm, so the helper is emitted once.
-            let guard_idx_i32 = {
-                let blk = ctx.block();
-                let raw_ge_zero = blk.fcmp("oge", &idx_double, "0.0");
-                let raw_le_i32_max = blk.fcmp("ole", &idx_double, "2147483647.0");
-                let raw_in_range = blk.and(I1, &raw_ge_zero, &raw_le_i32_max);
-                // `fptosi` is poison for NaN/out-of-range input: convert the
-                // range-sanitized value.
-                let safe_raw = blk.select(I1, &raw_in_range, DOUBLE, &idx_double, "0.0");
-                let raw_i32 = blk.fptosi(DOUBLE, &safe_raw, I32);
-                let raw_round_trip = blk.sitofp(I32, &raw_i32, DOUBLE);
-                let raw_is_integral = blk.fcmp("oeq", &raw_round_trip, &idx_double);
-                let raw_is_canonical = blk.and(I1, &raw_in_range, &raw_is_integral);
-                let bits = blk.bitcast_double_to_i64(&idx_double);
-                let top16 = blk.lshr(I64, &bits, "48");
-                let is_boxed_i32 = blk.icmp_eq(I64, &top16, crate::nanbox::INT32_TAG_TOP16_I64);
-                let boxed_i32 = blk.trunc(I64, &bits, I32);
-                let boxed_nonnegative = blk.icmp_sge(I32, &boxed_i32, "0");
-                let boxed_is_canonical = blk.and(I1, &is_boxed_i32, &boxed_nonnegative);
-                let canonical = blk.or(I1, &raw_is_canonical, &boxed_is_canonical);
-                let idx_i32 = blk.select(I1, &is_boxed_i32, I32, &boxed_i32, &raw_i32);
-                blk.select(I1, &canonical, I32, &idx_i32, "-1")
-            };
+            let guard_idx_i32 =
+                super::index_set_guarded::emit_canonical_element_index_i32(ctx, &idx_double);
             super::index_set_guarded::emit_guarded_inbounds_array_store(
                 ctx,
                 &arr_box,
@@ -361,8 +341,7 @@ fn lower_array_index_set_via_runtime_key(
                         value_needs_barrier,
                         source_label,
                         assignment_strict,
-                    );
-                    Ok(())
+                    )
                 },
             )?;
             Ok(val_double)
@@ -372,7 +351,18 @@ fn lower_array_index_set_via_runtime_key(
 
 /// The exact store for a numeric key the inline tier declined: the helper
 /// resolves `ToPropertyKey`, extends/reallocates, and returns the live head,
-/// which is written back to a local or module-global receiver.
+/// which is written back to the receiver's binding.
+///
+/// #11335: the write-back goes through `emit_push_writeback`, the one storage
+/// chain `push` / `unshift` already use. It used to store the new head straight
+/// into `ctx.locals[id]` — but for a BOXED local (a `var` captured by a closure,
+/// e.g. every module-level `var` of a CommonJS module, whose body runs inside
+/// the CJS factory closure) that slot holds the box pointer, not the value.
+/// The first store that grew the array past its capacity overwrote the box
+/// pointer with the array pointer, so every later read of the binding
+/// dereferenced an array as a box: `undefined`, or a SIGSEGV. iconv-lite's
+/// `encodings/utf7.js` fills a 256-entry table this way at load time, which
+/// crashed every compiled mysql2 program at its first connection.
 #[allow(clippy::too_many_arguments)]
 fn emit_array_runtime_key_store(
     ctx: &mut FnCtx<'_>,
@@ -384,7 +374,7 @@ fn emit_array_runtime_key_store(
     value_needs_barrier: bool,
     source_label: &str,
     assignment_strict: bool,
-) {
+) -> Result<()> {
     let arr_handle = {
         let blk = ctx.block();
         unbox_to_i64(blk, arr_box)
@@ -408,7 +398,12 @@ fn emit_array_runtime_key_store(
         ],
     );
     if let Expr::LocalGet(id) = object {
-        if let Some(slot) = ctx.locals.get(id).cloned() {
+        if ctx.boxed_vars.contains(id) {
+            // Through the box (or, for a boxed id with no box in this context,
+            // the capture / slot / global it falls through to).
+            let new_box = nanbox_pointer_inline(ctx.block(), &new_handle);
+            super::array_push::emit_push_writeback(ctx, *id, &new_box, "IndexSet")?;
+        } else if let Some(slot) = ctx.locals.get(id).cloned() {
             let new_box = nanbox_pointer_inline(ctx.block(), &new_handle);
             ctx.block().store(DOUBLE, &new_box, &slot);
         } else if let Some(global_name) = ctx.module_globals.get(id).cloned() {
@@ -421,6 +416,7 @@ fn emit_array_runtime_key_store(
         let arr_bits = ctx.block().bitcast_double_to_i64(arr_box);
         emit_write_barrier(ctx, &arr_bits, val_bits);
     }
+    Ok(())
 }
 
 /// #9459: the SLOPPY object-by-name tail for `Expr::IndexSet`.
@@ -654,7 +650,8 @@ pub(crate) fn lower(
                                 &vals[1],
                                 &vals[2],
                                 assignment_strict,
-                            );
+                                None,
+                            )?;
                             let slow = LoweredValue::js_value(result.clone());
                             ctx.record_lowered_value_with_access_mode(
                                 "TypedArraySet",
@@ -688,7 +685,8 @@ pub(crate) fn lower(
                         &vals[1],
                         &vals[2],
                         assignment_strict,
-                    );
+                        None,
+                    )?;
                     let slow = LoweredValue::js_value(vals[2].clone());
                     ctx.record_lowered_value_with_access_mode(
                         "TypedArraySet",
@@ -778,6 +776,13 @@ pub(crate) fn lower(
             ) || is_string_expr(ctx, index);
             if recv_unknown && !index_is_static_string_or_symbol {
                 let strict = assignment_strict;
+                // #10513: the receiver's layout is unknown, so the layout note
+                // stays on; the barrier and numeric note follow the VALUE.
+                let array_facts = super::index_set_typed_array::DynArrayStoreFacts {
+                    layout_note_needed: true,
+                    write_barrier_needed: array_store_needs_write_barrier(ctx, value),
+                    value_is_numeric: is_numeric_expr(ctx, value),
+                };
                 return rooting::with_operands_rooted_across(
                     ctx,
                     &[object, index],
@@ -798,13 +803,14 @@ pub(crate) fn lower(
                         // at the access site, falling back to `js_dyn_index_set` on
                         // any guard miss. #7640: both the receiver and key are
                         // re-read after the allocating RHS.
-                        Ok(lower_inline_dyn_typed_array_set(
+                        lower_inline_dyn_typed_array_set(
                             ctx,
                             &vals[0],
                             &vals[1],
                             &val_double,
                             strict,
-                        ))
+                            Some(array_facts),
+                        )
                     },
                 );
             }
@@ -909,6 +915,7 @@ pub(crate) fn lower(
                         "array[dynamic_index]",
                         TypedFeedbackContract::array_set_index_or_string(),
                     );
+                    let strict_flag = if assignment_strict { "1" } else { "0" };
                     ctx.block().call(
                         I64,
                         "js_typed_feedback_array_set_index_or_string",
@@ -917,6 +924,7 @@ pub(crate) fn lower(
                             (I64, &arr_handle),
                             (DOUBLE, idx_double),
                             (DOUBLE, val_double),
+                            (I32, strict_flag),
                         ],
                     );
                     if value_needs_barrier {
@@ -1323,7 +1331,14 @@ pub(crate) fn lower(
                     // declared empty was a silent no-op, both the value
                     // and the implicit length update vanishing.
                     if let Some(id) = local_id {
-                        if ctx.locals.contains_key(&id) {
+                        // #11335: a BOXED local's slot holds the box pointer,
+                        // not the array head, so it cannot take the slot
+                        // write-back `lower_index_set_fast` does on growth —
+                        // that store clobbered the box, and every later read
+                        // of the binding dereferenced the array as a box. It
+                        // takes the captured arm below, which writes the new
+                        // head back through the box.
+                        if ctx.locals.contains_key(&id) && !ctx.boxed_vars.contains(&id) {
                             let value_is_canonical_raw_f64 =
                                 crate::type_analysis::expr_produces_canonical_raw_f64(ctx, value);
                             let string_addref_needed =
@@ -1429,11 +1444,16 @@ pub(crate) fn lower(
                             let val_double_c = val_double.clone();
                             let idx_i32_c = idx_i32.clone();
                             let feedback_site_id_c = feedback_site_id.clone();
+                            // #11335: a boxed binding gets the grown head
+                            // written back through its box (the same chain
+                            // `push` uses), so no reader depends on the old
+                            // head's forwarding pointer.
+                            let write_back_boxed = ctx.boxed_vars.contains(&id);
                             let slow_store = move |ctx: &mut FnCtx<'_>| -> Result<()> {
                                 let blk = ctx.block();
                                 let arr_bits = blk.bitcast_double_to_i64(&arr_box_c);
                                 let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-                                blk.call(
+                                let new_handle = blk.call(
                                     I64,
                                     "js_typed_feedback_array_set_f64_extend",
                                     &[
@@ -1443,6 +1463,12 @@ pub(crate) fn lower(
                                         (DOUBLE, &val_double_c),
                                     ],
                                 );
+                                if write_back_boxed {
+                                    let new_box = nanbox_pointer_inline(ctx.block(), &new_handle);
+                                    super::array_push::emit_push_writeback(
+                                        ctx, id, &new_box, "IndexSet",
+                                    )?;
+                                }
                                 // The extending runtime setter barriers the actual
                                 // destination slot on every pointer-bearing store.
                                 Ok(())

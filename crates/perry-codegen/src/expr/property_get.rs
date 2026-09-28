@@ -1656,10 +1656,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         // A subclass the guard cannot name would miss it on
                         // every read and pay the IC call behind it; the
                         // generic IC serves such a site from its own word.
+                        // The same holds when instances outgrow the birth
+                        // shape the guard compares against: a constructor
+                        // that adds keys moves every finished instance off
+                        // it, so every read would miss (tsc's per-evaluation
+                        // classes, Zod's `ZodType`).
                         if !crate::expr::class_field_inline_guard::class_field_arms_cover_every_subclass(
                             ctx,
                             &class_name,
                             &subclass_arms,
+                        ) || crate::expr::class_field_inline_guard::class_instances_grow_past_layout(
+                            ctx,
+                            &class_name,
                         ) {
                             return lower_generic_property_get(ctx, object, property, *byte_offset);
                         }
@@ -1695,18 +1703,24 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 let key_bits = blk.bitcast_double_to_i64(&key_box);
                                 blk.and(I64, &key_bits, POINTER_MASK_I64)
                             };
-                            let val = ctx.block().call(
-                                DOUBLE,
-                                "js_class_field_get_ic",
-                                &[
-                                    (I64, &site_id),
-                                    (DOUBLE, &recv_box),
-                                    (I32, &expected_class_id_str),
-                                    (I32, &expected_shape_id),
-                                    (I64, &key_raw),
-                                    (I32, &field_idx_str),
-                                    (I32, requires_raw_f64_str),
-                                ],
+                            // S2: guard + load is a GC-leaf call; the by-name
+                            // fallback is the cold collecting arm.
+                            let ic_args = [
+                                (I64, site_id.as_str()),
+                                (DOUBLE, recv_box.as_str()),
+                                (I32, expected_class_id_str.as_str()),
+                                (I32, expected_shape_id.as_str()),
+                                (I64, key_raw.as_str()),
+                                (I32, field_idx_str.as_str()),
+                                (I32, requires_raw_f64_str),
+                            ];
+                            let val = crate::expr::ic_fast_split::emit_hole_declining_split(
+                                ctx,
+                                "class_field_get",
+                                "js_class_field_get_ic_fast",
+                                &ic_args,
+                                "js_class_field_get_ic_fast_miss",
+                                &ic_args,
                             );
                             return Ok(val);
                         }

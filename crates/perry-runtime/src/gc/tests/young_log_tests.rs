@@ -16,6 +16,7 @@
 //! and in release on the stale address the un-visited entry keeps.
 
 use super::super::*;
+use super::dead_owner_side_tables::alloc_nursery_test_array;
 use super::support::*;
 
 fn young_closure() -> usize {
@@ -215,7 +216,7 @@ fn old_closure_entries_are_skipped_by_a_minor() {
     assert!(crate::closure::closure_is_key_deleted(owner, "name"));
     let row = walk("closure.dynamic_props");
     assert!(row.partial);
-    assert!(row.table_len >= 2, "{row:?}");
+    assert!(row.table_len >= 1, "{row:?}");
     assert_eq!(
         row.visited, 0,
         "an old owner with no heap values must not be visited by a minor: {row:?}"
@@ -245,15 +246,11 @@ fn dead_young_closure_owner_is_pruned_by_the_young_prune() {
 
 // -------------------------------------------------------------- descriptors
 
-#[test]
-fn young_accessor_getter_is_moved_through_the_log() {
-    let _guard = CopyingNurseryTestGuard::new(1);
-    gc_register_mutable_root_scanner(crate::object::descriptor_state::scan_descriptor_roots_mut);
-
-    let (owner, _) = unsafe { alloc_nursery_test_object(0) };
-    let owner = owner as usize;
+/// Install a young getter on a young `owner`, rooted only through the
+/// accessor, take a copying minor, and return (owner after, getter after).
+fn young_getter_across_a_minor(owner: usize) -> (usize, usize, usize) {
     js_shadow_slot_set(0, ptr_bits(owner));
-    // The getter closure is reachable ONLY through the accessor table.
+    // The getter closure is reachable ONLY through the accessor.
     let getter = young_closure();
     crate::object::set_accessor_descriptor(
         owner,
@@ -273,10 +270,46 @@ fn young_accessor_getter_is_moved_through_the_log() {
     let getter_after = (acc.get & POINTER_MASK) as usize;
     assert_ne!(getter_after, getter, "the getter must have been evacuated");
     assert!(crate::arena::pointer_in_nursery(getter_after));
+    (owner_after, getter, getter_after)
+}
+
+/// An array's accessors live in the owner-keyed table; its young-owner log
+/// moves the getter.
+#[test]
+fn young_accessor_getter_is_moved_through_the_log() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    gc_register_mutable_root_scanner(crate::object::descriptor_state::scan_descriptor_roots_mut);
+
+    let owner = unsafe { alloc_nursery_test_array() } as usize;
+    young_getter_across_a_minor(owner);
     assert!(crate::object::get_accessor_descriptor(owner, "g").is_none());
     let row = walk("object.descriptors");
     assert!(row.partial);
     assert!(row.visited >= 1, "{row:?}");
+}
+
+/// An ordinary object's accessor pair lives in its key's slot (charter step
+/// 3), so the getter moves with the object's own trace — no table entry and
+/// no log visit. Sabotage: dropping the pair's closure words from its layout
+/// (`pair_new` skipping `rebuild_array_layout_from_slots`) leaves the getter
+/// unevacuated and the helper's `assert_ne!` fails.
+#[test]
+fn young_accessor_getter_moves_with_its_objects_slot() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    gc_register_mutable_root_scanner(crate::object::descriptor_state::scan_descriptor_roots_mut);
+
+    let (owner, _) = unsafe { alloc_nursery_test_object(0) };
+    let (owner_after, _, _) = young_getter_across_a_minor(owner as usize);
+    assert!(
+        !crate::state::state()
+            .descriptors
+            .accessor_descriptors
+            .borrow()
+            .keys()
+            .any(|(o, _)| *o == owner_after || *o == owner as usize),
+        "an ordinary object's accessor never reaches the owner table"
+    );
+    assert_eq!(walk("object.descriptors").visited, 0);
 }
 
 #[test]
@@ -298,7 +331,9 @@ fn old_descriptor_owners_are_skipped_by_a_minor() {
     let _ = gc_collect_minor();
     let before = walk("object.descriptors");
 
-    let (owner, _) = unsafe { alloc_old_test_object(0) };
+    // An array owner: an ordinary object's descriptors live with its keys and
+    // slots (charter step 3); an array's are still in the owner-keyed tables.
+    let (owner, _) = unsafe { alloc_old_test_array(0) };
     let owner = owner as usize;
     let getter = old_closure();
     crate::object::set_accessor_descriptor(
@@ -317,8 +352,15 @@ fn old_descriptor_owners_are_skipped_by_a_minor() {
 
     let _ = gc_collect_minor();
 
+    // The TABLE entry, read directly: this harness registers only the
+    // descriptor scanner.
     assert_eq!(
-        crate::object::get_accessor_descriptor(owner, "g").map(|acc| acc.get),
+        crate::state::state()
+            .descriptors
+            .accessor_descriptors
+            .borrow()
+            .get(&(owner, "g".to_string()))
+            .map(|acc| acc.get),
         Some(ptr_bits(getter))
     );
     let row = walk("object.descriptors");
@@ -1035,4 +1077,35 @@ fn old_layout_records_are_skipped_by_a_minor() {
     );
 
     crate::gc::layout_clear_for_ptr(owner as usize);
+}
+
+#[test]
+fn closure_walks_count_distinct_owners_consistently() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    gc_register_mutable_root_scanner(crate::closure::scan_closure_dynamic_props_roots_mut);
+    let owner = old_closure();
+    crate::closure::closure_set_dynamic_prop(owner, "count", 42.0);
+    crate::closure::closure_set_static_prototype(owner, crate::value::TAG_NULL);
+    crate::closure::closure_mark_key_deleted(owner, "name");
+    let other = old_closure();
+    crate::closure::closure_mark_key_deleted(other, "length");
+
+    let mut mark = |_value: f64| {};
+    let mut visitor = RuntimeRootVisitor::for_copy(&mut mark);
+    crate::closure::scan_closure_dynamic_props_roots_mut(&mut visitor);
+    let full = walk("closure.dynamic_props");
+    assert!(!full.partial);
+    assert_eq!(full.table_len, 2);
+    assert_eq!(full.logged, 2);
+    assert_eq!(full.visited, 2);
+
+    let _ = gc_collect_minor();
+    let young = walk("closure.dynamic_props");
+    assert!(young.partial);
+    assert_eq!(
+        young.table_len, full.table_len,
+        "one owner in three maps still counts once"
+    );
+    assert_eq!(young.logged, 0);
+    assert_eq!(young.visited, 0);
 }

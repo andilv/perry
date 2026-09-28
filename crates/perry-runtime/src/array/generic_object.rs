@@ -69,21 +69,31 @@ fn al_set_length(recv: f64, len: i64) {
             "Cannot set property length of object which has only a getter",
         );
     }
-    // An object-LITERAL `get length()` lives in the anon-shape class vtable,
-    // not the defineProperty descriptor table — a getter with no setter makes
-    // `Set(O, "length", ..., true)` throw (test262 splice/S15.4.4.12_A6.1_T3).
+    // A class instance without an own `length` meets its class's
+    // `get length()` / `set length(v)` on the prototype chain: the setter
+    // runs, and an accessor with no setter makes `Set(O, "length", ..., true)`
+    // throw.
     {
         let raw = raw_addr as *const crate::object::ObjectHeader;
         let class_id = crate::object::js_object_get_class_id(raw);
-        if class_id != 0 {
-            if let Some((getter, setter)) =
-                crate::object::class_own_accessor_ptrs(class_id, "length")
-            {
-                if setter == 0 && getter != 0 {
-                    crate::collection_iter::throw_type_error(
-                        "Cannot set property length of object which has only a getter",
-                    );
-                }
+        // SAFETY: a nonzero class id means `raw` is a live ordinary object;
+        // nothing between here and the lookup allocates.
+        let own_length = class_id != 0
+            && unsafe {
+                let keys = crate::object::object_keys(raw);
+                !keys.is_null()
+                    && crate::object::keys_find_slot_by_bytes(keys.arr(), keys.count(), b"length")
+                        .is_some()
+            };
+        if class_id != 0 && !own_length {
+            match unsafe {
+                crate::object::class_chain_setter_apply(class_id, "length", recv, len as f64)
+            } {
+                Some(true) => return,
+                Some(false) => crate::collection_iter::throw_type_error(
+                    "Cannot set property length of object which has only a getter",
+                ),
+                None => {}
             }
         }
     }
@@ -372,6 +382,8 @@ pub(crate) fn object_sort(recv: f64, cmp_validated: *const ClosureHeader) -> f64
     // Length and indexed getters may collect before comparison begins.
     let scope = crate::gc::RuntimeHandleScope::new();
     let recv_handle = scope.root_nanbox_f64(recv);
+    // #11419: the comparator runs with `this` undefined.
+    let _this = crate::object::ImplicitThisScope::bind_undefined(&scope);
     let cmp_handle = scope.root_raw_const_ptr(cmp_validated);
     let cmp = if cmp_validated.is_null() {
         None
