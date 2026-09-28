@@ -739,6 +739,13 @@ pub(crate) fn finish_native_emission(
 /// then one linker input: the piece itself when there is one, otherwise the
 /// pieces combined exactly as codegen units are (#10586 — the fast-emit
 /// budget's offenders are emitted apart from their siblings).
+///
+/// Inherent to the in-process backend, so without the feature this is a stub
+/// (same contract as [`compile_ll_inprocess_in`]'s): dispatch routes to the
+/// clang-subprocess text path when `llvm-inprocess` is off
+/// ([`inprocess_requested`] returns `false` there), so the stub is
+/// unreachable in a `--no-default-features` build.
+#[cfg(feature = "llvm-inprocess")]
 pub(crate) fn finish_native_pieces(
     pieces: Vec<Vec<u8>>,
     effective_target: &str,
@@ -753,6 +760,16 @@ pub(crate) fn finish_native_pieces(
         1 => Ok(objs.pop().expect("one piece")),
         _ => merge_unit_objects(&objs),
     }
+}
+
+/// No-LLVM stub: see [`finish_native_pieces`].
+#[cfg(not(feature = "llvm-inprocess"))]
+pub(crate) fn finish_native_pieces(
+    _pieces: Vec<Vec<u8>>,
+    _effective_target: &str,
+    _clang_args: &[String],
+) -> Result<Vec<u8>> {
+    anyhow::bail!("the in-process native backend requires the `llvm-inprocess` feature")
 }
 
 /// Route `.ll -> .o` through the LLVM C API inside this process (no clang
