@@ -52,9 +52,10 @@ pub use header::{BufferHeader, BUFFER_TYPE_ID, NODE_BUFFER_CLASS_ID, SMALL_BUF_T
 // ---- Re-exports: allocation / registry helpers ----
 pub(crate) use header::{is_small_buf_slab_addr, visit_ab_alias_slot};
 // #9342: primed by `typedarray::js_u8_buffer_read_f64` (codegen slow arm).
+pub(crate) use access::{cached_u8_read, cached_u8_write};
 #[cfg(test)]
 pub(crate) use header::test_u8_inline_cache_holds;
-pub(crate) use header::u8_inline_cache_try_prime;
+pub(crate) use header::{u8_inline_cache_hit, u8_inline_cache_try_prime};
 // `shared_sab` publishes process-global backings that `is_registered_buffer`
 // reports as buffers without them entering `BUFFER_REGISTRY`, so it arms the
 // same monotone latch — before the backing becomes reachable.
@@ -67,7 +68,7 @@ pub use header::{
     is_uint8array_buffer, js_set_crypto_key_death_hook, mark_as_array_buffer,
     mark_as_asymmetric_key, mark_as_crypto_key, mark_as_data_view, mark_as_secret_key,
     mark_as_shared_array_buffer, mark_as_uint8array, register_buffer, resolve_buffer_ab_alias,
-    set_buffer_ab_alias, CryptoKeyDeathHookFn,
+    set_buffer_ab_alias, u8_inline_cache_holds_for_test, CryptoKeyDeathHookFn,
 };
 pub(crate) use header::{
     buffer_alloc_foreign, collect_dead_registered_buffers_post_trace,

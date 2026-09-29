@@ -2181,7 +2181,18 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
                 IMPLICIT_THIS.with(|c| c.set(prev_this_h.get_nanbox_u64()));
                 return result;
             }
-            return crate::object::null_stub_value();
+            // Nothing on the function's own properties or its prototype chain
+            // answers `method_name` (the Function.prototype and Object.prototype
+            // builtins were dispatched above; a deleted key reads as absent), so
+            // the member call has no callee: a TypeError, as in node. This used
+            // to return the null-object stub, so `delete f.m; f.m()` produced
+            // `{}` and the program carried on.
+            crate::error::js_throw_type_error_not_a_function(
+                std::ptr::null(),
+                0,
+                method_name.as_ptr(),
+                method_name.len(),
+            );
         }
 
         if let Some(r) = crate::builtins::try_console_instance_method_dispatch(
@@ -2685,13 +2696,20 @@ pub unsafe extern "C-unwind" fn js_native_call_method(
     // `server.listen(...)` / `server.on(...)` on the plain-object `this`
     // behave as calls on the underlying server. See native_this_alias.rs.
     if super::native_this_alias::alias_active() {
-        if let Some(handle_val) = super::native_this_alias::alias_handle_for_object(object()) {
-            // Dispatch through the PRIMARY handle dispatcher only: the alias
-            // handle is known to be an http(s) server handle, and the
-            // composite's extension dispatchers (ext-net) may own an
-            // id-colliding socket that would claim shared names like
-            // `address`/`on` first.
-            if let Some(dispatch) = super::class_handles::handle_method_dispatch_primary() {
+        if let Some((handle_val, composite)) =
+            super::native_this_alias::alias_handle_for_object(object())
+        {
+            // Server aliases dispatch through the PRIMARY handle dispatcher
+            // only: the composite's extension dispatchers (ext-net) may own
+            // an id-colliding socket that would claim shared names like
+            // `address`/`on` first. A `ServerResponse` alias (#10454) needs
+            // the composite, whose http extension owns that handle.
+            let dispatch = if composite {
+                super::class_handles::handle_method_dispatch()
+            } else {
+                super::class_handles::handle_method_dispatch_primary()
+            };
+            if let Some(dispatch) = dispatch {
                 let handle = (handle_val.to_bits() & crate::value::POINTER_MASK) as i64;
                 let args = refreshed_args();
                 return dispatch(

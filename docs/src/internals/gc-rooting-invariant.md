@@ -166,7 +166,7 @@ handles, still open for field reads.
 alloca in generated code. Within that scope it is the only instrument that sees
 a defect before it crashes, which is why it runs first.
 
-**It is blind to three classes, all found the hard way. A clean report is not
+**It is blind to four classes, all found the hard way. A clean report is not
 evidence for any of them:**
 
 - **Runtime tables and interning caches** (#7231) — it reads emitted IR and
@@ -180,6 +180,16 @@ evidence for any of them:**
   verbatim. Property sets classified `MOVING: YES`, property gets `MOVING: no`,
   and 31 stale uses were dropped by `--moving-only`. **Audit these sets against
   what codegen actually emits, the way #7227 audits `ALLOC_RE`.**
+
+- **A slot the collector was told not to visit** (#11550) — not a rooting
+  bug at all. The object spill store read a buffer's uninitialized tail as the
+  slot's old value; pointer-shaped leftovers turned the first store into a
+  "pointer over pointer" overwrite, which skips the GC slot-mask update, so the
+  slot was never marked or rewritten. Every root was correct, and the IR has
+  nothing to see. Tell: the holder of the stale value is a *live* object whose
+  sibling slots were rewritten, and `PERRY_GC_PROTECT_FROMSPACE_HOLDERS=1`'s
+  report names nothing. When a runtime store helper takes an `old_bits`
+  shortcut, the old bits must come from inside the element range the GC walks.
 
 For the classes above, the instruments that catch them are the schedule/quarantine
 arms below and a *dependency-scale* workload — #7280 records 25 curated corpus
@@ -251,6 +261,23 @@ makes the report sound in both directions: the producing instruction must
 dominate the bind, so the register being rooted really is the one that
 instruction produced on every path. It is one-sided: an unrecognised call counts
 as collecting, so a gap in its model costs a false positive, never a missed bug.
+
+**Phi edges that replace the value are not part of its window (#11604).** When
+the bound register reaches the producing instruction through a `phi`, a path
+that enters the join through an edge whose operand is something *else* (another
+register or a constant) delivers that other value to the slot, not the one being
+checked. So the window walk does not take such an edge: a collector reachable
+from the producer only through it is not reported. This is the shadow-mode twin
+of #7664's `--statepoints` refinement. The shape that needed it is S2's
+template coercion (#11554): `phi [ %v, %entry ], [ %coerced, %tmpl_coerce.slow ]`,
+where the only collecting call is on the arm that replaces `%v`. Before the
+refinement that one join read as 96 violations. A collector on an edge that
+*carries* the value, or between the join and the bind, is still reported, and
+`--self-test` asserts both (`_SELFTEST_PHI_SAFE_EDGE` / `_SELFTEST_PHI_HAZARD`).
+`--stale-registers` applies the same rule when a use reaches its source only
+through such a phi (`_stale_use_replacing_edges`). That took the stale budgets
+from 39 to 2 (curated) and from 118 to 10 (dependency-scale). The
+dependency-scale corpus had been at 457 on `main`, and no step reported it.
 
 For a single file you are iterating on:
 
@@ -754,6 +781,26 @@ before — and note that its `--max-unrooted` budget is a *ratchet under triage*
 not a calibrated zero: the residual is enumerated by shape in #7664. Lower it as
 the population is fixed; a promotion that freezes the budget where it is has
 bought a number, not an invariant.
+
+## Rematerialized global-backed roots (native lowering)
+
+A root slot whose only heap value is a copy of an immutable, collector-rewritten
+global is not relocated. It is re-read from that global at each use
+(`crates/perry-codegen/src/function/precise_roots/remat.rs`). Two global families
+qualify: string-literal handles (`<mod>_.str.N.handle`) and class-keys arrays
+(`@perry_class_keys_*`). Both are registered with `js_gc_register_global_root`,
+rewritten on evacuation, and written only by their module's init. The pass checks
+the rest on the emitted IR. Every store into the slot must be a load of that one
+global or a constant, the slot's address must not escape, and the function must
+not store to the global. Any slot that fails a check stays an ordinary
+`ptr addrspace(1)` root.
+
+The slot stays a plain alloca and records "holds the global's value" as a
+non-heap marker in the `0x7FFC` band. Each read becomes
+`select(slot == marker, load @G, slot)`, so the value a consumer sees is always
+loaded after the last safepoint. Module `let`/`var` globals (`@perry_global_*`)
+and static fields are registered roots too, but the program reassigns them, so
+they are never rematerialized. A re-read could observe a later assignment.
 
 ## Rules of thumb
 

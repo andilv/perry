@@ -1,12 +1,13 @@
 //! Method calls on a function object, answered from its SHAPE.
 //!
-//! A closure on its base Function shape (`closure::shape`) has exactly the
-//! intrinsic own keys (`name`, `length`, `prototype`) and inherits from the
-//! prototype its shape names. So for any other key the answer is the
-//! prototype's own slot, and the call is decided by that slot's VALUE:
+//! A closure on a described Function shape (`closure::shape`: base or keyed,
+//! not FunctionDictionary) has exactly the own keys its shape lists and
+//! inherits from the prototype its shape names. So for a key the list lacks
+//! the answer is the prototype's own slot, and the call is decided by that
+//! slot's VALUE:
 //!
-//! 1. one compare: the receiver's +4 word is this agent's base Function
-//!    ShapeId (ownership then proven by the tracked GC header);
+//! 1. the receiver's +4 word is a Function ShapeId naming Function.prototype
+//!    whose key list lacks the key (ownership proven by the tracked header);
 //! 2. one lookup: the key's data slot on `Function.prototype`;
 //! 3. identity by value: the slot still holds the intrinsic `bind` / `call` /
 //!    `apply` closure (its code pointer) — then run exactly what the by-name
@@ -49,17 +50,16 @@ pub(crate) unsafe fn try_function_shape_method_call(
     if !crate::object::shapes::is_exotic_shape_id(word) {
         return None;
     }
-    if word
-        != crate::closure::shape::function_base_shape(
-            crate::closure::shape::FunctionProtoKind::Function,
-        )
-    {
-        return None;
-    }
     if !crate::closure::is_closure_ptr(addr) {
         return None;
     }
-    if crate::closure::shape::is_intrinsic_function_key_bytes(name) {
+    // A DESCRIBED Function shape (base or keyed) whose prototype is
+    // Function.prototype, and whose own key list does not hold `name` —
+    // then the receiver has no own `name` and inherits it from the prototype.
+    if word == crate::closure::shape::function_dictionary_shape() {
+        return dictionary_function_proto_method_call(object, addr, name, args_ptr, args_len);
+    }
+    if !crate::closure::shape::function_shape_inherits_from_function_prototype(word, name) {
         return None;
     }
     // (2) The prototype the shape names, and its own data slot for the key.
@@ -80,6 +80,64 @@ pub(crate) unsafe fn try_function_shape_method_call(
     #[cfg(test)]
     FUNCTION_SHAPE_HITS.with(|c| c.set(c.get() + 1));
     super::common_methods::dispatch_function_proto_method(object, which, args_ptr, args_len)
+}
+
+/// `bind`/`call`/`apply` on a FunctionDictionary receiver — one whose
+/// `[[Prototype]]` may be RECORDED (`Object.setPrototypeOf(fn, p)`). The
+/// shape answers nothing, so the key is resolved the ordinary way: an own
+/// property declines to the full path; otherwise the inherited value comes
+/// from the receiver's ACTUAL prototype (`reify_function_method_value`, which
+/// reads `getPrototypeOf(fn)`). The intrinsic runs the tower's semantics; any
+/// other callable (`p.call`) is invoked with the function as `this`.
+unsafe fn dictionary_function_proto_method_call(
+    object: f64,
+    addr: usize,
+    name: &[u8],
+    args_ptr: *const f64,
+    args_len: usize,
+) -> Option<f64> {
+    let method: &'static [u8] = match name {
+        b"call" => b"call",
+        b"apply" => b"apply",
+        b"bind" => b"bind",
+        _ => return None,
+    };
+    let key = std::str::from_utf8(method).ok()?;
+    if crate::closure::closure_has_own_dynamic_prop(addr, key)
+        || crate::object::get_accessor_descriptor(addr, key).is_some()
+    {
+        return None;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver_h = scope.root_nanbox_f64(object);
+    let value = crate::closure::reify_function_method_value(object, method);
+    let value_h = scope.root_nanbox_f64(value);
+    let jv = JSValue::from_bits(value.to_bits());
+    if !jv.is_pointer() {
+        return None;
+    }
+    let func = crate::closure::get_valid_func_ptr(jv.as_pointer::<ClosureHeader>());
+    if let Some(which) = crate::object::global_this::function_prototype_intrinsic_of(func) {
+        return super::common_methods::dispatch_function_proto_method(
+            receiver_h.get_nanbox_f64(),
+            which,
+            args_ptr,
+            args_len,
+        );
+    }
+    if func.is_null() {
+        return None;
+    }
+    // A user callable inherited from the recorded prototype: an ordinary
+    // method call with the function as `this`.
+    let prev_this_h = scope.root_nanbox_u64(
+        super::IMPLICIT_THIS.with(|c| c.replace(receiver_h.get_nanbox_f64().to_bits())),
+    );
+    let callee =
+        crate::closure::rebind_explicit_this(value_h.get_nanbox_f64(), receiver_h.get_nanbox_f64());
+    let result = crate::closure::js_native_call_value(callee, args_ptr, args_len);
+    super::IMPLICIT_THIS.with(|c| c.set(prev_this_h.get_nanbox_u64()));
+    Some(result)
 }
 
 #[cfg(test)]

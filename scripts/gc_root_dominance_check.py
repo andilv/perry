@@ -1312,8 +1312,36 @@ def audit_poll_reach(roots=SYMBOL_ROOTS, bodies=None):
 
 
 # Bit-level / identity producers a heap address flows through unchanged.
-TRANSPARENT_OPS = ("or i64", "and i64", "bitcast", "inttoptr", "ptrtoint",
-                   "select", "phi", "add i64", "sub i64")
+#
+# Matched on the instruction's OPCODE (and, for the integer ops, its type), never
+# as a substring of the line. The substring form was correct only by accident:
+# `xor i64` -- the NaN-box re-tag, and the handle derivation
+# `bits ^ POINTER_TAG` that `root_reload.rs` treats as transparent -- was
+# tracked solely because the text "or i64" occurs inside it, and any line whose
+# REGISTER NAMES contained "phi", "select" or "bitcast" was taken for a
+# transparent op and skipped as a use. Deleting the word "or" from the old tuple
+# would have made every xor-derived stale handle invisible with every self-test
+# still green; `self_test()` now carries the xor fixtures that turn red instead.
+TRANSPARENT_OPS = ("or i64", "and i64", "xor i64", "add i64", "sub i64",
+                   "bitcast", "inttoptr", "ptrtoint", "select", "phi")
+# `%r = <opcode> <first type token>`: the two tokens a TRANSPARENT_OPS entry
+# names. No flags are skipped: `add nuw i64` was never matched by "add i64"
+# and still is not, so the change widens nothing but the xor it names.
+_OPCODE_RE = re.compile(r"^\s*%[\w.$-]+\s*=\s*([a-z]+)\s+(\S+)")
+
+
+# opcode -> the type it must carry ("" = any), derived from TRANSPARENT_OPS
+# once: this predicate runs for every instruction of every closure walk.
+_TRANSPARENT_TYPE = {op.partition(" ")[0]: op.partition(" ")[2] for op in TRANSPARENT_OPS}
+
+
+def rhs_is_transparent(text):
+    """Is `text` (a whole instruction, `%r = ...`) one of TRANSPARENT_OPS?"""
+    m = _OPCODE_RE.match(text)
+    if not m:
+        return False
+    want_ty = _TRANSPARENT_TYPE.get(m.group(1))
+    return want_ty is not None and (not want_ty or m.group(2) == want_ty)
 TRANSPARENT_CALLS = {"js_ctor_return_override"}
 # Calls that ROOT their argument (protecting it from that point on).
 # `js_box_set_bits` publishes into a mutable-capture box, which `BOX_REGISTRY`
@@ -1334,7 +1362,7 @@ def is_transparent(ins):
         return True
     if ins.callee is not None:
         return False
-    return any(op in ins.text for op in TRANSPARENT_OPS)
+    return rhs_is_transparent(ins.text)
 
 
 def provenance(def_of, reg, limit=64):
@@ -1785,14 +1813,20 @@ def dominates(idom, a, b):
     return False
 
 
-def between_blocks(f, a_blk, b_blk):
+def between_blocks(f, a_blk, b_blk, killed=frozenset()):
     """Blocks strictly between a_blk and b_blk on some path that does NOT
     re-enter a_blk (so a loop back-edge round trip is not counted -- that is a
-    different dynamic instance of the value)."""
+    different dynamic instance of the value).
+
+    `killed` is a set of `(pred, succ)` CFG edges no path may take: the
+    phi edges along which the value being checked is REPLACED rather than
+    carried (#11604, see `phi_replacing_edges`). Empty by default, which is
+    every caller except the bind-anchored window."""
     if a_blk == b_blk:
         return set()
     fwd = set()
-    q = deque(s for s in f.succs[a_blk] if s in f.insns and s != a_blk)
+    q = deque(s for s in f.succs[a_blk]
+              if s in f.insns and s != a_blk and (a_blk, s) not in killed)
     while q:
         x = q.popleft()
         if x in fwd:
@@ -1801,10 +1835,11 @@ def between_blocks(f, a_blk, b_blk):
         if x == b_blk:
             continue          # sink: do not expand past the bind
         for s in f.succs[x]:
-            if s in f.insns and s != a_blk:
+            if s in f.insns and s != a_blk and (x, s) not in killed:
                 q.append(s)
     bwd = set()
-    q = deque(p for p in f.preds[b_blk] if p in f.insns and p != a_blk)
+    q = deque(p for p in f.preds[b_blk]
+              if p in f.insns and p != a_blk and (p, b_blk) not in killed)
     while q:
         x = q.popleft()
         if x in bwd:
@@ -1813,9 +1848,105 @@ def between_blocks(f, a_blk, b_blk):
         if x == b_blk:
             continue
         for p in f.preds[x]:
-            if p in f.insns and p != a_blk:
+            if p in f.insns and p != a_blk and (p, x) not in killed:
                 q.append(p)
     return (fwd & bwd) - {a_blk, b_blk}
+
+
+def phi_replacing_edges(f, def_of, origin_reg, chain):
+    """CFG edges along which the value `origin_reg` produced is REPLACED on
+    its way to the bound register, rather than carried to it (#11604).
+
+    `chain` is the bound register's backward transparent closure. A `phi` on
+    it merges several values; on an incoming edge whose operand is NOT
+    derived from `origin_reg` (another register, or a constant), the join
+    yields that other value, so a collection on a path that enters the join
+    only through such an edge happens while the slot is about to receive
+    something else -- not `origin_reg`'s pointer. Counting it anyway is the
+    loose-direction over-approximation #7664 already removed from the
+    `--statepoints` mode (`_cast_closure`'s `phi_all_edges` and
+    `_phi_edge_hazard`), and it is exactly the S2 template-coercion join
+    (#11554): `phi [ %v, %entry ], [ %coerced, %tmpl_coerce.slow ]`, where the
+    only collecting call is on the arm that replaces `%v`.
+
+    An edge is killed only when NO chain phi in the join block takes an
+    origin-derived operand from it, so two phis that disagree about an edge
+    keep it (conservative). A collector on any edge that does carry the
+    value, or between the join and the bind, is still reported -- the
+    `_SELFTEST_PHI_*` fixtures assert both.
+    """
+    tainted = {origin_reg}
+    changed = True
+    while changed:
+        changed = False
+        for r in chain:
+            if r in tainted:
+                continue
+            d = def_of.get(r)
+            if d is None or not is_transparent(d):
+                continue
+            if operand_regs(d.text) & tainted:
+                tainted.add(r)
+                changed = True
+    carry = {}      # join block -> preds that carry an origin-derived operand
+    replace = {}    # join block -> preds whose operand is something else
+    for r in tainted:
+        d = def_of.get(r)
+        if d is None or not _is_phi(d):
+            continue
+        for val, pred in phi_incoming(d):
+            val = val.strip()
+            if val.startswith("%") and val[1:] in tainted:
+                carry.setdefault(d.block, set()).add(pred)
+            else:
+                replace.setdefault(d.block, set()).add(pred)
+    return frozenset((pred, blk) for blk, preds in replace.items()
+                     for pred in preds - carry.get(blk, set()))
+
+
+def loop_carried_blocks(f, a_blk, b_blk, barrier_blks=()):
+    """Blocks on a cycle b_blk -> ... -> b_blk that enters neither a_blk nor
+    any of `barrier_blks` (blocks that re-store the slot), or None when there
+    is no such cycle.
+
+    Only the unrooted-alloca mode uses this (#11590). A memory slot stored in
+    `a_blk` and loaded in a loop body `b_blk` keeps its value across the
+    back-edge, so a collector on that cycle is inside the window of every
+    load after the first. For an SSA register `between_blocks`'s refusal to
+    expand past `b_blk` is right; for a slot it misses exactly this shape.
+    """
+    if a_blk == b_blk:
+        return None
+    stop = {a_blk} | set(barrier_blks)
+    if b_blk in stop:
+        return None
+    fwd = set()
+    q = deque(s for s in f.succs[b_blk] if s in f.insns and s not in stop)
+    while q:
+        x = q.popleft()
+        if x in fwd:
+            continue
+        fwd.add(x)
+        if x == b_blk:
+            continue
+        for s in f.succs[x]:
+            if s in f.insns and s not in stop:
+                q.append(s)
+    if b_blk not in fwd:
+        return None
+    bwd = set()
+    q = deque(p for p in f.preds[b_blk] if p in f.insns and p not in stop)
+    while q:
+        x = q.popleft()
+        if x in bwd:
+            continue
+        bwd.add(x)
+        if x == b_blk:
+            continue
+        for p in f.preds[x]:
+            if p in f.insns and p not in stop:
+                q.append(p)
+    return (fwd & bwd) - {b_blk}
 
 
 # ---------------------------------------------------------- slot activity (must)
@@ -1959,7 +2090,7 @@ def check_func(module, f, want_moving_only=False, poll_reaching=frozenset(),
     idom = dominators(f)
     violations = []
 
-    def window_hits(A, B):
+    def window_hits(A, B, killed=frozenset()):
         """Collecting calls on some CFG path from just after A to B."""
         hits = []
         if A.block == B.block:
@@ -1973,13 +2104,13 @@ def check_func(module, f, want_moving_only=False, poll_reaching=frozenset(),
         for c in f.insns[B.block]:
             if is_collecting(c.callee) and c.idx < B.idx:
                 hits.append(c)
-        for m_blk in between_blocks(f, A.block, B.block):
+        for m_blk in between_blocks(f, A.block, B.block, killed):
             for c in f.insns[m_blk]:
                 if is_collecting(c.callee):
                     hits.append(c)
         return hits
 
-    def protected(A, B, chain):
+    def protected(A, B, chain, killed=frozenset()):
         """Is the value rooted some other way inside the window?  A temp-root
         push or a mutable-capture box store of any register in the value's
         provenance chain roots it (both are scanned AND rewritten)."""
@@ -1994,7 +2125,7 @@ def check_func(module, f, want_moving_only=False, poll_reaching=frozenset(),
             return True
         if scan(B.block, 0, B.idx):
             return True
-        for m_blk in between_blocks(f, A.block, B.block):
+        for m_blk in between_blocks(f, A.block, B.block, killed):
             if scan(m_blk, 0, len(f.insns[m_blk])):
                 return True
         return False
@@ -2043,10 +2174,12 @@ def check_func(module, f, want_moving_only=False, poll_reaching=frozenset(),
                 continue
             if origin.block == bind_ins.block and origin.idx >= bind_ins.idx:
                 continue
-            hits = window_hits(origin, bind_ins)
+            killed = (phi_replacing_edges(f, def_of, origin.result, chain)
+                      if origin.result else frozenset())
+            hits = window_hits(origin, bind_ins, killed)
             if not hits:
                 continue
-            if protected(origin, bind_ins, chain):
+            if protected(origin, bind_ins, chain, killed):
                 continue
             v = Violation(module, f.name, origin, store_ins, bind_ins, hits,
                           slot, poll_reaching)
@@ -2261,7 +2394,7 @@ def _reaches_alloc(defs, reg, limit=32):
             if ALLOC_RE.match(cm.group(1)):
                 return True
             continue
-        if any(op in rhs for op in TRANSPARENT_OPS):
+        if rhs_is_transparent("%x = " + rhs):
             q.extend(re.findall(r"%([\w.$]+)", rhs))
     return False
 
@@ -2443,6 +2576,86 @@ define double @perry_fn_selftest__nolabel(double %a) {
   %obj = call ptr @js_object_alloc(i32 4)
   %ret = call double @js_call_function(double %a)
   store ptr %obj, ptr %slot
+  call void @js_shadow_slot_bind(i32 0, ptr %slot)
+  ret double %ret
+}
+"""
+
+
+# #11604: the S2 template-coercion join (#11554). `%v` is a heap value; the
+# only collecting call is on the arm that REPLACES it, so on every path that
+# delivers `%v` to the store nothing collects. Before #11604 this read as a
+# violation (96 of them on the corpus): the window walk followed the phi back
+# to `%v` and then counted the slow arm's call, a path on which the slot
+# receives `%c`, not `%v`.
+_SELFTEST_PHI_SAFE_EDGE = """\
+define double @perry_fn_selftest__tmpl_join(double %a) {
+entry.0:
+  %slot = alloca i64
+  call void @js_shadow_frame_enter(i32 1)
+  %v = call double @js_jsvalue_to_string_method_box(double %a)
+  %bits = bitcast double %v to i64
+  %top = lshr i64 %bits, 48
+  %is_str = icmp eq i64 %top, 32767
+  br i1 %is_str, label %tmpl_coerce.merge.2, label %tmpl_coerce.slow.1
+
+tmpl_coerce.slow.1:
+  %c = call double @js_template_string_coerce_box(double %v)
+  br label %tmpl_coerce.merge.2
+
+tmpl_coerce.merge.2:
+  %p = phi double [ %v, %entry.0 ], [ %c, %tmpl_coerce.slow.1 ]
+  %pb = bitcast double %p to i64
+  store i64 %pb, ptr %slot
+  call void @js_shadow_slot_bind(i32 0, ptr %slot)
+  ret double %p
+}
+"""
+
+# The two ways that join CAN still be a hazard, which the edge refinement must
+# keep reporting: a collector on an edge that CARRIES `%v` into the join, and a
+# collector between the join and the bind (on every path, including the one
+# carrying `%v`).
+_SELFTEST_PHI_HAZARD = """\
+define double @perry_fn_selftest__carrying_edge(double %a, i1 %k) {
+entry.0:
+  %slot = alloca i64
+  call void @js_shadow_frame_enter(i32 1)
+  %v = call double @js_jsvalue_to_string_method_box(double %a)
+  br i1 %k, label %fast.1, label %slow.2
+
+fast.1:
+  %poll = call double @js_gc_loop_safepoint(double %a)
+  br label %merge.3
+
+slow.2:
+  %c = call double @js_template_string_coerce_box(double %v)
+  br label %merge.3
+
+merge.3:
+  %p = phi double [ %v, %fast.1 ], [ %c, %slow.2 ]
+  %pb = bitcast double %p to i64
+  store i64 %pb, ptr %slot
+  call void @js_shadow_slot_bind(i32 0, ptr %slot)
+  ret double %p
+}
+
+define double @perry_fn_selftest__after_join(double %a, i1 %k) {
+entry.0:
+  %slot = alloca i64
+  call void @js_shadow_frame_enter(i32 1)
+  %v = call double @js_jsvalue_to_string_method_box(double %a)
+  br i1 %k, label %merge.2, label %slow.1
+
+slow.1:
+  %c = call double @js_template_string_coerce_box(double %v)
+  br label %merge.2
+
+merge.2:
+  %p = phi double [ %v, %entry.0 ], [ %c, %slow.1 ]
+  %ret = call double @js_call_function(double %a)
+  %pb = bitcast double %p to i64
+  store i64 %pb, ptr %slot
   call void @js_shadow_slot_bind(i32 0, ptr %slot)
   ret double %ret
 }
@@ -2712,6 +2925,7 @@ def check_func_stale(module, f, poll_reaching=frozenset(), moving_only=False):
                                 and uses(ins.text, chain)):
                             chain.add(ins.result)
                             grew = True
+            direct = None   # phi-free closure, built on first need (#11604)
             # First real (non-transparent) use of any register in the chain
             # that sits below a collection point.
             for bb in f.blocks:
@@ -2730,6 +2944,18 @@ def check_func_stale(module, f, poll_reaching=frozenset(), moving_only=False):
                     hits = window_hits_generic(f, src, use)
                     if not hits:
                         continue
+                    # #11604: a use reached only through a phi edge that
+                    # REPLACES the source is not below that edge's collector.
+                    # Refining can only remove hits, so it runs only when
+                    # there are some.
+                    if direct is None:
+                        direct = _phi_free_closure(def_of, src.result, chain)
+                    killed = _stale_use_replacing_edges(
+                        f, def_of, src.result, chain, direct, use)
+                    if killed:
+                        hits = window_hits_generic(f, src, use, killed=killed)
+                        if not hits:
+                            continue
                     v = StaleUse(module, f.name, src, kind, use, hits,
                                  src.result, poll_reaching)
                     if moving_only and not v.moving:
@@ -2742,11 +2968,58 @@ def check_func_stale(module, f, poll_reaching=frozenset(), moving_only=False):
     return out
 
 
+def _phi_free_closure(def_of, src_reg, chain):
+    """The registers of `chain` (the source's forward transparent closure)
+    that derive from `src_reg` WITHOUT passing through a phi: they carry the
+    source on every path."""
+    direct = {src_reg}
+    grew = True
+    while grew:
+        grew = False
+        for r in chain:
+            if r in direct:
+                continue
+            d = def_of.get(r)
+            if (d is not None and not _is_phi(d) and is_transparent(d)
+                    and operand_regs(d.text) & direct):
+                direct.add(r)
+                grew = True
+    return direct
+
+
+def _stale_use_replacing_edges(f, def_of, src_reg, chain, direct, use):
+    """`phi_replacing_edges` for a stale-register use (#11604).
+
+    The use reads the source only through a phi when none of the chain
+    registers it names is in `direct` (the phi-free closure). Then a path
+    that enters such a phi through an edge carrying something else delivers
+    that other value to the use, and a collector reachable only through that
+    edge is not in the source's window. S2's template join is the case:
+    `phi [ %v, %entry ], [ %coerced, %tmpl_coerce.slow ]` then a store of
+    the phi, where the only collector is the slow arm's call. If the use
+    names any directly-derived register, nothing is dropped.
+    """
+    used = {r for r in operand_regs(use.text) if r in chain}
+    if not used or used & direct:
+        return frozenset()
+    back = set()
+    q = deque(used)
+    while q:
+        r = q.popleft()
+        if r in back:
+            continue
+        back.add(r)
+        d = def_of.get(r)
+        if d is not None and is_transparent(d):
+            q.extend(operand_regs(d.text))
+    return phi_replacing_edges(f, def_of, src_reg, back)
+
+
 def _collecting_insn(ins):
     return is_collecting(ins.callee)
 
 
-def window_hits_generic(f, A, B, pred=_collecting_insn):
+def window_hits_generic(f, A, B, pred=_collecting_insn, killed=frozenset()):
     """Collection points on some CFG path from just after A to just before B.
 
     `pred` decides what a collection point IS. The shadow modes pass the
@@ -2766,7 +3039,7 @@ def window_hits_generic(f, A, B, pred=_collecting_insn):
     for c in f.insns[B.block]:
         if pred(c) and c.idx < B.idx:
             hits.append(c)
-    for m_blk in between_blocks(f, A.block, B.block):
+    for m_blk in between_blocks(f, A.block, B.block, killed):
         for c in f.insns[m_blk]:
             if pred(c):
                 hits.append(c)
@@ -3289,7 +3562,12 @@ def check_func_unrooted_allocas(module, f, want_moving_only=False,
             if lm and lm.group(1) in allocas:
                 loads[lm.group(1)].append(ins)
 
-    def window_hits(A, B):
+    store_blocks = defaultdict(set)   # alloca -> blocks that (re)store it
+    for reg_, sts in stores.items():
+        for st_ in sts:
+            store_blocks[reg_].add(st_.block)
+
+    def window_hits(A, B, reg):
         hits = []
         if A.block == B.block:
             return [c for c in f.insns[A.block]
@@ -3300,6 +3578,19 @@ def check_func_unrooted_allocas(module, f, want_moving_only=False,
                  if is_collecting(c.callee) and c.idx < B.idx]
         for m_blk in between_blocks(f, A.block, B.block):
             hits += [c for c in f.insns[m_blk] if is_collecting(c.callee)]
+        # #11590: a slot stored ONCE before a loop and loaded in its body is
+        # the same value on every iteration, so a collection anywhere on the
+        # back-edge cycle sits between the store and every load after the
+        # first. `between_blocks` stops at the load's block (right for an SSA
+        # value re-defined per iteration), which hid the packed-range loop's
+        # module-global cache: its only moving collector is the slow clone's
+        # back-edge `js_gc_loop_safepoint`, AFTER the load.
+        cyc = loop_carried_blocks(f, A.block, B.block, store_blocks[reg])
+        if cyc is not None:
+            hits += [c for c in f.insns[B.block]
+                     if is_collecting(c.callee) and c.idx > B.idx]
+            for m_blk in cyc:
+                hits += [c for c in f.insns[m_blk] if is_collecting(c.callee)]
         return hits
 
     out = []
@@ -3339,7 +3630,7 @@ def check_func_unrooted_allocas(module, f, want_moving_only=False,
                     continue
                 if st.block == ld.block and st.idx >= ld.idx:
                     continue
-                hits = window_hits(st, ld)
+                hits = window_hits(st, ld, reg)
                 if not hits:
                     continue
                 v = UnrootedAlloca(module, f.name, alloca_ins, st, ld, hits,
@@ -3377,6 +3668,44 @@ entry.0:
   ret double %this
 }
 """
+
+# #11590: the packed-range loop's module-global cache, reduced. The slot is
+# stored ONCE before the loop and loaded in the body; the only MOVING collector
+# is the back-edge poll, which runs AFTER the load. A store->load window that
+# stops at the load's block sees nothing; the second iteration's load reads
+# whatever the first iteration's poll left behind. `@loop_rooted` differs only
+# by the bind, the #11590 fix.
+_SELFTEST_LOOP_CARRIED = """\
+@perry_global_selftest__0 = global double 0.0
+
+define void @perry_fn_selftest__loop_unrooted() {
+entry.0:
+  %slot = alloca double
+  %g = load double, ptr @perry_global_selftest__0
+  store double %g, ptr %slot
+  br label %cond.1
+cond.1:
+  %i = phi i32 [ 0, %entry.0 ], [ %n, %poll.3 ]
+  %c = icmp slt i32 %i, 80
+  br i1 %c, label %body.2, label %exit.4
+body.2:
+  %d = load double, ptr %slot
+  %r = call double @js_dyn_index_set_strict(double %d, double 0.0, double 1.0, i32 0)
+  %n = add i32 %i, 1
+  br label %poll.3
+poll.3:
+  call void @js_gc_loop_safepoint()
+  br label %cond.1
+exit.4:
+  ret void
+}
+"""
+
+_SELFTEST_LOOP_ROOTED = _SELFTEST_LOOP_CARRIED.replace(
+    "loop_unrooted", "loop_rooted").replace(
+    "  store double %g, ptr %slot\n",
+    "  store double %g, ptr %slot\n"
+    "  call void @js_shadow_slot_bind(i32 0, ptr %slot)\n")
 
 _SELFTEST_ROOTED = """\
 define double @perry_fn_selftest__rooted(double %a) {
@@ -3571,6 +3900,49 @@ entry.0:
   %inner = call double @js_object_get_field_ic_miss(i64 %rh, i64 %a3, ptr @perry_ic_1)
   %def = load double, ptr %d
   %out = call double @perry_fn_other__callee(double %def, double %inner)
+  ret double %out
+}
+"""
+
+
+# The HANDLE form of the same window: the receiver is un-tagged with `xor`
+# (`bits ^ POINTER_TAG`), not masked with `and`. A region-scoped guard keeps
+# exactly this register (the object's address) for every access it covers, and
+# `root_reload.rs` re-derives it as a transparent `xor`, so the checker must
+# follow the same derivation or a handle held across a collecting call is
+# invisible. Before the opcode match this was reported only because the text
+# "or i64" happens to occur inside "xor i64".
+_SELFTEST_XOR_HANDLE_WINDOW = """\
+define double @perry_fn_selftest__xor_handle(double %a1, double %a2, i64 %a3) {
+entry.0:
+  %d = alloca double
+  store double %a2, ptr %d
+  call void @js_shadow_slot_bind(i32 1, ptr %d)
+  %def = load double, ptr %d
+  %db = bitcast double %def to i64
+  %dh = xor i64 %db, 9222809086901354496
+  %rb = bitcast double %a1 to i64
+  %rh = and i64 %rb, 281474976710655
+  %inner = call double @js_object_get_field_ic_miss(i64 %rh, i64 %a3, ptr @perry_ic_1)
+  %out = call double @js_object_get_field_by_name_f64(i64 %dh, i64 %a3)
+  ret double %out
+}
+"""
+
+# The fix: the handle is re-derived from the slot BELOW the collecting call.
+_SELFTEST_XOR_HANDLE_RELOADED = """\
+define double @perry_fn_selftest__xor_handle_reloaded(double %a1, double %a2, i64 %a3) {
+entry.0:
+  %d = alloca double
+  store double %a2, ptr %d
+  call void @js_shadow_slot_bind(i32 1, ptr %d)
+  %rb = bitcast double %a1 to i64
+  %rh = and i64 %rb, 281474976710655
+  %inner = call double @js_object_get_field_ic_miss(i64 %rh, i64 %a3, ptr @perry_ic_1)
+  %def = load double, ptr %d
+  %db = bitcast double %def to i64
+  %dh = xor i64 %db, 9222809086901354496
+  %out = call double @js_object_get_field_by_name_f64(i64 %dh, i64 %a3)
   ret double %out
 }
 """
@@ -4483,6 +4855,24 @@ __SAFEPOINT__
 }
 """.replace("__SAFEPOINT__", _sp(live=("rs4gc.s1",)))
 
+# `_SELFTEST_SP_STALE` with the raw word un-tagged by `xor` before the
+# safepoint and only the xor result used below it: the region-guard handle. The
+# stale register is the DERIVED one, so the forward closure has to cross the
+# `xor` to see it.
+_SELFTEST_SP_XOR_STALE = """\
+define double @perry_fn_selftest__sp_xor_stale(double %a) gc "statepoint-example" {
+entry.0:
+  %rs4gc.b1 = bitcast double %a to i64
+  %rs4gc.s1 = inttoptr i64 %rs4gc.b1 to ptr addrspace(1)
+  %raw = ptrtoint ptr addrspace(1) %rs4gc.s1 to i64
+  %h = xor i64 %raw, 9222809086901354496
+__SAFEPOINT__
+  %rs4gc.s1.relocated = call coldcc ptr addrspace(1) @llvm.experimental.gc.relocate.p1(token %tok, i32 0, i32 0)
+  %r = call double @js_object_get_field_by_name_f64(i64 %h, i64 0)
+  ret double %r
+}
+""".replace("__SAFEPOINT__", _sp(live=("rs4gc.s1",)))
+
 # ★★ THE CONTROL FOR THE TRACKED/UNTRACKED LINE, and the one fixture whose
 # absence was found by sabotage rather than by design.
 #
@@ -4743,7 +5133,8 @@ def statepoint_self_test():
                            ("roundtrip", _SELFTEST_SP_TRACKED_ROUNDTRIP),
                            ("quoted", _SELFTEST_SP_QUOTED_NAME),
                            ("phi_safe_edge", _SELFTEST_SP_PHI_SAFE_EDGE),
-                           ("phi_hazard_edge", _SELFTEST_SP_PHI_HAZARD_EDGE)):
+                           ("phi_hazard_edge", _SELFTEST_SP_PHI_HAZARD_EDGE),
+                           ("xor_stale", _SELFTEST_SP_XOR_STALE)):
             p = os.path.join(td, f"sp_{name}.ll")
             with open(p, "w") as fh:
                 fh.write(text)
@@ -4772,6 +5163,15 @@ def statepoint_self_test():
                       "--moving-only -- the arm CI gates on -- drops it and "
                       "the proof is vacuous.", file=sys.stderr)
                 ok = False
+
+        hits = _scan_statepoints([paths["xor_stale"]], moving_only=True)
+        if len(hits) != 1 or hits[0].kind_class != "stale":
+            print("self-test FAIL: a raw word un-tagged by `xor` above a "
+                  "safepoint and used below it must report exactly one stale "
+                  f"hazard, got {[(h.kind_class, h.kind) for h in hits]}. The "
+                  "forward closure must cross `xor`, the handle derivation "
+                  "root_reload.rs and region guards use.", file=sys.stderr)
+            ok = False
 
         hits = _scan_statepoints([paths["reloaded"]], moving_only=True)
         if hits:
@@ -5197,6 +5597,50 @@ def self_test():
                   file=sys.stderr)
             ok = False
 
+        # --- #11604: phi edges that REPLACE the value, both directions ------
+        #
+        # The safe join must clear, and the refinement that clears it must
+        # not have blinded the check to a collector on an edge that carries
+        # the value, or to one between the join and the bind.
+        phi_safe = os.path.join(td, "phi_safe.ll")
+        phi_hazard = os.path.join(td, "phi_hazard.ll")
+        for p, text in ((phi_safe, _SELFTEST_PHI_SAFE_EDGE),
+                        (phi_hazard, _SELFTEST_PHI_HAZARD)):
+            with open(p, "w") as fh:
+                fh.write(text)
+        found, binds = _scan([phi_safe], False, "alloc")
+        if found or binds != 1:
+            print(f"self-test FAIL: template-coercion join fixture -> "
+                  f"{len(found)} violations over {binds} binds, expected 0 "
+                  "over 1. The only collecting call is on the arm whose phi "
+                  "edge REPLACES the value, so the slot never receives the "
+                  "allocation across it (#11604).", file=sys.stderr)
+            ok = False
+        found, binds = _scan([phi_hazard], False, "alloc")
+        got = sorted(v.func for v in found)
+        want = ["perry_fn_selftest__after_join",
+                "perry_fn_selftest__carrying_edge"]
+        if got != want or binds != 2 or not all(v.moving for v in found):
+            print(f"self-test FAIL: phi hazard fixture -> {got} over {binds} "
+                  f"binds, expected {want} over 2, both MOVING. The phi-edge "
+                  "refinement must only drop edges that REPLACE the value; a "
+                  "collector on a carrying edge, or after the join, is still "
+                  "a late root store.", file=sys.stderr)
+            ok = False
+        # Same refinement, same two directions, in --stale-registers: the
+        # join's store must not read as a stale use of `%v`, and both hazard
+        # shapes must still do so.
+        n_safe, _rc = _stale_probe(phi_safe, None)
+        n_hazard, _rc = _stale_probe(phi_hazard, None)
+        if n_safe != 0 or n_hazard != 2:
+            print(f"self-test FAIL: --stale-registers over the phi fixtures -> "
+                  f"{n_safe} (safe join) / {n_hazard} (hazards), expected 0 / "
+                  "2. A use reached only through a phi edge that REPLACES the "
+                  "source is not below the replacing arm's collector (#11604); "
+                  "a carrying edge's collector, or one after the join, is.",
+                  file=sys.stderr)
+            ok = False
+
         # --stale-registers is a diagnostic, so its exit status is asserted
         # from both ends: the default must NOT go red on a corpus that has
         # hits, and --max-stale must actually be able to. A budget nobody has
@@ -5448,6 +5892,50 @@ def self_test():
                   "code shape rather than on the staleness.", file=sys.stderr)
             ok = False
 
+        # The xor-derived HANDLE, both directions (see the fixtures).
+        xh = os.path.join(td, "xor_handle_window.ll")
+        xh_fixed = os.path.join(td, "xor_handle_reloaded.ll")
+        for p, text in ((xh, _SELFTEST_XOR_HANDLE_WINDOW),
+                        (xh_fixed, _SELFTEST_XOR_HANDLE_RELOADED)):
+            with open(p, "w") as fh:
+                fh.write(text)
+        for moving_only in (False, True):
+            got = _stale_kinds_probe(xh, moving_only=moving_only).get("slotload", 0)
+            if got != 1:
+                print("self-test FAIL: a receiver handle derived from a shadow "
+                      "slot by `xor` (bits ^ POINTER_TAG) and used below the "
+                      "generic GET dispatch must report exactly one slotload "
+                      f"hazard (moving_only={moving_only}), got {got}. `xor` must "
+                      "be a transparent op: root_reload.rs re-derives through it, "
+                      "and region-scoped guards hold exactly this register.",
+                      file=sys.stderr)
+                ok = False
+            got = _stale_kinds_probe(xh_fixed, moving_only=moving_only).get("slotload", 0)
+            if got != 0:
+                print("self-test FAIL: re-deriving the xor handle BELOW the call is "
+                      f"the fix; the control must report 0, got {got}.",
+                      file=sys.stderr)
+                ok = False
+        # The matcher itself: opcode and type, never a substring of the line.
+        for text, want in (
+                ("  %h = xor i64 %b, 9222809086901354496", True),
+                ("  %h = or i64 %b, 1", True),
+                ("  %h = and i64 %b, 281474976710655", True),
+                ("  %h = bitcast double %v to i64", True),
+                ("  %h = phi i64 [ %a, %bb1 ], [ %b, %bb2 ]", True),
+                ("  %h = add nuw i64 %b, 16", False),
+                ("  %h = xor i32 %b, 1", False),
+                ("  %h = fadd double %phi.3, %select.1", False),
+                ("  store double %bitcast.7, ptr %slot", False),
+                ("  %h = load double, ptr %phi.slot", False)):
+            if rhs_is_transparent(text) != want:
+                print(f"self-test FAIL: rhs_is_transparent({text.strip()!r}) "
+                      f"must be {want}: transparency is the instruction's opcode "
+                      "and type, not a substring of the line (a register named "
+                      "`%phi.3` does not make a load transparent).",
+                      file=sys.stderr)
+                ok = False
+
         # The packed entry is the name emitted by generic property reads now,
         # and since T1 the SLOW entry is the only one most sites carry at all:
         # the tower's six other calls collapsed into it, so a set that named
@@ -5522,6 +6010,28 @@ def self_test():
         if n_allocas != 1:
             print(f"self-test FAIL: rooted control -> {n_allocas} gc-capable "
                   "allocas, expected 1", file=sys.stderr)
+            ok = False
+
+        # #11590: the loop-carried window, both directions, under the gated
+        # `--moving-only` filter (the poll is the only mover).
+        lc_bad = os.path.join(td, "loop_carried_unrooted.ll")
+        lc_ok = os.path.join(td, "loop_carried_rooted.ll")
+        for p, text in ((lc_bad, _SELFTEST_LOOP_CARRIED),
+                        (lc_ok, _SELFTEST_LOOP_ROOTED)):
+            with open(p, "w") as fh:
+                fh.write(text)
+        found, _ = _scan_unrooted([lc_bad], moving_only=True)
+        if len(found) != 1:
+            print(f"self-test FAIL: loop-carried unrooted-alloca fixture "
+                  f"(#11590) -> {len(found)} --moving-only violations, "
+                  "expected 1. A slot stored before a loop and loaded in its "
+                  "body is stale after the back-edge poll.", file=sys.stderr)
+            ok = False
+        found, _ = _scan_unrooted([lc_ok], moving_only=True)
+        if found:
+            print(f"self-test FAIL: loop-carried rooted control (#11590) -> "
+                  f"{len(found)} violations, expected 0; it differs from the "
+                  "planted fixture only by the bind.", file=sys.stderr)
             ok = False
 
         # And it must not fire on the bind-anchored fixtures, nor the reverse:

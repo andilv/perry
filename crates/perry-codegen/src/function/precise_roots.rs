@@ -6,6 +6,8 @@
 //! [`retype_landing_pads_for_statepoints`], both called from
 //! `LlFunction::serialize`.
 
+mod remat;
+
 fn parse_shadow_bind(line: &str) -> Option<(usize, String)> {
     let rest = line
         .trim()
@@ -322,6 +324,24 @@ pub(super) fn lower_precise_roots_to_native_stack(
     }
 
     let root_ptrs: Vec<String> = roots.into_iter().flatten().collect();
+
+    // Slots that only ever hold a copy of an immutable, collector-rewritten
+    // global (string-literal handles, class-keys arrays) are re-read from that
+    // global at each use instead of being relocated. See `remat.rs` for the
+    // conditions; a slot that fails any of them stays a root below.
+    let remat_plans = remat::plan(&lines, &root_ptrs);
+    let remat_ir;
+    let (lines, root_ptrs) = if remat_plans.is_empty() {
+        (lines, root_ptrs)
+    } else {
+        remat_ir = remat::apply(&lines, &remat_plans);
+        let kept = root_ptrs
+            .into_iter()
+            .filter(|ptr| !remat_plans.contains_key(ptr))
+            .collect::<Vec<_>>();
+        (remat_ir.lines().collect::<Vec<&str>>(), kept)
+    };
+
     let report = crate::statepoint_report::enabled().then(|| {
         crate::statepoint_report::FunctionRecord::new(
             function_name,
@@ -377,7 +397,10 @@ mod tests {
         use crate::types::{I32, I64, PTR, VOID};
         module.declare_function("js_shadow_slot_bind", VOID, &[I32, PTR]);
         module.declare_function("js_closure_get_capture_bits", I64, &[I64, I32]);
-        module.declare_function("js_closure_set_capture_bits", VOID, &[I64, I32, I64]);
+        // `js_closure_set_capture_bits` used to be the setter here; the
+        // generated table proves it can flush a deferred collection (#11523),
+        // so the leaf setter probed is the i32 box store.
+        module.declare_function("js_i32_box_set", VOID, &[I64, I32]);
         module.declare_function("js_box_alloc_bits", I64, &[I64]);
         module.declare_function("js_box_set_bits", VOID, &[I64, I64]);
         module.declare_function("js_map_alloc", I64, &[I32]);
@@ -404,10 +427,7 @@ mod tests {
             "js_closure_get_capture_bits",
             &[(I64, "0"), (I32, "0")],
         );
-        entry.call_void(
-            "js_closure_set_capture_bits",
-            &[(I64, "0"), (I32, "0"), (I64, &cap)],
-        );
+        entry.call_void("js_i32_box_set", &[(I64, &box_ptr), (I32, "0")]);
         // Control: an unaudited callee stays a genuine safepoint.
         let unknown = entry.call(I64, "js_map_alloc", &[(I32, "1")]);
         let live = entry.load(I64, &root);
@@ -432,7 +452,7 @@ mod tests {
             "call i64 @js_box_alloc_bits(",
             "call void @js_box_set_bits(",
             "call i64 @js_closure_get_capture_bits(",
-            "call void @js_closure_set_capture_bits(",
+            "call void @js_i32_box_set(",
         ] {
             assert!(
                 rewritten.contains(direct),

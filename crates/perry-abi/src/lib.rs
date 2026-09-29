@@ -15,6 +15,10 @@ pub const AGENT_PTR_SLOTS: usize = 4;
 /// Slot 1: the address of this agent's implicit-`this` cell
 /// (`tls_hot::HotTls::implicit_this`), which a direct method call binds.
 pub const AGENT_PTR_IMPLICIT_THIS: usize = 1;
+/// Slot 2: this agent's stack limit (#10812) — not a pointer to anything, the
+/// lowest frame address a compiled prologue accepts before it throws
+/// `RangeError: Maximum call stack size exceeded`. Null means unchecked.
+pub const AGENT_PTR_STACK_LIMIT: usize = 2;
 /// `tls_hot::HotTls::agent_ptrs` (Apple aarch64 TSD path; LP64): directly
 /// after `implicit_this` (128), behind fixed-size fields only.
 pub const HOT_TLS_AGENT_PTRS_OFFSET: usize = 136;
@@ -65,8 +69,11 @@ pub const fn method_site_padded_argc(argc: usize) -> usize {
 }
 /// The entry `slot` bit for an own key in the receiver's spill buffer.
 pub const METHOD_SITE_SPILL: u64 = 1 << 62;
-/// The index bits of an entry's `slot` word (bits 61 and 60 are reserved for
-/// the function-bag and accessor entry kinds).
+/// The entry `slot` bit for an own key of a function-object receiver: an
+/// inline slot of the object at `ClosureHeader::props`.
+pub const METHOD_SITE_FUNCTION_BAG: u64 = 1 << 61;
+/// The index bits of an entry's `slot` word (bit 60 is reserved for the
+/// accessor entry kind).
 pub const METHOD_SITE_INDEX_MASK: u64 = (1 << 60) - 1;
 /// `object::ObjectMeta::spill` (the object-owned overflow buffer).
 pub const OBJECT_META_SPILL_OFFSET: usize = 32;

@@ -83,6 +83,13 @@ pub extern "C" fn js_packed_arraylike_index_get(
                         return probed;
                     }
                 }
+                // #10515: an admitted owning byte view answers from the
+                // inline-access cache before the dispatcher's registry probes.
+                if header.obj_type == crate::gc::GC_TYPE_BUFFER {
+                    if let Some(byte) = cached_u8_packed_get(raw as usize, index_u32) {
+                        return byte;
+                    }
+                }
                 if matches!(
                     header.obj_type,
                     crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY
@@ -151,6 +158,14 @@ pub extern "C" fn js_packed_arraylike_index_get(
     }
     crate::value::js_dyn_index_get(receiver, index)
 }
+/// #10515: an admitted owning byte view's element, out of line so the Array
+/// receivers this helper mostly serves pay only the brand compare.
+#[inline(never)]
+fn cached_u8_packed_get(addr: usize, index: u32) -> Option<f64> {
+    let idx = i32::try_from(index).ok()?;
+    crate::buffer::cached_u8_read(addr, idx).map(f64::from)
+}
+
 #[cfg(feature = "keepalive-anchors")]
 #[used(compiler)]
 static KEEP_JS_PACKED_ARRAYLIKE_INDEX_GET: extern "C" fn(
