@@ -57,11 +57,14 @@ pub(crate) use test_root_helpers::*;
 
 pub(crate) mod alloc;
 mod alloc_basic;
-pub(crate) use alloc::mark_object_plain_ordinary;
+pub(crate) mod alloc_plain;
 pub use alloc::{
     js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent,
     js_object_alloc_null_proto, js_object_alloc_with_parent, js_object_coerce,
 };
+pub(crate) use alloc_basic::object_alloc_plain;
+#[allow(unused_imports)]
+pub(crate) use alloc_plain::mark_object_plain_ordinary;
 mod json_construction;
 pub(crate) use json_construction::{
     object_from_inline_json_fields, object_from_json_fields_preinstalled,
@@ -84,6 +87,7 @@ mod class_gc_roots;
 mod class_handles;
 pub mod class_image;
 mod class_registry;
+pub(crate) mod class_value;
 #[cfg(test)]
 mod zeroed_cache_tests;
 pub(crate) use class_registry::async_resource_prototype_value;
@@ -96,6 +100,8 @@ pub(crate) mod accessor_pair;
 pub(crate) mod attr_census;
 pub(crate) mod canonical_keys;
 mod census;
+pub(crate) mod field_rep;
+pub(crate) mod field_rep_store;
 pub(crate) mod key_attrs;
 pub(crate) use census::object_tables_census;
 #[cfg(test)]
@@ -164,6 +170,8 @@ pub use side_table_roots::{
 pub(crate) use side_table_roots::{
     test_seed_transition_cache_entry, test_transition_cache_occupancy,
 };
+#[cfg(test)]
+mod field_rep_store_tests;
 pub(crate) mod iterator_prototypes;
 pub(crate) mod map_set_subclass;
 pub mod method_site;
@@ -218,6 +226,7 @@ pub(crate) mod shape_carriers;
 #[cfg_attr(not(feature = "shape-mint-diag"), allow(dead_code))]
 pub(crate) mod shape_mint_census;
 pub(crate) mod shapes;
+pub(crate) mod static_shapes;
 pub(crate) use shapes::ShapeTable;
 mod prototype_helpers;
 mod reflect_support;
@@ -334,8 +343,6 @@ pub use class_meta_registry::{
 };
 #[cfg(test)]
 pub(crate) use descriptor_state::test_may_have_descriptor_entry;
-#[cfg(test)]
-pub(crate) use descriptor_state::test_reset_class_field_inline_guard;
 pub use descriptor_state::PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED;
 pub(crate) use descriptor_state::{
     accessor_descriptor_keys_for_obj, class_field_inline_guard_enabled,
@@ -363,16 +370,14 @@ pub(crate) use this_binding::js_derived_super_scope_push;
 pub(crate) use this_binding::SuperNewTargetScope;
 pub(crate) use this_binding::{
     derived_super_binding_stack_restore, derived_super_binding_stack_savepoint,
-    implicit_this_trap_restore, implicit_this_trap_savepoint, new_target_trap_restore,
-    new_target_trap_savepoint, scan_implicit_this_roots_mut, static_private_owner_current,
-    static_private_owner_pop, static_private_owner_push, static_private_owner_stack_restore,
-    static_private_owner_stack_savepoint, static_this_arm, static_this_arm_if_unarmed,
-    static_this_disarm, IMPLICIT_THIS,
+    new_target_trap_restore, new_target_trap_savepoint, scan_dispatch_binding_roots_mut,
+    static_private_owner_current, static_private_owner_pop, static_private_owner_push,
+    static_private_owner_stack_restore, static_private_owner_stack_savepoint, static_this_arm,
+    static_this_arm_if_unarmed, static_this_disarm,
 };
 pub use this_binding::{
-    js_implicit_this_get, js_implicit_this_get_sloppy, js_implicit_this_set, js_new_target_get,
-    js_new_target_set, js_static_this_arm_classref, js_static_this_arm_value,
-    js_static_this_resolve, ImplicitThisScope,
+    js_new_target_get, js_new_target_set, js_static_this_arm_classref, js_static_this_arm_value,
+    js_static_this_resolve, js_static_this_resolve_class, js_this_coerce_sloppy,
 };
 pub use to_string_tag::js_object_to_string;
 pub(crate) use to_string_tag::typed_array_to_string_tag_name;
@@ -466,6 +471,8 @@ crate::perry_thread_local! {
     static LOCAL_STORAGE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
     static SESSION_STORAGE_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
     static URL_INTRINSIC_PROTO_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
+    static OBJECT_INTRINSIC_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
+    static OBJECT_INTRINSIC_PROTO_PTR_SLOT: AtomicI64 = const { AtomicI64::new(0) };
 }
 
 static HTTP_METHODS_CACHE: RealmAtomicU64 = RealmAtomicU64::new(&HTTP_METHODS_CACHE_SLOT);
@@ -507,6 +514,12 @@ pub(crate) static ASYNC_GENERATOR_PROTOTYPE_PTR: RealmAtomicI64 =
 /// native constructor builds must keep the real component accessors (#11585).
 pub(crate) static URL_INTRINSIC_PROTO_PTR: RealmAtomicI64 =
     RealmAtomicI64::new(&URL_INTRINSIC_PROTO_PTR_SLOT);
+/// `%Object%` and `%Object.prototype%`, built by `ensure_object_intrinsics`
+/// without the realm global and adopted by it.
+pub(crate) static OBJECT_INTRINSIC_PTR: RealmAtomicI64 =
+    RealmAtomicI64::new(&OBJECT_INTRINSIC_PTR_SLOT);
+pub(crate) static OBJECT_INTRINSIC_PROTO_PTR: RealmAtomicI64 =
+    RealmAtomicI64::new(&OBJECT_INTRINSIC_PROTO_PTR_SLOT);
 pub(crate) static LOCAL_STORAGE_PTR: RealmAtomicI64 = RealmAtomicI64::new(&LOCAL_STORAGE_PTR_SLOT);
 pub(crate) static SESSION_STORAGE_PTR: RealmAtomicI64 =
     RealmAtomicI64::new(&SESSION_STORAGE_PTR_SLOT);
@@ -698,6 +711,7 @@ const KEYS_INDEX_THRESHOLD: u32 = 32;
 #[path = "keys_lookup.rs"]
 mod keys_lookup;
 mod object_keys;
+pub(crate) mod shaped_symbols;
 pub(crate) use object_keys::ObjectKeys;
 pub(crate) mod read_stub;
 pub(crate) use keys_lookup::*;
@@ -735,30 +749,6 @@ pub(crate) struct ShapeCacheEntry {
     /// backing shared with longer lists, so its header length is not it.
     key_count: u32,
     keys_array: *mut ArrayHeader,
-}
-
-crate::perry_thread_local! {
-    /// Issue #618-followup / drizzle SQL.Aliased: dynamic properties added
-    /// via the IIFE pattern `((SQL2) => { SQL2.Aliased = Aliased; })(SQL)`
-    /// to imported classes (which Perry stores as INT32-tagged class ids).
-    /// Pre-fix `js_object_set_field_by_name` saw the receiver as an INT32
-    /// "small handle" and silently dropped the assignment. Now route through
-    /// this side-table keyed by class_id.
-    pub(crate) static CLASS_DYNAMIC_PROPS: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashMap<String, f64>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    /// Property-creation order for `CLASS_DYNAMIC_PROPS`. The value table is a
-    /// HashMap for hot lookup, while [[OwnPropertyKeys]] needs first-insertion
-    /// order (with delete + re-add moving a key to the end).
-    pub(crate) static CLASS_DYNAMIC_PROP_ORDER: std::cell::RefCell<std::collections::HashMap<u32, Vec<String>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    /// #7190: `(writable, enumerable)` for static own keys installed by
-    /// `Object.defineProperty(C, k, desc)`. They live in `CLASS_DYNAMIC_PROPS`
-    /// next to `static x = …` fields, which are writable AND enumerable by
-    /// CreateDataPropertyOrThrow — a data descriptor defaults to neither. An
-    /// ABSENT entry therefore means "declared static field", and keeps the
-    /// previous `(true, true)` reporting untouched.
-    pub(crate) static CLASS_STATIC_DEFINED_ATTRS: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashMap<String, (bool, bool, bool)>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 // Storage: `ObjectHotTables::{shape_inline_cache, shape_cache_overflow}`.
@@ -1487,6 +1477,7 @@ pub fn scan_object_cache_roots(mark: &mut dyn FnMut(f64)) {
 }
 
 pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    crate::event_target::state::scan_roots(visitor);
     // Object-owned weak layout caches: rewrite moves without retaining keys.
     canonical_keys::scan_canonical_keys_roots_mut(visitor);
     scan_class_keys_roots_mut(visitor);
@@ -1520,6 +1511,8 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
         &LOCAL_STORAGE_PTR,
         &SESSION_STORAGE_PTR,
         &URL_INTRINSIC_PROTO_PTR,
+        &OBJECT_INTRINSIC_PTR,
+        &OBJECT_INTRINSIC_PROTO_PTR,
     ] {
         slot.with_slot(|slot| {
             visitor.visit_atomic_i64_slot(slot, Ordering::Acquire, Ordering::Release);
@@ -1764,7 +1757,7 @@ pub(crate) unsafe fn object_is_regular(obj: *const ObjectHeader) -> bool {
     header.obj_type == crate::gc::GC_TYPE_OBJECT
         && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
         && shapes::shape_object_kind_by_id((*obj).parent_class_id)
-            == Some(shapes::ShapeObjectKind::Ordinary)
+            .is_some_and(|kind| kind.is_ordinary_layout())
 }
 
 #[inline]
@@ -1781,6 +1774,9 @@ pub(crate) unsafe fn object_is_shaped(obj: *const ObjectHeader) -> bool {
 
 // 16-byte header with `meta` last (target_layout.rs): offset 8 LP64, 12 ILP32.
 const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 16 - size_of::<usize>());
+const _: () = assert!(
+    std::mem::offset_of!(ObjectHeader, parent_class_id) == crate::codegen_abi::OBJECT_SHAPE_OFFSET
+);
 const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 8);
 
 pub(crate) mod cell_meta;

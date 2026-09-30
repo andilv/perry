@@ -353,7 +353,7 @@ fn class_field_fast_contract(
         let shape_ok = (*obj).class_id == expected_class_id
             && shape_id == expected_shape_id
             && descriptor.is_some_and(|facts| {
-                facts.object_kind == crate::object::shapes::ShapeObjectKind::Ordinary
+                facts.object_kind.is_ordinary_layout()
                     && expected_field_index < facts.live_inline_slot_count
             });
         let layout_ok = shape_ok
@@ -798,6 +798,14 @@ pub extern "C" fn js_class_field_set_ic(
 /// outline drops the inline path's static raw-number type hint (the result is
 /// treated as a general JS value), which is value-correct — acceptable on the
 /// size-gated full-outline path.
+///
+/// `cache_slot` is the site's own read cache (the `PicCacheSlot` every
+/// generic read site has). With typed feedback off, a read the inline
+/// pre-check could not prove is the One Path read, exactly as for any other
+/// receiver: the receiver's shape against the site's word, then the generic
+/// ladder (own miss, the inherited-read cache, priming) — see
+/// [`class_field_get_one_path`]. With feedback on, the guard runs and records
+/// as before.
 #[no_mangle]
 pub extern "C" fn js_class_field_get_ic(
     site_id: u64,
@@ -807,7 +815,11 @@ pub extern "C" fn js_class_field_get_ic(
     key: *const crate::StringHeader,
     expected_field_index: u32,
     require_raw_f64: i32,
+    cache_slot: *mut crate::object::PicCacheSlot,
 ) -> f64 {
+    if !typed_feedback_enabled() {
+        return class_field_get_one_path(site_id, receiver, key, cache_slot, true);
+    }
     let guard_ok = js_typed_feedback_class_field_get_guard(
         site_id,
         receiver,
@@ -830,8 +842,123 @@ pub extern "C" fn js_class_field_get_ic(
     class_field_get_after_guard_fail(site_id, receiver, key)
 }
 
-/// `js_class_field_get_ic`'s guard-FAIL arm, shared with the S2 miss
-/// continuation [`js_class_field_get_ic_fast_miss`].
+/// The class-field read's miss arm with typed feedback off: the One Path
+/// read every other receiver takes, from the site's own cache.
+///
+/// The guard's answer is not needed first: a receiver its contract passes
+/// holds the key in slot `expected_field_index` of a shape that lists it
+/// there, which is the slot the shape read loads, so asking the shape answers
+/// the same value for it and for every receiver the contract refuses. What
+/// the shape read cannot serve inline (an inherited key, a getter, a Proxy,
+/// a primitive, a nullish receiver's TypeError) the ladder handles exactly as
+/// it does for `o.key` at a generic site. Before, a refused receiver took
+/// `js_object_get_field_by_name_f64`, a walk with no site memo, on every
+/// read: `this.pa` in a literal's method called on an `Object.create` child
+/// of it cost ~1,300 instructions where the same read through a parameter
+/// cost ~310.
+///
+/// `probe_mru` is false only when the S2 leaf entry already asked the word.
+fn class_field_get_one_path(
+    site_id: u64,
+    receiver: f64,
+    key: *const crate::StringHeader,
+    cache_slot: *mut crate::object::PicCacheSlot,
+    probe_mru: bool,
+) -> f64 {
+    let bits = receiver.to_bits();
+    // `key` is always the class field's literal name, loaded from a
+    // string-literal handle global (perry-codegen's property_get.rs), and a
+    // literal handle is always heap-allocated regardless of length
+    // (perry-codegen's strings.rs), so this can never be a SHORT_STRING_TAG
+    // value in practice; checked explicitly so a short string here declines
+    // to the generic ladder (which is SSO-aware) instead of being masked
+    // into a garbage pointer.
+    if crate::value::JSValue::from_bits(key as u64).is_short_string() {
+        crate::hot_diag::recv_route_note_runtime(crate::hot_diag::RT_ROUTE_CLASS_MISS_LADDER);
+        return crate::object::field_get_set::get_field_ic_dispatch(
+            bits as i64,
+            key,
+            site_id,
+            cache_slot,
+            false,
+        );
+    }
+    let key = (key as u64 & crate::value::POINTER_MASK) as *const crate::StringHeader;
+    if probe_mru {
+        if let Some(value) = unsafe { class_field_get_from_shape(bits, key, cache_slot, false) } {
+            return value;
+        }
+    }
+    crate::hot_diag::recv_route_note_runtime(crate::hot_diag::RT_ROUTE_CLASS_MISS_LADDER);
+    crate::object::field_get_set::get_field_ic_dispatch(
+        bits as i64,
+        key,
+        site_id,
+        cache_slot,
+        false,
+    )
+}
+
+/// The answers the receiver's shape gives without the ladder, in the order
+/// the emitted generic read asks them: the site's own word, the site's holder
+/// entry, then (on its declined edge) the inherited-read cache. `None` for
+/// everything else.
+///
+/// `leaf`: the caller is the S2 GC-leaf entry, so an inherited ACCESSOR entry
+/// (which runs a getter) is declined, as `js_inherited_read_cache_hit_f64`
+/// declines it for the emitted read. Otherwise the cache is asked once, as
+/// the ladder's own first question (`get_field_ic_miss_impl`'s hook A) asks
+/// it, getter included.
+///
+/// # Safety
+/// `cache_slot` is null or the site's live read cache; `key` is the interned
+/// key with its tag masked off.
+#[inline(always)]
+unsafe fn class_field_get_from_shape(
+    bits: u64,
+    key: *const crate::StringHeader,
+    cache_slot: *mut crate::object::PicCacheSlot,
+    leaf: bool,
+) -> Option<f64> {
+    // POINTER tag above the handle band: the receiver test every emitted
+    // generic read makes before either lookup.
+    if bits >> 48 != 0x7FFD {
+        return None;
+    }
+    let handle = (bits & crate::value::POINTER_MASK) as usize as *const ObjectHeader;
+    if !crate::value::addr_class::is_above_handle_band(handle as usize) {
+        return None;
+    }
+    if let Some(value) = crate::object::field_get_set::pic_outlined_mru_hit(handle, cache_slot) {
+        crate::hot_diag::recv_route_note_runtime(crate::hot_diag::RT_ROUTE_CLASS_MISS_SHAPE);
+        return Some(value);
+    }
+    // The site's holder entry, which the emitted generic read asks next.
+    if let Some(value) =
+        crate::object::method_site::read_holder::read_holder_hit(handle, cache_slot)
+    {
+        crate::hot_diag::recv_route_note_runtime(crate::hot_diag::RT_ROUTE_CLASS_MISS_SHAPE);
+        return Some(value);
+    }
+    let value = if leaf {
+        let value =
+            crate::object::inherited_read_cache::js_inherited_read_cache_hit_f64(handle, key);
+        (value.to_bits() != crate::value::TAG_HOLE).then_some(value)
+    } else {
+        match crate::object::inherited_read_cache::inherited_read_cache_lookup(handle, key) {
+            crate::object::inherited_read_cache::Lookup::Hit(value) => {
+                Some(f64::from_bits(value.bits()))
+            }
+            _ => None,
+        }
+    };
+    if value.is_some() {
+        crate::hot_diag::recv_route_note_runtime(crate::hot_diag::RT_ROUTE_CLASS_MISS_SHAPE);
+    }
+    value
+}
+
+/// `js_class_field_get_ic`'s guard-FAIL arm with typed feedback on.
 fn class_field_get_after_guard_fail(
     site_id: u64,
     receiver: f64,
@@ -936,8 +1063,9 @@ pub extern "C" fn js_class_field_get_ic_fast(
     key: *const crate::StringHeader,
     expected_field_index: u32,
     require_raw_f64: i32,
+    cache_slot: *mut crate::object::PicCacheSlot,
 ) -> f64 {
-    let _ = (site_id, key);
+    let _ = site_id;
     if !class_field_fast_entries_serve()
         || !class_field_fast_contract(
             receiver,
@@ -947,6 +1075,28 @@ pub extern "C" fn js_class_field_get_ic_fast(
             require_raw_f64 != 0,
         )
     {
+        // The receiver's shape (GC leaves, as in
+        // `js_object_get_field_ic_fast`): the One Path hit for a receiver
+        // the contract does not describe. Feedback on asks nothing here.
+        //
+        // `key` is always the class field's literal name, loaded from a
+        // string-literal handle global (perry-codegen's property_get.rs),
+        // and a literal handle is always heap-allocated regardless of
+        // length (perry-codegen's strings.rs), so this can never be a
+        // SHORT_STRING_TAG value in practice; checked explicitly so a short
+        // string declines here (falls through to `TAG_HOLE`, and the miss
+        // continuation's ladder) instead of being masked into a garbage
+        // pointer.
+        if !typed_feedback_enabled()
+            && !crate::value::JSValue::from_bits(key as u64).is_short_string()
+        {
+            let key = (key as u64 & crate::value::POINTER_MASK) as *const crate::StringHeader;
+            if let Some(value) =
+                unsafe { class_field_get_from_shape(receiver.to_bits(), key, cache_slot, true) }
+            {
+                return value;
+            }
+        }
         return f64::from_bits(crate::value::TAG_HOLE);
     }
     let object_addr = normalize_raw_object_addr(receiver.to_bits());
@@ -957,10 +1107,11 @@ pub extern "C" fn js_class_field_get_ic_fast(
     }
 }
 
-/// Collecting continuation of [`js_class_field_get_ic_fast`]. When the fast
-/// entry served nothing because feedback or descriptors are in use, this is
-/// the whole `js_class_field_get_ic`; otherwise its (side-effect-free) guard
-/// already failed and this is exactly that helper's guard-FAIL arm.
+/// Collecting continuation of [`js_class_field_get_ic_fast`]. With typed
+/// feedback on, the fast entry served nothing and this is the whole
+/// `js_class_field_get_ic`. With it off, the fast entry already asked the
+/// contract (when descriptors allow) and the site's shape word, and this is
+/// the rest of the One Path read: the generic ladder.
 #[no_mangle]
 pub extern "C" fn js_class_field_get_ic_fast_miss(
     site_id: u64,
@@ -970,8 +1121,9 @@ pub extern "C" fn js_class_field_get_ic_fast_miss(
     key: *const crate::StringHeader,
     expected_field_index: u32,
     require_raw_f64: i32,
+    cache_slot: *mut crate::object::PicCacheSlot,
 ) -> f64 {
-    if !class_field_fast_entries_serve() {
+    if typed_feedback_enabled() {
         return js_class_field_get_ic(
             site_id,
             receiver,
@@ -980,9 +1132,10 @@ pub extern "C" fn js_class_field_get_ic_fast_miss(
             key,
             expected_field_index,
             require_raw_f64,
+            cache_slot,
         );
     }
-    class_field_get_after_guard_fail(site_id, receiver, key)
+    class_field_get_one_path(site_id, receiver, key, cache_slot, false)
 }
 
 /// GC-leaf hit of the full-outline class-field SET; returns one of the
@@ -1355,7 +1508,7 @@ pub unsafe extern "C" fn js_method_direct_shape_guard(
 pub extern "C" fn js_typed_feedback_closure_direct_call_guard(
     site_id: u64,
     closure_value: f64,
-    expected_func_ptr: *const u8,
+    expected_info: *const crate::closure::JsFunctionInfo,
     expected_arity: u32,
     call_arity: u32,
 ) -> i32 {
@@ -1368,19 +1521,17 @@ pub extern "C" fn js_typed_feedback_closure_direct_call_guard(
         std::ptr::null()
     };
     let closure_ptr = crate::closure::clean_closure_ptr(raw_ptr);
-    let func_ptr = crate::closure::get_valid_func_ptr(closure_ptr);
-    let has_rest = !func_ptr.is_null() && crate::closure::lookup_closure_rest(func_ptr).is_some();
-    let declared = if func_ptr.is_null() {
-        None
-    } else {
-        crate::closure::lookup_closure_arity(func_ptr)
-    };
-    let contract_valid = !expected_func_ptr.is_null()
-        && !func_ptr.is_null()
-        && func_ptr == expected_func_ptr
-        && func_ptr != crate::closure::BOUND_METHOD_FUNC_PTR
-        && !has_rest
-        && declared.unwrap_or(expected_arity) == expected_arity
+    let info = crate::closure::closure_info(closure_ptr);
+    let func_ptr = info.map_or(std::ptr::null(), |info| info.code);
+    // The body's own info is the identity; its rest kind and parameter count
+    // are the contract a direct call at `call_arity` relies on.
+    let contract_valid = !expected_info.is_null()
+        && info.is_some_and(|info| {
+            std::ptr::eq(info, expected_info)
+                && info.code != crate::closure::BOUND_METHOD_FUNC_PTR
+                && crate::closure::info_rest(info).is_none()
+                && u32::from(info.params) == expected_arity
+        })
         && expected_arity == call_arity;
     let observation = Observation {
         source: ObservationSource::Closure,
@@ -1412,7 +1563,7 @@ pub extern "C" fn js_typed_feedback_closure_direct_call_guard(
 /// direct call.
 ///
 /// Whole-program object-literal capabilities already prove the target's
-/// arity/rest contract at compile time. Repeating the closure registry lookups
+/// arity/rest contract at compile time. Repeating the closure info checks
 /// and recording a typed-feedback observation on every call therefore adds no
 /// safety. This smaller guard deliberately keeps the speculation-safe closure
 /// header validation used by the universal dispatcher: arbitrary replacement
@@ -1432,14 +1583,14 @@ fn closure_ptr_from_value_bits(bits: u64) -> *const crate::closure::ClosureHeade
 #[no_mangle]
 pub extern "C" fn js_closure_exact_func_guard(
     closure_value: f64,
-    expected_func_ptr: *const u8,
+    expected_info: *const crate::closure::JsFunctionInfo,
 ) -> u64 {
-    if expected_func_ptr.is_null() {
+    if expected_info.is_null() {
         return 0;
     }
     let raw_ptr = closure_ptr_from_value_bits(closure_value.to_bits());
     let closure_ptr = crate::closure::clean_closure_ptr(raw_ptr);
-    if crate::closure::get_valid_func_ptr(closure_ptr) == expected_func_ptr {
+    if std::ptr::eq(crate::closure::get_valid_info(closure_ptr), expected_info) {
         closure_ptr as u64
     } else {
         0
@@ -1481,7 +1632,7 @@ pub unsafe extern "C" fn js_object_own_method_cache_miss(
     field_index: u32,
     method_name_ptr: *const i8,
     method_name_len: usize,
-    expected_func_ptr: *const u8,
+    expected_info: *const crate::closure::JsFunctionInfo,
     cache_slot: *mut MethodPicCacheSlot,
 ) -> u64 {
     {
@@ -1490,7 +1641,7 @@ pub unsafe extern "C" fn js_object_own_method_cache_miss(
             (*cache)[0] = 0;
         }
     }
-    if expected_class_id == 0 || expected_func_ptr.is_null() || cache_slot.is_null() {
+    if expected_class_id == 0 || expected_info.is_null() || cache_slot.is_null() {
         return 0;
     }
     let Some(method_bytes) = method_name_bytes(method_name_ptr, method_name_len) else {
@@ -1544,7 +1695,7 @@ pub unsafe extern "C" fn js_object_own_method_cache_miss(
     let closure_bits = std::ptr::read(fields.add(field_index as usize));
     let raw_ptr = closure_ptr_from_value_bits(closure_bits);
     let closure = crate::closure::clean_closure_ptr(raw_ptr);
-    if crate::closure::get_valid_func_ptr(closure) != expected_func_ptr {
+    if !std::ptr::eq(crate::closure::get_valid_info(closure), expected_info) {
         return 0;
     }
 
@@ -1581,15 +1732,15 @@ mod keep_guard_symbols {
     #[cfg(feature = "keepalive-anchors")]
     #[used(compiler)] static G1D: extern "C" fn(u64, f64, u32, u32, *const crate::StringHeader, u32, f64, i32) = js_class_field_set_ic;
     #[cfg(feature = "keepalive-anchors")]
-    #[used(compiler)] static G1E: extern "C" fn(u64, f64, u32, u32, *const crate::StringHeader, u32, i32) -> f64 = js_class_field_get_ic;
+    #[used(compiler)] static G1E: extern "C" fn(u64, f64, u32, u32, *const crate::StringHeader, u32, i32, *mut crate::object::PicCacheSlot) -> f64 = js_class_field_get_ic;
     #[cfg(feature = "keepalive-anchors")]
     #[used(compiler)] static G2: unsafe extern "C" fn(u64, f64, u32, u32, *const i8, usize, *const u8) -> i32 = js_typed_feedback_method_direct_call_guard;
     #[cfg(feature = "keepalive-anchors")]
-    #[used(compiler)] static G3: extern "C" fn(u64, f64, *const u8, u32, u32) -> i32 = js_typed_feedback_closure_direct_call_guard;
+    #[used(compiler)] static G3: extern "C" fn(u64, f64, *const crate::closure::JsFunctionInfo, u32, u32) -> i32 = js_typed_feedback_closure_direct_call_guard;
     #[cfg(feature = "keepalive-anchors")]
-    #[used(compiler)] static G3B: extern "C" fn(f64, *const u8) -> u64 = js_closure_exact_func_guard;
+    #[used(compiler)] static G3B: extern "C" fn(f64, *const crate::closure::JsFunctionInfo) -> u64 = js_closure_exact_func_guard;
     #[cfg(feature = "keepalive-anchors")]
-    #[used(compiler)] static G3C: unsafe extern "C" fn(f64, u32, u32, *const i8, usize, *const u8, *mut MethodPicCacheSlot) -> u64 = js_object_own_method_cache_miss;
+    #[used(compiler)] static G3C: unsafe extern "C" fn(f64, u32, u32, *const i8, usize, *const crate::closure::JsFunctionInfo, *mut MethodPicCacheSlot) -> u64 = js_object_own_method_cache_miss;
     #[cfg(feature = "keepalive-anchors")]
     #[used(compiler)] static G4: unsafe extern "C" fn(f64, u32, u32, u32) -> i32 = js_method_direct_shape_guard;
     #[cfg(feature = "keepalive-anchors")]

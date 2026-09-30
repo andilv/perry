@@ -178,12 +178,12 @@ const ADD_SLOT_MASK: u64 = (1 << ADD_SLOT_BITS) - 1;
 const SPILL_FLIP: u32 = crate::object::field_get_set::PACKED_SPILL_FLIP;
 
 /// `_reserved` bits that refuse a receiver on the runtime-side hit. The
-/// integrity flags are refused as well although the shape proves them.
+/// integrity flags are refused as well although the shape proves them. The
+/// receiver kind and the numeric proof are not here (charter step 3): a memo
+/// is published only for an `Ordinary` pre-shape, which proves both.
 const ADD_BLOCKING: u16 = crate::gc::OBJ_FLAG_FROZEN
     | crate::gc::OBJ_FLAG_SEALED
     | crate::gc::OBJ_FLAG_NO_EXTEND
-    | crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO
-    | crate::gc::OBJ_FLAG_PACKED_NUMERIC_PROOF
     | crate::gc::OBJ_FLAG_STABLE_TOMBSTONES
     | crate::gc::OBJ_FLAG_HAS_DESCRIPTORS;
 
@@ -264,14 +264,15 @@ pub(crate) fn note_packed_add_carriers() {
 
 // ---------------------------------------------------------------------------
 // Store census (`PERRY_STORE_CENSUS`): compile-time instrumentation writes
-// counters 0..16 from emitted code; the runtime classifies its own paths in
-// 16..32. Printed at exit when the variable is set at run time.
+// counters 0..16 and the array-element counters 32..48 from emitted code; the
+// runtime classifies its own paths in 16..32. Printed at exit when the
+// variable is set at run time.
 // ---------------------------------------------------------------------------
 
 /// The census counters. **Indices below [`CENSUS_RUNTIME_BASE`] are owned by
 /// `perry-codegen/src/expr/store_census.rs`.**
 #[no_mangle]
-pub static PERRY_STORE_CENSUS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+pub static PERRY_STORE_CENSUS: [AtomicU64; 48] = [const { AtomicU64::new(0) }; 48];
 #[allow(dead_code)]
 pub const CENSUS_RUNTIME_BASE: usize = 16;
 pub(crate) const C_ADD_RT_INLINE: usize = 16;
@@ -285,7 +286,7 @@ pub(crate) const C_FULL_KEYADD_SPILL: usize = 23;
 pub(crate) const C_PRIME_UNVERIFIED: usize = 24;
 
 #[cfg_attr(test, allow(dead_code))]
-const CENSUS_NAMES: [&str; 32] = [
+const CENSUS_NAMES: [&str; 48] = [
     "emit.pic.word_hit",
     "emit.pic.way_hit",
     "emit.add.inline_hit",
@@ -318,6 +319,22 @@ const CENSUS_NAMES: [&str; 32] = [
     "rt.29",
     "rt.30",
     "rt.31",
+    "emit.elem.read.fast",
+    "emit.elem.read.hole_arm",
+    "emit.elem.read.cold_arm",
+    "emit.elem.read.fallback_call",
+    "emit.elem.read.other_tier",
+    "emit.elem.store.inbounds",
+    "emit.elem.store.append_inline",
+    "emit.elem.store.guard_miss",
+    "emit.elem.store.fallback_call",
+    "emit.41",
+    "emit.elem.store.f64_cold",
+    "emit.43",
+    "emit.44",
+    "emit.45",
+    "emit.46",
+    "emit.47",
 ];
 
 #[inline]
@@ -425,7 +442,6 @@ pub(crate) unsafe fn packed_add_try(
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & ADD_BLOCKING != 0
-        || !write_fast_path_receiver_kind_ok(obj, header._reserved)
         || !crate::object::object_is_regular(obj)
     {
         return None;
@@ -624,7 +640,12 @@ pub(crate) unsafe fn packed_add_prime(
     let Some(header) = crate::value::addr_class::try_read_gc_header(obj as usize) else {
         return;
     };
-    if !write_fast_path_receiver_kind_ok(obj, header._reserved) {
+    // Charter step 3: the memo's pre-shape must be one a store is admitted on
+    // by shape alone, so the hit (emitted or runtime) needs no per-object test.
+    let _ = header;
+    if !crate::object::shapes::store_kind::shape_admits_plain_store(pre)
+        || !crate::object::shapes::store_kind::shape_admits_plain_store(post)
+    {
         census(C_PRIME_UNVERIFIED);
         return;
     }

@@ -28,7 +28,10 @@ extern "C" {
     fn js_u8_buffer_read_f64(target: *const u8, index: i32) -> f64;
 }
 
-extern "C" fn probe_thunk(_closure: *const perry_runtime::ClosureHeader) -> f64 {
+extern "C" fn probe_thunk(
+    _closure: *const perry_runtime::ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+) -> f64 {
     0.0
 }
 
@@ -52,7 +55,7 @@ fn addr_of(value: f64) -> usize {
 #[test]
 fn thread_exit_releases_the_threads_symbol_side_table_entries() {
     const STATIC_SYMBOL_CLASS: u32 = 0x0B11_4711;
-    let ((owner, sym), alive) = std::thread::spawn(|| {
+    let ((owner, class_owner, sym), alive) = std::thread::spawn(|| {
         use perry_runtime::symbol as s;
         let scope = RuntimeHandleScope::new();
         let sym = scope.root_nanbox_f64(unsafe { s::js_symbol_new(string_value("t11471")) });
@@ -86,7 +89,7 @@ fn thread_exit_releases_the_threads_symbol_side_table_entries() {
         // Object.defineProperty(obj, sym3, { get }) (SYMBOL_ACCESSOR_PROPERTIES).
         let sym3 = scope.root_nanbox_f64(unsafe { s::js_symbol_new(string_value("t11471c")) });
         let getter = scope.root_raw_mut_ptr(perry_runtime::closure::js_closure_alloc(
-            probe_thunk as *const u8,
+            perry_runtime::fn_info!(probe_thunk, 0),
             0,
         ));
         let accessor = scope.root_raw_mut_ptr(perry_runtime::object::js_object_alloc(0, 0));
@@ -100,7 +103,8 @@ fn thread_exit_releases_the_threads_symbol_side_table_entries() {
             sym3.get_nanbox_f64(),
             js_nanbox_pointer(accessor.get_raw_mut_ptr::<u8>() as i64),
         );
-        // static [sym] = [] on a (process-global) class id (CLASS_STATIC_SYMBOLS).
+        // static [sym] = [] on a class id: an own symbol property of the class's
+        // function object, which this thread's agent mints in its own heap.
         unsafe {
             s::js_class_register_static_symbol(
                 STATIC_SYMBOL_CLASS,
@@ -110,6 +114,7 @@ fn thread_exit_releases_the_threads_symbol_side_table_entries() {
         };
 
         let owner = obj.get_raw_mut_ptr::<u8>() as usize;
+        let class_owner = s::class_static_symbol_owner_for_test(STATIC_SYMBOL_CLASS);
         let (sym, sym2, sym3) = (
             addr_of(sym.get_nanbox_f64()),
             addr_of(sym2.get_nanbox_f64()),
@@ -119,9 +124,9 @@ fn thread_exit_releases_the_threads_symbol_side_table_entries() {
             s::symbol_property_tables_hold_for_test(owner, sym).0,
             s::symbol_property_tables_hold_for_test(owner, sym2).1,
             s::symbol_accessor_held_for_test(owner, sym3),
-            s::class_static_symbol_held_for_test(STATIC_SYMBOL_CLASS, sym),
+            s::symbol_property_tables_hold_for_test(class_owner, sym).0,
         ];
-        ((owner, [sym, sym2, sym3]), alive)
+        ((owner, class_owner, [sym, sym2, sym3]), alive)
     })
     .join()
     .unwrap();
@@ -144,7 +149,7 @@ fn thread_exit_releases_the_threads_symbol_side_table_entries() {
         "a dead thread's symbol accessor outlived its heap"
     );
     assert!(
-        !s::class_static_symbol_held_for_test(STATIC_SYMBOL_CLASS, sym[0]),
+        !s::symbol_property_tables_hold_for_test(class_owner, sym[0]).0,
         "a dead thread's class-static symbol member outlived its heap"
     );
 }
@@ -273,10 +278,9 @@ fn thread_exit_releases_the_threads_buffer_own_props() {
 /// inline-access cache (a key is not integer-indexed), so the key buffer can
 /// no longer witness the cache's release; an ordinary `Buffer` on the same
 /// thread does.
-fn external_buffer_registrations(key: usize, view: usize) -> [bool; 4] {
-    let [ext, u8a, meta] = perry_runtime::buffer::external_registries_hold_for_test(key);
+fn external_buffer_registrations(key: usize, view: usize) -> [bool; 3] {
+    let [u8a, meta] = perry_runtime::buffer::external_registries_hold_for_test(key);
     [
-        ext,
         u8a,
         meta,
         perry_runtime::buffer::u8_inline_cache_holds_for_test(view),
@@ -299,7 +303,7 @@ fn external_buffer_registrations(key: usize, view: usize) -> [bool; 4] {
 /// Holds `(key, view, seen)`: the CryptoKey buffer, the cache-admitted byte
 /// view, and the verdict.
 #[allow(clippy::type_complexity)]
-static EXTERNAL_BUFFER_EXIT_PROBE: std::sync::Mutex<(usize, usize, Option<[bool; 4]>)> =
+static EXTERNAL_BUFFER_EXIT_PROBE: std::sync::Mutex<(usize, usize, Option<[bool; 3]>)> =
     std::sync::Mutex::new((0, 0, None));
 
 fn record_external_buffer_release(freed: &perry_runtime::arena::thread_exit::FreedRanges) {
@@ -317,9 +321,8 @@ fn record_external_buffer_release(freed: &perry_runtime::arena::thread_exit::Fre
 
 /// Verdict on what [`record_external_buffer_release`] saw: `Err` names the
 /// first table that still held the dead buffer when its thread was released.
-fn external_buffer_release_verdict(seen: Option<[bool; 4]>) -> Result<(), &'static str> {
-    const TABLES: [&str; 4] = [
-        "EXTERNAL_BUFFER_REGISTRY outlived the thread",
+fn external_buffer_release_verdict(seen: Option<[bool; 3]>) -> Result<(), &'static str> {
+    const TABLES: [&str; 3] = [
         "EXTERNAL_UINT8ARRAY_REGISTRY outlived the thread",
         "EXTERNAL_CRYPTO_KEY_META_REGISTRY outlived the thread",
         "PERRY_U8_INLINE_CACHE outlived the thread",
@@ -337,7 +340,7 @@ fn thread_exit_releases_the_threads_external_buffer_registrations() {
         let scope = RuntimeHandleScope::new();
         let buf = scope.root_raw_mut_ptr(perry_runtime::buffer::js_buffer_alloc(16, 0));
         let addr = buf.get_raw_mut_ptr::<u8>() as usize;
-        // webcrypto's CryptoKey registration: all three external registries.
+        // webcrypto's CryptoKey registration: both external registries.
         // This also registers their thread-exit hook, so it runs before the
         // probe registered below.
         unsafe { js_buffer_mark_as_crypto_key_external(addr, 1, 0, 1, 1, 0, 0) };
@@ -368,7 +371,7 @@ fn thread_exit_releases_the_threads_external_buffer_registrations() {
         "key material must never enter the inline element-access cache"
     );
     assert_eq!(
-        alive, [true; 4],
+        alive, [true; 3],
         "every registration must exist while its thread lives"
     );
     if let Err(table) = external_buffer_release_verdict(seen) {
@@ -388,20 +391,20 @@ fn external_buffer_verdict_is_taken_at_release_not_by_address() {
     let addr = buf.get_raw_mut_ptr::<u8>() as usize;
     unsafe { js_buffer_mark_as_crypto_key_external(addr, 1, 0, 1, 1, 0, 0) };
     assert!(
-        perry_runtime::buffer::is_external_buffer(addr),
+        perry_runtime::buffer::external_registries_hold_for_test(addr)[0],
         "the newcomer is registered, so an address-only check would fail"
     );
     assert_eq!(
-        external_buffer_release_verdict(Some([false; 4])),
+        external_buffer_release_verdict(Some([false; 3])),
         Ok(()),
         "a newcomer at a released address was reported as the dead buffer"
     );
     assert_eq!(
-        external_buffer_release_verdict(Some([true, false, false, false])),
-        Err("EXTERNAL_BUFFER_REGISTRY outlived the thread")
+        external_buffer_release_verdict(Some([true, false, false])),
+        Err("EXTERNAL_UINT8ARRAY_REGISTRY outlived the thread")
     );
     assert_eq!(
-        external_buffer_release_verdict(Some([false, false, false, true])),
+        external_buffer_release_verdict(Some([false, false, true])),
         Err("PERRY_U8_INLINE_CACHE outlived the thread")
     );
     assert!(
@@ -417,7 +420,7 @@ fn thread_exit_releases_the_threads_dom_exceptions() {
             perry_runtime::event_target::js_dom_exception_new(undefined(), undefined()) as usize;
         (
             err,
-            perry_runtime::event_target::dom_exception_error_registered_for_test(err),
+            perry_runtime::event_target::dom_exception_has_error_brand_for_test(err),
         )
     })
     .join()
@@ -427,7 +430,7 @@ fn thread_exit_releases_the_threads_dom_exceptions() {
         "new DOMException() must be recorded while its thread lives"
     );
     assert!(
-        !perry_runtime::event_target::dom_exception_error_registered_for_test(err),
+        !perry_runtime::event_target::dom_exception_has_error_brand_for_test(err),
         "a dead thread's DOMException address outlived its heap"
     );
 }

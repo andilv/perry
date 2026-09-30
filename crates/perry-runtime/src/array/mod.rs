@@ -53,7 +53,7 @@ mod species;
 mod splice_slice;
 mod storage;
 pub use storage::array_elements_ptr;
-pub(crate) use storage::{array_front_offset, array_physical_capacity};
+pub(crate) use storage::{array_front_offset, array_physical_capacity, array_truncate_length};
 mod subclass;
 pub(crate) mod subclass_elements;
 
@@ -67,6 +67,8 @@ mod dense_move_tests;
 mod dynamic_numeric_key_tests;
 #[cfg(test)]
 mod forwarding_tests;
+#[cfg(test)]
+mod hole_tail_tests;
 #[cfg(test)]
 mod index_get_exit_tests;
 #[cfg(test)]
@@ -221,8 +223,9 @@ pub use self::numeric_range::{
 };
 pub use self::prototype_addr::scan_prototype_addr_cache_roots_mut;
 pub(crate) use self::prototype_addr::{
-    array_prototype_addr, function_prototype_addr, object_prototype_addr,
-    object_prototype_addr_if_resolved, object_prototype_addr_matches, prime_prototype_addr_cache,
+    array_prototype_addr, function_prototype_addr, note_object_prototype_intrinsic,
+    object_prototype_addr, object_prototype_addr_if_resolved, object_prototype_addr_matches,
+    prime_prototype_addr_cache,
 };
 #[cfg(test)]
 pub(crate) use self::prototype_addr::{
@@ -247,8 +250,8 @@ pub(crate) use self::subclass::{
     array_subclass_fast_length, array_subclass_fast_length_with_ic,
     array_subclass_named_prefix_token_for_slot, array_subclass_tail_descriptors_are_plain,
     clear_array_subclass_named_prefix_token, clear_packed_subclass_numeric_proof,
-    is_array_subclass_class_id, is_array_subclass_value, note_array_subclass_index_write,
-    note_packed_subclass_spill_store,
+    drop_packed_subclass_numeric_proof_record, is_array_subclass_class_id, is_array_subclass_value,
+    note_array_subclass_index_write, note_packed_subclass_spill_store,
 };
 // Issue #1572 — flatten helpers reused by `node_stream::ns_iter_flat_map`
 // so an `async function*` mapper return is driven through the iterator

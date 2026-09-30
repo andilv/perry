@@ -68,6 +68,7 @@ mod object_create;
 mod old_free_intrusive;
 mod oldgen;
 mod os_tag;
+mod pinned_roots;
 mod promote_in_place;
 mod promoted_cohort;
 mod proxy_registry;
@@ -116,3 +117,6 @@ mod zero_slot_skip;
 mod dyn_eval_registry;
 
 mod private_evaluation_storage;
+
+mod event_internal_slots;
+mod external_buffer;

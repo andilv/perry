@@ -565,7 +565,7 @@ pub(super) fn emit_pshape_argument_dispatch(
         let class_id = *ctx.class_ids.get(&arg.fact.class_name)?;
         let keys_global = ctx.class_keys_globals.get(&arg.fact.class_name)?.clone();
         let shape_id =
-            crate::typed_shape::load_class_shape_id(ctx, &arg.fact.class_name, &keys_global);
+            crate::typed_shape::class_shape_id_operand(ctx, &arg.fact.class_name, &keys_global);
         guarded.push((
             arg,
             value,
@@ -782,9 +782,9 @@ pub(super) fn emit_own_method_override_check(
     // assigned via `this.method = fn` or `class X { method = fn; }`
     // (hono's RegExpRouter uses this exact shape — `match = match;`
     // assigns the imported standalone `match` function as an instance
-    // own-property; its body reads `this.buildAllMatchers()`). Bind
-    // `IMPLICIT_THIS` to the receiver around the call so non-arrow
-    // function bodies see the right `this` (issue #632 / #519 pattern).
+    // own-property; its body reads `this.buildAllMatchers()`). Pass the
+    // receiver as `this` so non-arrow function bodies see the right `this`
+    // (issue #632 / #519 pattern).
     ctx.current_block = override_idx;
     let user_arg_count = override_user_args.len();
     let (args_ptr, args_len) = if user_arg_count == 0 {
@@ -809,19 +809,17 @@ pub(super) fn emit_own_method_override_check(
     } else {
         this_box.to_string()
     };
-    // #7211: rooted save/restore — the displaced implicit `this` is live
-    // across `js_native_call_value`, which runs arbitrary user code.
-    let prev_this = crate::rooting::implicit_this_save(ctx, &recv_for_this);
+    let this_bits = ctx.block().bitcast_double_to_i64(&recv_for_this);
     let v_override = ctx.block().call(
         DOUBLE,
         "js_native_call_value",
         &[
             (DOUBLE, &own_method),
+            (I64, &this_bits),
             (crate::types::PTR, &args_ptr),
             (I64, &args_len),
         ],
     );
-    crate::rooting::implicit_this_restore(ctx, prev_this);
     let after_override = ctx.block().label.clone();
     if !ctx.block().is_terminated() {
         ctx.block().br(&merge_label);
@@ -981,7 +979,7 @@ pub(super) fn emit_guarded_direct_method_call(
 
     let expected_class_id_str = expected_class_id.to_string();
     let expected_shape_id =
-        crate::typed_shape::load_class_shape_id(ctx, receiver_class_name, &keys_global_name);
+        crate::typed_shape::class_shape_id_operand(ctx, receiver_class_name, &keys_global_name);
 
     let key_idx = ctx.strings.intern(property);
     let entry = ctx.strings.entry(key_idx);
@@ -1004,6 +1002,9 @@ pub(super) fn emit_guarded_direct_method_call(
     let subclass_shape_ids: Vec<String> = subclass_arms
         .iter()
         .map(|arm| {
+            if let Some(id) = crate::typed_shape::static_class_shape_id(&arm.keys_global) {
+                return id.to_string();
+            }
             let shape_global =
                 crate::typed_shape::shape_id_global_name_from_keys_global(&arm.keys_global);
             let slot = ctx.func.entry_init_load_global(&shape_global, I32);

@@ -131,32 +131,6 @@ pub extern "C" fn js_object_alloc_null_proto(class_id: u32, field_count: u32) ->
     ptr
 }
 
-/// #8098: mark `obj` as an ORDINARY plain object — class-less, but with no
-/// per-object `[[Set]]` semantics of its own, so the object-write fast paths
-/// may treat it exactly like a class instance.
-///
-/// The mark is deliberately OPT-IN and set at BIRTH. `class_id == 0` is not a
-/// sufficient condition: a `URL` instance, `Object.prototype`, a module
-/// namespace, and a native-module receiver are all class-less, and the write
-/// guards used to exclude the whole class-less population wholesale rather than
-/// reason about them (`proxy/put_value.rs`, and the same three exclusions in
-/// `field_set_by_name/fast_paths.rs::try_existing_own_data_overwrite`). Only a
-/// birth site that has established its receiver is ordinary calls this; every
-/// other class-less receiver keeps taking the full `[[Set]]` walk.
-///
-/// The bit lives in `GcHeader::_reserved`, which survives evacuation
-/// (`gc/copying.rs` and `gc/oldgen.rs` carry the word across), is preserved by
-/// the survival-age (`0x0038`) and layout-state (`0xC000`) updates, and is
-/// already loaded by the generated write PIC for its blocking-flag test.
-#[inline]
-pub(crate) unsafe fn mark_object_plain_ordinary(obj: *mut ObjectHeader) {
-    if obj.is_null() {
-        return;
-    }
-    let gc = (obj as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
-    (*gc)._reserved |= crate::gc::OBJ_FLAG_PLAIN_ORDINARY;
-}
-
 /// Allocate a class instance's storage while the caller holds `keys` — a keys
 /// array it received as a raw copy of a root it does not own (a codegen
 /// per-class global, the class memo, the shape cache) — and hand back both the
@@ -204,10 +178,21 @@ fn alloc_instance_keeping_keys_collecting(
 /// traces the unfinished array never reads uninitialized words. Callers own
 /// the layout policy (`js_build_class_keys_array` adds its immortal scope).
 ///
+/// Every caller passes key names from program text: the key literals the
+/// modules' string pools mint as ATOMS (`js_string_pool_atom`), the one
+/// string object per key text a read site passes and a canonical list
+/// stores. A list can be built before the pool holding one of its texts runs
+/// (a seed runs before every pool; a class registers at its own module's
+/// init, before the modules it does not import), so the atom of each name is
+/// minted HERE first (the pool finds it later) and the canonical copy stores
+/// the atoms, exactly as a list first written after the pools ran. Without
+/// it the list holds strings no read site ever passes, and every pointer
+/// confirm against it (the megamorphic slot guess) misses.
+///
 /// # Safety
 /// `prefix` is a live keys array with at least `prefix_len` slots, or null
 /// with `prefix_len == 0`, and was read with no allocation since.
-unsafe fn build_longlived_keys_array(
+pub(crate) unsafe fn build_longlived_keys_array(
     prefix: *mut ArrayHeader,
     prefix_len: u32,
     keys: &[&[u8]],
@@ -216,6 +201,9 @@ unsafe fn build_longlived_keys_array(
     let scope = crate::gc::RuntimeHandleScope::new();
     let prefix_handle = scope.root_raw_mut_ptr(prefix);
     let (arr, _) = prefix_handle.across_mut::<ArrayHeader, _>(|| {
+        for key_bytes in keys {
+            mint_pool_atom(key_bytes);
+        }
         crate::array::js_array_alloc_with_length_longlived(total as u32)
     });
     let slots = crate::array::array_elements_ptr(arr as *const ArrayHeader) as *mut u64;
@@ -256,6 +244,22 @@ unsafe fn build_longlived_keys_array(
     arr
 }
 
+/// Mint (or find) the atom a module pool mints for key literal `name`: a
+/// pool gives one to every non-empty UTF-8 literal of at most
+/// `INTERN_MAX_BYTE_LEN` bytes (a WTF-8 literal holds a lone surrogate, is
+/// not UTF-8, and gets none). Nothing is held across the allocation; the
+/// atom table roots the atom.
+fn mint_pool_atom(name: &[u8]) {
+    if name.is_empty()
+        || name.len() > crate::string::INTERN_MAX_BYTE_LEN as usize
+        || std::str::from_utf8(name).is_err()
+    {
+        return;
+    }
+    let hash = super::key_bytes_hash(name.as_ptr(), name.len());
+    crate::string::js_string_pool_atom(name.as_ptr(), name.len() as u32, hash, 0);
+}
+
 /// Fast class instance allocator that takes a pre-built keys_array
 /// pointer directly, skipping the per-call SHAPE_CACHE lookup. The
 /// codegen pre-builds the keys_array ONCE at module init time
@@ -276,12 +280,13 @@ unsafe fn build_longlived_keys_array(
 /// widened bound this computes has to travel back to the caller that stamps it.
 /// The last element is `keys_array`'s address after the allocation, which is
 /// the only one a caller may use.
-fn object_alloc_class_inline_keys_impl(
+pub(super) fn object_alloc_class_inline_keys_impl(
     class_id: u32,
     parent_class_id: u32,
     field_count: u32,
     keys: crate::object::ObjectKeys,
     preinstalled_shape_id: u32,
+    premark_plain: bool,
 ) -> (*mut ObjectHeader, u32, bool, crate::object::ObjectKeys) {
     if parent_class_id != 0 {
         register_class(class_id, parent_class_id);
@@ -311,6 +316,11 @@ fn object_alloc_class_inline_keys_impl(
         (*ptr).parent_class_id = parent_class_id;
         // GC_STORE_AUDIT(INIT): fresh object starts with no per-object meta record (#6759 B).
         (*ptr).meta = ptr::null_mut();
+        if premark_plain {
+            // Charter step 3: marked before the first stamp, so the birth
+            // shape is minted `Ordinary` and no twin is ever needed.
+            crate::object::shapes::store_kind::premark_plain_ordinary(ptr);
+        }
         // The compiled entry point passes the ShapeId installed beside this
         // canonical keys global at module initialization. Reuse that immutable
         // descriptor directly when its keys facts and live-slot bound still
@@ -389,17 +399,13 @@ pub(crate) fn alloc_class_instance_with_keys(
     field_count: u32,
     keys: crate::object::ObjectKeys,
 ) -> *mut ObjectHeader {
-    let (ptr, birth_slots, _, keys) =
-        object_alloc_class_inline_keys_impl(class_id, parent_class_id, field_count, keys, 0);
-    unsafe {
-        let id = crate::object::shapes::shape_id_for_class_keys_ensure(
-            keys.arr() as *const ArrayHeader,
-            keys.count(),
-            class_id,
-        );
-        crate::object::shapes::birth_stamp_object_shape(ptr, id, birth_slots);
-    }
-    ptr
+    super::alloc_plain::alloc_class_instance_with_keys_impl(
+        class_id,
+        parent_class_id,
+        field_count,
+        keys,
+        false,
+    )
 }
 
 /// The compiled-class allocation entry point after #6759 C3 rung 2.
@@ -421,15 +427,14 @@ pub extern "C" fn js_object_alloc_class_inline_keys_stamped(
     // The key count comes from the shape the module-init code minted beside
     // this keys global: the global holds only the array, and the array can
     // be a canonical backing longer than this class's list.
-    let keys = preinstalled_class_keys(keys_array, shape_id);
-    let (ptr, birth_slots, used_preinstalled_shape, _) =
-        object_alloc_class_inline_keys_impl(class_id, parent_class_id, field_count, keys, shape_id);
-    if !used_preinstalled_shape {
-        unsafe {
-            crate::object::shapes::birth_stamp_object_shape(ptr, shape_id, birth_slots);
-        }
-    }
-    ptr
+    super::alloc_plain::alloc_class_inline_keys_stamped_impl(
+        class_id,
+        parent_class_id,
+        field_count,
+        keys_array,
+        shape_id,
+        false,
+    )
 }
 
 /// A class keys global's keys, with the count its module-init ShapeId names.
@@ -441,7 +446,7 @@ pub extern "C" fn js_object_alloc_class_inline_keys_stamped(
 /// there. The fallback's count then differs from the id's, so the stamp
 /// declines it and publishes an exact descriptor.
 #[inline]
-fn preinstalled_class_keys(
+pub(super) fn preinstalled_class_keys(
     keys_array: *mut ArrayHeader,
     shape_id: u32,
 ) -> crate::object::ObjectKeys {

@@ -1,4 +1,5 @@
 use crate::ffi::{js_gc_pin_user_ptr, js_string_from_bytes};
+use crate::srgb;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
@@ -39,7 +40,7 @@ pub(crate) fn scan_macos_textfield_gc_roots(visitor: &mut perry_ffi::GcRootVisit
 }
 
 extern "C" {
-    fn js_closure_call1(closure: *const u8, arg: f64) -> f64;
+    fn js_closure_call1(closure: *const u8, this: perry_ffi::JsThis, arg: f64) -> f64;
     fn js_nanbox_get_pointer(value: f64) -> i64;
     fn js_nanbox_string(ptr: i64) -> f64;
 }
@@ -119,7 +120,7 @@ define_class!(
                             b.suppress.set(true);
                         }
                         unsafe {
-                            js_closure_call1(closure_ptr as *const u8, nanboxed);
+                            js_closure_call1(closure_ptr as *const u8, perry_ffi::JsThis::UNDEFINED, nanboxed);
                         }
                         if let Some(b) = binding {
                             b.suppress.set(false);
@@ -183,7 +184,7 @@ define_class!(
 
                         let closure_ptr = unsafe { js_nanbox_get_pointer(closure_f64) };
                         unsafe {
-                            js_closure_call1(closure_ptr as *const u8, nanboxed);
+                            js_closure_call1(closure_ptr as *const u8, perry_ffi::JsThis::UNDEFINED, nanboxed);
                         }
                     }
                 });
@@ -460,7 +461,7 @@ define_class!(
                         } else { return; }
                         let closure_ptr = unsafe { js_nanbox_get_pointer(closure_f64) };
                         unsafe {
-                            js_closure_call1(closure_ptr as *const u8, 0.0);
+                            js_closure_call1(closure_ptr as *const u8, perry_ffi::JsThis::UNDEFINED, 0.0);
                         }
                     }
                 });
@@ -552,13 +553,7 @@ pub fn set_background_color(handle: i64, r: f64, g: f64, b: f64, a: f64) {
         unsafe {
             let tf: &NSTextField = &*(Retained::as_ptr(&view) as *const NSTextField);
             tf.setDrawsBackground(true);
-            let color: Retained<objc2_app_kit::NSColor> = objc2::msg_send![
-                objc2::runtime::AnyClass::get(c"NSColor").unwrap(),
-                colorWithRed: r as objc2_core_foundation::CGFloat,
-                green: g as objc2_core_foundation::CGFloat,
-                blue: b as objc2_core_foundation::CGFloat,
-                alpha: a as objc2_core_foundation::CGFloat
-            ];
+            let color = srgb::ns_color(r, g, b, a);
             tf.setBackgroundColor(Some(&color));
         }
     }
@@ -595,13 +590,7 @@ pub fn set_text_color(handle: i64, r: f64, g: f64, b: f64, a: f64) {
     if let Some(view) = super::get_widget(handle) {
         unsafe {
             let tf: &NSTextField = &*(Retained::as_ptr(&view) as *const NSTextField);
-            let color: Retained<objc2_app_kit::NSColor> = objc2::msg_send![
-                objc2::runtime::AnyClass::get(c"NSColor").unwrap(),
-                colorWithRed: r as objc2_core_foundation::CGFloat,
-                green: g as objc2_core_foundation::CGFloat,
-                blue: b as objc2_core_foundation::CGFloat,
-                alpha: a as objc2_core_foundation::CGFloat
-            ];
+            let color = srgb::ns_color(r, g, b, a);
             tf.setTextColor(Some(&color));
         }
     }
