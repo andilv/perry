@@ -66,8 +66,10 @@ pub(in crate::codegen) fn compile_static_method(
     let mut shadow_slot_map = if crate::codegen::helpers::precise_root_analysis_enabled() {
         let flat_const_ids: std::collections::HashSet<u32> =
             cross_module.flat_const_arrays.keys().copied().collect();
-        let m =
-            crate::collectors::collect_pointer_typed_locals(&f.params, &f.body, &flat_const_ids);
+        let m = crate::scope_env::compact_root_slots(
+            crate::collectors::collect_pointer_typed_locals(&f.params, &f.body, &flat_const_ids),
+            &cross_module.scope_map,
+        );
         crate::codegen::helpers::maybe_spill_roots_to_shadow_frame(
             lf,
             &llvm_name,
@@ -137,7 +139,7 @@ pub(in crate::codegen) fn compile_static_method(
         }
         (this_slot, map)
     };
-    crate::codegen::arguments::release_boxed_param_slots_at_exit(
+    crate::codegen::arguments::box_rooted_parameter_slots(
         lf,
         &f.params,
         &static_boxed_vars,
@@ -229,6 +231,7 @@ pub(in crate::codegen) fn compile_static_method(
         proven_local_types: std::collections::HashMap::new(),
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
+        module_global_transfers: &cross_module.module_global_transfers,
         reassigned_locals: crate::collectors::reassigned_locals(&f.body),
         const_string_locals: std::collections::HashMap::new(),
         const_number_locals: std::collections::HashMap::new(),
@@ -276,6 +279,7 @@ pub(in crate::codegen) fn compile_static_method(
         class_field_counts: &cross_module.class_field_counts,
         class_init_chains: &cross_module.class_init_chains,
         class_header_image_globals: &cross_module.class_header_images,
+        class_birth_reps: &cross_module.class_birth_reps,
         imported_class_ctors: &cross_module.imported_class_ctors,
         func_signatures,
         func_synthetic_arguments,
@@ -287,6 +291,7 @@ pub(in crate::codegen) fn compile_static_method(
             .compiler_private_async_i32_control_locals,
         compiler_private_async_i1_control_locals: &cross_module
             .compiler_private_async_i1_control_locals,
+        scope_map: &cross_module.scope_map,
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
         guard_free_closure_bindings: std::collections::HashSet::new(),
@@ -333,6 +338,7 @@ pub(in crate::codegen) fn compile_static_method(
         // emitted before FnCtx exists here), so clears never get skipped.
         shadow_slots_bound: shadow_slot_map.values().copied().collect(),
         temp_roots: crate::rooting::TempRootPool::default(),
+        scoped_temp_roots: Vec::new(),
         shadow_slot_map,
         persistent_shadow_slots: std::collections::HashSet::new(),
         declared_only_numeric_locals: std::collections::HashSet::new(),

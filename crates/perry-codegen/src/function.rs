@@ -20,6 +20,10 @@ mod entry_allocas;
 
 use precise_roots::{lower_precise_roots_to_native_stack, retype_landing_pads_for_statepoints};
 
+/// The intrinsic [`LlFunction::entry_tls_address`] calls, for a thread-local
+/// global in address space 0.
+pub const TLS_ADDRESS_INTRINSIC: &str = "llvm.threadlocal.address.p0";
+
 pub struct LlFunction {
     pub name: String,
     pub return_type: LlvmType,
@@ -183,14 +187,10 @@ pub struct LlFunction {
     /// Entry/module-init functions use this for process-level diagnostics
     /// that must run regardless of which block reaches the normal epilogue.
     pre_return_void_calls: Vec<String>,
-    /// #10464: entry-alloca slots holding a variable-box cell this frame
-    /// minted, paired with the kind's `js_*box_scope_release`. Each `ret`
-    /// hands the slot's current cell back to the runtime (a no-op for a slot
-    /// still holding its TAG_UNDEFINED entry sentinel).
-    pre_return_box_releases: Vec<(String, &'static str)>,
-    /// Slots withdrawn by [`Self::forget_pre_return_box_release`]; a later
-    /// registration of the same slot stays withdrawn.
-    withheld_box_release_slots: Vec<String>,
+    /// Thread-local globals whose current-thread address this function has
+    /// already computed in its entry block, with the SSA register holding it
+    /// (see [`Self::entry_tls_address`]).
+    entry_tls_addresses: Vec<(String, String)>,
 }
 
 /// Render the frame-push instruction. Kept in one place so the eager
@@ -316,8 +316,7 @@ impl LlFunction {
             force_shadow_frame: false,
             outline_straight_line_store_ics: false,
             pre_return_void_calls: Vec::new(),
-            pre_return_box_releases: Vec::new(),
-            withheld_box_release_slots: Vec::new(),
+            entry_tls_addresses: Vec::new(),
         }
     }
 
@@ -545,29 +544,6 @@ impl LlFunction {
         self.pre_return_void_calls.push(func_name.into());
     }
 
-    /// #10464: release the variable-box cell held by `slot` before every
-    /// `ret`. `slot` must be an entry-block alloca whose value is a box
-    /// pointer or TAG_UNDEFINED on every path. Idempotent per slot.
-    pub fn add_pre_return_box_release(&mut self, slot: &str, release_fn: &'static str) {
-        if !self.pre_return_box_releases.iter().any(|(s, _)| s == slot)
-            && !self.withheld_box_release_slots.iter().any(|s| s == slot)
-        {
-            self.pre_return_box_releases
-                .push((slot.to_string(), release_fn));
-        }
-    }
-
-    /// Withdraw a slot registered by [`Self::add_pre_return_box_release`]
-    /// because a holder the runtime does not count (a mapped `arguments`
-    /// object, a plain-async step closure) received its cell. Sticky: the
-    /// slot is never released by this frame afterwards.
-    pub fn forget_pre_return_box_release(&mut self, slot: &str) {
-        self.pre_return_box_releases.retain(|(s, _)| s != slot);
-        if !self.withheld_box_release_slots.iter().any(|s| s == slot) {
-            self.withheld_box_release_slots.push(slot.to_string());
-        }
-    }
-
     /// Invoke-EH (#7302): enter/leave a handler scope. While a scope is
     /// active, every potentially-throwing call any block of this function
     /// emits carries an unwind edge to the scope's landing-pad label.
@@ -589,6 +565,36 @@ impl LlFunction {
         let r = format!("%r{}", self.reg_counter.next());
         self.entry_allocas.push(format!("  {} = alloca {}", r, ty));
         r
+    }
+
+    /// The current thread's address of the thread-local global `@global`,
+    /// computed ONCE per function invocation at the top of the entry block
+    /// (`llvm.threadlocal.address`) and returned as an SSA `ptr` register that
+    /// every later access in the function reuses.
+    ///
+    /// Each textual use of a thread-local global is otherwise materialized
+    /// per basic block by the backend: a `tlv_get_addr` call on Darwin for
+    /// every load, and an `fs:`-based address recomputed every loop iteration
+    /// on x86_64. One address per invocation makes a hit a plain load.
+    ///
+    /// It is correct because a perry function invocation runs start to finish
+    /// on one thread: an agent never migrates a running frame, and every
+    /// re-entry (another agent calling the same function, an async or
+    /// generator step) is a new invocation that computes its own address. The
+    /// address is not a heap value, so collections never move it.
+    ///
+    /// The caller declares `llvm.threadlocal.address.p0` in the module.
+    pub fn entry_tls_address(&mut self, global: &str) -> String {
+        if let Some((_, reg)) = self.entry_tls_addresses.iter().find(|(g, _)| g == global) {
+            return reg.clone();
+        }
+        let reg = format!("%r{}", self.reg_counter.next());
+        self.entry_allocas.push(format!(
+            "  {reg} = call ptr @{TLS_ADDRESS_INTRINSIC}(ptr @{global})"
+        ));
+        self.entry_tls_addresses
+            .push((global.to_string(), reg.clone()));
+        reg
     }
 
     /// Allocate a fixed-size `[count x elem_ty]` array slot in the function
@@ -1168,9 +1174,8 @@ impl LlFunction {
         &self,
         sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
     ) -> Result<(), E> {
-        let rewrite_rets = self.shadow_frame_slot.is_some()
-            || !self.pre_return_void_calls.is_empty()
-            || !self.pre_return_box_releases.is_empty();
+        let rewrite_rets =
+            self.shadow_frame_slot.is_some() || !self.pre_return_void_calls.is_empty();
         let mut seq: u32 = 0;
         for (i, blk) in self.blocks.iter().enumerate() {
             if i > 0 {
@@ -1279,18 +1284,6 @@ impl LlFunction {
     ) -> Result<(), E> {
         for func_name in &self.pre_return_void_calls {
             sink(FinalItem::Text(&format!("  call void @{}()", func_name)))?;
-        }
-        for (slot, release_fn) in &self.pre_return_box_releases {
-            let load_reg = format!("%box_release_l_{}", seq);
-            *seq += 1;
-            sink(FinalItem::Text(&format!(
-                "  {} = load i64, ptr {}",
-                load_reg, slot
-            )))?;
-            sink(FinalItem::Text(&format!(
-                "  call void @{}(i64 {})",
-                release_fn, load_reg
-            )))?;
         }
         if let Some(handle_slot) = &self.shadow_frame_slot {
             let load_reg = format!("%shadow_pop_l_{}", seq);

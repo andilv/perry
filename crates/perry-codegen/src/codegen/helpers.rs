@@ -769,6 +769,21 @@ pub fn program_has_worker() -> bool {
     PROGRAM_HAS_WORKER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether any module of this program launches a perry/thread agent
+/// (`spawn`, `parallelMap`, `parallelFilter`). Separate from Worker
+/// module evaluation: perry/thread agents share user-module globals but each
+/// agent owns a separate moving heap. The driver sets it before module codegen.
+static PROGRAM_HAS_THREAD_AGENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_program_has_thread_agents(value: bool) {
+    PROGRAM_HAS_THREAD_AGENTS.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn program_has_thread_agents() -> bool {
+    PROGRAM_HAS_THREAD_AGENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn write_barriers_enabled() -> bool {
     use std::sync::OnceLock;
     static CACHED: OnceLock<bool> = OnceLock::new();
@@ -1923,7 +1938,13 @@ pub(super) fn emit_callee_binding_resolutions(
             let slot_addr = blk.add(I64, "%this_closure", &offset.to_string());
             let slot_ptr = blk.inttoptr(I64, &slot_addr);
             let bits = blk.load(I64, &slot_ptr);
-            if ctx.boxed_vars.contains(&id) {
+            if let (true, Some(slot)) = (
+                ctx.boxed_vars.contains(&id),
+                crate::scope_env::access::slot(ctx, id),
+            ) {
+                let cell_bits = crate::scope_env::access::read_bits(ctx, id, slot, &bits);
+                ctx.block().bitcast_i64_to_double(&cell_bits)
+            } else if ctx.boxed_vars.contains(&id) {
                 let blk = ctx.block();
                 let cell_bits = blk.call(I64, "js_box_get_bits", &[(I64, &bits)]);
                 ctx.block().bitcast_i64_to_double(&cell_bits)
@@ -1931,8 +1952,7 @@ pub(super) fn emit_callee_binding_resolutions(
                 ctx.block().bitcast_i64_to_double(&bits)
             }
         } else if let Some(global_name) = ctx.module_globals.get(&id).cloned() {
-            let g_ref = format!("@{global_name}");
-            ctx.block().load(DOUBLE, &g_ref)
+            crate::codegen::global_transfer::load_module_global(ctx, id, &global_name)
         } else if let Some(slot) = ctx.locals.get(&id).cloned() {
             if ctx.boxed_vars.contains(&id) {
                 continue;

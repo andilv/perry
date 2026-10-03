@@ -48,9 +48,7 @@ fn raise(error: EngineError) -> ! {
     if let EngineError::Abrupt(value) = error {
         crate::exception::js_throw(value);
     }
-    if let EngineError::Build(BuildError::Abrupt(bits))
-    | EngineError::Storage(StorageError::Abrupt(bits)) = error
-    {
+    if let EngineError::Build(BuildError::Abrupt(bits)) = error {
         crate::exception::js_throw(f64::from_bits(bits));
     }
     let type_error = matches!(error, EngineError::Type(_));
@@ -476,7 +474,10 @@ pub(crate) fn execute_output(
         None => {
             let (bound, identity) = bind_heap_subject_observed(input)?;
             fresh_subject = bound;
-            cross_call = identity;
+            // Only g/y searches can start away from zero. A non-stateful
+            // call gains nothing from finding or recording a position, and
+            // otherwise copies/scans the entire four-entry hint table twice.
+            cross_call = identity.filter(|_| stateful);
             &fresh_subject
         }
     };
