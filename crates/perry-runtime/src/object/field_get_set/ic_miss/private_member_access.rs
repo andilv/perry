@@ -282,7 +282,7 @@ pub(crate) fn private_member_set_by_name(
 /// being accessed was declared by an ancestor. Every ancestor evaluation whose
 /// constructor ran on the instance through `super()` is reachable from that
 /// stamp by the per-evaluation parent edge each fresh class object pins
-/// (`js_class_object_pin_parent`), so walk it and answer with the ancestor
+/// (`js_class_evaluation_object`), so walk it and answer with the ancestor
 /// evaluation belonging to `declaring_class_id`'s template. Comparing only the
 /// stamp rejected every legal `this.#x` in an inherited method when both
 /// classes are per-evaluation — function-local classes (#11127), and
@@ -632,7 +632,8 @@ mod repeated_evaluation_tests {
             let second = private_field_marker_key(62_531, b"#v".as_ptr(), 2);
             private_lexical_brand_pop();
             assert_ne!(
-                first, second,
+                first.as_ref().map(|key| key.spelling.as_str()),
+                second.as_ref().map(|key| key.spelling.as_str()),
                 "each evaluation creates a fresh private name"
             );
         }

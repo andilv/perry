@@ -1128,8 +1128,21 @@ fn get_field_by_name_past_data_probe(
                 if !name.is_empty()
                     && !super::super::class_registry::class_static_key_deleted(class_id, name)
                 {
-                    if super::super::class_registry::lookup_static_method_in_chain(class_id, name)
-                        .is_some()
+                    // A class object owns every static method its template
+                    // declares (`define_class_object_own_properties`), and so
+                    // does each earlier evaluation it inherits from, so a
+                    // declaration of a per-evaluation class found here was
+                    // DELETED from its object: it must not come back. Only a
+                    // method of a shared (never-evaluated-to-an-object) class
+                    // is served from the registry.
+                    if super::super::class_registry::lookup_static_method_owner(class_id, name)
+                        .is_some_and(|(owner, _)| {
+                            let object_owned =
+                                super::super::class_registry::class_object_value_for_cid(owner)
+                                    .is_some()
+                                    || owner == class_id;
+                            !object_owned
+                        })
                     {
                         let heap_name = {
                             let layout =
@@ -1614,7 +1627,6 @@ fn get_field_by_name_past_data_probe(
     // bare value is rare; the `value.method()` call form is handled in
     // `js_native_call_method`). `obj` may be NaN-boxed (top16 0x7FFD) or a
     // raw-I64 pointer (top16 0).
-    #[cfg(feature = "temporal")]
     {
         let bits = obj as u64;
         let top16 = bits >> 48;
@@ -1645,7 +1657,7 @@ fn get_field_by_name_past_data_probe(
                     ) {
                         return JSValue::from_bits(v.to_bits());
                     }
-                    if let Some(v) = crate::temporal::dispatch::get_property(boxed, &name) {
+                    if let Some(v) = crate::temporal::hooked::get_property(boxed, &name) {
                         return JSValue::from_bits(v.to_bits());
                     }
                     // A prototype METHOD read as a value (`d.abs`, not `d.abs()`):
@@ -1654,7 +1666,7 @@ fn get_field_by_name_past_data_probe(
                     // spread/dynamic call `d[m](...args)` to a property read + apply,
                     // so the read must yield a callable. Only bind genuine method
                     // names so an unknown property still reads as `undefined`. (#5587)
-                    if crate::temporal::dispatch::has_method(boxed, &name) {
+                    if crate::temporal::hooked::has_method(boxed, &name) {
                         let heap_name = {
                             let layout =
                                 std::alloc::Layout::from_size_align(key_bytes.len().max(1), 1)

@@ -187,10 +187,9 @@ pub(super) unsafe fn dispatch_primitive(
     // `Temporal.*` value is a NaN-boxed pointer to a custom cell with no
     // codegen fast-path, so every method call funnels through here. The router
     // throws `TypeError` for an unknown method name on a real Temporal receiver.
-    #[cfg(feature = "temporal")]
     if crate::temporal::is_temporal_value(object) {
         let args = refreshed_args();
-        return Some(crate::temporal::dispatch::call_method(
+        return Some(crate::temporal::hooked::call_method(
             object,
             method_name,
             &args,
@@ -402,8 +401,12 @@ pub(super) unsafe fn dispatch_primitive(
     if crate::object::class_registry::is_class_object_value(object) {
         let class_id = crate::object::js_object_get_class_id(jsval.as_pointer::<ObjectHeader>());
         if class_id != 0
-            && crate::object::class_registry::lookup_static_method_in_chain(class_id, method_name)
-                .is_some()
+            && unsafe {
+                crate::object::class_object_registry_serves_static(
+                    jsval.as_pointer::<ObjectHeader>(),
+                    method_name,
+                )
+            }
         {
             let args = refreshed_args();
             return Some(crate::object::class_registry::js_class_static_method_call(

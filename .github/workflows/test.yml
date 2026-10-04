@@ -928,6 +928,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           ./scripts/gc_repsel_matrix.sh --self-test-liveness-parser
+          ./scripts/gc_repsel_matrix.sh --self-test-fixture-env
           python3 scripts/gc_repsel_matrix_merge.py --self-test
           python3 scripts/gc_matrix_liveness_check.py --self-test
           python3 scripts/gc_matrix_liveness_check.py --check-registry
@@ -2017,6 +2018,9 @@ jobs:
         shell: bash
         run: RUST_TEST_THREADS=1 cargo test --profile perry-dev --lib -p perry-runtime
 
+      - name: Windows runtime regressions against pinned Node
+        run: python scripts/run_windows_runtime_regressions.py
+
       # Small deterministic subset: verifies the Git Bash driver itself,
       # `.exe`/`.lib` discovery, native TEMP paths, compilation, execution,
       # and Node/Perry comparison on a real Windows host.
@@ -3001,7 +3005,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # gap-suite (was `conformance-smoke`): the gap suite, sharded. Runs in every
-  # tier -- 6 fast-mode shards on a PR, 3 in the sweep, 12 auto-optimize shards
+  # tier -- 12 fast-mode shards on a PR, 3 in the sweep, 24 auto-optimize shards
   # in the full tier (scripts/ci_plan.py GAP_SUITE). The `gate` fan-in below is
   # what branch protection requires; a single shard's red bubbles up through it.
   # ---------------------------------------------------------------------------
@@ -3082,7 +3086,7 @@ jobs:
     # protection requires. 2026-08-16: in the harness's default (auto-optimize)
     # mode 96% of a shard's wall time was ~10 tests at ~200 s each -- the
     # feature-stripped runtime rebuild per distinct feature set, redone in
-    # every shard. That mode is now the full tier's 12-shard arm; PR and sweep
+    # every shard. That mode is now the full tier's 24-shard arm; PR and sweep
     # tiers use `fast` mode against one prebuilt release build (~1.5 s/test).
     strategy:
       fail-fast: false
@@ -3144,7 +3148,7 @@ jobs:
       #         auto-optimize, which rebuilds a feature-stripped runtime per
       #         distinct feature set (~200 s each; measured 96% of a shard's
       #         wall time). It is the arm that sees auto-optimize-only bugs,
-      #         so it stays in the nightly/release tier at 8 shards, and never
+      #         so it stays in the nightly/release tier at 24 shards, and never
       #         downloads a shared build.
       # Both compare against the SAME committed Linux snapshot; a divergence
       # between them is a real auto-optimize-specific finding, not noise.

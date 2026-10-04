@@ -184,6 +184,8 @@ use copying_first_cycle::*;
 // Named rather than glob-imported: a glob does not propagate through the
 // transitive re-exports the gc submodules reach these through.
 use copying_pointer_set::{plausible_gc_header, CopyingPointer, CopyingPointerKind};
+#[cfg(any(debug_assertions, feature = "field-rep-assert", perry_gc_instruments))]
+pub(crate) use forwarding::field_rep_live_address;
 use forwarding::*;
 use sticky_remembered::*;
 // The copied-minor pointer classifier is consumed by the weak-holder registry
@@ -279,12 +281,12 @@ pub use verify::*;
 /// Env-gated heap census (`PERRY_GC_CENSUS`); off by default.
 pub(crate) mod census;
 mod census_field_repr;
-#[cfg(feature = "diagnostics")]
+#[cfg(perry_diagnostics)]
 mod heap_snapshot;
 mod heap_stats;
 mod regex_census;
 pub use census::{census_poll_signal, gc_census_enabled};
-#[cfg(feature = "diagnostics")]
+#[cfg(perry_diagnostics)]
 pub use heap_snapshot::gc_build_v8_heap_snapshot_json;
 pub(crate) use heap_stats::heap_stats;
 
@@ -978,9 +980,9 @@ pub fn gc_init() {
         return;
     }
     crate::perf_hooks::init_time_origin();
-    #[cfg(not(feature = "gc-instruments"))]
+    #[cfg(not(perry_gc_instruments))]
     instruments::refuse_instrument_knobs_without_instruments();
-    #[cfg(not(feature = "hot-diag"))]
+    #[cfg(not(perry_hot_diag))]
     crate::hot_diag::refuse_knobs_without_hot_diag();
     // `PERRY_GC_CENSUS`: remember the main thread and install the SIGUSR2
     // trigger. No-op (one OnceLock read) when the env var is unset.
@@ -1034,6 +1036,9 @@ pub fn gc_init() {
     // ordered-keys slot; this scanner only follows existing forwarding records
     // for descriptors and the pointer-keyed slot accelerator after evacuation.
     reg_scanner!(crate::object::shapes::scan_shape_table_rekey_mut);
+    // The shape records' [[Prototype]] words and their identity index are
+    // strong roots (object::shapes_prototype).
+    reg_scanner!(crate::object::shapes::scan_shape_prototype_words_mut);
     reg_scanner!(crate::proxy::scan_proxy_roots_mut);
     // Object/string-valued `err.<prop> = v` user props live as raw bits in
     reg_scanner!(exception_mutable_root_scanner);
@@ -1233,8 +1238,9 @@ pub fn gc_init() {
     // temporaries, arguments of in-flight interpreted frames). Mark +
     // REWRITE — interpreter state must survive moving collections triggered
     // from inside interpreted code.
-    #[cfg(feature = "dyn-eval")]
-    reg_scanner!(crate::dyn_eval::scan_dyn_eval_roots_mut);
+    // Registered unconditionally; it scans once the `dyn-eval` install has
+    // connected the interpreter (see `crate::dyn_eval_hooks`).
+    reg_scanner!(crate::dyn_eval_hooks::scan_dyn_eval_roots_mut);
     reg_scanner!(crate::tls::scan_tls_roots_mut);
     reg_scanner!(crate::process::scan_process_finalization_roots_mut);
     reg_scanner!(crate::process::scan_process_module_loader_roots_mut);
@@ -1396,6 +1402,9 @@ pub extern "C" fn js_gc_init() {
         crate::object::disable_class_field_inline_guard();
     }
     gc_init();
+    // Optional runtime features install from the program's generated
+    // installer (see `crate::feature_hooks`), before any user code runs.
+    crate::feature_hooks::run_feature_installer();
 }
 
 /// Release external Map/Set/JSON-tape storage owned by the current thread.

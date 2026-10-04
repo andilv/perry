@@ -1010,8 +1010,7 @@ pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user
         }
         GcMoveHookKind::ClosureDynamicProps => {
             crate::closure::closure_dynamic_props_owner_moved(old_user, new_user);
-            #[cfg(feature = "dyn-eval")]
-            crate::dyn_eval::function_owner_moved(old_user, new_user);
+            crate::dyn_eval_hooks::function_owner_moved(old_user, new_user);
         }
         GcMoveHookKind::MapForeachStack => {
             crate::map::map_header_moved_for_gc(old_user, new_user);
@@ -1118,7 +1117,7 @@ pub(crate) unsafe fn gc_type_finalize_unmarked_payload(obj_type: u8, user_ptr: *
     }
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(perry_diagnostics)]
 #[inline]
 pub(super) fn gc_type_name(obj_type: u8) -> &'static str {
     gc_type_info(obj_type).map_or("unknown", |info| info.name)

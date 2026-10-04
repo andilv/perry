@@ -43,6 +43,7 @@ impl LoweringContext {
         let module_identity = salt_identity.into();
         let tagged_template_site_salt = super::context::stable_module_salt(&module_identity);
         Self {
+            iterator_loop_labels: Vec::new(),
             next_local_id: 0,
             local_source_spans: HashMap::new(),
             classic_for_lexical_bindings: HashSet::new(),
@@ -94,6 +95,9 @@ impl LoweringContext {
             class_decl_self_binding_wanted: false,
             class_decl_self_binding: None,
             per_evaluation_class_decls: HashSet::new(),
+            shared_first_class_bindings: HashMap::new(),
+            evaluated_parent_bindings: HashMap::new(),
+            shared_first_decl_locals: HashMap::new(),
             class_decl_self_binding_ids: Vec::new(),
             current_class_member_is_static: false,
             private_scopes: Vec::new(),

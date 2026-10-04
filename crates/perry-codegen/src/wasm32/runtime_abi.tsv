@@ -589,6 +589,7 @@ js_class_env_register_slot	void	i32u,i32u,ptr
 js_class_env_register_state	void	i32u,ptr
 js_class_env_set	void	f64,i32u,i32u,f64
 js_class_env_stamp	f64	f64,i32u,f64
+js_class_evaluation_object	i64	i32u,i32u,i32u,ptr
 js_class_field_add	f64	f64,f64,f64
 js_class_field_get_ic	f64	i64,f64,i32u,i32u,ptr,i32u,i32s,ptr
 js_class_field_get_ic_fast	f64	i64,f64,i32u,i32u,ptr,i32u,i32s,ptr
@@ -601,9 +602,11 @@ js_class_lexical_binding_get	f64	f64
 js_class_lexical_binding_set	f64	f64,f64
 js_class_method_bind	f64	f64,ptr,usize
 js_class_method_bind_by_id	f64	f64,i64
+js_class_method_entry_enter_home	i64	i32u,i64,i64
+js_class_method_entry_leave	void	i64
 js_class_method_snapshot_bind	f64	f64,ptr,usize
-js_class_object_pin_parent	void	i64,i32u
 js_class_object_refresh_capture_values	void	f64,i64,f64
+js_class_object_set_ctor_caps	void	i64,f64,ptr
 js_class_prototype_method_value	f64	f64,f64
 js_class_register_capture_values	void	i32u,ptr,usize
 js_class_register_static_field	void	i32u,ptr,usize,f64,ptr
@@ -1145,7 +1148,7 @@ js_event_emitter_remove_all_listeners	i64	i64,ptr
 js_event_emitter_remove_listener	i64	i64,i64,i64
 js_event_emitter_set_domain	i32s	i64,i64
 js_event_emitter_set_max_listeners	i64	i64,f64
-js_event_emitter_subclass_init	f64	f64
+js_event_emitter_subclass_init	f64	f64,f64
 js_event_loop_check_phase	i32s	
 js_event_loop_host_driven	i32s	
 js_event_loop_poll_callbacks	i32s	
@@ -1977,6 +1980,7 @@ js_native_call_method	f64	f64,ptr,usize,ptr,usize
 js_native_call_method_apply	f64	f64,ptr,usize,i64
 js_native_call_method_apply_by_id	f64	f64,i64,i64
 js_native_call_method_by_id	f64	f64,i64,ptr,usize
+js_native_call_method_by_id_learn	f64	f64,i64,ptr,usize,ptr,i32u
 js_native_call_method_nullsafe	f64	f64,ptr,usize,ptr,usize
 js_native_call_method_patched_proto	f64	f64,ptr,usize,ptr,usize
 js_native_call_method_patched_proto_apply	f64	f64,ptr,usize,i64
@@ -2053,6 +2057,7 @@ js_net_socket_address_new	i64	f64
 js_net_socket_address_parse	f64	i64
 js_net_socket_alloc	i64	
 js_net_socket_connect	i64	f64,f64,f64
+js_net_socket_cork	i64	i64
 js_net_socket_destroy	void	i64
 js_net_socket_end	void	i64,i64
 js_net_socket_event_names	ptr	i64
@@ -2076,6 +2081,7 @@ js_net_socket_get_remote_port	f64	i64
 js_net_socket_get_timeout	f64	i64
 js_net_socket_get_type_of_service	f64	i64
 js_net_socket_get_writable	f64	i64
+js_net_socket_get_writable_corked	f64	i64
 js_net_socket_get_writable_ended	f64	i64
 js_net_socket_get_writable_high_water_mark	f64	i64
 js_net_socket_get_writable_length	f64	i64
@@ -2100,6 +2106,7 @@ js_net_socket_set_encoding	i64	i64,i64
 js_net_socket_set_no_delay	i64	i64,i64
 js_net_socket_set_timeout	i64	i64,f64,i64
 js_net_socket_set_type_of_service	i64	i64,f64
+js_net_socket_uncork	i64	i64
 js_net_socket_unpipe	i64	i64,f64
 js_net_socket_unref	i64	i64
 js_net_socket_upgrade_tls	ptr	i64,i64,f64
@@ -2568,6 +2575,8 @@ js_object_delete_field	i32s	ptr,ptr
 js_object_delete_field_value	i32s	f64,ptr
 js_object_entries	ptr	ptr
 js_object_entries_value	ptr	f64
+js_object_final_shape_id_for_class_keys_static_constfn	i32u	i64,i32u,i32u,i32u,i32u,i64,ptr,i32u
+js_object_finalize_constfn_static	i64	i64,i32u,ptr,i32u,i32u,i32u,i32u,i64,ptr,i32u
 js_object_free	void	ptr
 js_object_freeze	f64	f64
 js_object_from_entries	f64	f64
@@ -2589,6 +2598,7 @@ js_object_get_field_ic_overflow_load	f64	ptr,ptr,i32s,ptr
 js_object_get_field_ic_slow	f64	i64,ptr,ptr,ptr
 js_object_get_index_polymorphic	f64	i64,f64
 js_object_get_own_field_or_undef	f64	f64,ptr,usize
+js_object_get_own_field_or_undef_learn	f64	f64,ptr,usize,ptr
 js_object_get_own_property_descriptor	f64	f64,f64
 js_object_get_own_property_descriptors	f64	f64
 js_object_get_own_property_names	f64	f64
@@ -3190,7 +3200,7 @@ js_regexp_to_string	ptr	ptr
 js_region_guard_pack	i64	i32u,i32u,i64,i64,i64,i64,i64
 js_region_guard_prime	i64	ptr,i32u,i32u,i64,i64,i64,i64,i64
 js_region_loop_pack	i64	i32u,i32u,i64,i64,i64,i64,i64,i32u,i32u
-js_region_loop_prime	i64	ptr,i32u,i32u,i64,i64,i64,i64,i64,i32u,i32u,i32u
+js_region_loop_prime	i64	ptr,i32u,i32u,i64,i64,i64,i64,i64,i32u,i32u,i32u,i32u
 js_register_anon_shape_class_id	void	i32u
 js_register_aux_has_active	void	ptr
 js_register_aux_pump	void	ptr
@@ -3209,6 +3219,8 @@ js_register_class_id	void	i32u
 js_register_class_length	void	i32u,i32u
 js_register_class_method	void	i64,ptr,i64,i64,i64,i64,i64
 js_register_class_method_bind_length	void	i64,ptr,i64,i64
+js_register_class_method_entry	void	i64,ptr,i64,i64
+js_register_class_method_with_entry	void	i64,ptr,i64,i64,i64,i64,i64,i64
 js_register_class_name	void	i32u,ptr,i32u
 js_register_class_parent	void	i32u,i32u
 js_register_class_parent_dynamic	void	i32u,f64
@@ -3221,6 +3233,7 @@ js_register_class_static_method_bind_length	void	i64,ptr,i64,i64
 js_register_class_static_method_entry	void	i64,ptr,i64,i64
 js_register_class_static_setter	void	i64,ptr,i64,i64,i32s
 js_register_class_string_member_order	void	i64,ptr,i64,i64,i64
+js_register_class_template_cell	void	i64,i64
 js_register_class_to_string_tag	void	i32u,i64
 js_register_embedded_asset	void	ptr,usize,ptr,usize
 js_register_embedded_text_asset	void	ptr,usize,ptr,usize
@@ -3267,6 +3280,7 @@ js_register_path_init	void	ptr,i64,i64
 js_register_path_module	void	f64,f64
 js_register_path_module_partial	void	f64,f64
 js_register_prototype_method	void	i32u,ptr,usize,f64
+js_register_readable_handle_predicate	void	ptr
 js_register_set_text_handler	void	ptr
 js_register_show_toast_handler	void	ptr
 js_register_stdin_flow_ops	void	ptr,ptr
@@ -3344,6 +3358,15 @@ js_run_ext_pump	void
 js_run_module_init_catching	void	i64
 js_run_stdlib_pump	void	
 js_runtime_init	void	
+js_runtime_install_bun_cli_utils	void	
+js_runtime_install_compiled	void	
+js_runtime_install_dyn_eval	void	
+js_runtime_install_intl_datetime	void	
+js_runtime_install_intl_namespace	void	
+js_runtime_install_regex_engine	void	
+js_runtime_install_temporal	void	
+js_runtime_install_url_engine	void	
+js_runtime_register_feature_installer	void	ptr
 js_runtime_validate_crypto_key_arg	void	f64,ptr,i32u
 js_runtime_validate_integer_arg	void	f64,ptr,i32u,f64,f64
 js_runtime_validate_string_arg	void	f64,ptr,i32u
@@ -3455,6 +3478,7 @@ js_shape_ordinary_inline_slot_for_key	i32s	i32u,i64
 js_shape_register_static_seed	void	ptr
 js_shape_run_static_seed	void	
 js_shape_seed_plain	i32u	i32u,ptr,i32u,i32u,i32u,i64
+js_shape_seed_plain_constfn	i32u	i32u,ptr,i32u,i32u,i32u,i64,ptr,i32u
 js_shared_array_buffer_new	ptr	i32s
 js_shared_array_buffer_new_value	ptr	f64
 js_sharp_auto_orient	i64	i64
@@ -3510,6 +3534,7 @@ js_state_get	f64	f64
 js_state_init	void	f64,f64
 js_state_set	void	f64,f64
 js_static_method_entry_enter	void	i32u,i64
+js_static_method_entry_enter_home	void	i32u,i64,i64
 js_static_method_entry_leave	void	
 js_static_this_arm_classref	void	i32u
 js_static_this_arm_value	void	f64
@@ -3718,9 +3743,12 @@ js_thread_global_materialize	f64	i64,i64,i64
 js_thread_global_publish	void	i64,i64,i64
 js_thread_has_pending	i32s	
 js_thread_parallel_filter	f64	f64,f64
+js_thread_parallel_filter_with_literals	f64	f64,f64,i64
 js_thread_parallel_map	f64	f64,f64
+js_thread_parallel_map_with_literals	f64	f64,f64,i64
 js_thread_process_pending	i32s	
 js_thread_spawn	f64	f64
+js_thread_spawn_with_literals	f64	f64,i64
 js_throw	void	f64
 js_throw_bigint_constructor_type_error	f64	
 js_throw_collection_receiver_type_error	void	f64,ptr,usize
@@ -3899,6 +3927,7 @@ js_typed_feedback_native_call_method_by_id	f64	i64,f64,i64,ptr,usize
 js_typed_feedback_numeric_array_index_get_guard	i32s	i64,f64,i32s,i32s
 js_typed_feedback_numeric_array_index_set_guard	i32s	i64,f64,i32s,f64,i32s
 js_typed_feedback_numeric_array_push_guard	i32s	i64,f64,f64
+js_typed_feedback_object_get_field_by_key_f64	f64	i64,ptr,f64,f64
 js_typed_feedback_object_get_field_by_name_f64	f64	i64,ptr,ptr
 js_typed_feedback_object_get_field_by_value_f64	f64	i64,ptr,f64
 js_typed_feedback_object_set_field_by_name	void	i64,ptr,ptr,f64

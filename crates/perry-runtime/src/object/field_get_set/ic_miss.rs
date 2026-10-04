@@ -708,6 +708,8 @@ fn ic_diag_note(
     crate::hot_diag::ic_note(site, bytes, reason);
 }
 
+#[path = "ic_miss/class_field_define_fast.rs"]
+mod class_field_define_fast;
 #[path = "ic_miss/packed_get.rs"]
 mod packed_get;
 pub use packed_get::{js_object_get_field_ic_miss, js_object_get_field_ic_miss_packed};
@@ -719,6 +721,16 @@ pub(super) fn get_field_ic_miss_impl(
     packed: *const std::sync::atomic::AtomicU64,
 ) -> f64 {
     use crate::hot_diag::IcMissReason as R;
+    // #11725: an explicit-this native subclass reads missing properties
+    // from its aliased handle. The ordinary IC ladder bypasses the f64
+    // getter (and may cache an absent key), so preserve that getter's alias
+    // semantics before consulting or priming shape-based caches.
+    if super::super::native_this_alias::alias_active()
+        && super::super::native_this_alias::alias_handle_for_object(f64::from_bits(obj as u64))
+            .is_some()
+    {
+        return js_object_get_field_by_name_f64(obj, key);
+    }
     if crate::hot_diag::receiver_repr_on() {
         crate::hot_diag::receiver_repr_note_decoded_pointer(obj as usize);
     }
@@ -925,6 +937,18 @@ pub(super) fn get_field_ic_miss_impl(
                 return crate::array::js_array_length(arr) as f64;
             }
             unsafe {
+                // A plain function on its base shape: the site's holder entry
+                // answers a key its shape and `%Function.prototype%`'s chain
+                // prove (`read_holder::prime_function_read`).
+                if gc_kind == Some(crate::gc::GC_TYPE_CLOSURE) {
+                    if let Some(val) = crate::object::method_site::read_holder::prime_function_read(
+                        obj as usize,
+                        key,
+                        cache_slot,
+                    ) {
+                        return val;
+                    }
+                }
                 if let Some(val) = closure_dynamic_prop_by_key(obj as usize, key) {
                     if diag {
                         ic_diag_note(cache_slot, key, R::ClosureProp);
@@ -1761,7 +1785,7 @@ fn private_field_marker_key(
     declaring_class_id: u32,
     field_name_ptr: *const u8,
     field_name_len: u32,
-) -> Option<String> {
+) -> Option<std::rc::Rc<PrivateStorageKey>> {
     private_field_marker_key_for(None, declaring_class_id, field_name_ptr, field_name_len)
 }
 
@@ -1770,28 +1794,23 @@ fn private_field_marker_key_for(
     declaring_class_id: u32,
     field_name_ptr: *const u8,
     field_name_len: u32,
-) -> Option<String> {
+) -> Option<std::rc::Rc<PrivateStorageKey>> {
     if field_name_ptr.is_null() || field_name_len == 0 {
         return None;
     }
-    let field_name = unsafe {
-        std::str::from_utf8(std::slice::from_raw_parts(
-            field_name_ptr,
-            field_name_len as usize,
-        ))
-        .ok()?
-    };
-    let field_name = field_name.to_owned();
-    Some(format!(
-        "#<perry:private-field:{}:{field_name}>",
-        private_storage_namespace_for(declaring_class_id, receiver)
+    let bytes = unsafe { std::slice::from_raw_parts(field_name_ptr, field_name_len as usize) };
+    let name = intern_private_name(bytes)?;
+    Some(private_storage_key(
+        declaring_class_id,
+        receiver,
+        None,
+        name,
+        PrivateStorageKind::Field,
     ))
 }
 
-fn private_marker_is_present(storage: f64, marker: &str) -> bool {
-    crate::object::js_object_get_own_field_or_undef(storage, marker.as_ptr(), marker.len())
-        .to_bits()
-        != crate::value::TAG_UNDEFINED
+fn private_marker_is_present(storage: f64, marker: &PrivateStorageKey) -> bool {
+    marker.get(storage).to_bits() != crate::value::TAG_UNDEFINED
 }
 
 fn private_instance_element_is_present(
@@ -1811,9 +1830,12 @@ fn private_instance_element_is_present(
             field_name_len,
         )
     } else {
-        Some(format!(
-            "#<perry:private-brand:{}>",
-            private_storage_namespace_for(declaring_class_id, Some(storage.get_nanbox_f64()))
+        Some(private_storage_key(
+            declaring_class_id,
+            Some(storage.get_nanbox_f64()),
+            None,
+            "",
+            PrivateStorageKind::Brand,
         ))
     };
     marker.is_some_and(|marker| private_marker_is_present(storage.get_nanbox_f64(), &marker))
@@ -1833,9 +1855,12 @@ pub extern "C" fn js_private_brand_add(obj: f64, declaring_class_id: u32) -> f64
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj = scope.root_nanbox_f64(obj);
-    let marker = format!(
-        "#<perry:private-brand:{}>",
-        private_storage_namespace_for(declaring_class_id, Some(obj.get_nanbox_f64()))
+    let marker = private_storage_key(
+        declaring_class_id,
+        Some(obj.get_nanbox_f64()),
+        None,
+        "",
+        PrivateStorageKind::Brand,
     );
     let storage = crate::proxy::private_element_receiver(obj.get_nanbox_f64());
     if private_marker_is_present(storage, &marker) {
@@ -1854,7 +1879,7 @@ pub extern "C" fn js_private_brand_add(obj: f64, declaring_class_id: u32) -> f64
     // accessors after the allocation.
     let scope = crate::gc::RuntimeHandleScope::new();
     let object = scope.root_raw_mut_ptr(object);
-    let key = crate::string::js_string_from_bytes(marker.as_ptr(), marker.len() as u32);
+    let key = crate::string::intern_ascii_literal(marker.as_bytes());
     let key = scope.root_string_ptr(key);
     object.with_mut_ptr::<ObjectHeader, _>(|object| {
         key.with_const_ptr::<crate::StringHeader, _>(|key| {
@@ -1894,7 +1919,8 @@ pub extern "C" fn js_private_field_add(
         ))
     }
     .unwrap_or_else(|_| throw_private_type_error("Invalid private field name"));
-    let field_name = field_name.to_owned();
+    let field_name = intern_private_name(field_name.as_bytes())
+        .unwrap_or_else(|| throw_private_type_error("Invalid private field name"));
     let marker = private_field_marker_key_for(
         Some(obj.get_nanbox_f64()),
         declaring_class_id,
@@ -1917,10 +1943,9 @@ pub extern "C" fn js_private_field_add(
         throw_private_type_error("Cannot initialize a private field on a non-object");
     }
     let object = scope.root_raw_mut_ptr(object);
-    let storage_key =
-        crate::string::js_string_from_bytes(storage_name.as_ptr(), storage_name.len() as u32);
+    let storage_key = crate::string::intern_ascii_literal(storage_name.as_bytes());
     let storage_key = scope.root_string_ptr(storage_key);
-    let marker_key = crate::string::js_string_from_bytes(marker.as_ptr(), marker.len() as u32);
+    let marker_key = crate::string::intern_ascii_literal(marker.as_bytes());
     let marker_key = scope.root_string_ptr(marker_key);
     object.with_mut_ptr::<ObjectHeader, _>(|object| {
         storage_key.with_const_ptr::<crate::StringHeader, _>(|storage_key| {
@@ -1944,6 +1969,13 @@ pub extern "C" fn js_class_field_add(receiver: f64, key: f64, value: f64) -> f64
     let receiver = scope.root_nanbox_f64(receiver);
     let key = scope.root_nanbox_f64(key);
     let value = scope.root_nanbox_f64(value);
+    if class_field_define_fast::try_define_new_class_field(
+        receiver.get_nanbox_f64(),
+        key.get_nanbox_f64(),
+        value.get_nanbox_f64(),
+    ) {
+        return value.get_nanbox_f64();
+    }
     // Use [[DefineOwnProperty]] for both ordinary objects and Proxies.  The
     // ordinary define path bypasses an inherited setter; the Proxy path invokes
     // the receiver's `defineProperty` trap.  A normal `[[Set]]` helper cannot

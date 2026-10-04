@@ -47,6 +47,7 @@ fn empty_opts() -> CompileOptions {
         target: None,
         is_entry_module: false,
         non_entry_module_prefixes: Vec::new(),
+        thread_literal_module_prefixes: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -64,6 +65,7 @@ fn empty_opts() -> CompileOptions {
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
+        program_class_accessor_names: Default::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -15483,11 +15485,12 @@ fn static_put_value_uses_write_pic_for_call_free_rhs() {
     );
     assert!(
         ir.contains(
-            "_packed_set = private global [4 x i64] \
-             [i64 4294967295, i64 4294967295, i64 0, i64 0]"
+            "_packed_set = private global [5 x i64] \
+             [i64 4294967295, i64 4294967295, i64 0, i64 0, i64 0]"
         ),
         "the site record must be born EMPTY: its existing-key word and its key-add \
-         pre-shape word both 0xFFFF_FFFF, which no receiver word equals:\n{ir}"
+         pre-shape word both 0xFFFF_FFFF, which no receiver word equals, and no \
+         ConstFn body:\n{ir}"
     );
     assert!(
         ir.contains("put.add.check") && ir.contains("put.add.hit.store"),

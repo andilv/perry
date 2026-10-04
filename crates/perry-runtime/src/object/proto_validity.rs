@@ -161,6 +161,24 @@ pub(crate) unsafe fn mark_exotic_read_receiver(obj: usize) {
         ensure_meta_for_mark(obj, crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER)
     });
     if let Some(meta) = meta {
+        // The receiver is leaving every shape that can name its prototype
+        // (`PROTO_ID_PER_OBJECT`): its meta record becomes the authority, so
+        // copy the shape's word there first.
+        if (*meta).prototype == 0 {
+            let word = crate::object::shapes::shape_prototype_word(
+                crate::object::shapes::object_shape_stamp(object),
+            );
+            if word != 0 {
+                (*meta).prototype = word;
+                // GC_STORE_AUDIT(BARRIERED): meta-record prototype slot store
+                // (parent = the meta record), as in the prototype funnel.
+                crate::gc::runtime_write_barrier_slot(
+                    meta as usize,
+                    &(*meta).prototype as *const u64 as usize,
+                    word,
+                );
+            }
+        }
         // GC_STORE_AUDIT(POINTER_FREE): scalar classification bit.
         (*meta).flags |= crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER;
         // The flag makes the receiver's [[Prototype]] identity its own
@@ -226,16 +244,67 @@ unsafe fn ensure_meta_for_mark(obj: usize, flag: u64) -> Option<*mut crate::obje
     if meta.is_null() {
         return None;
     }
-    if (*meta).flags & flag == 0 {
+    if (*meta).flags & flag == 0 && flag != crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER {
+        // An exotic read receiver needs no private lineage: its caller
+        // restamps the [[Prototype]] identity to `PROTO_ID_PER_OBJECT`, a
+        // value no ordinary receiver's shape carries, so every shape a marked
+        // object can carry is already disjoint from every unmarked one. A
+        // counter-unique generation per arguments object minted one shape
+        // family per call (#10509).
+        //
         // The transition may allocate a descriptor, and so move the owner;
         // the meta record is reached through the owner again afterwards.
+        // A prototype mark changes no slot and no descriptor, so the new
+        // shape keeps the ConstFn lanes the object still satisfies.
         let (_, object) = handle.across_mut::<crate::object::ObjectHeader, _>(|| {
-            crate::object::shapes::transition_object_shape_semantics(object)
+            if flag == crate::object::OBJECT_META_FLAG_IS_PROTOTYPE {
+                crate::object::shapes::transition_object_shape_semantics_keeping_constfn(object)
+            } else {
+                crate::object::shapes::transition_object_shape_semantics(object)
+            }
         });
         let meta = (*object).meta;
-        return (!meta.is_null()).then_some(meta);
+        if meta.is_null() {
+            return None;
+        }
+        if flag == crate::object::OBJECT_META_FLAG_IS_PROTOTYPE {
+            keep_prototype_in_record(object, meta);
+        }
+        return Some(meta);
     }
     Some(meta)
+}
+
+/// A prototype is read on every inherited walk through it, so it keeps its
+/// own [[Prototype]] bits in its meta record, the cheaper read
+/// (`shapes::object_prototype_word`). The prototype funnel writes both while
+/// a record exists; an object linked before it had one (a class declaration
+/// prototype, linked to its parent's when it is created) starts its record
+/// from the shape's word when it becomes a prototype. Only a linked
+/// identity has a word.
+///
+/// # Safety
+/// `object` is a live `ObjectHeader` and `meta` its record.
+unsafe fn keep_prototype_in_record(
+    object: *mut crate::object::ObjectHeader,
+    meta: *mut crate::object::ObjectMeta,
+) {
+    if (*meta).prototype != 0
+        || !crate::object::shapes::shape_word_may_be_linked((*object).parent_class_id)
+    {
+        return;
+    }
+    let word = crate::object::shapes::object_prototype_word(object);
+    if word != 0 {
+        (*meta).prototype = word;
+        // GC_STORE_AUDIT(BARRIERED): meta-record prototype slot store (parent
+        // = the meta record), as in the prototype funnel.
+        crate::gc::runtime_write_barrier_slot(
+            meta as usize,
+            &(*meta).prototype as *const u64 as usize,
+            word,
+        );
+    }
 }
 
 /// # Safety

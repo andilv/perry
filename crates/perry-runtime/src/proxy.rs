@@ -1377,6 +1377,7 @@ fn is_non_configurable_exotic_own(target: f64, key: f64) -> bool {
             // is a non-configurable own property.
             if !crate::closure::closure_is_arrow(closure)
                 && !crate::closure::closure_is_bound_method(closure)
+                && !crate::closure::closure_body_is_non_constructor(closure)
             {
                 return true;
             }
@@ -2119,9 +2120,6 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                             // neither record nor honor store plans.
                             let plan_eligible = header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO
                                 == 0
-                                && !crate::object::prototype_chain::object_has_prototype_divergence(
-                                    addr,
-                                )
                                 && class_id != crate::object::NATIVE_MODULE_CLASS_ID
                                 // #8113: this asks for ORDINARY specifically —
                                 // it must stay FALSE for a class object or

@@ -24,7 +24,7 @@
 
 // Without `hot-diag` the probes below have no armed caller. `allow` rather
 // than a cascade of cfgs keeps them compiled, so they cannot rot unbuilt.
-#![cfg_attr(not(feature = "hot-diag"), allow(dead_code, unused_imports))]
+#![cfg_attr(not(perry_hot_diag), allow(dead_code, unused_imports))]
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -53,7 +53,7 @@ pub(crate) fn sink_from_env(name: &str) -> Option<Sink> {
 /// `HOT_DIAG_KNOBS` in the compiler's `optimized_libs/freshness.rs` (pinned by
 /// `hot_diag_knobs_match_the_runtime`).
 // Read only by the feature-off startup check below.
-#[cfg_attr(feature = "hot-diag", allow(dead_code))]
+#[cfg_attr(perry_hot_diag, allow(dead_code))]
 pub(crate) const HOT_DIAG_KNOBS: &[&str] = &[
     "PERRY_REGEX_DIAG",
     "PERRY_IC_DIAG",
@@ -65,7 +65,7 @@ pub(crate) const HOT_DIAG_KNOBS: &[&str] = &[
 
 /// Startup check for binaries built without the instruments: a knob that
 /// would arm one (same spelling rules as [`sink_from_env`]) aborts.
-#[cfg(not(feature = "hot-diag"))]
+#[cfg(not(perry_hot_diag))]
 pub(crate) fn refuse_knobs_without_hot_diag() {
     if let Some(knob) = HOT_DIAG_KNOBS
         .iter()
@@ -76,7 +76,7 @@ pub(crate) fn refuse_knobs_without_hot_diag() {
     }
 }
 
-#[cfg(not(feature = "hot-diag"))]
+#[cfg(not(perry_hot_diag))]
 #[cold]
 #[inline(never)]
 fn hot_diag_unavailable(knob: &str) -> ! {
@@ -147,9 +147,9 @@ fn regex_sink() -> &'static Option<Sink> {
 /// Is the regex instrument armed? One relaxed load once initialised.
 #[inline]
 pub fn regex_on() -> bool {
-    #[cfg(not(feature = "hot-diag"))]
+    #[cfg(not(perry_hot_diag))]
     return false;
-    #[cfg(feature = "hot-diag")]
+    #[cfg(perry_hot_diag)]
     {
         if REGEX_SINK.get().is_none() {
             regex_sink();
@@ -566,9 +566,9 @@ pub fn layout_on() -> bool {
     if let Some(armed) = LAYOUT_TEST_ARMED.with(std::cell::Cell::get) {
         return armed;
     }
-    #[cfg(not(feature = "hot-diag"))]
+    #[cfg(not(perry_hot_diag))]
     return false;
-    #[cfg(feature = "hot-diag")]
+    #[cfg(perry_hot_diag)]
     {
         if LAYOUT_SINK.get().is_none() {
             layout_sink();
@@ -813,9 +813,9 @@ impl Drop for LayoutDiagTestGuard {
 /// Is the IC-miss instrument armed? One relaxed load once initialised.
 #[inline]
 pub fn ic_on() -> bool {
-    #[cfg(not(feature = "hot-diag"))]
+    #[cfg(not(perry_hot_diag))]
     return false;
-    #[cfg(feature = "hot-diag")]
+    #[cfg(perry_hot_diag)]
     {
         if IC_SINK.get().is_none() {
             ic_sink();
@@ -1220,9 +1220,9 @@ fn enum_sink() -> &'static Option<Sink> {
 /// Is the enumeration/concat execution counter armed?
 #[inline]
 pub fn enum_on() -> bool {
-    #[cfg(not(feature = "hot-diag"))]
+    #[cfg(not(perry_hot_diag))]
     return false;
-    #[cfg(feature = "hot-diag")]
+    #[cfg(perry_hot_diag)]
     {
         if ENUM_SINK.get().is_none() {
             enum_sink();
@@ -1392,9 +1392,9 @@ fn buffer_sink() -> &'static Option<Sink> {
 /// Is the buffer-probe instrument armed? One relaxed load once initialised.
 #[inline]
 pub fn buffer_on() -> bool {
-    #[cfg(not(feature = "hot-diag"))]
+    #[cfg(not(perry_hot_diag))]
     return false;
-    #[cfg(feature = "hot-diag")]
+    #[cfg(perry_hot_diag)]
     {
         if BUFFER_SINK.get().is_none() {
             buffer_sink();
@@ -1524,7 +1524,7 @@ fn buffer_dump() {
 
 /// Receiver-route admission census names, indexed by the route number the
 /// emitted call passes. **Must match `receiver_range::Route` in perry-codegen.**
-const RECV_ROUTE_NAMES: [&str; 33] = [
+const RECV_ROUTE_NAMES: [&str; 35] = [
     "generic",
     "generic_mru_hit",
     "generic_way_hit",
@@ -1578,6 +1578,10 @@ const RECV_ROUTE_NAMES: [&str; 33] = [
     // Runtime-counted by `js_region_loop_prime`: refused because a key a bare
     // store may write a non-double into is not an `Any` lane (charter step 5).
     "rt_rloop_refuse_f64_stored",
+    "rt_rloop_refuse_rep",
+    // Emitted only in a route-census build: F ran with at least one R bit
+    // backed by its chosen static or learned supplier.
+    "rloop_f_rep",
 ];
 
 /// The runtime-counted routes: see [`RECV_ROUTE_NAMES`].
@@ -1596,9 +1600,10 @@ pub(crate) const RT_ROUTE_RLOOP_REFUSE_SPILL_UNSERVABLE: u32 = 25;
 pub(crate) const RT_ROUTE_RLOOP_REFUSE_RANGE: u32 = 26;
 pub(crate) const RT_ROUTE_RLOOP_RETIRE: u32 = 27;
 pub(crate) const RT_ROUTE_RLOOP_REFUSE_F64_STORED: u32 = 32;
+pub(crate) const RT_ROUTE_RLOOP_REFUSE_REP: u32 = 33;
 
-static RECV_ROUTES: [std::sync::atomic::AtomicU64; 33] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 33];
+static RECV_ROUTES: [std::sync::atomic::AtomicU64; 35] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 35];
 static RECV_ROUTES_REPORT: std::sync::Once = std::sync::Once::new();
 /// Set by the first emitted `js_recv_route_note`, i.e. only in a binary
 /// compiled with `PERRY_RECV_ROUTE_COUNT=1`; the runtime-counted routes are a

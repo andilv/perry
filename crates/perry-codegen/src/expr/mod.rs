@@ -113,6 +113,7 @@ mod pod_layout_constants;
 mod pod_record;
 mod property_get_names;
 mod proven_view_access;
+mod proven_view_guarded;
 mod range_facts;
 mod strings;
 mod typed_feedback;
@@ -175,6 +176,9 @@ pub(crate) use proven_view_access::{
     try_lower_proven_view_checked_f64_load, try_lower_proven_view_checked_store,
     try_lower_proven_view_checked_u32_load,
 };
+pub(crate) use proven_view_guarded::{
+    try_lower_proven_view_guarded_load, try_lower_proven_view_guarded_store,
+};
 pub(crate) use range_facts::{
     bounds_for_buffer_access_width, effective_alias_state_for_access,
     guarded_buffer_indices_for_condition, int_range_expr, invalidate_local_write_facts,
@@ -231,7 +235,11 @@ mod hit_path_access_tests;
 mod index_set_barrier_tests;
 #[cfg(test)]
 mod instanceof_imported_rhs_tests;
+#[cfg(test)]
+mod proven_view_guarded_tests;
 mod record_value;
+#[cfg(test)]
+mod region_array_loop_tests;
 #[cfg(test)]
 mod region_loop_tests;
 mod repsel_gates;
@@ -276,7 +284,7 @@ pub(crate) use slot_rep::{
     deny_canonical_context, deny_canonical_i32, load_canonical_local_boxed, local_is_canonical_str,
     local_rep_is_canonical_i32, note_canonical_local, ptr_shape_context_rule_text,
     store_canonical_local_from_double, CanonicalI32Denial, SlotRep, PTR_SHAPE_NO_ACCESS_SITE,
-    PTR_SHAPE_SCALAR_REPLACED,
+    PTR_SHAPE_REGION_AUTHORITY, PTR_SHAPE_SCALAR_REPLACED,
 };
 
 pub(crate) use dispatch::{lower_expr, lower_math_operand};
@@ -863,6 +871,9 @@ pub(crate) struct FnCtx<'a> {
     /// calls. See `CompileOptions::object_literal_method_candidates`.
     pub object_literal_method_candidates:
         &'a std::collections::HashMap<String, Vec<crate::ObjectLiteralMethodCandidate>>,
+    /// The whole program's class accessor names. See
+    /// `CompileOptions::program_class_accessor_names`.
+    pub program_class_accessor_names: Option<&'a crate::ClassAccessorNames>,
     /// FFI manifest: `name -> (params, return)` from `package.json`
     /// `nativeLibrary.functions`. Descriptors use the shared native-library
     /// ABI vocabulary. `lower_call` consults
@@ -1089,19 +1100,6 @@ pub(crate) struct FnCtx<'a> {
     /// removed the moment the local leaves that scope.
     pub suppressed_cleared_shadow_slots: std::collections::HashSet<u32>,
 
-    /// #5093: scoped loop-versioning facts for monomorphic class-field loops.
-    /// Pushed only around the FAST clone of `lower_class_field_versioned_for`
-    /// (`stmt/loops.rs`): the loop preheader already proved the receiver's
-    /// exact class shape (class_id, keys identity, field_count, typed-layout
-    /// intact bit, not-frozen, inline-guard enable flag), and the matcher
-    /// proved the fast body is call-free (no allocation ⇒ no GC ⇒ the cached
-    /// `obj_ptr` cannot move and the shape cannot change mid-loop). Inside
-    /// that clone, `recv.field` GET/SET on a tracked raw-f64 field lowers to
-    /// a bare GEP+load/store on `obj_ptr` with no guard and no fallback call;
-    /// SET keeps an inline plain-finite-number check that side-exits to the
-    /// slow clone's preheader BEFORE committing any side effect of the
-    /// current iteration.
-    pub class_field_loop_facts: Vec<ClassFieldLoopFact>,
     /// Step 4b (#10884): loop / body regions whose body is not lowered yet
     /// (`stmt::region_loop`), and the facts active while an F-body lowers.
     pub region_loops: Vec<crate::stmt::region_loop::Pending>,
@@ -2154,30 +2152,6 @@ pub(crate) struct StringWindowArrayFact {
     pub max_idx_exclusive: i64,
 }
 
-/// #5093: one fact per (receiver, versioned loop). See
-/// `FnCtx::class_field_loop_facts` for the safety argument.
-#[derive(Debug, Clone)]
-pub(crate) struct ClassFieldLoopFact {
-    /// LocalId of the loop-invariant receiver (plain local or module global).
-    pub recv_local_id: u32,
-    pub scope_id: u32,
-    /// Class the preheader check proved exactly (by class_id compare).
-    pub class_name: String,
-    /// SSA name of the receiver object pointer, `inttoptr`'d in the
-    /// preheader's deref block. Dominates every block of the fast clone and
-    /// is stable for the clone's whole lifetime because the fast body is
-    /// call-free (no allocation ⇒ no GC ⇒ no evacuation).
-    pub obj_ptr: String,
-    /// Slow clone's preheader label. A raw-f64 store whose value fails the
-    /// inline plain-finite check branches here; the slow clone re-executes
-    /// the current iteration from scratch (no side effect has committed yet).
-    pub side_exit_label: String,
-    /// property name -> packed slot index. Every entry is a declared raw-f64
-    /// candidate field validated by the matcher via
-    /// `class_field_global_index` / `class_field_declared_type`.
-    pub fields: std::collections::BTreeMap<String, u32>,
-}
-
 /// #10123: where the fast clone's element index comes from.
 ///
 /// The class-keyed arm admits [`Self::Counter`] only — the preheader's
@@ -2501,23 +2475,6 @@ pub(crate) fn element_shape_loop_fact_for_property_get<'f>(
     }
 }
 
-/// Find the innermost active class-field loop fact covering
-/// `(recv_local_id, class_name, property)`. Returns the fact and the packed
-/// slot index of the field.
-pub(crate) fn class_field_loop_fact_lookup<'f>(
-    facts: &'f [ClassFieldLoopFact],
-    recv_local_id: u32,
-    class_name: &str,
-    property: &str,
-) -> Option<(&'f ClassFieldLoopFact, u32)> {
-    facts.iter().rev().find_map(|fact| {
-        if fact.recv_local_id != recv_local_id || fact.class_name != class_name {
-            return None;
-        }
-        fact.fields.get(property).map(|idx| (fact, *idx))
-    })
-}
-
 /// Build a linker-unique inline-cache global name.
 ///
 /// `ic_site_counter` is only module-wide. LLVM codegen-unit splitting can
@@ -2721,6 +2678,13 @@ mod inline_cache_name_tests {
 }
 
 impl<'a> FnCtx<'a> {
+    /// May some compiled class of the program declare a setter named `name`?
+    /// Where this is false a store site emits no class-setter arm.
+    pub(crate) fn program_may_declare_setter(&self, name: &str) -> bool {
+        self.program_class_accessor_names
+            .is_none_or(|names| names.may_set(name))
+    }
+
     /// Is `e` the `this` of a STATIC class member — i.e. a receiver that holds
     /// the class CONSTRUCTOR (an INT32 class ref) rather than an instance?
     ///
@@ -2817,7 +2781,14 @@ impl<'a> FnCtx<'a> {
         &self,
         e: &perry_hir::Expr,
     ) -> Option<&crate::collectors::PtrShapeLocal> {
-        if !self.repsel_context_allows_ptr_shape {
+        // An admitted region's authority covers its receivers' STORES only
+        // (`ptr_shape_store_fact`). A read or a call's dispatch keeps the
+        // route it has outside the region: it writes nothing the region's
+        // facts rest on, and the region's own bare stores keep every lane's
+        // representation, so the exact-class proof stays true inside it.
+        if !self.repsel_context_allows_ptr_shape
+            && self.repsel_ptr_shape_context_denial != Some(PTR_SHAPE_REGION_AUTHORITY)
+        {
             // #7106 follow-up: this early return is the whole of mechanism 2.
             // The fact EXISTS — `collect_shape_proven_ptr_locals` already ran
             // and already recorded a `select()` for it — and every access site
@@ -2834,6 +2805,26 @@ impl<'a> FnCtx<'a> {
             perry_hir::Expr::This => self.proven_this.as_ref(),
             _ => None,
         }
+    }
+
+    /// The `Ptr<Shape>` proof a STORE to `e` may act on.
+    ///
+    /// An admitted loop/body region owns its receivers' stores
+    /// ([`PTR_SHAPE_REGION_AUTHORITY`]): its live ShapeId guard and store
+    /// admission replace the unguarded store route, so inside the region a
+    /// store never takes it. Reads and a call's dispatch are not under that
+    /// authority ([`FnCtx::ptr_shape_receiver_fact`]).
+    pub(crate) fn ptr_shape_store_fact(
+        &self,
+        e: &perry_hir::Expr,
+    ) -> Option<&crate::collectors::PtrShapeLocal> {
+        if !self.repsel_context_allows_ptr_shape {
+            if crate::opt_report::enabled() {
+                self.report_ptr_shape_context_drop(e);
+            }
+            return None;
+        }
+        self.ptr_shape_receiver_fact(e)
     }
 
     /// Shared exact-shape lookup for a local, with clone-parameter overlays
@@ -2894,8 +2885,9 @@ impl<'a> FnCtx<'a> {
     }
 
     /// The `Ptr<Shape>` fact for `e` ignoring the context gate — the proof the
-    /// analysis actually produced, as opposed to the proof codegen is allowed
-    /// to act on. Report-only.
+    /// analysis actually produced, as opposed to permission for an unguarded
+    /// access. Used for reporting and for class provenance in a separately
+    /// shape-guarded region; never grants native-slot or numeric permission.
     fn ptr_shape_fact_ignoring_context(
         &self,
         e: &perry_hir::Expr,
@@ -2905,6 +2897,20 @@ impl<'a> FnCtx<'a> {
             perry_hir::Expr::This => self.proven_this.as_ref(),
             _ => None,
         }
+    }
+
+    /// Class provenance for a region's static supplier, never a license for
+    /// raw access. The supplier must validate the live ShapeId and obtain all
+    /// offsets/representations from that shape. Unlike the unguarded accessor,
+    /// this route is valid while region lowering owns representation authority.
+    /// Other unguarded-context denials do not invalidate a class hint either:
+    /// region eligibility still rejects unsupported bindings, and its guarded
+    /// loads re-read tagged roots. No native-slot permission is inherited here.
+    /// The collection OFF knob removes the fact itself; this accessor cannot
+    /// recreate it from a type annotation.
+    pub(crate) fn ptr_shape_region_class(&self, e: &perry_hir::Expr) -> Option<String> {
+        self.ptr_shape_fact_ignoring_context(e)
+            .map(|fact| fact.class_name.clone())
     }
 
     /// Record that a selected `Ptr<Shape>` proof was dropped by the context
@@ -2943,7 +2949,7 @@ impl<'a> FnCtx<'a> {
             tier: crate::opt_report::Tier::CompilerLimitation,
             issue: Some(issue),
             detail: Some(format!(
-                "proven Ptr<Shape> of class {}; every access site keeps the guard diamond",
+                "proven Ptr<Shape> of class {}; this access cannot use the unguarded receiver route",
                 fact.class_name
             )),
         });
@@ -2952,7 +2958,10 @@ impl<'a> FnCtx<'a> {
     /// Record that codegen COMMITTED to a `Ptr<Shape>` lowering for `e`.
     ///
     /// Call from the taken branch of a site that has already decided to emit
-    /// the guard-free form — never from the accessor, which answers `Some` at
+    /// the guard-free form, or from an emitted region access whose static
+    /// supplier was selected using this fact's class provenance. The region's
+    /// ShapeId guard still owns its slot/representation authority. Never call
+    /// from the accessor, which answers `Some` at
     /// sites that then reject the fact on a class or numeric-field mismatch and
     /// emit the guarded diamond anyway.
     pub(crate) fn note_ptr_shape_consumed(&self, e: &perry_hir::Expr, site: &'static str) {
@@ -3051,6 +3060,8 @@ pub(crate) mod call_spread;
 pub(crate) mod calls;
 mod child_proc;
 pub(crate) mod class_env;
+pub(crate) mod class_field_push;
+pub(crate) mod class_first_evaluation;
 mod closure;
 mod compare;
 pub(crate) mod region_guard;
@@ -3090,8 +3101,8 @@ mod unary_bigint_tests;
 mod unary_bitnot_tests;
 pub(crate) use index_get::{
     affine_counter_occurrences, affine_index_fits_i64, emit_affine_index_i64_with,
-    emit_array_region_guard, numeric_index_has_integer_array_index_proof,
-    packed_f64_loop_index_parts,
+    emit_array_region_guard, emit_typed_f64_region_guard,
+    numeric_index_has_integer_array_index_proof, packed_f64_loop_index_parts, ArrayRegionDense,
 };
 pub(crate) use masked_window::masked_window_fact_for_index;
 /// Rooting coverage for the computed-store arms the TS corpora cannot reach
@@ -3120,6 +3131,9 @@ mod math_simple;
 pub(crate) mod method_site;
 mod misc_methods;
 mod new_dynamic;
+pub(crate) mod number_to_string_inline;
+#[cfg(test)]
+mod number_to_string_inline_tests;
 mod objects_arrays_lit;
 pub(crate) mod os_uri_dates;
 pub(crate) mod property_get;
