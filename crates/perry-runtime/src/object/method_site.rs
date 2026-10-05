@@ -45,9 +45,7 @@
 //! What the prime refuses (they keep the ordinary dispatch): non-ordinary
 //! receivers (class objects, native-module namespaces, dictionaries,
 //! `Object.prototype`, typed-array prototypes, exotic read receivers),
-//! accessors, spill slots, class instances for the inherited entry (their
-//! methods live in the vtable until class prototypes carry real slots, D4),
-//! and any value that is not a plain closure the call can enter directly for
+//! accessors, spill slots, and any value that is not a plain closure the call can enter directly for
 //! this site's argument count (bound functions, rest / `arguments` bodies,
 //! runtime thunks, class constructors, closures that capture `this`).
 //!
@@ -92,6 +90,8 @@
 
 use crate::object::ObjectHeader;
 
+pub(crate) mod chain_memo;
+mod function_intrinsic;
 pub(crate) mod read_holder;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -246,28 +246,13 @@ pub fn note_worker_agent() {
     }
 }
 
-/// Why a miss did not prime (diagnostic; `PERRY_METHOD_SITE_STATS` prints it).
-const REFUSALS: [&str; 19] = [
-    "not_object_pointer",
-    "not_ordinary",
-    "dictionary",
-    "own_spill_slot",
-    "own_accessor",
-    "own_not_direct_callable",
-    "inh_class_instance",
-    "inh_proto_not_in_shape",
-    "inh_hop_refused",
-    "inh_not_found",
-    "inh_not_direct_callable",
-    "inh_workers",
-    "dc_not_closure",
-    "dc_special",
-    "dc_rest",
-    "dc_captures_this",
-    "dc_arity_pad",
-    "dc_bound",
-    "site_megamorphic",
-];
+/// Why a miss did not prime (diagnostic; `PERRY_METHOD_SITE_STATS` prints it),
+/// by the index [`refuse`] counts under. One string, see
+/// [`crate::hot_diag::report_name`].
+fn refusal_name(reason: usize) -> &'static str {
+    const NAMES: &str = "not_object_pointer not_ordinary dictionary own_spill_slot own_accessor own_not_direct_callable inh_class_instance inh_proto_not_in_shape inh_hop_refused inh_not_found inh_not_direct_callable inh_workers dc_not_closure dc_special dc_rest dc_captures_this dc_arity_pad dc_bound site_megamorphic";
+    crate::hot_diag::report_name(NAMES, reason)
+}
 per_test_global! {
     static SITE_REFUSED: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
 }
@@ -300,7 +285,7 @@ pub fn method_site_stats() -> (u64, u64, u64) {
 }
 
 /// `js_method_site_stats(which)`: 0 own primes, 1 inherited primes, 2 misses,
-/// 3 function-bag primes, 4 ConstFn own primes.
+/// 3 function-bag primes, 4 ConstFn own primes, 5 chain memo ways recorded.
 /// Exposed so gap tests can prove a path ran.
 #[no_mangle]
 pub extern "C" fn js_method_site_stats(which: i32) -> f64 {
@@ -310,16 +295,30 @@ pub extern "C" fn js_method_site_stats(which: i32) -> f64 {
         1 => b,
         3 => method_site_function_primes(),
         4 => PRIMES_CONSTFN.load(Ordering::Relaxed),
+        5 => chain_memo::chain_memo_records(),
         _ => c,
     }) as f64
 }
 
+/// Is `PERRY_METHOD_SITE_STATS` set? Read once; the reader that settles the
+/// answer installs the exit report. A tri-state byte (0 unread, 1 off, 2 on)
+/// rather than a `OnceLock<bool>`: `OnceLock` initialises through a `dyn`
+/// closure whose vtable is load-time relocations in every program that links
+/// the miss path.
 fn stats_report_enabled() -> bool {
     per_test_global! {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
     }
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("PERRY_METHOD_SITE_STATS").is_some();
+    match ON.load(Ordering::Relaxed) {
+        0 => {}
+        state => return state == 2,
+    }
+    let on = std::env::var_os("PERRY_METHOD_SITE_STATS").is_some();
+    let state = if on { 2 } else { 1 };
+    if ON
+        .compare_exchange(0, state, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
         if on {
             extern "C" fn report() {
                 let (a, b, c) = method_site_stats();
@@ -327,16 +326,21 @@ fn stats_report_enabled() -> bool {
                 for (i, n) in SITE_REFUSED.iter().enumerate() {
                     let n = n.load(Ordering::Relaxed);
                     if n != 0 {
-                        refused.push_str(&format!(" refused.{}={n}", REFUSALS[i]));
+                        refused.push_str(&format!(" refused.{}={n}", refusal_name(i)));
                     }
                 }
                 let (hd, ha, hr) = read_holder::read_holder_stats();
                 let (ap, ah) = read_holder::read_accessor_stats();
                 let (cp, ch, cr) = read_holder::class_read_stats();
+                let (fp, fneg, fh) = function_intrinsic::function_intrinsic_stats();
                 eprintln!(
-                    "[method-site] primes_own={a} primes_inherited={b} primes_function={} primes_constfn={} holder_rewrites={} misses={c} read_holder_primes={hd} read_absent_primes={ha} read_accessor_primes={ap} read_accessor_hits={ah} read_accessor_class_primes={} class_read_primes={cp} class_read_hits={ch} class_read_root_rewrites={cr} read_holder_rewrites={} read_accessor_rewrites={} read_accessor_same_shape_relinks={} read_holder_refused={hr}{refused}",
+                    "[method-site] fn_intrinsic_primes={fp} fn_intrinsic_negative={fneg} fn_intrinsic_hits={fh}"
+                );
+                eprintln!(
+                    "[method-site] primes_own={a} primes_inherited={b} primes_function={} primes_constfn={} chain_memo_records={} holder_rewrites={} misses={c} read_holder_primes={hd} read_absent_primes={ha} read_accessor_primes={ap} read_accessor_hits={ah} read_accessor_class_primes={} class_read_primes={cp} class_read_hits={ch} class_read_root_rewrites={cr} read_holder_rewrites={} read_accessor_rewrites={} read_accessor_same_shape_relinks={} read_holder_refused={hr}{refused}",
                     method_site_function_primes(),
                     PRIMES_CONSTFN.load(Ordering::Relaxed),
+                    chain_memo::chain_memo_records(),
                     HOLDER_REWRITES.load(Ordering::Relaxed),
                     read_holder::read_accessor_class_primes(),
                     read_holder::read_holder_rewrites(),
@@ -346,8 +350,8 @@ fn stats_report_enabled() -> bool {
             }
             unsafe { libc::atexit(report) };
         }
-        on
-    })
+    }
+    on
 }
 
 /// The miss entry: prime the site when the facts hold, then dispatch as the
@@ -382,11 +386,44 @@ pub unsafe extern "C-unwind" fn js_method_site_miss(
             argc,
         );
     }
+    let name = std::slice::from_raw_parts(name_ref.ptr, name_ref.len);
+    // One read of the receiver's header classifies it for both steps below.
+    let receiver = miss_receiver(recv);
+    // A function receiver calling an intrinsic it inherits from
+    // `%Function.prototype%` (`fn.bind(this)`): the site's function-intrinsic
+    // entry answers from words, or the call primes one (`function_intrinsic`).
+    // Only once the realm has built `%Function.prototype%` can an entry
+    // exist, and only for a receiver whose ShapeId says it inherits from it,
+    // whatever the key: the base Function shape, or a keyed Function shape
+    // over `Function.prototype`. A class method, a class function object, a
+    // FunctionDictionary receiver or an async/generator function is refused
+    // on its ShapeId, before any site or name is read.
+    if let MissReceiver::Function { word, base, keyed } = receiver {
+        if (base || keyed)
+            && crate::object::native_call_method::function_prototype_built()
+            && (base
+                || crate::closure::shape::keyed_function_shape_has_function_prototype(
+                    (word >> 32) as u32,
+                ))
+        {
+            if let Some(result) =
+                function_intrinsic::on_miss(slot, site_id, recv, word, name, args_ptr, argc)
+            {
+                return result;
+            }
+        }
+    }
+    if let MissReceiver::Payload = receiver {
+        if let Some(result) =
+            crate::native_payload::try_payload_method_fast_dispatch(recv, name, args_ptr, argc)
+        {
+            return result;
+        }
+    }
     // Only an ordinary heap object can prime. Everything else (primitives,
     // handles, functions, arrays) dispatches with no extra work at all.
     let megamorphic = site_is_megamorphic(slot);
-    if megamorphic || !prime_candidate(recv, std::slice::from_raw_parts(name_ref.ptr, name_ref.len))
-    {
+    if megamorphic || !prime_candidate(receiver, name) {
         refuse(if megamorphic { 18 } else { 1 });
         return crate::typed_feedback::js_typed_feedback_native_call_method(
             site_id,
@@ -396,6 +433,18 @@ pub unsafe extern "C-unwind" fn js_method_site_miss(
             args_ptr,
             argc,
         );
+    }
+    // `emitter.emit(...)`: its body takes a rest parameter, which no site
+    // entry can call, so every call misses. The emitter machinery (armed by
+    // the events / stream installs) calls it directly instead of the tower.
+    if let MissReceiver::Ordinary = receiver {
+        if name == b"emit" {
+            if let Some(ops) = super::nm_ee_ops() {
+                if let Some(result) = (ops.emit_call)(recv, args_ptr, argc) {
+                    return result;
+                }
+            }
+        }
     }
     // Dispatch first, then prime: the prime may allocate (marking a
     // prototype hop, the borrowed-builtin classifier's key), which can move
@@ -412,7 +461,6 @@ pub unsafe extern "C-unwind" fn js_method_site_miss(
         argc,
     );
     let result_h = scope.root_nanbox_f64(result);
-    let name = std::slice::from_raw_parts(name_ref.ptr, name_ref.len);
     {
         // The prime reads the receiver, its holder chain and the method value
         // as raw addresses and may allocate (a prototype mark, the
@@ -424,41 +472,91 @@ pub unsafe extern "C-unwind" fn js_method_site_miss(
     result_h.get_nanbox_f64()
 }
 
-/// A cheap first cut of [`ordinary_receiver`] / [`prime_function`]: a heap
-/// pointer whose GcHeader says ordinary object, or a function object whose
-/// SHAPE lists `name` as an own key. Most calls on functions (`fn.bind`,
-/// `fn.call`) name an inherited builtin a site never memoizes; they leave
-/// here on the shape's key list, before the miss roots anything.
+/// What one read of a miss receiver's header says.
+#[derive(Clone, Copy)]
+enum MissReceiver {
+    /// A heap object whose GcHeader says ordinary object.
+    Ordinary,
+    /// A heap function object: its word (`capture_count | ShapeId`), whether
+    /// its ShapeId is the base Function shape (keyless, over
+    /// `%Function.prototype%`), and whether it is keyed (neither that nor the
+    /// FunctionDictionary shape).
+    Function { word: u64, base: bool, keyed: bool },
+    /// An instance of a native-payload family (`native_payload.rs`).
+    Payload,
+    /// Anything else: primitives, handles, arrays, strings.
+    Other,
+}
+
+// A closure's first word is `capture_count | ShapeId`: the ShapeId is its
+// high half.
+const _: () = assert!(crate::closure::CLOSURE_SHAPE_OFFSET == 4);
+
 #[inline]
-fn prime_candidate(recv: f64, name: &[u8]) -> bool {
+fn miss_receiver(recv: f64) -> MissReceiver {
     let bits = recv.to_bits();
     if bits & !crate::value::POINTER_MASK != crate::value::POINTER_TAG {
-        return false;
+        return MissReceiver::Other;
     }
     let addr = (bits & crate::value::POINTER_MASK) as usize;
     if !crate::value::addr_class::is_above_handle_band(addr) {
-        return false;
+        return MissReceiver::Other;
     }
     match unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
-        Some(h) if h.obj_type == crate::gc::GC_TYPE_OBJECT => true,
-        Some(h) if h.obj_type == crate::gc::GC_TYPE_CLOSURE => unsafe {
-            function_shape_lists_key(addr, name)
-        },
-        _ => false,
+        Some(h) if h.obj_type == crate::gc::GC_TYPE_OBJECT => {
+            // #11919 P0: a native-payload instance's methods are builtins on
+            // its family prototype, which a site never memoizes: priming
+            // would fail on every call, and the tower would walk every probe
+            // before reaching them. The miss answers them directly.
+            // SAFETY: the header says a live ordinary object.
+            let class_id = unsafe { (*(addr as *const crate::object::ObjectHeader)).class_id };
+            if crate::native_class_ids::is_native_payload_class_id(class_id) {
+                MissReceiver::Payload
+            } else {
+                MissReceiver::Ordinary
+            }
+        }
+        Some(h) if h.obj_type == crate::gc::GC_TYPE_CLOSURE => {
+            // SAFETY: the header says a live closure; its first word is the
+            // `capture_count | ShapeId` word.
+            let word = unsafe { std::ptr::read(addr as *const u64) };
+            let id = (word >> 32) as u32;
+            let (base, dictionary) = crate::closure::shape::function_base_and_dictionary_shapes();
+            let keyed = id != base && super::shapes::is_exotic_shape_id(id) && id != dictionary;
+            MissReceiver::Function {
+                word,
+                base: id == base,
+                keyed,
+            }
+        }
+        _ => MissReceiver::Other,
     }
 }
 
-/// Does the (claimed) function object at `addr` sit on a KEYED Function shape
-/// whose key list holds `name`? Reads the ShapeId word and the shape's key
-/// list only; [`prime_function`] re-proves ownership before trusting it.
+/// A cheap first cut of [`ordinary_receiver`] / [`prime_function`]: an
+/// ordinary heap object, or a function object whose SHAPE lists `name` as an
+/// own key. Most calls on functions (`fn.bind`, `fn.call`) name an inherited
+/// builtin a site never memoizes; they leave here on the shape's key list,
+/// before the miss roots anything.
 #[inline]
-unsafe fn function_shape_lists_key(addr: usize, name: &[u8]) -> bool {
-    let id = *((addr as *const u8).add(crate::closure::CLOSURE_SHAPE_OFFSET) as *const u32);
-    if !super::shapes::is_exotic_shape_id(id)
-        || id == crate::closure::shape::function_dictionary_shape()
-    {
-        return false;
+fn prime_candidate(receiver: MissReceiver, name: &[u8]) -> bool {
+    match receiver {
+        MissReceiver::Ordinary => true,
+        // The base shape lists no key and the FunctionDictionary shape
+        // answers nothing: only a keyed shape can list `name`.
+        MissReceiver::Function {
+            word, keyed: true, ..
+        } => unsafe { function_shape_lists_key((word >> 32) as u32, name) },
+        MissReceiver::Function { .. } => false,
+        MissReceiver::Payload | MissReceiver::Other => false,
     }
+}
+
+/// Does the keyed Function ShapeId `id` (a claimed function object's, see
+/// [`MissReceiver::Function`]) list `name` in its key list? Reads the shape's
+/// key list only; [`prime_function`] re-proves ownership before trusting it.
+#[inline]
+unsafe fn function_shape_lists_key(id: u32, name: &[u8]) -> bool {
     // The record in place (no descriptor copy): its key list and count.
     let Some(record) = super::shapes::shape_record_by_id(id) else {
         return false;
@@ -580,13 +678,23 @@ unsafe fn prime(slot: *mut MethodSiteSlot, recv: f64, name: &[u8], argc: usize) 
         prime_function(slot, addr, name, argc);
         return;
     }
-    let Some(obj) = ordinary_receiver(addr) else {
-        let dict = crate::value::addr_class::try_read_gc_header(addr)
-            .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
-            && !crate::closure::is_closure_ptr(addr)
-            && super::dictionary::is_dictionary(addr as *const ObjectHeader);
-        refuse(if dict { 2 } else { 1 });
-        return;
+    // A per-evaluation class object (`ClassExprFresh`) serves its OWN keys
+    // only: its static methods are own data properties of it, born in its
+    // template's final shape, but what it inherits follows its pinned
+    // parent, not a [[Prototype]] a holder entry could name.
+    let (obj, own_only) = match ordinary_receiver(addr) {
+        Some(obj) => (obj, false),
+        None => match class_object_receiver(addr) {
+            Some(obj) => (obj, true),
+            None => {
+                let dict = crate::value::addr_class::try_read_gc_header(addr)
+                    .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
+                    && !crate::closure::is_closure_ptr(addr)
+                    && super::dictionary::is_dictionary(addr as *const ObjectHeader);
+                refuse(if dict { 2 } else { 1 });
+                return;
+            }
+        },
     };
     let Some(shape) = super::shapes::object_shape_descriptor(obj) else {
         refuse(1);
@@ -691,6 +799,10 @@ unsafe fn prime(slot: *mut MethodSiteSlot, recv: f64, name: &[u8], argc: usize) 
         }
         return;
     }
+    if own_only {
+        refuse(1);
+        return;
+    }
     prime_inherited(slot, obj, word, name, argc);
 }
 
@@ -784,6 +896,43 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
     }
     let stamp = super::shapes::object_shape_stamp(obj);
     if !super::shapes::is_shape_id(stamp) {
+        return None;
+    }
+    let meta = (*obj).meta;
+    if !meta.is_null()
+        && ((*meta).elements != 0
+            || (*meta).flags & super::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER != 0)
+    {
+        return None;
+    }
+    Some(obj)
+}
+
+/// A class object an own entry may serve: everything [`ordinary_receiver`]
+/// asks of an ordinary object, on an object whose shape kind is `Class`.
+///
+/// # Safety
+/// `addr` is a plausible object address.
+unsafe fn class_object_receiver(addr: usize) -> Option<*const ObjectHeader> {
+    if !crate::value::addr_class::is_above_handle_band(addr) {
+        return None;
+    }
+    let header = crate::value::addr_class::try_read_gc_header(addr)?;
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || crate::closure::is_closure_ptr(addr)
+        || !address_is_prime_stable(addr)
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
+        || !super::class_registry::is_class_object_ptr(addr as *const u8)
+    {
+        return None;
+    }
+    // A class object is not `object_is_regular` (its kind is `Class`), but
+    // its own keys live in inline slots exactly as an ordinary object's do.
+    let obj = addr as *const ObjectHeader;
+    if super::dictionary::is_dictionary(obj)
+        || !super::shapes::is_shape_id(super::shapes::object_shape_stamp(obj))
+    {
         return None;
     }
     let meta = (*obj).meta;
@@ -961,27 +1110,48 @@ unsafe fn prime_inherited(
         refuse(11);
         return;
     }
-    // Class instances resolve methods through their vtable (D4: until class
-    // prototypes carry real slots).
+    // A declared-class instance's direct prototype is its class's prototype
+    // object (a bare CLASS identity: the class's function object keeps that
+    // link for the agent's life, and a relink retires the displaced
+    // prototype's ShapeId) or the serial a MIXED identity records. Its
+    // methods are real slots of that object (class prototypes hold function
+    // objects of their bodies, with ConstFn lanes), so the entry is the same
+    // holder entry as for any receiver.
     let class_id = (*obj).class_id;
-    if class_id != 0
+    let class_instance = class_id != 0
         && class_id < super::class_registry::prototype_objects::SYNTHETIC_CLASS_ID_BASE
-        && !super::is_anon_shape_class_id(class_id)
-    {
-        refuse(6);
-        return;
-    }
+        && !super::is_anon_shape_class_id(class_id);
     if key_may_be_accessor(obj, name) {
         refuse(8);
         return;
     }
-    // Only a serial or the realm-default identity pins one direct prototype.
-    let Some(proto_id) = read_holder::admitted_proto_id(obj) else {
-        refuse(7);
-        return;
+    let class_holder = if class_instance {
+        match read_holder::class_link(obj) {
+            Some(holder) => Some(holder),
+            None => {
+                refuse(6);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    // Otherwise only a serial or the realm-default identity pins one direct
+    // prototype.
+    let proto_id = match class_holder {
+        Some(_) => super::shapes::PROTO_ID_CLASS,
+        None => match read_holder::admitted_proto_id(obj) {
+            Some(pid) => pid,
+            None => {
+                refuse(7);
+                return;
+            }
+        },
     };
     {
-        let next = if proto_id == super::shapes::PROTO_ID_DEFAULT {
+        let next = if let Some(holder) = class_holder {
+            holder
+        } else if proto_id == super::shapes::PROTO_ID_DEFAULT {
             crate::array::object_prototype_addr_if_resolved() as *const ObjectHeader
         } else {
             next_prototype(obj)
@@ -1278,5 +1448,16 @@ mod constfn_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod report_names_line_up {
+    #[test]
+    fn refusal_names_cover_every_counter() {
+        assert_eq!(super::refusal_name(0), "not_object_pointer");
+        assert_eq!(super::refusal_name(11), "inh_workers");
+        assert_eq!(super::refusal_name(18), "site_megamorphic");
+        assert_eq!(super::refusal_name(19), "?");
     }
 }

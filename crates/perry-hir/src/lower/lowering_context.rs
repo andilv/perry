@@ -163,6 +163,10 @@ pub struct LoweringContext {
     /// LocalIds that represent immutable bindings (`const`, imports, and
     /// other lexical bindings that must throw when assigned).
     pub(crate) immutable_locals: HashSet<LocalId>,
+    /// Parameters that nothing in their function can rebind after entry
+    /// (`lower::unrebound_params`). A read of one yields the value of any
+    /// earlier read. Ids are unique per lowering, so the set is never pruned.
+    pub(crate) unrebound_params: HashSet<LocalId>,
     /// Global variables: name -> (id, type)
     // #854: initialized in `new` but currently unread (globals tracked
     // elsewhere). Retained alongside `next_global_id` for the global table.
@@ -661,6 +665,14 @@ pub struct LoweringContext {
     /// (non-var) bindings. Populated by pre_register_forward_captured_lets
     /// and drained when the body's prealloc set is assembled.
     pub(crate) tdz_forward_ids: HashSet<LocalId>,
+    /// #11826: ids of the module-level `let`/`const` bindings (pre-registered
+    /// before the main pass). `module_tdz` gives them their dead zone.
+    pub(crate) module_lexical_ids: HashSet<LocalId>,
+    /// #11826: for each class a top-level statement defined directly, the
+    /// `module.init` length when that statement began. A class absent here
+    /// (one defined inside a function body or expression) counts as defined
+    /// at the start.
+    pub(crate) class_def_positions: HashMap<String, usize>,
     /// Names of lexical `let`/`const`/`class` bindings declared in the current
     /// (or an enclosing, same-function) block scope that are still resolvable as
     /// forward references — i.e. a bare read of the name before its declarator

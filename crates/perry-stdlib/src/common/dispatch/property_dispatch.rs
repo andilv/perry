@@ -5,7 +5,6 @@ use crate::common::feature_hooks::{Hook, PropertyArm};
 
 // One slot per optional-feature position in `js_handle_property_dispatch`, in
 // hub order; see `method_dispatch.rs` for the scheme.
-static PROP_EVENTS: Hook<PropertyArm> = Hook::empty();
 static PROP_TLS: Hook<PropertyArm> = Hook::empty();
 static PROP_STREAMS: Hook<PropertyArm> = Hook::empty();
 static PROP_ZLIB: Hook<PropertyArm> = Hook::empty();
@@ -45,8 +44,6 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
     {
         return value;
     }
-
-    try_arm!(PROP_EVENTS, handle, property_name);
 
     if let Some(value) = dispatch_async_local_storage_property(handle, property_name) {
         return value;
@@ -122,14 +119,6 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
 
     // Unknown handle type - return undefined
     f64::from_bits(0x7FFC_0000_0000_0001)
-}
-
-#[cfg(any(feature = "bundled-events", feature = "external-events-construct"))]
-unsafe fn prop_events(handle: i64, property_name: &str) -> Option<f64> {
-    if let Some(value) = dispatch_event_emitter_property(handle, property_name) {
-        return Some(value);
-    }
-    None
 }
 
 #[cfg(all(
@@ -621,43 +610,6 @@ unsafe fn prop_fetch(handle: i64, property_name: &str) -> Option<f64> {
 
 #[cfg(feature = "crypto")]
 unsafe fn prop_crypto(handle: i64, property_name: &str) -> Option<f64> {
-    if matches!(
-        property_name,
-        "update"
-            | "digest"
-            | "copy"
-            | "write"
-            | "end"
-            | "on"
-            | "once"
-            | "addListener"
-            | "pipe"
-            | "setEncoding"
-            | "destroy"
-            | "close"
-    ) && with_handle::<crate::crypto::HashHandle, bool, _>(handle, |_| true).unwrap_or(false)
-    {
-        return Some(crate::crypto::dispatch_hash_property(handle, property_name));
-    }
-
-    if matches!(
-        property_name,
-        "update"
-            | "digest"
-            | "write"
-            | "end"
-            | "on"
-            | "once"
-            | "addListener"
-            | "pipe"
-            | "setEncoding"
-            | "destroy"
-            | "close"
-    ) && with_handle::<crate::crypto::HmacHandle, bool, _>(handle, |_| true).unwrap_or(false)
-    {
-        return Some(crate::crypto::dispatch_hmac_property(handle, property_name));
-    }
-
     if matches!(property_name, "update" | "sign")
         && with_handle::<crate::crypto::SignHandle, bool, _>(handle, |_| true).unwrap_or(false)
     {
@@ -743,29 +695,10 @@ unsafe fn prop_crypto(handle: i64, property_name: &str) -> Option<f64> {
         return Some(crate::crypto::dispatch_x509_property(handle, property_name));
     }
 
-    // Issue #1111: CipherHandle method-as-value reads. Returns a
-    // bound-method closure for `update` / `final` / `getAuthTag` /
-    // `setAuthTag` / `setAAD` / `setAutoPadding` so `c.getAuthTag?.()` doesn't short-circuit
-    // on the optional-chain `c.getAuthTag == null` check. Same disjoint
-    // method-name gate as the method-dispatch arm above.
-    if matches!(
-        property_name,
-        "update" | "final" | "getAuthTag" | "setAuthTag" | "setAAD" | "setAutoPadding"
-    ) && with_handle::<crate::crypto::CipherHandle, bool, _>(handle, |_| true).unwrap_or(false)
-    {
-        return Some(crate::crypto::dispatch_cipher_property(
-            handle,
-            property_name,
-        ));
-    }
     None
 }
 
 // Per-feature slot fills, called from the owning feature's install.
-#[cfg(any(feature = "bundled-events", feature = "external-events-construct"))]
-pub(super) fn install_events() {
-    PROP_EVENTS.set(prop_events);
-}
 #[cfg(all(
     feature = "tls-runtime",
     not(target_os = "ios"),

@@ -71,6 +71,12 @@ pub const CLASS_FIRST_EVALUATION_STATE: u64 = 0x7FFE_0000_0000_0001;
 /// `gc::GC_TYPE_CLOSURE`: the GcHeader type byte (at payload - 8) that makes a
 /// cell a function object. The kind is this byte, never a payload magic.
 pub const GC_TYPE_CLOSURE: u8 = 4;
+/// `gc::GC_TYPE_BUFFER` and `gc::GC_TYPE_BUFFER_UINT8ARRAY`: the GcHeader type
+/// bytes of the two BYTE-VIEW buffer brands, a Node `Buffer` and a
+/// `BufferHeader`-backed `Uint8Array` (#10694: a buffer's flavor is its type
+/// byte). Emitted byte-access guards accept exactly these two.
+pub const GC_TYPE_BUFFER: u8 = 10;
+pub const GC_TYPE_BUFFER_UINT8ARRAY: u8 = 26;
 /// `gc::GC_FLAG_FORWARDED` (GcHeader byte 1): an evacuated from-space stub.
 pub const GC_FLAG_FORWARDED: u8 = 0x80;
 /// `gc::GC_HEADER_SIZE`.
@@ -306,7 +312,9 @@ pub struct JsFunctionInfo {
     pub trusted_boxed_mask: u64,
     /// A compiler-private versioned-loop callback clone (null when none).
     pub versioned_code: *const u8,
-    /// Captures the versioned-loop clone was compiled for.
+    /// Captures the versioned-loop clone was compiled for. When
+    /// [`FN_HAS_SOURCE`] is set and `versioned_code` is null, this otherwise
+    /// idle word instead carries the source byte length.
     pub versioned_captures: u32,
     /// The JS-visible declared parameter count (valid with
     /// [`FN_HAS_DECLARED`]): what `.length` falls back to. It can differ
@@ -316,7 +324,9 @@ pub struct JsFunctionInfo {
     /// [`JsFunctionInfo::of`] (typed) or the `unsafe`
     /// [`JsFunctionInfo::from_code`].
     reserved: u16,
-    /// The versioned-loop clone's boxed-capture mask.
+    /// The versioned-loop clone's boxed-capture mask. When
+    /// [`FN_HAS_SOURCE`] is set and `versioned_code` is null, this otherwise
+    /// idle word instead carries the signed 64-bit source displacement.
     pub versioned_boxed_mask: u64,
 }
 
@@ -362,6 +372,14 @@ pub const FN_PERMANENT_IMAGE: u32 = 1 << 12;
 /// ordinary ones: the runtime decides that from this bit, once per body,
 /// instead of probing the callee against every built-in on each use.
 pub const FN_COMPILED_BODY: u32 = 1 << 13;
+/// A compiler-emitted info carries retained source. When `versioned_code` is
+/// null, its otherwise idle versioned-captures fields carry byte length and
+/// signed displacement; an info that also has a versioned clone is followed
+/// by two `i32`s. Runtime/native infos stay [`JS_FUNCTION_INFO_SIZE`] bytes.
+pub const FN_HAS_SOURCE: u32 = 1 << 14;
+/// The retained source describes an ordinary non-strict function. Methods,
+/// arrows and strict ordinary functions leave this clear.
+pub const FN_NON_STRICT_ORDINARY: u32 = 1 << 15;
 
 /// Byte offsets of the fields codegen emits and emitted code reads.
 pub const JS_FUNCTION_INFO_CODE_OFFSET: usize = 0;
@@ -556,13 +574,23 @@ pub const PIC_HOLDER_KIND_WORD: usize = 15;
 /// [`PIC_HOLDER_ACCESSOR_BIT`] over the holder's inline slot (low 32 bits);
 /// [`PIC_HOLDER_PAIR_WORD`] holds the raw address of the accessor pair that
 /// slot held when the site primed (a strong root the collector rewrites), and
-/// [`PIC_HOLDER_GETTER_WORD`] the compiled getter that pair names
-/// (`double get(double this)`; 0 for a setter-only pair). A hit is the
-/// receiver token, the holder's ShapeId and the slot's value equal to the
-/// pair: then the getter is called with the receiver as `this`.
+/// [`PIC_HOLDER_GETTER_WORD`] the code the hit calls for the getter that pair
+/// names, as `double get(double this, i64 pair)` (0 when only the collecting
+/// slow call answers the entry: a setter-only pair, or a lane in the holder's
+/// spill storage, see [`PIC_HOLDER_SLOT_SPILL_BIT`]):
+/// a compiled class getter, which declares `this` only (the pair is
+/// over-applied), or the runtime's closure-getter entry, which calls the
+/// function object in the pair's getter element through the closure ABI. A
+/// hit is the receiver token, the holder's ShapeId and the slot's value equal
+/// to the pair: then the getter is called with the receiver as `this`.
 pub const PIC_HOLDER_ACCESSOR_BIT: i64 = 1 << 61;
 pub const PIC_HOLDER_PAIR_WORD: usize = 16;
 pub const PIC_HOLDER_GETTER_WORD: usize = 19;
+/// A holder slot word (the low 32 bits of an entry's kind) with this bit set
+/// names a position in the holder's SPILL storage, not an inline slot. The
+/// emitted accessor arm loads inline lanes only: a spill lane's accessor entry
+/// keeps getter word 0, and the collecting slow call answers it.
+pub const PIC_HOLDER_SLOT_SPILL_BIT: i64 = 1 << 31;
 
 /// `proxy::put_value::setter_site` (#10498): the word of a static-key store
 /// site's ways cache that names the site's compiled-setter entry, as

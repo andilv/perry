@@ -541,34 +541,6 @@ pub extern "C" fn js_proxy_is_proxy(value: f64) -> i32 {
     }
 }
 
-/// Resolve the backing object used by Perry's private-element storage without
-/// invoking any Proxy trap.  Private names use the object's internal
-/// [[PrivateElements]] list in ECMAScript; they are deliberately not ordinary
-/// `[[Get]]`/`[[Set]]` operations.  Perry's Proxy is a stable registry handle,
-/// so its private storage lives on the backing target and all private-element
-/// entry points consistently resolve through this helper.
-pub(crate) fn private_element_receiver(mut value: f64) -> f64 {
-    for _ in 0..32 {
-        let Some(id) = lookup(value) else {
-            return value;
-        };
-        let (target, revoked) = PROXIES.with(|p| {
-            p.borrow()
-                .get(id as usize)
-                .and_then(|entry| entry.as_ref())
-                .map(|entry| (entry.target, entry.revoked))
-                .unwrap_or((f64::from_bits(TAG_UNDEFINED), false))
-        });
-        if revoked {
-            revoked_return_with_message(
-                "Cannot access a private element on a proxy that has been revoked",
-            );
-        }
-        value = target;
-    }
-    value
-}
-
 /// `IsArray`'s Proxy branch (ECMA-262 §7.2.2). If `value` is a live Proxy,
 /// returns `Some(target)` so the caller can recurse on the target; if the Proxy
 /// has been revoked, throws a `TypeError` (does not return). Returns `None` for
@@ -2332,11 +2304,16 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                     && !crate::closure::closure_has_own_dynamic_prop(cur_ptr, &name)
                 {
                     let closure = cur_ptr as *const crate::closure::ClosureHeader;
-                    let func_ptr = crate::closure::get_valid_func_ptr(closure);
-                    let is_non_strict_ordinary_function = !func_ptr.is_null()
-                        && crate::builtins::function_is_non_strict_ordinary_for_ptr(
-                            func_ptr as usize,
-                        );
+                    let is_non_strict_ordinary_function = crate::closure::closure_info(closure)
+                        .is_some_and(|info| {
+                            if info.flags & crate::codegen_abi::FN_HAS_SOURCE != 0 {
+                                info.flags & crate::codegen_abi::FN_NON_STRICT_ORDINARY != 0
+                            } else {
+                                crate::builtins::function_is_non_strict_ordinary_for_ptr(
+                                    info.code as usize,
+                                )
+                            }
+                        });
                     if is_non_strict_ordinary_function {
                         return false;
                     }

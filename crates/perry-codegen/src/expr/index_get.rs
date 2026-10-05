@@ -676,9 +676,29 @@ fn lower_bounded_array_index_get_checked(
     arr_box: &str,
     idx_i32: &str,
 ) -> Result<String> {
+    let lazy_idx = ctx.new_block("bidx.lazy");
+    let header_idx = ctx.new_block("bidx.header");
+    let fast_idx = ctx.new_block("bidx.fast");
+    let merge_idx = ctx.new_block("bidx.merge");
+    let lazy_label = ctx.block_label(lazy_idx);
+    let header_label = ctx.block_label(header_idx);
+    let fast_label = ctx.block_label(fast_idx);
+    let merge_label = ctx.block_label(merge_idx);
+
     let blk = ctx.block();
     let arr_bits = blk.bitcast_double_to_i64(arr_box);
     let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
+    // #11875: the receiver must be a heap pointer before its header is read.
+    // A declared `T[]` is a hint: a Proxy bound to it is a POINTER-tagged id in
+    // the handle band, and the header loads below dereferenced it (SIGSEGV in
+    // a counter loop over `Body[]`). The fused tag + handle-band compare every
+    // sibling element guard already pays (`receiver_range`); anything else
+    // takes the generic read, which routes a proxy through its `[[Get]]`.
+    let receiver = crate::expr::receiver_range::emit_fused_receiver_test(blk, &arr_bits);
+    blk.cond_br(&receiver.is_object_pointer, &header_label, &lazy_label);
+
+    ctx.current_block = header_idx;
+    let blk = ctx.block();
 
     // Issue #179 Phase 3: lazy-array guard on the bounded-index fast path.
     // Same story as the generic path below: a LazyArrayHeader has unrelated
@@ -721,13 +741,6 @@ fn lower_bounded_array_index_get_checked(
     let desc_bits = blk.and(I16, &obj_flags, "1024");
     let has_desc = blk.icmp_ne(I16, &desc_bits, "0");
     let needs_slow = blk.or(I1, &needs_slow, &has_desc);
-
-    let lazy_idx = ctx.new_block("bidx.lazy");
-    let fast_idx = ctx.new_block("bidx.fast");
-    let merge_idx = ctx.new_block("bidx.merge");
-    let lazy_label = ctx.block_label(lazy_idx);
-    let fast_label = ctx.block_label(fast_idx);
-    let merge_label = ctx.block_label(merge_idx);
     ctx.block().cond_br(&needs_slow, &lazy_label, &fast_label);
 
     ctx.current_block = lazy_idx;
@@ -748,19 +761,22 @@ fn lower_bounded_array_index_get_checked(
     let element_addr = fast_blk.add(I64, &elements_addr, &byte_offset);
     let element_ptr = fast_blk.inttoptr(I64, &element_addr);
     let fast_raw = fast_blk.load(DOUBLE, &element_ptr);
-    // `new Array(n)` slots are TAG_HOLE internally; JavaScript reads expose
-    // `undefined`.
+    // #11876: a hole (`delete a[i]`, `new Array(n)`) is not `undefined`: per
+    // OrdinaryGet the read continues on the prototype chain, where
+    // `Array.prototype[i]` (or a custom prototype) can answer. Nothing on this
+    // path proves the chain carries no indexed property, so a hole takes the
+    // generic read above (`js_array_get_f64` resolves it through
+    // `array_oob_prototype_get`). A present element costs the same compare
+    // and a branch in place of the old `select`.
     let fast_raw_bits = fast_blk.bitcast_double_to_i64(&fast_raw);
     let is_hole = fast_blk.icmp_eq(I64, &fast_raw_bits, crate::nanbox::TAG_HOLE_I64);
-    let undef_d = fast_blk.bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
-    let fast_val = fast_blk.select(I1, &is_hole, DOUBLE, &undef_d, &fast_raw);
     let fast_end_label = fast_blk.label.clone();
-    fast_blk.br(&merge_label);
+    fast_blk.cond_br(&is_hole, &lazy_label, &merge_label);
 
     ctx.current_block = merge_idx;
     Ok(ctx.block().phi(
         DOUBLE,
-        &[(&fast_val, &fast_end_label), (&lazy_val, &lazy_end_label)],
+        &[(&fast_raw, &fast_end_label), (&lazy_val, &lazy_end_label)],
     ))
 }
 

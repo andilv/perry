@@ -17,18 +17,20 @@ use std::sync::{LazyLock, Mutex};
 use perry_runtime::agent::AgentId;
 use perry_runtime::closure::ClosureHeader;
 use perry_runtime::string::{js_string_from_bytes, StringHeader};
-use perry_runtime::thread::{
-    deserialize_nanbox_on_current_thread, serialize_nanbox_for_thread, SerializedValue,
-};
+use perry_runtime::thread::{deserialize_nanbox_on_current_thread, SerializedValue};
 use perry_runtime::value::JSValue;
 
 // #7764: async-bridge entry points that exist in both feature configurations.
 mod async_shim;
 mod broadcast_channel;
 mod channel_pump;
+mod clone;
 mod direct_message;
+mod entry_table;
+mod inbox;
 mod message_port;
 mod parent_port;
+mod thread_values;
 mod worker_options;
 mod worker_pump;
 mod worker_surface;
@@ -42,8 +44,14 @@ pub use channel_pump::{
 // points, which moved into sibling modules to keep this file under the
 // 2000-line lint cap.
 pub use broadcast_channel::js_worker_threads_broadcast_channel_new;
+pub use entry_table::{js_worker_threads_register_entry, js_worker_threads_worker_new_by_spec};
+pub use thread_values::{
+    js_worker_threads_is_main_thread, js_worker_threads_parent_port,
+    js_worker_threads_resource_limits, js_worker_threads_thread_id, js_worker_threads_thread_name,
+};
 pub use worker_pump::{js_worker_threads_has_pending, js_worker_threads_process_pending};
 
+use clone::clone_message;
 use message_port::message_port_object;
 use worker_pump::{deliver_parent_port_message, start_stdin_reader};
 
@@ -124,9 +132,8 @@ thread_local! {
 }
 
 /// Per-port state for a same-process MessageChannel (#3157). A `MessageChannel`
-/// creates two ports linked as peers; `port.postMessage(v)` JSON-serializes `v`
-/// (structured-clone-like value semantics, matching the existing stdin/stdout
-/// IPC path) and enqueues it on the PEER's `inbox`. The event-loop pump drains
+/// creates two ports linked as peers; `port.postMessage(v)` structured-clones
+/// `v` (`clone.rs`) and enqueues it on the PEER's `inbox`. The event-loop pump drains
 /// inboxes and fires the `message` callback; `receiveMessageOnPort(port)` pops a
 /// single queued message synchronously without involving the pump.
 #[derive(Default)]
@@ -135,8 +142,8 @@ struct MessagePortState {
     peer: u64,
     /// NaN-boxed MessagePort object value, used as MessageEvent target.
     object_bits: u64,
-    /// Queue of delivered structured-clone snapshots (oldest first).
-    inbox: VecDeque<SerializedMessage>,
+    /// Queue of delivered structured clones (oldest first).
+    inbox: VecDeque<SerializedValue>,
     /// Node-style `message` listeners registered through on()/once().
     message_cbs: Vec<EventListener>,
     /// Node-style `close` listeners registered through on()/once().
@@ -170,8 +177,8 @@ struct BroadcastChannelState {
     name: String,
     /// NaN-boxed BroadcastChannel object value, used as MessageEvent target.
     object_bits: u64,
-    /// Queue of delivered structured-clone snapshots (oldest first).
-    inbox: VecDeque<SerializedMessage>,
+    /// Queue of delivered structured clones (oldest first).
+    inbox: VecDeque<SerializedValue>,
     /// `message` listeners registered through addEventListener().
     message_event_cbs: Vec<EventListener>,
     /// Whether `close()` has detached this BroadcastChannel.
@@ -213,8 +220,37 @@ enum WorkerCommand {
     Terminate,
 }
 
+/// The parent's end of a worker's command channel. Every send also wakes the
+/// worker's own loop: while the worker has I/O in flight it blocks in that
+/// loop, not on this channel (see the wait in `js_worker_threads_worker_new`).
+#[derive(Clone)]
+struct WorkerSender {
+    tx: Sender<WorkerCommand>,
+    /// The worker's agent id, published by the worker thread before it runs
+    /// any JS (so before it can have I/O in flight); 0 until then.
+    agent: std::sync::Arc<AtomicU64>,
+}
+
+impl WorkerSender {
+    fn new(tx: Sender<WorkerCommand>) -> Self {
+        Self {
+            tx,
+            agent: std::sync::Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn send(&self, command: WorkerCommand) -> Result<(), mpsc::SendError<WorkerCommand>> {
+        self.tx.send(command)?;
+        let agent = self.agent.load(Ordering::Acquire);
+        if agent != 0 {
+            perry_runtime::event_pump::notify_agent_loop(agent);
+        }
+        Ok(())
+    }
+}
+
 struct WorkerRecord {
-    sender: Sender<WorkerCommand>,
+    sender: WorkerSender,
     /// NaN-boxed Worker handle used as the target for property handlers such
     /// as `worker.onmessage = fn`. Kept as a mutable GC root below.
     object_bits: u64,
@@ -258,7 +294,8 @@ struct WorkerListener {
 enum WorkerEvent {
     Online(u64),
     Message(u64, SerializedValue),
-    Error(u64),
+    /// The worker ended on an uncaught exception: a clone of the thrown value.
+    Error(u64, SerializedValue),
     Exit(u64, i32),
 }
 
@@ -392,7 +429,7 @@ pub(crate) mod thread_exit_probe {
             }],
         );
         let mut record = WorkerRecord {
-            sender: tx,
+            sender: WorkerSender::new(tx),
             object_bits,
             listeners,
             alive: false,
@@ -667,6 +704,10 @@ fn string_coerce(value: f64) -> f64 {
     f64::from_bits(JSValue::string_ptr(ptr).bits())
 }
 
+extern "C" {
+    fn js_run_agent_pumps() -> i32;
+}
+
 /// #10854: a worker must get event-loop turns, or an `async` `onmessage` handler
 /// never resumes after its first `await` and the reply is never posted.
 ///
@@ -703,11 +744,27 @@ fn pump_worker_microtasks() {
         // this worker's arena. That is what lets `await` of a timer — or of
         // anything a timer ultimately resolves — resume inside a worker.
         ran += perry_runtime::timer::js_await_loop_tick_timers();
+        // This worker's native completions (#11433 tags each with its owner
+        // agent, so this settles only promises in this worker's heap): a
+        // fetch's response lands here once a turn of the worker's own loop
+        // collects it, and nothing else ever settles it.
+        ran += crate::common::async_bridge::js_stdlib_process_pending();
+        // Extension events this worker made (its zlib streams): their queues
+        // are per agent, and only this thread may deliver them.
+        ran += unsafe { js_run_agent_pumps() };
         if ran == 0 {
             break;
         }
     }
+    // The microtask checkpoint: a rejection nothing handled is reported here.
+    // In a worker it ends the worker (see `run_worker_body`).
+    perry_runtime::promise::js_promise_report_unhandled_rejections();
 }
+
+/// Upper bound on one park in the worker's own loop while it has I/O in
+/// flight. Completions and sends wake the park early; this only bounds how
+/// stale an unrelated check (a close request) can get.
+const WORKER_IO_PARK_MS: u64 = 1000;
 
 /// How long the worker may block waiting for its next command.
 ///
@@ -761,167 +818,6 @@ extern "C" fn worker_threads_channels_microtask(
 ) -> f64 {
     js_worker_threads_channels_process_pending();
     js_undefined()
-}
-
-/// Same-agent message snapshot. JSON remains the fallback for ordinary
-/// values; typed arrays retain their element kind and are reconstructed as a
-/// fresh typed array rather than degrading to a plain JSON object (#6763).
-#[derive(Clone)]
-enum SerializedMessage {
-    Json(String),
-    ArrayBuffer(Vec<u8>),
-    BigIntTypedArray { kind: u8, lanes: Vec<u64> },
-    TypedArray { kind: u8, elements: Vec<f64> },
-}
-
-fn serialize_message(value: f64) -> SerializedMessage {
-    let raw = perry_runtime::value::js_nanbox_get_pointer(value) as usize;
-    // Perry's Uint8Array constructor is BufferHeader-backed rather than a
-    // TypedArrayHeader, so preserve that branded representation too.
-    if perry_runtime::buffer::is_uint8array_buffer(raw) {
-        let buffer = raw as *const perry_runtime::buffer::BufferHeader;
-        let len = perry_runtime::buffer::js_buffer_length(buffer).max(0);
-        let elements = (0..len)
-            .map(|index| perry_runtime::buffer::js_buffer_get(buffer, index) as f64)
-            .collect();
-        return SerializedMessage::TypedArray {
-            kind: perry_runtime::typedarray::KIND_UINT8,
-            elements,
-        };
-    }
-    if perry_runtime::buffer::is_array_buffer(raw) {
-        let buffer = raw as *const perry_runtime::buffer::BufferHeader;
-        let len = perry_runtime::buffer::js_buffer_length(buffer).max(0);
-        let bytes = (0..len)
-            .map(|index| perry_runtime::buffer::js_buffer_get(buffer, index) as u8)
-            .collect();
-        return SerializedMessage::ArrayBuffer(bytes);
-    }
-    if let Some(kind) = perry_runtime::typedarray::lookup_typed_array_kind(raw) {
-        let typed = raw as *const perry_runtime::typedarray::TypedArrayHeader;
-        let len = perry_runtime::typedarray::js_typed_array_length(typed).max(0);
-        if matches!(
-            kind,
-            perry_runtime::typedarray::KIND_BIGINT64 | perry_runtime::typedarray::KIND_BIGUINT64
-        ) {
-            let lanes = (0..len)
-                .map(|index| {
-                    perry_runtime::typedarray::bigint_lane_bits(typed, index).unwrap_or_default()
-                })
-                .collect();
-            return SerializedMessage::BigIntTypedArray { kind, lanes };
-        }
-        let elements = (0..len)
-            .map(|index| perry_runtime::typedarray::js_typed_array_get(typed, index))
-            .collect();
-        return SerializedMessage::TypedArray { kind, elements };
-    }
-
-    let str_ptr = unsafe { js_json_stringify(value, 0) };
-    SerializedMessage::Json(
-        string_header_to_string(str_ptr).unwrap_or_else(|| "undefined".to_string()),
-    )
-}
-
-fn deserialize_message(msg: &SerializedMessage) -> f64 {
-    match msg {
-        SerializedMessage::ArrayBuffer(bytes) => {
-            let buffer = perry_runtime::buffer::js_array_buffer_new(bytes.len() as i32);
-            for (index, value) in bytes.iter().enumerate() {
-                perry_runtime::buffer::js_buffer_set(buffer, index as i32, *value as i32);
-            }
-            f64::from_bits(JSValue::pointer(buffer as *const u8).bits())
-        }
-        SerializedMessage::BigIntTypedArray { kind, lanes } => {
-            let typed = perry_runtime::typedarray::js_typed_array_new_empty(
-                *kind as i32,
-                lanes.len() as i32,
-            );
-            for (index, bits) in lanes.iter().enumerate() {
-                perry_runtime::typedarray::set_bigint_lane_bits(typed, index as i32, *bits);
-            }
-            f64::from_bits(JSValue::pointer(typed as *const u8).bits())
-        }
-        SerializedMessage::TypedArray { kind, elements } => {
-            if *kind == perry_runtime::typedarray::KIND_UINT8 {
-                let buffer = perry_runtime::buffer::js_uint8array_alloc(elements.len() as i32);
-                for (index, value) in elements.iter().enumerate() {
-                    perry_runtime::buffer::js_buffer_set(buffer, index as i32, *value as i32);
-                }
-                return f64::from_bits(JSValue::pointer(buffer as *const u8).bits());
-            }
-            let typed = perry_runtime::typedarray::js_typed_array_new_empty(
-                *kind as i32,
-                elements.len() as i32,
-            );
-            for (index, value) in elements.iter().enumerate() {
-                perry_runtime::typedarray::js_typed_array_set(typed, index as i32, *value);
-            }
-            f64::from_bits(JSValue::pointer(typed as *const u8).bits())
-        }
-        SerializedMessage::Json(json) => {
-            if json == "undefined" || json.is_empty() {
-                return js_undefined();
-            }
-            let str_ptr = js_string_from_bytes(json.as_ptr(), json.len() as u32);
-            f64::from_bits(unsafe { js_json_parse(str_ptr) })
-        }
-    }
-}
-
-/// Reject functions, symbols, marked values, and MessagePorts anywhere in a
-/// submitted message graph. The visited set makes cyclic graphs terminate;
-/// JSON remains the ordinary-object snapshot fallback.
-fn message_value_is_uncloneable(value: f64, visited: &mut HashSet<usize>) -> bool {
-    let js = JSValue::from_bits(value.to_bits());
-    if !js.is_pointer() {
-        return false;
-    }
-    let raw = perry_runtime::value::js_nanbox_get_pointer(value) as usize;
-    // Node deliberately ignores markAsUncloneable(ArrayBuffer): backing
-    // stores remain cloneable (and transferable) even when marked.
-    if UNCLONEABLE_OBJECTS.with(|set| set.borrow().contains(&value.to_bits()))
-        && !perry_runtime::buffer::is_array_buffer(raw)
-    {
-        return true;
-    }
-    if raw < 0x10000
-        || perry_runtime::buffer::is_registered_buffer(raw)
-        || perry_runtime::typedarray::lookup_typed_array_kind(raw).is_some()
-        || perry_runtime::set::is_registered_set(raw)
-        || perry_runtime::shared_sab::is_shared_sab(raw)
-    {
-        return false;
-    }
-    if perry_runtime::closure::is_closure_ptr(raw)
-        || perry_runtime::symbol::is_registered_symbol(raw)
-        || port_id_from_object(value).is_some()
-    {
-        return true;
-    }
-    if !visited.insert(raw) {
-        return false;
-    }
-
-    if let Some(array) = array_ptr_from_value(value) {
-        let len = perry_runtime::array::js_array_length(array);
-        return (0..len).any(|index| {
-            message_value_is_uncloneable(
-                perry_runtime::array::js_array_get_f64(array, index),
-                visited,
-            )
-        });
-    }
-    let Some(object) = object_ptr_from_value(value) else {
-        return false;
-    };
-    // The exact live-slot bound includes private class fields too; enumeration
-    // helpers intentionally filter those and are therefore not a substitute.
-    let field_count = unsafe { perry_runtime::object_live_slot_count(object) };
-    (0..field_count).any(|index| {
-        let field = perry_runtime::object::js_object_get_field(object, index);
-        message_value_is_uncloneable(f64::from_bits(field.bits()), visited)
-    })
 }
 
 fn call_callback1(callback_bits: u64, this_bits: u64, arg: f64) {
@@ -1115,9 +1011,10 @@ extern "C" fn worker_post_message(
     closure: *const ClosureHeader,
     _this: perry_runtime::closure::JsThis,
     value: f64,
+    transfer: f64,
 ) -> f64 {
     let worker_id = captured_worker_id(closure);
-    let message = unsafe { serialize_nanbox_for_thread(value.to_bits()) };
+    let message = clone_message(value, transfer);
     let sender = WORKERS
         .lock()
         .unwrap()
@@ -1363,8 +1260,8 @@ pub extern "C" fn js_worker_threads_receive_message_on_port(port: f64) -> f64 {
         None
     };
     match msg {
-        Some(json) => {
-            let value = deserialize_message(&json);
+        Some(message) => {
+            let value = f64::from_bits(unsafe { deserialize_nanbox_on_current_thread(&message) });
             let obj = perry_runtime::object::js_object_alloc(0, 0);
             set_object_field(obj, "message", value);
             object_value(obj)
@@ -1456,10 +1353,15 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
         if is_undefined(data) {
             None
         } else {
-            Some(unsafe { serialize_nanbox_for_thread(data.to_bits()) })
+            let scope = perry_runtime::gc::RuntimeHandleScope::new();
+            let data = scope.root_nanbox_f64(data);
+            let transfer = get_object_field_from_value(options, "transferList");
+            Some(clone_message(data.get_nanbox_f64(), transfer))
         }
     };
     let (tx, rx) = mpsc::channel::<WorkerCommand>();
+    let sender = WorkerSender::new(tx);
+    let published_agent = sender.agent.clone();
     let worker_obj = worker_object(worker_id, &options_state);
     let resource_scope = perry_runtime::gc::RuntimeHandleScope::new();
     let mut async_resources = [perry_runtime::async_hooks::AsyncResourceIds {
@@ -1487,7 +1389,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
         resource_handles[2].get_nanbox_f64().to_bits(),
     ];
     let mut record = WorkerRecord {
-        sender: tx,
+        sender: sender.clone(),
         object_bits: object_value(worker_obj).to_bits(),
         listeners: HashMap::new(),
         alive: false,
@@ -1509,6 +1411,10 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
     // shares the parent's class tables instead of building a second copy. Its
     // entry's `js_gc_init` then finds an image already installed and keeps it.
     let class_image = perry_runtime::object::class_image::current_image_handle();
+    // Same image, so the same module initializers: a runtime `require` of a
+    // Deferred module (a function-local or conditional `require`) must find
+    // its initializer on the worker too.
+    let path_inits = perry_runtime::module_require::current_path_init_image();
     // #10399: a worker runs the module graph, so it needs the same stack
     // headroom as the blocking pool — the program's static TLS block is
     // carved from this same mapping (see `async_bridge::RUNTIME`).
@@ -1516,6 +1422,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
         .stack_size(crate::common::thread_config::blocking_thread_stack_size())
         .spawn(move || {
             perry_runtime::object::class_image::adopt_image(class_image);
+            perry_runtime::module_require::adopt_path_init_image(path_inits);
             // #10854/#6185: claim this thread's own agent id BEFORE it can allocate
             // or enqueue anything. A `worker_threads` Worker gets its own arena and
             // GC, but it never claimed an agent, so `current_agent()` fell back to
@@ -1535,6 +1442,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
             // later by `ensure_loop_with` — failing after acceptance instead of
             // taking the fallback path.
             let worker_agent = perry_runtime::agent::enter_worker_agent();
+            published_agent.store(worker_agent, Ordering::Release);
             let previous_env = apply_worker_env(&thread_options.env);
             CURRENT_WORKER_ID.with(|id| id.set(worker_id));
             CURRENT_PARENT_AGENT.with(|agent| agent.set(parent_agent));
@@ -1545,40 +1453,72 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
             CURRENT_WORKER_CLOSE_REQUESTED.with(|closed| closed.set(false));
             worker_surface::install_web_worker_globals();
             push_parent_event(parent_agent, WorkerEvent::Online(worker_id));
+            inbox::install(rx);
 
             let entry: WorkerEntry = unsafe { std::mem::transmute(entry_ptr as usize) };
             let mut exit_code = 0;
+            // An exception the worker leaves unhandled ends the worker, not
+            // the process: it lands in `run_worker_body`.
             let result = catch_unwind(AssertUnwindSafe(|| {
-                'reload: loop {
+                perry_runtime::exception::run_worker_body(|| 'reload: loop {
                     entry();
+                    // Let module-level continuations run, and report a
+                    // module-level rejection nothing handled.
+                    pump_worker_microtasks();
                     if CURRENT_WORKER_CLOSE_REQUESTED.with(Cell::get) {
                         return;
                     }
                     // Keep the worker thread alive to service main→worker messages
-                    // only if it registered a Node-style, EventTarget-style, or
-                    // property-style message consumer.
-                    let has_message_consumer = MESSAGE_CALLBACK.with(|cb| cb.borrow().is_some())
-                        || MESSAGE_EVENT_CALLBACKS.with(|cbs| !cbs.borrow().is_empty())
-                        || worker_surface::web_worker_global_handler("onmessage").is_some();
-                    if !has_message_consumer {
+                    // only if it registered a message consumer.
+                    if !inbox::has_message_consumer() {
                         return;
                     }
                     loop {
                         // #10854: a continuation may be waiting on a timer another
                         // thread owns, so bound the wait when anything is pending.
-                        let received = match worker_wait_budget() {
-                            Some(budget) => match rx.recv_timeout(budget) {
-                                Ok(command) => Ok(command),
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                    pump_worker_microtasks();
-                                    continue;
+                        // A worker with I/O in flight (a fetch, a socket) must turn
+                        // its own loop: only a turn on THIS thread completes that
+                        // I/O, and blocking on the channel instead left every
+                        // fetch in a worker pending forever (OpenCode's TUI server
+                        // timed out fetching models.dev and never finished its
+                        // bootstrap). A send wakes the turn (`WorkerSender::send`),
+                        // and the notification latches, so a message that arrives
+                        // after `try_recv` and before the park is not missed.
+                        let received =
+                            if perry_runtime::event_pump::agent_loop_has_outstanding_work() {
+                                match inbox::try_recv() {
+                                    Ok(command) => Ok(command),
+                                    Err(mpsc::TryRecvError::Empty) => {
+                                        let budget_ms = worker_wait_budget()
+                                            .map_or(WORKER_IO_PARK_MS, |budget| {
+                                                budget.as_millis() as u64
+                                            });
+                                        perry_runtime::event_pump::js_loop_turn_bounded(budget_ms);
+                                        pump_worker_microtasks();
+                                        if CURRENT_WORKER_CLOSE_REQUESTED.with(Cell::get) {
+                                            return;
+                                        }
+                                        continue;
+                                    }
+                                    Err(mpsc::TryRecvError::Disconnected) => {
+                                        Err(std::sync::mpsc::RecvError)
+                                    }
                                 }
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    Err(std::sync::mpsc::RecvError)
+                            } else {
+                                match worker_wait_budget() {
+                                    Some(budget) => match inbox::recv_timeout(budget) {
+                                        Ok(command) => Ok(command),
+                                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                            pump_worker_microtasks();
+                                            continue;
+                                        }
+                                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                            Err(std::sync::mpsc::RecvError)
+                                        }
+                                    },
+                                    None => inbox::recv(),
                                 }
-                            },
-                            None => rx.recv(),
-                        };
+                            };
                         match received {
                             Ok(WorkerCommand::Message(message)) => {
                                 deliver_parent_port_message(&message);
@@ -1616,7 +1556,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
                             Err(_) => break 'reload,
                         }
                     }
-                }
+                })
             }));
             restore_worker_env(previous_env);
             // This arena is about to go away; purge any queue entry still tagged
@@ -1625,20 +1565,44 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
             perry_runtime::agent::retire_agent(worker_agent);
 
             let exit_code = match result {
-                Ok(()) => exit_code,
+                Ok(Ok(())) => exit_code,
+                Ok(Err(thrown)) => {
+                    let error = worker_error_message(thrown);
+                    push_parent_event(parent_agent, WorkerEvent::Error(worker_id, error));
+                    1
+                }
                 Err(_) => {
-                    push_parent_event(parent_agent, WorkerEvent::Error(worker_id));
+                    let error = plain_error_message(b"the worker thread panicked");
+                    push_parent_event(parent_agent, WorkerEvent::Error(worker_id, error));
                     1
                 }
             };
             push_parent_event(parent_agent, WorkerEvent::Exit(worker_id, exit_code));
         });
     if spawned.is_err() {
-        push_parent_event(parent_agent, WorkerEvent::Error(worker_id));
+        let error = plain_error_message(b"the worker thread could not be started");
+        push_parent_event(parent_agent, WorkerEvent::Error(worker_id, error));
         push_parent_event(parent_agent, WorkerEvent::Exit(worker_id, 1));
     }
 
     object_value(worker_obj)
+}
+
+/// The value a worker threw, cloned for its parent's 'error' event. A value
+/// that cannot be cloned arrives as a plain Error saying so.
+fn worker_error_message(thrown: f64) -> SerializedValue {
+    clone::try_clone_message(thrown, js_undefined()).unwrap_or_else(|_| {
+        plain_error_message(b"the worker threw a value that could not be cloned")
+    })
+}
+
+fn plain_error_message(message: &[u8]) -> SerializedValue {
+    SerializedValue::Error {
+        name: b"Error".to_vec(),
+        message: Some(message.to_vec()),
+        stack: None,
+        cause: None,
+    }
 }
 
 /// worker_threads.setEnvironmentData(key, value)
@@ -1702,44 +1666,13 @@ pub extern "C" fn js_worker_threads_get_worker_data() -> f64 {
     f64::from_bits(bits)
 }
 
+/// parentPort.postMessage(data, transfer). Inside a Worker it clones `data`
+/// to the parent; in a process worker it writes JSON to stdout.
 #[no_mangle]
-pub extern "C" fn js_worker_threads_is_main_thread() -> f64 {
-    js_bool(CURRENT_WORKER_ID.with(|id| id.get()) == 0)
-}
-
-/// Get parentPort handle (returns NaN-boxed POINTER_TAG handle)
-#[no_mangle]
-pub extern "C" fn js_worker_threads_parent_port() -> f64 {
-    if CURRENT_WORKER_ID.with(|id| id.get()) != 0 {
-        return object_value(parent_port::worker_parent_port_object());
-    }
-    // On the main thread there is no parent port: Node exposes `parentPort`
-    // as `null` (only a spawned Worker has a MessagePort back to its parent).
-    // Returning a `{}` object here made `if (parentPort)` truthy on the main
-    // thread, diverging from Node.
-    js_null()
-}
-
-#[no_mangle]
-pub extern "C" fn js_worker_threads_thread_name() -> f64 {
-    CURRENT_THREAD_NAME.with(|slot| string_value(&slot.borrow()))
-}
-
-#[no_mangle]
-pub extern "C" fn js_worker_threads_resource_limits() -> f64 {
-    if CURRENT_WORKER_ID.with(|id| id.get()) == 0 {
-        return object_value(empty_object());
-    }
-    CURRENT_RESOURCE_LIMITS
-        .with(|limits| object_value(worker_resource_limits_object(&limits.get())))
-}
-
-/// parentPort.postMessage(data) - JSON-stringify and write to stdout
-#[no_mangle]
-pub extern "C" fn js_worker_threads_post_message(data: f64) -> f64 {
+pub extern "C" fn js_worker_threads_post_message(data: f64, transfer: f64) -> f64 {
     let worker_id = CURRENT_WORKER_ID.with(|id| id.get());
     if worker_id != 0 {
-        let message = unsafe { serialize_nanbox_for_thread(data.to_bits()) };
+        let message = clone_message(data, transfer);
         let parent = CURRENT_PARENT_AGENT.with(Cell::get);
         push_parent_event(parent, WorkerEvent::Message(worker_id, message));
         return js_undefined();
@@ -1780,6 +1713,10 @@ pub extern "C" fn js_worker_threads_on(event_ptr: i64, callback: i64) -> f64 {
         }
     };
 
+    // The stored closure is only a raw pointer: without the root scanner a
+    // collection in the worker moves or frees it, and the next message calls
+    // a stale pointer ("value is not a function").
+    ensure_parent_port_event_gc_scanner();
     match event_name.as_str() {
         "message" => {
             MESSAGE_CALLBACK.with(|cb| {
@@ -1909,7 +1846,13 @@ static KEEP_WT_MARK_AS_UNCLONEABLE: extern "C" fn(f64) -> f64 =
 #[used(compiler)]
 static KEEP_WT_WORKER_NEW: extern "C" fn(i64, f64) -> f64 = js_worker_threads_worker_new;
 #[used(compiler)]
-static KEEP_WT_WORKER_POST_MESSAGE: extern "C" fn(i64, f64) -> f64 =
+static KEEP_WT_WORKER_NEW_BY_SPEC: extern "C" fn(f64, f64) -> f64 =
+    js_worker_threads_worker_new_by_spec;
+#[used(compiler)]
+static KEEP_WT_REGISTER_ENTRY: unsafe extern "C" fn(*const u8, i64, i64) =
+    js_worker_threads_register_entry;
+#[used(compiler)]
+static KEEP_WT_WORKER_POST_MESSAGE: extern "C" fn(i64, f64, f64) -> f64 =
     js_worker_threads_worker_post_message;
 #[used(compiler)]
 static KEEP_WT_WORKER_ON: extern "C" fn(i64, f64, i64) -> f64 = js_worker_threads_worker_on;

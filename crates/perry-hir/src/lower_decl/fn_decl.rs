@@ -177,8 +177,6 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
             let native_info = match type_name.as_str() {
                 "PluginApi" => Some(("perry/plugin", "PluginApi")),
                 "WebSocket" | "WebSocketServer" => Some(("ws", type_name.as_str())),
-                "EventEmitter" => Some(("events", "EventEmitter")),
-                "EventEmitterAsyncResource" => Some(("events", "EventEmitterAsyncResource")),
                 // Web Fetch API: Request / Response / Headers as function
                 // params — same registration the local-init paths get
                 // (destructuring.rs:1457+ for `const r = new Request(…)`).
@@ -311,6 +309,12 @@ pub fn lower_fn_decl(ctx: &mut LoweringContext, fn_decl: &ast::FnDecl) -> Result
     // statements are pulled to the top of the result so forward references
     // resolve, and a synthetic `Stmt::PreallocateBoxes` is emitted for any
     // sibling/forward captures that need a box pre-allocated.
+    crate::lower::unrebound_params::note(
+        ctx,
+        &params,
+        fn_decl.function.params.iter().map(|p| &p.pat),
+        fn_decl.function.body.as_ref(),
+    );
     let mut body = if let Some(ref block) = fn_decl.function.body {
         lower_fn_body_block_stmt(ctx, block)?
     } else {

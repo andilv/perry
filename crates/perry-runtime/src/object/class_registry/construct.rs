@@ -1,3 +1,4 @@
+use super::super::native_module::worker_threads_construct;
 use super::*;
 use crate::JSValue;
 
@@ -213,6 +214,27 @@ pub(crate) unsafe fn nm_ctor_repl(
         });
     }
     None
+}
+
+/// #4995: `new EE()` where `EE = require('events')` or came in as a default /
+/// namespace import (`import EE from 'events'`, `import * as ev from
+/// 'events'; new ev.EventEmitter()`). The callee is the bound
+/// `events.EventEmitter` export value; the instance is the same ordinary
+/// object the static `new EventEmitter()` builds (#10508).
+pub(crate) unsafe fn nm_ctor_events(
+    _module: &str,
+    method: &str,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> Option<f64> {
+    let options = nm_ctor_arg(args_ptr, args_len, 0);
+    match method {
+        "EventEmitter" => Some(crate::node_stream::js_event_emitter_object_new(options)),
+        "EventEmitterAsyncResource" => {
+            Some(crate::node_stream::js_event_emitter_async_resource_object_new(options))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) unsafe fn nm_ctor_stream(
@@ -455,28 +477,6 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
                 );
             }
         }
-        // #4995: `new EE()` where `EE = require('events')` or came in as a
-        // default / namespace import (`import EE from 'events'`, `import * as
-        // ev from 'events'; new ev.EventEmitter()`). The callee is the bound
-        // `events.EventEmitter` export value; without this arm construction
-        // fell through to the generic empty-object path, so the instance had
-        // no `.on`/`.emit`/`.setMaxListeners` (signal-exit's init throws).
-        // Route to the linked emitter impl (perry-stdlib `bundled-events` or
-        // perry-ext-events) via the construct dispatcher registered at
-        // startup — this crate can't call the constructors directly.
-        if module == "events"
-            && matches!(
-                method.as_str(),
-                "EventEmitter" | "EventEmitterAsyncResource"
-            )
-        {
-            let ptr =
-                crate::value::JS_NATIVE_EVENTS_CONSTRUCT.load(std::sync::atomic::Ordering::SeqCst);
-            if !ptr.is_null() {
-                let dispatch: crate::value::JsNativeEventsConstructFn = std::mem::transmute(ptr);
-                return dispatch(method.as_ptr(), method.len(), args_ptr, args_len);
-            }
-        }
         // `new <bound async_hooks.AsyncLocalStorage>()` / `<...AsyncResource>()`.
         // Next.js stores the native ctor on `globalThis.AsyncLocalStorage` and
         // later does `new maybeGlobalAsyncLocalStorage()` (a dynamic callee), so
@@ -493,6 +493,10 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
                 let dispatch: crate::value::JsNativeEventsConstructFn = std::mem::transmute(ptr);
                 return dispatch(method.as_ptr(), method.len(), args_ptr, args_len);
             }
+        }
+        // `new ns.Worker(...)` on the worker_threads namespace as a value.
+        if let Some(worker) = worker_threads_construct(&module, &method, args_ptr, args_len) {
+            return worker;
         }
         if module == "zlib" && matches!(method.as_str(), "ZstdCompress" | "ZstdDecompress") {
             let ptr =
@@ -773,8 +777,29 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
                 } else {
                     args[0]
                 };
-                let error = crate::error::js_error_new_kind_from_value(kind, message);
+                // `new E(message, options)`: the `{ cause }` option.
+                let error = match args.get(1) {
+                    Some(&options) => crate::error::js_error_new_kind_with_options_from_value(
+                        kind, message, options,
+                    ),
+                    None => crate::error::js_error_new_kind_from_value(kind, message),
+                };
                 return crate::value::js_nanbox_pointer(error as i64);
+            }
+            // `new (rebound AggregateError)(errors, message?, options?)`.
+            "AggregateError" => {
+                let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+                let arg = |i: usize| args.get(i).copied().unwrap_or(undefined);
+                let error = crate::error::js_aggregateerror_new_full(arg(0), arg(1), arg(2));
+                return crate::value::js_nanbox_pointer(error as i64);
+            }
+            // `new (rebound Proxy)(target, handler)`: the constructor a global
+            // value reaches through `Reflect.construct`, `new G.Proxy(...)` and a
+            // spread `new Proxy(...args)`.
+            "Proxy" => {
+                let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+                let arg = |i: usize| args.get(i).copied().unwrap_or(undefined);
+                return crate::proxy::js_proxy_new(arg(0), arg(1));
             }
             // #2889: `new (rebound RegExp)(pattern, flags)`.
             #[cfg(feature = "regex-engine")]
@@ -1024,10 +1049,11 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
             .as_pointer::<ObjectHeader>();
         let class_cid = js_object_get_class_id(obj);
         if class_cid != 0 {
-            let inst = js_object_alloc(
-                class_cid,
-                crate::object::learned_inline_field_count(class_cid),
-            );
+            // The template's own record, named by the class object; an image
+            // static, so it stays put across every allocation below.
+            let cell = unsafe { super::super::field_get_set::class_object_template_cell(obj) };
+            let inst =
+                construct_class_object_instance(class_handle.get_nanbox_f64(), class_cid, cell);
             // #7280: root the instance across the replay — see the long note
             // in `construct_registered_class_ref`. The replay runs a user
             // constructor body, so a bare `*mut ObjectHeader` held across it
@@ -1035,9 +1061,6 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
             // address. Reproduced by `new C()` where `C = mk()` is a class
             // EXPRESSION value.
             let inst_handle = scope.root_raw_mut_ptr(inst);
-            inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
-                link_class_object_instance_prototype(class_handle.get_nanbox_f64(), inst)
-            });
             // Every evaluation gets a distinct brand despite sharing its
             // class id. Stamp it before replay, where private access may occur.
             inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
@@ -1087,6 +1110,13 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
                 && ctor_result.to_bits() != current_inst.to_bits()
             {
                 return ctor_result;
+            }
+            // A template recorded without heritage, of a class with no
+            // declared parent, has no builtin in its chain to back.
+            let heritage = cell.is_none_or(|cell| unsafe { cell.has_heritage() })
+                || get_parent_class_id(class_cid).is_some_and(|parent| parent != 0);
+            if !heritage {
+                return current_inst;
             }
             // `class X extends Request/Response {}` constructed via the dynamic
             // (class-expression value) path: the replayed ctor's `super()`
@@ -1823,7 +1853,9 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
                 let bits = result.to_bits();
                 let addr = if (bits >> 48) == 0x7FFD {
                     (bits & crate::value::POINTER_MASK) as usize
-                } else if (bits >> 48) == 0 && crate::buffer::is_registered_buffer(bits as usize) {
+                } else if (bits >> 48) == 0
+                    && crate::buffer::buffer_family_type_owned(bits as usize).is_some()
+                {
                     // ArrayBuffer and SharedArrayBuffer are represented by a
                     // raw BufferHeader pointer rather than a NaN-boxed object.
                     bits as usize

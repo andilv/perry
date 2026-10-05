@@ -207,6 +207,7 @@ mod export_value_wrappers;
 pub(crate) mod fresh_class_templates;
 pub(crate) mod func_registry;
 mod function;
+mod function_metadata_descriptors;
 mod function_source_header;
 #[cfg(test)]
 mod guarded_falsy_default_method_tests;
@@ -222,6 +223,8 @@ mod indexed_method_artifacts;
 #[cfg(test)]
 mod literal_method_this_tests;
 mod ordinary_method_artifacts;
+#[cfg(test)]
+mod string_accumulator_tests;
 mod tdz_names;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
@@ -229,7 +232,7 @@ pub(crate) mod helpers;
 // #10399: the driver sets this before any module codegen runs.
 pub use helpers::{
     program_has_thread_agents, program_has_worker, set_program_has_thread_agents,
-    set_program_has_worker,
+    set_program_has_worker, set_worker_entries, worker_entries,
 };
 pub(crate) mod global_transfer;
 mod literal_constructor;
@@ -255,6 +258,7 @@ mod spec_self_recursion_tests;
 pub(crate) mod static_constfn;
 pub(crate) mod static_constfn_class;
 pub(crate) mod static_fields;
+pub(crate) mod static_private_class;
 mod static_shape_ids;
 pub use static_shape_ids::{
     assign_static_shape_ids, decode_static_seed, encode_static_seed, take_module_static_seeds,
@@ -2419,13 +2423,15 @@ fn compile_module_impl(
             // `lower_call::new_alloc::constructor_added_key_count`): such a
             // class is born with a live bound of keys + slack, minted beside
             // this image by the string pool (`birth_live`, 0 = the key count).
+            // The private fields' entries are key-adds of construction too
+            // (#11791): reserve their inline slots the same way.
             let slack = if imported_stub_names.contains(class_name.as_str()) {
                 0
             } else {
                 class_table.get(class_name).map_or(0, |class| {
-                    crate::lower_call::new_alloc::constructor_added_key_count_in(class, &|name| {
-                        class_table.get(name).copied()
-                    })
+                    let lookup = |name: &str| class_table.get(name).copied();
+                    crate::lower_call::new_alloc::constructor_added_key_count_in(class, &lookup)
+                        + crate::lower_call::new_alloc::private_field_slot_count_in(class, &lookup)
                 })
             };
             let birth_live = if slack > 0 { key_count + slack } else { 0 };
@@ -2514,6 +2520,16 @@ fn compile_module_impl(
                 &module_prefix,
                 &reps,
             ));
+        }
+        if opts.output_type == "executable" {
+            let private_finals = static_private_class::module_private_finals(
+                hir,
+                &module_prefix,
+                births,
+                &class_keys_globals_map,
+                &class_ids,
+            );
+            births.extend(private_finals);
         }
         return Ok(Vec::new());
     }
@@ -2763,6 +2779,7 @@ fn compile_module_impl(
         compiler_private_async_i32_control_locals,
         compiler_private_async_i1_control_locals,
         scope_map: Default::default(),
+        string_accumulator_locals: Default::default(),
         disable_buffer_fast_path,
         program_shadows_buffer_read_method:
             crate::lower_call::buffer_intrinsic::module_shadows_buffer_read_method(hir),
@@ -2973,6 +2990,7 @@ fn compile_module_impl(
     // globals. Every capture layout below is computed through this map.
     cross_module.scope_map =
         crate::scope_env::ScopeMap::build(hir, &module_boxed_vars, &module_globals);
+    cross_module.string_accumulator_locals = crate::collectors::string_accumulator_locals(hir);
     // #6369: the *receiver-type oracle* for closure bodies — every module-wide
     // `Stmt::Let` type, with NO representation-driven filtering. `FnCtx.
     // local_types` is what `static_type_of` / `is_array_expr` /
@@ -3358,13 +3376,7 @@ fn compile_module_impl(
             // Callee-side demotion: params the raw ABI cannot accept keep the
             // boxed protocol (reassigned params would stale the entry-bound
             // proofs; closure-referenced params feed the capture machinery).
-            let closure_refs = crate::expr::collect_closure_referenced_locals(&f.body);
-            let reassigned = crate::collectors::reassigned_locals(&f.body);
-            let demoted: Vec<bool> = f
-                .params
-                .iter()
-                .map(|p| reassigned.contains(&p.id) || closure_refs.contains(&p.id))
-                .collect();
+            let demoted = crate::collectors::callee_demoted_params(f);
             // (#8094) A descriptor proof describes a heap object and is
             // established once, at entry. Any call in this body can run code
             // that reaches that same object — not only through an argument we
@@ -3939,6 +3951,12 @@ fn compile_module_impl(
             &module_prefix,
             &static_shape_ids::module_final_seeds(),
         );
+        // The seed table names every ConstFn body of every seed, including
+        // shapes that joined the seed set through a guard rather than a
+        // finalizer; each of those records must be emitted linkable too.
+        for info in static_shape_ids::module_seed_constfn_infos() {
+            llmod.request_static_seed_body(info.strip_suffix("$info").expect("body info suffix"));
+        }
     }
     llmod.emit_fn_infos(constfn_body_metadata);
 

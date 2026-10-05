@@ -382,10 +382,6 @@ pub struct ClassVTable {
     pub methods: HashMap<String, VTableMethodEntry>,
     pub accessors: HashMap<String, AccessorDecl>,
     pub private_accessors: HashMap<String, AccessorDecl>,
-    /// The address of the class's template cell (`@perry_ctpl.<cid>`) when
-    /// the class is a per-evaluation template (`class_object_template`); 0
-    /// otherwise.
-    pub template_cell: usize,
 }
 
 impl ClassVTable {
@@ -475,25 +471,6 @@ pub static CLASS_STRING_MEMBER_ORDERS: ImageTable<RwLock<Option<StringMemberOrde
 /// is exact (Test262 .../class/*/dflt-params-trailing-comma).
 pub static CLASS_METHOD_BIND_LENGTHS: ImageTable<RwLock<Option<HashMap<(u32, String), u32>>>> =
     ImageTable::new(|image| &image.method_bind_lengths);
-
-/// Record `cell` as per-evaluation template `class_id`'s template cell.
-pub(crate) fn class_set_template_cell(class_id: u32, cell: usize) {
-    let Ok(mut guard) = CLASS_VTABLE_REGISTRY.write() else {
-        return;
-    };
-    guard
-        .get_or_insert_with(crate::fast_hash::new_ptr_hash_map)
-        .entry(class_id)
-        .or_default()
-        .template_cell = cell;
-}
-
-/// Per-evaluation template `class_id`'s template cell, if one was registered.
-pub(crate) fn class_template_cell(class_id: u32) -> Option<usize> {
-    let guard = CLASS_VTABLE_REGISTRY.read().ok()?;
-    let cell = guard.as_ref()?.get(&class_id)?.template_cell;
-    (cell != 0).then_some(cell)
-}
 
 /// The closure-convention entry registered for method `name` of per-evaluation
 /// class `class_id` (its vtable entry's `entry`), if any.
@@ -1165,6 +1142,100 @@ pub(super) fn install_class_decl_prototype_method_field(
     });
 }
 
+/// Install one computed Symbol ClassBody member on the materialized declared
+/// prototype. The class registries retain compiled dispatch metadata, while
+/// the prototype shape is the authoritative record that the property exists:
+/// deleting the shape entry therefore cannot be resurrected by a registry
+/// fallback.
+pub(super) fn install_class_decl_prototype_symbol_member(
+    proto: *mut ObjectHeader,
+    class_id: u32,
+    sym_key: usize,
+) {
+    if proto.is_null() || sym_key == 0 {
+        return;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let proto_h = scope.root_raw_mut_ptr(proto);
+    let sym = f64::from_bits(crate::JSValue::pointer(sym_key as *const u8).bits());
+    let sym_h = scope.root_nanbox_f64(sym);
+    // SAFETY: `sym_key` came from the registered ClassBody symbol table and
+    // remains rooted by that registry for the class lifetime.
+    let display_name = unsafe { crate::symbol::symbol_function_name(sym_key) };
+
+    if let Some((raw_get, raw_set)) =
+        super::class_own_symbol_accessor_ptrs(class_id, sym_key, false)
+    {
+        let get = scope.root_nanbox_f64(super::class_accessor_function_value(
+            raw_get,
+            false,
+            false,
+            &display_name,
+            None,
+        ));
+        let set = scope.root_nanbox_f64(super::class_accessor_function_value(
+            raw_set,
+            true,
+            false,
+            &display_name,
+            None,
+        ));
+        let proto_value =
+            proto_h.with_mut_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64));
+        unsafe {
+            crate::symbol::set_symbol_accessor_property(
+                proto_value,
+                sym_h.get_nanbox_f64(),
+                if raw_get == 0 {
+                    0
+                } else {
+                    get.get_nanbox_u64()
+                },
+                if raw_set == 0 {
+                    0
+                } else {
+                    set.get_nanbox_u64()
+                },
+            );
+        }
+    } else if let Some((func_ptr, param_count, has_rest)) =
+        super::class_own_symbol_method(class_id, sym_key, false)
+    {
+        let value = scope.root_nanbox_f64(crate::object::build_symbol_bound_method_closure(
+            crate::object::class_prototype_ref_value(class_id),
+            func_ptr,
+            param_count,
+            has_rest,
+            false,
+            &display_name,
+        ));
+        let proto_value =
+            proto_h.with_mut_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64));
+        unsafe {
+            crate::symbol::define_symbol_data_property(
+                proto_value,
+                sym_h.get_nanbox_f64(),
+                value.get_nanbox_f64(),
+            );
+        }
+    } else {
+        return;
+    }
+
+    let owner = proto_h.with_mut_ptr::<ObjectHeader, _>(|p| p as usize);
+    crate::symbol::set_symbol_property_attrs(owner, sym_key, PropertyAttrs::new(true, false, true));
+}
+
+fn install_class_decl_prototype_symbol_members(proto: *mut ObjectHeader, class_id: u32) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let proto_h = scope.root_raw_mut_ptr(proto);
+    for sym_key in super::class_own_symbol_member_keys(class_id, false) {
+        proto_h.with_mut_ptr(|p: *mut ObjectHeader| {
+            install_class_decl_prototype_symbol_member(p, class_id, sym_key)
+        });
+    }
+}
+
 /// The class's own string-keyed prototype members in ClassBody order, each
 /// with whether it is an accessor (else a method).
 pub(crate) fn class_prototype_member_names(class_id: u32) -> Vec<(String, bool)> {
@@ -1390,6 +1461,7 @@ pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
         PropertyAttrs::new(true, false, true),
     );
     install_class_decl_prototype_method_fields(proto, class_id);
+    install_class_decl_prototype_symbol_members(proto, class_id);
 
     // #5024 followup: backfill assignment-registered prototype methods
     // (`Class.prototype.m = fn`, stored in CLASS_PROTOTYPE_METHODS) onto the

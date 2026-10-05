@@ -186,8 +186,13 @@ pub(super) struct Planner<'p, 'a> {
     /// A body region nested in this loop region (array regions): while its
     /// tail is walked, its bare accesses run no JS and its fact trees only
     /// set the loop's dirty flag.
-    inner: Option<(&'p HashSet<usize>, &'p HashSet<usize>)>,
+    inner: Option<(&'p HashSet<usize>, &'p HashSet<usize>, &'p HashSet<usize>)>,
     in_inner: bool,
+    /// While the nested body region's tail is walked outside a nested
+    /// loop's first pass: a statement there after which the facts may be
+    /// stale is recorded in `dirty_after` (the tail's own accesses are not
+    /// recorded; they lower under the body region's facts).
+    record_dirty: bool,
     /// A store RHS can use R to prove its own numeric reads. Its add must
     /// stay an ordinary bare-read add, not the generic fact tree (which
     /// dirties freshness before the following store).
@@ -211,12 +216,29 @@ pub(super) struct Planner<'p, 'a> {
     /// the loop being refused or re-checked every iteration.
     mark_dirty: bool,
     dirty_after: HashSet<usize>,
+    /// The expressions this walk judged able to run JS (recorded walks only).
+    stale_at: std::cell::RefCell<HashSet<usize>>,
 }
 
 impl Planner<'_, '_> {
     /// `e` may run JS: every fact is stale. `PERRY_REGION_DIAG=5` names
     /// the expression that staled them (the planner's refusal trace).
     fn stale(&self, e: &Expr, st: &mut St) {
+        // In a nested body region's tail, that region's own walk is the judge
+        // of what can run JS: it proves operands this walk cannot (its R
+        // reads and the locals they feed), so an expression it walked without
+        // staling its facts runs no JS. Only its stale points touch the
+        // loop's facts.
+        if self.in_inner {
+            if let Some((_, _, istale)) = self.inner {
+                if !istale.contains(&(e as *const Expr as usize)) {
+                    return;
+                }
+            }
+        }
+        if self.record {
+            self.stale_at.borrow_mut().insert(e as *const Expr as usize);
+        }
         if st.as_ref().is_some_and(|m| !m.is_empty())
             && std::env::var("PERRY_REGION_DIAG").as_deref() == Ok("5")
         {
@@ -354,14 +376,14 @@ impl Planner<'_, '_> {
     fn expr(&mut self, e: &Expr, mut st: St) -> St {
         st.as_ref()?;
         if self.in_inner {
-            if let Some((ibare, itrees)) = self.inner {
+            if let Some((ibare, itrees, _)) = self.inner {
                 let key = e as *const Expr as usize;
                 if itrees.contains(&key) {
                     dirty(&mut st);
                     return st;
                 }
                 if ibare.contains(&key) {
-                    if let Expr::PutValueSet { value, .. } = e {
+                    if let Expr::PutValueSet { value, .. } | Expr::PropertySet { value, .. } = e {
                         return self.expr(value, st);
                     }
                     return st;
@@ -403,6 +425,29 @@ impl Planner<'_, '_> {
                     }
                     _ if arrays::element_store(e).is_some() => self.element_store(e, &mut st),
                     _ => self.stale(e, &mut st),
+                }
+                st
+            }
+            // A static-key store through a binding: `o.p = v` in the forms
+            // that lower to `PropertySet`, and `o.p op= v` on a `const`
+            // binding (no base temp). The same bare store as `PutValueSet`'s.
+            Expr::PropertySet {
+                object,
+                property,
+                value,
+            } => {
+                st = self.expr(object, st);
+                let outer_rhs = self.in_store_rhs;
+                self.in_store_rhs = true;
+                st = self.expr(value, st);
+                self.in_store_rhs = outer_rhs;
+                match Recv::of(object) {
+                    Some(r) => {
+                        let boxed =
+                            !crate::type_analysis::expr_produces_canonical_raw_f64(self.ctx, value);
+                        self.access(e, r, property, true, boxed, &mut st)
+                    }
+                    None => self.stale(e, &mut st),
                 }
                 st
             }
@@ -598,7 +643,7 @@ impl Planner<'_, '_> {
             st = self.stmt(s, st);
             if let (Some(b), Some(a)) = (&before, &st) {
                 if b.keys().any(|r| !a.contains_key(r)) {
-                    if self.record {
+                    if self.record || self.record_dirty {
                         self.dirty_after.insert(s as *const Stmt as usize);
                     }
                     st = Some(b.keys().map(|r| (*r, DIRTY)).collect());
@@ -695,8 +740,10 @@ impl Planner<'_, '_> {
         st: St,
     ) -> St {
         let rec = self.record;
+        let rec_dirty = self.record_dirty;
         let saved = std::mem::take(&mut self.continues);
         self.record = false;
+        self.record_dirty = false;
         let mut s = st.clone();
         if let Some(c) = cond {
             s = self.expr(c, s);
@@ -711,6 +758,7 @@ impl Planner<'_, '_> {
             back = self.expr(u, back);
         }
         self.record = rec;
+        self.record_dirty = rec_dirty;
         let head = meet(st.clone(), back);
         let mut s = head.clone();
         if let Some(c) = cond {
@@ -983,6 +1031,21 @@ pub(super) fn accesses(ss: &[Stmt]) -> Vec<(Recv, String, bool, usize, Option<&E
                     }
                 }
             }
+            Expr::PropertySet {
+                object,
+                property,
+                value,
+            } => {
+                if let Some(r) = Recv::of(object) {
+                    out.push((
+                        r,
+                        property.clone(),
+                        true,
+                        e as *const Expr as usize,
+                        Some(value),
+                    ));
+                }
+            }
             _ => {}
         }
         // A method callee `o.m(...)` is not an own-slot read.
@@ -1108,6 +1171,8 @@ pub(super) struct Plan {
     pub(super) arrays: Vec<(Recv, ArrayUse)>,
     /// Statements after which F-body sets the dirty flag (`Planner::mark_dirty`).
     pub(super) dirty_after: HashSet<usize>,
+    /// The expressions the final walk judged able to run JS.
+    pub(super) stale_at: HashSet<usize>,
 }
 
 /// What the top of an iteration must do before F-body.
@@ -1135,10 +1200,11 @@ pub(super) fn plan(
     ctx: &FnCtx<'_>,
     tail: &[Stmt],
     cands: HashSet<Recv>,
+    wide: &HashMap<Recv, String>,
     arrays: HashMap<Recv, ArrayUse>,
     env: &Env,
     loop_ctl: Option<(Option<&Expr>, Option<&Expr>)>,
-    inner: Option<(usize, &HashSet<usize>, &HashSet<usize>)>,
+    inner: Option<(usize, &HashSet<usize>, &HashSet<usize>, &HashSet<usize>)>,
 ) -> Option<Plan> {
     let empty_reads = HashSet::new();
     let empty_locals = HashSet::new();
@@ -1146,13 +1212,15 @@ pub(super) fn plan(
         ctx,
         tail,
         &cands,
+        wide,
         &arrays,
         env,
         loop_ctl,
         inner,
         &empty_reads,
         &empty_locals,
-    )?;
+    );
+    let seed = seed?;
     let mut proof_reads: HashSet<usize> = seed
         .numeric_candidates
         .iter()
@@ -1184,6 +1252,7 @@ pub(super) fn plan(
             ctx,
             tail,
             &cands,
+            wide,
             &arrays,
             env,
             loop_ctl,
@@ -1231,10 +1300,16 @@ fn plan_once<'p, 'a>(
     ctx: &'p FnCtx<'a>,
     tail: &[Stmt],
     cands: &'p HashSet<Recv>,
+    wide: &HashMap<Recv, String>,
     arrays: &'p HashMap<Recv, ArrayUse>,
     env: &'p Env,
     loop_ctl: Option<(Option<&Expr>, Option<&Expr>)>,
-    inner: Option<(usize, &'p HashSet<usize>, &'p HashSet<usize>)>,
+    inner: Option<(
+        usize,
+        &'p HashSet<usize>,
+        &'p HashSet<usize>,
+        &'p HashSet<usize>,
+    )>,
     proof_reads: &'p HashSet<usize>,
     proof_locals: &'p HashSet<u32>,
 ) -> Option<Plan> {
@@ -1247,9 +1322,13 @@ fn plan_once<'p, 'a>(
         if !cands.contains(&r) {
             continue;
         }
+        // A learned word addresses MAX_KEYS keys; a receiver whose class
+        // the compiler names takes its slots from the static birth shape
+        // (checked against the keys at the end of the plan).
+        let limit = if wide.contains_key(&r) { 31 } else { MAX_KEYS };
         let list = keys.entry(r).or_default();
         if !list.contains(&k) {
-            if list.len() == MAX_KEYS {
+            if list.len() == limit {
                 overflow.insert(r);
             } else {
                 list.push(k);
@@ -1280,8 +1359,9 @@ fn plan_once<'p, 'a>(
         number_local_uses: HashSet::new(),
         bare_reads: Vec::new(),
         bare_arrays: HashSet::new(),
-        inner: inner.map(|(_, b, t)| (b, t)),
+        inner: inner.map(|(_, b, t, s)| (b, t, s)),
         in_inner: false,
+        record_dirty: false,
         in_store_rhs: false,
         trees: HashSet::new(),
         bare_stores: HashSet::new(),
@@ -1290,20 +1370,25 @@ fn plan_once<'p, 'a>(
         record: true,
         proof_reads,
         proof_locals,
-        // Loop regions with array receivers and no nested body region.
-        mark_dirty: loop_ctl.is_some() && !arrays.is_empty() && inner.is_none(),
+        // Loop regions with array receivers. A statement in a nested body
+        // region's tail sets the flag from that region's F-tail (its
+        // `dirty_slot` is the loop's).
+        mark_dirty: loop_ctl.is_some() && !arrays.is_empty(),
         dirty_after: HashSet::new(),
+        stale_at: std::cell::RefCell::new(HashSet::new()),
     };
     let end = match inner {
         // The nested body region's tail: F-tail keeps the loop's facts
         // (its fact trees set the dirty flag), G-tail leaves the loop region.
         // Loop accesses inside it are not recorded (the tail lowers under
         // the body region's facts).
-        Some((k, _, _)) => {
+        Some((k, _, _, _)) => {
             let st = p.stmts(&tail[..k], Some(fresh.clone()));
             p.record = false;
             p.in_inner = true;
+            p.record_dirty = true;
             let st = p.stmts(&tail[k..], st);
+            p.record_dirty = false;
             p.in_inner = false;
             p.record = true;
             st
@@ -1476,6 +1561,17 @@ fn plan_once<'p, 'a>(
                 .cloned(),
         )
         .collect();
+    // A receiver wider than a learned word is served only by its static
+    // supplier: every key it names, with the plan's boxed stores.
+    for (r, k, _, _, bm, _) in &receivers {
+        if k.len() > MAX_KEYS
+            && !wide
+                .get(r)
+                .is_some_and(|c| super::guard::static_keys_served(ctx, c, k, *bm))
+        {
+            return None;
+        }
+    }
     Some(Plan {
         receivers,
         bare,
@@ -1487,5 +1583,6 @@ fn plan_once<'p, 'a>(
         recheck,
         arrays: plan_arrays,
         dirty_after,
+        stale_at: p.stale_at.take(),
     })
 }

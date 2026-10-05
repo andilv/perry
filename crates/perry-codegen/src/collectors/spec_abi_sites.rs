@@ -11,8 +11,10 @@
 //! - **`TaPtr { kind, const_len }`** — the arg is a local/module binding whose
 //!   SINGLE, top-level `let`/`const` binding is `new Int32Array(x)` (or another
 //!   numeric typed-array kind) in a **non-view construction form**: `x` absent,
-//!   an integer-literal length, an immutable local bound once to such a length,
-//!   or a local proven to be a plain array (its own single binding is an array
+//!   an integer-literal length, an operator whose result is never an Object
+//!   (`rows.length * 7`, see [`operator_result_is_never_object`]), an
+//!   immutable local bound once to either, or a local proven to be a plain
+//!   array (its own single binding is an array
 //!   literal, never reassigned). The binding local is
 //!   never reassigned anywhere in the module (`LocalSet`/`GlobalSet`/`Update`)
 //!   and never referenced inside any closure body — so at every dominated call
@@ -147,6 +149,26 @@ pub(crate) fn rebound_locals(stmts: &[Stmt]) -> HashSet<u32> {
     ids
 }
 
+/// Callee-side demotion for a specialized entry: which parameters of `f` must
+/// keep the boxed protocol.
+///
+/// A specialized entry binds each raw parameter once, at entry, and the body's
+/// proofs (a numeric parameter is a Number, a typed-array length, ...) describe
+/// that entry value. Anything that can leave the parameter's slot holding a
+/// different value invalidates them, so the parameter is demoted when the body
+/// rebinds it ([`rebound_locals`]: a `LocalSet` or `Update`, and also a `var`
+/// re-declaration, which reuses the parameter's id as a `Stmt::Let`; `var n = b`
+/// rebinds `n` exactly as `n = b` does) or when a closure refers to it (the
+/// capture machinery needs the boxed slot).
+pub(crate) fn callee_demoted_params(f: &perry_hir::Function) -> Vec<bool> {
+    let closure_refs = crate::expr::collect_closure_referenced_locals(&f.body);
+    let rebound = rebound_locals(&f.body);
+    f.params
+        .iter()
+        .map(|p| rebound.contains(&p.id) || closure_refs.contains(&p.id))
+        .collect()
+}
+
 /// Every local whose slot `stmts` can fill from something other than a
 /// `Stmt::Let` initialiser, a `LocalSet` right-hand side or an `Update`: a
 /// closure parameter or `catch` binding, a box pre-allocation, or a
@@ -170,6 +192,29 @@ pub(crate) fn non_expression_bound_locals(stmts: &[Stmt]) -> HashSet<u32> {
 /// after an enclosing body has replaced the binding with another value.
 pub(crate) fn reassigned_locals_in_module(hir: &Module) -> HashSet<u32> {
     scan_whole_module(hir).writes
+}
+
+/// Module-wide: the bindings that are string ACCUMULATORS — written by a
+/// self-append (`x += s`, `x = x + a + b`) AND given a string literal by some
+/// `let` initialiser or assignment (`var out; ... out = ""; ... out += s`).
+///
+/// This is a lowering hint, never a type proof. It exists for untyped
+/// accumulators (`var output;` in TypeScript's own `createTextWriter`), whose
+/// declared type is `any`, so the declared-`string` gate never selected the
+/// amortized in-place append and every `output += s` copied the whole
+/// accumulator: a quadratic build that was 6.5 GB of the 7.0 GB a tsc
+/// transpile allocates, all of it born-tenured large strings, and 236 of its
+/// 237 full collections. The selected lowering is the tag-dispatched one, so
+/// whatever the binding actually holds at run time chooses append versus
+/// ordinary JS `+`; and an accumulator's ordinary reads demote a uniquely
+/// owned string exactly as a declared-`string` binding's do, which is what
+/// keeps the in-place append sound.
+pub(crate) fn string_accumulator_locals(hir: &Module) -> HashSet<u32> {
+    let scan = scan_whole_module(hir);
+    scan.self_appends
+        .intersection(&scan.string_literal_writes)
+        .copied()
+        .collect()
 }
 
 /// Single-id convenience over [`reassigned_locals`].
@@ -257,6 +302,28 @@ struct ModuleScan {
     /// `WithSetFallback`, never through a `LocalSet` right-hand side, so a
     /// value judgment over `Let` initialisers and `LocalSet`s cannot see it.
     with_fallback_writes: HashSet<u32>,
+    /// `x = x + ...` targets (`x += ...` lowers to this): the leftmost leaf of
+    /// the left-associated `+` chain is a read of the binding being written.
+    self_appends: HashSet<u32>,
+    /// Bindings initialised or assigned a string literal somewhere.
+    string_literal_writes: HashSet<u32>,
+}
+
+/// The leftmost leaf of a left-associated `+` chain.
+fn add_chain_head(mut e: &Expr) -> &Expr {
+    while let Expr::Binary {
+        op: perry_hir::BinaryOp::Add,
+        left,
+        ..
+    } = e
+    {
+        e = left;
+    }
+    e
+}
+
+fn is_string_literal(e: &Expr) -> bool {
+    matches!(e, Expr::String(_) | Expr::WtfString(_))
 }
 
 fn record_expr_use(e: &Expr, depth: u32, scan: &mut ModuleScan) {
@@ -269,6 +336,20 @@ fn record_expr_use(e: &Expr, depth: u32, scan: &mut ModuleScan) {
         }
         Expr::LocalSet(id, value) | Expr::GlobalSet(id, value) => {
             scan.writes.insert(*id);
+            if matches!(e, Expr::LocalSet(..)) {
+                if is_string_literal(value) {
+                    scan.string_literal_writes.insert(*id);
+                } else if matches!(
+                    value.as_ref(),
+                    Expr::Binary {
+                        op: perry_hir::BinaryOp::Add,
+                        ..
+                    }
+                ) && matches!(add_chain_head(value), Expr::LocalGet(head) if head == id)
+                {
+                    scan.self_appends.insert(*id);
+                }
+            }
             if depth > 0 {
                 scan.closure_refs.insert(*id);
             }
@@ -412,6 +493,9 @@ fn walk_stmt(s: &Stmt, depth: u32, scan: &mut ModuleScan) {
                 scan.let_closures.insert(*id, *func_id);
             }
             if let Some(e) = init {
+                if is_string_literal(e) {
+                    scan.string_literal_writes.insert(*id);
+                }
                 record_expr_use(e, depth, scan);
             }
         }
@@ -577,26 +661,51 @@ fn typed_array_length_literal(e: &Expr) -> Option<i64> {
     }
 }
 
+/// Whether `e` is an operator whose result can never be an Object, whatever
+/// its operands are: arithmetic and bitwise binaries yield a Number, BigInt or
+/// (for `+`) a String; unary operators, comparisons and `typeof` yield a
+/// Number, BigInt, Boolean or String; `++`/`--` yield a Number or BigInt. Each
+/// either produces that primitive or throws.
+///
+/// As a typed-array constructor argument such a value is therefore always the
+/// LENGTH form (`ToIndex(arg)`), never the view or copy forms, which need an
+/// Object: `new Float64Array(rows.length * 7)` allocates fresh inline storage
+/// exactly like `new Float64Array(35)`. Its value is not a compile-time
+/// constant, so it proves the form, not the length.
+pub(crate) fn operator_result_is_never_object(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Binary { .. }
+            | Expr::Unary { .. }
+            | Expr::Compare { .. }
+            | Expr::TypeOf(_)
+            | Expr::Update { .. }
+    )
+}
+
 /// Judge the `new TypedArray(arg)` constructor argument: `Some(const_len)`
 /// when the construction is provably NON-VIEW (arg is a length or a plain
 /// array — never an ArrayBuffer), `None` when the form is unproven.
 fn judge_ctor_arg(
     arg: Option<&Expr>,
     array_literal_locals: &HashMap<u32, Option<i64>>,
-    literal_length_locals: &HashMap<u32, i64>,
+    length_locals: &HashMap<u32, Option<i64>>,
 ) -> Option<Option<i64>> {
     if let Some(len) = arg.and_then(typed_array_length_literal) {
         return Some(Some(len));
     }
     match arg {
         None => Some(Some(0)),
-        // A local whose single binding is an array literal, never reassigned:
+        // An immutable local bound once to a length (literal or computed), or
+        // a local whose single binding is an array literal, never reassigned:
         // definitely a plain array (copy construction, non-view). The length
         // is constant only when no use of the source could have resized it.
-        Some(Expr::LocalGet(id)) => literal_length_locals
+        Some(Expr::LocalGet(id)) => length_locals
             .get(id)
-            .map(|len| Some(*len))
+            .copied()
             .or_else(|| array_literal_locals.get(id).copied()),
+        // A computed length: the length form, value unknown.
+        Some(e) if operator_result_is_never_object(e) => Some(None),
         _ => None,
     }
 }
@@ -846,8 +955,10 @@ pub fn collect_spec_abi_facts(hir: &Module) -> SpecAbiModuleFacts {
     // Immutable, single-binding constructor lengths. Resolving this one
     // indirection keeps `new Float64Array(nodes)` equivalent to the literal
     // form without treating an arbitrary local as a non-view constructor.
-    let mut literal_length_locals: HashMap<u32, i64> = HashMap::new();
-    let mut collect_literal_lengths = |stmts: &[Stmt]| {
+    // `Some(len)` for a literal, `None` for a computed length
+    // (`const n = rows.length * 7`): the form is proven, the value is not.
+    let mut length_locals: HashMap<u32, Option<i64>> = HashMap::new();
+    let mut collect_lengths = |stmts: &[Stmt]| {
         for s in stmts {
             if let Stmt::Let {
                 id,
@@ -863,15 +974,17 @@ pub fn collect_spec_abi_facts(hir: &Module) -> SpecAbiModuleFacts {
                     && !scan.other_bindings.contains(id)
                 {
                     if let Some(len) = typed_array_length_literal(e) {
-                        literal_length_locals.insert(*id, len);
+                        length_locals.insert(*id, Some(len));
+                    } else if operator_result_is_never_object(e) {
+                        length_locals.insert(*id, None);
                     }
                 }
             }
         }
     };
-    collect_literal_lengths(&hir.init);
+    collect_lengths(&hir.init);
     for f in &hir.functions {
-        collect_literal_lengths(&f.body);
+        collect_lengths(&f.body);
     }
 
     // Proven typed-array bindings: single TOP-LEVEL `let`/`const` bound to a
@@ -894,11 +1007,9 @@ pub fn collect_spec_abi_facts(hir: &Module) -> SpecAbiModuleFacts {
                 {
                     continue;
                 }
-                if let Some(const_len) = judge_ctor_arg(
-                    arg.as_deref(),
-                    &array_literal_locals,
-                    &literal_length_locals,
-                ) {
+                if let Some(const_len) =
+                    judge_ctor_arg(arg.as_deref(), &array_literal_locals, &length_locals)
+                {
                     ta_bindings.insert(
                         *id,
                         SpecTaBinding {

@@ -8,10 +8,10 @@
 //! * **Function-name registration** (`codegen/artifacts.rs`). Every inline
 //!   closure carrying a HIR display name mints a rodata constant through
 //!   `add_string_constant` — whose `@.str.N` counter numbers in first-use order
-//!   — and emits one `js_register_function_name_static` call into
-//!   `__perry_init_strings_*`. Iterating `hir.closure_display_names` permuted
-//!   both. (#7038 fixed the identical defect in the `closure_source_text` loop
-//!   directly below it and left this one standing.)
+//!   — and appends one relative descriptor to the function-name batch table.
+//!   Iterating `hir.closure_display_names` permuted both. (#7038 fixed the
+//!   identical defect in the `closure_source_text` loop directly below it and
+//!   left this one standing.)
 //! * **The dynamic method-dispatch tower**
 //!   (`lower_call/property_get/dynamic_dispatch.rs`). Every class implementing
 //!   the called property becomes one `icmp`-guarded case block; iterating
@@ -180,7 +180,7 @@ fn ir_for_output_type(module: &Module, output_type: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Shape 1: `js_register_function_name_static` / `@.str.N`
+// Shape 1: function-name descriptor table / `@.str.N`
 // ---------------------------------------------------------------------------
 
 /// `let _fK = () => {}` for `K` in `0..N`, each carrying a HIR display name.
@@ -220,15 +220,15 @@ fn closure_display_module() -> Module {
     m
 }
 
-/// The `func_id` of every `js_register_function_name_static` call, in emission order.
+/// The `func_id` of every closure entry in the name table, in emission order.
 fn registered_closure_ids(ir: &str) -> Vec<u32> {
     ir.lines()
-        .filter(|l| l.contains("call void @js_register_function_name_static("))
-        .filter_map(|l| {
-            let at = l.find("@perry_closure_")?;
-            let rest = &l[at..];
-            let end = rest.find(',')?;
-            rest[..end].rsplit("__").next()?.parse::<u32>().ok()
+        .find(|line| line.starts_with("@__perry_function_name_descriptors_"))
+        .into_iter()
+        .flat_map(|line| line.split("ptrtoint (ptr @perry_closure_").skip(1))
+        .filter_map(|entry| {
+            let symbol = entry.split(" to i64)").next()?;
+            symbol.rsplit("__").next()?.parse::<u32>().ok()
         })
         .collect()
 }
@@ -240,14 +240,14 @@ fn closure_display_names_are_emitted_in_func_id_order() {
     assert_eq!(
         ids.len(),
         N as usize,
-        "expected one js_register_function_name_static per closure display name; \
+        "expected one function-name descriptor per closure display name; \
          the fixture stopped exercising the emission path"
     );
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(
         ids, sorted,
-        "js_register_function_name_static calls must be emitted in FuncId order, not \
+        "function-name descriptors must be emitted in FuncId order, not \
          `hir.closure_display_names` hash order (#7622)"
     );
 }
@@ -260,7 +260,7 @@ fn closure_display_name_emission_is_run_to_run_deterministic() {
     let first = ir(&closure_display_module());
     let second = ir(&closure_display_module());
     assert!(
-        first.contains("call void @js_register_function_name_static("),
+        first.contains("call void @js_register_function_names_static("),
         "liveness: fixture emitted no function-name registrations"
     );
     assert_eq!(
@@ -474,11 +474,11 @@ fn registration_spelling_follows_output_kind() {
 
     let executable = ir_for_output_type(&module, "executable");
     assert!(
-        executable.contains("call void @js_register_function_name_static("),
+        executable.contains("call void @js_register_function_names_static("),
         "an executable outlives its own registry and must keep the borrow"
     );
     assert!(
-        !executable.contains("call void @js_register_function_name("),
+        !executable.contains("call void @js_register_function_names("),
         "an executable must not pay the startup copy this optimisation removed"
     );
 
@@ -489,11 +489,13 @@ fn registration_spelling_follows_output_kind() {
             "{unloadable} can be unloaded, so its names must be COPIED into the registry"
         );
         assert!(
-            !ir.contains("call void @js_register_function_name_static("),
+            !ir.contains("call void @js_register_function_names_static(")
+                && !ir.contains("call void @js_register_function_name_static("),
             "{unloadable} must not lend rodata that `dlclose` will unmap"
         );
         assert!(
-            !ir.contains("call void @js_register_function_source_static("),
+            !ir.contains("call void @js_register_function_sources_static(")
+                && !ir.contains("call void @js_register_function_source_static("),
             "{unloadable} must not lend source text that `dlclose` will unmap"
         );
     }
@@ -550,7 +552,11 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
         assert_eq!(
             source_globals.len(),
             1,
-            "nested sources must share one physical parent constant"
+            "all retained text must share one physical module blob"
+        );
+        assert!(
+            source_globals[0].contains("perry_src"),
+            "retained text must live outside the ordinary literal section"
         );
         let base = source_globals[0].split_whitespace().next().unwrap();
         let pointer = |source: &str| {
@@ -558,47 +564,100 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
             if offset == 0 {
                 return base.to_owned();
             }
-            let gep = emitted
-                .lines()
-                .find(|line| {
-                    line.contains("getelementptr")
-                        && line.contains(&format!("ptr {base}, i64 {offset}"))
-                })
-                .expect("nonzero source offset must actually be emitted");
-            gep.trim().split(" = ").next().unwrap().to_owned()
-        };
-        let register = if output_type == "executable" {
-            "js_register_function_source_static"
-        } else {
-            "js_register_function_source"
+            format!("getelementptr (i8, ptr {base}, i64 {offset})")
         };
         let calls: Vec<_> = emitted
             .lines()
             .filter(|line| line.contains("call void @js_register_function_source"))
             .collect();
-        assert_eq!(
-            calls.len(),
-            3,
-            "two functions and one materialized method must be registered"
-        );
-        for (call, (symbol, source, flag)) in calls.iter().zip([
-            ("__outer", outer.as_str(), 1),
-            ("__inner", inner, 0),
-            ("__C__m", method, 0),
-        ]) {
-            assert!(call.contains(&format!("@{register}(")), "{call}");
+        if output_type == "executable" {
+            assert_eq!(
+                calls.len(),
+                1,
+                "ordinary functions use their info records; raw methods use one batch call"
+            );
+            assert!(calls[0].contains("@js_register_function_sources_static("));
+            assert!(!emitted.contains("call void @js_register_function_source_static("));
+            let table = emitted
+                .lines()
+                .find(|line| line.starts_with("@__perry_function_source_descriptors_"))
+                .expect("raw method source descriptor table");
+            let entries: Vec<_> = table
+                .split("{ i32, i32, i32, i32 } { i32 trunc (i64 sub (i64 ptrtoint (ptr @")
+                .skip(1)
+                .collect();
+            assert_eq!(entries.len(), 1, "only the raw method needs registration");
+            assert!(entries[0].contains("__C__m to i64)"), "{}", entries[0]);
+            assert!(calls[0].contains("ptr @__perry_function_source_descriptors_"));
             assert!(
-                call.contains(&format!("{symbol},")),
-                "registration order/symbol changed: {call}"
+                entries[0].contains(&format!("ptrtoint (ptr {} to i64)", pointer(method))),
+                "raw method source range changed: {}",
+                entries[0]
             );
             assert!(
-                call.contains(&format!(
-                    "ptr {}, i32 {}, i32 {flag})",
-                    pointer(source),
-                    source.len()
-                )),
-                "source range/length/strictness changed: {call}"
+                entries[0].contains(&format!("i32 {}, i32 0", method.len())),
+                "raw method source metadata changed: {}",
+                entries[0]
             );
+            for (symbol, source) in [("__outer$info", outer.as_str()), ("__inner$info", inner)] {
+                let info = emitted
+                    .lines()
+                    .find(|line| line.starts_with('@') && line.contains(symbol))
+                    .expect("ordinary retained function must have an info definition");
+                assert!(
+                    info.contains("ptrtoint"),
+                    "source range must be relative: {info}"
+                );
+                assert!(
+                    info.contains(&format!("ptr null, i32 {}, i16", source.len())),
+                    "source length must reuse the idle versioned-captures field: {info}"
+                );
+                assert!(
+                    !info.contains("constant { { ptr"),
+                    "ordinary source info must stay at the common ABI size: {info}"
+                );
+            }
+        } else {
+            assert_eq!(
+                calls.len(),
+                3,
+                "unloadable images must copy all three sources"
+            );
+            for (call, (symbol, source, flag)) in calls.iter().zip([
+                ("__outer", outer.as_str(), 1),
+                ("__inner", inner, 0),
+                ("__C__m", method, 0),
+            ]) {
+                assert!(call.contains("@js_register_function_source("), "{call}");
+                assert!(
+                    call.contains(&format!("{symbol},")),
+                    "registration order/symbol changed: {call}"
+                );
+                let offset = outer.find(source).unwrap();
+                let source_pointer = if offset == 0 {
+                    base.to_owned()
+                } else {
+                    emitted
+                        .lines()
+                        .find(|line| {
+                            line.contains("getelementptr")
+                                && line.contains(&format!("ptr {base}, i64 {offset}"))
+                        })
+                        .expect("copying registration must compute the source slice")
+                        .trim()
+                        .split(" = ")
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                };
+                assert!(
+                    call.contains(&format!(
+                        "ptr {source_pointer}, i32 {}, i32 {flag})",
+                        source.len()
+                    )),
+                    "source range/length/strictness changed: {call}"
+                );
+            }
         }
         // #11501: class source follows the same output-kind spelling as
         // function source — borrowed by an executable, copied by an image
@@ -619,10 +678,27 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
              contract: {}",
             class_calls[0]
         );
+        let class_offset = outer.find(class.as_str()).unwrap();
+        let class_pointer = if class_offset == 0 {
+            base.to_owned()
+        } else {
+            emitted
+                .lines()
+                .find(|line| {
+                    line.contains(" = getelementptr")
+                        && line.contains(&format!("ptr {base}, i64 {class_offset}"))
+                })
+                .expect("class registration must compute the retained source slice")
+                .trim()
+                .split(" = ")
+                .next()
+                .unwrap()
+                .to_owned()
+        };
         assert!(
             class_calls[0].contains(&format!(
                 "(i32 3, ptr {}, i32 {})",
-                pointer(&class),
+                class_pointer,
                 class.len()
             )),
             "class source range/length changed: {}",

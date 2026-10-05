@@ -104,6 +104,8 @@ pub(crate) fn builtin_parent_reserved_class_id(name: &str) -> Option<u32> {
         "DataView" => 0xFFFF002B,
         "WeakMap" => 0xFFFF002C,
         "WeakSet" => 0xFFFF002D,
+        "WeakRef" => 0xFFFF0064,
+        "FinalizationRegistry" => 0xFFFF0065,
         "Promise" => 0xFFFF0027,
         "Number" => 0xFFFF00D0,
         "String" => 0xFFFF00D1,
@@ -498,7 +500,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "Uint8Array" => 0xFFFF0004u32,
                 "Buffer" => 0xFFFF000Cu32,
                 // Other %TypedArray% kinds (#3148). The runtime resolves the
-                // actual kind via TYPED_ARRAY_REGISTRY + class_id_for_kind in
+                // actual kind from the typed array's header + class_id_for_kind in
                 // instanceof.rs; these reserved ids must match the
                 // CLASS_ID_* constants in perry-runtime/src/typedarray.rs.
                 "Int8Array" => 0xFFFF0030u32,
@@ -540,6 +542,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 "DataView" => 0xFFFF002Bu32,
                 "WeakMap" => 0xFFFF002Cu32,
                 "WeakSet" => 0xFFFF002Du32,
+                // WeakRef / FinalizationRegistry instances carry these ids on
+                // their header (CLASS_ID_WEAKREF / CLASS_ID_FINALIZATION_REGISTRY
+                // in perry-runtime/src/weakref.rs), so the class-id match needs
+                // no probe. They must stay distinct from every probe id above:
+                // they once shared 0x29/0x2A with `Request`/`Headers`.
+                "WeakRef" => 0xFFFF0064u32,
+                "FinalizationRegistry" => 0xFFFF0065u32,
                 // `Blob` — stream consumers allocate a scoped Blob-shaped
                 // ObjectHeader tagged with this reserved class id.
                 "Blob" => 0xFFFF0026u32,

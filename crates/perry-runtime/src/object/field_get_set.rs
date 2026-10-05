@@ -209,7 +209,9 @@ mod buffer_own_prop;
 mod class_object_props;
 mod class_object_template;
 pub(crate) use class_object_template::{
-    is_evaluation_prototype_with_methods, static_method_value_runs,
+    class_object_template_cell, is_evaluation_prototype_with_methods, record_instance_link,
+    static_method_value_runs, template_instance, TemplateCell, TemplateInstance,
+    CLASS_TEMPLATE_KEY,
 };
 mod crypto_key;
 pub(crate) mod entries_shape;
@@ -233,6 +235,8 @@ mod probe_dispatch;
 /// #9131: per-instance `[[Prototype]]` override lookup, split out of
 /// `get_field_by_name_tail.rs` for the 2000-line cap.
 mod prototype_override;
+/// A builtin's spec `Get` as a read site: an emitted site's two words, per agent.
+pub(crate) mod runtime_read_site;
 #[allow(dead_code)] // #9244: field-get short-circuits removed; kept for the method path.
 
 /// Size of the direct-mapped `(keys_ptr, key_hash, field_index)` inline
@@ -287,6 +291,7 @@ pub(crate) use crypto_key::{
 pub(crate) use enumeration::{
     canonical_array_index, ecma_own_key_order, instance_private_key_hidden,
     is_internal_runtime_key, is_internal_runtime_key_bytes, keys_contain_array_index,
+    own_key_hidden_bytes, own_keys_may_hide,
 };
 pub use enumeration::{
     js_for_in_keys_value, js_object_entries, js_object_entries_value, js_object_keys,
@@ -334,6 +339,7 @@ pub(crate) use ic_miss::{get_field_ic_dispatch, pic_outlined_mru_hit};
 // The read path's spill flip, shared with the static-key store IC's ways
 // (`proxy/put_value/packed_set.rs`): one encoding for both compact words.
 pub(crate) use ic_miss::PACKED_SPILL_FLIP;
+pub(crate) use ic_miss::PRIVATE_FRESH_EVALUATION_BRAND;
 #[cfg(test)]
 pub(crate) use ic_miss::{
     primitive_proto_method_name_static, test_pending_private_access_owner,

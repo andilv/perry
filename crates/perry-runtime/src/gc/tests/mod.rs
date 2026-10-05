@@ -64,6 +64,7 @@ mod leaf_marks;
 mod map_store;
 mod mark_slot_hoists;
 mod minor_fixed_cost;
+mod native_payload;
 mod noncollecting_root_lock;
 mod object_create;
 mod old_free_intrusive;
@@ -98,6 +99,7 @@ mod sweep_described_runs;
 mod sweep_hole_rebuild;
 mod sweep_page_tally;
 mod sweep_whole_block;
+mod sweep_window_births;
 mod teardown;
 mod telemetry_verifier;
 mod temp_roots;
@@ -120,3 +122,6 @@ mod private_evaluation_storage;
 
 mod event_internal_slots;
 mod external_buffer;
+
+#[cfg(target_os = "linux")]
+mod eden_entry_residency;

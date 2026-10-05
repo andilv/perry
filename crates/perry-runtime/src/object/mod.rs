@@ -5,7 +5,6 @@
 //! - Parent/shape ID (for inheritance and descriptor lookup)
 //! - Metadata pointer (for overflow storage and descriptor overrides)
 //! - Fields array (inline)
-
 use crate::arena::arena_alloc_gc;
 use crate::ArrayHeader;
 use crate::JSValue;
@@ -14,7 +13,6 @@ use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
-
 /// Minimum number of inline field slots every object is allocated with, even
 /// when it has fewer fields. This is a corruption-critical invariant: allocation,
 /// every field get/set bounds check, and every direct-slot read MUST use the
@@ -47,14 +45,12 @@ use std::sync::RwLock;
 /// all of them), so 2 is chosen as the one that keeps the most inline headroom
 /// for a dynamically-grown `{}` at zero byte cost.
 pub(crate) const INLINE_SLOT_FLOOR: usize = 2;
-
 // Submodules (issue #1103): behavior-preserving split of the former
 // 11.2k-line object.rs. Public re-exports keep FFI symbols stable.
 #[cfg(test)]
 mod test_root_helpers;
 #[cfg(test)]
 pub(crate) use test_root_helpers::*;
-
 pub(crate) mod alloc;
 mod alloc_basic;
 pub(crate) mod alloc_plain;
@@ -213,8 +209,8 @@ pub(crate) use native_module_registry::nm_ctor_lookup;
 // Re-exported for submodule installers that delegate to a native module
 // (`fs/promises` → `fs.constants`, `sys` → `util`).
 pub(crate) use native_module_registry::{
-    js_install_global_value_surfaces, js_nm_install_fs, js_nm_install_module, js_nm_install_perf,
-    js_nm_install_util,
+    js_install_global_value_surfaces, js_nm_install_events, js_nm_install_fs, js_nm_install_module,
+    js_nm_install_perf, js_nm_install_util,
 };
 mod literal_constructor;
 mod native_module_stream;
@@ -400,7 +396,6 @@ pub use this_binding::{
 pub use to_string_tag::js_object_to_string;
 pub(crate) use to_string_tag::typed_array_to_string_tag_name;
 pub(crate) use to_string_tag::web_builtin_to_string_tag;
-
 /// An atomic GC root whose backing slot belongs to the calling Perry agent.
 ///
 /// The public handle stays process-global and contains no heap address. Every
@@ -411,42 +406,35 @@ pub(crate) use to_string_tag::web_builtin_to_string_tag;
 pub(crate) struct RealmAtomicI64 {
     slot: &'static crate::tls_hot::HotKey<AtomicI64>,
 }
-
 impl RealmAtomicI64 {
     // `pub(crate)` so a family that owns its own prototype singletons can
     // declare them in its own module (`timer.rs`) instead of parking them here.
     pub(crate) const fn new(slot: &'static crate::tls_hot::HotKey<AtomicI64>) -> Self {
         Self { slot }
     }
-
     #[inline(always)]
     pub(crate) fn load(&self, ordering: Ordering) -> i64 {
         self.slot.with(|slot| slot.load(ordering))
     }
-
     #[inline(always)]
     pub(crate) fn store(&self, value: i64, ordering: Ordering) {
         self.slot.with(|slot| {
             crate::gc::runtime_store_root_atomic_raw_i64(slot, value, ordering);
         });
     }
-
     #[inline(always)]
     pub(crate) fn with_slot<R>(&self, f: impl FnOnce(&AtomicI64) -> R) -> R {
         self.slot.with(f)
     }
-
     #[cfg(test)]
     pub(crate) fn test_slot_addr(&self) -> usize {
         self.slot.with(|slot| slot as *const AtomicI64 as usize)
     }
 }
-
 /// `u64` twin of [`RealmAtomicI64`] for NaN-boxed root words.
 pub(crate) struct RealmAtomicU64 {
     slot: &'static crate::tls_hot::HotKey<AtomicU64>,
 }
-
 impl RealmAtomicU64 {
     const fn new(slot: &'static crate::tls_hot::HotKey<AtomicU64>) -> Self {
         Self { slot }
@@ -731,6 +719,7 @@ mod keys_lookup;
 mod object_keys;
 pub(crate) mod shaped_symbols;
 pub(crate) use object_keys::ObjectKeys;
+pub(crate) mod define_own_data;
 pub(crate) mod dynamic_key_read;
 pub(crate) mod read_stub;
 pub(crate) use keys_lookup::*;
@@ -1592,6 +1581,9 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
     // and be rewritten when they move — the same contract as the iterator
     // tower above.
     crate::timer::scan_timer_prototype_roots_mut(visitor);
+    // #11919 P0: the native-payload families' prototypes (crypto `Hash`,
+    // `Hmac`, `Cipheriv`, `Decipheriv`, ...). Same contract as the timers'.
+    crate::native_payload::scan_payload_prototype_roots_mut(visitor);
     // #340/#341: the five `perry/tui` prototypes and the three singleton
     // handles (`useApp` / `useStdout` / `useFocusManager`). The singletons are
     // a resource -> object mapping, not just a prototype: `useApp()` must be
@@ -1936,6 +1928,8 @@ unsafe fn set_object_keys_with_live_rep(
 
 /// #9180: the receiver `[[Set]]` own-key probe, split out to keep `tests.rs`
 /// under the 2000-line cap.
+#[cfg(test)]
+mod builtin_value_tests;
 #[cfg(test)]
 mod keys_front_offset_tests;
 #[cfg(test)]

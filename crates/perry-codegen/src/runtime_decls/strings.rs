@@ -384,6 +384,23 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, DOUBLE, I32, PTR, I32, I32, I32, PTR],
     );
+    // #11791: the misses of the inline private field read and write.
+    module.declare_function(
+        "js_private_field_site_get",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, PTR, I32, PTR, DOUBLE],
+    );
+    module.declare_function(
+        "js_private_field_site_set",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I32, PTR, I32, PTR, DOUBLE, DOUBLE],
+    );
+    // #11791: a class's completed private shape, minted at module init.
+    module.declare_function(
+        "js_object_final_shape_id_for_class_keys_static_private",
+        I32,
+        &[I64, I32, I32, I32, I32, I64, PTR, I32, PTR, I32],
+    );
     module.declare_function(
         "js_private_method_guard",
         DOUBLE,
@@ -519,6 +536,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         "js_fs_write_sync_options_dispatch",
         DOUBLE,
         &[DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_fs_write_sync_args",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE],
     );
     // fs.accessSync(path) — returns i32 status (1=ok, 0=error).
     module.declare_function("js_fs_access_sync", I32, &[DOUBLE]);
@@ -1621,6 +1643,8 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[DOUBLE],
     );
     module.declare_function("js_throw_reference_error_unresolved_get", DOUBLE, &[]);
+    // #11826: module-level TDZ checks (`expr/tdz_module_check.rs`).
+    module.declare_function("js_throw_reference_error_tdz", DOUBLE, &[DOUBLE]);
     // with-statement implicit-global sentinel (HOLE) helpers.
     module.declare_function("js_with_implicit_unset", DOUBLE, &[]);
     module.declare_function("js_with_implicit_read", DOUBLE, &[DOUBLE, DOUBLE]);

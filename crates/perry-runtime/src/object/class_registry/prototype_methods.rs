@@ -53,6 +53,59 @@ pub unsafe extern "C" fn js_class_register_static_field(
     crate::object::class_value::note_static_field_defined(class_id, name);
 }
 
+/// [`js_class_register_static_field`] for a static PRIVATE field
+/// (`static #x`): the same store, then the storage key becomes an
+/// `ENTRY_PRIVATE` entry of the class function's bag, so no reflection path
+/// sees it (#11791).
+#[no_mangle]
+pub unsafe extern "C" fn js_class_register_static_private_field(
+    class_id: u32,
+    name_ptr: *const u8,
+    name_len: usize,
+    value: f64,
+    global_slot: *mut f64,
+) {
+    js_class_register_static_field(class_id, name_ptr, name_len, value, global_slot);
+    if class_id == 0 || name_ptr.is_null() || name_len == 0 {
+        return;
+    }
+    let name = std::slice::from_raw_parts(name_ptr, name_len);
+    crate::object::class_value::class_static_claim_private(class_id, name);
+}
+
+/// Define a static PRIVATE field of a fresh class evaluation on its class
+/// object: the ordinary store, then the key becomes an `ENTRY_PRIVATE` entry
+/// of the class object's own properties (#11791).
+#[no_mangle]
+pub unsafe extern "C" fn js_class_object_define_static_private(
+    class_object: *mut crate::object::ObjectHeader,
+    key: *const crate::StringHeader,
+    value: f64,
+) {
+    crate::object::js_object_set_field_by_name(class_object, key, value);
+    if key.is_null() {
+        return;
+    }
+    let addr = (class_object as u64 & crate::value::POINTER_MASK) as usize;
+    let Some(header) = crate::value::addr_class::try_read_gc_header(addr) else {
+        return;
+    };
+    let name =
+        std::slice::from_raw_parts(crate::string::string_data(key), (*key).byte_len as usize);
+    if header.obj_type == crate::gc::GC_TYPE_CLOSURE {
+        crate::closure::props::bag_claim_private(addr, name);
+    } else if header.obj_type == crate::gc::GC_TYPE_OBJECT {
+        let _no_move = crate::gc::GcSuppressScope::new();
+        let obj = addr as *mut crate::object::ObjectHeader;
+        if !crate::object::key_attrs::object_key_is_private(obj, name) {
+            crate::object::key_attrs::apply_edits(
+                obj,
+                &[crate::object::key_attrs::AttrsEdit::Private(name)],
+            );
+        }
+    }
+}
+
 /// Read a computed instance-field key resolved at ClassDefinitionEvaluation.
 /// Fresh class values carry the hidden slot on their heap class object; plain
 /// class references use the class-id static side table.
@@ -217,11 +270,10 @@ pub(crate) fn invalidate_class_prototype_fast_guards_for_method(name: &str) {
 ///   ancestor declares — exactly the names whose resolution it can change. A
 ///   name the class itself declares still resolves to its own body, and a
 ///   name no declared class carries never had a direct arm;
-/// * the `(class_id, method name)` dispatch caches (`VTABLE_IC`,
-///   `OBJ_DISPATCH_IC`) are keyed on `VTABLE_GEN`, which the retirement bumps.
-///
-/// The receiver-word site memos need nothing: the relink restamps `proto`'s
-/// shape, which their hop facts compare.
+/// The runtime's by-name method calls need nothing: they read the
+/// prototype chain's shapes (`native_call_method::class_holder`), and the
+/// relink restamps `proto`. Neither do the receiver-word site memos: the
+/// relink restamps `proto`'s shape, which their hop facts compare.
 ///
 /// # Safety
 /// `proto` must point to a live, meta-capable object.

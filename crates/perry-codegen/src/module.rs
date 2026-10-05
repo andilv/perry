@@ -323,6 +323,36 @@ impl LlModule {
         note(self.fn_infos.borrow_mut().facts_mut(body));
     }
 
+    /// Attach retained source directly to an ordinary compiled JS body's
+    /// static info. Raw method/accessor ABIs deliberately decline: their
+    /// reflected function objects run shared runtime thunks and still use the
+    /// copying/borrowing registry path in `string_pool`.
+    pub(crate) fn attach_fn_source(
+        &self,
+        body: &str,
+        global: &str,
+        offset: usize,
+        byte_len: usize,
+        is_non_strict_ordinary: bool,
+    ) -> bool {
+        let Some(function) = self.function_named(body) else {
+            return false;
+        };
+        if !is_js_body(function) {
+            return false;
+        }
+        self.fn_infos
+            .borrow_mut()
+            .facts_mut(body)
+            .set_source(crate::fn_info::RetainedSource {
+                global: global.to_string(),
+                offset,
+                byte_len,
+                is_non_strict_ordinary,
+            });
+        true
+    }
+
     pub(crate) fn request_static_seed_body(&mut self, body: &str) {
         self.fn_infos.borrow_mut().request_static_seed_body(body);
     }
@@ -540,6 +570,41 @@ impl LlModule {
         ));
     }
 
+    /// Emit the module's one cold retained-source blob outside the ordinary
+    /// literal pages. This is a byte blob, not a C string: every consumer
+    /// carries an explicit byte length, so no terminator is emitted.
+    pub fn add_retained_source_constant(&mut self, value: &str) -> (String, usize) {
+        let name = if self.symbol_prefix.is_empty() {
+            ".perry.retained_source".to_string()
+        } else {
+            format!("{}_.perry.retained_source", self.symbol_prefix)
+        };
+        let bytes = value.as_bytes();
+        let mut lit = String::with_capacity(bytes.len() + 8);
+        lit.push_str("c\"");
+        for &byte in bytes {
+            if (32..127).contains(&byte) && byte != b'"' && byte != b'\\' {
+                lit.push(byte as char);
+            } else {
+                lit.push('\\');
+                lit.push_str(&format!("{byte:02X}"));
+            }
+        }
+        lit.push('"');
+        let section = if self.target_triple.contains("apple") {
+            "__TEXT,__perry_src"
+        } else if self.target_triple.contains("windows") {
+            ".rdata$perry_src"
+        } else {
+            ".perry_src"
+        };
+        self.string_constants.push(format!(
+            "@{name} = private constant [{} x i8] {lit}, section \"{section}\", align 1",
+            bytes.len()
+        ));
+        (name, bytes.len())
+    }
+
     /// Add a UTF-8 string constant to the module's constant pool. Returns
     /// `(global_name, byte_length)` — the byte length is what Perry passes as
     /// the `len` argument to `js_string_from_bytes`.
@@ -602,9 +667,10 @@ impl LlModule {
     }
 
     /// The module *skeleton*: everything [`to_ir`] emits EXCEPT function
-    /// definitions — header, string constants, globals, declarations (still
-    /// filtered against defined names, which the native path adds via the C
-    /// API), attribute groups and metadata.
+    /// definitions — header, string constants, globals, declarations,
+    /// attribute groups and metadata. Locally-defined functions are emitted
+    /// as declarations so globals with relative function references resolve
+    /// when the skeleton is parsed on its own.
     ///
     /// This is the only text the native construction path
     /// (`PERRY_LLVM_INPROCESS=native`) still parses: a few KB of module
@@ -633,11 +699,8 @@ impl LlModule {
             ir.push('\n');
         }
         ir.push('\n');
-        let defined: HashSet<&str> = self
-            .deduped_function_refs()
-            .iter()
-            .map(|f| f.name.as_str())
-            .collect();
+        let funcs = self.deduped_function_refs();
+        let defined: HashSet<&str> = funcs.iter().map(|f| f.name.as_str()).collect();
         for (name, decl) in &self.declarations {
             if defined.contains(name.as_str()) {
                 continue;
@@ -647,6 +710,10 @@ impl LlModule {
         }
         if crate::codegen::helpers::native_stack_roots_enabled() {
             push_statepoint_declarations(&mut ir);
+        }
+        for f in funcs {
+            ir.push_str(&declare_line_for(f));
+            ir.push('\n');
         }
         ir.push('\n');
         self.push_attrs_and_metadata(&mut ir);
@@ -1026,8 +1093,12 @@ impl LlModule {
         // of literal zeros in the Claude Code binary's `__data`, 8.2% of the
         // file, purely from the promotion. Only LOCAL-linkage definitions skip
         // it (`has_local_linkage`) — that covers every generated cache and
-        // table, and keeps a strong external definition's cross-module
-        // coalescing exactly as it was.
+        // table. An EXTERNAL definition keeps its cross-module coalescing, as
+        // `weak_odr` rather than `linkonce_odr`: both fold same-named copies,
+        // but `linkonce_odr` is discardable, and LLVM drops a sole definition
+        // that nothing in its own unit uses even when another object of the
+        // link names it (a ConstFn body's `$info`, referenced only by the
+        // static shape-seed object, vanished from the binary that way).
         let mut defining_unit_count: Vec<usize> = vec![0; all_globals.len()];
         if replicate_globals {
             for need in &bucket_needs {
@@ -1069,7 +1140,11 @@ impl LlModule {
                 let owns = global_owners[gi] == bi;
                 if (replicate_globals && referenced) || owns {
                     if replicate_globals {
-                        if defining_unit_count[gi] > 1 || !has_local_linkage(def) {
+                        if !has_local_linkage(def) {
+                            // External: another object may name it, so it must
+                            // coalesce without ever being discarded.
+                            pre.push_str(&promote_external_global_for_units(def));
+                        } else if defining_unit_count[gi] > 1 {
                             pre.push_str(&promote_global_for_units(def));
                         } else {
                             pre.push_str(def);

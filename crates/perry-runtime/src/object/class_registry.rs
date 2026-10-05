@@ -3,9 +3,10 @@
 //! registers its methods, getters, and setters at startup;
 //! `js_native_call_method` / `js_dynamic_object_get_property` look up
 //! the vtable by the object's `class_id` when static dispatch isn't
-//! possible. Also home for the per-callsite inline cache
-//! (`vtable_ic_*` / `call_vtable_method`) and the parent-chain
-//! registration helpers used by codegen.
+//! possible. Also home for `call_vtable_method` and the parent-chain
+//! registration helpers used by codegen. A by-name call of a class
+//! instance's string-keyed method does not consult the vtable: its
+//! prototype chain's shapes answer it (`native_call_method::class_holder`).
 //!
 //! Split out of `object/mod.rs` (issue #1103). Pure relocation — no
 //! logic changes.
@@ -17,29 +18,19 @@
 //! `pub use class_registry::*` glob in `object/mod.rs`). Pure relocation.
 
 pub use super::class_handles::{
-    event_emitter_async_resource_dispatch, event_emitter_async_resource_handle_probe,
-    event_emitter_get_domain, event_emitter_handle_probe, event_emitter_method_dispatch,
-    event_emitter_on, event_emitter_property_dispatch, event_emitter_set_domain,
     fetch_handle_kind_probe, handle_method_dispatch, handle_own_property_names_dispatch,
     handle_property_dispatch, handle_property_set_dispatch, handle_prototype_dispatch,
-    http_agent_handle_probe, js_register_event_emitter_async_resource_dispatch,
-    js_register_event_emitter_async_resource_handle_probe, js_register_event_emitter_get_domain,
-    js_register_event_emitter_handle_probe, js_register_event_emitter_method_dispatch,
-    js_register_event_emitter_on, js_register_event_emitter_property_dispatch,
-    js_register_event_emitter_set_domain, js_register_fetch_handle_kind_probe,
+    http_agent_handle_probe, js_register_fetch_handle_kind_probe,
     js_register_handle_method_dispatch, js_register_handle_own_property_names_dispatch,
     js_register_handle_property_dispatch, js_register_handle_property_set_dispatch,
     js_register_handle_prototype_dispatch, js_register_http_agent_handle_probe,
     js_register_net_socket_handle_probe, js_register_stream_expando_set,
     js_register_stream_handle_kind_probe, js_register_stream_handle_probe,
     js_register_tls_handle_kind_probe, net_socket_handle_probe, stream_expando_set,
-    stream_handle_kind_probe, stream_handle_probe, tls_handle_kind_probe,
-    EventEmitterAsyncResourceDispatchFn, EventEmitterAsyncResourceHandleProbeFn,
-    EventEmitterGetDomainFn, EventEmitterHandleProbeFn, EventEmitterOnFn, EventEmitterSetDomainFn,
-    FetchHandleKindProbeFn, HandleMethodDispatchFn, HandleOwnPropertyNamesDispatchFn,
-    HandlePropertyDispatchFn, HandlePropertySetDispatchFn, HandlePrototypeDispatchFn,
-    HttpAgentHandleProbeFn, NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn,
-    TlsHandleKindProbeFn,
+    stream_handle_kind_probe, stream_handle_probe, tls_handle_kind_probe, FetchHandleKindProbeFn,
+    HandleMethodDispatchFn, HandleOwnPropertyNamesDispatchFn, HandlePropertyDispatchFn,
+    HandlePropertySetDispatchFn, HandlePrototypeDispatchFn, HttpAgentHandleProbeFn,
+    NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn, TlsHandleKindProbeFn,
 };
 use super::*;
 
@@ -101,11 +92,10 @@ pub(crate) use state::{
     class_prototype_method_value_cache_root_store, class_prototype_object_addr_index_contains,
     class_prototype_object_addr_index_rekey, class_prototype_object_root_store,
     class_ref_dynamic_prop_root_store, class_register_declared_static_global_slot,
-    class_set_template_cell, class_static_alias_sync, class_static_clear_defined_attrs,
-    class_static_defined_attrs, class_static_key_deleted, class_static_prototype,
-    class_static_prototype_is_nulled, class_static_prototype_root_clear,
-    class_static_prototype_root_store, class_static_set_defined_attrs, class_template_cell,
-    decl_prototype_identity_id, global_object_prototype_bits,
+    class_static_alias_sync, class_static_clear_defined_attrs, class_static_defined_attrs,
+    class_static_key_deleted, class_static_prototype, class_static_prototype_is_nulled,
+    class_static_prototype_root_clear, class_static_prototype_root_store,
+    class_static_set_defined_attrs, decl_prototype_identity_id, global_object_prototype_bits,
     is_bound_native_constructor_closure_value, is_non_constructable_builtin_function_value,
     parent_closure_in_chain, template_has_class_objects, throw_non_constructable_builtin_function,
     CLASS_OBJECT_EVER,
@@ -123,10 +113,9 @@ pub use state::{
 pub(crate) use prototype_objects::{
     class_decl_prototype_relinked, class_prototype_object, decl_prototype_relinked,
     ensure_function_prototype_object, function_class_id, function_value_for_class_id,
-    instance_class_prototype_object, object_proto_chain_symbol_slot, relinked_class_prototype_read,
-    resolve_proto_chain_field, resolve_proto_chain_field_noting_miss,
-    resolve_proto_chain_field_with_receiver, resolve_proto_chain_symbol,
-    synthetic_class_prototype_object, SYNTHETIC_CLASS_ID_BASE,
+    object_proto_chain_symbol_slot, relinked_class_prototype_read, resolve_proto_chain_field,
+    resolve_proto_chain_field_noting_miss, resolve_proto_chain_field_with_receiver,
+    resolve_proto_chain_symbol, synthetic_class_prototype_object, SYNTHETIC_CLASS_ID_BASE,
 };
 pub use prototype_objects::{
     js_set_function_prototype, js_set_prototype_property, NEXT_SYNTHETIC_CLASS_ID,
@@ -178,8 +167,9 @@ pub use prototype_methods::{
 pub(crate) use construct::{
     bound_function_target_value, extends_target_must_throw, is_callable_function_value,
     js_value_is_constructor, lookup_own_prototype_method, lookup_prototype_method,
-    nm_ctor_child_process, nm_ctor_cluster, nm_ctor_fs, nm_ctor_readline, nm_ctor_repl,
-    nm_ctor_stream, nm_ctor_tls, nm_ctor_tty, nm_ctor_vm, nm_ctor_wasi, promise_parent_in_chain,
+    nm_ctor_child_process, nm_ctor_cluster, nm_ctor_events, nm_ctor_fs, nm_ctor_readline,
+    nm_ctor_repl, nm_ctor_stream, nm_ctor_tls, nm_ctor_tty, nm_ctor_vm, nm_ctor_wasi,
+    promise_parent_in_chain,
 };
 pub use construct::{
     js_ctor_return_override, js_new_function_construct, js_new_function_construct_apply,
@@ -229,8 +219,7 @@ pub(crate) use dispatch::test_bump_vtable_generation;
 pub(crate) use dispatch::{
     call_vtable_method, call_vtable_method_value, call_vtable_method_with_private_brand,
     class_lookup_surface_gen_bump, class_lookup_surface_generation, fetch_parent_kind_in_chain,
-    obj_dispatch_ic_insert, obj_dispatch_ic_lookup, vtable_generation, vtable_ic_insert,
-    vtable_ic_lookup, VTABLE_GEN,
+    vtable_generation, VTABLE_GEN,
 };
 
 // ── parent_static.rs ────────────────────────────────────────────────────────

@@ -92,6 +92,7 @@ mod literal_descriptor;
 #[cfg(test)]
 mod map_entry_at_tests;
 pub(crate) mod stack_guard;
+pub(crate) mod tdz_module_check;
 pub(crate) use bitset_test::is_u32_bitset_test;
 mod buffer_access;
 mod buffer_views;
@@ -159,7 +160,9 @@ pub(crate) use i32_fast_path::{
     try_flat_const_2d_int, try_lower_flat_const_index_get,
 };
 pub(crate) use index::lower_index_set_fast;
-pub(crate) use logical_collections::emit_private_site_cache;
+pub(crate) use logical_collections::{
+    emit_private_site_cache, emit_private_site_guard, emit_private_template_inert,
+};
 pub(crate) use nanbox_inline::{
     i32_bool_to_nanbox, i32_to_nanbox, nanbox_bigint_inline, nanbox_pointer_inline,
     nanbox_pointer_inline_pub, nanbox_string_inline,
@@ -223,6 +226,8 @@ mod array_push_own_tests;
 #[cfg(test)]
 mod barrier_stem_census_tests;
 #[cfg(test)]
+mod bounded_array_hole_tests;
+#[cfg(test)]
 mod class_field_barrier_tests;
 #[cfg(test)]
 mod class_field_get_shape_tests;
@@ -250,6 +255,8 @@ mod write_pic_barrier_tests;
 // `pub(crate)` since #7615 slice 8: `rooting/temp_root.rs` binds a pooled
 // temp alloca through the same shadow-slot emission every named local uses,
 // and it now lives outside `crate::expr`.
+#[cfg(test)]
+mod bounded_array_index_tests;
 #[cfg(test)]
 mod call_return_array_index_tests;
 #[cfg(test)]
@@ -720,6 +727,13 @@ pub(crate) struct FnCtx<'a> {
     pub compiler_private_async_i1_control_locals: &'a std::collections::HashSet<u32>,
     /// Module-wide scope context object groups (`crate::scope_env`).
     pub scope_map: &'a crate::scope_env::ScopeMap,
+    /// Module-wide untyped string accumulators
+    /// (`collectors::string_accumulator_locals`): selected for the in-place
+    /// self-append and demoted on ordinary reads, like a declared `string`.
+    pub string_accumulator_locals: &'a std::collections::HashSet<u32>,
+    /// Set while lowering `<id>.length`: that read of `id` cannot hand the
+    /// string anywhere, so it skips the unique-owner demote.
+    pub string_length_read_of: Option<u32>,
     /// Closure rest param index: closure `FuncId` → index of the rest
     /// parameter. Built once in `compile_module` from the collected
     /// closures. Used by the closure call site in `lower_call` to
@@ -2678,6 +2692,13 @@ mod inline_cache_name_tests {
 }
 
 impl<'a> FnCtx<'a> {
+    /// May some compiled class of the program declare a getter named `name`?
+    /// Where this is false a read site emits no class-getter arm.
+    pub(crate) fn program_may_declare_getter(&self, name: &str) -> bool {
+        self.program_class_accessor_names
+            .is_none_or(|names| names.may_get(name))
+    }
+
     /// May some compiled class of the program declare a setter named `name`?
     /// Where this is false a store site emits no class-setter arm.
     pub(crate) fn program_may_declare_setter(&self, name: &str) -> bool {
@@ -3136,6 +3157,7 @@ pub(crate) mod number_to_string_inline;
 mod number_to_string_inline_tests;
 mod objects_arrays_lit;
 pub(crate) mod os_uri_dates;
+pub(crate) mod private_field_site;
 pub(crate) mod property_get;
 pub(crate) mod property_set;
 pub(crate) mod proxy_reflect;

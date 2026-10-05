@@ -223,8 +223,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     .as_ref()
                     .map(|name| format!("@{name}"))
                     .unwrap_or_else(|| "null".to_string());
+                // A static private element is claimed as one at its source
+                // (an `ENTRY_PRIVATE` key of the class function, #11791).
+                let register = if field_name.starts_with('#') {
+                    "js_class_register_static_private_field"
+                } else {
+                    "js_class_register_static_field"
+                };
                 ctx.block().call_void(
-                    "js_class_register_static_field",
+                    register,
                     &[
                         (crate::types::I32, &cid_str),
                         (crate::types::PTR, &bytes_ref),
@@ -941,12 +948,12 @@ pub(crate) fn lower_class_evaluation_object(ctx: &mut FnCtx<'_>, expr: &Expr) ->
             crate::codegen::fresh_class_templates::template_cell_global(template_cid)
         )
     };
-    // Room for the evaluation's own `length`, `name` and static
-    // methods, its pinned parent, its captured environment and its
-    // prototype object besides its static fields, so the template's
+    // Room for the evaluation's template key, its own `length`, `name`
+    // and static methods, its pinned parent, its captured environment and
+    // its prototype object besides its static fields, so the template's
     // shapes are all inline slots (`class_object_template`).
     let own_member_slots =
-        3 + ctx.classes.get(template).map_or(0, |c| {
+        4 + ctx.classes.get(template).map_or(0, |c| {
             c.static_methods.len()
                 + usize::from(c.extends_expr.is_some() || evaluated_parent.is_some())
         }) + usize::from(!captured_args.is_empty());
@@ -1131,10 +1138,14 @@ pub(crate) fn lower_class_evaluation_object(ctx: &mut FnCtx<'_>, expr: &Expr) ->
                     let key_box = blk.load(DOUBLE, &key_handle_global);
                     let key_bits = blk.bitcast_double_to_i64(&key_box);
                     let key_raw = blk.and(I64, &key_bits, crate::nanbox::POINTER_MASK_I64);
-                    blk.call_void(
-                        "js_object_set_field_by_name",
-                        &[(I64, &obj), (I64, &key_raw), (DOUBLE, &value)],
-                    );
+                    // A static private element is claimed as one where it is
+                    // created (#11791).
+                    let define = if name.starts_with('#') {
+                        "js_class_object_define_static_private"
+                    } else {
+                        "js_object_set_field_by_name"
+                    };
+                    blk.call_void(define, &[(I64, &obj), (I64, &key_raw), (DOUBLE, &value)]);
                 }
                 perry_hir::ClassFreshStaticInit::Computed(index) => {
                     let Some((key_slot, init)) = computed_statics.get(*index as usize) else {

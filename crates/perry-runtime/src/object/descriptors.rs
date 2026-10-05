@@ -186,6 +186,22 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
             }
         }
 
+        // A private field (#11791) or a runtime-internal key is not a property.
+        if obj_jv.is_pointer() {
+            let object = obj_jv.as_pointer::<super::ObjectHeader>();
+            if super::object_is_shaped(object) && super::field_get_set::own_keys_may_hide(object) {
+                let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+                if crate::string::js_string_key_bytes(
+                    crate::JSValue::from_bits(key_value.to_bits()),
+                    &mut sso,
+                )
+                .is_some_and(|bytes| super::field_get_set::own_key_hidden_bytes(object, bytes))
+                {
+                    return f64::from_bits(crate::value::TAG_UNDEFINED);
+                }
+            }
+        }
+
         // A per-evaluation class object (`ClassExprFresh`, #1772/#1787) is a
         // POINTER-tagged heap object, not a `0x7FFE` class ref, so the
         // `class_ref_id` branch below never fires for it. Its static METHODS
@@ -460,16 +476,6 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                         );
                     }
                 }
-                // `C.prototype` is a non-writable, non-enumerable, non-configurable
-                // own data property of the class constructor (ECMA-262
-                // MakeConstructor). Only the constructor ref carries it — the
-                // prototype ref's own `prototype` lookup falls through.
-                // (Test262 definition/prototype-property.)
-                if method_name == "prototype" && super::class_prototype_ref_id(obj_value).is_none()
-                {
-                    let proto = super::native_module::class_prototype_ref_value(class_id);
-                    return build_data_descriptor(proto, false, false, false);
-                }
                 if method_name == "name"
                     && super::class_prototype_ref_id(obj_value).is_none()
                     && super::class_registry::lookup_static_method_in_chain(class_id, "name")
@@ -544,12 +550,9 @@ pub extern "C" fn js_object_get_own_property_descriptor(obj_value: f64, key_valu
                     super::rebuild_object_field_layout(desc, 4);
                     return f64::from_bits((desc as u64) | 0x7FFD_0000_0000_0000);
                 }
-                // Static methods are own properties of the class *constructor*
-                // (not the prototype). `getOwnPropertyDescriptor(C, "m")` for a
-                // Static FIELDS are own data properties of the constructor,
-                // created via CreateDataPropertyOrThrow → writable, enumerable,
-                // configurable all true. Codegen registers each declared
-                // static field in CLASS_DYNAMIC_PROPS at module init.
+                // Own data properties, including `prototype`, live in the
+                // class function object's property bag. Read their actual
+                // values and shape attributes, never an encoded class ref.
                 if super::class_prototype_ref_id(obj_value).is_none() {
                     if let Some(v) =
                         super::class_registry::class_own_static_field_value(class_id, &method_name)
@@ -1425,7 +1428,7 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
         };
         // Drop only compiler/runtime storage keys. A user String key beginning
         // with `#` is still an ordinary reflectable property.
-        let hide_private = (*obj).class_id != 0;
+        let hide_private = super::field_get_set::own_keys_may_hide(obj);
         let hide_wasi_state = crate::wasi::is_wasi_import_object(obj)
             || crate::wasi::is_wasi_instance(f64::from_bits(
                 crate::value::js_nanbox_pointer(obj as i64).to_bits(),
@@ -1450,7 +1453,9 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
                 let Some(bytes) = crate::string::js_string_key_bytes(key_val, &mut sso_buf) else {
                     continue;
                 };
-                if super::field_get_set::is_internal_runtime_key_bytes(bytes) {
+                if super::field_get_set::is_internal_runtime_key_bytes(bytes)
+                    || (hide_private && super::key_attrs::object_key_is_private(obj, bytes))
+                {
                     continue;
                 }
                 if let Ok(name) = std::str::from_utf8(bytes) {
@@ -1502,7 +1507,7 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
             }
             if hide_private || hide_wasi_state {
                 if let Some(b) = crate::string::js_string_key_bytes(key_val, &mut sso_buf) {
-                    if super::field_get_set::is_internal_runtime_key_bytes(b)
+                    if (hide_private && super::field_get_set::own_key_hidden_bytes(obj, b))
                         || (hide_wasi_state && b.starts_with(b"__wasi"))
                     {
                         continue;

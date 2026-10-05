@@ -296,8 +296,8 @@ pub(super) fn emit_string_pool(
     // Pre-allocate string constants for function-name registration. Same
     // borrow-ordering constraint as the class-name constants below: we
     // must mint the rodata globals BEFORE `init_fn` claims `&mut llmod`.
-    // Each entry becomes one `js_register_function_name_static(<sym>, <str>,
-    // <len>)` call inside the init function. See #1202.
+    // Each entry becomes one relative record in the module's batched function
+    // name descriptor table. See #1202 and #11927.
     let mut user_fn_name_constants: Vec<(String, String, usize)> = Vec::new();
     // Deduplicated by CONTENT (#9486): the same display name is now registered
     // against several symbols — a top-level function's wrapper and its body,
@@ -341,6 +341,11 @@ pub(super) fn emit_string_pool(
     class_sources.sort_by_key(|entry| entry.0);
     class_sources.dedup_by_key(|(cid, _)| *cid);
 
+    // An image that can be unloaded cannot leave borrowed source metadata in
+    // either a registry or a function-info record. Executables are permanent;
+    // dylibs/staticlibs retain the copying registration path below.
+    let strings_outlive_registry = output_type != "dylib" && output_type != "staticlib";
+
     // #4101/#9413: mint source globals BEFORE `init_fn` borrows `llmod`.
     // Sharing changes only the backing bytes, never registration order, source
     // lengths, strictness flags, or the copying/static ownership contract.
@@ -357,11 +362,19 @@ pub(super) fn emit_string_pool(
         if wrapper_sym.is_empty() || source_text.is_empty() {
             continue;
         }
-        user_fn_source_constants.push((
-            wrapper_sym.clone(),
-            source_pool.get(source_text),
-            *is_non_strict_ordinary,
-        ));
+        let source = source_pool.get(source_text);
+        if strings_outlive_registry
+            && llmod.attach_fn_source(
+                wrapper_sym,
+                &source.global,
+                source.offset,
+                source.byte_len,
+                *is_non_strict_ordinary,
+            )
+        {
+            continue;
+        }
+        user_fn_source_constants.push((wrapper_sym.clone(), source, *is_non_strict_ordinary));
     }
 
     // Pre-allocate string constants for class-name registration. We need
@@ -552,16 +565,10 @@ pub(super) fn emit_string_pool(
     // `staticlib` is included because its objects are linked into whatever
     // consumes them, which may itself be a plugin. Executables keep the
     // borrow, which is where all the volume is.
-    let strings_outlive_registry = output_type != "dylib" && output_type != "staticlib";
     let register_name_fn = if strings_outlive_registry {
         "js_register_function_name_static"
     } else {
         "js_register_function_name"
-    };
-    let register_source_fn = if strings_outlive_registry {
-        "js_register_function_source_static"
-    } else {
-        "js_register_function_source"
     };
     let register_class_source_fn = if strings_outlive_registry {
         "js_register_class_source_static"
@@ -575,44 +582,81 @@ pub(super) fn emit_string_pool(
     // wrapper's compiled address (`__perry_wrap_<name>`), which is
     // what `js_closure_alloc_singleton` stamps into ClosureHeader.
     // See #1202.
-    for (wrapper_sym, name_const, name_len) in &user_fn_name_constants {
-        chunker.roll_if_full();
-        let blk = chunker.current_block();
-        let wrapper_ref = format!("@{}", wrapper_sym);
-        let name_ref = format!("@{}", name_const);
-        let len_str = name_len.to_string();
-        // `_static` when this image outlives the registry, else the copying
-        // spelling: `@.str.N` is a `private unnamed_addr constant` in this
-        // module's rodata, which satisfies the process-lifetime contract only
-        // for an image nothing unloads (#9188).
-        blk.call_void(
-            register_name_fn,
-            &[(PTR, &wrapper_ref), (PTR, &name_ref), (I32, &len_str)],
+    if strings_outlive_registry {
+        let name_table = super::function_metadata_descriptors::emit_name_table(
+            chunker.module(),
+            module_prefix,
+            user_fn_name_constants
+                .iter()
+                .map(|(wrapper, name, len)| (wrapper.as_str(), name.as_str(), *len)),
         );
+        if let Some(table) = name_table {
+            chunker.roll_if_full();
+            chunker.current_block().call_void(
+                "js_register_function_names_static",
+                &[
+                    (PTR, &format!("@{}", table.global)),
+                    (I32, &table.len.to_string()),
+                ],
+            );
+        }
+    } else {
+        for (wrapper_sym, name_const, name_len) in &user_fn_name_constants {
+            chunker.roll_if_full();
+            chunker.current_block().call_void(
+                register_name_fn,
+                &[
+                    (PTR, &format!("@{wrapper_sym}")),
+                    (PTR, &format!("@{name_const}")),
+                    (I32, &name_len.to_string()),
+                ],
+            );
+        }
     }
 
     // #4101: register each function's retained source text against the same
     // wrapper/closure address `js_closure_alloc_singleton` stamps into the
     // ClosureHeader, so `fn.toString()` resolves the source by func_ptr.
-    for (wrapper_sym, source, is_non_strict_ordinary) in &user_fn_source_constants {
-        chunker.roll_if_full();
-        let blk = chunker.current_block();
-        let wrapper_ref = format!("@{}", wrapper_sym);
-        let source_ref = source.pointer(blk);
-        let len_str = source.byte_len.to_string();
-        // Same spelling choice as the names above (#9188), and the bigger half
-        // of the win: source text is registered for every function the bundle
-        // CONTAINS, to serve a `Function.prototype.toString()` that most
-        // programs never call.
-        blk.call_void(
-            register_source_fn,
-            &[
-                (PTR, &wrapper_ref),
-                (PTR, &source_ref),
-                (I32, &len_str),
-                (I32, if *is_non_strict_ordinary { "1" } else { "0" }),
-            ],
+    if strings_outlive_registry {
+        let source_table = super::function_metadata_descriptors::emit_source_table(
+            chunker.module(),
+            module_prefix,
+            user_fn_source_constants
+                .iter()
+                .map(|(wrapper, source, is_non_strict_ordinary)| {
+                    (
+                        wrapper.as_str(),
+                        source.constant_pointer(),
+                        source.byte_len,
+                        *is_non_strict_ordinary,
+                    )
+                }),
         );
+        if let Some(table) = source_table {
+            chunker.roll_if_full();
+            chunker.current_block().call_void(
+                "js_register_function_sources_static",
+                &[
+                    (PTR, &format!("@{}", table.global)),
+                    (I32, &table.len.to_string()),
+                ],
+            );
+        }
+    } else {
+        for (wrapper_sym, source, is_non_strict_ordinary) in &user_fn_source_constants {
+            chunker.roll_if_full();
+            let blk = chunker.current_block();
+            let source_ref = source.pointer(blk);
+            blk.call_void(
+                "js_register_function_source",
+                &[
+                    (PTR, &format!("@{wrapper_sym}")),
+                    (PTR, &source_ref),
+                    (I32, &source.byte_len.to_string()),
+                    (I32, if *is_non_strict_ordinary { "1" } else { "0" }),
+                ],
+            );
+        }
     }
 
     // #11420: every input to a class's birth [[Prototype]] identity
@@ -1161,9 +1205,9 @@ pub(super) fn emit_string_pool(
         .filter_map(|name| class_ids.get(name).copied())
         .collect();
     // Each per-evaluation template's own record, its template cell
-    // (`fresh_class_templates::template_cell_global`), registered on the
-    // template's vtable entry for the runtime paths that start from one of its
-    // class objects.
+    // (`fresh_class_templates::template_cell_global`). Every class object of
+    // the template names it (its first own key), so the runtime paths that
+    // start from one find it there.
     let mut fresh_cells: Vec<(u32, usize)> = fresh_class_templates
         .iter()
         .filter_map(|name| {
@@ -1181,12 +1225,6 @@ pub(super) fn emit_string_pool(
             "@{global} = internal global [{words} x i64] [i64 {words}{}]",
             ", i64 0".repeat(words - 1)
         ));
-        let blk = chunker.current_block();
-        let cell_i64 = blk.ptrtoint(&format!("@{global}"), I64);
-        blk.call_void(
-            "js_register_class_template_cell",
-            &[(I64, &cid.to_string()), (I64, &cell_i64)],
-        );
     }
     method_triples.sort_unstable();
     let mut method_entries: Vec<StaticMethodEntry> = Vec::new();
@@ -1780,6 +1818,79 @@ pub(super) fn emit_string_pool(
                         ),
                     ),
                     (I32, &shape.constfn.len().to_string()),
+                ],
+            );
+        }
+    }
+
+    // Completed private contents (#11791, `static_private_class`): minted by
+    // facts under their static ids after every class/prototype registration,
+    // before any instance can reach them.
+    if super::static_shape_ids::has_static_final_shapes() {
+        let defined_classes: HashMap<_, _> = module_classes
+            .iter()
+            .filter_map(|class| class_ids.get(&class.name).map(|cid| (*cid, class)))
+            .collect();
+        for entry in class_keys_init_data {
+            let birth = super::static_shape_ids::class_birth(
+                module_prefix,
+                entry,
+                class_header_image_inits,
+                class_birth_reps,
+                class_ids,
+            );
+            let Some(ordinary) = birth.shape else {
+                continue;
+            };
+            let Some(class) = defined_classes.get(&birth.class_id).copied() else {
+                continue;
+            };
+            let Some(shape) =
+                super::static_private_class::private_final(class, classes, &ordinary, &|name| {
+                    super::static_private_class::element_class_id_in(classes, class_ids, name)
+                })
+            else {
+                continue;
+            };
+            let Some(id) = super::static_shape_ids::static_final_shape_id(&shape) else {
+                continue;
+            };
+            super::static_private_class::emit_final_constants(
+                chunker.module(),
+                module_prefix,
+                &shape,
+                id,
+            );
+            let symbol = super::static_private_class::final_symbol(module_prefix, id);
+            let private_ptr = if shape.private.is_empty() {
+                "null".to_string()
+            } else {
+                format!("@{symbol}_keys")
+            };
+            let brands_ptr = if shape.brands.is_empty() {
+                "null".to_string()
+            } else {
+                format!("@{symbol}_brands")
+            };
+            chunker.roll_if_full();
+            let blk = chunker.current_block();
+            // Registration calls above can collect; load the canonical keys
+            // afresh from their registered root immediately before the mint.
+            let keys = blk.load(I64, &format!("@{}", entry.0));
+            blk.call(
+                I32,
+                "js_object_final_shape_id_for_class_keys_static_private",
+                &[
+                    (I64, &keys),
+                    (I32, &shape.key_count.to_string()),
+                    (I32, &shape.live.to_string()),
+                    (I32, &birth.class_id.to_string()),
+                    (I32, &id.to_string()),
+                    (I64, &shape.rep.to_string()),
+                    (PTR, &private_ptr),
+                    (I32, &shape.private.len().to_string()),
+                    (PTR, &brands_ptr),
+                    (I32, &shape.brands.len().to_string()),
                 ],
             );
         }

@@ -76,7 +76,7 @@ pub unsafe fn dispatch_bound_method(
     // name-based interpretation of the captures below (slots 3/4 are not part
     // of the name layout).
     if method_name_ptr == crate::object::SYMBOL_BOUND_METHOD_NAME.as_ptr() as *const i8 {
-        return dispatch_symbol_bound_method(closure, namespace_obj, args);
+        return dispatch_symbol_bound_method(closure, namespace_obj, this, args);
     }
 
     // Private-method value (`const f = this.#m; f.call(o)`): a `#`-named method
@@ -238,7 +238,8 @@ pub unsafe fn dispatch_bound_method(
 /// Mirrors the direct-call symbol dispatch in `js_native_call_method_value`.
 unsafe fn dispatch_symbol_bound_method(
     closure: *const ClosureHeader,
-    receiver: f64,
+    captured_receiver: f64,
+    this: crate::closure::JsThis,
     args: &[f64],
 ) -> f64 {
     let func_ptr = js_closure_get_capture_ptr(closure, 3) as usize;
@@ -252,6 +253,7 @@ unsafe fn dispatch_symbol_bound_method(
     let param_count = (meta & 0xFFFF_FFFF) as u32;
     let has_rest = (meta >> 32) & 1 == 1;
     let is_static = (meta >> 33) & 1 == 1;
+    let receiver = crate::object::canonical_bound_method_receiver(captured_receiver, this);
     if is_static {
         // The static method runs with the class ref as `this`, exactly like
         // the direct-call path. The one-shot static-`this` override (armed by
@@ -395,9 +397,19 @@ pub(crate) fn coerce_call_this(target: f64, this_arg: f64) -> f64 {
     let Some(info) = crate::closure::closure_info(closure) else {
         return this_arg;
     };
-    if crate::builtins::function_source_for_ptr(info.code as usize).is_none()
-        || info.flags & crate::closure::FN_STRICT != 0
-    {
+    const PERMANENT_COMPILED: u32 =
+        crate::codegen_abi::FN_PERMANENT_IMAGE | crate::codegen_abi::FN_COMPILED_BODY;
+    let image_kind = info.flags & (PERMANENT_COMPILED | crate::codegen_abi::FN_NON_STRICT_ORDINARY);
+    if image_kind & PERMANENT_COMPILED == PERMANENT_COMPILED {
+        // Every permanent compiled user body carries its exact kind in the
+        // info record. Synthetic bodies deliberately leave the ordinary bit
+        // clear, so neither case needs a registry probe.
+        if image_kind & crate::codegen_abi::FN_NON_STRICT_ORDINARY == 0 {
+            return this_arg;
+        }
+    } else if !crate::builtins::function_is_non_strict_ordinary_for_ptr(info.code as usize) {
+        // Runtime-created functions and unloadable images retain the owning
+        // compatibility registry because their image metadata is not permanent.
         return this_arg;
     }
     crate::object::js_object_coerce(this_arg)

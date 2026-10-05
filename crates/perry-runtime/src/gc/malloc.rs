@@ -120,7 +120,7 @@ impl MallocState {
     ///   teardown, never mid-program, so this cannot yank live objects out from
     ///   under running code.
     ///
-    /// # Why finalizers are deliberately NOT run here
+    /// # Why finalizers are deliberately NOT run here (except native handles)
     /// The sweep path pairs `dealloc` with `gc_type_finalize_unmarked_payload` /
     /// `layout_clear_for_ptr`, which reach into *other* thread-locals
     /// (`MAP_REGISTRY`, `MAP_INDEX`, `PROMISE_CONTEXTS`, the async-hooks queues,
@@ -151,6 +151,19 @@ impl MallocState {
                 let total_size = (*header).size as usize;
                 if total_size == 0 {
                     continue;
+                }
+                // #11919 P0: the one finalizer that DOES run here. An owned
+                // native-handle resource (a Rust payload's `Box`, a C
+                // resource) lives outside every arena, so skipping it leaks
+                // it at every worker exit. Its finalizer is basic native
+                // cleanup by contract (no thread-locals, no JS), so the TLS
+                // destruction-order hazard above does not apply, and the
+                // teardown variant leaves the pacing counters alone.
+                if (*header).obj_type == GC_TYPE_NATIVE_HANDLE {
+                    crate::native_handle::finalize_native_handle_at_teardown(
+                        (header as *mut u8).add(GC_HEADER_SIZE)
+                            as *mut crate::native_handle::NativeHandleHeader,
+                    );
                 }
                 let layout = Layout::from_size_align(total_size, 8).unwrap();
                 dealloc(header as *mut u8, layout);
@@ -195,7 +208,7 @@ impl Drop for MallocState {
     }
 }
 
-/// Pre-allocated capacity for `MallocState.objects` and `.set`.
+/// Initial capacity for `MallocState.objects` and, on activation, `.set`.
 ///
 /// History: this used to be a flat 256 k (`MALLOC_STATE_HEAVY_CAPACITY`
 /// below), sized for promise-heavy kernels (`promise_all_chains`
@@ -211,6 +224,7 @@ impl Drop for MallocState {
 /// thread), reserve straight to the heavy capacity in one step —
 /// preserving the rehash-amortization rationale exactly where it
 /// mattered while cutting the per-thread floor everywhere else.
+/// The exact-validation set reserves neither capacity until activated.
 pub(super) const MALLOC_STATE_INITIAL_CAPACITY: usize = 4096;
 /// One-time growth trigger: a thread whose live tracked-object count
 /// reaches this is on the promise-heavy profile — reserve the rest.
@@ -223,10 +237,8 @@ pub(super) const MALLOC_STATE_HEAVY_CAPACITY: usize = 256 * 1024;
 crate::perry_thread_local! {
     pub(crate) static MALLOC_STATE: RefCell<MallocState> = RefCell::new(MallocState {
         objects: Vec::with_capacity(MALLOC_STATE_INITIAL_CAPACITY),
-        set: crate::fast_hash::PtrHashSet::with_capacity_and_hasher(
-            MALLOC_STATE_INITIAL_CAPACITY,
-            crate::fast_hash::PtrHasher,
-        ),
+        // Exact validation is lazy; its backing allocation must be lazy too.
+        set: crate::fast_hash::new_ptr_hash_set(),
         realloc_forwarding: crate::fast_hash::new_ptr_hash_map(),
         realloc_snapshot_headers: crate::fast_hash::new_ptr_hash_set(),
         registry_state: MallocRegistryState::Inactive,
@@ -386,8 +398,10 @@ impl MallocState {
         self.heavy_capacity_reserved = true;
         self.objects
             .reserve(MALLOC_STATE_HEAVY_CAPACITY.saturating_sub(self.objects.len()));
-        self.set
-            .reserve(MALLOC_STATE_HEAVY_CAPACITY.saturating_sub(self.set.len()));
+        if self.malloc_registry_available() {
+            self.set
+                .reserve(MALLOC_STATE_HEAVY_CAPACITY.saturating_sub(self.set.len()));
+        }
     }
 
     #[inline]
@@ -537,6 +551,15 @@ pub(super) fn ensure_set_built(s: &mut MallocState) {
         return;
     }
     s.set.clear();
+    // Activation can follow the heavy-capacity crossing. Preserve the same
+    // growth headroom as an already-active registry, without allocating it
+    // for threads that never ask for exact malloc-pointer validation.
+    let capacity = if s.heavy_capacity_reserved {
+        MALLOC_STATE_HEAVY_CAPACITY
+    } else {
+        MALLOC_STATE_INITIAL_CAPACITY
+    };
+    s.set.reserve(capacity.max(s.objects.len()));
     s.set.extend(s.objects.iter().map(|&h| h as usize));
     s.registry_state = MallocRegistryState::ActiveConsistent;
     MALLOC_REGISTRY_REBUILD_COUNT.with(|c| c.set(c.get().saturating_add(1)));

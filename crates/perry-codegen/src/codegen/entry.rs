@@ -313,6 +313,24 @@ pub(super) fn compile_module_entry(
                 (cn, len, prefix.clone())
             })
             .collect();
+        // Worker entries: `(path constant, byte_len, init symbol)`, registered
+        // below before any module init so every way of constructing a Worker
+        // can find a compiled entry by its path.
+        let worker_entry_inits: Vec<(String, usize, String)> = if cross_module.needs_stdlib {
+            crate::codegen::worker_entries()
+                .iter()
+                .filter(|(_, prefix)| non_entry_module_prefixes.contains(prefix))
+                .map(|(path, prefix)| {
+                    let (cn, len) = llmod.add_string_constant(path);
+                    // A program with worker entries always has thread-local
+                    // init guards (`program_has_worker`), so the guarded
+                    // wrapper runs once per thread.
+                    (cn, len, format!("{prefix}__init"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // `PERRY_DEBUG_INIT` is a startup-order diagnostic, so keep all of its
         // emitted code in the entry object.  The old implementation put a
         // `puts("INIT: <prefix>")` in every non-entry module body, which made
@@ -540,6 +558,19 @@ pub(super) fn compile_module_entry(
                     ],
                 );
             }
+            for (const_name, byte_len, init) in &worker_entry_inits {
+                let path_ptr = format!("@{}", const_name);
+                let len_str = byte_len.to_string();
+                let init_addr = format!("ptrtoint (ptr @{} to i64)", init);
+                blk.call_void(
+                    "js_worker_threads_register_entry",
+                    &[
+                        (PTR, path_ptr.as_str()),
+                        (I64, len_str.as_str()),
+                        (I64, init_addr.as_str()),
+                    ],
+                );
+            }
             // #10735: publish the shared `require.main` placeholder before
             // ANY module's `__init` below runs (those are this CJS entry's
             // OWN static imports, which ESM eval order runs before the
@@ -737,6 +768,8 @@ pub(super) fn compile_module_entry(
             compiler_private_async_i1_control_locals: &cross_module
                 .compiler_private_async_i1_control_locals,
             scope_map: &cross_module.scope_map,
+            string_accumulator_locals: &cross_module.string_accumulator_locals,
+            string_length_read_of: None,
             closure_rest_params,
             local_closure_func_ids: HashMap::new(),
             guard_free_closure_bindings: std::collections::HashSet::new(),
@@ -1611,6 +1644,8 @@ pub(super) fn compile_module_entry(
             compiler_private_async_i1_control_locals: &cross_module
                 .compiler_private_async_i1_control_locals,
             scope_map: &cross_module.scope_map,
+            string_accumulator_locals: &cross_module.string_accumulator_locals,
+            string_length_read_of: None,
             closure_rest_params,
             local_closure_func_ids: HashMap::new(),
             guard_free_closure_bindings: std::collections::HashSet::new(),

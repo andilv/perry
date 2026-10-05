@@ -139,6 +139,27 @@ pub(crate) fn proxy_set_with_receiver(
     )
 }
 
+/// The receivers the key-add lane serves, decided from the header and the
+/// class id before the key is looked at: a heap object whose class id is 0
+/// or a registered object-literal shape. The lane refuses every other
+/// receiver anyway; asking first keeps it from resolving the key.
+///
+/// # Safety
+/// `addr` is the payload of a POINTER-tagged value.
+#[inline]
+unsafe fn plain_store_receiver(addr: usize) -> bool {
+    if !crate::value::addr_class::is_above_handle_band(addr) {
+        return false;
+    }
+    match crate::value::addr_class::try_read_gc_header(addr) {
+        Some(h) if h.obj_type == crate::gc::GC_TYPE_OBJECT => {
+            let class_id = (*(addr as *const crate::ObjectHeader)).class_id;
+            class_id == 0 || crate::object::is_anon_shape_class_id(class_id)
+        }
+        _ => false,
+    }
+}
+
 /// Assignment PutValue for a property reference. Returns the assigned RHS value
 /// on success or sloppy failure, and throws TypeError when strict code attempts
 /// a failed [[Set]].
@@ -180,6 +201,41 @@ pub extern "C" fn js_put_value_set(
             return value;
         }
     }
+    // A key the receiver lacks: the append its shape's key-add edge names
+    // (`(ShapeId, key) -> target`), for a plain receiver whose prototype chain
+    // cannot intercept the key — the same lane a cached computed write site
+    // takes on its miss (`js_put_value_set_dyn_ic_miss`). It allocates only
+    // after its pre-checks pass and hands back re-rooted operands whenever it
+    // did, so a miss continues below with live values.
+    let (target, key, value, receiver) = {
+        let mut refreshed: Option<(f64, f64, f64)> = None;
+        if target_bits == receiver.to_bits()
+            && (target_bits & !POINTER_MASK) == POINTER_TAG
+            && unsafe { plain_store_receiver((target_bits & POINTER_MASK) as usize) }
+        {
+            if let Some(key_ptr) =
+                unsafe { crate::object::chain_store::interned_key_for_store(key) }
+            {
+                let obj = (target_bits & POINTER_MASK) as *mut crate::ObjectHeader;
+                if let Some(stored) =
+                    crate::object::object_set_field_by_name_transition_only_fast_value(
+                        obj,
+                        key_ptr,
+                        value,
+                        &mut refreshed,
+                    )
+                {
+                    return stored;
+                }
+            }
+        }
+        match refreshed {
+            // The key the lane used is the interned twin of the same text, so
+            // it stands in for the original key value on the general path.
+            Some((t, k, v)) => (t, k, v, t),
+            None => (target, key, value, receiver),
+        }
+    };
 
     let scope = crate::gc::RuntimeHandleScope::new();
     let target_handle = scope.root_nanbox_f64(target);
@@ -356,9 +412,37 @@ pub extern "C" fn js_put_value_set(
                 "Cannot set property {key_name} of #<{class_name}> which has only a getter"
             ));
         }
+        // Node names a class instance by its class: `#<Account>`.
+        if let Some(class_name) = class_instance_display_name(receiver) {
+            crate::collection_iter::throw_type_error(&format!(
+                "Cannot assign to read only property '{key_name}' of object '#<{class_name}>'"
+            ));
+        }
         crate::error::throw_immutable_write(0, &key_name);
     }
     value_handle.get_nanbox_f64()
+}
+
+/// The class name of a compiled class instance, for error texts; `None` for
+/// every other value.
+fn class_instance_display_name(receiver: f64) -> Option<String> {
+    let recv = crate::JSValue::from_bits(receiver.to_bits());
+    if !recv.is_pointer() {
+        return None;
+    }
+    let object = recv.as_pointer::<crate::ObjectHeader>();
+    // SAFETY: the header is read through the checked reader, and only an
+    // ordinary object is asked for its shape.
+    let is_object = unsafe { crate::value::addr_class::try_read_gc_header(object as usize) }
+        .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_OBJECT);
+    if !is_object || !unsafe { crate::object::object_is_shaped(object) } {
+        return None;
+    }
+    let class_id = crate::object::js_object_get_class_id(object);
+    if class_id == 0 {
+        return None;
+    }
+    crate::object::class_name_for_id(class_id)
 }
 
 /// For a refused strict write: when the key resolves on `receiver`'s chain to

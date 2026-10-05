@@ -48,11 +48,23 @@ pub(crate) struct ConstFnSlotInfo {
 /// Optional, record-owned extension. It has no keyed lookup: a method-site
 /// hit reads only the receiver's shape and current closure slot. The learned
 /// masks are not shape identity, so record copies/rekeys transfer this box.
+///
+/// `brands` is the sorted list of private brands (#11791) every receiver of
+/// the shape carries: one scalar per class evaluation whose private methods
+/// or fields were installed on it (`private_brand_id`). An identity fact like
+/// `constfn_infos`; scalars, so nothing here is a GC edge.
 #[derive(Debug)]
 pub(super) struct ShapeExtras {
     pub(super) constfn_infos: Box<[ConstFnSlotInfo]>,
+    pub(super) brands: Box<[u64]>,
     pub(super) to_nopointer: std::sync::atomic::AtomicU32,
     pub(super) to_any: std::sync::atomic::AtomicU32,
+}
+
+/// A brand list is strictly ascending: sorted with no duplicate, so equal
+/// sets are equal slices.
+pub(crate) fn brands_are_sorted(brands: &[u64]) -> bool {
+    brands.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// The exact mask of a sorted body list, or `None` for a duplicate, absent
@@ -259,7 +271,7 @@ impl ShapeRecord {
     }
 
     /// The same record carrying attribute summary `summary`.
-    #[inline]
+    #[inline(always)]
     pub(super) fn with_summary(mut self, summary: u8) -> ShapeRecord {
         self.flags_and_kind = (self.flags_and_kind & !RECORD_SUMMARY_MASK)
             | (u32::from(summary) << RECORD_SUMMARY_SHIFT);
@@ -444,21 +456,25 @@ impl ShapeRecord {
     /// lane absent from `infos` is reserved for optional NoPointer. The old
     /// `with_rep` keeps rejecting `11`, so no legacy mint silently omits the
     /// identity fact. Called only after the interner misses.
-    #[inline]
-    pub(super) fn with_special_facts(mut self, rep: u64, infos: &[ConstFnSlotInfo]) -> ShapeRecord {
+    #[inline(always)]
+    pub(super) fn with_special_facts(
+        mut self,
+        rep: u64,
+        infos: &[ConstFnSlotInfo],
+        brands: &[u64],
+    ) -> ShapeRecord {
         assert_eq!(self.extras, 0, "special facts replace a fresh record only");
         let mask = constfn_mask(infos).expect("invalid ConstFn slot list");
         assert!(crate::object::field_rep::is_valid_with_special(rep, mask));
         assert_eq!(mask & !crate::object::field_rep::special_lane_slots(rep), 0);
+        assert!(
+            brands_are_sorted(brands),
+            "a brand list is sorted and unique"
+        );
         self.rep = rep;
         self.special_constfn_mask = mask;
-        if !infos.is_empty() {
-            let extras = Box::new(ShapeExtras {
-                constfn_infos: infos.into(),
-                to_nopointer: std::sync::atomic::AtomicU32::new(0),
-                to_any: std::sync::atomic::AtomicU32::new(0),
-            });
-            self.extras = Box::into_raw(extras) as usize as u64;
+        if !infos.is_empty() || !brands.is_empty() {
+            self.extras = new_extras(infos, brands);
         }
         self
     }
@@ -478,6 +494,17 @@ impl ShapeRecord {
             // SAFETY: the live slab record owns this allocation; copies of
             // the record borrow it and a rekey transfers its ownership.
             unsafe { &(*(self.extras as usize as *const ShapeExtras)).constfn_infos }
+        }
+    }
+
+    /// The private brands every receiver of this shape carries (#11791).
+    #[inline]
+    pub(crate) fn brands(&self) -> &[u64] {
+        if self.extras == 0 {
+            &[]
+        } else {
+            // SAFETY: the live slab record owns this allocation.
+            unsafe { &(*(self.extras as usize as *const ShapeExtras)).brands }
         }
     }
 
@@ -524,7 +551,7 @@ impl ShapeRecord {
 
     /// The same record for a receiver whose [[Prototype]] identity is
     /// `proto_id` (see [`ShapeRecord::proto_id`]).
-    #[inline]
+    #[inline(always)]
     pub(super) fn with_proto_id(mut self, proto_id: u64) -> ShapeRecord {
         self.proto_id = proto_id;
         self
@@ -557,11 +584,12 @@ impl ShapeRecord {
             summary,
             rep,
             &[],
+            &[],
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[inline]
+    #[inline(always)]
     pub(super) fn facts_match_proto_with_special(
         &self,
         keys: u64,
@@ -574,6 +602,7 @@ impl ShapeRecord {
         summary: u8,
         rep: u64,
         infos: &[ConstFnSlotInfo],
+        brands: &[u64],
     ) -> bool {
         let Some(mask) = constfn_mask(infos) else {
             return false;
@@ -584,6 +613,7 @@ impl ShapeRecord {
                 == crate::object::field_rep::identity_with_special(rep)
             && self.special_constfn_mask == mask
             && self.constfn_infos() == infos
+            && brand_lists_equal(self.brands(), brands)
             && self.facts_match(
                 keys,
                 logical_key_count,
@@ -597,7 +627,7 @@ impl ShapeRecord {
     /// Exact-facts identity test (#8067): keys edge, both counts, generation,
     /// kind, tombstones. Liveness bits and the facts-indexed bit are storage
     /// state, never identity.
-    #[inline]
+    #[inline(always)]
     pub(super) fn facts_match(
         &self,
         keys: u64,
@@ -633,6 +663,7 @@ impl ShapeRecord {
             self.summary(),
             self.rep,
             self.constfn_infos(),
+            self.brands(),
         )
     }
 
@@ -716,14 +747,37 @@ pub(super) fn facts_key_proto(
         summary,
         rep,
         &[],
+        &[],
     )
+}
+
+/// The extension record of a shape with ConstFn slots or private brands, out
+/// of line: almost every mint has neither.
+#[cold]
+#[inline(never)]
+fn new_extras(infos: &[ConstFnSlotInfo], brands: &[u64]) -> u64 {
+    let extras = Box::new(ShapeExtras {
+        constfn_infos: infos.into(),
+        brands: brands.into(),
+        to_nopointer: std::sync::atomic::AtomicU32::new(0),
+        to_any: std::sync::atomic::AtomicU32::new(0),
+    });
+    Box::into_raw(extras) as usize as u64
+}
+
+/// Brand-list identity. Nearly every shape has none, and slice equality calls
+/// `memcmp` even for two empty lists, which the shape intern's hit path paid
+/// on every lookup (#11791).
+#[inline(always)]
+pub(crate) fn brand_lists_equal(a: &[u64], b: &[u64]) -> bool {
+    a.len() == b.len() && (a.is_empty() || a == b)
 }
 
 /// Extended exact-facts hash. Old shapes take the wrapper above and get the
 /// exact old fold; ConstFn adds a domain-separated ordered body list. Address
 /// values are process-local identities, never serialized as static seed keys.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 pub(super) fn facts_key_proto_with_special(
     keys: u64,
     logical_key_count: u32,
@@ -735,6 +789,7 @@ pub(super) fn facts_key_proto_with_special(
     summary: u8,
     rep: u64,
     infos: &[ConstFnSlotInfo],
+    brands: &[u64],
 ) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -770,9 +825,28 @@ pub(super) fn facts_key_proto_with_special(
             h = fold(h, entry.info);
         }
     }
+    // Brands (#11791) are domain-separated the same way; a brandless shape
+    // keeps the key it had before brands existed.
+    if !brands.is_empty() {
+        h = fold_brands(h, brands);
+    }
     // Final avalanche: FNV keeps most of its entropy in the high bits and
     // hashbrown's probe sequence starts from the LOW bits.
     h ^ (h >> 32)
+}
+
+/// The brand half of [`facts_key_proto_with_special`], out of line: almost
+/// no shape carries a brand, and the hash runs on every intern.
+#[cold]
+#[inline(never)]
+fn fold_brands(mut h: u64, brands: &[u64]) -> u64 {
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let fold = |acc: u64, word: u64| (acc ^ word).wrapping_mul(FNV_PRIME);
+    h = fold(h, 0x8_4252_4e44);
+    for &brand in brands {
+        h = fold(h, brand);
+    }
+    h
 }
 
 /// Records per chunk. Ids are minted far faster than they survive — the
