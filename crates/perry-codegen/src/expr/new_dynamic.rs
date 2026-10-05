@@ -364,6 +364,34 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 }
             }
 
+            // `new WS.Server({...})` / `new WS.WebSocketServer({...})` — the
+            // default-import member shape (`import WebSocket from "ws"`),
+            // which is what real-world `ws` code overwhelmingly uses
+            // (e.g. nostr-filter's `new WebSocket.Server({ server })`).
+            // The callee arrives as `PropertyGet {
+            // NativeModuleRef("ws"), "Server" }` rather than the bare
+            // `WebSocketServer` identifier the named-import path produces.
+            // Without this arm it falls through to the runtime construct
+            // helper, which reads `Server` off the `ws` namespace object
+            // (undefined there) and throws "undefined is not a
+            // constructor". Route to the same `lower_builtin_new` server
+            // arm the named-import path uses so the runtime allocates a
+            // real attached/standalone server handle.
+            if let Expr::PropertyGet {
+                object, property, ..
+            } = callee.as_ref()
+            {
+                if matches!(property.as_str(), "Server" | "WebSocketServer") {
+                    if let Expr::NativeModuleRef(mod_name) = object.as_ref() {
+                        if mod_name == "ws" {
+                            // NewDynamic reroute of a native-module builtin ctor
+                            // export: no HIR cap forwards are appended here.
+                            return lower_new(ctx, "WebSocketServer", args, 0);
+                        }
+                    }
+                }
+            }
+
             // `new crypto.Certificate()` is a legacy constructor in Node, but
             // the implementation is a stateless namespace over the same SPKAC
             // helper methods as `crypto.Certificate.*`. Represent instances as
