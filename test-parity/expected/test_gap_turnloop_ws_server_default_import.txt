@@ -1,0 +1,16 @@
+Server listening: true
+Server open: open
+Server server: connection
+Server server message: ping
+Server client echo: echo:ping
+Server server close: 1000
+Server client close: 1000
+Server closed
+WebSocketServer listening: true
+WebSocketServer open: open
+WebSocketServer server: connection
+WebSocketServer server message: ping
+WebSocketServer client echo: echo:ping
+WebSocketServer server close: 1000
+WebSocketServer client close: 1000
+WebSocketServer closed
