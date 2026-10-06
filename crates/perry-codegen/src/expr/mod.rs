@@ -88,6 +88,7 @@ mod bitset_test;
 pub(crate) mod body_call;
 pub(crate) mod folded_builtin_override;
 pub(crate) mod hot_tls;
+pub(crate) mod inline_birth;
 mod literal_descriptor;
 #[cfg(test)]
 mod map_entry_at_tests;
@@ -130,7 +131,7 @@ pub(crate) use buffer_access::{
     access_facts_for_spec, can_lower_buffer_access_without_calls,
     can_lower_integer_typed_array_store_value, emit_buffer_access_pointer,
     lower_buffer_access_proof, lower_buffer_load, lower_buffer_store, lower_typed_array_load,
-    lower_typed_array_store, BufferAccessSpec,
+    lower_typed_array_store, typed_array_store_value_is_native, BufferAccessSpec,
 };
 pub(crate) use buffer_views::{
     alias_buffer_view_slot, attach_buffer_view_facts, attach_buffer_view_pointer_state_for_expr,
@@ -176,8 +177,8 @@ pub(crate) use pod_record::{
 };
 pub(crate) use proven_view_access::{
     index_is_exact_i32_shape, is_proven_u32_view_read, local_is_proven_int_store_view,
-    try_lower_proven_view_checked_f64_load, try_lower_proven_view_checked_store,
-    try_lower_proven_view_checked_u32_load,
+    proven_view_receiver, try_lower_proven_view_checked_f64_load,
+    try_lower_proven_view_checked_store, try_lower_proven_view_checked_u32_load,
 };
 pub(crate) use proven_view_guarded::{
     try_lower_proven_view_guarded_load, try_lower_proven_view_guarded_store,
@@ -300,10 +301,10 @@ pub(crate) use scalar_slot_root::{
     root_scalar_replaced_slot_unconditional,
 };
 pub(crate) use shadow_slot::{
-    current_closure_ptr_value, emit_persistent_shadow_root_barrier,
-    emit_shadow_slot_bind_for_local, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
-    enable_persistent_shadow_slot_for_array_alias, expr_is_known_non_pointer_shadow_value,
-    root_inlined_ctor_pointer_locals, try_current_closure_ptr_value,
+    current_closure_ptr_value, emit_shadow_slot_bind_for_local, emit_shadow_slot_clear,
+    emit_shadow_slot_update_for_expr, enable_persistent_shadow_slot_for_array_alias,
+    expr_is_known_non_pointer_shadow_value, root_inlined_ctor_pointer_locals,
+    try_current_closure_ptr_value,
 };
 
 /// One in-flight inline-constructor return target. See
@@ -656,6 +657,7 @@ pub(crate) struct FnCtx<'a> {
     /// walk, which mis-resolves same-named cross-module parents (effect's
     /// `Type` in SchemaAST.ts vs ParseResult.ts).
     pub class_field_counts: &'a std::collections::HashMap<String, u32>,
+    pub anon_key_adds: &'a std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     /// Issue #26 / #321: authoritative root→leaf ancestor chain per class
     /// (prefix-disambiguated). `apply_field_initializers_recursive` uses this
     /// to write the correct inherited fields instead of walking the name-keyed
@@ -1743,6 +1745,13 @@ pub(crate) struct FnCtx<'a> {
     /// store. Collected once as a HIR fact and consumed by Let lowering to seed
     /// direct data-pointer slots plus noalias metadata.
     pub known_noalias_buffer_locals: &'a std::collections::HashSet<u32>,
+    /// The `known_noalias_buffer_locals` no use can hand to code that reads
+    /// their `.buffer`: only these keep a trusted view
+    /// (`stmt/let_buffer_views.rs`).
+    pub sealed_buffer_locals: &'a std::collections::HashSet<u32>,
+    /// Exposed only by statements of their own body: their views stay trusted
+    /// until `lower_stmt` meets the first statement that may expose them.
+    pub late_exposed_buffer_locals: &'a std::collections::HashSet<u32>,
     /// Starting alias-scope id for buffers registered in this function.
     /// Seeded from `LlModule::buffer_alias_counter` at FnCtx creation so
     /// scope ids don't collide across functions in the same LLVM module.
@@ -2638,7 +2647,11 @@ pub(crate) fn load_inline_arena_state(ctx: &mut FnCtx<'_>) -> String {
             let blk = ctx.block();
             let state = blk.load(PTR, &state_ptr);
             let data = blk.load(PTR, &state);
-            let initialised = blk.icmp_ne(PTR, &data, "null");
+            let data_initialised = blk.icmp_ne(PTR, &data, "null");
+            let birth_field = blk.gep(I8, &state, &[(I64, inline_birth::BIRTH_FLAGS_OFFSET)]);
+            let birth_address = blk.load(PTR, &birth_field);
+            let birth_initialised = blk.icmp_ne(PTR, &birth_address, "null");
+            let initialised = blk.and(crate::types::I1, &data_initialised, &birth_initialised);
             blk.cond_br(&initialised, &ready_label, &slow_label);
             state
         };
@@ -3111,11 +3124,12 @@ pub(crate) mod suffix_cursor;
 #[cfg(test)]
 mod bigint_bitwise_tests;
 mod ptr_numarray_access;
+pub(crate) mod ta_element_read;
 mod ta_param_f64_read;
 mod toint32;
 #[cfg(test)]
 mod toint32_tests;
-mod u8_buffer_read;
+pub(crate) mod u8_buffer_read;
 #[cfg(test)]
 mod unary_bigint_tests;
 #[cfg(test)]
@@ -3136,8 +3150,6 @@ mod index_set_packed_loop;
 mod index_set_typed_array;
 mod instance_misc1;
 mod member_update;
-#[cfg(test)]
-mod packed_loop_shadow_barrier_tests;
 mod typed_array_rmw;
 mod typed_array_update;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;

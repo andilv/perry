@@ -1,5 +1,11 @@
 use super::*;
 
+#[path = "trace/mark_slots.rs"]
+mod mark_slots;
+#[cfg(test)]
+pub(crate) use mark_slots::{mark_hoist_sabotage, remembered_mark_sabotage};
+pub(super) use mark_slots::{trace_heap_rewrite_slots, trace_heap_rewrite_slots_remembering};
+
 #[path = "trace/block_skip.rs"]
 pub(super) mod block_skip;
 pub(super) use block_skip::BlockCensus;
@@ -1211,6 +1217,11 @@ impl ValidPointerSetBuilder {
     }
 }
 
+/// Stable address of the existing thread-local queue, including across `take`.
+pub(crate) fn mark_seed_queue_address() -> *mut std::ffi::c_void {
+    MARK_SEEDS.with(|cell| cell.get().cast())
+}
+
 pub(super) fn push_mark_seed(header: *mut GcHeader) {
     MARK_SEEDS.with(|cell| unsafe {
         (*cell.get()).push(header);
@@ -1541,6 +1552,43 @@ pub(super) fn drain_trace_worklist_step(
     minor_only: bool,
     budget: usize,
 ) -> bool {
+    drain_trace_worklist_step_impl::<false>(worklist, cursor, valid_ptrs, minor_only, budget, None)
+}
+
+pub(super) fn drain_trace_worklist_step_remembering(
+    worklist: &mut Vec<*mut GcHeader>,
+    cursor: &mut usize,
+    valid_ptrs: &ValidPointerSet,
+    minor_only: bool,
+    budget: usize,
+    sticky: Option<&mut StickyRememberedSet>,
+) -> bool {
+    // Choose once per drain, rather than adding a remembering-mode branch to
+    // every young object in a minor's existing mark traversal.
+    if let Some(sticky) = sticky {
+        drain_trace_worklist_step_impl::<true>(
+            worklist,
+            cursor,
+            valid_ptrs,
+            minor_only,
+            budget,
+            Some(sticky),
+        )
+    } else {
+        drain_trace_worklist_step_impl::<false>(
+            worklist, cursor, valid_ptrs, minor_only, budget, None,
+        )
+    }
+}
+
+fn drain_trace_worklist_step_impl<const REMEMBER: bool>(
+    worklist: &mut Vec<*mut GcHeader>,
+    cursor: &mut usize,
+    valid_ptrs: &ValidPointerSet,
+    minor_only: bool,
+    budget: usize,
+    mut sticky: Option<&mut StickyRememberedSet>,
+) -> bool {
     let mut remaining = budget;
     while remaining > 0 && *cursor < worklist.len() {
         let header = worklist[*cursor];
@@ -1552,17 +1600,24 @@ pub(super) fn drain_trace_worklist_step(
             super::prefetch::prefetch_read(ahead as usize);
         }
         *cursor += 1;
-        trace_one_worklist_header(header, valid_ptrs, worklist, minor_only);
+        trace_one_worklist_header::<REMEMBER>(
+            header,
+            valid_ptrs,
+            worklist,
+            minor_only,
+            sticky.as_deref_mut(),
+        );
         remaining -= 1;
     }
     *cursor >= worklist.len()
 }
 
-pub(super) fn trace_one_worklist_header(
+fn trace_one_worklist_header<const REMEMBER: bool>(
     header: *mut GcHeader,
     valid_ptrs: &ValidPointerSet,
     worklist: &mut Vec<*mut GcHeader>,
     minor_only: bool,
+    sticky: Option<&mut StickyRememberedSet>,
 ) {
     unsafe {
         let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
@@ -1610,7 +1665,11 @@ pub(super) fn trace_one_worklist_header(
                 return;
             }
         }
-        trace_heap_rewrite_slots(header, valid_ptrs, worklist);
+        if REMEMBER {
+            trace_heap_rewrite_slots_remembering(header, valid_ptrs, worklist, sticky);
+        } else {
+            trace_heap_rewrite_slots(header, valid_ptrs, worklist);
+        }
     }
 }
 
@@ -1707,8 +1766,16 @@ pub(super) fn note_block_persist_force_marks(marked: usize) {
     }
 }
 
+#[allow(dead_code)] // Reference entry used by GC tests.
 pub(super) fn mark_block_persisting_arena_objects(
     valid_ptrs: &ValidPointerSet,
+) -> BlockPersistTraceStats {
+    mark_block_persisting_arena_objects_remembering(valid_ptrs, None)
+}
+
+pub(super) fn mark_block_persisting_arena_objects_remembering(
+    valid_ptrs: &ValidPointerSet,
+    mut sticky: Option<&mut StickyRememberedSet>,
 ) -> BlockPersistTraceStats {
     let mut worklist: Vec<*mut GcHeader> = Vec::new();
     let mut stats = BlockPersistTraceStats::default();
@@ -1791,100 +1858,17 @@ pub(super) fn mark_block_persisting_arena_objects(
         // requiring another round to pick them up (but only within the
         // recent window — old blocks' newly-traced marks don't re-enter
         // the block-persist pump).
-        drain_trace_worklist(&mut worklist, valid_ptrs);
+        let mut cursor = 0;
+        while !drain_trace_worklist_step_remembering(
+            &mut worklist,
+            &mut cursor,
+            valid_ptrs,
+            false,
+            usize::MAX,
+            sticky.as_deref_mut(),
+        ) {}
     }
     stats
-}
-
-pub(super) unsafe fn trace_heap_rewrite_slots(
-    header: *mut GcHeader,
-    valid_ptrs: &ValidPointerSet,
-    worklist: &mut Vec<*mut GcHeader>,
-) {
-    // #10182: two per-object facts read once instead of once per slot —
-    // whether the proxy registry observes this trace (it changes only when a
-    // proxy is created, and none is created inside one object's visit), and
-    // whether the object is one of the weak-holder classes whose weak slots
-    // the trace skips (its class cannot change while it is traced). Range
-    // descriptors are walked here directly rather than through a per-slot
-    // dynamic callback.
-    let proxy_trace_active = super::full_trace::handle_trace_active();
-    #[cfg(not(test))]
-    let weak_holder = crate::weakref::is_weak_holder_header(header);
-    #[cfg(test)]
-    let weak_holder =
-        crate::weakref::is_weak_holder_header(header) && !mark_hoist_sabotage::forgetting_weak();
-    visit_gc_rewrite_slot_descriptors(header, |descriptor| unsafe {
-        let mut visit_slot = |slot: *mut u64, layout_kind: Option<HeapChildSlotReadKind>| {
-            if weak_holder && crate::weakref::is_weak_target_trace_slot(header, slot) {
-                return;
-            }
-            if let Some(kind) = layout_kind {
-                record_layout_child_slot_read(kind);
-                record_trace_slot_read();
-            }
-            mark_field_into_worklist(*slot, valid_ptrs, worklist, proxy_trace_active);
-        };
-        match descriptor {
-            GcMutableSlotDescriptor::PointerFreeRange(range) => {
-                if proxy_trace_active {
-                    for i in 0..range.slot_count() {
-                        super::full_trace::observe_handle(*range.slot(i), valid_ptrs);
-                    }
-                }
-            }
-            GcMutableSlotDescriptor::Slot(slot) => visit_slot(slot.slot, slot.layout_kind),
-            GcMutableSlotDescriptor::Range { range, layout_kind } => {
-                // Start the header reads of the range's pointer children
-                // before marking any of them: each is a cold DRAM read the
-                // mark would otherwise take one at a time. A prefetch cannot
-                // fault, so the candidate need not be proven a pointer yet.
-                for i in 0..range.slot_count() {
-                    let bits = *range.slot(i);
-                    let tag = bits & TAG_MASK;
-                    if tag == POINTER_TAG || tag == STRING_TAG {
-                        super::prefetch::prefetch_read(
-                            ((bits & POINTER_MASK) as usize).wrapping_sub(GC_HEADER_SIZE),
-                        );
-                    }
-                }
-                for i in 0..range.slot_count() {
-                    visit_slot(range.slot(i), layout_kind);
-                }
-            }
-        }
-    });
-}
-
-/// Sabotage switch for the mark-hoist test: the per-object weak-holder fact
-/// reads false, so a weak holder's weak slots are traced strongly. Test builds
-/// only.
-#[cfg(test)]
-pub(crate) mod mark_hoist_sabotage {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FORGET_WEAK: Cell<bool> = const { Cell::new(false) };
-    }
-
-    #[inline]
-    pub(crate) fn forgetting_weak() -> bool {
-        FORGET_WEAK.with(Cell::get)
-    }
-
-    pub(crate) struct Guard(bool);
-
-    impl Guard {
-        pub(crate) fn arm() -> Self {
-            Self(FORGET_WEAK.with(|s| s.replace(true)))
-        }
-    }
-
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            FORGET_WEAK.with(|s| s.set(self.0));
-        }
-    }
 }
 
 /// Trace array elements.

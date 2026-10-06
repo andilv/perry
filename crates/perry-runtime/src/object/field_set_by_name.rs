@@ -27,7 +27,7 @@ pub use attr_variants::{
 };
 pub use fast_paths::js_object_set_field_by_name_transition_fast;
 pub(crate) use fast_paths::{
-    object_set_field_by_name_transition_chain_proven_value,
+    add_absent_key_to_null_proto_object, object_set_field_by_name_transition_chain_proven_value,
     object_set_field_by_name_transition_only_fast_value, try_existing_own_data_overwrite,
     try_existing_own_data_overwrite_by_content, try_readd_stable_tombstone,
 };
@@ -46,6 +46,16 @@ pub extern "C" fn js_object_set_field_by_name(
     key: *const crate::StringHeader,
     value: f64,
 ) {
+    if !key.is_null() {
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                crate::string::string_data(key),
+                (*key).byte_len as usize,
+            );
+            let owner = (obj as u64 & crate::value::POINTER_MASK) as usize;
+            crate::typedarray_named::note_named_mutation(owner, bytes);
+        }
+    }
     // Guard hoisted to the call site (see `cannot_be_private_member_name`):
     // an ordinary key never calls into the private-member path.
     if !super::cannot_be_private_member_name(key)
@@ -469,9 +479,6 @@ pub extern "C" fn js_object_set_field_by_name(
                         if super::class_registry::class_instance_setter_apply(
                             class_id, &name, recv, value,
                         ) {
-                            return;
-                        }
-                        if super::class_registry::class_has_instance_getter(class_id, &name) {
                             return;
                         }
                     } else if !is_prototype_ref

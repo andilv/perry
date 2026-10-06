@@ -1246,6 +1246,7 @@ pub(super) fn compile_function(
         class_ids,
         class_keys_globals: &cross_module.class_keys_globals,
         class_field_counts: &cross_module.class_field_counts,
+        anon_key_adds: &cross_module.anon_key_adds,
         class_init_chains: &cross_module.class_init_chains,
         class_header_image_globals: &cross_module.class_header_images,
         class_birth_reps: &cross_module.class_birth_reps,
@@ -1448,6 +1449,8 @@ pub(super) fn compile_function(
         elided_arguments: HashMap::new(),
         native_rep_records: Vec::new(),
         known_noalias_buffer_locals: native_facts.known_noalias_buffer_locals(),
+        sealed_buffer_locals: native_facts.sealed_buffer_locals(),
+        late_exposed_buffer_locals: native_facts.late_exposed_buffer_locals(),
         buffer_alias_base,
     };
 
@@ -1522,6 +1525,8 @@ pub(super) fn compile_function(
                 // Declared-type hoist only — the construction form is unknown,
                 // so no inline-storage proof.
                 storage_inline_proven: false,
+                // Any caller's Buffer, which JS may detach between reads.
+                length_fixed: false,
             },
         );
     }
@@ -1544,8 +1549,12 @@ pub(super) fn compile_function(
     // minor never relocates, and old-page defrag skips it because
     // `gc_type_is_movable(GC_TYPE_TYPED_ARRAY)` is `false`. Note the reason is
     // header residency, not "storage is non-movable": the value in `%arg` is
-    // the header, and hoisting data+length reads THROUGH it (#6981). A
-    // non-view typed array also cannot be detached or resized.
+    // the header, and hoisting data+length reads THROUGH it (#6981). The
+    // data pointer and length stay valid only because every call site passes
+    // a SEALED binding and this param is itself sealed in the body
+    // (`spec_abi_sites::buffer_exposed_bindings`): construction alone does
+    // not keep them, since observing `.buffer` rebinds the array to an
+    // external backing and `buffer.transfer()` then detaches it (length 0).
     if let Some(plan) = spec_entry {
         for (p, rep) in f.params.iter().zip(plan.reps.iter()) {
             let crate::collectors::SpecParamRep::TaPtr { kind, const_len } = rep else {
@@ -1590,6 +1599,8 @@ pub(super) fn compile_function(
                     native_owned: None,
                     pointer_state: BufferViewPointerState::Stable,
                     storage_inline_proven: true,
+                    // Every call site passes a sealed binding.
+                    length_fixed: true,
                 },
             );
         }
@@ -1602,6 +1613,48 @@ pub(super) fn compile_function(
     if !f.is_async {
         let param_ids: std::collections::HashSet<u32> = f.params.iter().map(|p| p.id).collect();
         super::helpers::emit_callee_binding_resolutions(&mut ctx, &f.body, &param_ids, None, false);
+    }
+
+    // Stable byte parameters indexed in loops resolve their backing once. This proof
+    // never treats an owning buffer's +8 byte payload as a pointer, and does
+    // not cache length across detach or resize. Async/generator continuations
+    // and mutable/mapped parameters need their per-access receiver guards.
+    if !f
+        .params
+        .iter()
+        .any(|param| param.arguments_object.is_some())
+        && !f.is_async
+        && !f.is_generator
+        && !f.was_plain_async
+        && !ctx.disable_buffer_fast_path
+    {
+        for param in &f.params {
+            if ctx.boxed_vars.contains(&param.id) || ctx.reassigned_locals.contains(&param.id) {
+                continue;
+            }
+            let object = perry_hir::Expr::LocalGet(param.id);
+            if crate::expr::u8_buffer_read::loop_param_is_read(&f.body, param.id) {
+                if let Some(kind) = crate::expr::ta_element_read::receiver_kind(&ctx, &object) {
+                    if let Some(slot) = ctx.locals.get(&param.id).cloned() {
+                        let boxed = ctx.block().load(DOUBLE, &slot);
+                        crate::expr::ta_element_read::materialize_param(
+                            &mut ctx, param.id, &boxed, kind,
+                        );
+                    }
+                }
+            }
+            if !crate::expr::u8_buffer_read::u8_buffer_receiver_eligible(&ctx, &object)
+                || !crate::expr::u8_buffer_read::byte_view_param_is_read(&f.body, param.id)
+            {
+                continue;
+            }
+            if let Some(slot) = ctx.locals.get(&param.id).cloned() {
+                let boxed = ctx.block().load(DOUBLE, &slot);
+                crate::expr::u8_buffer_read::materialize_byte_view_param(
+                    &mut ctx, param.id, &boxed,
+                );
+            }
+        }
     }
 
     // #10812: throw a catchable RangeError before the native stack runs out.

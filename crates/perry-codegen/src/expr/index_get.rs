@@ -50,7 +50,7 @@ use foreign_counter::{affine_packed_loop_read, emit_affine_index_i64, foreign_pa
 pub(crate) use guarded_array::{
     emit_array_region_guard, emit_typed_f64_region_guard, ArrayRegionDense,
 };
-mod inline_dyn_typed_array;
+pub(super) mod inline_dyn_typed_array;
 
 use guarded_array::{
     lower_guarded_array_index_get, lower_packed_f64_loop_index_get,
@@ -901,6 +901,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if let Some(v) = super::try_lower_proven_view_guarded_load(ctx, object, index)? {
                     return Ok(v);
                 }
+                if let Some(value) = super::ta_element_read::try_lower(ctx, object, index, false)? {
+                    return Ok(value);
+                }
                 if typed_array_index_needs_runtime_key(ctx, object.as_ref(), index.as_ref()) {
                     if runtime_key_may_expose_typed_array_backing_buffer(index) {
                         if let Expr::LocalGet(id) = object.as_ref() {
@@ -1005,14 +1008,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(materialize_js_value(ctx, value, reason));
                 }
                 if typed_array_index_needs_runtime_key(ctx, object.as_ref(), index.as_ref()) {
+                    let param_access = super::u8_buffer_read::byte_view_param_for(ctx, object);
                     return rooting::with_operands_rooted(ctx, &[object, index], |ctx, vals| {
-                        let blk = ctx.block();
-                        let arr_bits = blk.bitcast_double_to_i64(&vals[0]);
-                        let arr_i64 = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-                        Ok(blk.call(
-                            DOUBLE,
-                            "js_typed_array_index_get_dynamic",
-                            &[(I64, &arr_i64), (DOUBLE, &vals[1])],
+                        // Keep the boxed receiver: numeric bits must never
+                        // become an unchecked raw pointer. This existing
+                        // dynamic guard preserves fractional/OOB/key semantics.
+                        Ok(inline_dyn_typed_array::lower_inline_dyn_typed_array_get_with_byte_view_param(
+                            ctx, &vals[0], &vals[1], false, param_access.as_ref(),
                         ))
                     });
                 }

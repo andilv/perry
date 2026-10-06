@@ -77,6 +77,13 @@ pub const GC_TYPE_CLOSURE: u8 = 4;
 /// byte). Emitted byte-access guards accept exactly these two.
 pub const GC_TYPE_BUFFER: u8 = 10;
 pub const GC_TYPE_BUFFER_UINT8ARRAY: u8 = 26;
+/// A buffer view stores its resolved native byte pointer at payload +8.
+/// The backing GC edge remains traced by the buffer descriptor. This bit
+/// never admits a view to the owning-buffer inline-storage cache.
+pub const GC_BUFFER_VIEW_DATA: u16 = 0x100;
+pub const BUFFER_VIEW_DATA_OFFSET: usize = 8;
+/// Header-less symbols must be screened before trusting a buffer layout.
+pub const SYMBOL_HEADER_MAGIC: u32 = 0x5359_4D42;
 /// `gc::GC_FLAG_FORWARDED` (GcHeader byte 1): an evacuated from-space stub.
 pub const GC_FLAG_FORWARDED: u8 = 0x80;
 /// `gc::GC_HEADER_SIZE`.
@@ -687,6 +694,16 @@ pub const METHOD_SITE_CONSTFN: u64 = 1 << 59;
 /// The index bits of an entry's `slot` word (bit 60 remains reserved for the
 /// accessor entry kind; bit 59 is ConstFn).
 pub const METHOD_SITE_INDEX_MASK: u64 = (1 << 59) - 1;
+/// What `js_method_site_prepare` answers for a call whose method read nothing
+/// can observe: dispatch by name after the arguments (#11910). The array-hole
+/// marker, a bit pattern no JS value takes.
+pub const METHOD_SITE_BY_NAME: u64 = 0x7FFC_0000_0000_0010;
+/// `js_method_site_prepare`'s by-name answer for a receiver no site entry
+/// describes (a primitive, a native cell): the call goes straight to the
+/// universal dispatcher. In the same never-a-value namespace;
+/// `bits | 2 == METHOD_SITE_BY_NAME_DIRECT` tests for either by-name answer.
+pub const METHOD_SITE_BY_NAME_DIRECT: u64 = 0x7FFC_0000_0000_0012;
+const _: () = assert!(METHOD_SITE_BY_NAME | 2 == METHOD_SITE_BY_NAME_DIRECT);
 /// `object::ObjectMeta::spill` (the object-owned overflow buffer).
 pub const OBJECT_META_SPILL_OFFSET: usize = 32;
 
@@ -716,3 +733,7 @@ pub const PACKED_ADD_CONSTFN_SLOT: u64 = 1 << 14;
 /// claim (`field_rep_store::constfn_store_info`).
 pub const CLOSURE_CAPTURES_THIS_FLAG: u32 = 0x8000_0000;
 pub const CLOSURE_NO_THIS_REBIND_FLAG: u32 = 0x4000_0000;
+
+/// Numeric typed-array resolved ArrayBuffer storage contract.
+pub const TA_STORAGE_RESOLVED: u8 = 2;
+pub const TA_DATA_OFFSET: usize = 16;

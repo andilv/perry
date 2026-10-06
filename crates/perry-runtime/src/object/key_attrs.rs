@@ -204,17 +204,39 @@ impl Word {
 
     /// This position's word: `entry` for `key`, after the cumulative `prev`.
     #[inline(always)]
-    unsafe fn after(prev: Word, entry: u8, key: crate::JSValue) -> Word {
+    unsafe fn after(prev: Word, entry: u8, key: impl AttributeKey) -> Word {
         let mut w = Word { entry, ..prev };
         if entry != 0 {
             w.summary |= entry_summary(entry);
-            let bit = key_bloom_bit(key);
+            let bit = key.bloom_bit();
             w.entry_bloom |= bit;
             if entry & ENTRY_ACCESSOR != 0 {
                 w.accessor_bloom |= bit;
             }
         }
         w
+    }
+}
+
+/// The key whose attribute word is being written. A builder that has just
+/// stored a string key can pass its original text; both forms feed the same
+/// cumulative word, without rereading a fresh array's key slot.
+pub(crate) trait AttributeKey {
+    fn bloom_bit(self) -> u16;
+}
+
+impl AttributeKey for crate::JSValue {
+    #[inline]
+    fn bloom_bit(self) -> u16 {
+        // SAFETY: the writer's key is live, as required by attrs_write.
+        unsafe { key_bloom_bit(self) }
+    }
+}
+
+impl AttributeKey for &str {
+    #[inline]
+    fn bloom_bit(self) -> u16 {
+        bloom_bit_of_bytes(self.as_bytes())
     }
 }
 
@@ -319,6 +341,55 @@ pub(crate) unsafe fn keys_entry(keys: *const ArrayHeader, pos: u32) -> u8 {
     } else {
         0
     }
+}
+
+/// Find an accessor candidate in a live shape's key prefix. Data names need
+/// not be decoded on a negative accessor walk. A positive candidate still
+/// checks the complete lookup: a later duplicate data key shadows it.
+///
+/// # Safety
+/// `keys` belongs to a live shape, with no intervening allocation or safepoint.
+pub(crate) unsafe fn keys_find_accessor_slot_resolved(
+    keys: *const ArrayHeader,
+    count: u32,
+    key: &[u8],
+) -> Option<u32> {
+    let attrs = keys_attrs(keys);
+    if attrs.is_null() {
+        return None;
+    }
+    let (entries, entry_len) = words(attrs);
+    let (slots, slot_len) = crate::object::keys_array_dense_slots_resolved(keys);
+    if slots.is_null() {
+        return None;
+    }
+    let n = (count as usize).min(entry_len).min(slot_len);
+    // Prefix summaries are cumulative: everything before the first prefix
+    // carrying SUMMARY_ACCESSOR is data. Method-heavy prototypes often put
+    // their few accessors last, so find that boundary without scanning every
+    // preceding attribute entry.
+    let (mut first, mut end) = (0, n);
+    while first < end {
+        let mid = first + (end - first) / 2;
+        if Word::decode(*entries.add(mid)).summary & SUMMARY_ACCESSOR == 0 {
+            first = mid + 1;
+        } else {
+            end = mid;
+        }
+    }
+    let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    for i in (first..n).rev() {
+        if Word::decode(*entries.add(i)).entry & ENTRY_ACCESSOR == 0 {
+            continue;
+        }
+        let value = crate::JSValue::from_bits((*slots.add(i)).to_bits());
+        if crate::string::js_string_key_bytes(value, &mut sso) == Some(key) {
+            return (crate::object::keys_find_slot_by_bytes_resolved(keys, count, key)
+                == Some(i as u32))
+            .then_some(i as u32);
+        }
+    }
+    None
 }
 
 /// Is key position `pos` of `keys` an accessor — does its value slot hold an
@@ -461,7 +532,7 @@ pub(crate) unsafe fn attrs_write(
     attrs: *mut ArrayHeader,
     pos: u32,
     entry: u8,
-    key: crate::JSValue,
+    key: impl AttributeKey,
 ) {
     let (w, len) = words(attrs);
     debug_assert!((pos as usize) <= len && pos < (*attrs).capacity);

@@ -246,6 +246,19 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
                 _ => {}
             }
         }
+        // A native superclass is also the constructor's actual [[Prototype]].
+        // Keep this edge on the class function shape, alongside instance
+        // heritage, so static reads and their receivers use ordinary lookup.
+        if !crate::object::class_value::class_value_is_first_evaluation(class_id) {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let parent = scope.root_nanbox_f64(parent_value);
+            // Materialize the child before passing a raw parent to the store.
+            crate::object::class_value::class_value_ptr(class_id);
+            class_static_prototype_root_store(
+                class_id,
+                crate::value::js_nanbox_get_pointer(parent.get_nanbox_f64()) as *mut ObjectHeader,
+            );
+        }
         return;
     }
     // Spec: a non-`null` superclass that is not a constructor throws a TypeError
@@ -607,10 +620,33 @@ pub fn is_class_object_ptr(ptr: *const u8) -> bool {
         };
         header.obj_type == crate::gc::GC_TYPE_OBJECT
             && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-            && crate::object::shapes::object_shape_descriptor(ptr.cast()).is_some_and(|shape| {
-                shape.object_kind == crate::object::shapes::ShapeObjectKind::Class
-            })
+            && object_shape_kind_is_class(ptr)
     }
+}
+
+/// [`is_class_object_ptr`] for a caller that already holds `ptr`'s header.
+///
+/// # Safety
+/// `header` is the GcHeader of the cell at `ptr`, obtained from a checked
+/// reader (`try_read_gc_header` / `try_read_tracked_gc_header`).
+pub(crate) unsafe fn is_class_object_with_header(
+    ptr: *const u8,
+    header: &crate::gc::GcHeader,
+) -> bool {
+    header.obj_type == crate::gc::GC_TYPE_OBJECT
+        && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+        && object_shape_kind_is_class(ptr)
+}
+
+/// Does the ShapeId of the live, unforwarded object at `ptr` name a class
+/// object?
+///
+/// # Safety
+/// `ptr` is a live `GC_TYPE_OBJECT` cell that has not been forwarded.
+#[inline(always)]
+unsafe fn object_shape_kind_is_class(ptr: *const u8) -> bool {
+    crate::object::shapes::object_shape_descriptor(ptr.cast())
+        .is_some_and(|shape| shape.object_kind == crate::object::shapes::ShapeObjectKind::Class)
 }
 
 /// #1789: f64-value form of [`is_class_object_ptr`] — true only for a
@@ -941,7 +977,6 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
         VTABLE_GEN.fetch_add(1, Ordering::Release);
         return;
     }
-    super::verdict_classes::note_verdict_class_accessor_change(class_id as u32);
     if let Some(name) = property_key_string(property_key) {
         super::registration::record_class_string_member_order(
             class_id,
@@ -1067,72 +1102,6 @@ pub(crate) fn lookup_static_method_owner(
         }
     }
     None
-}
-
-/// Apply an instance `set name(v)` accessor from the class vtable chain,
-/// invoking it with the `(this, value)` calling convention class setters use.
-/// Returns `true` if a setter was found and called. Used when a write targets
-/// a class prototype ref (`C.prototype[key] = v`) whose `key` is an accessor
-/// defined on the prototype itself (Test262 accessor-name-inst setters).
-/// Whether the class (or an ancestor) has an instance `get name()` accessor.
-pub(crate) fn class_has_instance_getter(class_id: u32, name: &str) -> bool {
-    let Ok(guard) = CLASS_VTABLE_REGISTRY.read() else {
-        return false;
-    };
-    let Some(reg) = guard.as_ref() else {
-        return false;
-    };
-    let mut cid = class_id;
-    let mut depth = 0usize;
-    while cid != 0 && depth < 32 {
-        if let Some(vt) = reg.get(&cid) {
-            if vt.declares_getter(name) {
-                return true;
-            }
-        }
-        match get_parent_class_id(cid) {
-            Some(p) if p != 0 && p != cid => {
-                cid = p;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-    false
-}
-
-/// Whether the class chain rooted at `class_id` defines an instance getter OR
-/// setter named `name` (on `Class.prototype`, via `js_register_class_getter` /
-/// `js_register_class_setter`). These accessors live in the per-class vtable,
-/// NOT in the address-keyed descriptor tables, so a prototype-object descriptor
-/// scan would miss them — the dynamic-write fast path must consult this before
-/// treating `instance[name] = v` as a plain own-data store (an inherited
-/// accessor must intercept instead). Walks the `extends` chain like
-/// [`class_has_instance_getter`].
-pub(crate) fn class_chain_has_instance_accessor(class_id: u32, name: &str) -> bool {
-    let Ok(guard) = CLASS_VTABLE_REGISTRY.read() else {
-        return false;
-    };
-    let Some(reg) = guard.as_ref() else {
-        return false;
-    };
-    let mut cid = class_id;
-    let mut depth = 0usize;
-    while cid != 0 && depth < 32 {
-        if let Some(vt) = reg.get(&cid) {
-            if vt.accessor_decl(name).is_some() {
-                return true;
-            }
-        }
-        match get_parent_class_id(cid) {
-            Some(p) if p != 0 && p != cid => {
-                cid = p;
-                depth += 1;
-            }
-            _ => break,
-        }
-    }
-    false
 }
 
 pub(crate) unsafe fn class_instance_setter_apply(
@@ -1698,6 +1667,20 @@ pub unsafe extern "C" fn js_class_static_method_call(
     // calling an absent member throws instead of silently returning the class.
     // In particular, this is observable when code deliberately probes a class
     // with an unknown method inside `assert.throws`.
+    // A class inherits `Object.prototype` through `Function.prototype`; with
+    // no static of that name on its chain, these two are the builtins.
+    if matches!(name, "hasOwnProperty" | "propertyIsEnumerable") {
+        let key = if args_len >= 1 && !args_ptr.is_null() {
+            *args_ptr
+        } else {
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        };
+        return if name == "hasOwnProperty" {
+            crate::object::js_object_has_own(receiver, key)
+        } else {
+            crate::object::js_object_property_is_enumerable(receiver, key)
+        };
+    }
     report_dispatch_miss(
         "static-member-call",
         receiver,

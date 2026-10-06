@@ -127,7 +127,7 @@ pub(crate) fn symbol_property_ic_epoch_bump() {
 
 /// Magic number distinguishing SymbolHeader from other GC_TYPE_STRING objects.
 /// Placed at offset 0 so `js_is_symbol` can cheaply detect symbols.
-pub const SYMBOL_MAGIC: u32 = 0x5359_4D42; // "SYMB"
+pub const SYMBOL_MAGIC: u32 = crate::codegen_abi::SYMBOL_HEADER_MAGIC; // "SYMB"
 
 /// Symbol object header. Allocated via `gc_malloc` (or malloc for registered
 /// symbols that need to outlive GC cycles).
@@ -1260,6 +1260,7 @@ pub(crate) fn store_object_symbol_property_root(
 ) -> bool {
     note_symbol_key_installed(sym_key);
     note_symbol_owner_installed(obj_key);
+    let _function_bag = crate::object::descriptor_state::FunctionBagEdit::new(obj_key);
     if unsafe { crate::object::shaped_symbols::owner(obj_key).is_some() } {
         let existed = unsafe { crate::object::shaped_symbols::entry(obj_key, sym_key) };
         let entry = existed.unwrap_or(0) & !crate::object::key_attrs::ENTRY_ACCESSOR_MASK;

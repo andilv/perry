@@ -84,7 +84,6 @@ NON_HANDLE_TABLES = {
     ("crates/perry-runtime/src/object/descriptor_state.rs", "DECLARED_FIELD_NAME_HASHES"),
     ("crates/perry-runtime/src/object/descriptor_state.rs", "PROTO_DESCRIPTOR_KEY_HASHES"),
     ("crates/perry-runtime/src/regex/site_test.rs", "SITE_TEST_HEADERS"),
-    ("crates/perry-runtime/src/object/native_module/callable_exports/builtin_closure_metadata.rs", "BUILTIN_CLOSURE_LENGTH"),
     ("crates/perry-runtime/src/object/native_module/callable_exports/builtin_closure_metadata.rs", "BUILTIN_CLOSURE_NON_CONSTRUCTABLE"),
     # Class ids are compiler metadata ids, not native-resource handles.
     ("crates/perry-runtime/src/object/class_constructors.rs", "CLASS_CAPTURE_VALUES"),
@@ -94,6 +93,9 @@ NON_HANDLE_TABLES = {
     # A TLS option hash and a TCP port respectively.
     ("crates/perry-ext-http/src/client_turnloop/tls.rs", "CONFIGS"),
     ("crates/perry-ext-http/src/tls_client.rs", "INTERNAL_HTTPS_SERVERS"),
+    # Keyed by agent id: one state bundle per thread agent, not per resource.
+    ("crates/perry-ext-zlib/src/stream/agent_state.rs", "ALL"),
+    ("crates/perry-stdlib/src/zlib/tables.rs", "ALL_ZLIB_TABLES"),
 }
 
 # Numeric class registries are concentrated in these modules.  The one

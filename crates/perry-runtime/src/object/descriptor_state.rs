@@ -48,11 +48,9 @@ impl PropertyAttrs {
     }
 }
 
-/// #6759 Phase A: the descriptor side tables and their per-thread fast-path
-/// gates, grouped as the `descriptors` field of
-/// [`crate::state::RuntimeState`]. Previously four separate `thread_local!`s;
-/// reach them via `crate::state::state().descriptors` (one TLS fetch for the
-/// whole group).
+/// #6759 Phase A: descriptor side tables and their per-thread fast-path gates, grouped
+/// in [`crate::state::RuntimeState`]::descriptors. Replaces four `thread_local!`s,
+/// accessed through `crate::state::state().descriptors` with one TLS fetch.
 pub(crate) struct DescriptorTables {
     /// Per-property attribute flags set by `Object.defineProperty` /
     /// `Object.freeze` / `Object.seal`, keyed `(owner_addr, key_string)`.
@@ -141,6 +139,8 @@ pub(crate) use filter::may_have_descriptor_entry;
 #[cfg(test)]
 pub(crate) use filter::test_may_have_descriptor_entry;
 use filter::{descriptor_route, meta_may_have, DescriptorRoute};
+mod function_attrs;
+pub(crate) use function_attrs::FunctionBagEdit;
 mod owner_lifecycle;
 mod young;
 
@@ -467,21 +467,15 @@ pub(crate) fn object_proto_may_intercept_key(key: f64) -> bool {
 /// `[[Set]]` walk is required instead of a direct own-data store. Conservative:
 /// any uncertainty returns `true` (take the slow path).
 ///
-/// All interception sources are checked so the fast path stays correct:
-///   1. A class getter/setter named `key` anywhere in the `extends` chain. These
-///      live in the per-class vtable, NOT the address-keyed descriptor tables, so
-///      the prototype-object scan in (2) cannot see them.
-///   2. An address-keyed accessor / non-writable descriptor on any *class*
-///      prototype object (`Object.defineProperty(C.prototype, …)`), detected via
-///      `OBJ_FLAG_HAS_DESCRIPTORS` on that prototype object.
-///   3. `Object.prototype` at the chain tail — delegated per-key to
-///      [`object_proto_may_intercept_key`].
+/// Every interception source is a property of a prototype object. The walk
+/// reads accessor and non-writable data attributes from each holder's shape,
+/// including declared class accessors and `Object.prototype` at the tail.
 ///
 /// Own-instance descriptors / frozen / sealed are excluded by the caller before
 /// this is reached.
 pub(crate) unsafe fn class_instance_set_may_intercept(
     obj_addr: usize,
-    class_id: u32,
+    _class_id: u32,
     key: f64,
 ) -> bool {
     // Decode the key once — used for both the class-chain and per-prototype
@@ -491,11 +485,7 @@ pub(crate) unsafe fn class_instance_set_may_intercept(
         // Non-decodable / non-string key: do not risk the fast path.
         None => return true,
     };
-    // (1) A class getter/setter for this exact key anywhere in the class chain.
-    if class_registry::class_chain_has_instance_accessor(class_id, &name) {
-        return true;
-    }
-    // (2)/(3) Walk the prototype OBJECTS from the instance's [[Prototype]].
+    // Walk the actual prototype objects; their shapes own all accessors.
     let mut proto = js_object_get_prototype_of(crate::value::js_nanbox_pointer(obj_addr as i64));
     let mut depth = 0u32;
     loop {
@@ -601,7 +591,9 @@ pub(crate) fn note_accessor_descriptor_target(obj: usize, key: &str, acc: &Acces
 /// * **typed arrays**: early return, before either. A small typed array is
 ///   plain-alloc'd without a `GcHeader`, so there is no flag bit to set and
 ///   no `ObjectHeader` to stamp.
-/// * **every other cell kind** (array, closure, Map/Set, RegExp, Error,
+/// * **functions**: normalize to the traced own-property bag and refresh the
+///   function shape; its key entries carry all string descriptor state.
+/// * **every other cell kind** (array, Map/Set, RegExp, Error,
 ///   Promise, native handles, handle-band ids): the `obj_type` test below
 ///   rejects them, so they get neither the flag nor a shape transition.
 ///
@@ -612,6 +604,11 @@ pub(crate) fn note_accessor_descriptor_target(obj: usize, key: &str, acc: &Acces
 /// path needs their descriptor state carried in the shape word first
 /// (`rule1_funnel_does_not_cover_non_object_receivers` pins this).
 pub(crate) fn note_descriptor_target_edits(obj: usize, edits: &[AttrsEdit<'_>]) {
+    let function = FunctionBagEdit::new(obj);
+    if let Some(edit) = &function {
+        edit.materialize_data_keys(edits);
+    }
+    let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
     if crate::array::object_prototype_addr_matches(obj) {
         OBJECT_PROTO_DESCRIPTORS.store(true, Ordering::Relaxed);
     }
@@ -651,22 +648,6 @@ pub(crate) fn note_accessor_born_with_keys(obj: usize) {
 /// Look up the property descriptor for (obj, key). Returns None if no entry exists,
 /// in which case the JS default `{ writable: true, enumerable: true, configurable: true }` applies.
 pub(crate) fn get_property_attrs(obj: usize, key: &str) -> Option<PropertyAttrs> {
-    // A function object's own properties, and their attributes, live in
-    // its bag (`closure::props`): its keys answer.
-    if crate::closure::is_closure_ptr(obj) {
-        // SAFETY: a proven live closure; its bag is null or a live object.
-        let bag = unsafe { crate::closure::props::bag_of(obj) };
-        if !bag.is_null() {
-            let entry = unsafe {
-                super::key_attrs::object_key_entry(bag as *const ObjectHeader, key.as_bytes())
-            };
-            if entry != 0 {
-                return Some(PropertyAttrs {
-                    bits: super::key_attrs::entry_to_attr_bits(entry),
-                });
-            }
-        }
-    }
     // A STORED descriptor wins over the synthesized index default:
     // `Object.defineProperty` / `Object.freeze` on a wrapper installs a real
     // entry, and the §10.4.3 default must not shadow it. Synthesis therefore
@@ -676,11 +657,15 @@ pub(crate) fn get_property_attrs(obj: usize, key: &str) -> Option<PropertyAttrs>
     // Charter step 3: an ordinary object's attributes live with its keys. No
     // table, no summary Bloom, no string build — its shape answers.
     let may = match unsafe { descriptor_route(obj) } {
-        DescriptorRoute::Keys => {
-            let entry = unsafe {
-                super::key_attrs::object_key_entry(obj as *const ObjectHeader, key.as_bytes())
-            };
-            if entry != 0 {
+        DescriptorRoute::Keys(keys_owner) => {
+            if keys_owner.is_null() {
+                return None;
+            }
+            let entry = unsafe { super::key_attrs::object_key_entry(keys_owner, key.as_bytes()) };
+            if entry != 0
+                || (keys_owner as usize != obj
+                    && unsafe { crate::closure::props::bag_has_own(obj, key.as_bytes()) })
+            {
                 return Some(PropertyAttrs {
                     bits: super::key_attrs::entry_to_attr_bits(entry),
                 });
@@ -1061,11 +1046,6 @@ pub(crate) unsafe fn plain_custom_prototype_may_intercept(obj_addr: usize, key: 
         if class_id == crate::object::NATIVE_MODULE_CLASS_ID {
             return true;
         }
-        // A class instance or class prototype on the chain keeps its accessors
-        // in the class registry, not only in the descriptor tables.
-        if class_id != 0 && class_registry::class_chain_has_instance_accessor(class_id, name) {
-            return true;
-        }
         if super::key_attrs::attrs_live_in_keys(p) {
             if super::key_attrs::object_key_blocks_plain_store(proto_obj, name.as_bytes()) {
                 return true;
@@ -1189,6 +1169,11 @@ pub(crate) unsafe fn plain_data_write_may_intercept(addr: usize, class_id: u32, 
         // prototype is vetted per key instead of rejecting the receiver.
         if super::prototype_chain::object_static_prototype(addr).is_some() {
             plain_custom_prototype_may_intercept(addr, key)
+        } else if crate::value::addr_class::try_read_gc_header(addr)
+            .is_some_and(|header| header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0)
+        {
+            // Born with a null `[[Prototype]]` and never relinked: no chain.
+            false
         } else {
             object_proto_may_intercept_key(key)
         }
@@ -1201,6 +1186,7 @@ pub(crate) unsafe fn plain_data_write_may_intercept(addr: usize, class_id: u32, 
 
 /// Store a property descriptor for (obj, key).
 pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
     super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_data_descriptor_target(obj, &key, attrs);
     let st = state();
@@ -1209,7 +1195,9 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
     disable_inline_guards_for_descriptor_target(obj, &key);
     // Charter step 3: an ordinary object's attributes live with its keys
     // (recorded by the funnel above) and nowhere else.
-    if unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) } {
+    if unsafe {
+        crate::closure::is_closure_ptr(obj) || super::key_attrs::attrs_live_in_keys_for_install(obj)
+    } {
         return;
     }
     note_meta_descriptor_key(obj, &key, false);
@@ -1227,6 +1215,9 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
 /// The per-key guard, owner index, and GC bookkeeping still run for every key.
 #[cfg(test)]
 pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAttrs)]) {
+    for (key, _) in entries {
+        crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
+    }
     if entries.is_empty() {
         return;
     }
@@ -1239,7 +1230,9 @@ pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAtt
     let st = state();
     st.descriptors.property_attrs_in_use.set(true);
     GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
-    let in_keys = unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) };
+    let in_keys = unsafe {
+        crate::closure::is_closure_ptr(obj) || super::key_attrs::attrs_live_in_keys_for_install(obj)
+    };
     for &(key, attrs) in entries {
         disable_inline_guards_for_descriptor_target(obj, key);
         if in_keys {
@@ -1258,6 +1251,8 @@ pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAtt
 /// Remove a customized property descriptor for (obj, key), restoring default
 /// data-property attributes for subsequent writes and reflection.
 pub(crate) fn clear_property_attrs(obj: usize, key: &str) {
+    let function = FunctionBagEdit::new(obj);
+    let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
     if unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) } {
         let entry = unsafe {
             super::key_attrs::object_key_entry(obj as *const ObjectHeader, key.as_bytes())
@@ -1288,10 +1283,15 @@ pub(crate) fn get_accessor_descriptor(obj: usize, key: &str) -> Option<AccessorD
     // header read picks the route.
     let may = unsafe {
         match descriptor_route(obj) {
-            DescriptorRoute::Keys => {
-                return own_accessor(obj, key.as_bytes()).map(|a| AccessorDescriptor {
-                    get: a.get,
-                    set: a.set,
+            DescriptorRoute::Keys(keys_owner) => {
+                if keys_owner.is_null() {
+                    return None;
+                }
+                return own_accessor(keys_owner as usize, key.as_bytes()).map(|a| {
+                    AccessorDescriptor {
+                        get: a.get,
+                        set: a.set,
+                    }
                 });
             }
             DescriptorRoute::Meta(meta) => meta_may_have(meta, key, true),
@@ -1367,6 +1367,14 @@ pub(crate) fn handle_accessor_descriptor_keys(handle: usize) -> Vec<String> {
 /// descriptors in the program) walk, per enumeration, to decide whether a
 /// per-index `enumerable` check was needed at all.
 pub(crate) fn owner_has_property_descriptors(owner: usize) -> bool {
+    if crate::closure::is_closure_ptr(owner) {
+        let bag = unsafe { crate::closure::props::bag_of(owner) };
+        return if bag.is_null() {
+            false
+        } else {
+            owner_has_property_descriptors(bag as usize)
+        };
+    }
     // Charter step 3: the shape's summary, for an ordinary object: does any
     // key carry a non-default data attribute (accessor halves included)?
     if unsafe { super::key_attrs::attrs_live_in_keys(owner) } {
@@ -1388,6 +1396,14 @@ pub(crate) fn owner_has_property_descriptors(owner: usize) -> bool {
 }
 
 pub(crate) fn accessor_descriptor_keys_for_obj(obj: usize) -> Vec<String> {
+    if crate::closure::is_closure_ptr(obj) {
+        let bag = unsafe { crate::closure::props::bag_of(obj) };
+        return if bag.is_null() {
+            Vec::new()
+        } else {
+            accessor_descriptor_keys_for_obj(bag as usize)
+        };
+    }
     // Charter step 3: an ordinary object's accessors are its keys whose entry
     // says so.
     if unsafe { super::key_attrs::attrs_live_in_keys(obj) } {
@@ -1541,10 +1557,25 @@ fn note_accessor_descriptor_key(key: &str) {
     }
 }
 
+/// Does the table-route owner `obj` (an array, a native cell: no keys or
+/// meta summary of its own) hold ANY accessor? Every table insert indexes its
+/// owner (`accessor_keys_by_owner`), so one address-keyed probe answers
+/// without building a key string.
+pub(crate) fn table_owner_has_accessors(obj: usize) -> bool {
+    state()
+        .descriptors
+        .accessor_keys_by_owner
+        .borrow()
+        .contains_key(&obj)
+}
+
 /// Store an accessor descriptor for (obj, key).
 pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDescriptor) {
-    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
+    crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
     crate::closure::shape::note_function_own_state_changed(obj);
+    let function = FunctionBagEdit::new(obj);
+    let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     let in_keys = unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) };
     let previous = if in_keys {
         unsafe { own_accessor(obj, key.as_bytes()) }
@@ -1564,6 +1595,10 @@ pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDesc
         note_accessor_function_replaced(obj, &key, previous.map(descriptor_from), acc);
         return;
     }
+    // An array's header bit is the fact readers check before this table
+    // (`OBJ_FLAG_ARRAY_DESCRIPTORS`): arm it for every accessor install, an
+    // index key included, not only the ones that come through defineProperty.
+    crate::array::note_array_own_non_index_key(obj);
     note_young_descriptor_owner(st, obj, Some(&acc));
     owner_index_add(&st.descriptors.accessor_keys_by_owner, obj, &key);
     st.descriptors
@@ -1651,8 +1686,10 @@ pub(crate) fn install_fresh_accessor_property(
     acc: AccessorDescriptor,
     attrs: PropertyAttrs,
 ) {
-    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     crate::closure::shape::note_function_own_state_changed(obj);
+    let function = FunctionBagEdit::new(obj);
+    let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
+    super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     // One edit covers the pair: the keys record both halves, and a key that
     // is not yet own arrives WITH them (one trie edge; an in-place append on
     // the tip of an attribute backing).
@@ -1745,6 +1782,8 @@ fn note_meta_descriptor_key_both(owner: usize, key: &str) -> Option<(bool, bool)
 /// Remove an accessor descriptor for (obj, key), letting ordinary data-property
 /// reads and writes use the object's stored field again.
 pub(crate) fn clear_accessor_descriptor(obj: usize, key: &str) {
+    let function = FunctionBagEdit::new(obj);
+    let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
     if unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) } {
         if !unsafe {
             super::key_attrs::object_key_is_accessor(obj as *const ObjectHeader, key.as_bytes())
@@ -1802,9 +1841,11 @@ pub(crate) fn set_builtin_accessor_pair(
     pair: super::accessor_pair::Accessor,
     attrs: PropertyAttrs,
 ) {
+    crate::closure::shape::note_function_own_state_changed(obj);
+    let function = FunctionBagEdit::new(obj);
+    let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
     let acc = descriptor_from(pair);
     super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
-    crate::closure::shape::note_function_own_state_changed(obj);
     let in_keys = unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) };
     let previous = if in_keys {
         unsafe { own_accessor(obj, key.as_bytes()) }
@@ -1860,9 +1901,16 @@ pub(crate) fn set_builtin_accessor_pair(
 /// `PROPERTY_DESCRIPTORS` per-object and unconditionally. The gate stays
 /// down, so the object get/set hot path is unaffected for every program.
 pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    // A function born with this key's attributes (its bag's key entry
+    // already says so): nothing changes.
+    if unsafe { function_key_has_attrs(obj, &key, attrs) } {
+        return;
+    }
     super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_descriptor_target_edits(obj, &[AttrsEdit::Data(key.as_bytes(), attrs.bits)]);
-    if unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) } {
+    if unsafe {
+        crate::closure::is_closure_ptr(obj) || super::key_attrs::attrs_live_in_keys_for_install(obj)
+    } {
         return;
     }
     // #6759 Phase C2: see `set_builtin_accessor_descriptor`.
@@ -1876,13 +1924,31 @@ pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: Propert
         .insert((obj, key), attrs);
 }
 
+/// Does the function `obj` own data key `key` with exactly the non-default
+/// attributes `attrs`, per its bag's key entry?
+///
+/// # Safety
+/// `obj` is any address; only a proven closure's bag is read.
+unsafe fn function_key_has_attrs(obj: usize, key: &str, attrs: PropertyAttrs) -> bool {
+    let entry = super::key_attrs::attr_bits_to_entry(attrs.bits);
+    if entry == 0 || !crate::closure::is_closure_ptr(obj) {
+        return false;
+    }
+    let bag = crate::closure::props::bag_of(obj);
+    !bag.is_null()
+        && super::key_attrs::object_key_entry(bag, key.as_bytes()) == entry
+        && crate::closure::props::bag_has_own(obj, key.as_bytes())
+}
+
 /// Install a built-in data property WITH its attributes: `obj[key] = value`
 /// followed by [`set_builtin_property_attrs`], as one step. On an object
 /// whose attributes live with its keys (charter step 3) the key is claimed
 /// with its attributes before the value is stored, so a prototype or
 /// namespace gaining one method after another appends each key in place —
 /// set-then-rewrite would copy the object's key list once per member.
-/// Every other owner (a closure constructor, …) takes the two-call path.
+/// A function claims the key in its bag the same way, in one step
+/// (`closure_define_data_with_attrs`); every other owner takes the two-call
+/// path.
 ///
 /// The claim allocates; callers hold raw receivers across builtin installs,
 /// so it runs in a no-move window.
@@ -1894,7 +1960,13 @@ pub(crate) fn define_builtin_data_property(
     attrs: PropertyAttrs,
 ) {
     unsafe {
-        if super::key_attrs::attrs_live_in_keys_for_install(obj as usize) {
+        if crate::closure::is_closure_ptr(obj as usize) {
+            super::own_override::as_builtin_definition(|| {
+                super::own_override::note_exotic_named_prop_install(obj as usize);
+                crate::closure::closure_define_data_with_attrs(obj as usize, &name, value, attrs);
+            });
+            return;
+        } else if super::key_attrs::attrs_live_in_keys_for_install(obj as usize) {
             let _no_move = crate::gc::GcSuppressScope::new();
             let entry = super::key_attrs::attr_bits_to_entry(attrs.bits);
             if entry != 0 {
@@ -1910,68 +1982,8 @@ pub(crate) fn define_builtin_data_property(
     set_builtin_property_attrs(obj as usize, name, attrs);
 }
 
-/// Walk the keys array of `obj` and apply the given attribute mask AND filter to every existing key.
-/// Used by `Object.freeze` (drops `writable` + `configurable`) and `Object.seal` (drops `configurable`).
-pub(crate) unsafe fn mark_all_keys(
-    obj: *mut ObjectHeader,
-    drop_writable: bool,
-    _drop_enumerable: bool,
-    drop_configurable: bool,
-) {
-    // Charter step 3: an ordinary object's attributes live with its keys, and
-    // freeze/seal rebuilds them ONCE, from the first key.
-    if super::key_attrs::attrs_live_in_keys_for_install(obj as usize) {
-        super::prop_plan::prop_plan_epoch_bump_for_owner(obj as usize);
-        state().descriptors.property_attrs_in_use.set(true);
-        GLOBAL_DESCRIPTORS_IN_USE.store(true, Ordering::Relaxed);
-        note_descriptor_target_edits(
-            obj as usize,
-            &[AttrsEdit::Integrity {
-                freeze: drop_writable,
-            }],
-        );
-        let _ = drop_configurable;
-        return;
-    }
-    let keys_view = crate::object::object_keys(obj);
-    let keys = keys_view.arr();
-    if keys.is_null() {
-        return;
-    }
-    let keys_ptr = keys as usize;
-    if (keys_ptr as u64) >> 48 != 0 || keys_ptr < 0x10000 {
-        return;
-    }
-    let key_count = keys_view.count() as usize;
-    if key_count == 0 || key_count > 65536 {
-        return;
-    }
-    let obj_addr = obj as usize;
-    for i in 0..key_count {
-        let key_val = crate::array::js_array_get(keys, i as u32);
-        if !key_val.is_string() {
-            continue;
-        }
-        let stored_key = key_val.as_string_ptr();
-        if stored_key.is_null() {
-            continue;
-        }
-        let name_ptr = (stored_key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-        let name_len = (*stored_key).byte_len as usize;
-        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
-        let key_str = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => continue,
-        };
-        // Start from existing attrs (or default `{w:true, e:true, c:true}`) and clear bits.
-        let mut attrs =
-            get_property_attrs(obj_addr, &key_str).unwrap_or(PropertyAttrs::new(true, true, true));
-        if drop_writable {
-            attrs.bits &= !PropertyAttrs::WRITABLE;
-        }
-        if drop_configurable {
-            attrs.bits &= !PropertyAttrs::CONFIGURABLE;
-        }
-        set_property_attrs(obj_addr, key_str, attrs);
-    }
-}
+mod integrity;
+pub(crate) use integrity::mark_all_keys;
+
+#[cfg(test)]
+mod census;

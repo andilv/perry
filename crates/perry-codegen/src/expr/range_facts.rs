@@ -702,6 +702,17 @@ pub(crate) fn bounds_for_buffer_access_width(
     bounds_width_units: u32,
 ) -> BoundsState {
     let bounds_width_units = bounds_width_units.max(1);
+    // A planned-bare access of a loop region over a typed-array view: the
+    // region's guard (or its last re-check) proved every index of this
+    // access below the length it read, and nothing that can run JS has run
+    // since (decision 69).
+    if bounds_width_units == 1
+        && crate::stmt::region_loop::view_bounds_proven(ctx, buffer_local_id, index)
+    {
+        return BoundsState::Proven {
+            proof: BoundsProof::RegionGuard,
+        };
+    }
     if let Some(index_local_id) = native_index_source_local(ctx, index) {
         if let Some(bounds) = ctx
             .bounded_buffer_index_pairs
@@ -935,9 +946,14 @@ fn guarded_buffer_index(
     if width < 1 || width > u32::MAX as i64 {
         return None;
     }
+    // The guard read the length once; the guarded body may run JS before the
+    // access, and JS can detach a receiver whose length is not fixed
+    // (`buffer.transfer()` zeroes it), which would leave a bare access past
+    // the end.
     if !ctx
         .receiver_descriptors
-        .contains_buffer_view(buffer_local_id)
+        .buffer_view(buffer_local_id)
+        .is_some_and(|view| view.length_fixed)
     {
         return None;
     }

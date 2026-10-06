@@ -41,6 +41,7 @@ fn remembers(sv: &SerializedValue) -> bool {
             | SerializedValue::Date(_)
             | SerializedValue::Uint8Array(_)
             | SerializedValue::ArrayBuffer(_)
+            | SerializedValue::TransferredArrayBuffer(_)
             | SerializedValue::View { .. }
             | SerializedValue::Map(_)
             | SerializedValue::Set(_)
@@ -148,6 +149,11 @@ impl<'s> Reader<'s> {
             SerializedValue::ScopeCapture(slots) => return self.scope_capture(slots),
             SerializedValue::Uint8Array(bytes) => owned_uint8array(bytes),
             SerializedValue::ArrayBuffer(bytes) => array_buffer(bytes),
+            SerializedValue::TransferredArrayBuffer(store) => {
+                let buffer = crate::buffer::buffer_adopt_backing(store.take(), store.length);
+                crate::buffer::mark_as_array_buffer(buffer as usize);
+                JSValue::pointer(buffer as *const u8).bits()
+            }
             SerializedValue::View {
                 kind,
                 buffer,
@@ -250,13 +256,13 @@ impl<'s> Reader<'s> {
             let keys_handle = self.scope.root_raw_mut_ptr(keys_arr);
             for (i, name) in names.iter().enumerate() {
                 let key = string_bits(name);
-                let keys_arr = keys_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>();
                 // GC_STORE_AUDIT(BARRIERED): deserialized key array slot uses the shared array slot-store helper.
-                store_thread_array_slot(keys_arr, i, key);
+                keys_handle.with_mut_ptr(|keys_arr| store_thread_array_slot(keys_arr, i, key));
             }
-            let keys_arr = keys_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>();
-            (*keys_arr).length = names.len() as u32;
-            crate::object::js_object_set_keys(self.ptr(slot), keys_arr);
+            keys_handle.with_mut_ptr::<crate::array::ArrayHeader, _>(|keys_arr| {
+                (*keys_arr).length = names.len() as u32;
+                crate::object::js_object_set_keys(self.ptr(slot), keys_arr);
+            });
         }
         if let (Some(facts), Some(names)) = (final_constfn, keys) {
             let obj = super::constfn_transfer::restore(
@@ -415,14 +421,12 @@ impl<'s> Reader<'s> {
         cause: Option<&SerializedValue>,
     ) -> u64 {
         let kind = crate::error::error_kind_for_name(name);
-        let message = message.map_or(ptr::null_mut(), |bytes| {
-            (string_bits(bytes) & POINTER_MASK) as *mut crate::string::StringHeader
-        });
+        let message = message.map_or(ptr::null_mut(), |bytes| heap_string(bytes));
         let undefined = f64::from_bits(TAG_UNDEFINED);
         let err = crate::error::js_error_new_kind_with_options(kind, message, undefined);
         self.fill(slot, JSValue::pointer(err as *const u8).bits(), Made::Value);
         if let Some(stack) = stack {
-            let text = (string_bits(stack) & POINTER_MASK) as *mut crate::string::StringHeader;
+            let text = heap_string(stack);
             crate::error::error_set_stack(self.ptr(slot), text);
         }
         if let Some(cause) = cause {
@@ -434,15 +438,18 @@ impl<'s> Reader<'s> {
 }
 
 unsafe fn string_bits(bytes: &[u8]) -> u64 {
-    let ptr = crate::string::js_string_from_bytes(
+    JSValue::string_ptr(heap_string(bytes)).bits()
+}
+
+unsafe fn heap_string(bytes: &[u8]) -> *mut crate::string::StringHeader {
+    crate::string::js_string_from_bytes(
         if bytes.is_empty() {
             ptr::null()
         } else {
             bytes.as_ptr()
         },
         bytes.len() as u32,
-    );
-    JSValue::string_ptr(ptr).bits()
+    )
 }
 
 /// Perry's Uint8Array is a `BufferHeader` plus a brand; restore both (#10103).

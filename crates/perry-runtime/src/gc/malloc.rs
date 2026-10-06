@@ -133,8 +133,9 @@ impl MallocState {
     /// tables) are out of scope for this mechanical fix. This also avoids the
     /// re-entrant `MALLOC_STATE.with(...)` the sweep bookkeeping performs.
     ///
-    /// Pinned objects are skipped, mirroring `process_sweep_header`, so a
-    /// cross-thread promise pinned for an in-flight result is never yanked.
+    /// Pinned non-native objects are skipped, so cross-thread promises stay
+    /// alive. Native cells belong to this thread; pending queue refs expire
+    /// with the worker and cannot prevent its payload cleanup.
     fn free_all_tracked_objects(&mut self) -> u64 {
         let mut freed_bytes: u64 = 0;
         for header in self.objects.drain(..) {
@@ -145,7 +146,9 @@ impl MallocState {
             // (GcHeader-prefixed block) until freed here; this loop frees each
             // exactly once and the thread is exiting, so no concurrent access.
             unsafe {
-                if (*header).gc_flags & GC_FLAG_PINNED != 0 {
+                if (*header).gc_flags & GC_FLAG_PINNED != 0
+                    && (*header).obj_type != GC_TYPE_NATIVE_HANDLE
+                {
                     continue;
                 }
                 let total_size = (*header).size as usize;
@@ -317,6 +320,7 @@ pub fn gc_malloc(size: usize, obj_type: u8) -> *mut u8 {
         });
         GC_FLAGS.with(|f| f.set(f.get() & !GC_FLAG_IN_ALLOC));
 
+        super::allocation_pacing::note_allocation(total, total >= 16 * 1024);
         user_ptr
     }
 }
@@ -376,6 +380,10 @@ pub fn gc_malloc_batch(sizes: &[usize], obj_type: u8) -> Vec<*mut u8> {
         GC_FLAGS.with(|f| f.set(f.get() & !GC_FLAG_IN_ALLOC));
     }
 
+    for &size in sizes {
+        let total = GC_HEADER_SIZE + size;
+        super::allocation_pacing::note_allocation(total, total >= 16 * 1024);
+    }
     results
 }
 
@@ -684,6 +692,8 @@ pub fn gc_realloc(old_user_ptr: *mut u8, new_payload_size: usize) -> *mut u8 {
             }
         });
 
+        let growth = new_total.saturating_sub(old_total);
+        super::allocation_pacing::note_allocation(growth, growth >= 16 * 1024);
         new_raw.add(GC_HEADER_SIZE)
     }
 }
@@ -839,5 +849,18 @@ pub(crate) fn malloc_state_census() -> Vec<crate::gc::census::SideTableRow> {
                 map_bytes(&s.realloc_forwarding),
             ),
         ]
+    })
+}
+
+/// Header-inclusive resident bytes, maintained by the existing malloc ledger.
+pub(super) fn malloc_resident_bytes() -> usize {
+    MALLOC_STATE.with(|state| {
+        state
+            .borrow()
+            .kind_telemetry
+            .iter()
+            .fold(0usize, |total, kind| {
+                total.saturating_add(kind.survivor_bytes as usize)
+            })
     })
 }

@@ -44,6 +44,10 @@ pub(crate) fn ensure_object_intrinsics() -> ObjectPair {
     if ctor != 0 && proto != 0 {
         return (ctor as *mut _, proto as *mut _);
     }
+    // This bootstrap can precede globalThis (and js_gc_init on a worker or
+    // native caller). Register the intrinsic and runtime-handle scanners
+    // before publishing roots, just as the realm-global bootstrap does.
+    crate::gc::ensure_gc_initialized();
     if OBJECT_INTRINSICS_BUILDING.with(|b| b.swap(true, Ordering::AcqRel)) {
         return (std::ptr::null_mut(), std::ptr::null_mut());
     }
@@ -81,6 +85,8 @@ pub(crate) fn ensure_object_prototype_shape() -> *mut ObjectHeader {
     if current != 0 {
         return current as *mut ObjectHeader;
     }
+    // The shape-only sentinel also lives in the intrinsic root cache.
+    crate::gc::ensure_gc_initialized();
     if OBJECT_INTRINSICS_BUILDING.with(|b| b.swap(true, Ordering::AcqRel)) {
         return std::ptr::null_mut();
     }
@@ -135,30 +141,18 @@ fn build_object_intrinsics() -> Option<ObjectPair> {
     if closure_ptr.is_null() {
         return None;
     }
-    install_builtin_constructor_statics("Object", closure_ptr);
-    super::super::native_module::set_bound_native_closure_name(closure_ptr, "Object");
-    if let Some(len) = builtin_constructor_spec_length("Object") {
-        super::super::native_module::set_builtin_closure_length(closure_ptr as usize, len);
-    }
-    for key in ["name", "length"] {
-        super::super::set_builtin_property_attrs(
-            closure_ptr as usize,
-            key.to_string(),
-            super::super::PropertyAttrs::new(false, false, true),
-        );
-    }
-    let proto_obj = js_object_alloc(0, 0);
+    // The intrinsic's terminal edge is published by its birth shape, like
+    // any other null-parent object. No address or name exception is needed
+    // by a presence walk.
+    let proto_obj = js_object_alloc_null_proto(0, super::proto_room::BUILTIN_PROTOTYPE_ROOM);
     if proto_obj.is_null() {
         return None;
     }
     let ctor_value = crate::value::js_nanbox_pointer(closure_ptr as i64);
-    let proto_key = crate::string::js_string_from_bytes(b"prototype".as_ptr(), 9);
-    super::super::define_builtin_data_property(
-        closure_ptr as *mut ObjectHeader,
-        proto_key,
-        crate::value::js_nanbox_pointer(proto_obj as i64),
-        "prototype".to_string(),
-        super::super::PropertyAttrs::new(false, false, false),
+    install_builtin_constructor_statics(
+        "Object",
+        closure_ptr,
+        Some(crate::value::js_nanbox_pointer(proto_obj as i64)),
     );
     let ctor_key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
     super::super::define_builtin_data_property(
@@ -169,6 +163,8 @@ fn build_object_intrinsics() -> Option<ObjectPair> {
         super::super::PropertyAttrs::new(true, false, true),
     );
     populate_builtin_prototype_methods("Object", proto_obj);
+    // SAFETY: the fresh prototype, not yet exposed, collection suppressed.
+    unsafe { super::proto_room::fit_builtin_prototype(proto_obj) };
     Some((closure_ptr, proto_obj))
 }
 
@@ -208,6 +204,13 @@ mod tests {
                 proto_addr
             );
             assert!(crate::array::object_prototype_addr_matches(proto_addr));
+            // Every constructor own property, including prototype, fits the
+            // initial bag. Prototype-chain reads must not gain a spill just
+            // because length/name now carry their attributes in that bag.
+            let bag = unsafe { crate::closure::props::bag_of(ctor as usize) };
+            let layout = unsafe { super::super::shapes::object_shape_descriptor(bag) }
+                .expect("constructor own-property shape");
+            assert!(layout.live_inline_slot_count >= layout.logical_key_count);
             // Complete before any realm global: statics, prototype methods.
             let keys = crate::closure::closure_get_dynamic_prop(ctor as usize, "keys");
             assert!(

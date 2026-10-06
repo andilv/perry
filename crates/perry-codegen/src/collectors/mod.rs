@@ -6,6 +6,7 @@
 //! hub — public-API shape (`crate::collectors::*`) is preserved.
 
 mod all_pointer_arrays;
+pub(crate) mod anon_key_adds;
 mod byte_read_key;
 #[cfg(test)]
 mod byte_read_key_tests;
@@ -54,6 +55,7 @@ mod repsel_benefit;
 mod safepoint_sites;
 mod scalar_method_dispatch;
 mod scalar_methods;
+pub(crate) mod sealed_buffers;
 pub mod segview;
 #[cfg(test)]
 mod segview_tests;
@@ -128,8 +130,8 @@ pub(crate) use ptr_shape::{ptr_shape_locals_enabled, PtrShapeLocal};
 pub(crate) use ptr_shape_callbacks::collect_array_callback_shapes;
 pub(crate) use ptr_shape_returns::collect_exported_return_shapes;
 pub(crate) use receiver_regions::{
-    region_enders_in_stmts_with_trusted_operations, ReceiverArrayValidationKind,
-    ReceiverDescriptorTable, RegionEnder,
+    region_enders_in_stmts_with_trusted_operations, ByteViewParamAccess,
+    ReceiverArrayValidationKind, ReceiverDescriptorTable, RegionEnder,
 };
 pub(crate) use refs::{
     collect_let_ids, collect_ref_ids_in_expr, collect_ref_ids_in_stmts, is_clamp_call,

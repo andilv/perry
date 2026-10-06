@@ -17,7 +17,7 @@ mod disposal;
 mod function_shape;
 pub(crate) use function_shape::{
     call_function_intrinsic, function_intrinsic_facts, function_prototype_built,
-    FunctionIntrinsicFacts,
+    run_function_intrinsic, FunctionIntrinsicFacts,
 };
 mod handle_methods;
 mod memo_entries;
@@ -57,6 +57,7 @@ pub(crate) use namespace_override::{
     namespace_override_stack_restore, namespace_override_stack_savepoint,
 };
 pub use object_proto::js_value_to_locale_string;
+use object_proto::{call_builtin_object_proto_method, is_ordinary_object_receiver};
 pub(crate) use object_proto::{
     js_object_default_value_of, js_object_is_prototype_of_value,
     js_object_prototype_to_locale_string,
@@ -1896,6 +1897,19 @@ pub(crate) unsafe fn native_call_method_tower(
         return result;
     }
 
+    // `hasOwnProperty` / `propertyIsEnumerable` on a receiver that is not an
+    // ordinary object (a primitive, function, class, array, collection, typed
+    // array, …): the kind dispatchers below answer by name, and for these two
+    // names their answers are wrong (`undefined`, or `true` for any key). The
+    // receiver's own property was consulted just above; its kind's prototype
+    // carries the builtin, so the builtin answers. An ordinary object goes on
+    // to the common arm, which reads the method off its prototype chain.
+    if matches!(method_name, "hasOwnProperty" | "propertyIsEnumerable")
+        && !is_ordinary_object_receiver(object())
+    {
+        return call_builtin_object_proto_method(object(), method_name, &refreshed_args());
+    }
+
     if let Some(r) = primitive_methods::dispatch_primitive(
         &root_scope,
         &object_handle,
@@ -1995,24 +2009,6 @@ pub(crate) unsafe fn native_call_method_tower(
         // Guard: ensure we can safely read GC_HEADER_SIZE bytes before obj
         if (obj as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
             return 0.0;
-        }
-
-        // AsyncHook/AsyncResource handles are raw Box pointers under
-        // POINTER_TAG, not GC heap objects — recognize them by registry
-        // membership BEFORE the gc_header read below (which would read foreign
-        // allocator memory). Covers receivers whose static type the codegen
-        // lost through a helper return, closure capture, or `any` binding.
-        if let Some(r) = crate::async_hooks::try_async_hook_method_dispatch(obj as i64, method_name)
-        {
-            return r;
-        }
-        if let Some(r) = crate::async_hooks::try_async_resource_method_dispatch(
-            obj as i64,
-            method_name,
-            args_ptr,
-            args_len,
-        ) {
-            return r;
         }
 
         let gc_header =
@@ -2577,64 +2573,6 @@ pub(crate) unsafe fn native_call_method_tower(
                         crate::closure::JsThis::from_f64(object()),
                         args_ptr,
                         args_len,
-                    );
-                    return result;
-                }
-            }
-        }
-    }
-
-    // #10893: `c.g(args)` where `g` is an ACCESSOR rather than a method. Every
-    // arm above probes for a callable VALUE — vtable methods, own fields, the
-    // prototype chain — but none of them RUNS a getter, so a class exposing a
-    // callable through `get g()` threw "g is not a function" even though
-    // `const f = c.g; f(args)` returned the very same function. Effect's schema
-    // classes reach their constructor this way, which is how a decoded value
-    // ended up built from the wrong class (#10891).
-    //
-    // Read the property through the ordinary by-name get, which runs the
-    // accessor, and call the result with the receiver bound as `this`. This
-    // runs LAST, after every method/field/prototype arm, so a real method of
-    // the same name still wins and only a genuine miss reaches here; a getter
-    // that yields a non-callable falls through to the throw below unchanged.
-    if jsval().is_pointer() {
-        let receiver = object_handle.get_nanbox_f64();
-        let recv = (receiver.to_bits() & crate::value::POINTER_MASK) as *mut ObjectHeader;
-        // Only fire for a genuine ACCESSOR, and never for a key `delete`
-        // removed. The first version of this arm did an ordinary by-name read
-        // and called whatever came back, which resurrected members the tower
-        // had correctly refused: `delete C.prototype.m; obj.m()` stopped
-        // throwing, and the imported-clone guards lost a prototype semantic
-        // (`issue_9180`, `issue_8693`). Requiring a declared accessor on the
-        // receiver's class chain keeps the arm to exactly the case it is for.
-        let has_accessor =
-            !recv.is_null() && !crate::value::addr_class::is_small_handle(recv as usize) && {
-                let class_id = crate::object::js_object_get_class_id(recv);
-                class_id != 0
-                    && !crate::object::class_registry::class_proto_key_deleted(
-                        class_id,
-                        method_name,
-                    )
-                    && crate::object::class_registry::class_chain_has_instance_accessor(
-                        class_id,
-                        method_name,
-                    )
-            };
-        if has_accessor {
-            let accessor_key =
-                crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
-            if !accessor_key.is_null() {
-                let got = super::field_get_set::js_object_get_field_by_name(recv, accessor_key);
-                let candidate = f64::from_bits(got.bits());
-                if crate::collection_iter::is_callable(candidate) {
-                    let args = refreshed_args();
-                    let result = crate::closure::native_call_value_this(
-                        candidate,
-                        // Re-read: the key allocation and the getter can
-                        // move the receiver.
-                        crate::closure::JsThis::from_f64(object_handle.get_nanbox_f64()),
-                        args.as_ptr(),
-                        args.len(),
                     );
                     return result;
                 }

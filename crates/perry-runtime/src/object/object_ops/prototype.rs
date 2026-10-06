@@ -143,6 +143,25 @@ pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
 /// Refs #420 / #618 followup.
 #[no_mangle]
 pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
+    // A default-link proof returns the realm's Object.prototype. It cannot
+    // expose an iterator-family prototype, so it needs no exposure probes.
+    // The intrinsic must already be complete: this arm cannot collect.
+    let value = crate::JSValue::from_bits(obj_value.to_bits());
+    if value.is_pointer() {
+        let addr = value.as_pointer::<u8>() as usize;
+        unsafe {
+            if let Some(header) = crate::value::addr_class::try_read_gc_header(addr) {
+                if header.obj_type == crate::gc::GC_TYPE_OBJECT
+                    && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                    && header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO == 0
+                {
+                    if let Some(proto) = default_link_prototype(addr as *const ObjectHeader) {
+                        return proto;
+                    }
+                }
+            }
+        }
+    }
     let proto = get_prototype_of_resolved(obj_value);
     // #10086: this is the ONE place a prototype object reaches user code, so
     // it is also the only place the array-iterator prototype can escape to be
@@ -198,7 +217,7 @@ unsafe fn default_link_prototype(obj: *const ObjectHeader) -> Option<f64> {
         .then(|| f64::from_bits(crate::value::js_nanbox_pointer(proto as i64).to_bits()))
 }
 
-fn get_prototype_of_resolved(obj_value: f64) -> f64 {
+pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
     const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
     // #2820: `Object.getPrototypeOf(null | undefined)` throws TypeError
     // (`Cannot convert undefined or null to object`). Class refs and heap
@@ -534,6 +553,11 @@ fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             {
                 return f64::from_bits(proto_bits);
             }
+            if let Some(parent) =
+                crate::object::native_module::buffer_intrinsic_prototype_parent(raw_addr as usize)
+            {
+                return parent;
+            }
             unsafe {
                 let obj = raw_addr as *const ObjectHeader;
                 let gc = gc_header_for(obj);
@@ -793,6 +817,11 @@ fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             super::super::prototype_chain::object_static_prototype(bits as usize)
         {
             return f64::from_bits(proto_bits);
+        }
+        if let Some(parent) =
+            crate::object::native_module::buffer_intrinsic_prototype_parent(bits as usize)
+        {
+            return parent;
         }
         unsafe {
             let obj = bits as *const ObjectHeader;

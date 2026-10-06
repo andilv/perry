@@ -112,6 +112,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // #9342: Uint8Array inline-read admission cache (buffer/header.rs).
     module.add_external_global("PERRY_U8_INLINE_CACHE", "[64 x i64]");
     module.add_external_global("PERRY_TA_OWN_PROPS_PRESENT", I8);
+    module.add_external_global("PERRY_TYPED_NAMED_PROPS_INVALIDATED", I8);
     module.declare_function("js_object_alloc", I64, &[I32, I32]);
     module.declare_function("js_event_target_subclass_init", DOUBLE, &[DOUBLE, I32]);
     // #3149: `Object(value)` plain-call coercion. Takes & returns a NaN-boxed
@@ -419,6 +420,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_nm_install_vm", VOID, &[]);
     module.declare_function("js_nm_install_wasi", VOID, &[]);
     module.declare_function("js_nm_install_zlib", VOID, &[]);
+    module.declare_function("js_nm_install_worker_threads", VOID, &[]);
     module.declare_function("js_nm_install_all", VOID, &[]);
     module.declare_function("js_nm_enable_install_all", VOID, &[]);
     module.declare_function("js_object_get_field_ic_miss", DOUBLE, &[I64, I64, PTR]);
@@ -663,6 +665,28 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_method_site_miss",
         DOUBLE,
         &[PTR, I64, DOUBLE, I64, PTR, I64],
+    );
+    // #11910: the split site's lookup half and its call half's runtime path.
+    module.declare_function("js_method_site_prepare", DOUBLE, &[PTR, DOUBLE, I64, I64]);
+    module.declare_function(
+        "js_method_site_lookup",
+        DOUBLE,
+        &[PTR, DOUBLE, I64, I64, PTR],
+    );
+    module.declare_function(
+        "js_method_site_call_split",
+        DOUBLE,
+        &[DOUBLE, PTR, I64, DOUBLE, I64, PTR, I64],
+    );
+    module.declare_function(
+        "js_method_site_call_value",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR, I64],
+    );
+    module.declare_function(
+        "js_method_site_call_value_apply",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I64],
     );
     module.declare_function(
         "js_put_value_set_dyn_ic",

@@ -967,6 +967,12 @@ test_gap_11743_class_field_array_push
 # still walking; the walk freed the live buffer born there.
 test_gap_gc_11842_sweep_window_hole_reuse
 
+# #11862: a local read out of an array element (`const x = a[0]` after an
+# in-place `a[0] = obj`) took its type from the array literal, so it got no
+# shadow slot and held a from-space address. Also the one-element owner box HIR
+# builds for a repeatable class declaration whose members name the class.
+test_gap_gc_11862_array_cell_element_root
+
 # --- worker message clone: reader roots and the parentPort callback ---------
 # The message reader allocates every object of a message while earlier ones
 # must stay reachable for later references (shared objects, cycles, Map keys,
@@ -975,3 +981,17 @@ test_gap_gc_11842_sweep_window_hole_reuse
 # closure, whose stale pointer was the registry worker's "value is not a
 # function".
 test_gap_gc_worker_message_clone_rooting
+
+# Literal birth capacity: reserved slots, deletion/re-addition and beyond-cap spill.
+test_gap_addkey_born_wide_11497
+# #11931: function attribute edges across incremental/minor GC and agent exit.
+test_gap_gc_11931_function_attrs_incremental
+test_gap_gc_11931_function_attrs_old_minor
+test_gap_gc_11931_function_attrs_worker
+
+# #11929: generated mutable local/global roots use the collector's final
+# root remark instead of per-store shading; closure captures keep heap barriers.
+test_gap_gc_generated_root_final_remark
+# #11929/#11960: root-heavy stable homes during budgeted marking and copying GC.
+test_gap_gc_11929_stable_home_marking
+test_gap_gc_11929_inline_births

@@ -16,10 +16,9 @@ pub(super) enum InheritedRead {
     Missed,
     /// No walk happened; the caller's fallbacks run unchanged.
     NotWalked,
-    /// #11391: the recorded chain was walked and does not carry the key, AND
-    /// it is not the chain the receiver's class id names any more, so the
-    /// class-id prototype arms must not answer either. See
-    /// `prototype_chain::class_default_prototype_superseded`.
+    /// The recorded chain missed, and replaces the class-id surface: an
+    /// evaluated class (#12029) or a displaced default prototype (#11391).
+    /// The class-id prototype arms must not answer either.
     Superseded,
 }
 
@@ -30,8 +29,7 @@ impl InheritedRead {
     }
 
     /// Whether the class-id prototype walk may still answer this read: false
-    /// once the receiver's own `[[Prototype]]` has replaced the object that
-    /// walk reads (#11391).
+    /// when the receiver's recorded chain owns the whole class surface.
     pub(super) fn class_prototype_answers(&self) -> bool {
         !matches!(self, InheritedRead::Superseded)
     }
@@ -57,8 +55,8 @@ impl InheritedRead {
 /// heritage can differ between evaluations of one template. Other internal
 /// runtime wiring retains its existing fallback behavior.
 ///
-/// A non-`Hit` answer means either no override, or an override that does not
-/// carry this key — in both cases the caller keeps its existing fallback.
+/// An evaluated class's recorded chain owns its whole surface: a miss disables
+/// class-id fallbacks too (#12029). Synthesized intrinsic fallbacks remain.
 ///
 /// #10877: the two non-`Hit` answers differ in whether the recorded chain was
 /// already walked. Both callers end in a `resolve_inherited_field` of their
@@ -85,17 +83,14 @@ pub(super) fn inherited_field_if_overridden(
     if !individual && !superseded {
         return InheritedRead::NotWalked;
     }
-    if individual && class_prototype_declares_own_getter(obj, key) {
-        return InheritedRead::NotWalked;
-    }
     if let Some(value) = crate::object::prototype_chain::resolve_inherited_field(obj as usize, key)
     {
         return InheritedRead::Hit(value);
     }
     // #10827: the two reasons this walk can miss are not the same reason.
     //
-    // If the chain ENDS IN AN EXPLICIT NULL, the miss is the final answer and
-    // it is `undefined` — there is nothing above this receiver to synthesize
+    // If the chain ENDS IN AN EXPLICIT NULL before Object.prototype, the miss
+    // is the final answer: `undefined`. There is nothing above it to synthesize
     // from, and the arms below would go and ask the class surface anyway.
     // That is how `Object.setPrototypeOf(o, null); o.a` kept answering from
     // the prototype `o` was born with, while `"a" in o` correctly said false:
@@ -106,10 +101,21 @@ pub(super) fn inherited_field_if_overridden(
     // everything Perry SYNTHESIZES rather than stores on a real prototype (a
     // plain function's `.prototype`, the boxed-wrapper builtins, the iterator
     // helpers), and swallowing those made them unreachable.
-    if crate::object::prototype_chain::prototype_chain_ends_in_explicit_null(obj as usize) {
+    if crate::object::prototype_chain::prototype_chain_ends_in_null_before_object_prototype(
+        obj as usize,
+    ) {
         return InheritedRead::Hit(JSValue::undefined());
     }
-    if superseded {
+    // #12029: a class evaluation owns its entire prototype surface. A miss
+    // on that chain must never fall through to the template's declaration
+    // prototype (the first evaluation), even for a newly added data property.
+    // ClassBody accessors, like methods, are physical keys on the prototype.
+    let evaluated = individual
+        && crate::object::private_evaluation_brand_value(crate::value::js_nanbox_pointer(
+            obj as i64,
+        ))
+        .is_some_and(crate::object::class_registry::is_class_object_value);
+    if superseded || evaluated {
         return InheritedRead::Superseded;
     }
     InheritedRead::Missed
@@ -131,39 +137,4 @@ pub(super) fn static_prototype_already_read(obj: *const ObjectHeader, read_miss:
     let noted = JSValue::from_bits(read_miss);
     let proto = JSValue::from_bits(proto_bits);
     proto.is_pointer() && noted.is_pointer() && proto.as_pointer::<u8>() == noted.as_pointer::<u8>()
-}
-
-/// A class prototype object's ClassBody getters are not stored on the object:
-/// they live only in its template's vtable, which the tail consults after this
-/// override. A per-evaluation prototype (`ClassExprFresh`, #9502/#11043) also
-/// carries an individual `[[Prototype]]`: the evaluated parent's prototype.
-/// Walking that chain first let an ancestor's accessor shadow the class's own
-/// one, so `class F extends Base { get type() {…} }` declared in a function
-/// answered `new F().type` with `Base`'s getter. luxon's zones hit this
-/// (`FixedOffsetZone.utcInstance.type` threw "Zone is an abstract class") once
-/// an in-body `new FixedOffsetZone()` constructed through the evaluation (#11142).
-///
-/// Only the class's OWN vtable is consulted. An inherited getter must still come
-/// from the evaluated heritage chain, which can differ between evaluations of
-/// one template.
-fn class_prototype_declares_own_getter(
-    obj: *const ObjectHeader,
-    key: *const crate::string::StringHeader,
-) -> bool {
-    let Some(class_id) =
-        crate::object::class_registry::class_id_for_decl_prototype_object(obj as usize)
-    else {
-        return false;
-    };
-    let key_copy = unsafe { super::HeapKeyBytes::copy_of_key(key) };
-    let Ok(name) = std::str::from_utf8(key_copy.as_bytes()) else {
-        return false;
-    };
-    let Ok(guard) = crate::object::class_registry::CLASS_VTABLE_REGISTRY.read() else {
-        return false;
-    };
-    guard
-        .as_ref()
-        .and_then(|registry| registry.get(&class_id))
-        .is_some_and(|vtable| vtable.declares_getter(name))
 }

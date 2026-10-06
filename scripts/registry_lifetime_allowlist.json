@@ -72,24 +72,6 @@
       "why": "Keyed by NEXT_WRITER_ID per getWriter(); releaseLock only sets locked=false and the only remove is in #[cfg(test)]"
     },
     {
-      "file": "crates/perry-runtime/src/async_context.rs",
-      "name": "HANDLE_GENERATIONS",
-      "verdict": "open_leak",
-      "why": "Keyed by AsyncLocalStorage handle; bumped on disable() while active and never dropped by remove_store, so it grows per such ALS instance"
-    },
-    {
-      "file": "crates/perry-runtime/src/async_hooks.rs",
-      "name": "ASYNC_HOOK_HANDLES",
-      "verdict": "open_leak",
-      "why": "Set of AsyncHook handles, one per createHook(); disable() does not remove and nothing else does"
-    },
-    {
-      "file": "crates/perry-runtime/src/async_hooks.rs",
-      "name": "ASYNC_RESOURCE_HANDLES",
-      "verdict": "open_leak",
-      "why": "Set of Box::into_raw AsyncResource handles, one per new AsyncResource; documented as monotonic and never shrunk"
-    },
-    {
       "file": "crates/perry-runtime/src/buffer/header.rs",
       "name": "ASYMMETRIC_KEY_REGISTRY",
       "verdict": "open_leak",
@@ -553,6 +535,12 @@
       "name": "HIDDEN_KEYS",
       "verdict": "bounded_by_program",
       "why": "Keyed by (address, length) of the &'static [u8] hidden-field name literals passed to hidden_key; at most one entry per literal in the compiled runtime, so growth stops once each has been used once per thread. The cached key strings are rooted (marked and rewritten) by the node_stream_hidden_keys mutable root scanner."
+    },
+    {
+      "file": "crates/perry-stdlib/src/worker_threads/entry_table.rs",
+      "name": "WORKER_ENTRIES",
+      "verdict": "bounded_by_program",
+      "why": "Keyed by the absolute (and canonical) paths of the worker modules compiled into the binary, registered by the generated main before any module runs; nothing inserts at run time, so the table is fixed by the program."
     }
   ]
 }

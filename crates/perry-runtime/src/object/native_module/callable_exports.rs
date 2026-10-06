@@ -1,6 +1,12 @@
 use super::callable_export_arity_table::native_callable_export_arity;
 use super::*;
+mod buffer_constructor;
 mod buffer_species;
+pub(crate) use buffer_constructor::{
+    buffer_constructor_value, buffer_intrinsic_prototype_parent, buffer_intrinsic_prototype_value,
+    buffer_original_prototype_value, cached_buffer_intrinsic_prototype_value,
+    is_buffer_constructor_value,
+};
 mod builtin_closure_metadata;
 mod module_cjs;
 pub(crate) use builtin_closure_metadata::*;
@@ -141,6 +147,14 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
         |c: *mut crate::closure::ClosureHeader| crate::value::js_nanbox_pointer(c as i64),
     ));
 
+    // Publish the rooted constructor before resolving its children/parent.
+    // Stream.Readable forms a cycle with its constructor parent;
+    // recursive materialization must reuse this exact constructor shape.
+    NATIVE_CALLABLE_EXPORTS.with(|c| {
+        c.borrow_mut().insert(key, value.get_nanbox_u64());
+        crate::gc::runtime_write_barrier_root_nanbox(value.get_nanbox_u64());
+    });
+
     // Per-module prototype/statics decoration, routed through the attach
     // registry (see `native_module_registry::nm_attach_lookup`): each
     // module's handler is registered by its `js_nm_install_<module>()`, and
@@ -177,10 +191,6 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
 
     let value = value.get_nanbox_f64();
 
-    NATIVE_CALLABLE_EXPORTS.with(|c| {
-        c.borrow_mut().insert(key, value.to_bits());
-        crate::gc::runtime_write_barrier_root_nanbox(value.to_bits());
-    });
     value
 }
 
@@ -240,6 +250,9 @@ fn async_hooks_static_method_value(
     set_builtin_closure_length(
         closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
         length,
+    );
+    set_builtin_closure_non_constructable(
+        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
     );
     crate::value::js_nanbox_pointer(
         closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
@@ -957,156 +970,6 @@ fn attach_sqlite_session_prototype(constructor_value: f64) {
     );
 }
 
-pub(crate) fn buffer_constructor_value() -> f64 {
-    BUFFER_CONSTRUCTOR_VALUE.with(|slot| {
-        let cached = slot.get();
-        if cached != 0 {
-            return f64::from_bits(cached);
-        }
-
-        // #6924: the statics minted below are BOUND_METHOD closures that
-        // dispatch by name through the "buffer.Buffer" namespace, and that
-        // dispatch resolves via the per-module registry
-        // (`nm_dispatch_lookup`). The registry's soundness rule — a bound
-        // export exists only after its module's `js_nm_install_*` ran — is
-        // upheld by codegen for IMPORTED modules, but `Buffer` is a global:
-        // this mint runs with no `buffer` import anywhere, so nothing armed
-        // the bucket and every inherited/captured static (`MyBuf.from`,
-        // `const f = B.from`) silently returned `undefined`. Arm it at the
-        // mint, mirroring `install_native_module_vtable()` above.
-        super::super::native_module_registry::js_nm_install_buffer();
-
-        let func_ptr = crate::fn_info!(buffer_constructor_thunk, 3; with_declared(3));
-        let closure = crate::closure::js_closure_alloc(func_ptr, 0);
-        if closure.is_null() {
-            return f64::from_bits(crate::value::TAG_UNDEFINED);
-        }
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let closure = scope.root_raw_mut_ptr(closure);
-        closure.with_mut_ptr::<crate::closure::ClosureHeader, _>(|ptr| {
-            set_bound_native_closure_name(ptr, "Buffer")
-        });
-
-        for method in BUFFER_STATIC_METHODS {
-            let method_value =
-                scope.root_nanbox_f64(bound_native_callable_export_value("buffer.Buffer", method));
-            closure.with_mut_ptr(|closure: *mut crate::closure::ClosureHeader| {
-                crate::closure::closure_set_dynamic_prop(
-                    closure as usize,
-                    method,
-                    method_value.get_nanbox_f64(),
-                )
-            });
-        }
-
-        closure.with_mut_ptr(|closure: *mut crate::closure::ClosureHeader| {
-            crate::closure::closure_set_dynamic_prop(
-                closure as usize,
-                "poolSize",
-                buffer_pool_size(),
-            )
-        });
-
-        let proto = js_object_alloc(0, 0);
-        if !proto.is_null() {
-            let proto = scope.root_raw_mut_ptr(proto);
-            let constructor = "constructor";
-            let constructor_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
-                constructor.as_ptr(),
-                constructor.len() as u32,
-            ));
-            proto.with_mut_ptr(|proto: *mut ObjectHeader| {
-                constructor_key.with_mut_ptr(|constructor_key| {
-                    closure.with_mut_ptr(|closure: *mut crate::closure::ClosureHeader| {
-                        js_object_set_field_by_name(
-                            proto,
-                            constructor_key,
-                            crate::value::js_nanbox_pointer(closure as i64),
-                        )
-                    })
-                })
-            });
-            proto.with_mut_ptr(|proto: *mut ObjectHeader| {
-                super::set_builtin_property_attrs(
-                    proto as usize,
-                    constructor.to_string(),
-                    super::PropertyAttrs::new(true, false, true),
-                )
-            });
-
-            for method in BUFFER_PROTOTYPE_METHODS {
-                let method_ptr = crate::fn_info!(buffer_prototype_method_thunk, 0);
-                let method_closure = crate::closure::js_closure_alloc(method_ptr, 0);
-                if method_closure.is_null() {
-                    continue;
-                }
-                let method_closure = scope.root_raw_mut_ptr(method_closure);
-                method_closure.with_mut_ptr::<crate::closure::ClosureHeader, _>(|ptr| {
-                    set_bound_native_closure_name(ptr, method)
-                });
-                let key = scope.root_string_ptr(crate::string::js_string_from_bytes(
-                    method.as_ptr(),
-                    method.len() as u32,
-                ));
-                proto.with_mut_ptr(|proto: *mut ObjectHeader| {
-                    key.with_mut_ptr(|key| {
-                        method_closure.with_mut_ptr(
-                            |method_closure: *mut crate::closure::ClosureHeader| {
-                                js_object_set_field_by_name(
-                                    proto,
-                                    key,
-                                    crate::value::js_nanbox_pointer(method_closure as i64),
-                                )
-                            },
-                        )
-                    })
-                });
-            }
-            proto.with_mut_ptr(|proto: *mut ObjectHeader| {
-                install_buffer_prototype_getter(
-                    proto,
-                    "parent",
-                    crate::fn_info!(buffer_prototype_parent_getter_thunk, 0; with_declared(0)),
-                );
-                install_buffer_prototype_getter(
-                    proto,
-                    "offset",
-                    crate::fn_info!(buffer_prototype_offset_getter_thunk, 0; with_declared(0)),
-                );
-            });
-            let proto_value = proto.with_mut_ptr(|proto: *mut ObjectHeader| {
-                crate::value::js_nanbox_pointer(proto as i64)
-            });
-            closure.with_mut_ptr(|closure: *mut crate::closure::ClosureHeader| {
-                crate::closure::closure_set_dynamic_prop(closure as usize, "prototype", proto_value)
-            });
-            closure.with_mut_ptr(|closure: *mut crate::closure::ClosureHeader| {
-                super::set_builtin_property_attrs(
-                    closure as usize,
-                    "prototype".to_string(),
-                    super::PropertyAttrs::new(true, false, false),
-                )
-            });
-        }
-
-        let value = closure.with_mut_ptr(|closure: *mut crate::closure::ClosureHeader| {
-            crate::value::js_nanbox_pointer(closure as i64)
-        });
-        slot.set(value.to_bits());
-        // #11193: `Buffer[Symbol.species]` (FastBuffer). After the slot is
-        // set, so a re-entrant read of `Buffer` during the install sees it.
-        buffer_species::install_buffer_species(value);
-        f64::from_bits(slot.get())
-    })
-}
-
-pub(crate) fn is_buffer_constructor_value(value: f64) -> bool {
-    BUFFER_CONSTRUCTOR_VALUE.with(|slot| {
-        let cached = slot.get();
-        cached != 0 && cached == value.to_bits()
-    })
-}
-
 fn attach_crypto_key_object_shape(closure_addr: usize, constructor_value: f64) {
     let from_value = bound_native_callable_export_value("crypto.KeyObject", "from");
     crate::closure::closure_set_dynamic_prop(closure_addr, "from", from_value);
@@ -1453,7 +1316,7 @@ fn attach_tls_constructor_prototype(constructor_value: f64, constructor_name: &s
         );
         let name_string = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         let name_handle = scope.root_string_ptr(name_string);
-        crate::closure::closure_set_dynamic_prop(
+        crate::closure::closure_define_dynamic_prop(
             method_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
             "name",
             f64::from_bits(JSValue::string_ptr(name_handle.get_raw_mut_ptr()).bits()),
@@ -1573,48 +1436,6 @@ pub(crate) unsafe fn bound_native_callable_value_arity(value: f64) -> Option<u32
         ("process", "getBuiltinModule") => Some(1),
         _ => native_callable_export_arity(module, method.as_str()),
     }
-}
-
-pub(crate) fn set_bound_native_closure_name(
-    closure: *mut crate::closure::ClosureHeader,
-    name: &str,
-) {
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let closure_handle = scope.root_raw_mut_ptr(closure);
-    let ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    let name_handle = scope.root_string_ptr(ptr);
-    let name_value = f64::from_bits(JSValue::string_ptr(name_handle.get_raw_mut_ptr()).bits());
-    crate::closure::closure_set_dynamic_prop(
-        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
-        "name",
-        name_value,
-    );
-    // Spec: a function's `name` property is { writable:false, enumerable:false,
-    // configurable:true }. Storing it as a plain dynamic prop left it ENUMERABLE
-    // by default, so `for (k in Buffer)` yielded "name" — even though
-    // `getOwnPropertyDescriptor(Buffer,'name').enumerable` correctly reported
-    // false via the function-name special case. The inconsistency broke
-    // safe-buffer's `copyProps(Buffer, SafeBuffer)` (`for (k in Buffer)
-    // SafeBuffer[k] = Buffer[k]`): it copied "name" onto SafeBuffer, whose own
-    // `name` is read-only, throwing `Cannot assign to read only property 'name'`
-    // in strict mode (jsonwebtoken → Next.js). Pin the proper descriptor so
-    // enumeration matches reflection.
-    //
-    // #6809: MUST be the gate-neutral BUILTIN install. This runs during
-    // `populate_global_this_builtins` for every program that touches a
-    // builtin global (`console.log` suffices) — the user-install variant
-    // flipped `GLOBAL_DESCRIPTORS_IN_USE` process-wide at startup, which
-    // pushed EVERY subsequent dynamic property write onto the descriptor-
-    // interception slow walk (prototype-chain vetting incl. a dynamic
-    // `.constructor` read per write; measured as the dominant cost of the
-    // #6759 write micro). Reflection and enumeration read the descriptor
-    // table unconditionally, so the builtin variant preserves the
-    // safe-buffer semantics above.
-    crate::object::set_builtin_property_attrs(
-        closure_handle.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
-        "name".to_string(),
-        crate::object::PropertyAttrs::new(false, false, true),
-    );
 }
 
 pub(crate) fn builtin_closure_is_non_constructable_value(value: f64) -> bool {
@@ -1874,6 +1695,11 @@ pub(crate) unsafe fn nm_attach_async_hooks(
             "bind",
             bind.get_nanbox_f64(),
         );
+        super::set_builtin_property_attrs(
+            crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
+            "bind".to_string(),
+            super::PropertyAttrs::new(true, false, true),
+        );
         let snapshot = scope.root_nanbox_f64(async_hooks_static_method_value(
             crate::fn_info!(crate::async_hooks::js_async_local_storage_static_snapshot_method, 1; with_rest(0)),
             "snapshot",
@@ -1883,6 +1709,11 @@ pub(crate) unsafe fn nm_attach_async_hooks(
             crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
             "snapshot",
             snapshot.get_nanbox_f64(),
+        );
+        super::set_builtin_property_attrs(
+            crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
+            "snapshot".to_string(),
+            super::PropertyAttrs::new(true, false, true),
         );
     }
 
@@ -1902,66 +1733,22 @@ pub(crate) unsafe fn nm_attach_async_hooks(
             "bind",
             bind.get_nanbox_f64(),
         );
+        super::set_builtin_property_attrs(
+            crate::value::js_nanbox_get_pointer(constructor_handle.get_nanbox_f64()) as usize,
+            "bind".to_string(),
+            super::PropertyAttrs::new(true, false, true),
+        );
     }
     value = constructor_handle.get_nanbox_f64();
     value
 }
 
-#[allow(unused_mut)]
-pub(crate) unsafe fn nm_attach_events(
-    property_name: &str,
-    mut value: f64,
-    closure_addr: usize,
-) -> f64 {
-    if property_name == "EventEmitter" {
-        let async_resource_ctor =
-            bound_native_callable_export_value("events", "EventEmitterAsyncResource");
-        for method in [
-            "addAbortListener",
-            "once",
-            "on",
-            "getEventListeners",
-            "getMaxListeners",
-            "listenerCount",
-            "setMaxListeners",
-        ] {
-            let method_value = bound_native_callable_export_value("events", method);
-            crate::closure::closure_set_dynamic_prop(closure_addr, method, method_value);
-        }
-        crate::closure::closure_set_dynamic_prop(closure_addr, "EventEmitter", value);
-        crate::closure::closure_set_dynamic_prop(
-            closure_addr,
-            "EventEmitterAsyncResource",
-            async_resource_ctor,
-        );
-        crate::closure::closure_set_dynamic_prop(closure_addr, "defaultMaxListeners", 10.0);
-        crate::closure::closure_set_dynamic_prop(
-            closure_addr,
-            "usingDomains",
-            f64::from_bits(JSValue::bool(false).bits()),
-        );
-        crate::closure::closure_set_dynamic_prop(
-            closure_addr,
-            "captureRejections",
-            f64::from_bits(JSValue::bool(false).bits()),
-        );
-        crate::closure::closure_set_dynamic_prop(closure_addr, "captureRejectionSymbol", {
-            let name = "nodejs.rejection";
-            let ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-            unsafe { crate::symbol::js_symbol_for(f64::from_bits(JSValue::string_ptr(ptr).bits())) }
-        });
-        crate::closure::closure_set_dynamic_prop(closure_addr, "errorMonitor", {
-            let name = "events.errorMonitor";
-            let ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-            unsafe { crate::symbol::js_symbol_for(f64::from_bits(JSValue::string_ptr(ptr).bits())) }
-        });
-        crate::closure::closure_set_dynamic_prop(
-            closure_addr,
-            "init",
-            bound_native_callable_export_value("events", "init"),
-        );
+pub(crate) unsafe fn nm_attach_events(name: &str, value: f64, _addr: usize) -> f64 {
+    if name == "EventEmitter" {
+        super::constructor_shapes::install_event_emitter_statics(value)
+    } else {
+        value
     }
-    value
 }
 
 #[allow(unused_mut)]

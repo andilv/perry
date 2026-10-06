@@ -83,6 +83,26 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get(
     idx_d: &str,
     coerce_slow_to_number: bool,
 ) -> String {
+    lower_inline_dyn_typed_array_get_with_byte_view_param(
+        ctx,
+        obj_box,
+        idx_d,
+        coerce_slow_to_number,
+        None,
+    )
+}
+
+pub(in crate::expr) fn lower_inline_dyn_typed_array_get_with_byte_view_param(
+    ctx: &mut FnCtx<'_>,
+    obj_box: &str,
+    idx_d: &str,
+    coerce_slow_to_number: bool,
+    param_access: Option<&crate::collectors::ByteViewParamAccess>,
+) -> String {
+    if let Some(access) = param_access {
+        return lower_resolved_byte_param_get(ctx, obj_box, idx_d, coerce_slow_to_number, access);
+    }
+
     // TAG_MASK / POINTER_TAG / POINTER_MASK as signed-i64 LLVM literals.
     let tag_mask = crate::nanbox::i64_literal(crate::nanbox::TAG_MASK);
     let pointer_tag = crate::nanbox::POINTER_TAG_I64;
@@ -101,9 +121,11 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get(
     let slot_ref = format!("@{cache_name}");
 
     let u8_brand_idx = ctx.new_block("arrlike.u8.brand");
+    let u8_view_idx = ctx.new_block("arrlike.u8.view");
     let u8_bounds_idx = ctx.new_block("arrlike.u8.bounds");
     let u8_load_idx = ctx.new_block("arrlike.u8.load");
     let u8_brand_label = ctx.block_label(u8_brand_idx);
+    let u8_view_label = ctx.block_label(u8_view_idx);
     let u8_bounds_label = ctx.block_label(u8_bounds_idx);
     let u8_load_label = ctx.block_label(u8_load_idx);
     let object_header_idx = ctx.new_block("arrlike.ic.header");
@@ -576,8 +598,8 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get(
     // receiver. Untyped `b[i]` over a Buffer used to leave through the exit
     // and the typed-array + buffer registry probes on every element. The
     // cache is primed by the runtime byte accessors on a miss, and anything
-    // it does not hold (views, ArrayBuffers, DataViews, foreign spans, an
-    // out-of-range index) still leaves through the exit.
+    // it does not hold is offered to the pointer-backed byte-view miss arm.
+    // ArrayBuffers, DataViews, foreign spans and out-of-range indices exit.
     ctx.current_block = u8_brand_idx;
     {
         let blk = ctx.block();
@@ -594,8 +616,35 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get(
         let is_buffer = blk.or(I1, &is_node_buffer, &is_uint8array);
         let admitted = crate::expr::u8_buffer_read::emit_u8_cache_holds(blk, &object_raw);
         let hit = blk.and(I1, &is_buffer, &admitted);
-        blk.cond_br(&hit, &u8_bounds_label, &object_miss_label);
+        blk.cond_br(&hit, &u8_bounds_label, &u8_view_label);
     }
+    // A live view has a native pointer at +8, never inline byte storage.
+    ctx.current_block = u8_view_idx;
+    let view_data = crate::expr::u8_buffer_read::emit_u8_view_param_or_guard(
+        ctx,
+        obj_box,
+        &object_raw,
+        &object_miss_label,
+        param_access,
+    );
+    let view_load_idx = ctx.new_block("arrlike.u8.view_load");
+    let view_load_label = ctx.block_label(view_load_idx);
+    let len_ptr = ctx.block().inttoptr(I64, &object_raw);
+    let view_len = ctx.block().load(I32, &len_ptr);
+    let view_len = ctx.block().zext(I32, &view_len, I64);
+    let view_in_bounds = ctx.block().icmp_ult(I64, &object_idx_i64, &view_len);
+    ctx.block()
+        .cond_br(&view_in_bounds, &view_load_label, &object_miss_label);
+    ctx.current_block = view_load_idx;
+    let view_addr = ctx.block().add(I64, &view_data, &object_idx_i64);
+    let view_ptr = ctx.block().inttoptr(I64, &view_addr);
+    // A view can alias a SAB shared with another agent. Atomic byte loads
+    // prevent LLVM from hoisting or merging reads of concurrently changed data.
+    let target = ctx.target_triple.to_owned();
+    let view_value =
+        super::super::u8_buffer_read::emit_u8_atomic_load_f64(ctx.block(), &target, &view_ptr);
+    let view_end_label = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
     ctx.current_block = u8_bounds_idx;
     {
         let blk = ctx.block();
@@ -736,7 +785,79 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get(
             (array_value.as_str(), array_end_label.as_str()),
             (elem_value.as_str(), elem_end_label.as_str()),
             (u8_value.as_str(), u8_end_label.as_str()),
+            (view_value.as_str(), view_end_label.as_str()),
             (slow_val.as_str(), slow_end_label.as_str()),
         ],
     )
+}
+
+/// An entry-proved byte parameter needs only canonical-index and current
+/// bounds checks. Keep other receiver types on their existing dispatch path.
+fn lower_resolved_byte_param_get(
+    ctx: &mut FnCtx<'_>,
+    obj_box: &str,
+    idx_d: &str,
+    coerce_slow_to_number: bool,
+    access: &crate::collectors::ByteViewParamAccess,
+) -> String {
+    let index_idx = ctx.new_block("u8p.index");
+    let bounds_idx = ctx.new_block("u8p.bounds");
+    let load_idx = ctx.new_block("u8p.load");
+    let slow_idx = ctx.new_block("u8p.slow");
+    let done_idx = ctx.new_block("u8p.done");
+    let index_label = ctx.block_label(index_idx);
+    let bounds_label = ctx.block_label(bounds_idx);
+    let load_label = ctx.block_label(load_idx);
+    let slow_label = ctx.block_label(slow_idx);
+    let done_label = ctx.block_label(done_idx);
+    let ge0 = ctx.block().fcmp("oge", idx_d, "0.0");
+    let lt_max = ctx.block().fcmp("olt", idx_d, "4294967295.0");
+    let range = ctx.block().and(I1, &ge0, &lt_max);
+    let ready = ctx.block().and(I1, &access.valid_i1, &range);
+    ctx.block().cond_br(&ready, &index_label, &slow_label);
+
+    ctx.current_block = index_idx;
+    let index = ctx.block().fptosi(DOUBLE, idx_d, I64);
+    let back = ctx.block().sitofp(I64, &index, DOUBLE);
+    let integer = ctx.block().fcmp("oeq", idx_d, &back);
+    ctx.block().cond_br(&integer, &bounds_label, &slow_label);
+
+    ctx.current_block = bounds_idx;
+    let bits = ctx.block().bitcast_double_to_i64(obj_box);
+    let raw = ctx.block().and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
+    let header = ctx.block().inttoptr(I64, &raw);
+    let length = ctx.block().load(I32, &header);
+    let length = ctx.block().zext(I32, &length, I64);
+    let in_bounds = ctx.block().icmp_ult(I64, &index, &length);
+    ctx.block().cond_br(&in_bounds, &load_label, &slow_label);
+
+    ctx.current_block = load_idx;
+    let address = ctx.block().add(I64, &access.data_i64, &index);
+    let pointer = ctx.block().inttoptr(I64, &address);
+    let target = ctx.target_triple.to_owned();
+    let value =
+        super::super::u8_buffer_read::emit_u8_atomic_load_f64(ctx.block(), &target, &pointer);
+    let load_end = ctx.block().label.clone();
+    ctx.block().br(&done_label);
+
+    // An invalid annotation, noncanonical key or out-of-range access keeps
+    // the complete boxed semantics, including property-key coercion.
+    ctx.current_block = slow_idx;
+    let handle = super::super::helpers::unbox_to_i64(ctx.block(), obj_box);
+    let fallback = ctx.block().call(
+        DOUBLE,
+        "js_typed_array_index_get_dynamic",
+        &[(I64, &handle), (DOUBLE, idx_d)],
+    );
+    let fallback = if coerce_slow_to_number {
+        ctx.block()
+            .call(DOUBLE, "js_number_coerce", &[(DOUBLE, &fallback)])
+    } else {
+        fallback
+    };
+    let slow_end = ctx.block().label.clone();
+    ctx.block().br(&done_label);
+    ctx.current_block = done_idx;
+    ctx.block()
+        .phi(DOUBLE, &[(&value, &load_end), (&fallback, &slow_end)])
 }

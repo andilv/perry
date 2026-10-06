@@ -595,6 +595,8 @@ pub(crate) struct Arena {
     pub(crate) current: usize,
     pub(crate) generation: HeapGeneration,
     pub(crate) space: HeapSpace,
+    pub(crate) allocated_bytes: usize,
+    pub(crate) large_allocated_bytes: usize,
 }
 
 impl Drop for Arena {
@@ -625,6 +627,9 @@ impl Drop for Arena {
             if block.data.is_null() {
                 continue;
             }
+            super::walk::for_each_block_header(block, |header| unsafe {
+                crate::buffer::drop_owned_backing_at_thread_exit(header);
+            });
             super::map_allocations::walk_block_maps(block, &mut |header| unsafe {
                 if (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0 {
                     crate::map::drop_map_store_at_thread_exit(
@@ -653,6 +658,16 @@ impl Drop for Arena {
 }
 
 impl Arena {
+    /// Monotonic mutator/collector allocation counters. Resetting or moving
+    /// blocks never resets these; the pacer subtracts collector deltas per step.
+    #[inline(always)]
+    pub(crate) fn note_allocation(&mut self, bytes: usize, large: bool) {
+        self.allocated_bytes = self.allocated_bytes.saturating_add(bytes);
+        if large {
+            self.large_allocated_bytes = self.large_allocated_bytes.saturating_add(bytes);
+        }
+    }
+
     fn new(generation: HeapGeneration, space: HeapSpace) -> Self {
         let initial = ArenaBlock::new();
         register_block_space_with_object_starts(
@@ -668,6 +683,8 @@ impl Arena {
             current: 0,
             generation,
             space,
+            allocated_bytes: 0,
+            large_allocated_bytes: 0,
         }
     }
 
@@ -717,6 +734,8 @@ impl Arena {
             current: 0,
             generation,
             space,
+            allocated_bytes: 0,
+            large_allocated_bytes: 0,
         }
     }
 
@@ -728,6 +747,7 @@ impl Arena {
     fn try_block_alloc(&mut self, idx: usize, size: usize, align: usize) -> Option<*mut u8> {
         let before = self.blocks[idx].offset;
         let ptr = self.blocks[idx].alloc(size, align)?;
+        self.note_allocation(self.blocks[idx].offset - before, size >= 16 * 1024);
         if self.generation == HeapGeneration::Old {
             old_gen_in_use_bytes_add(self.blocks[idx].offset - before);
         }
@@ -745,6 +765,7 @@ impl Arena {
     ) -> Option<*mut u8> {
         let before = self.blocks[idx].offset;
         let ptr = self.blocks[idx].alloc_excluding_pages(size, align, excluded_pages)?;
+        self.note_allocation(self.blocks[idx].offset - before, size >= 16 * 1024);
         if self.generation == HeapGeneration::Old {
             old_gen_in_use_bytes_add(self.blocks[idx].offset - before);
         }
@@ -1236,6 +1257,8 @@ thread_local! {
         data: std::ptr::null_mut(),
         offset: 0,
         size: 0,
+        birth_flags: std::ptr::null(),
+        birth_seeds: std::ptr::null_mut(),
     }) };
 }
 

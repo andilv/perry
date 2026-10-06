@@ -59,7 +59,7 @@ pub use alloc::{
     js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent,
     js_object_alloc_null_proto, js_object_alloc_with_parent, js_object_coerce,
 };
-pub(crate) use alloc_basic::{object_alloc_born, object_alloc_plain};
+pub(crate) use alloc_basic::{object_alloc_born, object_alloc_filled_birth, object_alloc_plain};
 #[allow(unused_imports)]
 pub(crate) use alloc_plain::mark_object_plain_ordinary;
 pub use assign::*;
@@ -89,6 +89,7 @@ mod class_super_chain;
 pub(crate) mod class_value;
 #[cfg(test)]
 mod zeroed_cache_tests;
+pub use class_registry::async_local_storage_prototype_value;
 pub(crate) use class_registry::async_resource_prototype_value;
 pub(crate) use class_registry::class_registry_census;
 #[cfg(feature = "regex-engine")]
@@ -110,6 +111,7 @@ mod collection_proto_thunks;
 mod data_view_registry;
 mod dataview_proto_thunks;
 pub(crate) mod date_proto_thunks;
+pub(crate) mod delete_last_key;
 mod delete_rest;
 pub(crate) mod descriptors;
 pub(crate) mod dictionary;
@@ -205,12 +207,13 @@ mod native_module_crypto_random;
 mod native_module_dispatch;
 mod native_module_registry;
 pub(crate) use native_module_registry::js_nm_enable_install_all;
+pub(crate) use native_module_registry::nm_attach_lookup;
 pub(crate) use native_module_registry::nm_ctor_lookup;
 // Re-exported for submodule installers that delegate to a native module
 // (`fs/promises` → `fs.constants`, `sys` → `util`).
 pub(crate) use native_module_registry::{
     js_install_global_value_surfaces, js_nm_install_events, js_nm_install_fs, js_nm_install_module,
-    js_nm_install_perf, js_nm_install_util,
+    js_nm_install_perf, js_nm_install_readline, js_nm_install_util,
 };
 mod literal_constructor;
 mod native_module_stream;
@@ -1343,8 +1346,7 @@ fn transition_cache_insert(
     if next_keys == 0 {
         return;
     }
-    // Generated transition hits store without the owner layout note. They
-    // must not learn an edge from a numeric-proof predecessor.
+    // Generated hits skip the layout note: never learn from a numeric proof.
     if shapes::shape_object_kind_by_id(prev_shape_id)
         == Some(shapes::ShapeObjectKind::OrdinaryNumericProof)
     {
@@ -1369,8 +1371,7 @@ fn transition_cache_insert(
             }
         }
     }
-    // #9754 rule 1: log the slot BEFORE the entry is published when either
-    // address can matter to a minor.
+    // #9754: log BEFORE publishing if either address can matter to a minor.
     arm_transition_cache_young(slot, next_keys, kid, len_marker);
     with_transition_cache(|t| unsafe {
         // GC_STORE_AUDIT(ROOT): TRANSITION_CACHE_GLOBAL entries are scanned by scan_transition_cache_roots_mut.
@@ -1395,6 +1396,7 @@ fn transition_cache_insert(
         entry.target_len = target_len;
     });
     if target_len != 0 {
+        shapes::note_last_key_parent(target_shape_id, prev_shape_id);
         shape_carriers::note_shape_id(target_shape_id);
     }
     if !array_tail_owner.is_null() {
@@ -1407,10 +1409,8 @@ fn transition_cache_insert(
             slot_idx,
         );
     }
-    // Small dynamic shapes are stabilized eagerly because otherwise
-    // the original builder can grow the cached target in place and
-    // force future lookups to reject it. Large one-off dictionaries
-    // stay lazy to avoid cloning every growing prefix.
+    // Eagerly stabilize small shapes so growth cannot invalidate a cached
+    // target. Large one-off dictionaries stay lazy to avoid prefix copies.
 }
 
 /// GC root scanner: mark all JSValues stored in OVERFLOW_FIELDS.
@@ -1718,8 +1718,6 @@ pub struct ObjectHeader {
     pub meta: *mut ObjectMeta,
 }
 
-// `ObjectKeys` lives in `object_keys.rs`.
-
 /// Return the receiver's ordered keys, derived from its authoritative ShapeId
 /// descriptor: the keys array and the shape's key count. #8047 removed the
 /// per-object header mirror; this is the sole runtime spelling for consumers
@@ -1729,21 +1727,20 @@ pub(crate) unsafe fn object_keys(obj: *const ObjectHeader) -> ObjectKeys {
     object_keys_and_live_slot_count(obj).0
 }
 
-/// [`object_keys`] and [`object_live_slot_count`] together, from ONE shape
-/// table probe. A walk that needs both — `JSON.stringify` visits every object
-/// this way — otherwise pays the probe twice (#10696).
+/// Receiver keys and inline bound, read from one borrowed shape record.
+/// Dictionary shapes delegate the key list to their receiver.
 #[inline]
 pub(crate) unsafe fn object_keys_and_live_slot_count(
     obj: *const ObjectHeader,
 ) -> (ObjectKeys, u32) {
-    let Some(descriptor) = shapes::object_shape_descriptor(obj) else {
+    let Some(record) = shapes::object_shape_record(obj) else {
         return (ObjectKeys::NONE, 0);
     };
-    let live_slots = descriptor.live_inline_slot_count;
-    if descriptor.keys != 0 {
+    let live_slots = record.live_inline_slot_count();
+    if record.keys() != 0 {
         let keys = ObjectKeys::new(
-            descriptor.keys as usize as *mut ArrayHeader,
-            descriptor.logical_key_count,
+            record.keys() as usize as *mut ArrayHeader,
+            record.logical_key_count(),
         );
         return (keys, live_slots);
     }
@@ -1767,13 +1764,13 @@ pub(crate) unsafe fn object_keys_and_live_slot_count(
 pub(crate) unsafe fn object_keys_and_live_slots(
     obj: *const ObjectHeader,
 ) -> Option<(ObjectKeys, u32)> {
-    shapes::object_shape_descriptor(obj).map(|descriptor| {
+    shapes::object_shape_record(obj).map(|record| {
         (
             ObjectKeys::new(
-                descriptor.keys as usize as *mut ArrayHeader,
-                descriptor.logical_key_count,
+                record.keys() as usize as *mut ArrayHeader,
+                record.logical_key_count(),
             ),
-            descriptor.live_inline_slot_count,
+            record.live_inline_slot_count(),
         )
     })
 }

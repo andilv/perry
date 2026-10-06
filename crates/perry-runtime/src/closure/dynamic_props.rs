@@ -58,7 +58,12 @@ pub fn closure_mark_key_deleted(ptr: usize, key: &str) {
     if ptr == 0 || !is_closure_ptr(ptr) {
         return;
     }
-    unsafe { super::props::state_mark_deleted(ptr, key) };
+    unsafe {
+        super::props::state_mark_deleted(ptr, key);
+        // Recording the intrinsic deletion may have materialized its bag.
+        // The bag must reflect the deletion before any own-value reader runs.
+        super::props::bag_remove(ptr, key);
+    };
     super::shape::note_function_own_state_changed(ptr);
 }
 
@@ -419,6 +424,15 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
             return unsafe { crate::closure::bound_function_lazy_name(ptr) };
         }
     }
+    // An unmaterialized intrinsic name is still an OWN data property.
+    // Resolve its birth value before any inherited property lookup; once a
+    // bag key exists, its value (including undefined) already won above.
+    if prop == "name" && crate::object::has_own_helpers::closure_own_key_present(ptr, prop) {
+        let code = unsafe { (*(ptr as *const ClosureHeader)).code() } as usize;
+        let name = crate::builtins::function_name_for_ptr(code).unwrap_or_default();
+        let name = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        return crate::value::js_nanbox_string(name as i64);
+    }
     // #36 / #321: own prop miss — walk the closure's static prototype chain
     // (`Object.setPrototypeOf(closure, protoObj)`). Reads a string-keyed field
     // off the proto object. Lets effect's `TagClass._op` resolve to "Tag" on
@@ -513,8 +527,8 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
     // more, so the read continues on the prototype — `Function.prototype`
     // itself has own `name` ("") and `length` (0).
     if matches!(prop, "name" | "length") && !on_base && closure_is_key_deleted(ptr, prop) {
-        let proto = super::shape::FUNCTION_PROTOTYPE_PTR.load(std::sync::atomic::Ordering::Acquire);
-        if proto != 0 && proto as usize != ptr {
+        let proto = super::shape::function_prototype_ptr_materialized();
+        if proto != 0 && proto != ptr {
             let key_hdr = crate::string::js_string_from_bytes(prop.as_ptr(), prop.len() as u32);
             let v = crate::object::js_object_get_field_by_name(
                 proto as *const crate::object::ObjectHeader,
@@ -594,16 +608,14 @@ pub(crate) fn function_prototype_fallback_target(ptr: usize, prop: &str) -> Opti
     if matches!(
         prop,
         "prototype" | "name" | "length" | "caller" | "arguments" | "constructor"
-        // Universal Object.prototype method names: every receiver (closures
-        // included) resolves these through a dedicated native dispatch arm,
-        // not a literal field on the walked prototype object. Serving a
-        // generic-lookup result for one of these hijacks that dispatch —
-        // e.g. `m.propertyIsEnumerable` resolved a same-named-but-wrong
-        // value via this fallback, so `m.propertyIsEnumerable("length")`
-        // called the wrong thing (test262 S15.2.4.3_A8 / S15.2.4.4_A8 /
-        // S15.2.4.7_A8 regressions caught after the initial fix).
-        | "toString" | "valueOf" | "hasOwnProperty" | "isPrototypeOf"
-        | "propertyIsEnumerable" | "toLocaleString"
+        // Universal Object.prototype method names resolved through a
+        // dedicated native dispatch arm, not a literal field on the walked
+        // prototype object. Serving a generic-lookup result for one of these
+        // hijacked that dispatch with a same-named-but-wrong value (test262
+        // S15.2.4.3_A8 / S15.2.4.4_A8 / S15.2.4.7_A8). `hasOwnProperty` and
+        // `propertyIsEnumerable` are not listed: %Function.prototype% carries
+        // the real methods for them, so a read returns the method.
+        | "toString" | "valueOf" | "isPrototypeOf" | "toLocaleString"
     ) || crate::object::reified_function_method_name(prop).is_some()
     {
         return None;
@@ -650,27 +662,48 @@ pub(crate) fn closure_set_via_function_prototype_descriptor(
     value: f64,
     receiver: f64,
 ) -> bool {
+    // Constructor inheritance is stored on the closure's actual prototype.
+    // A writable own data property shadows descriptors further up the chain.
+    let mut cur = ptr;
+    for _ in 0..128 {
+        let Some(bits) = closure_static_prototype(cur) else {
+            break;
+        };
+        let next = crate::value::js_nanbox_get_pointer(f64::from_bits(bits)) as usize;
+        if next == 0 || next == cur {
+            break;
+        }
+        if let Some(handled) = set_via_own_descriptor(next, prop, value, receiver) {
+            return handled;
+        }
+        if !is_closure_ptr(next) {
+            return false;
+        }
+        cur = next;
+    }
     let Some(proto_ptr) = function_prototype_fallback_target(ptr, prop) else {
         return false;
     };
-    if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
+    set_via_own_descriptor(proto_ptr, prop, value, receiver).unwrap_or(false)
+}
+
+fn set_via_own_descriptor(ptr: usize, prop: &str, value: f64, receiver: f64) -> Option<bool> {
+    if let Some(acc) = crate::object::get_accessor_descriptor(ptr, prop) {
         if acc.set == 0 {
-            // Getter-only: matches `al_set_length`'s getter-only `length` throw
-            // (array/generic.rs) — a strict-mode write to an accessor with no
-            // setter is a TypeError, not a silent no-op.
             crate::collection_iter::throw_type_error(&format!(
                 "Cannot set property {prop} of #<Function> which has only a getter"
             ));
         }
         unsafe { crate::object::invoke_accessor_setter(acc.set, receiver, value) };
-        return true;
+        return Some(true);
     }
-    if let Some(attrs) = crate::object::get_property_attrs(proto_ptr, prop) {
-        if !attrs.writable() {
-            return true;
-        }
+    if let Some(attrs) = crate::object::get_property_attrs(ptr, prop) {
+        return Some(!attrs.writable());
     }
-    false
+    if is_closure_ptr(ptr) && closure_has_own_dynamic_prop(ptr, prop) {
+        return Some(false);
+    }
+    None
 }
 
 /// Set a dynamic property on a closure (an own data property in its bag).
@@ -683,6 +716,63 @@ pub fn closure_set_dynamic_prop(ptr: usize, prop: &str, value: f64) {
     // #3655: re-defining a previously deleted slot makes it present again.
     unsafe { super::props::state_clear_deleted(ptr, prop) };
     super::shape::refresh_closure_shape(ptr);
+}
+
+/// Define an own data value, preserving its current attributes. The caller
+/// has validated the descriptor; a configurable read-only key can be replaced.
+pub fn closure_define_dynamic_prop(ptr: usize, prop: &str, value: f64) {
+    if !is_closure_ptr(ptr) {
+        return;
+    }
+    unsafe {
+        super::props::bag_define_value(ptr, prop, value);
+        super::props::state_clear_deleted(ptr, prop);
+    }
+    super::shape::refresh_closure_shape(ptr);
+}
+
+/// Define an own data property with its value and attributes in one step
+/// (`props::bag_define_data_with_attrs`): the builtin-install form of a
+/// validated [[DefineOwnProperty]]. One shape refresh.
+pub(crate) fn closure_define_data_with_attrs(
+    ptr: usize,
+    prop: &str,
+    value: f64,
+    attrs: crate::object::PropertyAttrs,
+) {
+    if !is_closure_ptr(ptr) {
+        return;
+    }
+    crate::object::prop_plan::prop_plan_epoch_bump_for_owner(ptr);
+    unsafe {
+        super::props::bag_define_data_with_attrs(ptr, prop, value, attrs.bits);
+        super::props::state_clear_deleted(ptr, prop);
+    }
+    super::shape::refresh_closure_shape(ptr);
+}
+
+/// A function's first own data properties, defined at once: its bag is born
+/// holding `entries` in one shape (`props::bag_born_with`). False, with
+/// nothing done, when the function already has own properties; the caller
+/// then sets them one at a time ([`closure_set_dynamic_prop`]).
+pub fn closure_define_first_props(ptr: usize, entries: &[(&str, f64)]) -> bool {
+    closure_define_first_props_with_attrs(ptr, entries, &[])
+}
+
+/// Birth the function bag with the final attributes as well as its values.
+pub(crate) fn closure_define_first_props_with_attrs(
+    ptr: usize,
+    entries: &[(&str, f64)],
+    attrs: &[u8],
+) -> bool {
+    if ptr == 0 || !is_closure_ptr(ptr) {
+        return false;
+    }
+    if !unsafe { super::props::bag_born_with_attrs(ptr, entries, attrs) } {
+        return false;
+    }
+    super::shape::refresh_closure_shape(ptr);
+    true
 }
 
 /// Read an OWN dynamic property without any prototype/builtin fallback.

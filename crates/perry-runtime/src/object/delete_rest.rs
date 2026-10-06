@@ -34,6 +34,19 @@ pub extern "C" fn js_object_delete_field(
     if obj.is_null() || key.is_null() {
         return 1;
     }
+    if !key.is_null() {
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                crate::string::string_data(key),
+                (*key).byte_len as usize,
+            );
+            let owner = (obj as u64 & crate::value::POINTER_MASK) as usize;
+            crate::typedarray_named::note_named_mutation(owner, bytes);
+        }
+    }
+    if let Some(result) = unsafe { super::delete_last_key::try_delete_last_added_field(obj, key) } {
+        return result;
+    }
     if let Some(result) = crate::process::process_env_delete_field(obj, key) {
         return result;
     }
@@ -147,6 +160,7 @@ pub extern "C" fn js_object_delete_field(
             let gc_header =
                 (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
             if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
+                let obj = super::array_object_ops::array_header(obj) as *mut ObjectHeader;
                 if let Some(name) = super::has_own_helpers::str_from_string_header(key) {
                     // An Array's `length` is a non-configurable exotic own
                     // property with no descriptor-table entry, so the
@@ -316,11 +330,18 @@ pub extern "C" fn js_object_delete_field(
                         // evaluation's prototype (`ClassExprFresh`) owns its
                         // members alone: the template's records belong to
                         // every evaluation, so they stay.
-                        if !super::field_get_set::is_evaluation_prototype_with_methods(obj, cid) {
+                        if super::field_get_set::class_evaluation_prototype_class_id(obj as usize)
+                            .is_none()
+                        {
                             super::class_registry::class_prototype_method_root_remove(cid, name);
-                            super::class_registry::invalidate_class_string_member_order(
-                                cid, name, false,
-                            );
+                            // The shared class may itself be the first
+                            // evaluation (#11759 c′). Its live key is deleted,
+                            // but later evaluations still start from ClassBody.
+                            if !super::class_value::class_value_is_first_evaluation(cid) {
+                                super::class_registry::invalidate_class_string_member_order(
+                                    cid, name, false,
+                                );
+                            }
                         }
                         super::class_registry::invalidate_class_prototype_fast_guards_for_method(
                             name,
@@ -379,6 +400,10 @@ pub extern "C" fn js_object_delete_field(
             }
         }
 
+        // The last-added key: back to the shape without it (V8's rollback).
+        if i + 1 == key_count && super::delete_last_key::rollback(obj, i as u32) {
+            return 1;
+        }
         // Proper delete: shift remaining keys + values down by one, then
         // shorten keys_array. Pre-fix this just set the value to
         // undefined and left the key in place, so `Object.keys`,
@@ -810,7 +835,9 @@ fn class_delete_own_key(class_id: u32, name: &str) -> i32 {
     }
     super::class_registry::class_delete_own_dynamic_prop(class_id, name);
     crate::object::class_value::note_static_key_deleted(class_id, name);
-    super::class_registry::invalidate_class_string_member_order(class_id, name, true);
+    if !super::class_value::class_value_is_first_evaluation(class_id) {
+        super::class_registry::invalidate_class_string_member_order(class_id, name, true);
+    }
     1
 }
 
@@ -1094,6 +1121,10 @@ unsafe fn try_delete_stable_sso(obj: *mut ObjectHeader, key: JSValue) -> Option<
 /// Returns 1 if successful, 0 otherwise
 #[no_mangle]
 pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> i32 {
+    if let Some(result) = unsafe { super::delete_last_key::try_delete_last_added_dynamic(obj, key) }
+    {
+        return result;
+    }
     if let Some((_, elements)) = unsafe { crate::array::subclass_elements::backed(obj as usize) } {
         if let Some(elements_key) = crate::array::subclass_elements::key_of_value(key) {
             return unsafe { crate::array::subclass_elements::delete_key(elements, elements_key) };

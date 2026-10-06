@@ -212,16 +212,21 @@ unsafe fn default_object_prototype_property_value(
     // The address cache deliberately avoids constructing globalThis on array
     // index-write hot paths. A real inherited Get/HasProperty miss cannot use
     // that shortcut: an unmaterialized Object.prototype still has its methods.
-    // Bootstrap may allocate and collect, so keep both inputs rooted until the
-    // intrinsic address has been resolved. The existing hot path stays intact
-    // once this thread has a realm global.
+    // It needs %Object.prototype% and nothing else, and that intrinsic is built
+    // on its own (`ensure_object_intrinsics`), complete, and later adopted by
+    // the realm global. Building the whole realm global here instead (several
+    // hundred builtins, ~35M instructions and ~9 MB) made the first
+    // `o.hasOwnProperty(k)` or `o.toString()` of a program pay for every
+    // builtin it never names. Bootstrap may allocate, so keep both inputs
+    // rooted until the intrinsic address has been resolved. The existing hot
+    // path stays intact once this thread has a realm global.
     if !super::super::global_this_is_materialized() {
         let scope = crate::gc::RuntimeHandleScope::new();
         let receiver_h =
             scope.root_nanbox_f64(crate::value::js_nanbox_pointer(receiver_addr as i64));
         let key_h = scope.root_nanbox_f64(crate::value::nanbox_string_key(key));
-        super::super::js_get_global_this();
-        let proto_addr = crate::array::object_prototype_addr();
+        let (_, proto) = crate::object::ensure_object_intrinsics();
+        let proto_addr = proto as usize;
         if proto_addr == 0 {
             return None;
         }
@@ -316,7 +321,11 @@ pub(crate) unsafe fn ordinary_object_prototype_property_value(
     // class whose `prototype` was `setPrototypeOf(..., null)`, or one pointed
     // at an `Object.create(null)` — reached `Object.prototype` anyway and
     // answered `toString` from it while `"toString" in o` said false.
-    if super::super::prototype_chain::prototype_chain_ends_in_explicit_null(obj as usize) {
+    // Object.prototype's own terminal null edge must not hide its properties
+    // from receivers whose chain reaches it.
+    if super::super::prototype_chain::prototype_chain_ends_in_null_before_object_prototype(
+        obj as usize,
+    ) {
         return None;
     }
     if super::super::prototype_chain::object_static_prototype(obj as usize).is_some() {

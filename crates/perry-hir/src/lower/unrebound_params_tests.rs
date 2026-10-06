@@ -233,3 +233,146 @@ fn shadowing_or_unrelated_names_do_not_matter() {
         function(&m, "f").body
     );
 }
+
+#[test]
+fn arguments_mentions_invalidate_every_parameter_not_just_index_zero() {
+    let m = lower(
+        "function direct(a, b, c) { const args = arguments; a.x += 1; b.x += 1; c.x += 1; }\n\
+         function arrows(a, b, c) { const g = () => () => arguments; a.x += 1; b.x += 1; c.x += 1; }\n\
+         function strict(a, b, c) { \"use strict\"; const args = arguments; a.x += 1; b.x += 1; c.x += 1; }\n\
+         module.exports = { direct, arrows, strict };\n",
+        "arguments_all_params.cts",
+    );
+    for name in ["direct", "arrows", "strict"] {
+        let f = function(&m, name);
+        assert_eq!(temps(&f.body, "base").len(), 3, "{name}");
+        let objects = written_objects(&f.body);
+        for param in f.params.iter().filter(|p| p.arguments_object.is_none()) {
+            assert!(
+                !objects
+                    .iter()
+                    .any(|o| matches!(o, Expr::LocalGet(id) if *id == param.id)),
+                "{name}: {} needs a receiver snapshot",
+                param.name
+            );
+        }
+    }
+}
+
+#[test]
+fn object_methods_use_their_own_arguments_mapping_rules() {
+    let m = lower(
+        r#"const o = {
+            mapped(a, b) { (() => { arguments[0] = b; })(); return a; },
+            strict(a) { "use strict"; return arguments; },
+            defaulted(a = arguments[0]) { return a; },
+            rest(a, ...r) { return arguments; },
+            destructured({a}) { return arguments; }
+        };"#,
+        "object_method_arguments.cts",
+    );
+    for (name, strict, simple) in [
+        ("mapped", false, true),
+        ("strict", true, true),
+        ("defaulted", false, false),
+        ("rest", false, false),
+        ("destructured", false, false),
+    ] {
+        let f = m
+            .functions
+            .iter()
+            .find(|f| f.name.starts_with(&format!("__obj_method_{name}_")))
+            .unwrap_or_else(|| panic!("missing method {name}"));
+        assert_eq!(f.is_strict, strict, "{name}");
+        let meta = f
+            .params
+            .iter()
+            .find_map(|p| p.arguments_object.as_ref())
+            .unwrap_or_else(|| panic!("{name} needs its own arguments binding"));
+        assert_eq!(meta.strict, strict, "{name}");
+        assert_eq!(meta.simple_parameters, simple, "{name}");
+        assert_eq!(meta.restricted_callee, strict || !simple, "{name}");
+        if name == "mapped" {
+            let mut mapped = meta.mapped_parameter_ids.clone();
+            mapped.sort_unstable();
+            assert_eq!(mapped, vec![(0, f.params[0].id), (1, f.params[1].id)]);
+        } else {
+            assert!(meta.mapped_parameter_ids.is_empty(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn function_constructor_arguments_do_not_inherit_source_strictness() {
+    let m = lower(
+        r#"function enclosingStrict() {
+            "use strict";
+            const loose = new Function("a", "arguments[0] = 7; return a;");
+            const strict = new Function("a", '"use strict"; arguments[0] = 7; return a;');
+            return [loose, strict];
+        }"#,
+        "function_constructor_arguments.ts",
+    );
+    fn visit(expr: &Expr, seen: &mut Vec<(bool, usize)>) {
+        if let Expr::Closure {
+            params, is_strict, ..
+        } = expr
+        {
+            if let Some(meta) = params.iter().find_map(|p| p.arguments_object.as_ref()) {
+                assert_eq!(meta.strict, *is_strict);
+                seen.push((meta.strict, meta.mapped_parameter_ids.len()));
+            }
+        }
+        crate::walker::walk_expr_children(expr, &mut |child| visit(child, seen));
+    }
+    let mut seen = Vec::new();
+    for stmt in &function(&m, "enclosingStrict").body {
+        crate::walker::stmt_any_expr(stmt, &mut |expr| {
+            visit(expr, &mut seen);
+            false
+        });
+    }
+    seen.sort();
+    assert_eq!(seen, vec![(false, 1), (true, 0)]);
+}
+
+#[test]
+fn function_expression_var_redeclarations_share_parameter_ids() {
+    let m = lower(
+        r#"const f = function(a, b) {
+            var a = 11;
+            if (b) { var b = 12; }
+            return [a, b, arguments[0], arguments[1]];
+        };"#,
+        "function_expression_redeclared.cts",
+    );
+    let Stmt::Let {
+        init: Some(Expr::Closure { params, body, .. }),
+        ..
+    } = &m.init[0]
+    else {
+        panic!("function expression retained");
+    };
+    let mut declarations = Vec::new();
+    fn visit(stmts: &[Stmt], ids: &mut Vec<u32>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { id, name, .. } if name == "a" || name == "b" => ids.push(*id),
+                Stmt::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    visit(then_branch, ids);
+                    if let Some(branch) = else_branch {
+                        visit(branch, ids);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    visit(body, &mut declarations);
+    declarations.sort_unstable();
+    assert_eq!(declarations, vec![params[0].id, params[1].id]);
+}

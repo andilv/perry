@@ -12,12 +12,8 @@
 //! `"transform_stream"` arms in `lower_call.rs` route methods through
 //! these FFIs.
 //!
-//! Buffered model: `blob.stream()` and `response.body` produce a
-//! single-chunk readable stream over the body bytes that are already
-//! resident in memory. True chunk-by-chunk streaming from
-//! `reqwest::Response::chunk()` is a separate followup — the existing
-//! fetch path eagerly buffers the whole response anyway, so the user-
-//! visible contract is identical for the consumers we expose here.
+//! Native fetch producers enqueue incrementally with transport byte credit.
+//! Buffered Blob sources still deliver their stored payload.
 //!
 //! BYOB readers (`getReader({ mode: "byob" })`, `read(view)`,
 //! `controller.byobRequest.respond/respondWithNewView`) and real
@@ -25,13 +21,13 @@
 //! into `desiredSize`) live in `streams/byob.rs` and the queue helpers on
 //! `ReadableStreamData` (#4915).
 
+mod statics;
 use perry_runtime::closure::{JsFunctionInfo, JsThis};
 use perry_runtime::{ArrayHeader, ClosureHeader, JSValue, ObjectHeader, Promise, StringHeader};
+pub(crate) use statics::install_readable_stream_from_static;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-
-// Calls that allocate or mutate runtime-owned values must cross the stable C
-// ABI. A shared stdlib still contains fallback Rust runtime glue for generic
+// Calls that allocate or mutate runtime-owned values must cross the stable C ABI. A shared stdlib still contains fallback Rust runtime glue for generic
 // monomorphizations; direct Rust calls would allocate into that image's arena
 // instead of the process-wide runtime provider.
 extern "C" {
@@ -344,7 +340,11 @@ mod byob;
 mod expando;
 mod gc;
 mod idalloc;
+mod native;
 mod pipe;
+pub(crate) use native::{
+    alloc_native_readable, collect_body, native_capacity, native_enqueue, take_native_promise,
+};
 mod strategy;
 mod subclass;
 mod tee;
@@ -426,6 +426,9 @@ enum WritableState {
 }
 
 struct ReadableStreamData {
+    native_source: Option<native::NativeSource>,
+    tee_cancel_promise: Option<*mut Promise>,
+    body_consumer: Option<native::BodyConsumer>,
     state: ReadableState,
     /// Queued chunks as NaN-boxed pointers (typically Uint8Array via POINTER_TAG).
     chunks: VecDeque<u64>,
@@ -457,6 +460,7 @@ struct ReadableStreamData {
     pending_error_after_chunks: Option<u64>,
     /// Per-controller cancel reason captured when `cancel()` is called.
     canceled: bool,
+    disturbed: bool,
 }
 
 impl ReadableStreamData {
@@ -477,12 +481,6 @@ impl ReadableStreamData {
         self.chunks.clear();
         self.chunk_sizes.clear();
         self.queue_total_size = 0.0;
-    }
-
-    fn drain_chunks(&mut self) -> Vec<u64> {
-        self.chunk_sizes.clear();
-        self.queue_total_size = 0.0;
-        self.chunks.drain(..).collect()
     }
 }
 
@@ -833,20 +831,35 @@ unsafe fn stream_object_closure(object: f64, name: &[u8]) -> i64 {
 }
 
 unsafe fn build_iter_result(value_bits: u64, done: bool) -> u64 {
-    let obj = js_object_alloc(0, 2);
-    let keys = js_array_alloc(2);
-    let k_done = js_string_from_bytes(b"done".as_ptr(), 4);
-    let k_value = js_string_from_bytes(b"value".as_ptr(), 5);
-    js_array_push(keys, JSValue::string_ptr(k_done));
-    js_array_push(keys, JSValue::string_ptr(k_value));
-    let done_bits = if done { TAG_TRUE } else { TAG_FALSE };
-    js_object_set_field(obj, 0, JSValue::from_bits(done_bits));
-    js_object_set_field(obj, 1, JSValue::from_bits(value_bits));
-    js_object_set_keys(obj, keys);
-    JSValue::object_ptr(obj as *mut u8).bits()
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    let value = scope.root_nanbox_u64(value_bits);
+    let obj = scope.root_raw_mut_ptr(js_object_alloc(0, 2));
+    let keys = scope.root_raw_mut_ptr(js_array_alloc(2));
+    let k_done = scope.root_string_ptr(js_string_from_bytes(b"done".as_ptr(), 4));
+    let k_value = scope.root_string_ptr(js_string_from_bytes(b"value".as_ptr(), 5));
+    keys.set_raw_mut_ptr(js_array_push(
+        keys.get_raw_mut_ptr(),
+        JSValue::string_ptr(k_done.get_raw_mut_ptr()),
+    ));
+    keys.set_raw_mut_ptr(js_array_push(
+        keys.get_raw_mut_ptr(),
+        JSValue::string_ptr(k_value.get_raw_mut_ptr()),
+    ));
+    js_object_set_field(
+        obj.get_raw_mut_ptr(),
+        0,
+        JSValue::from_bits(if done { TAG_TRUE } else { TAG_FALSE }),
+    );
+    js_object_set_field(
+        obj.get_raw_mut_ptr(),
+        1,
+        JSValue::from_bits(value.get_nanbox_u64()),
+    );
+    js_object_set_keys(obj.get_raw_mut_ptr(), keys.get_raw_mut_ptr());
+    JSValue::object_ptr(obj.get_raw_mut_ptr() as *mut u8).bits()
 }
 
-unsafe fn alloc_uint8array_from_bytes(bytes: &[u8]) -> u64 {
+pub(crate) unsafe fn alloc_uint8array_from_bytes(bytes: &[u8]) -> u64 {
     let buf = perry_runtime::buffer::buffer_alloc(bytes.len() as u32);
     perry_runtime::buffer::mark_as_uint8array(buf as usize);
     (*buf).length = bytes.len() as u32;
@@ -987,6 +1000,9 @@ fn alloc_readable_with_strategy(
     READABLE_STREAMS.lock().unwrap().insert(
         id,
         ReadableStreamData {
+            native_source: None,
+            tee_cancel_promise: None,
+            body_consumer: None,
             state: ReadableState::Readable,
             chunks: VecDeque::new(),
             chunk_sizes: VecDeque::new(),
@@ -1019,6 +1035,7 @@ fn alloc_readable_with_strategy(
             error_value: 0,
             pending_error_after_chunks: None,
             canceled: false,
+            disturbed: false,
         },
     );
     id
@@ -1145,6 +1162,14 @@ extern "C" fn readable_pull_microtask(
                     if let Some(s) = READABLE_STREAMS.lock().unwrap().get_mut(&stream_id) {
                         s.pulling = false;
                     }
+                    if READABLE_STREAMS
+                        .lock()
+                        .unwrap()
+                        .get(&stream_id)
+                        .is_some_and(|s| s.body_consumer.is_some())
+                    {
+                        maybe_pull(stream_id);
+                    }
                 }
                 Err(exc) => {
                     if let Some(s) = READABLE_STREAMS.lock().unwrap().get_mut(&stream_id) {
@@ -1229,10 +1254,17 @@ pub(super) unsafe fn maybe_pull(stream_id: usize) {
 /// #5776). Forcing the pull when the queue is empty drives such a stream to
 /// completion regardless of its strategy.
 pub(super) unsafe fn maybe_pull_force(stream_id: usize) {
+    if let Some(source) = tee_source_of(stream_id) {
+        tee::tee_schedule_pull_demand(source);
+        return;
+    }
     maybe_pull_inner(stream_id, true);
 }
 
 unsafe fn maybe_pull_inner(stream_id: usize, force: bool) {
+    if native::pull_native(stream_id) {
+        return;
+    }
     // ShouldCallPull (#4915): a parked read request always justifies a
     // pull (this is what drives byte streams with highWaterMark 0 — the
     // pull only fires once a `read()` / `read(view)` is waiting);
@@ -1243,7 +1275,8 @@ unsafe fn maybe_pull_inner(stream_id: usize, force: bool) {
         let mut g = READABLE_STREAMS.lock().unwrap();
         match g.get_mut(&stream_id) {
             Some(s) if s.state == ReadableState::Readable && !s.pulling && s.started => {
-                let has_read_request = !s.pending_reads.is_empty() || has_byob_pending;
+                let has_read_request =
+                    !s.pending_reads.is_empty() || s.body_consumer.is_some() || has_byob_pending;
                 let need = (force && s.chunks.is_empty())
                     || has_read_request
                     || (s.chunks.is_empty() && s.high_water_mark > 0.0)
@@ -1284,6 +1317,8 @@ unsafe fn pull_deferred_byte_chunk(stream_id: usize, cb: i64) {
 }
 
 unsafe fn close_pending(stream_id: usize) {
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    native::advance_body(stream_id);
     let promises: Vec<*mut Promise> = {
         let mut g = READABLE_STREAMS.lock().unwrap();
         match g.get_mut(&stream_id) {
@@ -1291,9 +1326,14 @@ unsafe fn close_pending(stream_id: usize) {
             None => Vec::new(),
         }
     };
+    // Keep the entire detached batch live while an earlier result allocates.
+    let promises: Vec<_> = promises
+        .into_iter()
+        .map(|p| scope.root_raw_mut_ptr(p))
+        .collect();
     for p in promises {
         let result = build_iter_result(TAG_UNDEFINED, true);
-        js_promise_resolve(p, f64::from_bits(result));
+        js_promise_resolve(p.get_raw_mut_ptr(), f64::from_bits(result));
     }
     byob::close_pending_byob(stream_id);
     // #5437: stream is done — drop any expando entries so the table doesn't
@@ -1303,6 +1343,9 @@ unsafe fn close_pending(stream_id: usize) {
 }
 
 unsafe fn error_pending(stream_id: usize, reason_bits: u64) {
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    let reason = scope.root_nanbox_u64(reason_bits);
+    native::advance_body(stream_id);
     let promises: Vec<*mut Promise> = {
         let mut g = READABLE_STREAMS.lock().unwrap();
         match g.get_mut(&stream_id) {
@@ -1310,10 +1353,15 @@ unsafe fn error_pending(stream_id: usize, reason_bits: u64) {
             None => Vec::new(),
         }
     };
+    // Keep the entire detached batch live while an earlier result allocates.
+    let promises: Vec<_> = promises
+        .into_iter()
+        .map(|p| scope.root_raw_mut_ptr(p))
+        .collect();
     for p in promises {
-        js_promise_reject(p, f64::from_bits(reason_bits));
+        js_promise_reject(p.get_raw_mut_ptr(), f64::from_bits(reason.get_nanbox_u64()));
     }
-    byob::error_pending_byob(stream_id, reason_bits);
+    byob::error_pending_byob(stream_id, reason.get_nanbox_u64());
     // #5437: stream errored — drop any expando entries (see close_pending).
     expando::stream_expando_clear(stream_id);
     idalloc::retire_readable_terminal(stream_id);
@@ -1454,8 +1502,9 @@ pub fn alloc_readable_from_bytes(bytes: Vec<u8>) -> usize {
         let mut g = READABLE_STREAMS.lock().unwrap();
         if let Some(s) = g.get_mut(&id) {
             s.started = true;
+            s.is_byte_stream = true;
             if !bytes.is_empty() {
-                s.push_chunk(chunk_bits, 1.0);
+                s.push_chunk(chunk_bits, bytes.len() as f64);
             }
             s.state = ReadableState::Closed;
         }
@@ -1612,6 +1661,7 @@ unsafe fn js_readable_stream_cancel_inner(
                     0
                 } else {
                     s.canceled = true;
+                    s.disturbed = true;
                     s.state = ReadableState::Closed;
                     s.clear_chunks();
                     s.cancel_cb
@@ -1624,6 +1674,8 @@ unsafe fn js_readable_stream_cancel_inner(
         reject_type_error(promise, "ReadableStream is locked");
         return promise;
     }
+    native::cancel_native(id);
+    let tee_cancellation = tee::tee_cancel_branch(id, promise);
     let mut actions = [std::ptr::null_mut(); 2];
     let mut action_count = 0;
     if let Some(writable_id) = transform_writable_for_readable(id) {
@@ -1646,7 +1698,9 @@ unsafe fn js_readable_stream_cancel_inner(
         }
     }
     close_pending(id);
-    settle_stream_action_promise(promise, &actions[..action_count]);
+    if !tee_cancellation {
+        settle_stream_action_promise(promise, &actions[..action_count]);
+    }
     promise
 }
 
@@ -1673,8 +1727,7 @@ pub unsafe extern "C" fn js_readable_stream_from_blob(_blob_id: f64) -> f64 {
 #[cfg(feature = "web-fetch")]
 #[no_mangle]
 pub unsafe extern "C" fn js_readable_stream_from_response(resp_id: f64) -> f64 {
-    let bytes = crate::fetch::response_bytes_clone(resp_id as usize).unwrap_or_default();
-    alloc_readable_from_bytes(bytes) as f64
+    crate::fetch::response_body_stream(resp_id as usize)
 }
 
 #[cfg(not(feature = "web-fetch"))]
@@ -2054,6 +2107,9 @@ pub unsafe extern "C" fn js_readable_stream_controller_enqueue(
     if tee::tee_source_enqueue(id, chunk, chunk_bits, is_byte_stream) {
         return f64::from_bits(TAG_UNDEFINED);
     }
+    if native::collect_chunk(id, chunk_bits) {
+        return f64::from_bits(TAG_UNDEFINED);
+    }
     // A pending BYOB read (byte streams only) takes the chunk before the
     // default-read queue: the bytes land directly in the caller's view.
     if is_byte_stream && byob::service_pending_with_chunk(id, chunk_bits) {
@@ -2073,8 +2129,10 @@ pub unsafe extern "C" fn js_readable_stream_controller_enqueue(
         }
     };
     if let Some(p) = popped {
+        let scope = perry_runtime::gc::RuntimeHandleScope::new();
+        let promise = scope.root_raw_mut_ptr(p);
         let result = build_iter_result(chunk_bits, false);
-        js_promise_resolve(p, f64::from_bits(result));
+        js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
     } else {
         // Per spec the strategy's size(chunk) runs once at enqueue time; the
         // result is the chunk's contribution to desiredSize accounting.
@@ -2198,8 +2256,10 @@ extern "C" fn readable_from_chunk_fulfilled(
     }
     let promise = js_closure_get_capture_ptr(closure, 0) as *mut Promise;
     unsafe {
+        let scope = perry_runtime::gc::RuntimeHandleScope::new();
+        let promise = scope.root_raw_mut_ptr(promise);
         let result = build_iter_result(value.to_bits(), false);
-        js_promise_resolve(promise, f64::from_bits(result));
+        js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
     }
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -2225,44 +2285,66 @@ unsafe fn resolve_reader_read_value(promise: *mut Promise, value_bits: u64) {
             eprintln!("[STREAM] read RESOLVED value_bits={value_bits:#018x}");
         }
     }
-    let value = f64::from_bits(value_bits);
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    let promise = scope.root_raw_mut_ptr(promise);
+    let value_root = scope.root_nanbox_u64(value_bits);
+    let value = f64::from_bits(value_root.get_nanbox_u64());
     if js_value_is_promise(value) == 0 {
         let result = build_iter_result(value_bits, false);
-        js_promise_resolve(promise, f64::from_bits(result));
+        js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
         return;
     }
 
     let inner = js_nanbox_get_pointer(value) as *mut Promise;
     if inner.is_null() {
         let result = build_iter_result(value_bits, false);
-        js_promise_resolve(promise, f64::from_bits(result));
+        js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
         return;
     }
 
-    match js_promise_state(inner) {
+    let inner = scope.root_raw_mut_ptr(inner);
+    match js_promise_state(inner.get_raw_mut_ptr()) {
         1 => {
-            let value = js_promise_value(inner);
+            let value = js_promise_value(inner.get_raw_mut_ptr());
             let result = build_iter_result(value.to_bits(), false);
-            js_promise_resolve(promise, f64::from_bits(result));
+            js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
         }
         2 => {
-            js_promise_reject(promise, js_promise_reason(inner));
+            js_promise_reject(
+                promise.get_raw_mut_ptr(),
+                js_promise_reason(inner.get_raw_mut_ptr()),
+            );
         }
         _ => {
             let fulfill =
                 js_closure_alloc(perry_runtime::fn_info!(readable_from_chunk_fulfilled, 1), 1);
+            let fulfill = scope.root_raw_mut_ptr(fulfill);
             let reject =
                 js_closure_alloc(perry_runtime::fn_info!(readable_from_chunk_rejected, 1), 1);
-            js_closure_set_capture_ptr(fulfill, 0, promise as i64);
-            js_closure_set_capture_ptr(reject, 0, promise as i64);
-            let _ = js_promise_then(inner, fulfill, reject);
+            let reject = scope.root_raw_mut_ptr(reject);
+            js_closure_set_capture_ptr(
+                fulfill.get_raw_mut_ptr(),
+                0,
+                promise.get_raw_mut_ptr::<Promise>() as i64,
+            );
+            js_closure_set_capture_ptr(
+                reject.get_raw_mut_ptr(),
+                0,
+                promise.get_raw_mut_ptr::<Promise>() as i64,
+            );
+            let _ = js_promise_then(
+                inner.get_raw_mut_ptr(),
+                fulfill.get_raw_mut_ptr(),
+                reject.get_raw_mut_ptr(),
+            );
         }
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
-    let promise = js_promise_new();
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    let promise = scope.root_raw_mut_ptr(js_promise_new());
     let reader_handle = js_stream_unwrap_handle(reader_handle);
     let reader_id = reader_handle as usize;
     if std::env::var("PERRY_JSON_PATH").as_deref() == Ok("1") {
@@ -2275,12 +2357,15 @@ pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
     let stream_id = match READERS.lock().unwrap().get(&reader_id) {
         Some(r) if r.locked => r.stream_handle,
         Some(_) => {
-            reject_type_error(promise, "Reader is no longer locked to a stream");
-            return promise;
+            reject_type_error(
+                promise.get_raw_mut_ptr(),
+                "Reader is no longer locked to a stream",
+            );
+            return promise.get_raw_mut_ptr();
         }
         None => {
-            reject_type_error(promise, "Invalid reader");
-            return promise;
+            reject_type_error(promise.get_raw_mut_ptr(), "Invalid reader");
+            return promise.get_raw_mut_ptr();
         }
     };
     let mut closed_rejection: Option<(usize, u64)> = None;
@@ -2289,6 +2374,7 @@ pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
         let mut g = READABLE_STREAMS.lock().unwrap();
         match g.get_mut(&stream_id) {
             Some(s) => {
+                s.disturbed = true;
                 if let Some(c) = s.pop_chunk() {
                     if s.chunks.is_empty() {
                         if let Some(error) = s.pending_error_after_chunks.take() {
@@ -2309,13 +2395,14 @@ pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
                 } else if s.state == ReadableState::Errored {
                     Some((s.error_value, false, true))
                 } else {
-                    s.pending_reads.push_back(promise);
+                    s.pending_reads.push_back(promise.get_raw_mut_ptr());
                     None
                 }
             }
             None => Some((TAG_UNDEFINED, true, false)),
         }
     };
+    let value_root = scope.root_nanbox_u64(outcome.map(|v| v.0).unwrap_or(TAG_UNDEFINED));
     // Consumer progress: if this readable is a transform's output and its
     // queue just drained (pop emptied it, or the read parked on an empty
     // queue), release write promises parked on backpressure.
@@ -2342,29 +2429,32 @@ pub unsafe extern "C" fn js_reader_read(reader_handle: f64) -> *mut Promise {
         close_pending(stream_id);
     }
     match outcome {
-        Some((value, _, true)) => {
-            js_promise_reject(promise, f64::from_bits(value));
+        Some((_, _, true)) => {
+            let value = value_root.get_nanbox_u64();
+            js_promise_reject(promise.get_raw_mut_ptr(), f64::from_bits(value));
         }
-        Some((value, done, false)) => {
+        Some((_, done, false)) => {
+            let value = value_root.get_nanbox_u64();
             if done {
                 let result = build_iter_result(value, true);
-                js_promise_resolve(promise, f64::from_bits(result));
+                js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
             } else {
-                resolve_reader_read_value(promise, value);
+                resolve_reader_read_value(promise.get_raw_mut_ptr(), value);
             }
         }
         None => {}
     }
     maybe_pull(stream_id);
-    promise
+    promise.get_raw_mut_ptr()
 }
 
 fn resolved_done_promise() -> f64 {
     unsafe {
-        let promise = js_promise_new();
+        let scope = perry_runtime::gc::RuntimeHandleScope::new();
+        let promise = scope.root_raw_mut_ptr(js_promise_new());
         let result = build_iter_result(TAG_UNDEFINED, true);
-        js_promise_resolve(promise, f64::from_bits(result));
-        box_promise(promise)
+        js_promise_resolve(promise.get_raw_mut_ptr(), f64::from_bits(result));
+        box_promise(promise.get_raw_mut_ptr())
     }
 }
 
@@ -2681,3 +2771,5 @@ unsafe fn pipe_through_rooted_pair(readable_handle: f64, pair: f64, options: f64
     js_promise_mark_internally_handled(pipe);
     output
 }
+
+pub(crate) use self::subclass::readable_body_state;

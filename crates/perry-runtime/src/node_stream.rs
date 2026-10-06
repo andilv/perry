@@ -30,6 +30,7 @@ use crate::object::{js_object_get_field_by_name_f64, ObjectHeader};
 use crate::value::JSValue;
 
 pub(crate) mod async_iterator;
+mod readable_from_iterator;
 mod readable_from_promises;
 
 #[path = "node_stream_event_emitter.rs"]
@@ -65,6 +66,7 @@ pub(crate) use event_emitter::validate_max_listeners;
 // node EventEmitter instance state (EventEmitter.init) and the prototype defaults.
 pub(crate) use event_emitter::{
     init_event_emitter_capture, init_event_emitter_state, install_event_emitter_prototype_state,
+    new_events_object,
 };
 pub use event_emitter::{
     js_node_stream_method_event_names, js_node_stream_method_get_max_listeners,
@@ -546,8 +548,8 @@ extern "C" fn ns_emit_rest(
         raw_ptr_from_value(rest) as *const _,
     )
 }
-/// `recv.emit(...args)` for a method-call site's miss (`NmEeOps::emit_call`):
-/// when `recv`'s shapes resolve `emit` to an ordinary data property holding
+/// A method-call site's miss (`NmEeOps::emit_call`): when `recv`'s shapes
+/// resolve the requested name to an ordinary data property holding
 /// the emitter `emit` body (every emitter prototype and stream table installs
 /// the one body), run it with the call's arguments as they arrived -- the
 /// body's rest array would only be unpacked again. `None`, having done
@@ -558,11 +560,17 @@ extern "C" fn ns_emit_rest(
 /// `args_ptr` holds `argc` values (or is null with `argc == 0`).
 pub(crate) unsafe fn emitter_emit_call(
     recv: f64,
+    key: i64,
+    name: &[u8],
     args_ptr: *const f64,
     argc: usize,
 ) -> Option<f64> {
-    let value =
-        crate::object::native_get::try_data_get_bytes(JSValue::from_bits(recv.to_bits()), b"emit")?;
+    let value = match event_emitter::shape_method(recv, key, name) {
+        Some(value) => JSValue::from_bits(value.to_bits()),
+        None => {
+            crate::object::native_get::try_data_get_bytes(JSValue::from_bits(recv.to_bits()), name)?
+        }
+    };
     let bits = value.bits();
     if bits & !crate::value::POINTER_MASK != crate::value::POINTER_TAG {
         return None;
@@ -988,75 +996,70 @@ extern "C" fn ns_unpipe1(
 
 mod pipe_listeners;
 use pipe_listeners::{
-    finish_pipe_destination, pipe_close_callback, pipe_drain_callback, pipe_error_callback,
-    pipe_finish_callback, pipe_finish_destination_callback, pipe_listener_value,
-    pipe_unpipe_callback, set_pipe_listener_captures,
+    destination_listener, finish_pipe_destination, pipe_close_callback, pipe_drain_callback,
+    pipe_error_callback, pipe_finish_callback, pipe_finish_destination_callback,
+    pipe_listener_value, pipe_unpipe_callback, set_pipe_listener_captures,
 };
 
 fn install_pipe_destination_listeners(src: f64, dest: f64) {
-    let unpipe = js_closure_alloc(
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let src = scope.root_nanbox_f64(src);
+    let dest = scope.root_nanbox_f64(dest);
+    let unpipe = scope.root_raw_mut_ptr(js_closure_alloc(
         crate::fn_info!(pipe_unpipe_callback, 1; with_declared(1)),
         6,
-    );
-    let error = js_closure_alloc(crate::fn_info!(pipe_error_callback, 1; with_declared(1)), 6);
-    let close = js_closure_alloc(crate::fn_info!(pipe_close_callback, 0; with_declared(0)), 6);
-    let finish = js_closure_alloc(
+    ));
+    let error = scope.root_raw_mut_ptr(js_closure_alloc(
+        crate::fn_info!(pipe_error_callback, 1; with_declared(1)),
+        6,
+    ));
+    let close = scope.root_raw_mut_ptr(js_closure_alloc(
+        crate::fn_info!(pipe_close_callback, 0; with_declared(0)),
+        6,
+    ));
+    let finish = scope.root_raw_mut_ptr(js_closure_alloc(
         crate::fn_info!(pipe_finish_callback, 0; with_declared(0)),
         6,
-    );
-    let unpipe_value = pipe_listener_value(unpipe);
-    let error_value = pipe_listener_value(error);
-    let close_value = pipe_listener_value(close);
-    let finish_value = pipe_listener_value(finish);
-    set_pipe_listener_captures(
-        unpipe,
-        src,
-        dest,
-        unpipe_value,
-        error_value,
-        close_value,
-        finish_value,
-    );
-    set_pipe_listener_captures(
-        error,
-        src,
-        dest,
-        unpipe_value,
-        error_value,
-        close_value,
-        finish_value,
-    );
-    set_pipe_listener_captures(
-        close,
-        src,
-        dest,
-        unpipe_value,
-        error_value,
-        close_value,
-        finish_value,
-    );
-    set_pipe_listener_captures(
-        finish,
-        src,
-        dest,
-        unpipe_value,
-        error_value,
-        close_value,
-        finish_value,
-    );
-    add_stream_listener_for_event(dest, literal_string_value(b"unpipe"), unpipe_value);
-    add_stream_listener_for_event(dest, literal_string_value(b"error"), error_value);
-    add_stream_listener_for_event(dest, literal_string_value(b"close"), close_value);
-    add_stream_listener_for_event(dest, literal_string_value(b"finish"), finish_value);
+    ));
+    for listener in [&unpipe, &error, &close, &finish] {
+        set_pipe_listener_captures(
+            listener.get_raw_mut_ptr(),
+            src.get_nanbox_f64(),
+            dest.get_nanbox_f64(),
+            pipe_listener_value(unpipe.get_raw_const_ptr()),
+            pipe_listener_value(error.get_raw_const_ptr()),
+            pipe_listener_value(close.get_raw_const_ptr()),
+            pipe_listener_value(finish.get_raw_const_ptr()),
+        );
+    }
+    for (event, listener) in [
+        (b"unpipe".as_slice(), &unpipe),
+        (b"error".as_slice(), &error),
+        (b"close".as_slice(), &close),
+        (b"finish".as_slice(), &finish),
+    ] {
+        destination_listener(
+            dest.get_nanbox_f64(),
+            event,
+            pipe_listener_value(listener.get_raw_const_ptr()),
+            false,
+        );
+    }
 }
 
 fn add_pipe_drain_listener(src: f64, dest: f64) {
-    let listener = js_closure_alloc(crate::fn_info!(pipe_drain_callback, 0; with_declared(0)), 3);
-    let value = pipe_listener_value(listener);
-    js_closure_set_capture_f64(listener, 0, src);
-    js_closure_set_capture_f64(listener, 1, dest);
-    js_closure_set_capture_f64(listener, 2, value);
-    add_stream_listener_for_event(dest, literal_string_value(b"drain"), value);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let src = scope.root_nanbox_f64(src);
+    let dest = scope.root_nanbox_f64(dest);
+    let listener = scope.root_raw_mut_ptr(js_closure_alloc(
+        crate::fn_info!(pipe_drain_callback, 0; with_declared(0)),
+        3,
+    ));
+    let value = pipe_listener_value(listener.get_raw_const_ptr());
+    js_closure_set_capture_f64(listener.get_raw_mut_ptr(), 0, src.get_nanbox_f64());
+    js_closure_set_capture_f64(listener.get_raw_mut_ptr(), 1, dest.get_nanbox_f64());
+    js_closure_set_capture_f64(listener.get_raw_mut_ptr(), 2, value);
+    destination_listener(dest.get_nanbox_f64(), b"drain", value, false);
 }
 
 fn schedule_pipe_destination_finish(dest: f64) {

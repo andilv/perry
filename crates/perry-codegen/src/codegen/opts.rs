@@ -126,7 +126,7 @@ pub fn namespace_member_func_key(namespace: &str, member: &str) -> String {
 /// A read site's class-getter arm and a store site's class-setter arm can only
 /// ever take an entry for a name some compiled class declares as that kind of
 /// accessor: the runtime admits an entry only when the receiver's class chain
-/// declares the accessor (`class_chain_has_instance_accessor`). A site whose
+/// declares the getter name. A site whose
 /// name no class declares therefore emits no arm; it misses to the runtime as
 /// before the arm existed, which still asks the same entry first.
 #[derive(Debug, Clone, Default)]
@@ -1055,6 +1055,8 @@ pub(crate) struct CrossModuleCtx {
     /// instead of recomputing via the name-keyed `ctx.classes` walk (which
     /// mis-resolves same-named cross-module parents like effect's `Type`).
     pub class_field_counts: std::collections::HashMap<String, u32>,
+    /// Literal receiver key-add capacity, normalized over shared keys globals.
+    pub anon_key_adds: std::collections::HashMap<String, std::collections::BTreeSet<String>>,
     /// Issue #26 / #321: authoritative, source-prefix-disambiguated ancestor
     /// chain per class (root → leaf, `(class_name, fields)`), matching the
     /// keys-global layout. `apply_field_initializers_recursive` walks this

@@ -1109,6 +1109,7 @@ pub(super) fn compile_closure(
         class_ids,
         class_keys_globals: &cross_module.class_keys_globals,
         class_field_counts: &cross_module.class_field_counts,
+        anon_key_adds: &cross_module.anon_key_adds,
         class_init_chains: &cross_module.class_init_chains,
         class_header_image_globals: &cross_module.class_header_images,
         class_birth_reps: &cross_module.class_birth_reps,
@@ -1315,6 +1316,8 @@ pub(super) fn compile_closure(
         elided_arguments: HashMap::new(),
         native_rep_records: Vec::new(),
         known_noalias_buffer_locals: native_facts.known_noalias_buffer_locals(),
+        sealed_buffer_locals: native_facts.sealed_buffer_locals(),
+        late_exposed_buffer_locals: native_facts.late_exposed_buffer_locals(),
         buffer_alias_base,
     };
 

@@ -170,7 +170,7 @@ pub use self::immutable::{
 pub(crate) use self::indexing::{
     array_custom_prototype, array_has_own_index, array_iteration_is_exotic,
     array_iteration_is_exotic_cleaned, array_iteration_is_exotic_resolved, array_spec_get,
-    array_spec_has_index, array_spec_set,
+    array_spec_has_index, array_spec_set, try_strict_dense_index_set,
 };
 pub use self::indexing::{
     js_array_get_element, js_array_get_element_f64, js_array_get_f64, js_array_get_f64_unchecked,
@@ -226,6 +226,7 @@ pub(crate) use self::prototype_addr::{
     array_prototype_addr, forget_object_prototype_intrinsic, function_prototype_addr,
     function_prototype_addr_if_resolved, note_object_prototype_intrinsic, object_prototype_addr,
     object_prototype_addr_if_resolved, object_prototype_addr_matches, prime_prototype_addr_cache,
+    primitive_wrapper_prototype_addr,
 };
 #[cfg(test)]
 pub(crate) use self::prototype_addr::{

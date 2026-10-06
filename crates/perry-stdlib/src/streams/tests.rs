@@ -160,6 +160,9 @@ fn root_scanner_emits_callbacks_chunks_and_promises() {
         readable.insert(
             1,
             ReadableStreamData {
+                native_source: None,
+                tee_cancel_promise: None,
+                body_consumer: None,
                 state: ReadableState::Errored,
                 chunks: VecDeque::from([0x7FFD_0000_0000_1234, 0x7FFA_0000_0000_2345]),
                 chunk_sizes: VecDeque::from([1.0, 1.0]),
@@ -178,6 +181,7 @@ fn root_scanner_emits_callbacks_chunks_and_promises() {
                 error_value: 0x7FFF_0000_0000_4567,
                 pending_error_after_chunks: None,
                 canceled: false,
+                disturbed: false,
             },
         );
     }
@@ -485,17 +489,37 @@ fn iterator_next_is_called_with_the_iterator_as_its_receiver() {
 
 extern "C" fn collecting_pair_getter(
     closure: *const ClosureHeader,
-    _this: perry_runtime::closure::JsThis,
+    this: perry_runtime::closure::JsThis,
 ) -> f64 {
     // Only a numeric stream handle is held in Rust across the collection.
     let endpoint = perry_runtime::closure::js_closure_get_capture_f64(closure, 0);
+    let scope = perry_runtime::gc::RuntimeHandleScope::new();
+    let getter = scope.root_raw_const_ptr(closure);
+    let receiver = scope.root_nanbox_f64(this.as_f64());
+    let receiver_before = receiver.get_nanbox_f64().to_bits();
+    let calls = perry_runtime::closure::js_closure_get_capture_f64(closure, 1);
+    perry_runtime::closure::js_closure_set_capture_f64(
+        closure as *mut ClosureHeader,
+        1,
+        calls + 1.0,
+    );
     perry_runtime::gc::gc_collect_minor();
+    getter.with_const_ptr::<ClosureHeader, _>(|closure| {
+        perry_runtime::closure::js_closure_set_capture_f64(
+            closure as *mut ClosureHeader,
+            2,
+            (receiver.get_nanbox_f64().to_bits() != receiver_before) as u8 as f64,
+        );
+    });
     endpoint
 }
 
 #[test]
 fn pipe_through_pair_survives_a_moving_getter() {
     let _serial = serial_guard();
+    // Rust unit tests bypass the generated program's startup. Register the
+    // handle/accessor roots before the getters deliberately collect.
+    perry_runtime::gc::gc_init();
     struct RestoreGc(i32);
     impl Drop for RestoreGc {
         fn drop(&mut self) {
@@ -513,16 +537,22 @@ fn pipe_through_pair_survives_a_moving_getter() {
         let readable = js_transform_stream_readable(transform);
         let writable = js_transform_stream_writable(transform);
         let pair = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
-        let child = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
         let getter = scope.root_raw_mut_ptr(js_closure_alloc(
             perry_runtime::fn_info!(collecting_pair_getter, 0; with_declared(0)),
-            1,
+            3,
         ));
         perry_runtime::closure::js_closure_set_capture_f64(
             getter.get_raw_mut_ptr::<ClosureHeader>(),
             0,
             readable,
         );
+        for slot in [1, 2] {
+            perry_runtime::closure::js_closure_set_capture_f64(
+                getter.get_raw_mut_ptr::<ClosureHeader>(),
+                slot,
+                0.0,
+            );
+        }
         let key = js_string_from_bytes(b"readable".as_ptr(), 8);
         perry_runtime::object::js_object_define_accessor(
             f64::from_bits(
@@ -536,13 +566,20 @@ fn pipe_through_pair_survives_a_moving_getter() {
         );
         let writer_getter = scope.root_raw_mut_ptr(js_closure_alloc(
             perry_runtime::fn_info!(collecting_pair_getter, 0; with_declared(0)),
-            1,
+            3,
         ));
         perry_runtime::closure::js_closure_set_capture_f64(
             writer_getter.get_raw_mut_ptr::<ClosureHeader>(),
             0,
             writable,
         );
+        for slot in [1, 2] {
+            perry_runtime::closure::js_closure_set_capture_f64(
+                writer_getter.get_raw_mut_ptr::<ClosureHeader>(),
+                slot,
+                0.0,
+            );
+        }
         let key = js_string_from_bytes(b"writable".as_ptr(), 8);
         perry_runtime::object::js_object_define_accessor(
             f64::from_bits(
@@ -556,7 +593,7 @@ fn pipe_through_pair_survives_a_moving_getter() {
             undefined,
         );
         let options = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
-        let child_before = child.get_raw_mut_ptr::<ObjectHeader>();
+        let pair_before = pair.get_raw_mut_ptr::<ObjectHeader>();
         let source = alloc_closed_readable() as f64;
         let output = js_readable_stream_pipe_through_pair(
             source,
@@ -569,10 +606,24 @@ fn pipe_through_pair_survives_a_moving_getter() {
         );
         assert_eq!(output, readable);
         assert_ne!(
-            child.get_raw_mut_ptr::<ObjectHeader>(),
-            child_before,
-            "the getter must have performed a moving collection"
+            pair.get_raw_mut_ptr::<ObjectHeader>(),
+            pair_before,
+            "the getters must have moved the transform pair"
         );
+        for getter in [getter, writer_getter] {
+            getter.with_mut_ptr::<ClosureHeader, _>(|closure| {
+                assert_eq!(
+                    perry_runtime::closure::js_closure_get_capture_f64(closure, 1),
+                    1.0,
+                    "each endpoint getter must run exactly once"
+                );
+                assert_eq!(
+                    perry_runtime::closure::js_closure_get_capture_f64(closure, 2),
+                    1.0,
+                    "each endpoint getter must move its receiver"
+                );
+            });
+        }
     }
 }
 

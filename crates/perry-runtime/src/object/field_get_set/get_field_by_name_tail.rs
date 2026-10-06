@@ -8,6 +8,16 @@ pub(crate) fn get_field_by_name_object_tail(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> JSValue {
+    // Direct tail callers usually resolve a slot or method before the URL
+    // fallback. Defer classification until that fallback actually needs it.
+    get_field_by_name_object_tail_with_kind(obj, key, None)
+}
+
+pub(super) fn get_field_by_name_object_tail_with_kind(
+    obj: *const ObjectHeader,
+    key: *const crate::StringHeader,
+    ordinary_receiver: Option<bool>,
+) -> JSValue {
     if crate::hot_diag::receiver_repr_on() {
         let addr = (obj as u64 & 0x0000_FFFF_FFFF_FFFF) as usize;
         crate::hot_diag::receiver_repr_note_decoded_pointer(addr);
@@ -34,9 +44,6 @@ pub(crate) fn get_field_by_name_object_tail(
             if raw.is_null() || top16 == 0x7FFC {
                 // undefined/null tag or null pointer — return undefined
                 return JSValue::undefined();
-            }
-            if let Some(value) = async_resource_property(raw, key) {
-                return value;
             }
             // Issue #340: small-handle receivers (raw < 0x100000) come
             // from native modules (axios, fastify, ...) that
@@ -100,9 +107,6 @@ pub(crate) fn get_field_by_name_object_tail(
     };
     if obj.is_null() {
         return JSValue::undefined();
-    }
-    if let Some(value) = async_resource_property(obj, key) {
-        return value;
     }
     // Same handle-receiver path for already-stripped pointers — happens
     // when the codegen passes a raw i64 handle through the slow path.
@@ -1306,12 +1310,16 @@ pub(crate) fn get_field_by_name_object_tail(
                     // Class accessors are properties of the class prototype
                     // (charter step 3), so keyless receivers need the same
                     // fallback as shaped receivers.
-                    if let Some((v, _)) = super::super::class_registry::class_chain_getter_value(
-                        class_id,
-                        name,
-                        || super::accessors::class_getter_this(obj),
-                    ) {
-                        return v;
+                    if class_walk && !chain_walked {
+                        if let Some((v, _)) =
+                            super::super::class_registry::instance_chain_getter_value(
+                                obj,
+                                name,
+                                || super::accessors::class_getter_this(obj),
+                            )
+                        {
+                            return v;
+                        }
                     }
                     if class_walk
                         && lookup_class_method_in_chain(class_id, name).is_some()
@@ -1655,27 +1663,21 @@ pub(crate) fn get_field_by_name_object_tail(
         // Set by the class-chain walk below; see `static_prototype_already_read`.
         let mut proto_read_miss = 0u64;
 
-        // Key not found in the keys_array — fall back to the class
-        // vtable's getter map. Refs #486 (hono): cross-module class
-        // getters (e.g. hono Context's `get req()` defined in
-        // `hono/dist/context.js` and read from a user `c.req.url`
-        // expression in main.ts) reach this point because the field
-        // dispatcher only looks for stored fields, not getter accessors.
-        // The getter is registered in `CLASS_VTABLE_REGISTRY` via
-        // `js_register_class_getter` at module init by codegen — invoke
-        // it with the same NaN-boxed `this` the codegen passes for
-        // method dispatch.
+        // An own-key miss resolves a class accessor from the prototype
+        // holder's shape and calls its pair with the original receiver.
         let class_id = (*obj).class_id;
         if class_id != 0 {
             // Class accessors (a base class's included) are accessor
             // properties of the class prototype chain (charter step 3).
-            if let Ok(name) = std::str::from_utf8(key_bytes) {
-                if let Some((v, _)) =
-                    super::super::class_registry::class_chain_getter_value(class_id, name, || {
-                        super::accessors::class_getter_this(obj)
-                    })
-                {
-                    return v;
+            if class_walk && !chain_walked {
+                if let Ok(name) = std::str::from_utf8(key_bytes) {
+                    if let Some((v, _)) =
+                        super::super::class_registry::instance_chain_getter_value(obj, name, || {
+                            super::accessors::class_getter_this(obj)
+                        })
+                    {
+                        return v;
+                    }
                 }
             }
 
@@ -1882,24 +1884,13 @@ pub(crate) fn get_field_by_name_object_tail(
             }
         }
 
-        // #5961: native URLSearchParams is an ordinary object (class_id == 0,
-        // leading `_entries` slot) whose method surface normally exists only
-        // via static type-directed lowering. A type-erased receiver lands
-        // here instead — resolve the methods dynamically so `sp.append(...)`
-        // stays callable, and `size` reads as a number.
-        if !key.is_null() && crate::url::search_params::shape_is_url_search_params(obj) {
-            if let Ok(name) = std::str::from_utf8(key_bytes) {
-                if name == "size" {
-                    let n = crate::url::search_params::js_url_search_params_size(
-                        obj as *mut ObjectHeader,
-                    );
-                    return JSValue::from_bits((n as f64).to_bits());
-                }
-                if let Some(v) =
-                    crate::url::search_params::url_search_params_method_value(obj, name)
-                {
-                    return JSValue::from_bits(v.to_bits());
-                }
+        let ordinary_receiver = ordinary_receiver.unwrap_or_else(|| {
+            super::exotic_named_read::named_read_receiver_kind(obj)
+                == super::exotic_named_read::NamedReadKind::Ordinary
+        });
+        if !ordinary_receiver {
+            if let Some(value) = super::exotic_named_read::search_params_read(obj, key, key_bytes) {
+                return value;
             }
         }
 

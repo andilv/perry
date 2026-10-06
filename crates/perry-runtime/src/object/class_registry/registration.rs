@@ -432,7 +432,7 @@ pub(crate) fn class_accessor_function_value(
     let fn_name = format!("{prefix}{prop_name}");
     let name_ptr = crate::string::js_string_from_bytes(fn_name.as_ptr(), fn_name.len() as u32);
     let name_value = f64::from_bits(crate::value::JSValue::string_ptr(name_ptr).bits());
-    crate::closure::closure_set_dynamic_prop(closure as usize, "name", name_value);
+    crate::closure::closure_define_dynamic_prop(closure as usize, "name", name_value);
     crate::object::set_builtin_property_attrs(
         closure as usize,
         "name".to_string(),
@@ -468,7 +468,6 @@ pub unsafe extern "C" fn js_register_class_getter(
     let vtable = reg.entry(class_id as u32).or_default();
     vtable.declare_accessor_half(&name, func_ptr as usize, false);
     VTABLE_GEN.fetch_add(1, Ordering::Release);
-    super::verdict_classes::note_verdict_class_accessor_change(class_id as u32);
     drop(registry);
     super::decl_accessors::note_instance_accessor_registered(class_id as u32, &name);
 }
@@ -518,7 +517,6 @@ pub unsafe extern "C" fn js_register_class_setter(
         u32::try_from(spec_length).ok(),
     );
     VTABLE_GEN.fetch_add(1, Ordering::Release);
-    super::verdict_classes::note_verdict_class_accessor_change(class_id as u32);
     drop(registry);
     super::decl_accessors::note_instance_accessor_registered(class_id as u32, &name);
 }

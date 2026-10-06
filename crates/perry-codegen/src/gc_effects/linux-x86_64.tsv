@@ -990,13 +990,11 @@ js_dom_exception_subclass_init	Reenters
 js_domain_add	Reenters
 js_domain_bind	AllocOnly
 js_domain_create	Reenters
-js_domain_emit	Reenters
 js_domain_emit_error	Reenters
 js_domain_enter	Reenters
 js_domain_exit	Reenters
 js_domain_intercept	AllocOnly
 js_domain_native_dispatch	Reenters
-js_domain_on	Reenters
 js_domain_remove	Reenters
 js_domain_run	Reenters
 js_drain_queued_microtasks	Reenters
@@ -1322,6 +1320,7 @@ js_gc_memory_pressure	Reenters
 js_gc_module_collect	Reenters
 js_gc_module_idle_hint	AllocOnly
 js_gc_module_minor	AllocOnly
+js_gc_note_black_birth	Leaf
 js_gc_note_slot_layout	Leaf
 js_gc_note_slot_layout_aware	Leaf
 js_gc_pause_stats	Leaf
@@ -1645,7 +1644,12 @@ js_message_channel_new	Reenters
 js_message_port_constructor_error	Reenters
 js_method_direct_shape_class	Leaf
 js_method_direct_shape_guard	Leaf
+js_method_site_call_split	Reenters
+js_method_site_call_value	Reenters
+js_method_site_call_value_apply	Reenters
+js_method_site_lookup	Reenters
 js_method_site_miss	Reenters
+js_method_site_prepare	Reenters
 js_method_site_stats	Leaf
 js_microtasks_pending	Leaf
 js_migrate_stdin_listeners_to_provider	Reenters
@@ -1825,6 +1829,7 @@ js_nm_install_util	Leaf
 js_nm_install_v8	Leaf
 js_nm_install_vm	Leaf
 js_nm_install_wasi	Leaf
+js_nm_install_worker_threads	Leaf
 js_nm_install_zlib	Leaf
 js_node_inspector_close	Leaf
 js_node_inspector_console_debug	Reenters
@@ -3211,6 +3216,7 @@ js_symbol_typeof	Reenters
 js_symbol_well_known_async_iterator	AllocOnly
 js_symbol_well_known_iterator	AllocOnly
 js_syntaxerror_new	Reenters
+js_ta_read_receiver_is_kind	Reenters
 js_tagged_template_get_or_init	Reenters
 js_tagged_template_register_raw	Reenters
 js_tdz_suppress_begin	Leaf
@@ -3453,6 +3459,7 @@ js_typeerror_new_with_cause	Reenters
 js_u8_buffer_read_f64	Reenters
 js_u8_from_base64	Reenters
 js_u8_from_hex	Reenters
+js_u8_resolve_read_data	Leaf
 js_u8_set_from_base64	Reenters
 js_u8_set_from_hex	Reenters
 js_u8_to_base64	Reenters
@@ -3999,3 +4006,5 @@ perry_updater_verify_signature_v2	Reenters
 perry_updater_write_sentinel	Reenters
 redirect_lazy_to_materialized	Reenters
 setInterval	Reenters
+js_net_socket_address_parse_value	Reenters
+js_net_validate_socket_address_parse_input	Reenters

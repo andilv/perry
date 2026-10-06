@@ -100,12 +100,10 @@ fn declared_typed_array_length_reads_the_header_inline() {
         "the arm must test GC_TYPE_TYPED_ARRAY:\n{arm}"
     );
     assert!(
-        arm.lines()
-            .any(|l| l.contains("add i64") && l.trim_end().ends_with(", 10"))
-            && arm.contains("load i8")
-            && arm.contains("@PERRY_TA_OWN_PROPS_PRESENT"),
-        "a view (the receiver's storage byte at header + 10, #10516) or an own \
-         `length` property must keep the header read off:\n{arm}"
+        arm.contains("load atomic i8")
+            && arm.contains("@PERRY_TYPED_NAMED_PROPS_INVALIDATED")
+            && !arm.lines().any(|l| l.contains("add i64") && l.trim_end().ends_with(", 10")),
+        "the live length is valid for shared views, but metadata edits must withdraw the proof:\n{arm}"
     );
 }
 
@@ -139,8 +137,8 @@ fn unproven_numeric_index_store_has_an_inline_element_tier() {
     );
 }
 
-/// A declared typed array with an unproven index takes the same guarded inline
-/// arms as an erased receiver, not an unconditional runtime call per access.
+/// A declared typed array with an unproven index takes a kind-specific inline
+/// load; only declined receivers/keys reach the boxed dynamic getter.
 #[test]
 fn declared_typed_array_unproven_index_access_is_inline() {
     let get = probe_ir(&module(
@@ -152,8 +150,15 @@ fn declared_typed_array_unproven_index_access_is_inline() {
         }))],
     ));
     assert!(
-        get.contains("tav.brand") && !get.contains("@js_typed_array_index_get_dynamic("),
+        get.contains("ta.read.load")
+            && get.contains("ta.read.pointer")
+            && get.contains("@js_dyn_index_get("),
         "declared typed-array read must use the inline arm:\n{get}"
+    );
+    let hot = super::class_field_barrier_tests::block_body(&get, "ta.read.load.").unwrap();
+    assert!(
+        hot.contains("load atomic i64") && !hot.contains("call double"),
+        "in-bounds reads must load the lane without dispatch: {hot}"
     );
     let set = probe_ir(&module(
         "ta_dynamic_set",
@@ -231,8 +236,17 @@ fn plain_double_array_literal_skips_notes_and_marking() {
     );
     let noted = block_body(&ir, "arrlit.noted").unwrap_or_else(|| panic!("no noted arm:\n{ir}"));
     assert!(
-        noted.contains("@js_array_mark_numeric_f64_layout("),
-        "a boxed element must keep the marking walk:\n{noted}"
+        noted.contains("@js_gc_note_slot_layout(")
+            && !noted.contains("@js_array_mark_numeric_f64_layout("),
+        "the noted arm initializes metadata without running a collecting normalizer:\n{noted}"
+    );
+    let normalize = block_body(&ir, "arrlit.normalize")
+        .unwrap_or_else(|| panic!("boxed elements must keep a normalizer arm:\n{ir}"));
+    assert!(normalize.contains("@js_array_mark_numeric_f64_layout("));
+    assert!(
+        ir.find("@js_gc_note_black_birth(").unwrap()
+            < ir.find("@js_array_mark_numeric_f64_layout(").unwrap(),
+        "normalization must follow the completed birth seed"
     );
 }
 

@@ -443,7 +443,7 @@ extern "C" fn ns_ee_async_resource_destroy(
     this: crate::closure::JsThis,
 ) -> f64 {
     let resource = require_event_emitter_async_resource_receiver(closure, this);
-    crate::async_hooks::js_async_resource_emit_destroy(resource) as f64
+    crate::async_hooks::js_async_resource_emit_destroy(resource)
 }
 
 /// `EventEmitterAsyncResource.prototype.emit`'s body: `(event, ...args)`.
@@ -600,7 +600,13 @@ pub(crate) unsafe fn install_event_emitter_async_resource_instance_methods(
         let key = scope.root_string_ptr(hidden_key(name.as_bytes()));
         obj.with_mut_ptr::<ObjectHeader, _>(|obj| {
             key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                js_object_set_field_by_name(obj, key, f64::from_bits(crate::value::TAG_UNDEFINED));
+                // This seeds an own descriptor during native construction;
+                // an inherited getter must not turn it into an ordinary Set.
+                crate::object::object_ops::define_property_force_store_value(
+                    obj,
+                    key,
+                    f64::from_bits(crate::value::TAG_UNDEFINED),
+                );
             });
         });
         obj.with_mut_ptr::<ObjectHeader, _>(|obj| {

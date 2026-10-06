@@ -7351,9 +7351,13 @@ fn lower_for_after_init_impl(
         if local_bound_index_bounds_are_safe {
             if let Some(buffer_ids) = ctx.min_length_bounds.get(&bound_id).cloned() {
                 for buffer_local_id in buffer_ids {
+                    // `Math.min(a.length, ...)` read the length once; the body
+                    // may run JS, which can detach a receiver whose length is
+                    // not fixed.
                     if ctx
                         .receiver_descriptors
-                        .contains_buffer_view(buffer_local_id)
+                        .buffer_view(buffer_local_id)
+                        .is_some_and(|view| view.length_fixed)
                     {
                         ctx.bounded_buffer_index_pairs.push(BoundedBufferIndex {
                             index_local_id: counter_id,
@@ -7827,6 +7831,11 @@ pub(crate) fn emit_gc_loop_safepoint(
     // mutably.
     let needs_poll = {
         let is_inert = |e: &perry_hir::Expr| crate::rooting::expr_is_inert_primitive(ctx, e);
+        let body = if region_loop::body_cannot_collect(ctx, body) {
+            &[][..]
+        } else {
+            body
+        };
         crate::loop_purity::loop_may_allocate(body, controls, &is_inert)
     };
     if !needs_poll {
@@ -8357,6 +8366,16 @@ fn classify_for_length_hoist_rejection(
 }
 
 fn array_length_receiver_is_loop_local(ctx: &crate::expr::FnCtx<'_>, arr_id: u32) -> bool {
+    // A typed-array annotation can name a getter-bearing object. Only an
+    // owned sealed binding or a proven native view licenses a header length;
+    // the generic path must evaluate a possibly observable getter each time.
+    let object = perry_hir::Expr::LocalGet(arr_id);
+    if crate::type_analysis::is_typed_array_expr(ctx, &object)
+        && !ctx.sealed_buffer_locals.contains(&arr_id)
+        && crate::expr::proven_view_receiver(ctx, &object).is_none()
+    {
+        return false;
+    }
     ctx.locals.contains_key(&arr_id)
         && !ctx.boxed_vars.contains(&arr_id)
         && !ctx.module_globals.contains_key(&arr_id)

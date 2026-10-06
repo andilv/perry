@@ -50,7 +50,83 @@ fn func(id: u32, body: Vec<Stmt>) -> Function {
 fn module_with_init(init: Vec<Stmt>) -> Module {
     let mut m = Module::new("spec_abi_test");
     m.init = init;
+    add_callee_stubs(&mut m);
     m
+}
+
+/// Every `FuncRef` callee resolves to a module function, as in a real module:
+/// a missing callee gets a stub whose parameters are never used, so passing a
+/// typed array to it keeps the binding sealed (`collectors/sealed_buffers.rs`).
+fn add_callee_stubs(m: &mut Module) {
+    fn visit_expr(e: &Expr, out: &mut HashMap<u32, usize>) {
+        if let Expr::Call { callee, args, .. } = e {
+            if let Expr::FuncRef(f) = callee.as_ref() {
+                let n = out.entry(*f).or_insert(0);
+                *n = (*n).max(args.len());
+            }
+        }
+        perry_hir::walker::walk_expr_children(e, &mut |c| visit_expr(c, out));
+    }
+    fn visit_stmts(stmts: &[Stmt], out: &mut HashMap<u32, usize>) {
+        for s in stmts {
+            match s {
+                Stmt::Let { init: Some(e), .. }
+                | Stmt::Expr(e)
+                | Stmt::Return(Some(e))
+                | Stmt::Throw(e) => visit_expr(e, out),
+                Stmt::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    visit_expr(condition, out);
+                    visit_stmts(then_branch, out);
+                    if let Some(eb) = else_branch {
+                        visit_stmts(eb, out);
+                    }
+                }
+                Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+                    visit_expr(condition, out);
+                    visit_stmts(body, out);
+                }
+                Stmt::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                } => {
+                    if let Some(i) = init {
+                        visit_stmts(std::slice::from_ref(i.as_ref()), out);
+                    }
+                    for e in condition.iter().chain(update.iter()) {
+                        visit_expr(e, out);
+                    }
+                    visit_stmts(body, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut callees = HashMap::new();
+    visit_stmts(&m.init, &mut callees);
+    for (id, arity) in callees {
+        if m.functions.iter().any(|f| f.id == id) {
+            continue;
+        }
+        let mut stub = func(id, vec![]);
+        stub.params = (0..arity as u32)
+            .map(|i| perry_hir::Param {
+                id: 100_000 + id * 100 + i,
+                name: format!("s{id}_{i}"),
+                ty: Type::Any,
+                default: None,
+                decorators: vec![],
+                is_rest: false,
+                arguments_object: None,
+            })
+            .collect();
+        m.functions.push(stub);
+    }
 }
 
 #[test]
@@ -243,6 +319,7 @@ fn reassignment_in_another_function_rejects_binding() {
         ),
         Stmt::Expr(call(7, vec![Expr::LocalGet(3)])),
     ]);
+    m.functions.retain(|f| f.id != 7);
     m.functions.push(func(
         7,
         vec![Stmt::Expr(Expr::LocalSet(3, Box::new(Expr::Undefined)))],
@@ -628,4 +705,71 @@ fn a_property_read_or_mutable_computed_length_is_not_a_length_form() {
             vec![SpecParamRep::Boxed]
         );
     }
+}
+
+/// `var A = [1,2,3]; A[<key>] = 0; const P = new Int32Array(A); f(P)` with the
+/// extra `pre` statements ahead of the store. Returns P's proven length.
+fn store_key_const_len(pre: Vec<Stmt>, key: Expr) -> Option<Option<i64>> {
+    let mut body = vec![let_stmt(
+        1,
+        true,
+        Expr::Array(vec![Expr::Integer(1), Expr::Integer(2), Expr::Integer(3)]),
+    )];
+    body.extend(pre);
+    body.push(Stmt::Expr(Expr::IndexSet {
+        object: Box::new(Expr::LocalGet(1)),
+        index: Box::new(key),
+        value: Box::new(Expr::Integer(0)),
+    }));
+    body.push(let_stmt(
+        2,
+        false,
+        ta_new(TYPED_ARRAY_KIND_INT32, Some(Expr::LocalGet(1))),
+    ));
+    body.push(Stmt::Expr(call(7, vec![Expr::LocalGet(2)])));
+    let facts = collect_spec_abi_facts(&module_with_init(body));
+    facts.ta_bindings.get(&2).map(|b| b.const_len)
+}
+
+#[test]
+fn element_store_with_a_numeric_key_keeps_the_constant_length() {
+    // Growing or overwriting through a numeric key never shrinks the array.
+    assert_eq!(store_key_const_len(vec![], Expr::Integer(1)), Some(Some(3)));
+    assert_eq!(
+        store_key_const_len(
+            vec![let_stmt(3, false, Expr::Integer(2))],
+            Expr::LocalGet(3)
+        ),
+        Some(Some(3))
+    );
+}
+
+#[test]
+fn element_store_that_may_be_length_demotes_the_constant_length() {
+    // #11973: `for (a["length"] of [2]) {}` lowers to `a["length"] = 2` as an
+    // `IndexSet`, which truncates `a`. The literal key, a local holding the
+    // string, and a `+` that builds the string must all demote; the binding
+    // stays proven non-view.
+    assert_eq!(
+        store_key_const_len(vec![], Expr::String("length".into())),
+        Some(None)
+    );
+    assert_eq!(
+        store_key_const_len(
+            vec![let_stmt(3, false, Expr::String("length".into()))],
+            Expr::LocalGet(3)
+        ),
+        Some(None)
+    );
+    assert_eq!(
+        store_key_const_len(
+            vec![],
+            Expr::Binary {
+                op: perry_hir::BinaryOp::Add,
+                left: Box::new(Expr::String("len".into())),
+                right: Box::new(Expr::String("gth".into())),
+            }
+        ),
+        Some(None)
+    );
 }

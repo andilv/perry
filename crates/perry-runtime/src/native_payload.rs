@@ -16,9 +16,10 @@
 //!   as long as the object and is finalized by the sweep that finds both dead.
 //!
 //! Lifetime. The cell's finalizer is the monomorphized drop of `Box<T>`; it
-//! runs exactly once, at whichever comes first of [`close`] (the family's
-//! explicit close/final/digest), the sweep that finds the cell dead, or the
-//! owning thread's teardown. After it runs the object stays a valid object:
+//! runs once per installed payload, at release ([`close`]), sweep or thread
+//! teardown. Close leaves a CLOSED cell and its traced owner edge alive;
+//! only sweep and teardown finalize it. [`attach`] reopens the same cell.
+//! After close the object stays a valid object:
 //! [`payload_mut`] answers [`PayloadMiss::Closed`] and the family reports its
 //! node-shaped "already finalized" error.
 //!
@@ -29,8 +30,9 @@
 //! by the memory they really retain.
 //!
 //! What may sit in a payload: plain Rust data only. No JS values, no NaN-boxed
-//! bits, no raw GC pointers — the cell is a GC leaf and nothing traces into
-//! it. A JS value the family must keep (listeners, a pipe destination, an
+//! bits, no raw GC pointers. The optional cell.owner slot is the only traced
+//! back-edge; nothing traces into Box<T>. Stable OwnerLink tokens in callback
+//! sites are inert native data. A JS value the family must keep (listeners, a pipe destination, an
 //! options object) lives on the object: in an ordinary own property when node
 //! shows it, otherwise in the hidden per-object state object ([`js_state`]),
 //! which the collector traces and moves like any field. `Drop for T` must not
@@ -44,7 +46,7 @@
 //! The per-family conversion checklist is `docs/native-payload-pattern.md`.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use crate::native_handle::NativeHandleHeader;
 use crate::object::ObjectHeader;
@@ -53,6 +55,8 @@ use crate::object::ObjectHeader;
 pub struct NativePayloadFamily {
     /// The family's id from `native_class_ids.rs`.
     pub class_id: u32,
+    /// Trace a back-edge from the stable cell for registered callbacks/events.
+    pub links_owner: bool,
     /// The constructor name node reports (`h.constructor.name`).
     pub name: &'static str,
     /// The module export that IS this family's constructor in node
@@ -81,6 +85,92 @@ impl PayloadPrototype {
     pub fn method(&mut self, name: &str, info: *const crate::closure::JsFunctionInfo, arity: u32) {
         crate::object::install_proto_method(self.proto, name, info, arity);
     }
+
+    /// Install a non-enumerable, configurable builtin getter.
+    pub fn getter(&mut self, name: &str, info: *const crate::closure::JsFunctionInfo) {
+        let closure = crate::closure::js_closure_alloc(info, 0);
+        crate::object::native_module::set_bound_native_closure_name(
+            closure,
+            &format!("get {name}"),
+        );
+        crate::object::native_module::set_builtin_closure_length(closure as usize, 0);
+        crate::object::native_module::set_builtin_closure_non_constructable(closure as usize);
+        unsafe {
+            crate::object::install_builtin_getter(
+                self.proto,
+                name,
+                crate::value::js_nanbox_pointer(closure as i64).to_bits(),
+            );
+        }
+    }
+
+    /// Install an ordinary data property on the prototype.
+    pub fn data(
+        &mut self,
+        name: &str,
+        value: f64,
+        writable: bool,
+        enumerable: bool,
+        configurable: bool,
+    ) {
+        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        crate::object::define_builtin_data_property(
+            self.proto,
+            key,
+            value,
+            name.to_string(),
+            crate::object::PropertyAttrs::new(writable, enumerable, configurable),
+        );
+    }
+
+    /// Set the prototype's own `[[Prototype]]`.
+    pub fn inherit(&mut self, parent: f64) {
+        if crate::value::JSValue::from_bits(parent.to_bits()).is_pointer() {
+            crate::object::prototype_chain::object_link_class_default_prototype(
+                self.proto as usize,
+                parent.to_bits(),
+            );
+        }
+    }
+}
+
+/// Install a family's method set on a prototype materialized by an older
+/// native constructor export. Kept for the two legacy async class ids whose
+/// subclass machinery already shares that exact prototype object.
+pub fn install_on_prototype(proto: *mut ObjectHeader, install: fn(&mut PayloadPrototype)) {
+    if !proto.is_null() {
+        // The installer allocates one closure and one string per property.
+        // Its caller hands us a raw prototype pointer, so keep the heap fixed
+        // until every method has been attached.
+        let _no_move = crate::gc::GcSuppressScope::new();
+        install(&mut PayloadPrototype { proto });
+    }
+}
+
+/// Adopt a constructor's existing canonical prototype into the family's
+/// per-realm cache. Its methods are installed only when that prototype is
+/// first adopted, so user changes to the prototype remain ordinary changes.
+pub fn adopt_prototype(
+    family: &NativePayloadFamily,
+    proto: *mut ObjectHeader,
+) -> *mut ObjectHeader {
+    let index = slot_index(family.class_id);
+    let existing = PAYLOAD_PROTOTYPES.with(|slots| slots[index].load(Ordering::Acquire));
+    if existing != 0 {
+        return existing as *mut ObjectHeader;
+    }
+    if !proto.is_null() {
+        let _no_move = crate::gc::GcSuppressScope::new();
+        install_on_prototype(proto, family.install_prototype);
+        PAYLOAD_PROTOTYPES.with(|slots| {
+            crate::gc::runtime_store_root_atomic_raw_i64(
+                &slots[index],
+                proto as i64,
+                Ordering::Release,
+            );
+        });
+    }
+    proto
 }
 
 /// Why [`payload_mut`] has no payload for a value.
@@ -104,19 +194,38 @@ crate::perry_thread_local! {
 }
 
 const _: () = assert!(
-    crate::native_class_ids::CRYPTO_DECIPHERIV - crate::native_class_ids::WEB_BUILTIN_BLOCK_START
+    crate::native_class_ids::DOMAIN - crate::native_class_ids::WEB_BUILTIN_BLOCK_START
         < PROTOTYPE_SLOTS as u32,
     "a native-payload family id outgrew the prototype slot array"
 );
 
 #[inline]
 fn slot_index(class_id: u32) -> usize {
+    if class_id == crate::native_class_ids::ASYNC_LOCAL_STORAGE_LEGACY {
+        return PROTOTYPE_SLOTS - 2;
+    }
+    if class_id == crate::native_class_ids::ASYNC_RESOURCE_LEGACY {
+        return PROTOTYPE_SLOTS - 1;
+    }
     let index = class_id.wrapping_sub(crate::native_class_ids::WEB_BUILTIN_BLOCK_START) as usize;
     assert!(
         index < PROTOTYPE_SLOTS,
         "class id {class_id:#x} is not in the web-builtin block"
     );
     index
+}
+
+#[inline]
+fn slot_index_if_payload(class_id: u32) -> Option<usize> {
+    if matches!(
+        class_id,
+        crate::native_class_ids::ASYNC_LOCAL_STORAGE_LEGACY
+            | crate::native_class_ids::ASYNC_RESOURCE_LEGACY
+    ) {
+        return Some(slot_index(class_id));
+    }
+    let index = class_id.wrapping_sub(crate::native_class_ids::WEB_BUILTIN_BLOCK_START) as usize;
+    (index < PROTOTYPE_SLOTS).then_some(index)
 }
 
 /// GC roots for the payload prototypes. Called from
@@ -164,6 +273,17 @@ fn family_prototype(family: &NativePayloadFamily) -> *mut ObjectHeader {
         }
     };
     if crate::value::JSValue::from_bits(constructor.to_bits()).is_pointer() {
+        let constructor_ptr = crate::value::js_nanbox_get_pointer(constructor) as usize;
+        crate::closure::closure_set_dynamic_prop(
+            constructor_ptr,
+            "prototype",
+            crate::value::js_nanbox_pointer(proto as i64),
+        );
+        crate::object::set_builtin_property_attrs(
+            constructor_ptr,
+            "prototype".to_string(),
+            crate::object::PropertyAttrs::new(false, false, false),
+        );
         let key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
         // Spec shape for `constructor`: writable, NOT enumerable, configurable.
         crate::object::define_builtin_data_property(
@@ -222,7 +342,7 @@ pub(crate) fn is_payload_state_word(word: u64) -> bool {
 ///
 /// `external_bytes` is the native memory the payload really retains (heap
 /// buffers it owns, not `size_of::<T>()` alone unless that is all it holds);
-/// it feeds GC pacing until the payload is finalized. `own` lists node's own
+/// it feeds GC pacing until the payload is released. `own` lists node's own
 /// enumerable data properties in node's order (`[("_options", undefined)]`
 /// for a `Hash`); values may be heap values, they are rooted here.
 pub fn alloc<T: 'static>(
@@ -231,12 +351,41 @@ pub fn alloc<T: 'static>(
     external_bytes: usize,
     own: &[(&[u8], f64)],
 ) -> f64 {
+    let proto = family_prototype(family);
+    alloc_cell(family, Some(payload), external_bytes, own, proto)
+}
+
+/// Allocate an ordinary instance with its permanent cell but no resource.
+/// The first attach establishes the family's payload layout and drop thunk.
+pub fn alloc_closed(family: &'static NativePayloadFamily, own: &[(&[u8], f64)]) -> f64 {
+    let proto = family_prototype(family);
+    alloc_cell::<()>(family, None, 0, own, proto)
+}
+
+/// Allocate a payload-family instance linked to an already-materialized
+/// constructor prototype, including AsyncLocalStorage and AsyncResource.
+pub fn alloc_with_prototype<T: 'static>(
+    family: &'static NativePayloadFamily,
+    payload: T,
+    external_bytes: usize,
+    own: &[(&[u8], f64)],
+    proto: *mut ObjectHeader,
+) -> f64 {
+    alloc_cell(family, Some(payload), external_bytes, own, proto)
+}
+
+fn alloc_cell<T: 'static>(
+    family: &'static NativePayloadFamily,
+    payload: Option<T>,
+    external_bytes: usize,
+    own: &[(&[u8], f64)],
+    proto: *mut ObjectHeader,
+) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let own_roots: Vec<_> = own
         .iter()
         .map(|&(key, value)| (key, scope.root_nanbox_f64(value)))
         .collect();
-    let proto = family_prototype(family);
     if proto.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
@@ -248,18 +397,69 @@ pub fn alloc<T: 'static>(
     for (key, value) in &own_roots {
         set_own(&scope, &obj, key, value.get_nanbox_f64());
     }
+    attach_rooted(&obj, family, payload, external_bytes);
+    obj.with_mut_ptr::<ObjectHeader, _>(|obj| crate::value::js_nanbox_pointer(obj as i64))
+}
+
+/// Attach a payload to an existing ordinary object. This is the `super()`
+/// half of the pattern: a source-compiled subclass keeps its own class id and
+/// prototype, while its traced `native_state` owns the same typed cell as a
+/// direct instance.
+pub fn attach_to_object<T: 'static>(
+    value: f64,
+    family: &'static NativePayloadFamily,
+    payload: T,
+    external_bytes: usize,
+) -> bool {
+    let Some(obj) = any_object(value) else {
+        return false;
+    };
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj = scope.root_raw_mut_ptr(obj);
     let meta = obj
         .with_mut_ptr::<ObjectHeader, _>(|obj| unsafe { crate::object::object_meta_ensure(obj) });
     if meta.is_null() {
-        return f64::from_bits(crate::value::TAG_UNDEFINED);
+        return false;
     }
-    // The cell allocation may collect, which can move the meta record; it is
-    // re-read through the rooted object after.
-    let resource = Box::into_raw(Box::new(payload)) as *mut c_void;
+    let previous = unsafe { (*meta).native_state };
+    if is_payload_state_word(previous) {
+        let cell = (previous & crate::value::POINTER_MASK) as *mut NativeHandleHeader;
+        return attach_cell(
+            obj.with_mut_ptr::<ObjectHeader, _>(|obj| crate::value::js_nanbox_pointer(obj as i64)),
+            cell,
+            family,
+            payload,
+            external_bytes,
+        )
+        .is_ok();
+    }
+    attach_rooted(&obj, family, Some(payload), external_bytes);
+    true
+}
+
+fn attach_rooted<T: 'static>(
+    obj: &crate::gc::RuntimeHandle<'_>,
+    family: &'static NativePayloadFamily,
+    payload: Option<T>,
+    external_bytes: usize,
+) {
+    let meta = obj
+        .with_mut_ptr::<ObjectHeader, _>(|obj| unsafe { crate::object::object_meta_ensure(obj) });
+    if meta.is_null() {
+        return;
+    }
+    // The cell allocation may collect; re-read meta through the rooted object.
+    let resource = payload.map_or(std::ptr::null_mut(), |p| {
+        Box::into_raw(Box::new(p)) as *mut c_void
+    });
     let cell = unsafe {
         crate::native_handle::native_handle_new_rust_payload(
             resource,
-            type_tag::<T>(family.class_id),
+            if resource.is_null() {
+                family.class_id as u64
+            } else {
+                type_tag::<T>(family.class_id)
+            },
             drop_payload::<T>,
             family.name,
         )
@@ -268,8 +468,6 @@ pub fn alloc<T: 'static>(
     obj.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
         let meta = (*obj).meta;
         debug_assert!(!meta.is_null(), "object_meta_ensure ran above");
-        // GC_STORE_AUDIT(BARRIERED): metadata-record slot store + object
-        // barrier, exactly as `ObjectMeta::arguments` is stored.
         (*meta).native_state = word;
         crate::gc::runtime_write_barrier_slot(
             meta as usize,
@@ -277,12 +475,27 @@ pub fn alloc<T: 'static>(
             word,
         );
     });
+    if family.links_owner {
+        obj.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
+            let owner = crate::value::js_nanbox_pointer(obj as i64).to_bits();
+            // GC_STORE_AUDIT(BARRIERED): malloc cell -> nursery owner.
+            (*cell).owner = owner;
+            #[cfg(test)]
+            if callback_sabotage("barrier") {
+                return;
+            }
+            crate::gc::runtime_write_barrier_external_slot(
+                cell as usize,
+                &(*cell).owner as *const _ as usize,
+                owner,
+            );
+        });
+    }
     // Only now, with the cell reachable from the rooted object: reporting the
     // bytes can start a collection.
     if external_bytes != 0 {
         unsafe { crate::native_handle::native_handle_set_external_bytes(cell, external_bytes) };
     }
-    obj.with_mut_ptr::<ObjectHeader, _>(|obj| crate::value::js_nanbox_pointer(obj as i64))
 }
 
 /// A fresh instance of `class_id` linked to its family prototype `proto`,
@@ -351,6 +564,12 @@ unsafe fn mint_birth_record(
 /// The object behind `value` when it is an instance of `class_id`.
 #[inline]
 fn instance_of(value: f64, class_id: u32) -> Option<*mut ObjectHeader> {
+    let obj = any_object(value)?;
+    (unsafe { (*obj).class_id } == class_id).then_some(obj)
+}
+
+#[inline]
+fn any_object(value: f64) -> Option<*mut ObjectHeader> {
     let bits = value.to_bits();
     if bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
         return None;
@@ -360,8 +579,7 @@ fn instance_of(value: f64, class_id: u32) -> Option<*mut ObjectHeader> {
     if header.obj_type != crate::gc::GC_TYPE_OBJECT {
         return None;
     }
-    let obj = addr as *mut ObjectHeader;
-    (unsafe { (*obj).class_id } == class_id).then_some(obj)
+    Some(addr as *mut ObjectHeader)
 }
 
 #[inline]
@@ -409,14 +627,633 @@ pub unsafe fn payload_mut<'a, T: 'static>(
     Ok(&mut *(resource as *mut T))
 }
 
-/// Explicit close: drop the payload now and release its external bytes. The
-/// object stays valid and reads as [`PayloadMiss::Closed`] afterwards. True
-/// when this call dropped it; false for a foreign value or one already closed.
-pub fn close(value: f64, family: &NativePayloadFamily) -> bool {
-    match payload_cell(value, family.class_id) {
-        Ok(cell) => unsafe { crate::native_handle::native_handle_dispose_rust_payload(cell) },
-        Err(_) => false,
+/// The live payload attached to any ordinary object, including a subclass
+/// instance whose own class id differs from the native base's id.
+pub unsafe fn payload_mut_attached<'a, T: 'static>(
+    value: f64,
+    family: &NativePayloadFamily,
+) -> Result<&'a mut T, PayloadMiss> {
+    let obj = any_object(value).ok_or(PayloadMiss::Foreign)?;
+    let meta = (*obj).meta;
+    if meta.is_null() || !is_payload_state_word((*meta).native_state) {
+        return Err(PayloadMiss::Foreign);
     }
+    let cell = ((*meta).native_state & crate::value::POINTER_MASK) as *mut NativeHandleHeader;
+    if (*cell).type_id != type_tag::<T>(family.class_id) {
+        return Err(PayloadMiss::Foreign);
+    }
+    let resource =
+        crate::native_handle::native_handle_rust_payload_ptr(cell, type_tag::<T>(family.class_id));
+    if resource.is_null() {
+        return Err(PayloadMiss::Closed);
+    }
+    Ok(&mut *(resource as *mut T))
+}
+
+/// Result of an explicit close; the JS object remains a valid instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseOutcome {
+    Closed,
+    Deferred,
+    AlreadyClosed,
+    Foreign,
+}
+
+pub(crate) const PENDING: u8 = 1;
+pub(crate) const CLOSING: u8 = 2;
+
+/// The non-finalized cell states. Finalized cells answer PayloadMiss::Closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lifecycle {
+    Open,
+    Closing,
+    Closed,
+}
+
+pub fn lifecycle(value: f64, family: &NativePayloadFamily) -> Result<Lifecycle, PayloadMiss> {
+    let cell = payload_cell(value, family.class_id)?;
+    unsafe {
+        if (*cell).finalized != 0
+            || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+        {
+            return Err(PayloadMiss::Closed);
+        }
+        Ok(if (*cell).flags & CLOSING != 0 {
+            Lifecycle::Closing
+        } else if (*cell).resource_ptr.is_null() {
+            Lifecycle::Closed
+        } else {
+            Lifecycle::Open
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachMiss {
+    Foreign,
+    Open,
+    Closing,
+    Finalized,
+}
+
+/// CLOSED -> OPEN in the same cell. No JS or GC allocation before install.
+/// On rejection payload is dropped. Check lifecycle before opening a C resource.
+/// One payload type per family, including across reopen.
+pub fn attach<T: 'static>(
+    value: f64,
+    family: &'static NativePayloadFamily,
+    payload: T,
+    external_bytes: usize,
+) -> Result<(), AttachMiss> {
+    let cell = payload_cell(value, family.class_id).map_err(|_| AttachMiss::Foreign)?;
+    attach_cell(value, cell, family, payload, external_bytes)
+}
+
+fn attach_cell<T: 'static>(
+    value: f64,
+    cell: *mut NativeHandleHeader,
+    family: &'static NativePayloadFamily,
+    payload: T,
+    external_bytes: usize,
+) -> Result<(), AttachMiss> {
+    unsafe {
+        if (*cell).magic != crate::native_handle::NATIVE_HANDLE_MAGIC
+            || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+        {
+            return Err(AttachMiss::Foreign);
+        }
+        if (*cell).finalized != 0 && !lifecycle_sabotage("attach_finalized") {
+            return Err(AttachMiss::Finalized);
+        }
+        if (*cell).flags & CLOSING != 0 || (*cell).busy != 0 {
+            return Err(AttachMiss::Closing);
+        }
+        if !(*cell).resource_ptr.is_null() {
+            return Err(AttachMiss::Open);
+        }
+        let tag = type_tag::<T>(family.class_id);
+        if (*cell).type_id != family.class_id as u64
+            && ((*cell).type_id != tag || (*cell).finalizer != drop_payload::<T> as *mut c_void)
+        {
+            return Err(AttachMiss::Foreign);
+        }
+        // alloc_closed cannot know T. Establish the layout/thunk on first
+        // attach; subsequent opens keep both unchanged.
+        if (*cell).type_id == family.class_id as u64 {
+            (*cell).type_id = tag;
+            (*cell).finalizer = drop_payload::<T> as *mut c_void;
+        }
+        let resource = Box::into_raw(Box::new(payload)) as *mut c_void;
+        crate::native_handle::native_handle_attach_rust_payload(cell, resource);
+        // Root the owner before reporting bytes: pacing can collect. The
+        // payload is already installed and reachable through the owner.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let _owner = scope.root_nanbox_f64(value);
+        crate::native_handle::native_handle_set_external_bytes(cell, external_bytes);
+    }
+    Ok(())
+}
+
+/// A resource incarnation. Store it in reopenable payloads, children and data
+/// completions, and compare once before using the current resource.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenSerial(u64);
+static NEXT_OPEN_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_open_serial() -> OpenSerial {
+    let serial = NEXT_OPEN_SERIAL.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(serial, 0, "native open serial exhausted");
+    OpenSerial(serial)
+}
+
+/// Close immediately, or defer native destruction until the outer C call ends.
+pub fn close(value: f64, family: &NativePayloadFamily) -> CloseOutcome {
+    let Ok(cell) = payload_cell(value, family.class_id) else {
+        return CloseOutcome::Foreign;
+    };
+    unsafe {
+        if (*cell).finalized != 0 || (*cell).flags & CLOSING != 0 || (*cell).resource_ptr.is_null()
+        {
+            return CloseOutcome::AlreadyClosed;
+        }
+        // Preserve ordinary receiver thread validation (trampolines use link_owner).
+        if crate::native_handle::rust_payload_ptr_on_owner_thread(cell).is_null() {
+            return CloseOutcome::Foreign;
+        }
+        #[cfg(test)]
+        if callback_sabotage("close") {
+            crate::native_handle::native_handle_release_rust_payload(cell);
+            return CloseOutcome::Closed;
+        }
+        if (*cell).busy != 0 {
+            (*cell).flags |= CLOSING;
+            return CloseOutcome::Deferred;
+        }
+        crate::native_handle::native_handle_release_rust_payload(cell);
+        #[cfg(test)]
+        if lifecycle_sabotage("close_pin") {
+            link_ref(OwnerLink(cell as usize));
+        }
+        CloseOutcome::Closed
+    }
+}
+
+/// Stable, inert token. Send it to the owner thread; never dereference it on a
+/// native worker. Valid only while the C resource/sites or a link_ref keep the
+/// cell alive. Explicit close does not revoke outstanding refs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct OwnerLink(pub(crate) usize);
+
+/// Obtain a link in any non-finalized state with the traced owner edge enabled.
+pub fn owner_link(value: f64, family: &NativePayloadFamily) -> Result<OwnerLink, PayloadMiss> {
+    if !family.links_owner {
+        return Err(PayloadMiss::Foreign);
+    }
+    let cell = payload_cell(value, family.class_id)?;
+    unsafe {
+        if (*cell).magic != crate::native_handle::NATIVE_HANDLE_MAGIC
+            || (*cell).finalized != 0
+            || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+        {
+            return Err(PayloadMiss::Closed);
+        }
+        if (*cell).owner == 0 {
+            return Err(PayloadMiss::Foreign);
+        }
+    }
+    Ok(OwnerLink(cell as usize))
+}
+
+/// Never allocates or throws, including during finalization and on a wrong thread.
+///
+/// # Safety
+/// `link` must name a live cell, owned by its C resource or kept alive by link_ref.
+pub unsafe fn link_owner(link: OwnerLink) -> Option<f64> {
+    let cell = link.0 as *mut NativeHandleHeader;
+    #[cfg(test)]
+    if callback_sabotage("finalized_check") {
+        return Some(f64::from_bits((*cell).owner));
+    }
+    #[cfg(test)]
+    if callback_sabotage("thread") {
+        crate::native_handle::native_handle_rust_payload_ptr(cell, (*cell).type_id);
+    }
+    if crate::native_handle::rust_payload_ptr_on_owner_thread(cell).is_null() {
+        return None;
+    }
+    ((*cell).owner != 0).then(|| f64::from_bits((*cell).owner))
+}
+
+/// Owner lookup for pump events, including terminal events after release.
+/// Never throws or allocates. Read listeners from JS state at dispatch time.
+///
+/// # Safety
+/// The cell must be alive on its creator thread, kept by one ref per queued
+/// item. Drop items before worker heap teardown; never dispatch after teardown.
+pub unsafe fn link_event_owner(link: OwnerLink) -> Option<f64> {
+    let cell = link.0 as *mut NativeHandleHeader;
+    if (*cell).magic != crate::native_handle::NATIVE_HANDLE_MAGIC
+        || (*cell).finalized != 0
+        || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+    {
+        return None;
+    }
+    ((*cell).owner != 0).then(|| f64::from_bits((*cell).owner))
+}
+
+#[repr(C)]
+pub struct CallbackSite {
+    pub link: OwnerLink,
+    pub index: u32,
+}
+
+/// Stable userdata addresses; declare the C resource BEFORE this field so it
+/// closes before the sites are freed. Native destroy callbacks do not free sites.
+#[derive(Default)]
+pub struct CallbackSites(Vec<Box<CallbackSite>>);
+impl CallbackSites {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn site(&mut self, link: OwnerLink, index: u32) -> *mut c_void {
+        let mut site = Box::new(CallbackSite { link, index });
+        let ptr = &mut *site as *mut CallbackSite as *mut c_void;
+        self.0.push(site);
+        ptr
+    }
+}
+
+/// One C call. Finish explicitly BEFORE result conversion or a JS throw, and
+/// keep the receiver rooted across the call. No payload borrow/lock may span it.
+#[must_use = "finish after C returns, before any conversion or throw"]
+pub struct NativeCallGuard {
+    link: OwnerLink,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub fn enter(value: f64, family: &NativePayloadFamily) -> Result<NativeCallGuard, PayloadMiss> {
+    let link = owner_link(value, family)?;
+    unsafe {
+        let cell = link.0 as *mut NativeHandleHeader;
+        if crate::native_handle::rust_payload_ptr_on_owner_thread(cell).is_null() {
+            return Err(PayloadMiss::Closed);
+        }
+        #[cfg(test)]
+        if callback_sabotage("reentry") && (*cell).busy != 0 {
+            return Err(PayloadMiss::Closed);
+        }
+        (*cell).busy = (*cell)
+            .busy
+            .checked_add(1)
+            .expect("native call nesting overflow");
+    }
+    Ok(NativeCallGuard {
+        link,
+        _thread: std::marker::PhantomData,
+    })
+}
+
+/// Finish outside C frames. A callback exception takes priority over close.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CallEnd {
+    Threw(f64),
+    Closed,
+}
+
+impl NativeCallGuard {
+    /// Decrement busy, take the first pending exception, then complete a
+    /// deferred close at zero. Return the exception to throw outside C frames.
+    pub fn finish(self) -> Result<(), CallEnd> {
+        unsafe {
+            let cell = self.link.0 as *mut NativeHandleHeader;
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let owner = scope.root_nanbox_f64(f64::from_bits((*cell).owner));
+            assert_ne!((*cell).busy, 0, "unbalanced native call");
+            (*cell).busy -= 1;
+            let closing = (*cell).flags & CLOSING != 0;
+            let result = if (*cell).flags & PENDING != 0 {
+                let state = root_pointer::<ObjectHeader>(
+                    &scope,
+                    js_state_for_class(owner.get_nanbox_f64(), (*cell).type_id as u32, false),
+                );
+                let err = scope.root_nanbox_f64(state_field(&state, b"pendingException"));
+                // No allocation follows this take: the existing plain slot is cleared.
+                set_state_field(&scope, &state, b"pendingException", undefined());
+                (*cell).flags &= !PENDING;
+                if closing && lifecycle_sabotage("closed_priority") {
+                    Err(CallEnd::Closed)
+                } else {
+                    Err(CallEnd::Threw(err.get_nanbox_f64()))
+                }
+            } else if closing {
+                Err(CallEnd::Closed)
+            } else {
+                Ok(())
+            };
+            if (*cell).busy == 0 && (*cell).flags & CLOSING != 0 {
+                crate::native_handle::native_handle_release_rust_payload(cell);
+            }
+            result
+        }
+    }
+}
+
+fn undefined() -> f64 {
+    f64::from_bits(crate::value::TAG_UNDEFINED)
+}
+
+fn root_pointer<'a, T>(
+    scope: &'a crate::gc::RuntimeHandleScope,
+    value: f64,
+) -> crate::gc::RuntimeHandle<'a> {
+    scope.root_raw_mut_ptr(crate::JSValue::from_bits(value.to_bits()).as_pointer::<T>() as *mut T)
+}
+
+/// Runtime-owned data slots: no prototype lookup or accessor invocation can
+/// run JS while a native trampoline is preparing or parking an exception.
+fn state_field(state: &crate::gc::RuntimeHandle<'_>, key: &[u8]) -> f64 {
+    state.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
+        state_key_index(obj, key).map_or_else(undefined, |i| {
+            f64::from_bits(crate::object::js_object_get_field(obj, i as u32).bits())
+        })
+    })
+}
+
+unsafe fn state_key_index(obj: *const ObjectHeader, name: &[u8]) -> Option<usize> {
+    let keys = crate::object::object_keys(obj);
+    let (slots, len) = keys.dense_slots();
+    (0..(keys.count() as usize).min(len)).find(|&i| {
+        crate::string::js_string_key_matches_bytes(
+            crate::JSValue::from_bits((*slots.add(i)).to_bits()),
+            name,
+        )
+    })
+}
+
+fn set_state_field(
+    scope: &crate::gc::RuntimeHandleScope,
+    state: &crate::gc::RuntimeHandle<'_>,
+    key: &[u8],
+    value: f64,
+) {
+    let value = scope.root_nanbox_f64(value);
+    if state.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
+        if let Some(i) = state_key_index(obj, key) {
+            // The ordinary indexed store includes the exact-slot barrier.
+            crate::object::js_object_set_field(
+                obj,
+                i as u32,
+                crate::JSValue::from_bits(value.get_nanbox_f64().to_bits()),
+            );
+            true
+        } else {
+            false
+        }
+    }) {
+        return;
+    }
+    let key = scope.root_string_ptr(crate::string::intern_ascii_literal(key));
+    key.with_const_ptr::<crate::StringHeader, _>(|key| {
+        state.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
+            // Define an own data slot directly; [[Set]] could call an inherited setter.
+            crate::object::object_ops::define_property_force_store_value(
+                obj,
+                key,
+                value.get_nanbox_f64(),
+            );
+        });
+    });
+}
+
+/// The callbacks array on the owner's traced JS state, created on demand.
+pub fn callbacks(owner: f64, family: &NativePayloadFamily) -> f64 {
+    if !is_instance(owner, family) {
+        return undefined();
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let state = root_pointer::<ObjectHeader>(&scope, js_state(owner, family, true));
+    let existing = state_field(&state, b"callbacks");
+    if crate::JSValue::from_bits(existing.to_bits()).is_pointer() {
+        return existing;
+    }
+    let array = scope.root_raw_mut_ptr(crate::array::js_array_alloc(0));
+    let value = array.with_mut_ptr::<crate::array::ArrayHeader, _>(|p| {
+        crate::value::js_nanbox_pointer(p as i64)
+    });
+    set_state_field(&scope, &state, b"callbacks", value);
+    array
+        .with_mut_ptr::<crate::array::ArrayHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64))
+}
+
+pub fn set_callback(owner: f64, family: &NativePayloadFamily, index: u32, f: f64) {
+    if !is_instance(owner, family) {
+        return;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let f = scope.root_nanbox_f64(f);
+    let owner = scope.root_nanbox_f64(owner);
+    let array = root_pointer::<crate::array::ArrayHeader>(
+        &scope,
+        callbacks(owner.get_nanbox_f64(), family),
+    );
+    let updated = array.with_mut_ptr::<crate::array::ArrayHeader, _>(|p| {
+        crate::array::js_array_set_f64_extend(p, index, f.get_nanbox_f64())
+    });
+    let updated = scope.root_raw_mut_ptr(updated);
+    let state =
+        root_pointer::<ObjectHeader>(&scope, js_state(owner.get_nanbox_f64(), family, true));
+    set_state_field(
+        &scope,
+        &state,
+        b"callbacks",
+        updated.with_mut_ptr::<crate::array::ArrayHeader, _>(|p| {
+            crate::value::js_nanbox_pointer(p as i64)
+        }),
+    );
+}
+
+/// Call JS under a catch, park the first throw on the owner and return an error
+/// to C. A pending throw suppresses every subsequent callback until finish.
+///
+/// # Safety
+/// Values and args must be valid on the creator thread. A C trampoline must
+/// root the owner before any allocation and must never throw through C frames.
+pub unsafe fn call_from_native(
+    owner: f64,
+    callee: f64,
+    this: f64,
+    args: &[f64],
+) -> Result<f64, ()> {
+    let bits = owner.to_bits();
+    if bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
+        return Err(());
+    }
+    let Some(header) =
+        crate::value::addr_class::try_read_gc_header((bits & crate::value::POINTER_MASK) as usize)
+    else {
+        return Err(());
+    };
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+        return Err(());
+    }
+    let class_id = (*((bits & crate::value::POINTER_MASK) as *const ObjectHeader)).class_id;
+    let Ok(cell) = payload_cell(owner, class_id) else {
+        return Err(());
+    };
+    if crate::native_handle::rust_payload_ptr_on_owner_thread(cell).is_null()
+        || ((*cell).flags & PENDING != 0 && !pending_sabotage())
+    {
+        return Err(());
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner = scope.root_nanbox_f64(owner);
+    let callee = scope.root_nanbox_f64(callee);
+    let this = scope.root_nanbox_f64(this);
+    let args_roots: Vec<_> = args.iter().map(|&v| scope.root_nanbox_f64(v)).collect();
+    // Pre-create the pending field before running JS. The throw landing only
+    // writes an existing slot: it must not allocate with an unrooted exception.
+    let state = root_pointer::<ObjectHeader>(
+        &scope,
+        js_state_for_class(owner.get_nanbox_f64(), class_id, true),
+    );
+    set_state_field(&scope, &state, b"pendingException", undefined());
+    let args: Vec<_> = args_roots.iter().map(|v| v.get_nanbox_f64()).collect();
+    #[cfg(test)]
+    if callback_sabotage("catch") {
+        return Ok(crate::closure::native_call_value_this(
+            callee.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(this.get_nanbox_f64()),
+            args.as_ptr(),
+            args.len(),
+        ));
+    }
+    match crate::exception::catch_js_throw(|| {
+        crate::closure::native_call_value_this(
+            callee.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(this.get_nanbox_f64()),
+            args.as_ptr(),
+            args.len(),
+        )
+    }) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            // JS may have moved the owner. Re-read it through its handle;
+            // the pending helper also preserves an earlier nested failure.
+            let _ = set_pending_exception(owner.get_nanbox_f64(), err);
+            Err(())
+        }
+    }
+}
+
+/// Park a trampoline validation failure without throwing through C. Returns
+/// Err when the receiver is invalid/finalized/wrong-thread or an earlier throw
+/// is pending. Accepts CLOSING while a guard still owns the native call.
+/// The first pending exception wins; this function never calls JS.
+pub fn set_pending_exception(owner: f64, exception: f64) -> Result<(), ()> {
+    let bits = owner.to_bits();
+    if bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
+        return Err(());
+    }
+    let addr = (bits & crate::value::POINTER_MASK) as usize;
+    let Some(header) = (unsafe { crate::value::addr_class::try_read_gc_header(addr) }) else {
+        return Err(());
+    };
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+        return Err(());
+    }
+    let class_id = unsafe { (*(addr as *const ObjectHeader)).class_id };
+    let cell = payload_cell(owner, class_id).map_err(|_| ())?;
+    unsafe {
+        if (*cell).magic != crate::native_handle::NATIVE_HANDLE_MAGIC
+            || (*cell).finalized != 0
+            || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+            || (*cell).flags & PENDING != 0
+        {
+            return Err(());
+        }
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let owner = scope.root_nanbox_f64(owner);
+        let exception = scope.root_nanbox_f64(exception);
+        let state = root_pointer::<ObjectHeader>(
+            &scope,
+            js_state_for_class(owner.get_nanbox_f64(), class_id, true),
+        );
+        set_state_field(
+            &scope,
+            &state,
+            b"pendingException",
+            exception.get_nanbox_f64(),
+        );
+        (*cell).flags |= PENDING;
+        Ok(())
+    }
+}
+
+/// # Safety
+/// Call on the creator thread with a live cell, once per outstanding item.
+pub unsafe fn link_ref(link: OwnerLink) {
+    let cell = link.0 as *mut NativeHandleHeader;
+    assert_eq!(
+        (*cell).creator_thread_id,
+        crate::native_handle::current_thread_id()
+    );
+    (*cell).refs = (*cell).refs.checked_add(1).expect("native refs overflow");
+    #[cfg(test)]
+    if callback_sabotage("pin") {
+        return;
+    }
+    if (*cell).refs == 1 {
+        #[cfg(test)]
+        if callback_sabotage("latch") {
+            crate::gc::pin_object(
+                (((*cell).owner & crate::value::POINTER_MASK) as *mut u8)
+                    .sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader,
+            );
+            return;
+        }
+        crate::gc::pin_object_non_young(
+            (cell as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader
+        );
+    }
+}
+
+/// # Safety
+/// Match a link_ref on the creator thread, even when explicitly closed.
+pub unsafe fn link_unref(link: OwnerLink) {
+    let cell = link.0 as *mut NativeHandleHeader;
+    assert_eq!(
+        (*cell).creator_thread_id,
+        crate::native_handle::current_thread_id()
+    );
+    assert_ne!((*cell).refs, 0, "unbalanced native unref");
+    (*cell).refs -= 1;
+    if (*cell).refs == 0 {
+        crate::gc::unpin_object(
+            (cell as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader
+        );
+    }
+}
+
+/// Explicitly close a payload attached to an ordinary subclass instance.
+///
+/// Unlike [`close`], this accepts an object whose own class id differs from
+/// the native base family.  The typed probe is what proves that the attached
+/// cell belongs to `family`; a foreign native cell is never disposed.
+pub fn close_attached<T: 'static>(value: f64, family: &NativePayloadFamily) -> bool {
+    if unsafe { payload_mut_attached::<T>(value, family) }.is_err() {
+        return false;
+    }
+    let Some(obj) = any_object(value) else {
+        return false;
+    };
+    let meta = unsafe { (*obj).meta };
+    if meta.is_null() || !is_payload_state_word(unsafe { (*meta).native_state }) {
+        return false;
+    }
+    let cell =
+        (unsafe { (*meta).native_state } & crate::value::POINTER_MASK) as *mut NativeHandleHeader;
+    unsafe { crate::native_handle::native_handle_release_rust_payload(cell) }
 }
 
 /// Re-state the native bytes a live payload retains (after a buffer grew or
@@ -482,12 +1319,7 @@ pub(crate) unsafe fn try_payload_method_fast_dispatch(
         return None;
     }
     let obj = addr as *const ObjectHeader;
-    let index = (*obj)
-        .class_id
-        .wrapping_sub(crate::native_class_ids::WEB_BUILTIN_BLOCK_START) as usize;
-    if index >= PROTOTYPE_SLOTS {
-        return None;
-    }
+    let index = slot_index_if_payload((*obj).class_id)?;
     let proto = PAYLOAD_PROTOTYPES.with(|slots| slots[index].load(Ordering::Acquire))
         as *const ObjectHeader;
     if proto.is_null()
@@ -535,18 +1367,17 @@ pub(crate) const JS_STATE_KEY: &[u8] = b"#<perry:native-payload-js-state>";
 /// for an instance is a traced field that moves and dies with it. Created on
 /// first use when `create` is true; `undefined` otherwise when absent.
 pub fn js_state(value: f64, family: &NativePayloadFamily, create: bool) -> f64 {
-    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
-    let Some(obj) = instance_of(value, family.class_id) else {
+    js_state_for_class(value, family.class_id, create)
+}
+
+fn js_state_for_class(value: f64, class_id: u32, create: bool) -> f64 {
+    let undefined = undefined();
+    let Some(obj) = instance_of(value, class_id) else {
         return undefined;
     };
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj = scope.root_raw_mut_ptr(obj);
-    let key = scope.root_string_ptr(crate::string::intern_ascii_literal(JS_STATE_KEY));
-    let existing = key.with_const_ptr::<crate::StringHeader, _>(|key| {
-        obj.with_mut_ptr::<ObjectHeader, _>(|obj| {
-            crate::object::js_object_get_field_by_name_f64(obj, key)
-        })
-    });
+    let existing = state_field(&obj, JS_STATE_KEY);
     if crate::value::JSValue::from_bits(existing.to_bits()).is_pointer() || !create {
         return existing;
     }
@@ -555,7 +1386,7 @@ pub fn js_state(value: f64, family: &NativePayloadFamily, create: bool) -> f64 {
         return undefined;
     }
     let state = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(state as i64));
-    set_own(&scope, &obj, JS_STATE_KEY, state.get_nanbox_f64());
+    set_state_field(&scope, &obj, JS_STATE_KEY, state.get_nanbox_f64());
     state.get_nanbox_f64()
 }
 
@@ -586,6 +1417,9 @@ pub(crate) fn export_class_id(module: &str, export: &str) -> Option<u32> {
         ("crypto", "Hmac") => ids::CRYPTO_HMAC,
         ("crypto", "Cipheriv") => ids::CRYPTO_CIPHERIV,
         ("crypto", "Decipheriv") => ids::CRYPTO_DECIPHERIV,
+        ("async_hooks", "AsyncLocalStorage") => ids::ASYNC_LOCAL_STORAGE_LEGACY,
+        ("async_hooks", "AsyncResource") => ids::ASYNC_RESOURCE_LEGACY,
+        ("domain", "Domain") => ids::DOMAIN,
         _ => return None,
     })
 }
@@ -600,4 +1434,35 @@ pub(crate) fn reset_payload_prototypes_for_tests() {
             slot.store(0, Ordering::Release);
         }
     });
+}
+
+// Faults exist only in unit-test binaries, selected by child processes. No
+// production flags, owner registries or latch are introduced.
+#[cfg(test)]
+pub(crate) fn callback_sabotage(fault: &str) -> bool {
+    std::env::var("PERRY_TEST_CALLBACK_SABOTAGE").as_deref() == Ok(fault)
+}
+#[inline]
+fn pending_sabotage() -> bool {
+    #[cfg(test)]
+    {
+        callback_sabotage("pending")
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[inline]
+pub(crate) fn lifecycle_sabotage(fault: &str) -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("PERRY_TEST_LIFECYCLE_SABOTAGE").as_deref() == Ok(fault)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = fault;
+        false
+    }
 }

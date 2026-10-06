@@ -6,6 +6,7 @@ mod bound_method_builder;
 mod call_argument_lists;
 mod callback_scanners;
 mod fs_options_object;
+mod function_attrs_old_minor;
 mod generator_attach_prototype;
 mod handle_stack;
 mod hidden_keys;
@@ -671,7 +672,9 @@ fn hook_options(fields: &[(&[u8], *mut crate::closure::ClosureHeader)]) -> f64 {
 
 fn enable_async_hook(fields: &[(&[u8], *mut crate::closure::ClosureHeader)]) -> i64 {
     let options = hook_options(fields);
-    let handle = crate::async_hooks::js_async_hooks_create_hook(options);
+    let handle = crate::value::js_nanbox_get_pointer(
+        crate::async_hooks::js_async_hooks_create_hook(options),
+    );
     crate::async_hooks::js_async_hook_enable(handle);
     handle
 }

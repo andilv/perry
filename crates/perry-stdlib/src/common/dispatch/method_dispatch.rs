@@ -50,7 +50,15 @@ unsafe fn try_dispatch_external_zlib_stream(
             | "addListener"
             | "off"
             | "removeListener"
+            | "listenerCount"
             | "pipe"
+            | "iterator"
+            | "@@asyncIterator"
+            | "pause"
+            | "resume"
+            | "_perryDrain"
+            | "_perryIteratorState"
+            | "_perryIteratorError"
             | "flush"
             | "params"
             | "reset"
@@ -271,26 +279,10 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
     let _ = args;
     let _ = handle;
 
-    // Domain methods have no spelling in common with this stream vocabulary.
-    // Try the owning dispatcher before touching the unrelated Common map.
-    if static_name.is_some() {
-        try_arm!(ARM_STREAMS, handle, method_name, &args);
-    }
-
-    if let Some(v) = crate::domain::dispatch_domain_method(handle, method_name, &args) {
-        return v;
-    }
-
-    if static_name.is_none() {
-        try_arm!(ARM_STREAMS, handle, method_name, &args);
-    }
+    try_arm!(ARM_STREAMS, handle, method_name, &args);
 
     // Dispatchers below gate on registry membership plus method vocabulary
     // because native handle id spaces are not unified (#91).
-
-    if let Some(value) = dispatch_async_local_storage_method(handle, method_name, &args) {
-        return value;
-    }
 
     try_arm!(ARM_NODEMAILER, handle, method_name, &args);
 

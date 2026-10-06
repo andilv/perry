@@ -17,7 +17,6 @@ use std::sync::{
 };
 
 mod async_hooks_exports;
-pub(crate) use async_hooks_exports::async_resource_prototype_method_value;
 mod callable_export_arity_table;
 mod callable_export_check;
 mod callable_export_table;
@@ -27,6 +26,7 @@ pub(crate) use perf_instance_bind::{instance_bound_perf_method, performance_name
 pub(crate) mod constants;
 mod constants_tables;
 mod constructor_exports;
+pub(crate) mod constructor_shapes;
 mod module_keys;
 mod name_tables;
 mod namespace_builders;
@@ -43,18 +43,21 @@ pub(crate) use callable_exports::minted_native_callable_export;
 pub(crate) use callable_exports::test_collect_native_export_after_alloc;
 pub(crate) use callable_exports::{
     bound_native_callable_module_and_method, bound_native_callable_value_arity,
-    buffer_constructor_value, builtin_closure_is_non_constructable_value, builtin_closure_length,
+    buffer_constructor_value, buffer_intrinsic_prototype_parent, buffer_intrinsic_prototype_value,
+    buffer_original_prototype_value, builtin_closure_is_non_constructable_value,
+    builtin_closure_length, cached_buffer_intrinsic_prototype_value,
     fs_namespace_descriptor_getter_value, fs_namespace_descriptor_setter_value,
     is_buffer_constructor_value, is_cluster_emitter_method, module_builtin_modules_value,
     module_cjs_cache_value, module_cjs_extensions_value, module_cjs_global_paths_value,
     module_cjs_path_cache_value, module_cjs_prototype_for_instance, module_constants_value,
     native_string_value, prune_dead_builtin_closure_metadata_owners,
     prune_dead_builtin_closure_metadata_owners_young, scan_builtin_closure_metadata_roots_mut,
-    scan_tls_derived_prototype_roots_mut, set_bound_native_closure_name,
-    set_builtin_closure_length, set_builtin_closure_non_constructable,
-    sqlite_session_constructor_value, sqlite_statement_sync_constructor_value,
-    timers_promises_parent_namespace, tls_constructor_prototype_is_instance_of,
-    util_inspect_default_options_value, zlib_codes_object,
+    scan_tls_derived_prototype_roots_mut, set_bound_native_closure_metadata,
+    set_bound_native_closure_name, set_builtin_closure_length,
+    set_builtin_closure_non_constructable, sqlite_session_constructor_value,
+    sqlite_statement_sync_constructor_value, timers_promises_parent_namespace,
+    tls_constructor_prototype_is_instance_of, util_inspect_default_options_value,
+    zlib_codes_object,
 };
 pub(crate) use constants::{get_native_module_constant, native_module_constant_is_live};
 pub(crate) use constructor_exports::{
@@ -78,8 +81,11 @@ pub(crate) use vtable_impls::vt_own_keys_array;
 pub(crate) use web_locks::{worker_threads_locks_value, WebLocksState};
 
 crate::perry_thread_local! {
-    pub(crate) static NATIVE_CALLABLE_EXPORTS: RefCell<HashMap<String, u64>> =
-        RefCell::new(HashMap::new());
+    /// Every minted bound export by `"<module>\0<property>"`. Read on hot
+    /// paths (`new EventEmitter()` resolves its prototype through it), so it
+    /// hashes with aHash, which keeps a random key without SipHash's rounds.
+    pub(crate) static NATIVE_CALLABLE_EXPORTS: RefCell<HashMap<String, u64, ahash::RandomState>> =
+        RefCell::new(HashMap::default());
     pub(crate) static NATIVE_MODULE_ACCESSOR_EXPORTS: RefCell<HashMap<String, u64>> =
         RefCell::new(HashMap::new());
     static HANDLE_PROPERTY_BIND_REENTRY: Cell<bool> = const { Cell::new(false) };
@@ -1297,10 +1303,7 @@ pub(crate) fn build_symbol_bound_method_closure(
         param_count
     };
     closure_handle.with_mut_ptr::<crate::closure::ClosureHeader, _>(|closure| {
-        set_builtin_closure_length(closure as usize, spec_length);
-    });
-    closure_handle.with_mut_ptr::<crate::closure::ClosureHeader, _>(|closure| {
-        set_bound_native_closure_name(closure, display_name)
+        set_bound_native_closure_metadata(closure, display_name, spec_length)
     });
     closure_handle.with_mut_ptr::<crate::closure::ClosureHeader, _>(|closure| {
         crate::gc::runtime_write_barrier_root_heap_word(closure as u64)

@@ -46,10 +46,10 @@ pub use dynamic_import::{
     collect_dynamic_import_local_candidate_literals, collect_dynamic_import_param_literals,
     collect_module_const_locals, detect_top_level_await, dynamic_import_glob_pattern,
     flatten_exports, for_each_dynamic_import, for_each_dynamic_import_mut, for_each_module_expr,
-    for_each_worker_new, for_each_worker_new_mut, resolve_import_path,
+    for_each_worker_new, for_each_worker_new_mut, module_uses_worker_threads, resolve_import_path,
     resolve_import_path_with_consts, resolve_import_path_with_consts_and_params,
-    resolve_import_path_with_context, resolve_worker_path, FlatExport, Resolution,
-    DYNAMIC_IMPORT_PATH_CAP,
+    resolve_import_path_with_context, resolve_worker_path, worker_url_literals, FlatExport,
+    Resolution, WorkerUrl, DYNAMIC_IMPORT_PATH_CAP,
 };
 pub use egress::{audit_module_egress, EgressRefusalReason, EgressViolation};
 pub use enums::fix_imported_enums;
@@ -71,7 +71,7 @@ pub use lower::{
     lower_module_with_class_id, lower_module_with_class_id_and_types,
     lower_module_with_class_id_types_and_seed, lower_module_with_class_id_types_seed_and_entry,
 };
-pub use monomorph::monomorphize_module;
+pub use monomorph::{monomorphize_module, monomorphize_modules};
 pub use native_profile::exported_native_pod_abi;
 pub use patched_builtins::{
     clear_patched_builtins, patched_prototype_methods, scan_module as scan_patched_builtins,
