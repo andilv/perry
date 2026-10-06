@@ -91,7 +91,7 @@ jobs:
         if: steps.filter.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 'nightly-2026-08-20'
+          toolchain: 'nightly-2026-10-04'
           targets: ${{ matrix.target }}
 
       - uses: ./.github/actions/setup-llvm22
@@ -124,6 +124,22 @@ jobs:
           else
             echo "triple=${{ matrix.target }}" >> "$GITHUB_OUTPUT"
           fi
+          # Cargo maps the `dev` profile to the `debug` output dir; every
+          # other profile uses its own name. Packaging below must read from
+          # the real dir or `profile: dev` breaks every cp.
+          if [ "${{ github.event.inputs.profile }}" = "dev" ]; then
+            echo "outdir=debug" >> "$GITHUB_OUTPUT"
+          else
+            echo "outdir=${{ github.event.inputs.profile }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Ensure target std is installed
+        # dtolnay installs `targets:` on its own toolchain, but
+        # rust-toolchain.toml overrides the active toolchain for every cargo
+        # invocation — that toolchain never got the target's rust-std, which
+        # is exactly the musl E0463 (`can't find crate for core`). Install on
+        # the resolved triple (covers the `target` input override too).
+        if: steps.filter.outputs.run == 'true'
+        run: rustup target add ${{ steps.target.outputs.triple }}
 
       - name: Build perry
         if: steps.filter.outputs.run == 'true'
@@ -145,7 +161,7 @@ jobs:
       - name: Verify musl binary is fully static
         if: steps.filter.outputs.run == 'true' && matrix.musl == true
         run: |
-          BIN="target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry"
+          BIN="target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/perry"
           file "$BIN" | grep -q static || { echo "::error::$BIN is not statically linked"; exit 1; }
           if readelf -l "$BIN" | grep -q INTERP; then
             echo "::error::$BIN has a dynamic interpreter — musl artifact regressed to glibc-hybrid"
@@ -185,25 +201,25 @@ jobs:
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
         run: |
           mkdir -p staging
-          cp target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry staging/
+          cp target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/perry staging/
           for lib in libperry_runtime.a libperry_stdlib.a; do
-            cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging/
+            cp "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/$lib" staging/
           done
-          for lib in target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/libperry_ext_*.a; do
+          for lib in target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/libperry_ext_*.a; do
             [ -f "$lib" ] && cp "$lib" staging/
           done
           for lib in libperry_ui_macos.a libperry_ui_gtk4.a; do
-            [ -f "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" ] && \
-              cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging/
+            [ -f "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/$lib" ] && \
+              cp "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/$lib" staging/
           done
           cd staging
           tar czf ../${{ matrix.artifact }}.tar.gz *
           cd ..
           # Lite bundle - perry + stdlib + runtime only, no ext/UI libs
           mkdir -p staging-lite
-          cp target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry staging-lite/
+          cp target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/perry staging-lite/
           for lib in libperry_runtime.a libperry_stdlib.a; do
-            cp "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib" staging-lite/
+            cp "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/$lib" staging-lite/
           done
           cd staging-lite
           tar czf ../${{ matrix.artifact }}-lite.tar.gz *
@@ -213,21 +229,21 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path staging
-          Copy-Item "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry.exe" staging/
+          Copy-Item "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/perry.exe" staging/
           $libs = @("perry_runtime.lib", "perry_stdlib.lib")
           foreach ($lib in $libs) {
-            $path = "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib"
+            $path = "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/$lib"
             if (Test-Path $path) { Copy-Item $path staging/ }
           }
-          Get-ChildItem "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry_ext_*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
+          Get-ChildItem "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/perry_ext_*.lib" -ErrorAction SilentlyContinue | ForEach-Object {
             Copy-Item $_.FullName staging/
           }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
           # Lite bundle - perry + stdlib + runtime only, no ext/UI libs
           New-Item -ItemType Directory -Force -Path staging-lite
-          Copy-Item "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/perry.exe" staging-lite/
+          Copy-Item "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/perry.exe" staging-lite/
           foreach ($lib in $libs) {
-            $path = "target/${{ steps.target.outputs.triple }}/${{ github.event.inputs.profile }}/$lib"
+            $path = "target/${{ steps.target.outputs.triple }}/${{ steps.target.outputs.outdir }}/$lib"
             if (Test-Path $path) { Copy-Item $path staging-lite/ }
           }
           Compress-Archive -Path staging-lite/* -DestinationPath "${{ matrix.artifact }}-lite.zip"
@@ -237,7 +253,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: "*.tar.gz"
+          path: "${{ matrix.artifact }}.tar.gz"
 
       - name: Upload lite artifact (Unix)
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
@@ -251,7 +267,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: "*.zip"
+          path: "${{ matrix.artifact }}.zip"
 
       - name: Upload lite artifact (Windows)
         if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
