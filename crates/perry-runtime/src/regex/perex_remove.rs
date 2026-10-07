@@ -30,17 +30,18 @@ pub(super) fn try_remove(
     };
     if !empty
         || !JSValue::from_bits(receiver.to_bits()).is_any_string()
-        || !crate::object::regex_canonical::replace(search)
+        || !crate::object::regex_read_sites::replace(search)
     {
         return Ok(None);
     }
     let re = crate::value::js_nanbox_get_pointer(search) as *mut RegExpHeader;
     let (global, sticky, unicode, stored) = unsafe {
+        let data = &*crate::regex::regexp_data_ptr(re);
         (
-            (*re).global,
-            (*re).sticky,
-            (*re).unicode,
-            JSValue::from_bits((*re).last_index),
+            data.global,
+            data.sticky,
+            data.unicode,
+            JSValue::from_bits(crate::regex::get_last_index(re).to_bits()),
         )
     };
     if !stored.is_number() {

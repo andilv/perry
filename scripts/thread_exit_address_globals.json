@@ -385,7 +385,7 @@
     "OVERRIDES"
    ],
    "verdict": "no_heap_address",
-   "why": "function_name_overrides: func_ptr -> Arc<[u8]> owned name, written by js_register_function_name / register_function_name_if_absent; all callers key by ClosureHeader.func_ptr or thunk addresses (symbol/properties.rs:278, keys_array.rs:692, util_promisify.rs:168, populate.rs:658) — code addresses, not the closure. | (second declaration) function_source_overrides (fn_metadata.rs:358): func_ptr code address -> Arc<[u8]> copied source + non-strict flag, written by js_register_function_source; keys are code addresses."
+   "why": "function_name_overrides: func_ptr -> Arc<[u8]> owned name, written by js_register_function_name / register_function_name_if_absent; all callers key by ClosureHeader.func_ptr or thunk addresses (symbol/properties.rs:278, keys_array.rs:692, util_promisify.rs:168, populate.rs:658) \u2014 code addresses, not the closure. | (second declaration) function_source_overrides (fn_metadata.rs:358): func_ptr code address -> Arc<[u8]> copied source + non-strict flag, written by js_register_function_source; keys are code addresses."
   },
   {
    "file": "crates/perry-runtime/src/tls_hot.rs",
@@ -960,33 +960,6 @@
    "why": "OnceLock<Option<StaticSymbolIndex>> of relocated text-symbol start addresses and demangled String names loaded from the executable image (error_stack_frames.rs:429-438); code addresses. | (second declaration) OnceLock<Mutex<Option<CodeSymbolIndex>>> of (generated function start address, Arc<[u8]> display name) snapshotted from the codegen function registry (error_stack_frames.rs:581-592); code addresses."
   },
   {
-   "file": "crates/perry-stdlib/src/sqlite.rs",
-   "names": [
-    "NODE_SQLITE_CUSTOM_FUNCTIONS"
-   ],
-   "verdict": "thread_exit_invalidated",
-   "why": "Addresses of SQLite-owned boxes whose callback is a closure from the thread that called db.function(); a freed callback is set to undefined and the box unregistered at thread exit (xDestroy still frees it).",
-   "hook": "release_node_sqlite_callbacks_in_freed_ranges"
-  },
-  {
-   "file": "crates/perry-stdlib/src/sqlite.rs",
-   "names": [
-    "NODE_SQLITE_CUSTOM_AGGREGATES"
-   ],
-   "verdict": "thread_exit_invalidated",
-   "why": "Boxes holding db.aggregate() start/step/result/inverse closures; freed slots become undefined and the box is unregistered at thread exit.",
-   "hook": "release_node_sqlite_callbacks_in_freed_ranges"
-  },
-  {
-   "file": "crates/perry-stdlib/src/sqlite.rs",
-   "names": [
-    "NODE_SQLITE_ACTIVE_AGGREGATES"
-   ],
-   "verdict": "thread_exit_invalidated",
-   "why": "Running-aggregate state boxes; a freed state becomes undefined and the box is unregistered at thread exit, xFinal frees it as before.",
-   "hook": "release_node_sqlite_callbacks_in_freed_ranges"
-  },
-  {
    "file": "crates/perry-runtime/src/object/nm_namespace_hooks.rs",
    "names": [
     "NM_NAMESPACE_OPS"
@@ -1434,7 +1407,7 @@
     "SITES"
    ],
    "verdict": "process_global_allocation",
-   "why": "Sampled allocation-site table; `live` maps pointers returned by the process GlobalAlloc (CensusAlloc wrapping the system/mimalloc allocator, alloc_census.rs:232) to site ids, and record_free (:265) removes the entry on every dealloc — including arena blocks released through the allocator — so addresses are never stale."
+   "why": "Sampled allocation-site table; `live` maps pointers returned by the process GlobalAlloc (CensusAlloc wrapping the system/mimalloc allocator, alloc_census.rs:232) to site ids, and record_free (:265) removes the entry on every dealloc \u2014 including arena blocks released through the allocator \u2014 so addresses are never stale."
   },
   {
    "file": "crates/perry-runtime/src/closure/dynamic_props.rs",
@@ -1642,7 +1615,7 @@
     "MT_RUN_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1650,7 +1623,7 @@
     "MT_DRAIN_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1658,7 +1631,7 @@
     "MT_EMPTY_DRAIN_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1666,7 +1639,7 @@
     "MT_THENABLE_PROBE_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1674,7 +1647,7 @@
     "MT_PROMISE_NEW_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1682,7 +1655,7 @@
     "MT_PROMISE_THEN_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1690,7 +1663,7 @@
     "MT_PROMISE_RESOLVED_COUNT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1698,7 +1671,7 @@
     "MT_FAST_PATH_HIT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1706,7 +1679,7 @@
     "MT_FAST_PATH_MISS"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1714,7 +1687,7 @@
     "MT_STEP_CHAIN_REUSE_HIT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1722,7 +1695,7 @@
     "MT_STEP_CHAIN_REUSE_MISS"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1730,7 +1703,7 @@
     "MT_STEP_DONE_REUSE_HIT"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1738,7 +1711,7 @@
     "MT_STEP_DONE_REUSE_MISS"
    ],
    "verdict": "no_heap_address",
-   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit — never an address."
+   "why": "Instrumentation counter (PERRY_MT_PROFILE); only ever fetch_add'd, printed at exit \u2014 never an address."
   },
   {
    "file": "crates/perry-runtime/src/promise/mod.rs",
@@ -1948,7 +1921,7 @@
     "PENDING_DEFERRED"
    ],
    "verdict": "thread_exit_invalidated",
-   "why": "Queue of (owner AgentId, promise_ptr, converter) — purged per agent by async_bridge.rs purge_agent_resolutions from agent.rs:retire_agent at worker exit.",
+   "why": "Queue of (owner AgentId, promise_ptr, converter) \u2014 purged per agent by async_bridge.rs purge_agent_resolutions from agent.rs:retire_agent at worker exit.",
    "hook": "purge_agent_resolutions"
   },
   {
@@ -3952,6 +3925,30 @@
    ],
    "verdict": "process_global_allocation",
    "why": "Addresses of Box::leak'd ZlibTables sets (Rust heap, never freed, in no arena) that release_zlib_tables_of_agent emptied when their agent retired; tables() hands them to the next agent that needs tables. Thread exit cannot free them."
+  },
+  {
+   "file": "crates/perry-runtime/src/regex.rs",
+   "names": [
+    "LAST_INDEX_STORE"
+   ],
+   "verdict": "no_heap_address",
+   "why": "This RuntimeStoreSite is reached only for a branded RegExp with its own non-configurable lastIndex data slot, so it cannot prime an inherited setter entry or add a missing key. Its direct addresses name permanent Rust-owned PIC-arena storage; the active words are process-unique ShapeIds, slot indices and validity, with no receiver, prototype, value or atom address. Every hit validates the current receiver shape, and a descriptor change retires that shape. Agent exit cannot leave a dereferenceable arena object in this site."
+  },
+  {
+   "file": "crates/perry-runtime/src/object/field_get_set/runtime_store_site.rs",
+   "names": [
+    "SITE"
+   ],
+   "verdict": "process_global_allocation",
+   "why": "Test-only RuntimeStoreSite. Its direct addresses are permanent Rust-owned PIC-arena PackedSetWays/AddWays allocations and optional static JsFunctionInfo code; own/key-add ways hold only process-unique ShapeIds, slot indices and validity words. A generic slow store can also install a permanent Rust-owned setter_site::Entry: its key, holder and accessor pair are strong rewritable roots scanned via setter_site::ENTRIES, and both priming and admission require primary_only() before entry access. Worker agents never dereference that heap-bearing arm; after any worker starts it stays disabled. The readonly transition test exercises own/key-add data ways."
+  },
+  {
+   "file": "crates/perry-runtime/src/object/field_get_set/ic_miss/private_evaluation_storage.rs",
+   "names": [
+    "NEXT_PRIVATE_EVALUATION_ID"
+   ],
+   "verdict": "no_heap_address",
+   "why": "Monotonic scalar ClassDefinitionEvaluation identity, initialized to 1. Its only update is checked integer increment via AtomicU64::try_update, rejecting u64::MAX (the template namespace); zero is reserved for intrinsic private names. The returned integer is copied to class metadata native_state and used to qualify private storage keys. No pointer is stored in this atomic, and it is never dereferenced. Checked exhaustion replaces fetch_add, so the mechanical counter-only recognizer no longer admits it."
   }
  ]
 }

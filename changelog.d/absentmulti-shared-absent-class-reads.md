@@ -1,0 +1,5 @@
+Polymorphic absent-field reads can share a class-cache way across up to 128 receiver shapes with the same class, prototype identity, chain and terminal. Receiver ids live in the entry's owned allocation. Every use checks membership, every prototype-hop and terminal shape, and the class-link generation. Entries remain 48 bytes; GC traces the chain and terminal, never receiver ids. No registry or lookup side table is added.
+
+Sharing starts after an absent way has actually been replaced by another receiver shape of the same class. Filling the 16 ways, data churn and same-receiver refreshes do not arm it. Compatible absent ways coalesce and reclaim redundant ways. Primary-token hits retain their inline shape proof; shared lookup and publication use cold paths.
+
+Coverage includes Node parity over 96 shapes with later own/prototype definitions, getters, relinks and null roots, plus unit and sabotage checks for admission, membership, chain invalidation, capacity, root coverage and generation reproof.

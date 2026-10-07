@@ -1,10 +1,12 @@
 use super::super::*;
 use super::support::*;
 use std::cell::Cell;
+mod accessor_shape_expiry;
 mod arraylike_callbacks;
 mod bound_method_builder;
 mod call_argument_lists;
 mod callback_scanners;
+mod class_shape_expiry;
 mod fs_options_object;
 mod function_attrs_old_minor;
 mod generator_attach_prototype;
@@ -19,6 +21,7 @@ mod json_record_output;
 mod json_shape_template;
 mod json_tape_owned;
 mod native_module_name;
+mod object_create_birth;
 mod old_defrag_contract;
 #[cfg(feature = "regex-engine")]
 mod perex_construction;

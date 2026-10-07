@@ -72,6 +72,47 @@ pub(crate) fn object_alloc_plain(field_count: u32) -> *mut ObjectHeader {
     object_alloc_with_parent_impl::<true, false>(0, 0, field_count)
 }
 
+/// `Object.create`: publish only the final ordinary prototype shape. Only
+/// scalar shape/prototype identities cross the allocating call; the prototype
+/// is refreshed through its caller's handle afterwards.
+pub(crate) fn object_alloc_created(
+    proto: &crate::gc::RuntimeHandle<'_>,
+    proto_id: u64,
+    width: u32,
+) -> *mut ObjectHeader {
+    use crate::object::shapes;
+    let mut shape = shapes::created_birth_shape(proto_id, proto.get_nanbox_u64(), width);
+    let mut obj = object_alloc_unpublished(0, width);
+    unsafe {
+        shapes::store_kind::premark_plain_ordinary(obj);
+        // A full collection during allocation may retire an uncarried record.
+        // Remint those same birth facts, with the unpublished newborn rooted.
+        if !shapes::shape_is_keyless_birth_of(
+            shape,
+            proto_id,
+            width,
+            shapes::ShapeObjectKind::Ordinary,
+        ) {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let owner = scope.root_raw_mut_ptr(obj);
+            (shape, obj) = owner.across_mut::<ObjectHeader, _>(|| {
+                shapes::created_birth_shape(proto_id, proto.get_nanbox_u64(), width)
+            });
+        }
+        if crate::arena::pointer_in_nursery(obj as usize) {
+            // GC_STORE_AUDIT(POINTER_FREE): the sole birth publication is a ShapeId.
+            (*obj).parent_class_id = shape;
+        } else {
+            shapes::stamp_object_shape_id_with_carrier_note(obj, shape);
+        }
+        // The prototype edge lives outside the heap. A black newborn must
+        // still shade it during an incremental mark, as the link funnel does.
+        crate::gc::runtime_shade_external_edge(proto.get_nanbox_u64());
+        shapes::store_kind::check_store_facts(obj);
+    }
+    obj
+}
+
 /// A null-parent object must publish that edge in its birth shape, before
 /// any reader can observe the object. Setting only a post-birth header bit
 /// leaves the descriptor claiming the default prototype.
@@ -176,6 +217,40 @@ pub(crate) fn object_alloc_born(
     field_count: u32,
     shape_id: u32,
 ) -> *mut ObjectHeader {
+    object_alloc_born_impl(class_id, field_count, shape_id, false)
+}
+
+/// A plain ordinary receiver on a cached shape, or its keyless birth shape
+/// when the memo is absent or collection pruned it. Validate AFTER allocating:
+/// a scalar ShapeId memo does not retain the descriptor or its keys.
+#[cfg(feature = "regex-engine")]
+pub(crate) fn object_alloc_plain_born(field_count: u32, shape_id: u32) -> *mut ObjectHeader {
+    let object = object_alloc_unpublished(0, field_count);
+    unsafe {
+        crate::object::shapes::store_kind::premark_plain_ordinary(object);
+        if crate::object::shapes::shape_descriptor_by_id(shape_id).is_some_and(|shape| {
+            shape.object_kind == crate::object::shapes::ShapeObjectKind::Ordinary
+                && shape.live_inline_slot_count == field_count
+        }) {
+            if crate::arena::pointer_in_nursery(object as usize) {
+                // GC_STORE_AUDIT(POINTER_FREE): fresh nursery receiver's scalar ShapeId.
+                (*object).parent_class_id = shape_id;
+            } else {
+                crate::object::shapes::stamp_object_shape_id_with_carrier_note(object, shape_id);
+            }
+        } else {
+            crate::object::shapes::birth_publish_object_shape(object, field_count);
+        }
+    }
+    object
+}
+
+fn object_alloc_born_impl(
+    class_id: u32,
+    field_count: u32,
+    shape_id: u32,
+    premark_plain: bool,
+) -> *mut ObjectHeader {
     let alloc_field_count = std::cmp::max(field_count as usize, crate::object::INLINE_SLOT_FLOOR);
     let total_size =
         std::mem::size_of::<ObjectHeader>() + alloc_field_count * std::mem::size_of::<JSValue>();
@@ -191,6 +266,9 @@ pub(crate) fn object_alloc_born(
             ptr::write(fields_ptr.add(i), JSValue::undefined());
         }
         crate::gc::layout_init_pointer_free(ptr as *mut u8);
+        if premark_plain {
+            crate::object::shapes::store_kind::premark_plain_ordinary(ptr);
+        }
         if crate::arena::pointer_in_nursery(ptr as usize) {
             // A nursery newborn: no proof to retire, nobody inherits from it
             // and no old-generation carrier to note — the stamp is the store.

@@ -135,7 +135,10 @@ pub const GC_TYPE_BUFFER_SECRET_KEY: u8 = 30;
 /// A WebCrypto `CryptoKey`: Uint8Array storage holding the key material; its
 /// algorithm/usages metadata is `buffer::header::crypto_key_meta`.
 pub const GC_TYPE_BUFFER_CRYPTO_KEY: u8 = 31;
-pub const GC_TYPE_MAX: u8 = GC_TYPE_BUFFER_CRYPTO_KEY;
+/// Process-lifetime symbols carry a readable leaf header even though their
+/// allocation is deliberately outside the collecting heap.
+pub const GC_TYPE_SYMBOL: u8 = 32;
+pub const GC_TYPE_MAX: u8 = GC_TYPE_SYMBOL;
 
 /// Is `obj_type` a `BufferHeader` cell of any flavor (Buffer, Uint8Array,
 /// ArrayBuffer, SharedArrayBuffer, DataView, KeyObject, CryptoKey)?
@@ -883,7 +886,7 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
     )),
     Some(gc_type_info_entry(
         GC_TYPE_REGEXP,
-        "regexp",
+        "regexp_data",
         GcAllocationPolicy::ArenaOrMalloc,
         true,
         GcRewriteDescriptorKind::RegExp,
@@ -892,7 +895,7 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         GcExternalBytePolicy::InlinePayload,
         GcLargeObjectPolicy::MallocTracked,
         false,
-        GcMoveHookKind::ExoticExpandoOwner,
+        GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
@@ -997,6 +1000,21 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
     Some(buffer_family_type_info(
         GC_TYPE_BUFFER_CRYPTO_KEY,
         "buffer_crypto_key",
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_SYMBOL,
+        "symbol",
+        GcAllocationPolicy::ArenaOrMalloc,
+        true,
+        GcRewriteDescriptorKind::Leaf,
+        GcLayoutSlotKind::None,
+        false,
+        GcExternalBytePolicy::InlinePayload,
+        GcLargeObjectPolicy::MallocTracked,
+        true,
+        GcMoveHookKind::None,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::None,
     )),
 ];
 
@@ -1591,6 +1609,11 @@ pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
 /// | 12 | available | `GC_ARRAY_RAW_F64_HOLES` | |
 /// | 13 | available | `GC_LAYOUT_ALL_POINTERS` | closure/array layout only |
 /// | 14..15 | available | `GC_LAYOUT_STATE_MASK` | closure/array layout only |
+///
+/// Byte families, TypedArray and NativeArena owner only: byte access uses
+/// the active byte-pin count in 9..13, 14 is buffer detached state, and 15
+/// preserves a pre-existing permanent pin.
+/// These types have no dynamic layout-slot state; no header or cell grows.
 ///
 /// Object layout is a ShapeId fact. Bits 7 and 12..15 have no object
 /// layout meaning; array and closure layout metadata still uses its listed

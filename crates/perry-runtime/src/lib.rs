@@ -11,6 +11,8 @@
 #![recursion_limit = "256"]
 // Anchors are `#[used(compiler)]`: retained by rustc, not ld64 dead-strip roots.
 #![feature(used_with_arg)]
+// Keep the cold class-cache publisher compact without outlining hot reads.
+#![feature(optimize_attribute)]
 // `agent_ptrs::PERRY_AGENT_PTRS`: a thread-local generated code names directly.
 #![feature(thread_local)]
 // WASI (#11377): `std::os::wasi::fs::symlink_path` for `fs.symlink`.
@@ -146,6 +148,8 @@ pub mod native_abi;
 pub mod native_arena;
 pub mod native_handle;
 pub mod native_payload;
+pub mod native_payload_abi;
+pub mod native_payload_stream_abi;
 #[cfg(target_os = "linux")]
 mod native_stack;
 pub mod native_value_profile;

@@ -42,6 +42,7 @@ mod compiled_function;
 pub(crate) use compiled_function::{
     forget_birth_record_of_class, ordinary_compiled_function_has_instance, OrdinaryInstanceof,
 };
+mod native_receiver;
 mod rooted_arguments;
 pub(crate) use rooted_arguments::construct_rooted_arguments;
 #[cfg(feature = "regex-engine")]
@@ -135,16 +136,6 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
     // empty-object construction fallback and silently produced `{}`.
     if crate::builtins::boxed_primitive_payload(func_value).is_some() {
         super::super::object_ops::throw_object_type_error(b"is not a constructor");
-    }
-    // `new (new RegExp())` — a RegExp instance has no [[Construct]] internal
-    // method (Test262 `S15.10.7_A2_T2`). Without this it fell through to the
-    // empty-object construction fallback and silently produced `{}` instead
-    // of throwing.
-    {
-        let jv = crate::value::JSValue::from_bits(func_value.to_bits());
-        if jv.is_pointer() && crate::regex::is_registered_regex(jv.as_pointer::<u8>() as usize) {
-            super::super::object_ops::throw_object_type_error(b"is not a constructor");
-        }
     }
     // #3656: `new p()` where `p` is a Proxy dispatches through its `construct`
     // trap (or forwards to the target). Reached when the compiler can't prove
@@ -940,7 +931,10 @@ pub unsafe extern "C-unwind" fn js_new_function_construct(
             "ERR_INVALID_ARG_TYPE",
         );
     }
-    if extends_target_must_throw(func_value) {
+    // All class/builtin/proxy constructors returned above. The remaining
+    // path constructs callable function values; ordinary instances have no
+    // [[Construct]], regardless of their prototype or private fields.
+    if !is_callable_function_value(func_value) || extends_target_must_throw(func_value) {
         super::super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     let cid = synthetic_class_id_for_function(func_value);
@@ -1625,26 +1619,10 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
             let proto = new_target_custom_object_prototype(nt.get_nanbox_f64())
                 .map(|bits| scope.root_heap_word_u64(bits));
             let result = js_new_function_construct(func.get_nanbox_f64(), args_ptr, args_len);
-            if let Some(proto) = proto {
-                let bits = result.to_bits();
-                let addr = if (bits >> 48) == 0x7FFD {
-                    (bits & crate::value::POINTER_MASK) as usize
-                } else if (bits >> 48) == 0
-                    && crate::buffer::buffer_family_type_owned(bits as usize).is_some()
-                {
-                    // ArrayBuffer and SharedArrayBuffer are represented by a
-                    // raw BufferHeader pointer rather than a NaN-boxed object.
-                    bits as usize
-                } else {
-                    0
-                };
-                if addr != 0 {
-                    super::super::prototype_chain::object_set_static_prototype(
-                        addr,
-                        proto.get_heap_word_u64(),
-                    );
-                }
+            if ta_name == "RegExp" {
+                return native_receiver::finish_regexp(&scope, result, &nt, proto);
             }
+            native_receiver::apply_prototype(result, proto);
             return result;
         }
     }

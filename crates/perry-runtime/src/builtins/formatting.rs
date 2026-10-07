@@ -664,7 +664,11 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                 // would read garbage one word before the BufferHeader).
                 let buf_ptr = ptr as *const crate::buffer::BufferHeader;
                 format_buffer_value(buf_ptr)
-            } else if crate::regex::is_registered_regex(ptr as usize) {
+            } else if crate::regex::regexp_data_of(crate::value::js_nanbox_pointer(
+                (ptr as usize) as i64,
+            ))
+            .is_some()
+            {
                 // RegExp literals have their own GC kind and no enumerable
                 // keys; render `/source/flags` instead (#800).
                 collections::format_regexp(ptr as *const crate::regex::RegExpHeader)
@@ -881,42 +885,44 @@ unsafe fn format_buffer_value(buf_ptr: *const crate::buffer::BufferHeader) -> St
     if buf_ptr.is_null() {
         return "<Buffer >".to_string();
     }
-    let len = (*buf_ptr).length as usize;
-    let data = crate::buffer::buffer_data(buf_ptr as *const crate::buffer::BufferHeader);
-    let bytes = std::slice::from_raw_parts(data, len);
+    crate::buffer::bytes::no_gc(|scope| {
+        let value = crate::value::js_nanbox_pointer(buf_ptr as i64);
+        let bytes = crate::buffer::bytes::bytes(value, scope).unwrap_or(&[]);
+        let len = bytes.len();
 
-    // If this buffer was created via `new Uint8Array(...)`, format it Node-style
-    // as `Uint8Array(N) [ a, b, c ]` rather than `<Buffer aa bb cc>`.
-    if crate::buffer::is_uint8array_buffer(buf_ptr as usize) {
-        if len == 0 {
-            return "Uint8Array(0) []".to_string();
-        }
-        let mut out = format!("Uint8Array({}) [", len);
-        for (i, b) in bytes.iter().enumerate() {
-            if i == 0 {
-                out.push(' ');
-            } else {
-                out.push_str(", ");
+        // If this buffer was created via `new Uint8Array(...)`, format it Node-style
+        // as `Uint8Array(N) [ a, b, c ]` rather than `<Buffer aa bb cc>`.
+        if crate::buffer::is_uint8array_buffer(buf_ptr as usize) {
+            if len == 0 {
+                return "Uint8Array(0) []".to_string();
             }
-            out.push_str(&format!("{}", *b));
+            let mut out = format!("Uint8Array({}) [", len);
+            for (i, b) in bytes.iter().enumerate() {
+                if i == 0 {
+                    out.push(' ');
+                } else {
+                    out.push_str(", ");
+                }
+                out.push_str(&format!("{}", *b));
+            }
+            out.push_str(" ]");
+            return out;
         }
-        out.push_str(" ]");
-        return out;
-    }
 
-    // Node caps at 50 bytes then shows "... N more bytes"
-    let display_len = len.min(50);
-    let mut out = String::with_capacity(9 + display_len * 3);
-    out.push_str("<Buffer");
-    for b in &bytes[..display_len] {
-        out.push(' ');
-        out.push_str(&format!("{:02x}", b));
-    }
-    if len > display_len {
-        out.push_str(&format!(" ... {} more bytes", len - display_len));
-    }
-    out.push('>');
-    out
+        // Node caps at 50 bytes then shows "... N more bytes"
+        let display_len = len.min(50);
+        let mut out = String::with_capacity(9 + display_len * 3);
+        out.push_str("<Buffer");
+        for b in &bytes[..display_len] {
+            out.push(' ');
+            out.push_str(&format!("{:02x}", b));
+        }
+        if len > display_len {
+            out.push_str(&format!(" ... {} more bytes", len - display_len));
+        }
+        out.push('>');
+        out
+    })
 }
 
 fn format_proxy_value(value: f64, depth: usize, json: bool) -> String {
@@ -1453,7 +1459,10 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                 } else if crate::value::addr_class::is_handle_band(ptr as usize) {
                     "[object Object]".to_string()
                 } else if crate::symbol::is_registered_symbol(ptr as usize)
-                    || crate::regex::is_registered_regex(ptr as usize)
+                    || crate::regex::regexp_data_of(crate::value::js_nanbox_pointer(
+                        (ptr as usize) as i64,
+                    ))
+                    .is_some()
                     || crate::buffer::is_registered_buffer(ptr as usize)
                     || crate::typedarray::lookup_typed_array_kind(ptr as usize).is_some()
                 {

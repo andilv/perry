@@ -613,19 +613,11 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
     // merely marking an inline buffer as a DataView would make the numeric
     // setter interpret its first bytes as that cache pointer.
     if crate::buffer::is_data_view(addr) {
-        let backing = crate::buffer::buffer_alloc(src_len);
-        unsafe {
-            (*backing).length = src_len;
-            if src_len > 0 {
-                std::ptr::copy_nonoverlapping(
-                    crate::buffer::buffer_data(src),
-                    crate::buffer::buffer_data_mut(backing),
-                    src_len as usize,
-                );
-            }
-        }
-        crate::buffer::mark_as_array_buffer(backing as usize);
-        let backing_value = crate::value::js_nanbox_pointer(backing as i64);
+        let backing_value = crate::buffer::bytes::copy_value(
+            crate::buffer::bytes::Brand::ArrayBuffer,
+            crate::value::js_nanbox_pointer(addr as i64),
+        )
+        .expect("live DataView bytes");
         let cloned = crate::buffer::js_data_view_new(backing_value, 0.0, src_len as f64);
         if detach_source {
             let cloned_addr = pointer_addr(cloned).unwrap_or(0);
@@ -634,17 +626,14 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
         return cloned;
     }
 
-    let dst = crate::buffer::buffer_alloc(src_len);
-    unsafe {
-        (*dst).length = src_len;
-        if src_len > 0 {
-            std::ptr::copy_nonoverlapping(
-                crate::buffer::buffer_data(src),
-                crate::buffer::buffer_data_mut(dst),
-                src_len as usize,
-            );
-        }
-    }
+    let value = crate::buffer::bytes::copy_value(
+        crate::buffer::bytes::Brand::Buffer,
+        crate::value::js_nanbox_pointer(addr as i64),
+    )
+    .expect("live buffer bytes");
+    let dst = JSValue::from_bits(value.to_bits())
+        .as_pointer::<crate::buffer::BufferHeader>()
+        .cast_mut();
 
     let dst_addr = dst as usize;
     if crate::buffer::is_array_buffer(addr) {
@@ -856,16 +845,18 @@ fn js_structured_clone_inner(value: f64, depth: usize) -> f64 {
                     return cloned;
                 }
                 #[cfg(feature = "regex-engine")]
-                if gc_type == crate::gc::GC_TYPE_REGEXP {
+                if crate::regex::regexp_data_of(value).is_some() {
                     let memo_index = structured_clone_memo_reserve(value);
                     let scope = crate::gc::RuntimeHandleScope::new();
                     let source = scope.root_raw_const_ptr(ptr as *const crate::regex::RegExpHeader);
-                    let pattern = scope.root_string_ptr(
-                        source.with_const_ptr(|re| crate::regex::js_regexp_get_source(re)),
-                    );
-                    let flags = scope.root_string_ptr(
-                        source.with_const_ptr(|re| crate::regex::js_regexp_get_flags(re)),
-                    );
+                    let pattern =
+                        scope.root_string_ptr(source.with_const_ptr(|re| {
+                            crate::regex::regexp_source_and_flags(re).0.unwrap()
+                        }));
+                    let flags =
+                        scope.root_string_ptr(source.with_const_ptr(|re| {
+                            crate::regex::regexp_source_and_flags(re).1.unwrap()
+                        }));
                     let cloned = pattern.with_const_ptr(|pattern| {
                         flags.with_const_ptr(|flags| crate::regex::js_regexp_new(pattern, flags))
                     });
@@ -1447,15 +1438,15 @@ mod structured_clone_tests {
         let pattern = crate::string::js_string_from_bytes(b"a+".as_ptr(), 2);
         let flags = crate::string::js_string_from_bytes(b"gi".as_ptr(), 2);
         let source = crate::regex::js_regexp_new(pattern, flags);
-        crate::regex::js_regexp_set_last_index(source, 3.0);
+        crate::regex::set_last_index(source, 3.0);
         let cloned_value = js_structured_clone(crate::value::js_nanbox_pointer(source as i64));
         let cloned =
             crate::value::js_nanbox_get_pointer(cloned_value) as *mut crate::regex::RegExpHeader;
         assert_ne!(cloned, source);
-        assert_eq!(crate::regex::js_regexp_get_last_index(cloned), 0.0);
-        assert_eq!(crate::regex::js_regexp_get_last_index(source), 3.0);
-        crate::regex::js_regexp_set_last_index(cloned, 7.0);
-        assert_eq!(crate::regex::js_regexp_get_last_index(source), 3.0);
+        assert_eq!(crate::regex::get_last_index(cloned), 0.0);
+        assert_eq!(crate::regex::get_last_index(source), 3.0);
+        crate::regex::set_last_index(cloned, 7.0);
+        assert_eq!(crate::regex::get_last_index(source), 3.0);
     }
 
     /// #8232: a clone memo must resolve a back-edge to the destination object,

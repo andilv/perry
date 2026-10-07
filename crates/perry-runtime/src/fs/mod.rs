@@ -923,16 +923,13 @@ pub extern "C-unwind" fn js_fs_read_file_binary_options(
     }
 }
 
-/// A fresh Buffer holding `bytes`. A new allocation is never a view or
-/// foreign-backed, so its data sits directly after the header.
+/// A fresh Buffer holding `bytes`, independent of its storage placement.
 unsafe fn buffer_from_file_bytes(bytes: &[u8]) -> *mut crate::buffer::BufferHeader {
-    let buf = crate::buffer::js_buffer_alloc(bytes.len() as i32, 0);
-    if !buf.is_null() {
-        let buf_data = (buf as *mut u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_data, bytes.len());
-        (*buf).length = bytes.len() as u32;
-    }
-    buf
+    crate::value::JSValue::from_bits(
+        crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::Buffer, bytes).to_bits(),
+    )
+    .as_pointer::<crate::buffer::BufferHeader>()
+    .cast_mut()
 }
 
 /// Recursively remove a directory or file.
@@ -1240,11 +1237,12 @@ pub(crate) unsafe fn decode_path_value_named(path_value: f64, arg_name: &str) ->
         if buf.is_null() {
             return None;
         }
-        let bytes =
-            std::slice::from_raw_parts(crate::buffer::buffer_data(buf), (*buf).length as usize);
-        return std::str::from_utf8(bytes)
-            .ok()
-            .map(|s| reject_null_bytes(s.to_string(), arg_name));
+        let path = crate::buffer::bytes::no_gc(|scope| {
+            crate::buffer::bytes::bytes(crate::value::js_nanbox_pointer(buf as i64), scope)
+                .ok()
+                .and_then(|bytes| std::str::from_utf8(bytes).ok().map(str::to_owned))
+        });
+        return path.map(|s| reject_null_bytes(s, arg_name));
     }
     if jsval.is_pointer() {
         let obj = jsval.as_pointer::<crate::object::ObjectHeader>();

@@ -32,6 +32,25 @@ pub(crate) const PROGRAM_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const QUANTUM: usize = 4096;
 pub(crate) const OUTPUT_BYTES: usize = crate::string::MAX_STRING_LENGTH * 3;
 
+// The allocation-point root witness arms pressure after the search's
+// mandatory capture poll. A native function pointer is not a managed edge.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_RESULT_ALLOC: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_result_alloc(hook: Option<fn()>) -> Option<fn()> {
+    BEFORE_RESULT_ALLOC.with(|slot| slot.replace(hook))
+}
+
+#[cfg(test)]
+pub(super) fn before_result_alloc() {
+    if let Some(hook) = BEFORE_RESULT_ALLOC.with(|slot| slot.take()) {
+        hook();
+    }
+}
+
 /// Capture by reference when `f` can throw: its Rust frame can be abandoned by
 /// longjmp. Native ownership belongs in the caller, above this local trap.
 pub(crate) fn caught<T>(f: impl FnOnce() -> T) -> Result<T, EngineError> {
@@ -269,21 +288,22 @@ impl<'b, 's> Reuse<'b, 's> {
             crate::value::js_nanbox_get_pointer(receiver.get_nanbox_f64()) as *const RegExpHeader;
         // A receiver that is not a RegExp with a published program runs no
         // builtin search here; its failure belongs to the ordinary path.
-        let program = (super::is_valid_regex_ptr(re) && unsafe { !(*re).perex_program.is_null() })
-            .then(|| {
-                // Rooting pushes a handle slot and never collects, so `re` and
-                // its program edge are still current for every read below.
-                let receiver = scope.root_raw_const_ptr(re);
-                let cell = scope.root_raw_const_ptr(unsafe { (*re).perex_program });
-                let owner = unsafe { GcProgram::from_receiver(scope, &receiver) }.ok()?;
-                let bound = bind_program(owner, budget).ok()?;
-                Some(ReusedProgram {
-                    receiver,
-                    cell,
-                    bound,
-                })
+        let program = crate::regex::regexp_data_of(receiver.get_nanbox_f64()).and_then(|data| {
+            if unsafe { (*data).perex_program.is_null() } {
+                return None;
+            }
+            // These roots only push handle slots; no collection or callback
+            // occurs between the matcher read and establishing program ownership.
+            let receiver = scope.root_raw_const_ptr(re);
+            let owner = unsafe { GcProgram::from_data(scope, data) }.ok()?;
+            let cell = owner.root();
+            let bound = bind_program(owner, budget).ok()?;
+            Some(ReusedProgram {
+                receiver,
+                cell,
+                bound,
             })
-            .flatten();
+        });
         Self {
             input,
             subject,
@@ -311,7 +331,8 @@ impl<'b, 's> Reuse<'b, 's> {
         let reused = self.program.as_ref()?;
         let bound = reused.receiver.with_const_ptr::<RegExpHeader, _>(|p| p);
         let cell = reused.cell.with_const_ptr::<u8, _>(|p| p);
-        (receiver == bound && unsafe { (*receiver).perex_program } == cell)
+        (receiver == bound
+            && unsafe { (*crate::regex::regexp_data_ptr(receiver)).perex_program } == cell)
             .then(|| reused.bound.with_view(|program| program.name_count()).ok())
             .flatten()
     }
@@ -320,7 +341,9 @@ impl<'b, 's> Reuse<'b, 's> {
         let reused = self.program.as_ref()?;
         let bound = reused.receiver.with_const_ptr::<RegExpHeader, _>(|p| p);
         let cell = reused.cell.with_const_ptr::<u8, _>(|p| p);
-        (current == bound && unsafe { (*current).perex_program } == cell).then_some(&reused.bound)
+        (current == bound
+            && unsafe { (*crate::regex::regexp_data_ptr(current)).perex_program } == cell)
+            .then_some(&reused.bound)
     }
 }
 
@@ -342,24 +365,27 @@ pub(crate) fn test_window(
     let receiver = scope.root_nanbox_f64(receiver);
     let input = scope.root_string_ptr(input);
     let re = crate::value::js_nanbox_get_pointer(receiver.get_nanbox_f64()) as *const RegExpHeader;
-    if !super::is_valid_regex_ptr(re) {
+    let Some(data) = crate::regex::regexp_data_of(receiver.get_nanbox_f64()) else {
         return Ok(None);
-    }
-    let admitted = unsafe {
-        !(*re).global && !(*re).sticky
+    };
+    let data = scope.root_raw_const_ptr(data);
+    let admitted = data.with_const_ptr::<super::RegExpData, _>(|data| unsafe {
+        !(*data).global && !(*data).sticky
             // Even non-stateful builtin exec performs ToLength(lastIndex).
             // Only an already-Number permits omitting that observable step.
-            && crate::value::JSValue::from_bits((*re).last_index).is_number()
-    };
-    if !admitted
-        || !crate::object::regex_proto_thunks::regexp_view_uses_builtin(receiver.get_nanbox_f64())
-    {
+            && crate::value::JSValue::from_bits(crate::regex::get_last_index(re).to_bits()).is_number()
+    });
+    if !admitted || !crate::object::regex_read_sites::test_exec(receiver.get_nanbox_f64()) {
         return Ok(None);
     }
-    let raw_receiver = scope.root_raw_const_ptr(re);
     let mut budget = Budget::new(WORK);
     let memory = MemoryBudget::new(SCRATCH_BYTES);
-    let program = program(&scope, &raw_receiver, &mut budget, &memory, &mut host::poll)?;
+    let owner = data
+        .with_const_ptr::<super::RegExpData, _>(|data| unsafe {
+            GcProgram::from_data(&scope, data)
+        })
+        .map_err(|e| EngineError::Subject(perex::binding::SubjectError::Resource(e)))?;
+    let program = bind_program(owner, &mut budget)?;
     let owner = unsafe { HeapSubject::window(input, start, end) }
         .map_err(|e| EngineError::Subject(perex::binding::SubjectError::Resource(e)))?;
     let subject = BoundSubject::new(owner).map_err(|e| EngineError::Subject(e.error))?;
@@ -495,13 +521,11 @@ pub(crate) fn execute_rooted(
     poll: &mut impl FnMut() -> Result<(), EngineError>,
     reuse: Option<&Reuse<'_, '_>>,
 ) -> Result<Option<ExecMatch>, EngineError> {
-    let (stored, stateful, has_indices) = unsafe {
-        let r = regexp(receiver);
-        (
-            crate::value::JSValue::from_bits((*r).last_index),
-            (*r).global || (*r).sticky,
-            (*r).has_indices,
-        )
+    let stored =
+        crate::value::JSValue::from_bits(super::get_last_index(regexp(receiver)).to_bits());
+    let (stateful, has_indices) = unsafe {
+        let data = &*super::regexp_data_ptr(regexp(receiver));
+        (data.global || data.sticky, data.has_indices)
     };
     // ToLength(Get(R, "lastIndex")) is observable only when it is not a
     // Number (it may call `valueOf`); a Number matters only to g/y.
@@ -650,11 +674,5 @@ pub(crate) fn execute_rooted(
 /// the TypeError for a non-writable `lastIndex` returned instead of thrown.
 /// Neither branch runs user code.
 fn store_last_index(receiver: &RuntimeHandle<'_>, n: usize) -> Result<(), EngineError> {
-    let re = regexp(receiver);
-    if super::last_index_writable(re) {
-        super::store_last_index_number(re, n);
-        Ok(())
-    } else {
-        Err(EngineError::Type(super::LAST_INDEX_READ_ONLY))
-    }
+    super::set_last_index_caught(receiver.get_nanbox_f64(), n as f64).map_err(EngineError::Abrupt)
 }

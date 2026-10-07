@@ -59,7 +59,11 @@ pub use alloc::{
     js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent,
     js_object_alloc_null_proto, js_object_alloc_with_parent, js_object_coerce,
 };
-pub(crate) use alloc_basic::{object_alloc_born, object_alloc_filled_birth, object_alloc_plain};
+#[cfg(feature = "regex-engine")]
+pub(crate) use alloc_basic::object_alloc_plain_born;
+pub(crate) use alloc_basic::{
+    object_alloc_born, object_alloc_filled_birth, object_alloc_plain, object_alloc_unpublished,
+};
 #[allow(unused_imports)]
 pub(crate) use alloc_plain::mark_object_plain_ordinary;
 pub use assign::*;
@@ -225,7 +229,9 @@ pub(crate) mod own_override;
 mod own_override_builtin_install_tests;
 #[cfg(test)]
 mod own_override_push_tests;
-pub(crate) use object_ops::{ensure_key_in_keys_array, install_builtin_getter};
+pub(crate) use object_ops::{
+    ensure_key_in_keys_array, install_builtin_getter, install_own_builtin_accessor,
+};
 mod object_ops_frozen;
 mod polymorphic_index;
 #[cfg(test)]
@@ -251,9 +257,9 @@ mod reserved_floor;
 pub(crate) use reserved_floor::{
     ensure_reserved_floor_keys, reserved_slot_floor_for_class_id, reserved_slot_floor_for_object,
 };
-#[cfg(feature = "regex-engine")]
-pub(crate) mod regex_canonical;
 pub(crate) mod regex_proto_thunks;
+#[cfg(feature = "regex-engine")]
+pub(crate) mod regex_read_sites;
 // #6812 object-owned overflow storage + the legacy thread-local side table.
 // Split out of this file to stay under the 2000-line CI cap; the sibling
 // `object::*` modules reach these through `use super::*`, so re-export the
@@ -1595,8 +1601,6 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
     // holding it is a real GC root that a moving collection must rewrite.
     null_stub::scan_null_stub_roots_mut(visitor);
     crate::closure::shape::scan_function_prototype_roots_mut(visitor);
-    #[cfg(feature = "regex-engine")]
-    regex_proto_thunks::scan_canonical_test_site_roots_mut(visitor);
 }
 
 /// Drive the PRODUCTION shape-cache writer from a test. Deliberately nothing
@@ -1781,12 +1785,8 @@ pub(crate) use meta_flags::{OBJECT_META_FLAG_EXOTIC_READ_RECEIVER, OBJECT_META_F
 pub(crate) mod meta_record;
 pub use meta_record::ObjectMeta;
 
-/// Authoritative ordinary-object discriminator. RegExp has its own GC kind,
-/// and heap class-expression values carry their kind in the immutable ShapeId
-/// descriptor. #8113 deleted the legacy `ObjectHeader::object_type` ABI mirror,
-/// so this is the ONLY spelling of "is an ordinary object" — note it is FALSE
-/// for a class object (`ShapeObjectKind::Class`), which is exactly what the
-/// retired `object_type == OBJECT_TYPE_REGULAR` test meant (#6595).
+/// True when the receiver's ShapeId describes an ordinary layout.
+/// Class-expression objects carry `ShapeObjectKind::Class` and return false.
 #[inline]
 pub(crate) unsafe fn object_is_regular(obj: *const ObjectHeader) -> bool {
     if obj.is_null() {

@@ -42,10 +42,9 @@ extern "C" fn collect_then_zero(
 }
 
 fn register_regex_roots() {
-    register_runtime_handle_root_scanner_for_tests();
-    gc_register_mutable_root_scanner(
-        crate::object::regex_proto_thunks::scan_canonical_test_site_roots_mut,
-    );
+    // Builtin Gets now traverse ordinary realm objects and read-site roots.
+    // Restore the production scanners removed by the isolation guard.
+    super::perex_public::register_host_roots();
 }
 
 fn heap_string(bytes: &[u8]) -> *mut StringHeader {
@@ -108,8 +107,8 @@ fn regexp_exec_survives_a_moving_minor_inside_the_lastindex_coercion() {
     });
     let coercer_value = coercer_handle
         .with_mut_ptr::<ObjectHeader, _>(|obj| crate::value::js_nanbox_pointer(obj as i64));
-    re_handle.with_mut_ptr::<RegExpHeader, _>(|hdr| unsafe {
-        (*hdr).last_index = coercer_value.to_bits();
+    re_handle.with_mut_ptr::<RegExpHeader, _>(|hdr| {
+        crate::regex::set_last_index(hdr, f64::from_bits(coercer_value.to_bits()));
     });
 
     let cycles_before = copying_minor_cycles();
@@ -188,8 +187,8 @@ fn regexp_exec_materializes_an_owned_snapshot_after_an_alloc_point_minor() {
         }),
         1
     );
-    re_handle.with_mut_ptr::<RegExpHeader, _>(|re| unsafe {
-        (*re).last_index = 0.0f64.to_bits();
+    re_handle.with_mut_ptr::<RegExpHeader, _>(|re| {
+        crate::regex::set_last_index(re, f64::from_bits(0.0f64.to_bits()));
     });
 
     // The next general-arena block allocation is the result array created only
@@ -225,22 +224,37 @@ fn string_match_fancy_materializes_an_owned_snapshot_after_an_alloc_point_minor(
     let _guard = CopyingNurseryTestGuard::new(4);
     let _pacing = crate::gc::policy::force_alloc_point_minor_pacing();
     let _scan = ConservativeScanDisabledGuard::new();
-    let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_regex_roots();
 
     let scope = crate::gc::RuntimeHandleScope::new();
-    let subject = heap_string(b"prefix-young-42-suffix");
-    assert!(crate::arena::pointer_in_nursery(subject as usize));
-    let subject_handle = scope.root_string_ptr(subject);
-    let subject_before = subject as usize;
     let re = crate::regex::js_regexp_new(
         heap_string(br"(?<=prefix-)(?<word>young)-(\d+)"),
         heap_string(b"d"),
     );
     let re_handle = scope.root_raw_const_ptr(re);
+    let subject = heap_string(b"prefix-young-42-suffix");
+    assert!(crate::arena::pointer_in_nursery(subject as usize));
+    let subject_handle = scope.root_string_ptr(subject);
+    let subject_before = subject as usize;
 
-    super::force_next_general_arena_alloc_slow();
-    trigger_guard.make_arena_trigger_due();
+    // A captured search always polls before materialization. Arm pressure
+    // AFTER that poll so a budgeted cycle cannot consume this witness's
+    // trigger before the result-array allocation reaches it.
+    struct HookGuard(Option<fn()>);
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            crate::regex::perex_api::set_before_result_alloc(self.0);
+        }
+    }
+    fn arm_result_array_minor() {
+        super::force_next_general_arena_alloc_slow();
+        let just_due = crate::arena::arena_total_bytes().saturating_sub(1);
+        crate::gc::policy::GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.set(just_due));
+    }
+    let _hook = HookGuard(crate::regex::perex_api::set_before_result_alloc(Some(
+        arm_result_array_minor,
+    )));
     let collections_before = gc_collection_count();
     let matched = subject_handle.with_const_ptr::<StringHeader, _>(|subject_now| {
         re_handle.with_const_ptr::<RegExpHeader, _>(|re_now| {
@@ -248,6 +262,10 @@ fn string_match_fancy_materializes_an_owned_snapshot_after_an_alloc_point_minor(
         })
     });
 
+    assert!(
+        crate::regex::perex_api::set_before_result_alloc(None).is_none(),
+        "materialization must consume its allocation-point hook"
+    );
     assert!(
         gc_collection_count() > collections_before,
         "subject not live: the match-array allocation must run a copying minor"

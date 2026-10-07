@@ -243,7 +243,12 @@ unsafe fn ensure_key_in_keys_array_inner(
         let name_len = (*key).byte_len as usize;
         let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
         let key_hash = super::super::key_bytes_hash(name_ptr, name_len);
-        if super::super::keys_index_lookup(obj, keys, name_bytes, key_hash).is_some() {
+        let existing = if super::super::key_attrs::entry_is_private(entry) {
+            super::super::keys_find_private_slot_by_bytes(keys.arr(), key_count as u32, name_bytes)
+        } else {
+            super::super::keys_index_lookup_property(obj, keys, name_bytes, key_hash)
+        };
+        if existing.is_some() {
             return; // already present
         }
     } else {
@@ -254,7 +259,12 @@ unsafe fn ensure_key_in_keys_array_inner(
             // wasn't seen here, so `Object.defineProperty(obj, "id", ...)`
             // on an object that already had `id` as an SSO key
             // double-inserted instead of overwriting.
-            if crate::string::js_string_key_matches(stored, key) {
+            if crate::string::js_string_key_matches(stored, key)
+                && super::super::key_attrs::entry_is_private(super::super::key_attrs::keys_entry(
+                    keys.arr(),
+                    i as u32,
+                )) == super::super::key_attrs::entry_is_private(entry)
+            {
                 return; // already present
             }
         }
@@ -710,6 +720,38 @@ pub(crate) unsafe fn install_builtin_getter(proto: *mut ObjectHeader, key: &str,
     );
 }
 
+/// Install a built-in accessor as an OWN property of a freshly allocated
+/// ordinary object (node's per-instance getters such as `db.isOpen`): the key
+/// is claimed with the accessor's attributes and the pair lives in the key's
+/// slot, exactly as [`install_builtin_getter`] does for a prototype. The
+/// caller keeps the heap still (`GcSuppressScope`) and roots the object.
+pub(crate) unsafe fn install_own_builtin_accessor(
+    obj: *mut ObjectHeader,
+    key_str: *const crate::StringHeader,
+    key: &str,
+    getter_bits: u64,
+    setter_bits: u64,
+    attrs: PropertyAttrs,
+) {
+    if obj.is_null() || (obj as usize) < 0x10000 || key_str.is_null() {
+        return;
+    }
+    let entry = crate::object::key_attrs::AttrsEdit::Data(&[], attrs.bits).apply(
+        crate::object::key_attrs::AttrsEdit::Accessor(&[], getter_bits != 0, setter_bits != 0)
+            .apply(0),
+    );
+    ensure_key_in_keys_array_with_entry(obj, key_str, entry);
+    set_builtin_accessor_descriptor(
+        obj as usize,
+        key.to_string(),
+        AccessorDescriptor {
+            get: getter_bits,
+            set: setter_bits,
+        },
+        attrs,
+    );
+}
+
 /// A builtin getter's attributes: writable is N/A for an accessor;
 /// enumerable=false, configurable=true.
 const BUILTIN_GETTER_ATTRS: PropertyAttrs = PropertyAttrs::new(true, false, true);
@@ -874,6 +916,9 @@ unsafe fn own_key_lookup(
     // growing destination does not scan every preceding key before appending;
     // stale/incomplete indexes retain the dense-slot correctness fallback.
     // Slots and counts are u32 throughout, so there is no 65,536-key ceiling.
-    super::super::keys_find_slot_by_key_ptr(keys, key_count, key)
-        .is_some_and(|slot| !properties_only || !slot_is_private_entry(keys, slot))
+    if properties_only {
+        super::super::keys_find_property_slot_by_key_ptr(keys, key_count, key).is_some()
+    } else {
+        super::super::keys_find_slot_by_key_ptr(keys, key_count, key).is_some()
+    }
 }

@@ -26,9 +26,7 @@ mod one_shot_callback;
 pub(crate) use one_shot_callback::queue_one_shot_callback;
 
 #[cfg(test)]
-use flate2::read::{
-    DeflateDecoder, DeflateEncoder, GzEncoder, MultiGzDecoder, ZlibDecoder, ZlibEncoder,
-};
+use flate2::read::{DeflateDecoder, DeflateEncoder, MultiGzDecoder, ZlibDecoder, ZlibEncoder};
 use flate2::Compression;
 
 const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
@@ -143,7 +141,11 @@ pub(crate) unsafe fn read_input_bytes(ptr: *const StringHeader) -> Option<Vec<u8
     }
     if js_buffer_is_buffer(ptr as i64) != 0 {
         let buf = ptr as *const BufferHeader;
-        return Some(perry_ffi::read_buffer_bytes(buf).unwrap_or(&[]).to_vec());
+        return Some(perry_ffi::bytes::no_gc(|scope| {
+            perry_ffi::read_buffer_bytes(buf, scope)
+                .unwrap_or(&[])
+                .to_vec()
+        }));
     }
     let len = (*ptr).byte_len as usize;
     let data = (ptr as *const u8).add(std::mem::size_of::<StringHeader>());
@@ -348,7 +350,9 @@ fn run_codec(codec: Codec, input: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     match codec {
         Codec::Gzip => {
-            GzEncoder::new(input, Compression::default()).read_to_end(&mut out)?;
+            super::gzip_header()
+                .read(input, Compression::default())
+                .read_to_end(&mut out)?;
         }
         Codec::Gunzip => {
             MultiGzDecoder::new(input).read_to_end(&mut out)?;
@@ -487,7 +491,7 @@ fn make_codec_state(codec: Codec) -> Option<CodecState> {
 fn make_codec_state_with_level(codec: Codec, level: Compression) -> Option<CodecState> {
     use flate2::write;
     Some(match codec {
-        Codec::Gzip => CodecState::GzEnc(write::GzEncoder::new(Vec::new(), level)),
+        Codec::Gzip => CodecState::GzEnc(super::gzip_header().write(Vec::new(), level)),
         Codec::Gunzip => CodecState::GzDec(write::GzDecoder::new(Vec::new())),
         Codec::Deflate => CodecState::ZlibEnc(write::ZlibEncoder::new(Vec::new(), level)),
         Codec::Inflate => CodecState::ZlibDec(write::ZlibDecoder::new(Vec::new())),
@@ -701,7 +705,11 @@ unsafe fn chunk_to_bytes(value: f64) -> Option<Vec<u8>> {
         if js_buffer_is_buffer(raw) != 0 {
             let buf = raw as *const BufferHeader;
             if !buf.is_null() {
-                return Some(perry_ffi::read_buffer_bytes(buf).unwrap_or(&[]).to_vec());
+                return Some(perry_ffi::bytes::no_gc(|scope| {
+                    perry_ffi::read_buffer_bytes(buf, scope)
+                        .unwrap_or(&[])
+                        .to_vec()
+                }));
             }
         }
     }

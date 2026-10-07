@@ -235,7 +235,7 @@ pub(crate) const RULE3_KINDS: &[(u8, &str, &str, Rule3Word)] = &[
     ),
     (
         gc::GC_TYPE_REGEXP,
-        "RegExpHeader",
+        "RegExpData",
         "high half of pattern_ptr",
         Rule3Word::StructurallySmall,
     ),
@@ -310,6 +310,12 @@ pub(crate) const RULE3_KINDS: &[(u8, &str, &str, Rule3Word)] = &[
         "BufferHeader (CryptoKey)",
         "capacity: u32 (bytes), as `GC_TYPE_BUFFER`",
         Rule3Word::BoundedBelowRange,
+    ),
+    (
+        gc::GC_TYPE_SYMBOL,
+        "SymbolHeader (persistent)",
+        "registered: u32 — the Symbol.for flag is exactly 0 or 1",
+        Rule3Word::StructurallySmall,
     ),
 ];
 

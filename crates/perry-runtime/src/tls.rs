@@ -298,12 +298,11 @@ fn value_to_bytes(value: f64) -> Option<Vec<u8>> {
     if js.is_pointer() && crate::buffer::is_any_array_buffer(js.as_pointer::<u8>() as usize) {
         return None;
     }
-    let mut len = 0u32;
-    let data = unsafe { crate::buffer::js_value_buffer_or_typedarray_data(value, &mut len) };
-    if data.is_null() {
-        return None;
-    }
-    Some(unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec())
+    crate::buffer::bytes::no_gc(|scope| {
+        crate::buffer::bytes::bytes(value, scope)
+            .ok()
+            .map(<[u8]>::to_vec)
+    })
 }
 
 fn value_to_utf8(value: f64) -> Option<String> {
@@ -683,13 +682,15 @@ pub unsafe fn tls_legacy_certificate_object(der: &[u8], detailed: bool) -> f64 {
     if let Some(san) = certificate_subject_alt_name(&cert) {
         set_rooted_object_field(&obj, "subjectaltname", string_value(&san));
     }
-    let buffer = crate::buffer::js_buffer_alloc(der.len() as i32, 0);
-    if !buffer.is_null() {
-        let data = (buffer as *mut u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
-        std::ptr::copy_nonoverlapping(der.as_ptr(), data, der.len());
-        (*buffer).length = der.len() as u32;
-        set_rooted_object_field(&obj, "raw", ptr_value(buffer));
+    let raw = crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::Buffer, &der);
+    #[cfg(test)]
+    if crate::buffer::bytes::sabotage("tls_output") {
+        let ptr = JSValue::from_bits(raw.to_bits())
+            .as_pointer::<crate::buffer::BufferHeader>()
+            .cast_mut();
+        *crate::buffer::buffer_data_mut(ptr) ^= 1;
     }
+    set_rooted_object_field(&obj, "raw", raw);
     set_rooted_object_field(&obj, "valid_from", string_value(""));
     set_rooted_object_field(&obj, "valid_to", string_value(""));
     let value = obj.with_mut_ptr(|obj: *mut ObjectHeader| ptr_value(obj));
@@ -1704,3 +1705,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod b1_output_tests;

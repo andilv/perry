@@ -117,8 +117,13 @@ source of truth: no owner registries, address maps or per-family latches.
 `NativePayloadFamily::links_owner` opts into one traced, NaN-boxed owner slot
 on the stable malloc cell. Both marking and relocation visit it. The owner store uses
 `runtime_write_barrier_external_slot`, the exact-slot barrier that recognizes
-malloc parents (`runtime_write_barrier_slot` only remembers old arena parents). The cell
-remains 136 bytes; families without callbacks keep the slot zero.
+malloc parents (`runtime_write_barrier_slot` only remembers old arena parents). The cell also has a traced `callbacks` slot, mirroring the runtime-owned
+JS-state callbacks array. Both edges use the exact malloc-parent barrier and
+are visited for marking and relocation. Callback families allocate a traced
+16-byte extension after the unchanged 136-byte header (on 64-bit targets):
+one traced array word and one native catch-token pointer. The token contains
+no JS values and is installed only for the duration of `NativeCallGuard::call`.
+Legacy and N cells keep their layout and size; the owner stays zero for N.
 
 | Class | Native callback lifetime | Examples | Owner edge |
 |---|---|---|---|
@@ -144,8 +149,18 @@ S checklist:
    before `CallbackSites`, so it closes first. C xDestroy does not free sites.
 2. A trampoline calls `link_owner`; `None` returns the C error or no-op
    without JS. Root the owner immediately, and read it only through that
-   handle after allocation or JS. Read the callback from the owner's array.
-3. Call JS only through `call_from_native`. It catches a throw, parks the
+   handle after allocation or JS. `callback_from_link` reads the traced
+   callbacks slot after the last argument allocation, without owner-key
+   lookup. A trampoline whose only JS is one registered callback with
+   arguments that allocate nothing calls `call_callback(link, index, args)`:
+   one owner check (open, this thread, nothing pending), the slot read and
+   the call. Use `set_callback`, `state_set`, or `state_set_memo` to replace or
+   clear the callbacks array; these keep the state field and cell slot in sync.
+3. Call JS only through `call_from_native` / `call_from_link` /
+   `call_callback`. A native call (`NativeCallGuard::call`) captures one
+   handler at its first callback and reuses it for the rest; between
+   callbacks only runtime handle scopes may differ (a trampoline's argument
+   roots), never shadow frames or other managed stacks. It catches a throw, parks the
    exact value in `pendingException`, sets PENDING and returns `Err(())`.
    Further callbacks return the error without running JS: the first throw
    wins. Never throw through C or use throwing thread-validation helpers.
@@ -155,7 +170,19 @@ S checklist:
    the borrow before calling C. Hold neither `&mut T` nor a mutex over a call
    that can re-enter JS. Bracket every callback-capable call (step, exec,
    prepare, close, backup, changeset_apply) with `enter` and `finish`.
-5. Finish immediately when C returns, before result conversion or anything
+5. A loop may obtain `owner_link` once while its owner stays rooted, then
+   use `enter_link` per C call. This checks OPEN and creator-thread affinity
+   on every entry without validating the moving JS receiver again.
+   `NativeCallGuard::owner_link` exposes the link already validated at entry.
+   Prefer unsafe `guard.call(|| native_call())`: it finishes immediately and
+   shares a lazily captured catch savepoint across the call's callbacks.
+   Each callback still arms its own C trampoline, so a throw never jumps
+   across the native library. Between callbacks the trap is inactive; the
+   cached new.target remains traced and rewritten. Root depths are refreshed
+   per callback, including argument-conversion scopes. Native helpers within
+   this span may not change other managed stacks. `enter`/`finish` remains
+   available with ordinary per-callback capture for existing callers.
+   Finish immediately when C returns, before result conversion or anything
    that can throw. `CallEnd::Threw(value)` throws that exact value outside C;
    `CallEnd::Closed` throws the family's closed error without converting or
    returning partial results. A callback throw takes priority over close.
@@ -209,9 +236,84 @@ N checklist:
 2. Use the ordinary payload conversion checklist. Add no callback sites,
    keep-alive pins or pending-exception machinery.
 
+The first S family is node:sqlite (`perry-stdlib/src/sqlite/database_sync.rs`,
+`statement_sync.rs`, `sqlite_callbacks.rs`, `tag_store.rs`, `session.rs`):
+
+* `DatabaseSync` owns the `sqlite3*`; its payload exists only while open.
+  Everything `open()` needs to reopen (path, flags, limits) is plain data
+  kept in the JS state, so `close()` / `open()` keep the same object.
+* A statement owns no C resource: it keeps its SQL and options and compiles
+  them on its database per run, entering through the database. Children
+  carry the database's `OpenSerial`.
+* Each `sqlite3_step` is one guard; rows are converted after `finish`
+  with non-throwing converters, and an error finalizes the statement before
+  the throw. Resets that can run `xFinal` stay inside the guard, so a
+  pending exception keeps them out of JS.
+* The payload's `Drop` deletes sessions, finalizes any statement still on
+  the connection (the outer call of a deferred close), then
+  `sqlite3_close_v2`; the outer frame sees the database closed and forgets
+  its statement. A C child that must die before the connection (a
+  `sqlite3_session`) is shared through one `Rc` cell by the database
+  payload and the child payload: whichever goes first deletes it.
+* A statement owns the `sqlite3_stmt` its `prepare()` compiled, as node's
+  does (the authorizer runs once per `prepare()`; `expandedSQL` reads the
+  last bindings). Every run clears and rebinds it and leaves it reset, so
+  finalizing it never calls back. The connection's close finalizes it; the
+  open's `live` token (an `Rc<Cell<bool>>` shared with the database
+  payload) tells the statement's drop whether it still must.
+* node's own accessors (`stmt.sourceSQL`, `SQLTagStore#size`) are born with
+  the instance: `alloc_with_state(.., accessors, &BIRTH_MEMO)` installs them
+  at the site's first birth and records the final shapes; later births are
+  allocated in them, holding the family's shared accessor pairs. One-off
+  objects (`db.isOpen`, `db.limits.*`) still use
+  `native_payload::define_own_accessor`; a constructor export materializes
+  its prototype when the export is created (`native_payload::prototype`).
+
 In each family conversion PR, delete its callback id registries and scanners,
 `js_write_barrier_root_nanbox` callback "rooting", and listener/pipe tables
 keyed by id. For sqlite this includes NODE_SQLITE_CUSTOM_FUNCTIONS,
 NODE_SQLITE_CUSTOM_AGGREGATES, NODE_SQLITE_ACTIVE_AGGREGATES,
 scan_node_sqlite_roots_mut and release_node_sqlite_authorizer_in_freed_ranges.
 These deletions belong to the family lanes; the runtime API adds none of them.
+
+## Stream families (STREAM-PAYLOAD-DESIGN)
+
+A family whose node objects are streams (zlib's `Gzip`…, crypto's `Hash`,
+`Cipheriv`, `Sign`…) is an ordinary runtime Transform/Writable whose payload
+holds only the codec. There is one stream state machine: the runtime's
+writable buffer, readable queue, listeners and pipes.
+
+* **Hooks.** The payload cell's `finalizer` word names a static
+  `PayloadVTable { drop, stream }`; a stream family's vtable carries its
+  `StreamHooks { kind, timing, lazy, step, error, release }`
+  (`node_stream/native_hooks.rs`). The runtime reaches them from the object:
+  `meta.native_state` -> cell -> vtable. In-tree: `impl StreamPayload for T
+  { const HOOKS = &T_HOOKS; }` and `native_payload::alloc_stream` /
+  `attach_stream_to_object`. Binding crates: perry-ffi `native_stream`
+  (`payload_vtable::<T>(Some(&HOOKS))`, layout-checked by
+  `js_perry_stream_abi_layout`).
+* **Construction** mirrors node's constructor body: allocate with the family
+  prototype (whose chain reaches `Transform.prototype` / `Writable.prototype`)
+  and node's pre-fields, then `node_stream::init_transform_in_place(obj,
+  opts)` (or `init_writable_payload_in_place`), then the post-fields. The
+  instance owns no methods; its runtime state is non-enumerable.
+* **Steps.** Every write reaches `step(payload, &StepIn, &mut StepOut)`
+  through the writable machinery (serialized writes, the buffered-write
+  array). `step` calls no JS, allocates nothing on the GC heap and keeps no
+  pointer into `StepIn::input` (borrowed from the traced chunk for that step
+  only). Its output (in the payload's scratch) is copied into an
+  exact-length Buffer and pushed through the runtime's `push`. `MORE` steps
+  again, `NEED_INPUT` completes the write, `ENDED` (Final only) ends the
+  readable side, `ERROR` destroys with `error(owner, code)`.
+  `StepOut::external_bytes` restates the cell's external bytes after every
+  step. The runner parks while the readable side is at its highWaterMark
+  (node's Transform `kCallback`) and resumes when it drains.
+* **Timing.** `DEFERRED` (zlib) runs the steps from an immediate (`data`
+  never fires inside `write()`); `INLINE` (crypto) runs them inside `write()`.
+* **Release.** `destroy()` and autoDestroy call `release(owner)` (close the
+  payload; zlib also sets `_handle = null`) synchronously, before any event
+  is queued. Deferred jobs hold the stream as a traced capture, so a stream
+  family is `links_owner: false`.
+* **Overrides.** A JS `_transform`/`_flush` captured at init (an option, or a
+  subclass override) takes precedence over the hooks; the family prototype's
+  builtin `_transform` runs the same step for `super._transform(...)`.

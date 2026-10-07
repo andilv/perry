@@ -710,14 +710,13 @@ unsafe fn json_value_from_str(json: &str) -> f64 {
 }
 
 unsafe fn buffer_from_bytes(bytes: &[u8]) -> f64 {
-    let buf = perry_runtime::buffer::js_buffer_alloc(bytes.len() as i32, 0);
-    if buf.is_null() {
-        return undefined();
-    }
-    let data = (buf as *mut u8).add(std::mem::size_of::<perry_runtime::buffer::BufferHeader>());
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-    (*buf).length = bytes.len() as u32;
-    js_nanbox_pointer(buf as i64)
+    let result = perry_runtime::buffer::bytes::from_slice(
+        perry_runtime::buffer::bytes::Brand::Buffer,
+        bytes,
+    );
+    #[cfg(test)]
+    crate::buffer_b1_test_support::sabotage_output("tls", result);
+    result
 }
 
 fn certificate_attr_value(atv: &x509_cert::attr::AttributeTypeAndValue) -> String {
@@ -822,11 +821,11 @@ unsafe fn jsvalue_to_bytes(value: f64) -> Option<Vec<u8>> {
         return value_to_string(value).map(|s| s.into_bytes());
     }
     if v.is_pointer() {
-        let mut len = 0u32;
-        let data = perry_runtime::buffer::js_value_buffer_or_typedarray_data(value, &mut len);
-        if !data.is_null() {
-            return Some(std::slice::from_raw_parts(data, len as usize).to_vec());
-        }
+        return perry_runtime::buffer::bytes::no_gc(|scope| {
+            perry_runtime::buffer::bytes::bytes(value, scope)
+                .ok()
+                .map(<[u8]>::to_vec)
+        });
     }
     None
 }
@@ -1765,3 +1764,6 @@ static KEEP_TLS_FFI: KeepTlsFfi<23> = KeepTlsFfi([
     js_tls_socket_set_max_send_fragment as *const (),
     js_tls_process_pending as *const (),
 ]);
+
+#[cfg(test)]
+mod b1_output_tests;

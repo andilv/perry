@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context, Result};
-use perry_hir::{Expr, Function, Stmt};
+use perry_hir::Function;
 
 use crate::expr::FnCtx;
 use crate::module::LlModule;
@@ -627,11 +627,6 @@ pub(super) fn compile_function(
         .get(&f.id)
         .cloned()
         .ok_or_else(|| anyhow!("function name not resolved for {}", f.name))?;
-    let regex_factory_identity = (!f.is_async
-        && !f.is_generator
-        && f.params.is_empty()
-        && matches!(f.body.as_slice(), [Stmt::Return(Some(Expr::RegExp { .. }))]))
-    .then(|| public_llvm_name.clone());
     let guarded_public_plan = if typed_public_trampoline.is_none() && spec_entry.is_none() {
         cross_module
             .spec_abi_functions
@@ -746,12 +741,6 @@ pub(super) fn compile_function(
         );
         // Root the entry `this` slot of a this-reading body.
         let this_root_slots = usize::from(reads_this);
-        crate::codegen::helpers::maybe_spill_roots_to_shadow_frame(
-            lf,
-            &llvm_name,
-            m.len() + this_root_slots,
-            &f.body,
-        );
         lf.enable_shadow_frame((m.len() + this_root_slots) as u32);
         m
     } else {
@@ -1196,7 +1185,6 @@ pub(super) fn compile_function(
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
         source_function: f.name.clone(),
         source_function_slug: crate::expr::native_region_slug(&f.name),
-        regex_factory_identity,
         active_region_id: None,
         native_facts: &native_facts,
         locals,
@@ -1501,7 +1489,9 @@ pub(super) fn compile_function(
         let arg_val = blk.load(DOUBLE, &param_slot);
         let handle = crate::expr::unbox_to_i64(blk, &arg_val);
         let handle_ptr = blk.inttoptr(I64, &handle);
-        let data_ptr = blk.gep(I8, &handle_ptr, &[(I32, "8")]);
+        // Use the same backing resolution as Uint8Array views: a
+        // Buffer argument may own inline bytes or carry a view/native span.
+        let data_ptr = blk.call(PTR, "js_native_buffer_data_ptr", &[(DOUBLE, &arg_val)]);
         let buf_slot = ctx.func.alloca_entry(PTR);
         ctx.block().store(PTR, &data_ptr, &buf_slot);
         let scope_idx = ctx.buffer_alias_base + ctx.buffer_data_slots.len() as u32;
@@ -1511,12 +1501,14 @@ pub(super) fn compile_function(
             p.id,
             BufferViewSlot {
                 data_slot: buf_slot,
-                length_slot: None,
+                // Length belongs to the receiver header, not data_ptr - 8.
+                // Keep it live so detach/resize still invalidate bounds.
+                length_slot: Some(handle_ptr),
                 scope_idx: Some(scope_idx),
                 elem: BufferElem::U8,
                 element_width_bytes: 1,
                 index_unit: BufferIndexUnit::Byte,
-                view_byte_offset: Some(0),
+                view_byte_offset: None,
                 length_offset_from_data: -8,
                 alias: AliasState::Unknown,
                 length_source: Some(LengthSource::Unknown),

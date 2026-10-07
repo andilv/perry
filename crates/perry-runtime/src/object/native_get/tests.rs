@@ -222,12 +222,17 @@ fn unsupported_receivers_and_private_names_decline_and_preserve_results() {
 
 #[cfg(feature = "regex-engine")]
 #[test]
-fn regexp_expandos_and_accessors_remain_on_the_exotic_path() {
+fn regexp_expandos_are_ordinary_data_and_accessors_preserve_observability() {
     let _no_gc = crate::gc::GcSuppressScope::new();
     let regexp = crate::regex::js_regexp_new(key("x"), key("g"));
     let regexp_obj = regexp as *mut ObjectHeader;
     js_object_set_field_by_name(regexp_obj, key("value"), 67.0);
-    assert!(unsafe { try_data_get_by_name(regexp_obj, key("value")) }.is_none());
+    assert_eq!(
+        unsafe { try_data_get_by_name(regexp_obj, key("value")) }
+            .unwrap()
+            .as_number(),
+        67.0
+    );
     differential(boxed(regexp_obj), "value", 67.0);
     GETTER_CALLS.store(0, Ordering::Relaxed);
     install_getter(regexp_obj, "value", true);
@@ -313,5 +318,40 @@ fn class_statics_buffers_and_mapped_arguments_use_the_slow_path() {
         crate::object::js_arguments_object_map_index(arguments, 0, cell);
         assert!(try_data_get_by_name(arguments, key("0")).is_none());
         differential(boxed(arguments), "0", 79.0);
+    }
+}
+
+#[test]
+fn wide_private_shape_keeps_public_and_private_names_separate() {
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let object = object("visible", 7.0);
+    for i in 0..crate::object::KEYS_INDEX_THRESHOLD {
+        js_object_set_field_by_name(object, key(&format!("field{i}")), i as f64);
+    }
+    unsafe {
+        crate::object::key_attrs::apply_edits(
+            object,
+            &[crate::object::key_attrs::AttrsEdit::Private(b"hidden")],
+        );
+        let keys = crate::object::object_keys(object);
+        // Exercise both the unindexed fallback and the complete shape index.
+        for build in [false, true] {
+            if build {
+                let hash = super::super::key_bytes_hash(b"visible".as_ptr(), 7);
+                let _ = shapes::shape_slot_lookup_verdict(
+                    keys.arr(),
+                    b"visible",
+                    hash,
+                    keys.count(),
+                    true,
+                );
+            }
+            differential(boxed(object), "visible", 7.0);
+            differential(
+                boxed(object),
+                "hidden",
+                f64::from_bits(crate::value::TAG_UNDEFINED),
+            );
+        }
     }
 }

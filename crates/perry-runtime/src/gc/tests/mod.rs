@@ -14,6 +14,7 @@ mod boxes;
 mod budgeted_step_api;
 mod buffer_bound_method_name;
 mod buffer_side_tables;
+mod bulk_closure_captures;
 mod canonical_keys_holders;
 mod census;
 mod census_block_windows;
@@ -67,6 +68,7 @@ mod mark_slot_hoists;
 mod minor_fixed_cost;
 mod native_payload;
 mod native_payload_callbacks;
+mod native_payload_streams;
 mod noncollecting_root_lock;
 mod object_create;
 mod old_free_intrusive;
@@ -127,3 +129,7 @@ mod external_buffer;
 
 #[cfg(target_os = "linux")]
 mod eden_entry_residency;
+
+mod buffer_bytes;
+
+mod buffer_b4;

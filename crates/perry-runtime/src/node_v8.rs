@@ -114,31 +114,11 @@ unsafe fn build_object(pairs: &[(&str, f64)]) -> f64 {
 /// `Uint8Array` / other TypedArrays, and `ArrayBuffer`. Returns `None` for
 /// anything else (caller throws `ERR_INVALID_ARG_TYPE` like Node).
 unsafe fn input_bytes(value: f64) -> Option<Vec<u8>> {
-    let jsv = JSValue::from_bits(value.to_bits());
-    if !jsv.is_pointer() {
-        return None;
-    }
-    let addr = (value.to_bits() & crate::value::POINTER_MASK) as usize;
-    if addr < 0x10000 {
-        return None;
-    }
-    if crate::buffer::is_registered_buffer(addr) {
-        let data = crate::buffer::js_native_buffer_data_ptr(value);
-        let len = crate::buffer::js_native_buffer_byte_len(value);
-        if data.is_null() || len == 0 {
-            return Some(Vec::new());
-        }
-        return Some(std::slice::from_raw_parts(data, len).to_vec());
-    }
-    if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
-        let ta = addr as *const crate::typedarray::TypedArrayHeader;
-        return Some(
-            crate::typedarray::typed_array_bytes(ta)
-                .map(|b| b.to_vec())
-                .unwrap_or_default(),
-        );
-    }
-    None
+    crate::buffer::bytes::no_gc(|scope| {
+        crate::buffer::bytes::bytes(value, scope)
+            .ok()
+            .map(<[u8]>::to_vec)
+    })
 }
 
 fn is_valid_heap_snapshot_options(value: f64) -> bool {
@@ -222,18 +202,7 @@ fn snapshot_readable_stream(json: &str) -> f64 {
 #[no_mangle]
 pub extern "C" fn js_v8_serialize(value: f64) -> f64 {
     let bytes = crate::child_process::v8_serialize(value);
-    let buf = crate::buffer::js_buffer_alloc(bytes.len() as i32, 0);
-    if buf.is_null() {
-        return undefined();
-    }
-    unsafe {
-        let data = (buf as *mut u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
-        if !bytes.is_empty() {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-        }
-        (*buf).length = bytes.len() as u32;
-    }
-    f64::from_bits(JSValue::pointer(buf as *const u8).bits())
+    crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::Buffer, &bytes)
 }
 
 /// `v8.deserialize(buffer)` → reconstructed JS value.
@@ -478,18 +447,7 @@ pub extern "C" fn js_v8_deserializer_new(buffer: f64) -> f64 {
 
 /// Wrap a byte vector into a Node `Buffer` value.
 fn bytes_to_buffer(bytes: &[u8]) -> f64 {
-    let buf = crate::buffer::js_buffer_alloc(bytes.len() as i32, 0);
-    if buf.is_null() {
-        return undefined();
-    }
-    unsafe {
-        let data = (buf as *mut u8).add(std::mem::size_of::<crate::buffer::BufferHeader>());
-        if !bytes.is_empty() {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-        }
-        (*buf).length = bytes.len() as u32;
-    }
-    f64::from_bits(JSValue::pointer(buf as *const u8).bits())
+    crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::Buffer, bytes)
 }
 
 // ── Serializer instance methods (called from dispatch_native_module_method) ──

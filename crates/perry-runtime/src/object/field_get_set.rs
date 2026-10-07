@@ -292,7 +292,7 @@ pub(crate) use crypto_key::{
 pub(crate) use enumeration::{
     canonical_array_index, ecma_own_key_order, instance_private_key_hidden,
     is_internal_runtime_key, is_internal_runtime_key_bytes, keys_contain_array_index,
-    own_key_hidden_bytes, own_keys_may_hide,
+    own_key_hidden_bytes, own_keys_may_hide, own_slot_hidden,
 };
 pub use enumeration::{
     js_for_in_keys_value, js_object_entries, js_object_entries_value, js_object_keys,
@@ -315,6 +315,10 @@ pub(crate) use has_property::{
 };
 pub use has_property::{js_in_operator, js_object_has_property};
 pub use has_property_ic::js_in_operator_presence_ic;
+#[cfg(feature = "regex-engine")]
+pub(crate) use ic_miss::intrinsic_private_add;
+#[cfg(feature = "regex-engine")]
+pub(crate) use ic_miss::intrinsic_private_set;
 pub(crate) use ic_miss::{
     bind_primitive_proto_method_static, cannot_be_private_member_name, class_evaluation_of,
     current_private_lexical_brand_value, is_array_method_value_name,
@@ -324,7 +328,7 @@ pub(crate) use ic_miss::{
     private_member_access_hints_savepoint, private_member_call_by_name, private_member_get_by_name,
     private_member_set_by_name, scan_private_lexical_brand_roots_mut, set_method_value_name,
     stamp_private_evaluation_brand, take_private_method_call_hint, take_private_method_owner_hint,
-    PrivateHintBrandScope,
+    IntrinsicPrivateReadSite, PrivateHintBrandScope,
 };
 pub use ic_miss::{
     js_class_field_add, js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
@@ -459,3 +463,6 @@ mod buffer_ic_miss_tests {
         }
     }
 }
+
+#[cfg(any(test, feature = "regex-engine"))]
+pub(crate) mod runtime_store_site;

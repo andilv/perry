@@ -69,9 +69,7 @@ pub(super) fn admissible(receiver: &RuntimeHandle<'_>, reuse: &Reuse<'_, '_>) ->
     }
     let value = receiver.get_nanbox_f64();
     let re = crate::value::js_nanbox_get_pointer(value) as *const RegExpHeader;
-    super::is_valid_regex_ptr(re)
-        && crate::object::regex_proto_thunks::regexp_view_uses_builtin(value)
-        && reuse.name_count(re) == Some(0)
+    crate::object::regex_read_sites::exec_is_builtin(value) && reuse.name_count(re) == Some(0)
 }
 
 /// One collection-loop round in this many runs the GC safepoint poll.

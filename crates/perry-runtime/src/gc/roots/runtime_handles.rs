@@ -148,6 +148,19 @@ impl RuntimeHandleScope {
             .collect()
     }
 
+    /// Root a stable native argument cell through the existing runtime-handle
+    /// scanner, which rewrites the original buffer during moving collection.
+    ///
+    /// # Safety
+    /// The cell must remain allocated until this scope is dropped or restored
+    /// by the exception savepoint. Do not read a copied pointer across a call.
+    pub(crate) unsafe fn root_heap_word_cell(
+        &self,
+        cell: &std::cell::UnsafeCell<f64>,
+    ) -> RuntimeHandle<'_> {
+        self.push(RuntimeHandleSlot::HeapWordCell(cell.get() as usize))
+    }
+
     #[inline]
     pub fn root_nanbox_u64<'scope>(&'scope self, bits: u64) -> RuntimeHandle<'scope> {
         self.push(RuntimeHandleSlot::Nanbox(bits))
@@ -165,6 +178,27 @@ impl RuntimeHandleScope {
             .iter()
             .map(|bits| self.root_heap_word_u64(*bits))
             .collect()
+    }
+
+    /// Root every word immediately, then read its current value when the
+    /// iterator is consumed. Stable stack indices survive handle-stack growth
+    /// and moving collection without allocating temporary handle/value vectors.
+    pub fn root_heap_word_u64_slice_iter<'scope>(
+        &'scope self,
+        values: &[u64],
+    ) -> impl ExactSizeIterator<Item = u64> + 'scope {
+        let start = self.stack.len();
+        for &bits in values {
+            self.root_heap_word_u64(bits);
+        }
+        (start..start + values.len()).map(move |index| {
+            RuntimeHandle {
+                index,
+                stack: self.stack,
+                _scope: PhantomData,
+            }
+            .get_heap_word_u64()
+        })
     }
 
     pub fn refreshed_nanbox_f64_slice(handles: &[RuntimeHandle<'_>]) -> Vec<f64> {
@@ -238,6 +272,9 @@ fn runtime_handle_slot_write_barrier(slot: RuntimeHandleSlot) {
 fn runtime_handle_slot_write_barrier_active(slot: RuntimeHandleSlot) {
     match slot {
         RuntimeHandleSlot::Nanbox(bits) => runtime_write_barrier_root_nanbox(bits),
+        RuntimeHandleSlot::HeapWordCell(address) => unsafe {
+            runtime_write_barrier_root_heap_word((address as *const u64).read())
+        },
         RuntimeHandleSlot::HeapWord(bits) => runtime_write_barrier_root_heap_word(bits),
         RuntimeHandleSlot::RawPointer(addr)
         | RuntimeHandleSlot::RawString(addr)
@@ -465,6 +502,7 @@ impl<'scope> RuntimeHandle<'scope> {
     pub fn get_heap_word_u64(&self) -> u64 {
         self.with_slot(|slot| match slot {
             RuntimeHandleSlot::HeapWord(bits) => bits,
+            RuntimeHandleSlot::HeapWordCell(address) => unsafe { (address as *const u64).read() },
             _ => handle_kind_mismatch("heap word"),
         })
     }
@@ -472,6 +510,9 @@ impl<'scope> RuntimeHandle<'scope> {
     pub fn set_heap_word_u64(&self, bits: u64) {
         self.with_slot_mut(|slot| match slot {
             RuntimeHandleSlot::HeapWord(current) => *current = bits,
+            RuntimeHandleSlot::HeapWordCell(address) => unsafe {
+                (*address as *mut u64).write(bits)
+            },
             _ => panic!("runtime handle kind mismatch: expected heap word"),
         });
         runtime_write_barrier_root_heap_word(bits);
@@ -525,6 +566,9 @@ fn visit_runtime_handle_slot(stack: StackRef, index: usize, visitor: &mut Runtim
     };
     let rewritten = match &mut slot {
         RuntimeHandleSlot::Nanbox(bits) => visitor.visit_nanbox_u64_slot(bits),
+        RuntimeHandleSlot::HeapWordCell(address) => unsafe {
+            visitor.visit_heap_word_u64_slot(&mut *(*address as *mut u64))
+        },
         RuntimeHandleSlot::RawPointer(addr) => visitor.visit_tagged_usize_slot(addr, POINTER_TAG),
         RuntimeHandleSlot::RawString(addr) => visitor.visit_tagged_usize_slot(addr, STRING_TAG),
         RuntimeHandleSlot::RawBigInt(addr) => visitor.visit_tagged_usize_slot(addr, BIGINT_TAG),
