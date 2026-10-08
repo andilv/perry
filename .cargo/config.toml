@@ -74,6 +74,15 @@ CXXFLAGS_aarch64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
 CFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
 CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
 
+# The bundled SQLite is built as node's is in this one respect: node compiles
+# it with SQLITE_DEFAULT_MEMSTATUS=0 (`PRAGMA compile_options` on node 26),
+# so every sqlite3_malloc skips the global memory-statistics mutex and
+# counters. Nothing in perry reads SQLite's memory statistics.
+# (Single `[env]` table: TOML forbids a duplicate header, and the fork's musl
+# CFLAGS table above collided with upstream's LIBSQLITE3_FLAGS table after a
+# remote sync merged both regions without a textual conflict.)
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
+
 # #9486: x86_64 needs frame pointers, and cannot inherit them from `[build]`.
 #
 # `Error.stack` captures its frames by walking the `rbp` / `x29` chain, which
@@ -94,10 +103,3 @@ CXXFLAGS_x86_64_unknown_linux_musl = "-U_FORTIFY_SOURCE"
 # rather than silent — but it is still a mistake).
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "force-unwind-tables=yes", "-Z", "use-sync-unwind=yes", "-C", "force-frame-pointers=yes"]
-
-# The bundled SQLite is built as node's is in this one respect: node compiles
-# it with SQLITE_DEFAULT_MEMSTATUS=0 (`PRAGMA compile_options` on node 26),
-# so every sqlite3_malloc skips the global memory-statistics mutex and
-# counters. Nothing in perry reads SQLite's memory statistics.
-[env]
-LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
