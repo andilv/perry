@@ -93,8 +93,10 @@ mod scrub_dead_stack;
 mod shadow_stack_ops;
 mod shape_descriptor_authority;
 mod shape_keys_descriptor_edge;
+mod shape_young_log_release;
 mod smoke;
 mod start_bitmap;
+mod static_seed_keys;
 mod step_bounds;
 mod string_char_array_roots;
 pub(super) mod support;
@@ -133,3 +135,6 @@ mod eden_entry_residency;
 mod buffer_bytes;
 
 mod buffer_b4;
+
+mod census_two_mib;
+mod holder_memo;

@@ -9,6 +9,15 @@ use crate::node_stream::native_hooks::tests::{
 use crate::value::{JSValue, TAG_UNDEFINED};
 use std::sync::atomic::Ordering;
 
+/// Restores the thread's lazy-registration suppression on drop.
+struct AutoGcInitRestore(bool);
+
+impl Drop for AutoGcInitRestore {
+    fn drop(&mut self) {
+        crate::gc::set_auto_gc_init_suppressed(self.0);
+    }
+}
+
 fn finalized() -> usize {
     crate::native_handle::PAYLOAD_FINALIZED.load(Ordering::SeqCst)
 }
@@ -75,13 +84,30 @@ fn anon_rss_bytes() -> usize {
 /// finished stream alive (no static holds a step job).
 #[test]
 fn z8_churn_releases_every_codec_at_completion_and_drops_every_payload() {
+    // This churn can reach an automatic copying minor with either block size.
+    // Isolate scanner/cache roots just like the other copying-GC witnesses.
+    let _gc = super::support::CopyingNurseryTestGuard::new(0);
     let _reset = FamilyReset::new();
-    const N: usize = 2000;
+    // The isolation guard empties the scanner registry and suppresses lazy
+    // registration. This workload fills caches no hand-picked subset covers
+    // (canonical key lists, interned key names, shape caches, the payload
+    // prototype): a cache scanner missing from the set leaves a stale address
+    // after the first collection (a forwarded keys array read as live,
+    // #12136). Register the production set, exactly as an agent has it.
+    let _auto_init = AutoGcInitRestore(crate::gc::set_auto_gc_init_suppressed(false));
+    crate::gc::gc_init();
+    // Warm the larger backing before measuring six complete churn batches.
+    // Keep the RSS bound and all release/drop/finalization checks unchanged.
+    const BLOCK_SCALE: usize = crate::arena::BLOCK_SIZE / (1024 * 1024);
+    const WARMUP_BATCHES: usize = 2 * BLOCK_SCALE;
+    const BATCHES: usize = WARMUP_BATCHES + 6;
+    const PER_BATCH: usize = 250 * BLOCK_SCALE;
+    const N: usize = BATCHES * PER_BATCH;
     let input = vec![b'q'; 1024];
     let before_cells = finalized();
     let mut rss = Vec::new();
-    for batch in 0..8 {
-        for _ in 0..N / 8 {
+    for batch in 0..BATCHES {
+        for _ in 0..PER_BATCH {
             let scope = crate::gc::RuntimeHandleScope::new();
             let rot = scope.root_nanbox_f64(new_rot13(Rot13Opts::default()));
             on_data(rot.get_nanbox_f64(), crate::fn_info!(sink_data, 1));
@@ -129,17 +155,17 @@ fn z8_churn_releases_every_codec_at_completion_and_drops_every_payload() {
         CREATED.load(Ordering::SeqCst),
         RELEASED.load(Ordering::SeqCst),
         DROPPED.load(Ordering::SeqCst),
-        rss[2],
-        rss[2..].iter().max().unwrap(),
-        rss[2..].iter().max().unwrap() - rss[2..].iter().min().unwrap()
+        rss[WARMUP_BATCHES],
+        rss[WARMUP_BATCHES..].iter().max().unwrap(),
+        rss[WARMUP_BATCHES..].iter().max().unwrap() - rss[WARMUP_BATCHES..].iter().min().unwrap()
     );
     assert!(
         cells >= 2 * N - 16,
         "the dead streams' cells were swept: {cells} of {}",
         2 * N
     );
-    let warm = *rss[2..].iter().min().unwrap();
-    let peak = *rss[2..].iter().max().unwrap();
+    let warm = *rss[WARMUP_BATCHES..].iter().min().unwrap();
+    let peak = *rss[WARMUP_BATCHES..].iter().max().unwrap();
     assert!(
         peak - warm < 4 << 20,
         "anonymous RSS flat after warmup: {}",

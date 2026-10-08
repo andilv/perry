@@ -124,7 +124,7 @@ pub(crate) fn build_optimized_libs(
     // that gated the introductory cycle is now inverted:
     // `PERRY_DISABLE_WELL_KNOWN=1` reverts to perry-stdlib's
     // copies for bisection — except for the bindings that no longer have
-    // one (`net`, `ws`: `wrapper_is_sole_provider`), which route to their
+    // one (`net`, `ws`, `zlib`: `wrapper_is_sole_provider`), which route to their
     // wrapper either way. If a bundled `.a` is missing on disk,
     // each entry falls back to the perry-stdlib copy individually
     // (logged with `well-known: skipping` when verbose), so a
@@ -145,10 +145,10 @@ pub(crate) fn build_optimized_libs(
     let mut external_net_transport = false;
     // Web Fetch is selected independently from the external node:http
     // binding. `uses_fetch` adds `web-fetch` in compute_required_features.
-    // Was `if use_well_known { … }`; the gate is now per module
-    // (`retain_routed`), and the block is kept to leave the body's
+    // Was `if use_well_known { … }`; the gate is now the compile's routing
+    // decision (`routed_modules`), and the block is kept to leave the body's
     // indentation — and its blame — as it was.
-    let routed_set = retain_routed(iteration_set.clone());
+    let routed_set = routed_modules(ctx);
     {
         for module in &routed_set {
             let module_normalized = module.strip_prefix("node:").unwrap_or(module);
@@ -383,25 +383,14 @@ pub(crate) fn build_optimized_libs(
             if original_features.contains(&"tls") {
                 features.insert("external-tls-server");
             }
-            // #1843 — when the flip strips the compression base feature and
-            // routes `node:zlib` to perry-ext-zlib, activate
-            // `external-zlib-pump` to retain lost-static-type dispatch
-            // (`gz.write()`/`.on()`/`.pipe()`) into
-            // `js_ext_zlib_dispatch_method`. perry-ext-zlib registers its
-            // own deferred-event pump and keepalive contributor.
-            // `module_to_features` maps `zlib` to `compression-gzip` since
-            // the per-codec split;
-            // keep matching the legacy `compression` umbrella too so a
-            // future mapping change cannot silently drop the adapter.
+            // The same provider serves both builds. Resolve module exports
+            // from the separately linked archive in an optimized build.
             if original_features.contains(&"compression-gzip")
                 || original_features.contains(&"compression")
             {
                 features.insert("external-zlib-pump");
-                // The per-codec add-ons imply `compression-gzip` at the Cargo
-                // level, so leaving them enabled would compile the bundled
-                // zlib module back in and duplicate perry-ext-zlib's
-                // `js_zlib_*` symbols at link. The ext crate carries all
-                // codecs, so nothing is lost by dropping them here.
+                // The binding already carries every codec; avoid compiling
+                // a second copy of its dependencies through the stdlib rlib.
                 features.remove("compression-brotli");
                 features.remove("compression-zstd");
             }
@@ -440,12 +429,13 @@ pub(crate) fn build_optimized_libs(
                 // `js_tls_client_preflight` undefined at link time.
                 features.insert("external-tls-server");
             }
-            // Issue #769 — when `node:http` / `node:https` routes to
-            // perry-ext-http, retain its client dispatch adapters and shared
-            // runtime. The client queue and in-flight predicate self-register.
-            if matches!(module_normalized, "http" | "https") {
-                features.insert("external-http-client-pump");
-            }
+            features.extend(
+                crate::commands::stdlib_features::routed_stream_dispatch_features(
+                    module_normalized,
+                )
+                .iter()
+                .copied(),
+            );
         }
     }
 

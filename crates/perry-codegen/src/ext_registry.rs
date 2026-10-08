@@ -117,6 +117,7 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     // or bound export installs its provider's value-form dispatcher.
     ("js_ext_net_nm_install",                       OwnerKind::WellKnown("net")),
     ("js_ext_http_nm_install",                      OwnerKind::WellKnown("http")),
+    ("js_ext_zlib_nm_install",                      OwnerKind::WellKnown("zlib")),
     // ── #835: Web Streams ────────────────────────────────────────────
     // `perry-stdlib::streams` owns the canonical implementations.
     // `perry-ext-streams` re-implements a subset, but `js_stream_unwrap_handle`
@@ -629,6 +630,46 @@ pub fn well_known_owner_for_symbol(symbol: &str) -> Option<&'static str> {
         .map(|(_, binding)| *binding)
 }
 
+/// Does this registry name any symbol that only `module`'s wrapper crate
+/// defines (the same attribution [`well_known_owner_for_symbol`] makes)?
+/// Symbols the stdlib also implements are `OwnerKind::Stdlib`, not listed
+/// under the wrapper.
+pub fn wrapper_owns_symbols(module: &str) -> bool {
+    FFI_REGISTRY
+        .iter()
+        .any(|(_, owner)| matches!(owner, OwnerKind::WellKnown(key) if *key == module))
+        || EXT_PREFIX_REGISTRY
+            .iter()
+            .any(|(_, binding)| *binding == module)
+}
+
+/// The namespace install hook a wrapper crate defines, by its staticlib stem
+/// (`perry_ext_http` → `js_ext_http_nm_install`), when this registry lists one.
+/// A hook registers the wrapper's value-form export dispatcher and then chains
+/// to the runtime bucket install; `crate::native_routing` emits it for modules
+/// the compile routes to that wrapper.
+pub fn wrapper_install_hook(lib: &str) -> Option<&'static str> {
+    let stem = lib.strip_prefix("perry_")?;
+    FFI_REGISTRY.iter().find_map(|(name, owner)| {
+        (matches!(owner, OwnerKind::WellKnown(_))
+            && name
+                .strip_prefix("js_")
+                .and_then(|rest| rest.strip_suffix("_nm_install"))
+                == Some(stem))
+        .then_some(*name)
+    })
+}
+
+/// Every wrapper install hook this registry lists, for declaration.
+pub(crate) fn wrapper_install_hooks() -> impl Iterator<Item = &'static str> {
+    FFI_REGISTRY.iter().filter_map(|(name, owner)| {
+        (matches!(owner, OwnerKind::WellKnown(_))
+            && name.starts_with("js_ext_")
+            && name.ends_with("_nm_install"))
+        .then_some(*name)
+    })
+}
+
 /// Process-wide collector of provider keys observed during codegen.
 /// Populated by [`record_ffi_call`] from `LlBlock::call` / `call_void`.
 /// Drained by [`take_used_providers`] right before `build_optimized_libs`.
@@ -1029,6 +1070,14 @@ mod tests {
     #[test]
     fn provider_namespace_installs_route_to_their_well_known_binding() {
         let _guard = ProviderTestGuard::new();
+        use crate::native_routing::{NativeProvider, NativeRouting};
+        let wrapper = |lib: &str| NativeProvider::Wrapper(lib.to_string());
+        let routed = NativeRouting::new([
+            ("net".to_string(), wrapper("perry_ext_net")),
+            ("http".to_string(), wrapper("perry_ext_http")),
+            ("https".to_string(), wrapper("perry_ext_http")),
+            ("http2".to_string(), wrapper("perry_ext_http")),
+        ]);
         for (module, owner) in [
             ("net", "net"),
             ("node:net", "net"),
@@ -1036,10 +1085,24 @@ mod tests {
             ("node:https", "http"),
             ("http2", "http"),
         ] {
-            let symbol = crate::nm_install::nm_install_symbol(module)
+            let symbol = routed
+                .install_symbol(module)
                 .unwrap_or_else(|| panic!("{module} has no namespace install symbol"));
             assert_symbol_routes_to(symbol, OwnerKind::WellKnown(owner));
         }
+        // A module the bundled libraries serve installs the runtime bucket,
+        // which asks the linker for no wrapper.
+        let bundled = NativeRouting::new([(
+            "http".to_string(),
+            NativeProvider::Bundled("perry_ext_http".to_string()),
+        )]);
+        let symbol = bundled.install_symbol("http").expect("http bucket");
+        let _ = take_used_providers();
+        record_ffi_call(symbol);
+        assert!(
+            take_used_providers().is_empty(),
+            "{symbol} must record no provider"
+        );
     }
 
     #[test]

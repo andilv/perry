@@ -21,6 +21,13 @@ use crate::types::DOUBLE;
 /// here is a dispatch table; each module's `lower(ctx, expr)` contains the
 /// original arm bodies verbatim.
 pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+    // Hoisted byte-access proofs are dirtied by every executed call at the
+    // call-emission choke point and revalidated at their next use; no
+    // expression boundary refreshes them.
+    lower_expr_inner(ctx, expr)
+}
+
+fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     // #7590: TAKE the "this expression's value is discarded" flag before doing
     // anything else. `lower_stmt` set it for the statement's own expression;
     // taking it here means every operand lowered below reads `false`, so a
@@ -228,8 +235,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::PathWin32 { .. }
         | Expr::QueueMicrotask(..)
         | Expr::ProcessNextTick { .. }
-        | Expr::RegExpTest { .. }
-        | Expr::RegExpExec { .. }
         | Expr::GlobalGet(..)
         | Expr::PathDirname(..)
         | Expr::PathRelative(..)
@@ -380,8 +385,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::StringRaw { .. }
         | Expr::StringAt { .. }
         | Expr::StringCodePointAt { .. }
-        | Expr::RegExpSource(..)
-        | Expr::RegExpFlags(..)
         | Expr::ProcessChdir(..)
         | Expr::ProcessExit(..)
         | Expr::ProcessAbort
@@ -420,7 +423,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::MathAtan(..)
         | Expr::MathAtan2(..)
         | Expr::StringFromCharCode(..)
-        | Expr::RegExpSetLastIndex { .. }
         | Expr::ProcessStdin
         | Expr::ProcessStdout
         | Expr::ProcessStderr
@@ -516,7 +518,6 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::DateSetTime { .. } => super::os_uri_dates::lower(ctx, expr),
         Expr::ArrayIsArray(..)
         | Expr::AggregateErrorNew { .. }
-        | Expr::RegExpLastIndex(..)
         | Expr::BufferConcat(..)
         | Expr::BufferConcatWithLength { .. }
         | Expr::BufferSlice { .. }

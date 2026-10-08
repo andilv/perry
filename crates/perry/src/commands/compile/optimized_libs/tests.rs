@@ -989,7 +989,7 @@ fn disabled_flip_still_routes_sole_provider_wrappers() {
         ctx.native_module_imports.insert(module.to_string());
     }
     let libs = resolve_no_auto_optimized_libs(&ctx, None, OutputFormat::Json, 0);
-    let routed = super::retain_routed(well_known_iteration_set(&ctx));
+    let routed = super::routed_modules(&ctx);
 
     for (key, value) in &saved {
         set_env_var(key, value.as_deref());
@@ -1461,127 +1461,49 @@ fn auto_optimize_keepalive_anchors_not_bitcode_only() {
     );
 }
 
-/// The well-known flip drops `compression-brotli`/`compression-zstd` from the
-/// stdlib rebuild on a stated premise: "The ext crate carries all codecs, so
-/// nothing is lost by dropping them here."
-///
-/// #8005: that premise was a comment and nothing checked it. It is false for
-/// the RAW one-shots — `js_zlib_deflate_raw_sync` and `js_zlib_inflate_raw_sync`
-/// exist only in perry-stdlib — so the flip removed them from the link and
-/// `test_gap_zlib_4917_level` failed with two undefined symbols, two stages
-/// downstream of the decision that caused it.
-///
-/// This scans both crates for exported `js_zlib_*` symbols and requires the ext
-/// surface to be a superset, minus an explicit shrink-only list. A name that
-/// leaves stdlib, or gains an ext implementation, must be deleted from
-/// `KNOWN_EXT_GAPS` in the same commit — an entry matching nothing FAILS, so
-/// the list cannot rot into an alibi.
+/// Both default and optimized builds use the same binding provider. Keep a
+/// concrete ABI inventory: removing the bundled provider must not make its
+/// former superset witness vacuous.
 #[test]
-fn ext_zlib_covers_every_stdlib_symbol_the_flip_strips() {
-    /// Symbols perry-stdlib exports that perry-ext-zlib does not implement yet.
-    /// SHRINKS ONLY. Every entry is reachable today only because the flip does
-    /// not strip the feature that defines it; adding one is how #8005 happened.
-    const KNOWN_EXT_GAPS: &[&str] = &[
-        // Stream constructors — perry-ext-zlib owns streams through its own
-        // dispatch (`js_ext_zlib_dispatch_method`) rather than these entry
-        // points, so these are a naming difference, not a hole. Listed so the
-        // superset check stays honest instead of being weakened to ignore them.
-        "js_zlib_create_brotli_compress",
-        "js_zlib_create_brotli_decompress",
-        "js_zlib_create_deflate",
-        "js_zlib_create_deflate_raw",
-        "js_zlib_create_gunzip",
-        "js_zlib_create_gzip",
-        "js_zlib_create_inflate",
-        "js_zlib_create_inflate_raw",
-        "js_zlib_create_unzip",
-        "js_zlib_create_zstd_compress",
-        "js_zlib_create_zstd_decompress",
-        // Pump/dispatch plumbing, supplied by the `external-zlib-pump` feature
-        // the flip ADDS rather than strips.
-        "js_zlib_has_active_handles",
-        "js_zlib_native_dispatch",
-        "js_zlib_process_pending",
-    ];
-
-    fn exported_zlib_symbols(dir: &Path) -> std::collections::BTreeSet<String> {
-        let mut found = std::collections::BTreeSet::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(next) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&next) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for line in text.lines() {
-                    if let Some(rest) = line.split("fn js_zlib_").nth(1) {
-                        let name: String = rest
-                            .chars()
-                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                            .collect();
-                        if !name.is_empty() {
-                            found.insert(format!("js_zlib_{name}"));
-                        }
-                    }
-                }
-            }
-        }
-        found
-    }
-
+fn ext_zlib_is_the_only_provider_and_covers_the_linked_surface() {
     let root = find_perry_workspace_root().expect("workspace root");
-    let stdlib = exported_zlib_symbols(&root.join("crates/perry-stdlib/src"));
-    let ext = exported_zlib_symbols(&root.join("crates/perry-ext-zlib/src"));
-
-    // Live-subject check: a scan that found nothing would make every assertion
-    // below vacuously true, which is precisely the failure mode this test is
-    // about.
-    assert!(
-        stdlib.len() > 20 && ext.len() > 10,
-        "symbol scan looks broken — stdlib {} / ext {}; the superset check \
-         below would pass without proving anything",
-        stdlib.len(),
-        ext.len()
-    );
-    assert!(
-        ext.contains("js_zlib_deflate_raw_sync") && ext.contains("js_zlib_inflate_raw_sync"),
-        "#8005's pair must stay implemented in perry-ext-zlib; the flip strips \
-         the stdlib feature that would otherwise supply them"
-    );
-
-    let missing: Vec<&String> = stdlib
-        .iter()
-        .filter(|name| !ext.contains(*name) && !KNOWN_EXT_GAPS.contains(&name.as_str()))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "perry-stdlib exports these `js_zlib_*` symbols and perry-ext-zlib does \
-         not: {missing:?}. The well-known flip routes `node:zlib` to the ext \
-         crate on the premise that it carries everything, so a symbol only \
-         stdlib defines disappears from the link. Implement it in \
-         perry-ext-zlib, or add it to KNOWN_EXT_GAPS with the reason."
-    );
-
-    let stale: Vec<&&str> = KNOWN_EXT_GAPS
-        .iter()
-        .filter(|name| !stdlib.contains(**name) || ext.contains(**name))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "these KNOWN_EXT_GAPS entries no longer describe reality — the symbol \
-         left perry-stdlib or gained an ext implementation: {stale:?}. Delete \
-         them; a list that outlives its entries stops being a ratchet."
-    );
+    assert!(!root.join("crates/perry-stdlib/src/zlib.rs").exists());
+    let source = std::fs::read_to_string(root.join("crates/perry-ext-zlib/src/lib.rs")).unwrap()
+        + &std::fs::read_to_string(root.join("crates/perry-ext-zlib/src/stream.rs")).unwrap();
+    for family in [
+        "gzip",
+        "gunzip",
+        "deflate",
+        "inflate",
+        "deflate_raw",
+        "inflate_raw",
+        "unzip",
+        "brotli_compress",
+        "brotli_decompress",
+        "zstd_compress",
+        "zstd_decompress",
+    ] {
+        for symbol in [
+            format!("js_zlib_{family}_sync"),
+            format!("js_zlib_{family}"),
+            format!("js_zlib_create_{family}"),
+            format!("js_zlib_{family}_init"),
+        ] {
+            assert!(source.contains(&symbol), "missing binding ABI: {symbol}");
+        }
+    }
+    for retired in [
+        "scan_zlib_roots",
+        "js_zlib_process_pending",
+        "js_zlib_has_active_handles",
+    ] {
+        assert!(
+            !source.contains(retired),
+            "retired zlib plumbing: {retired}"
+        );
+    }
+    let manifest = std::fs::read_to_string(root.join("crates/perry-stdlib/Cargo.toml")).unwrap();
+    assert!(manifest.contains("compression-gzip = [\"dep:perry-ext-zlib\"]"));
 }
 
 /// Regression: a program that references `WebAssembly.*` must get the
@@ -1679,3 +1601,144 @@ fn hot_diag_knobs_match_the_runtime() {
 }
 
 mod no_auto_http_graph;
+
+/// Decision 69: codegen and the linker read ONE routing decision. For each
+/// representative import, in both modes and with the flip on and off, the
+/// install symbol codegen emits for the module's namespace, the entry
+/// prologue's wrapper hooks and the wrapper calls codegen may emit must name
+/// exactly the wrapper archives the linker links: auto mode links the
+/// archives of `routed_modules` (driver.rs), no-auto mode what
+/// `resolve_prebuilt_ext_libs` finds for them.
+#[test]
+fn codegen_install_symbols_match_the_linked_wrappers() {
+    let _guard = env_lock();
+    let saved: Vec<_> = [
+        "PERRY_LIB_DIR",
+        "PERRY_RUNTIME_DIR",
+        "PERRY_DISABLE_WELL_KNOWN",
+        "PERRY_NO_AUTO_OPTIMIZE",
+        "PERRY_FORCE_WELL_KNOWN",
+    ]
+    .iter()
+    .map(|k| (*k, std::env::var(k).ok()))
+    .collect();
+
+    let modules = ["http", "node:https", "net", "zlib", "ws"];
+    let dir = tempfile::tempdir().expect("tempdir");
+    for module in modules {
+        let binding = super::super::well_known::lookup_well_known(module).expect("binding");
+        let lib = dir
+            .path()
+            .join(super::super::well_known::ext_staticlib_filename(
+                &binding.lib,
+                rust_target_triple(None),
+            ));
+        std::fs::write(&lib, b"!<arch>\n").expect("write fake archive");
+    }
+    set_env_var("PERRY_LIB_DIR", dir.path().to_str());
+    set_env_var("PERRY_RUNTIME_DIR", None);
+    set_env_var("PERRY_FORCE_WELL_KNOWN", None);
+
+    // Wrapper symbols codegen emits for each module beyond its install.
+    let wrapper_calls = [
+        ("http", "js_node_http_create_server_with_options"),
+        ("net", "js_ext_net_nm_install"),
+    ];
+    let mut rows = Vec::new();
+    for no_auto in [false, true] {
+        for flip in [true, false] {
+            set_env_var("PERRY_NO_AUTO_OPTIMIZE", no_auto.then_some("1"));
+            set_env_var("PERRY_DISABLE_WELL_KNOWN", (!flip).then_some("1"));
+            let mut ctx = CompilationContext::new(dir.path().to_path_buf());
+            for module in modules {
+                ctx.native_module_imports.insert(module.to_string());
+            }
+            let routing = &ctx.native_routing;
+            let routed = routed_modules(&ctx);
+            // The linker's wrapper archives, by lib stem.
+            let linked: std::collections::BTreeSet<String> = if no_auto {
+                resolve_prebuilt_ext_libs(&routed, None, OutputFormat::Json, 0)
+                    .iter()
+                    .map(|p| {
+                        let name = p.file_name().unwrap().to_str().unwrap();
+                        name.trim_start_matches("lib")
+                            .trim_end_matches(".a")
+                            .to_string()
+                    })
+                    .collect()
+            } else {
+                routed
+                    .iter()
+                    .map(|m| {
+                        super::super::well_known::lookup_well_known(m)
+                            .unwrap()
+                            .lib
+                            .clone()
+                    })
+                    .collect()
+            };
+            let lib_of = |m: &str| {
+                super::super::well_known::lookup_well_known(m)
+                    .unwrap()
+                    .lib
+                    .clone()
+            };
+            for module in modules {
+                let install = routing.install_symbol(module);
+                let hook = perry_codegen::ext_registry::wrapper_install_hook(&lib_of(module));
+                if linked.contains(&lib_of(module)) && hook.is_some() {
+                    assert_eq!(
+                        install, hook,
+                        "{module} (no_auto={no_auto}, flip={flip}): its wrapper is linked, \
+                         so its namespace must install the wrapper's hook"
+                    );
+                } else {
+                    assert!(
+                        install.is_none_or(|s| !s.starts_with("js_ext_")),
+                        "{module} (no_auto={no_auto}, flip={flip}): wrapper hook {install:?} \
+                         emitted, but the linker links {linked:?}"
+                    );
+                }
+                rows.push(format!("{no_auto} {flip} {module} {install:?}"));
+            }
+            for (module, symbol) in wrapper_calls {
+                assert_eq!(
+                    routing.serves(symbol),
+                    linked.contains(&lib_of(module)),
+                    "{symbol} (no_auto={no_auto}, flip={flip}): linked {linked:?}"
+                );
+            }
+            let hooks = routing
+                .wrapper_install_hooks(well_known_iteration_set(&ctx).iter().map(String::as_str));
+            let expected_hooks: Vec<String> = linked
+                .iter()
+                .filter_map(|lib| perry_codegen::ext_registry::wrapper_install_hook(lib))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(hooks, expected_hooks, "no_auto={no_auto}, flip={flip}");
+        }
+    }
+
+    for (key, value) in &saved {
+        set_env_var(key, value.as_deref());
+    }
+
+    // The concrete answer, so a change to the decision itself is visible.
+    let expect = |no_auto: bool, flip: bool, module: &str| {
+        rows.iter()
+            .find(|r| r.starts_with(&format!("{no_auto} {flip} {module} ")))
+            .unwrap()
+            .clone()
+    };
+    for no_auto in [false, true] {
+        assert!(expect(no_auto, true, "http").ends_with("Some(\"js_ext_http_nm_install\")"));
+        assert!(expect(no_auto, true, "node:https").ends_with("Some(\"js_ext_http_nm_install\")"));
+        assert!(expect(no_auto, false, "http").ends_with("Some(\"js_nm_install_http\")"));
+        assert!(expect(no_auto, false, "node:https").ends_with("Some(\"js_nm_install_http\")"));
+        for flip in [true, false] {
+            assert!(expect(no_auto, flip, "zlib").ends_with("Some(\"js_ext_zlib_nm_install\")"));
+            assert!(expect(no_auto, flip, "net").ends_with("Some(\"js_ext_net_nm_install\")"));
+            assert!(expect(no_auto, flip, "ws").ends_with("None"));
+        }
+    }
+}

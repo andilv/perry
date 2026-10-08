@@ -381,24 +381,7 @@ pub(crate) unsafe fn finalize_set_side_allocation_for_gc(set: *mut SetHeader) {
 }
 
 fn is_dead_copied_minor_from_space_set(addr: usize) -> bool {
-    let space = crate::arena::classify_heap_space(addr);
-    if !matches!(space, crate::arena::HeapSpace::NurseryEden)
-        && space != crate::arena::active_survivor_space()
-    {
-        return false;
-    }
-    if addr < crate::gc::GC_HEADER_SIZE {
-        return false;
-    }
-    unsafe {
-        let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*header).obj_type != crate::gc::GC_TYPE_SET {
-            return false;
-        }
-        let flags = (*header).gc_flags;
-        flags & crate::gc::GC_FLAG_ARENA != 0
-            && flags & (crate::gc::GC_FLAG_MARKED | crate::gc::GC_FLAG_FORWARDED) == 0
-    }
+    crate::gc::owner_is_dead_copied_minor_from_space_of_type(addr, crate::gc::GC_TYPE_SET)
 }
 
 /// #6010: registry-driven finalization of DEAD Sets at sweep entry — the Set
@@ -1892,23 +1875,23 @@ pub extern "C" fn js_set_to_array(set: *const SetHeader) -> *mut crate::array::A
     unsafe {
         let set = set_handle.get_raw_const_ptr::<SetHeader>();
         let size = (*set).size as usize;
-        let result = crate::array::js_array_alloc(size as u32);
-        let result_handle = scope.root_raw_mut_ptr(result);
+        let array = crate::array::js_array_alloc(size as u32);
+        let result_handle = scope.root_raw_mut_ptr(array);
         maybe_force_helper_gc_for_test();
         if size > 0 {
             let set = set_handle.get_raw_const_ptr::<SetHeader>();
-            let result = result_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>();
+            let array = result_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>();
             let src = (*set).elements as *const f64;
-            let dst = crate::array::array_elements_ptr(result as *const crate::array::ArrayHeader)
+            let dst = crate::array::array_elements_ptr(array as *const crate::array::ArrayHeader)
                 as *mut f64;
             // GC_STORE_AUDIT(BARRIERED): Set-to-array bulk copy is followed by exact layout/barrier rebuild.
             ptr::copy_nonoverlapping(src, dst, size);
-            (*result).length = size as u32;
-            crate::array::rebuild_array_layout_exact(result);
+            (*array).length = size as u32;
+            crate::array::rebuild_array_layout_exact(array);
         }
-        let result = result_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>();
-        mark_set_iterator_array(result);
-        result
+        let array = result_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>();
+        mark_set_iterator_array(array);
+        array
     }
 }
 
@@ -2549,7 +2532,7 @@ mod tests {
             65535,
             addr_class::COMMON_HANDLE_BAND_END - 1,
             addr_class::FETCH_HANDLE_BAND_START,
-            addr_class::ZLIB_HANDLE_BAND_START,
+            addr_class::FETCH_HANDLE_BAND_END,
             addr_class::HANDLE_BAND_MAX - 1,
         ];
         let set = js_set_alloc(4);

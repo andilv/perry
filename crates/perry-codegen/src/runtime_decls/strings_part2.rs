@@ -15,7 +15,6 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // (`expr::body_call::emit_receiver_prologue`). Can allocate: a safepoint.
     module.declare_function("js_this_coerce_sloppy", DOUBLE, &[DOUBLE]);
     // RegExp exec
-    module.declare_function("js_regexp_exec", I64, &[I64, I64]);
     module.declare_function("js_number_to_precision", I64, &[DOUBLE, DOUBLE]);
     module.declare_function("js_number_to_exponential", I64, &[DOUBLE, DOUBLE]);
     module.declare_function("js_date_new", DOUBLE, &[]);
@@ -119,7 +118,6 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // #9342: priming slow arm of the inline Uint8Array byte read
     // (expr/u8_buffer_read.rs); delegates to js_uint8array_index_get_value.
     module.declare_function("js_u8_buffer_read_f64", DOUBLE, &[I64, I32]);
-    module.declare_function("js_u8_resolve_read_data", I64, &[DOUBLE]);
     module.declare_function("js_ta_read_receiver_is_kind", I32, &[DOUBLE, I32]);
     // #2063: string / dynamic-key `ta[key]` [[Get]] dispatcher (canonical
     // numeric index → element, else ordinary named-property [[Get]]).
@@ -419,8 +417,6 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // Regex extras (runtime has them; codegen was stubbing).
     module.declare_function("js_regexp_exec_get_index", DOUBLE, &[]);
     module.declare_function("js_regexp_exec_get_groups", I64, &[]);
-    module.declare_function("js_regexp_get_source", I64, &[I64]);
-    module.declare_function("js_regexp_get_flags", I64, &[I64]);
     module.declare_function("js_string_replace_regex_named", I64, &[I64, I64, I64]);
     module.declare_function("js_string_replace_all_regex_named", I64, &[I64, I64, I64]);
     module.declare_function("js_string_replace_string_fn", I64, &[I64, I64, DOUBLE]);
@@ -662,7 +658,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // `zlib.createBrotliDecompress(options?)` — axios feature-check
     // shim. Returns a registered Buffer-shaped handle (NaN-boxed at
     // the call site).
-    module.declare_function("js_zlib_create_brotli_decompress", I64, &[DOUBLE]);
+    module.declare_function("js_zlib_create_brotli_decompress", DOUBLE, &[DOUBLE]);
     // crypto.randomFillSync(buf, offset?, size?) → returns the same
     // NaN-boxed buffer with random bytes written in-place.
     module.declare_function(

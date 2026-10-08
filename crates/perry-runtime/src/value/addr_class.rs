@@ -21,7 +21,7 @@
 //! |                        | crypto, fastify, UI widgets, timers, …)                          |
 //! | `[0x40000, 0xE0000)`   | Web Fetch family (Request/Response/Headers/Blob), perry-stdlib   |
 //! |                        | `fetch/mod.rs` `FETCH_HANDLE_ID_{START,END}` (#3973/#3974/#4004) |
-//! | `[0xE0000, 0xF0000)`   | zlib streams, perry-stdlib `zlib.rs` (#1843)                     |
+//! | `[0xE0000, 0xF0000)`   | unallocated (former zlib ids, now ordinary payload objects)     |
 //! | `[0xF0000, 0x100000)`  | revocable Proxy ids, perry-runtime `proxy.rs` `PROXY_TAG_BASE`   |
 //! |                        | (#2846 crash cluster)                                            |
 //! | `>= 0x100000`          | plausible heap addresses (see [`is_valid_obj_ptr`] for the       |
@@ -34,7 +34,7 @@
 //! The `0x100000` ceiling was established by #1843 (zlib handle deref'd as
 //! heap object), #4004 (fetch handles moved to 0x40000), and #4800
 //! (`is_builtin_iterator_class_id` used an 0x1008 floor and deref'd a Headers
-//! handle on every hono response). All four sub-bands must stay below
+//! handle on every hono response). All allocated sub-bands must stay below
 //! [`HANDLE_BAND_MAX`]; perry-stdlib re-exports these constants and its unit
 //! tests assert the containment.
 
@@ -58,12 +58,6 @@ pub const COMMON_HANDLE_BAND_END: usize = 0x40000;
 /// common registry's way).
 pub const FETCH_HANDLE_BAND_START: usize = 0x40000;
 pub const FETCH_HANDLE_BAND_END: usize = 0xE0000;
-
-/// zlib stream handle band `[ZLIB_HANDLE_BAND_START, ZLIB_HANDLE_BAND_END)`,
-/// owned by perry-stdlib `zlib.rs` (#1843 established that these ids must not
-/// be dereferenced as heap objects).
-pub const ZLIB_HANDLE_BAND_START: usize = 0xE0000;
-pub const ZLIB_HANDLE_BAND_END: usize = 0xF0000;
 
 /// Revocable Proxy id band `[PROXY_ID_BAND_START, HANDLE_BAND_MAX)`, owned by
 /// perry-runtime `proxy.rs` (`PROXY_TAG_BASE`). Kept at the top of the handle
@@ -101,11 +95,6 @@ pub fn is_common_handle_band(addr: usize) -> bool {
 #[inline(always)]
 pub fn is_fetch_handle_band(addr: usize) -> bool {
     (FETCH_HANDLE_BAND_START..FETCH_HANDLE_BAND_END).contains(&addr)
-}
-
-#[inline(always)]
-pub fn is_zlib_handle_band(addr: usize) -> bool {
-    (ZLIB_HANDLE_BAND_START..ZLIB_HANDLE_BAND_END).contains(&addr)
 }
 
 /// Complement of [`is_handle_band`]: the payload is above the handle band and
@@ -401,9 +390,35 @@ pub(crate) fn tracked_header_probe_count_for_tests() -> u64 {
 /// allocation or collection safepoint. Returning a raw pointer is deliberate:
 /// some checked callers install forwarding metadata, so this gate must not
 /// manufacture a shared reference and then write through a cast of it.
-#[inline]
+///
+/// Out of line, with the allocator lookup folded into its one body: the
+/// probe sits on generic receiver paths (`has_cell_type`, own-key and
+/// expando checks, raw-word admission), and inlining its admission tail into
+/// each of them pushes those callers past LLVM's inlining budget.
+#[inline(never)]
 pub(crate) unsafe fn try_read_tracked_gc_header(
     addr: usize,
+) -> Option<std::ptr::NonNull<GcHeader>> {
+    tracked_gc_header_admitting(addr, crate::gc::gc_type_is_known)
+}
+
+/// [`try_read_tracked_gc_header`] for a caller that only accepts one type id:
+/// the type admission is `obj_type == kind` instead of the generic known-type
+/// test, with the same allocator proof and size/arena checks. `kind` must be a
+/// known type id. Out of line for the same reason.
+#[inline(never)]
+pub(crate) unsafe fn try_read_tracked_gc_header_of_type(
+    addr: usize,
+    kind: u8,
+) -> Option<std::ptr::NonNull<GcHeader>> {
+    debug_assert!(crate::gc::gc_type_is_known(kind));
+    tracked_gc_header_admitting(addr, |obj_type| obj_type == kind)
+}
+
+#[inline(always)]
+unsafe fn tracked_gc_header_admitting(
+    addr: usize,
+    admit: impl Fn(u8) -> bool,
 ) -> Option<std::ptr::NonNull<GcHeader>> {
     #[cfg(test)]
     TRACKED_HEADER_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -417,7 +432,7 @@ pub(crate) unsafe fn try_read_tracked_gc_header(
     }
     let header = std::ptr::NonNull::new(header_addr as *mut GcHeader)?;
     let header_ptr = header.as_ptr();
-    if crate::gc::gc_type_info((*header_ptr).obj_type).is_none() {
+    if !admit((*header_ptr).obj_type) {
         return None;
     }
     if ((*header_ptr).size as usize) < GC_HEADER_SIZE {
@@ -438,8 +453,7 @@ mod tests {
     fn band_layout_is_contiguous_and_contained() {
         assert!(COMMON_HANDLE_BAND_END <= FETCH_HANDLE_BAND_START);
         assert!(FETCH_HANDLE_BAND_START < FETCH_HANDLE_BAND_END);
-        assert!(FETCH_HANDLE_BAND_END <= ZLIB_HANDLE_BAND_START);
-        assert!(ZLIB_HANDLE_BAND_END <= PROXY_ID_BAND_START);
+        assert!(FETCH_HANDLE_BAND_END <= PROXY_ID_BAND_START);
         assert!(PROXY_ID_BAND_START < HANDLE_BAND_MAX);
         assert!(STREAM_ID_BAND_START >= HANDLE_BAND_MAX);
     }
