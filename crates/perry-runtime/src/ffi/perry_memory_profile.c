@@ -2,7 +2,21 @@
  * allow_thp enum member in Rust, and its numeric id is not a stable API. */
 #include <mimalloc.h>
 #include <sys/prctl.h>
+/* Ubuntu's musl-gcc specs search only musl's own include tree, so the
+ * kernel UAPI header (shipped by linux-libc-dev into /usr/include/linux,
+ * and by Alpine's linux-headers into /usr/include) is invisible there.
+ * Every musl build that matters for the fork compiles with it absent;
+ * glibc and Alpine musl still take the real header. The fallbacks below
+ * are fixed kernel ABI values (linux/prctl.h, Linux >= 4.5). */
+#if __has_include(<linux/prctl.h>)
 #include <linux/prctl.h>
+#endif
+#ifndef PR_GET_THP_DISABLE
+#define PR_GET_THP_DISABLE 42
+#endif
+#ifndef PR_SET_THP_DISABLE
+#define PR_SET_THP_DISABLE 41
+#endif
 #ifndef PR_THP_DISABLE_EXCEPT_ADVISED
 #define PR_THP_DISABLE_EXCEPT_ADVISED (1UL << 1)
 #endif
