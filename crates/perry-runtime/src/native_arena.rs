@@ -156,7 +156,7 @@ pub extern "C" fn js_native_arena_view(
             .checked_mul(size)
             .and_then(|n| offset.checked_add(n))
             .unwrap_or_else(|| throw_range_error(b"NativeArena view is out of bounds"));
-        if end > (*owner).length as u64 {
+        if end > crate::buffer::store::raw_length(owner as usize) as u64 {
             throw_range_error(b"NativeArena view is out of bounds");
         }
         crate::buffer::store::new_view(
@@ -200,7 +200,7 @@ pub extern "C" fn js_native_pod_view(
         let end = byte_offset
             .checked_add(byte_length)
             .unwrap_or_else(|| throw_range_error(b"NativePodView is out of bounds"));
-        if end > (*owner).length as u64 {
+        if end > crate::buffer::store::raw_length(owner as usize) as u64 {
             throw_range_error(b"NativePodView is out of bounds");
         }
         let view = crate::arena::arena_alloc_gc_old(
@@ -499,10 +499,10 @@ mod tests {
         let target = boxed_ptr(view as *const u8);
         let before = unsafe {
             (
-                (*view).link,
+                crate::buffer::store::raw_link(view as usize),
                 crate::buffer::store::data(view as usize),
-                (*view).capacity,
-                (*view).length,
+                crate::buffer::store::capacity(view as usize),
+                crate::buffer::store::raw_length(view as usize),
             )
         };
 
@@ -510,13 +510,13 @@ mod tests {
         assert_eq!(returned.to_bits(), target.to_bits());
 
         unsafe {
-            assert_eq!((*view).link, before.0);
+            assert_eq!(crate::buffer::store::raw_link(view as usize), before.0);
             assert_eq!(crate::buffer::store::data(view as usize), before.1);
-            assert_eq!((*view).capacity, before.2);
-            assert_eq!((*view).length, before.3);
+            assert_eq!(crate::buffer::store::capacity(view as usize), before.2);
+            assert_eq!(crate::buffer::store::raw_length(view as usize), before.3);
             let bytes = std::slice::from_raw_parts(
                 crate::buffer::store::data(view as usize),
-                (*view).length as usize,
+                crate::buffer::store::raw_length(view as usize) as usize,
             );
             assert!(
                 bytes.iter().any(|&byte| byte != 0),
@@ -524,6 +524,24 @@ mod tests {
             );
         }
         js_native_arena_dispose(owner as u64);
+    }
+
+    #[test]
+    fn a_disposed_view_hidden_by_bounds_turns_the_witness_red() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_arena::tests::disposed_native_uint8_views_throw_in_fallback_paths",
+                "--nocapture",
+            ])
+            .env("PERRY_B4_SABOTAGE", "native_bounds")
+            .output()
+            .unwrap();
+        let output = String::from_utf8_lossy(&child.stdout).to_string()
+            + &String::from_utf8_lossy(&child.stderr);
+        assert_eq!(child.status.code(), Some(101));
+        assert!(output.contains("running 1 test"));
+        assert!(output.contains("dynamic native indexed read must validate disposal before bounds"));
     }
 
     #[test]
@@ -539,6 +557,14 @@ mod tests {
         assert!(catch_runtime_throw(|| {
             crate::typedarray::js_uint8array_set(ta, 0, 1);
         }));
+        for index in [0.0, 1.0, 16.0] {
+            assert!(
+                catch_runtime_throw(|| {
+                    crate::value::js_dyn_index_get(boxed_ptr(ta.cast()), index);
+                }),
+                "dynamic native indexed read must validate disposal before bounds"
+            );
+        }
         assert!(catch_runtime_throw(|| unsafe {
             let _ = dispatch_random_fill_sync(view);
         }));

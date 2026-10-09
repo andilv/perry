@@ -273,9 +273,9 @@ pub use accessors::js_object_get_field;
 pub(crate) use accessors::{
     accessor_receiver_override_armed, accessor_receiver_override_begin,
     accessor_receiver_override_end, accessor_receiver_override_take,
-    array_prototype_property_value, builtin_reflection_accessor_read, invoke_accessor_getter,
-    invoke_accessor_setter, is_typed_array_prototype, object_field_at_with_live,
-    ordinary_object_prototype_property_value, own_data_field_by_name,
+    array_prototype_property_value, invoke_accessor_getter, invoke_accessor_setter,
+    is_typed_array_prototype, object_accessor_at_with_live, object_field_at_with_live,
+    ordinary_object_prototype_property_value, own_data_field_by_name, own_property_get_by_bytes,
     primitive_builtin_prototype_property, primitive_object_prototype_accessor,
     primitive_tagged_prototype_property, string_index_value,
 };
@@ -387,10 +387,10 @@ mod buffer_ic_miss_tests {
     }
 
     unsafe fn secret_buffer(len: usize) -> *mut crate::buffer::BufferHeader {
-        let buf = crate::buffer::buffer_alloc(len as u32);
+        let buf =
+            crate::buffer::store::alloc_test(crate::gc::GC_TYPE_BUFFER_SECRET_KEY, len as u32);
         crate::buffer::store::set_length(buf as usize, len as u32);
-        crate::buffer::mark_as_uint8array(buf as usize);
-        crate::buffer::mark_as_secret_key(buf as usize);
+
         buf
     }
 

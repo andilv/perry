@@ -117,9 +117,9 @@ pub const GC_TYPE_SCOPE: u8 = 25;
 // fixes its offsets), and a buffer is not a `GC_TYPE_OBJECT`, so it has no
 // class id to carry one.
 //
-// `GC_TYPE_BUFFER` itself is the Node `Buffer` flavor, which is what
-// `buffer_alloc` births; `buffer::header::set_buffer_brand` re-stamps a cell
-// when a producer turns it into another flavor. Keep the block contiguous:
+// `GC_TYPE_BUFFER` itself is the Node `Buffer` flavor. `store_alloc` births
+// every byte cell with its final brand; the brand never changes.
+// Keep the block contiguous:
 // `is_buffer_family_type` is one equality and one range compare.
 /// A `Uint8Array` stored as a `BufferHeader` (formats as `Uint8Array(n) [...]`).
 pub const GC_TYPE_BUFFER_UINT8ARRAY: u8 = 0x40;
@@ -1632,7 +1632,7 @@ pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
 ///
 /// Read this before spending a bit. It is the only place both namespaces are
 /// written down together, and the reason it exists is that they are not:
-/// `OBJ_FLAG_*` lives here, `GC_OBJ_TYPED_LAYOUT_INTACT` / `GC_LAYOUT_*` live
+/// `OBJ_FLAG_*` lives here, `GC_LAYOUT_*` live
 /// in `gc/layout.rs`, and a comment in this file used to claim bits 12..13
 /// were "the last free bits" while `gc/layout.rs` already owned 12, 13, 14
 /// and 15.
@@ -1680,7 +1680,7 @@ pub(crate) const GC_ARRAY_RAW_F64_HOLES: u16 = 0x1000;
 /// copies verbatim, so the invariant survives a move without a side-table
 /// walk. The *shape id* itself cannot fit here, so it lives in the
 /// address-keyed record `array::element_shape` maintains, moved on
-/// relocation by `layout_transfer` exactly like `TYPED_LAYOUTS`. The bit is
+/// relocation by `layout_transfer`. The bit is
 /// the authority: a fresh allocation's `_reserved` is zero, so a stale
 /// record left behind at a recycled address is never consulted.
 ///
@@ -1703,8 +1703,7 @@ mod buffer_family_type_tests {
 
     /// #10694: every buffer-family flavor is the same GC kind under another
     /// brand. If one ever diverged (a different descriptor, finalize hook or
-    /// movability) the brand would stop being a pure label and a re-stamp in
-    /// `set_buffer_brand` would change how the collector treats a live cell.
+    /// movability), the brand would change how the collector treats the cell.
     #[test]
     fn buffer_family_flavors_share_one_gc_kind() {
         let base = *gc_type_info(GC_TYPE_BUFFER).expect("buffer type info");

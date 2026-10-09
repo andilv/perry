@@ -73,6 +73,9 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         imported_func_return_types: std::collections::HashMap::new(),
         imported_vars: std::collections::HashSet::new(),
         output_type: "executable".to_string(),
+        disable_constfn_shapes: false,
+        program_has_worker: false,
+        program_has_thread_agents: false,
         needs_stdlib: false,
         program_is_synchronous: false,
         needs_ui: false,
@@ -246,6 +249,14 @@ fn pshape_definitions(ir: &str) -> Vec<String> {
 fn emit(m: &Module, is_entry: bool) -> String {
     String::from_utf8(compile_module(m, ir_opts(is_entry)).unwrap())
         .expect("LLVM IR should be UTF-8")
+}
+
+fn emit_static(m: &Module, is_entry: bool) -> String {
+    let mut opts = ir_opts(is_entry);
+    let births = crate::module_birth_shapes(m, opts.clone()).unwrap();
+    let ids = crate::assign_static_shape_ids(births.iter().map(|b| &b.shape));
+    opts.static_shape_ids = ids.into_iter().collect();
+    String::from_utf8(compile_module(m, opts).unwrap()).expect("LLVM IR should be UTF-8")
 }
 
 /// `bump(): void { this.value = this.value + 1 }` — a `void` return, so NO
@@ -1001,9 +1012,16 @@ fn guarded_pshape_call_site_is_preceded_by_a_shape_id_guard() {
         let prefix = &probe[..call_pos];
         let guarded = prefix.contains("call i32 @js_typed_feedback_method_direct_call_guard(")
             || prefix.contains("call i32 @js_method_direct_shape_guard(")
-            || prefix.contains(
-                "load atomic i8, ptr @PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED acquire",
-            );
+            || {
+                let bs = blocks(&probe);
+                let (call_block, _) = block_calling(&bs, target).expect("call block");
+                bs.iter().any(|(_, body)| {
+                    body.iter().any(|line| {
+                        line.starts_with("  br i1 ")
+                            && line.contains(&format!("label %{call_block}"))
+                    }) && body.iter().any(|line| line.contains("icmp eq i64"))
+                })
+            };
         assert!(
             guarded,
             "{target}: no ShapeId guard call precedes it in `probe` — a \
@@ -1099,26 +1117,22 @@ fn field_value_arguments_to_sibling_methods_keep_the_proven_this_clone() {
 }
 
 /// The single-pair shape-only arm is small enough to inline at the call site.
-/// Pin the complete safety gate: acquire both the all-method escape latch and
-/// the FNV-indexed method-name latch, accept both the boxed-pointer and
+/// Pin the complete safety gate: compare the live holder ShapeId, accept
+/// both the boxed-pointer and
 /// internal raw-pointer ABIs, reject addresses outside the target heap range
 /// before dereference, reject own descriptors, then compare the exact
 /// class/ShapeId pair. The out-of-line guard must be absent from this caller.
 #[test]
 fn single_arm_method_shape_guard_is_inlined_with_the_runtime_contract() {
-    let ir = emit(&guarded_site_module(), false);
+    let ir = emit_static(&guarded_site_module(), false);
     let probe = function_body(&ir, "__probe(");
     assert!(
-        probe.contains(
-            "load atomic i8, ptr @PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED acquire, align 1",
-        ),
-        "the inline guard must acquire the runtime's release-published sticky latch:\n{probe}"
+        probe.contains("holder.shape") && probe.contains("icmp eq i32"),
+        "the live holder P must be compared before the direct arm:\n{probe}"
     );
     assert!(
-        probe.contains(
-            "getelementptr i8, ptr @PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED_BY_METHOD",
-        ) && probe.matches("load atomic i8").count() >= 2,
-        "the inline guard must acquire its method-name invalidation byte:\n{probe}"
+        !ir.contains("PERRY_CLASS_PROTOTYPE_FAST_GUARDS"),
+        "latch readers are retired"
     );
     assert!(
         !probe.contains("call i32 @js_method_direct_shape_guard("),
@@ -1589,8 +1603,8 @@ fn tower_route_is_guarded_by_the_class_shape_id() {
     assert!(
         guard_body
             .iter()
-            .any(|l| l.contains("@PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED")),
-        "the routed call must also honour the sticky inline-guard latch:\n{guard_body:#?}"
+            .all(|l| !l.contains("@PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED")),
+        "the routed call must use shape facts without a process latch:\n{guard_body:#?}"
     );
 }
 

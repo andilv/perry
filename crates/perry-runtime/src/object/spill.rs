@@ -786,7 +786,7 @@ mod tests {
         let spill = crate::object::test_spill_buffer_addr(owner as usize);
         assert_eq!(
             crate::gc::test_layout_pointer_slot_count(spill, slot + 1),
-            Some(1)
+            None
         );
 
         let child_b = js_object_alloc(0x6B45_5A15, 0);
@@ -797,11 +797,11 @@ mod tests {
         assert_eq!(
             TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get),
             0,
-            "a pointer overwrite must preserve the existing mask bit"
+            "a pointer overwrite must preserve the mixed kind"
         );
         assert_eq!(
             crate::gc::test_layout_pointer_slot_count(spill, slot + 1),
-            Some(1)
+            None
         );
 
         TEST_LAYOUT_NOTE_SLOT_CALLS.with(|calls| calls.set(0));
@@ -809,20 +809,19 @@ mod tests {
         assert_eq!(
             TEST_LAYOUT_NOTE_SLOT_CALLS.with(Cell::get),
             1,
-            "a pointer-to-scalar transition must clear the slot layout"
+            "a pointer-to-scalar transition must enter the layout hook"
         );
         assert_eq!(
             crate::gc::test_layout_pointer_slot_count(spill, slot + 1),
-            Some(0)
+            None
         );
     }
 
     /// #11559: a spill store at or past the buffer's high-water mark must not
     /// read the headroom word as the value it overwrites.
     ///
-    /// `js_array_alloc_with_length(8)` initializes eight `TAG_HOLE` slots in a
-    /// sixteen-slot allocation; the other eight hold whatever the memory held
-    /// before. The poison below stands in for that previous tenant: a live
+    /// A sixteen-slot buffer is truncated to an eight-slot high-water mark.
+    /// The poison below stands in for a previous tenant's headroom: a live
     /// pointer, so it is exactly the pointer-shaped word that made the
     /// pointer-over-pointer layout shortcut skip the note. The assertion is
     /// the collector's own question — does it enumerate (and so mark and
@@ -836,8 +835,13 @@ mod tests {
         let first_bits = crate::value::POINTER_TAG | (first as u64 & crate::value::POINTER_MASK);
         spill_set(owner as usize, 2, first_bits);
 
+        // Reserve the headroom this fixture exercises explicitly: the array
+        // allocator no longer rounds an eight-slot request up to sixteen.
+        spill_set(owner as usize, 15, crate::value::TAG_UNDEFINED);
+
         let spill = crate::object::test_spill_buffer_addr(owner as usize);
         let header = spill as *mut crate::array::ArrayHeader;
+        crate::array::js_array_set_length(header, 8.0);
         let (length, capacity) =
             unsafe { ((*header).length as usize, (*header).capacity as usize) };
         assert_eq!(

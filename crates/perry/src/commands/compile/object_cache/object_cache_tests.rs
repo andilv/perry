@@ -47,6 +47,9 @@ fn empty_opts() -> CompileOptions {
         imported_func_return_types: std::collections::HashMap::new(),
         imported_vars: std::collections::HashSet::new(),
         output_type: "executable".to_string(),
+        disable_constfn_shapes: false,
+        program_has_worker: false,
+        program_has_thread_agents: false,
         needs_stdlib: false,
         program_is_synchronous: false,
         needs_ui: false,
@@ -900,6 +903,7 @@ fn static_seeds_round_trip_and_an_entry_without_them_misses() {
             constfn: Vec::new(),
             private: Vec::new(),
             brands: Vec::new(),
+            attrs: Vec::new(),
         },
     );
     cache.store_static_seeds(key, &[line.as_str()]);
@@ -933,6 +937,7 @@ fn constfn_body_sidecar_survives_a_warm_cache_hit_without_publishing_it() {
         }],
         private: Vec::new(),
         brands: Vec::new(),
+        attrs: Vec::new(),
     };
     let line = perry_codegen::encode_static_seed(0x1000_0044, &shape);
     cache.store_ffi_manifest(key, &[]);
@@ -1295,4 +1300,18 @@ fn thread_literal_graph_membership_changes_stable_module_key() {
         compute_object_cache_key(&a, 1, "0.5.156"),
         compute_object_cache_key(&b, 1, "0.5.156")
     );
+}
+
+#[test]
+fn agent_ownership_options_partition_object_cache_keys() {
+    let mut keys = std::collections::HashSet::new();
+    for workers in [false, true] {
+        for agents in [false, true] {
+            let mut opts = empty_opts();
+            opts.program_has_worker = workers;
+            opts.program_has_thread_agents = agents;
+            assert!(keys.insert(compute_object_cache_key(&opts, 0xdeadbeef, "test")));
+        }
+    }
+    assert_eq!(keys.len(), 4);
 }

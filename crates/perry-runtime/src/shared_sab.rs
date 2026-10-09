@@ -117,14 +117,7 @@ fn alloc_shared_block(size: u32) -> *mut BufferHeader {
         (*header)._reserved = 0;
         // Total block size, for honesty; a non-arena object is never block-walked.
         (*header).size = total.min(u32::MAX as usize) as u32;
-        std::ptr::write(
-            buf,
-            BufferHeader {
-                length: size,
-                capacity: size,
-                link: 0,
-            },
-        );
+        crate::buffer::store::initialize_shared_block(buf, size);
         // #7645 custody: the PIN goes through `gc::pin`, not a raw flag write.
         // `pin_object_non_young` is the right variant and its safety contract
         // is met by construction — this block is a process-global
@@ -149,6 +142,14 @@ fn alloc_shared_block(size: u32) -> *mut BufferHeader {
 
 /// Each agent owns its metadata while sharing only the process store.
 pub fn alloc_shared_sab(size: u32) -> *mut BufferHeader {
+    crate::buffer::store::store_alloc(
+        GC_TYPE_BUFFER_SHARED_ARRAY_BUFFER,
+        size,
+        crate::buffer::store::Init::Shared,
+    )
+}
+
+pub(crate) fn alloc_shared_sab_impl(size: u32) -> *mut BufferHeader {
     let block = alloc_shared_block(size);
     wrap_shared_sab(block as usize)
 }
@@ -159,11 +160,11 @@ pub(crate) fn wrap_shared_sab(block: usize) -> *mut BufferHeader {
         .unwrap_or_else(|e| e.into_inner())
         .contains(&block));
     unsafe {
-        let owner = crate::buffer::header::buffer_alloc_foreign(
-            crate::buffer::store::owner_data(block),
-            (*(block as *const BufferHeader)).length,
+        let owner = crate::buffer::store::store_alloc(
+            GC_TYPE_BUFFER_SHARED_ARRAY_BUFFER,
+            crate::buffer::store::length(block) as u32,
+            crate::buffer::store::Init::Foreign(crate::buffer::store::owner_data(block)),
         );
-        crate::buffer::mark_as_shared_array_buffer(owner as usize);
         owner
     }
 }

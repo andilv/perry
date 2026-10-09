@@ -390,11 +390,10 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get_with_byte_view_param(
     // coarsest split that keeps every load in bounds — reading 8 bytes from a
     // `Uint8Array`'s last element is not ours to take.)
     //
-    // The receiver's own storage byte (`TA_STORAGE_INLINE`) is the licence to
-    // compute the data pointer as `header + 16` without consulting the view
-    // registries (#10516); an external-storage receiver,
-    // like a BigInt lane or an out-of-range index, leaves through
-    // `arrlike.ic.miss` — the same exit the old `tav.get.slow` edge reached.
+    // The common byte-cell resolver admits the brand, follows a view's owner,
+    // and resolves Inline or OutOfLine storage from the owner's header.
+    // Special owners retain their runtime rules. BigInt lanes, rejected
+    // owners and out-of-range indices leave through `arrlike.ic.miss`.
     //
     // This arm sits AHEAD of the object probe, which was measured both ways:
     // putting it on the probe's decline edge instead saves an object receiver
@@ -602,11 +601,9 @@ pub(in crate::expr) fn lower_inline_dyn_typed_array_get_with_byte_view_param(
     ctx.current_block = view_load_idx;
     let view_addr = ctx.block().add(I64, &view_data, &object_idx_i64);
     let view_ptr = ctx.block().inttoptr(I64, &view_addr);
-    // A view can alias a SAB shared with another agent. Atomic byte loads
-    // prevent LLVM from hoisting or merging reads of concurrently changed data.
-    let target = ctx.target_triple.to_owned();
-    let view_value =
-        super::super::u8_buffer_read::emit_u8_atomic_load_f64(ctx.block(), &target, &view_ptr);
+    // B4's common owner guard declines shared and native-arena owners;
+    // every admitted view uses the same ordinary byte load.
+    let view_value = super::super::ta_element_read::emit_element(ctx.block(), &view_ptr, 1);
     let view_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
     ctx.current_block = u8_bounds_idx;
@@ -802,9 +799,7 @@ fn lower_resolved_byte_param_get(
     ctx.current_block = load_idx;
     let address = ctx.block().add(I64, &access.data_i64, &index);
     let pointer = ctx.block().inttoptr(I64, &address);
-    let target = ctx.target_triple.to_owned();
-    let value =
-        super::super::u8_buffer_read::emit_u8_atomic_load_f64(ctx.block(), &target, &pointer);
+    let value = super::super::ta_element_read::emit_element(ctx.block(), &pointer, 1);
     let load_end = ctx.block().label.clone();
     ctx.block().br(&done_label);
 

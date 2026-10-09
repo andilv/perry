@@ -42,15 +42,19 @@ pub(crate) fn throw_non_constructable_builtin_function() -> ! {
 /// Has `delete` removed class `class_id`'s own ClassBody prototype member
 /// `name` (a method, an accessor, or `constructor`)? Derived from the object
 /// that owns the member: it was declared, the class's decl prototype exists,
-/// and neither that object nor a runtime prototype assignment holds the key.
-/// Every delete of a prototype member retires the per-name prototype fast
-/// guard first, so a name whose guard is intact was never deleted anywhere.
+/// and that object no longer holds the key.
 pub(crate) fn class_proto_key_deleted(class_id: u32, name: &str) -> bool {
-    if class_id == 0
-        || !class_prototype_fast_guard_invalidated_for_method(class_prototype_method_guard_slot(
-            name,
-        ))
-    {
+    if class_id == 0 {
+        return false;
+    }
+    let proto = class_decl_prototype_object(class_id);
+    if proto.is_null() {
+        // A lazy holder cannot have lost any of its declaration's keys.
+        return false;
+    }
+    // The complete birth P proves every declared key is still present. This
+    // replaces the old latch-byte shortcut without probing the method name.
+    if unsafe { crate::object::shapes::pristine_declaration_holder(proto) } {
         return false;
     }
     let declared = name == "constructor"
@@ -59,35 +63,15 @@ pub(crate) fn class_proto_key_deleted(class_id: u32, name: &str) -> bool {
     if !declared || proto_member_has_no_string_key(class_id, name) {
         return false;
     }
-    let proto = class_decl_prototype_object(class_id);
-    if proto.is_null() {
-        // Never materialized: nothing was deleted from it.
-        return false;
-    }
-    let assigned = CLASS_PROTOTYPE_METHODS.with(|table| {
-        table
-            .read()
-            .ok()
-            .and_then(|g| {
-                g.as_ref()
-                    .map(|m| m.get(&class_id).is_some_and(|p| p.contains_key(name)))
-            })
-            .unwrap_or(false)
-    });
     // SAFETY: `proto` is this realm's live decl prototype; nothing below
     // allocates.
-    !assigned
-        && !unsafe {
-            let keys = crate::object::object_keys(proto);
-            let arr = keys.arr();
-            !arr.is_null()
-                && crate::object::keys_find_slot_by_bytes_resolved(
-                    arr,
-                    keys.count(),
-                    name.as_bytes(),
-                )
+    !unsafe {
+        let keys = crate::object::object_keys(proto);
+        let arr = keys.arr();
+        !arr.is_null()
+            && crate::object::keys_find_slot_by_bytes_resolved(arr, keys.count(), name.as_bytes())
                 .is_some()
-        }
+    }
 }
 
 /// A declared prototype member that the reflective prototype object never
@@ -379,6 +363,8 @@ pub struct AccessorDecl {
 /// lexical class read them.
 #[derive(Default)]
 pub struct ClassVTable {
+    /// Compiler candidate for lazy materialization, never a live lookup answer.
+    pub prototype_birth_shape: u32,
     pub methods: HashMap<String, VTableMethodEntry>,
     pub accessors: HashMap<String, AccessorDecl>,
     pub private_accessors: HashMap<String, AccessorDecl>,
@@ -554,57 +540,6 @@ pub(crate) fn class_prototype_object_addr_index_rekey(old: usize, new: usize) {
             *index.entry(new).or_insert(0) += 1;
         }
     });
-}
-
-crate::perry_thread_local! {}
-
-crate::perry_thread_local! {
-    /// #5024 followup: prototype methods registered via `Object.defineProperty(
-    /// Class.prototype, name, desc)` WITHOUT an explicit `enumerable: true` are
-    /// non-enumerable (spec default for defineProperty). The plain
-    /// `Class.prototype.m = fn` assignment path makes them enumerable. Both funnel
-    /// into `CLASS_PROTOTYPE_METHODS`, which stores only the value — so the
-    /// enumerability is tracked here, keyed by `(class_id, name)`. Absence means
-    /// "enumerable" (the assignment default). Consulted when mirroring a method
-    /// onto a prototype OBJECT so reflective `Object.keys`/`for-in` see the
-    /// correct attribute.
-    pub static CLASS_PROTOTYPE_METHOD_NONENUM: RwLock<
-        Option<std::collections::HashSet<(u32, String)>>,
-    > = RwLock::new(None);
-}
-
-/// Record the enumerability of the prototype method `(class_id, name)`.
-/// `enumerable == false` (a `defineProperty` data descriptor without an
-/// explicit `enumerable: true`) inserts the key into the non-enumerable set;
-/// `enumerable == true` removes it again, so a later redefine that flips the
-/// flag back on isn't left shadowed by a stale marker.
-pub(crate) fn class_prototype_method_set_enumerable(class_id: u32, name: &str, enumerable: bool) {
-    CLASS_PROTOTYPE_METHOD_NONENUM.with(|table| {
-        let mut guard = table.write().unwrap();
-        if enumerable {
-            if let Some(set) = guard.as_mut() {
-                set.remove(&(class_id, name.to_string()));
-            }
-            return;
-        }
-        if guard.is_none() {
-            *guard = Some(std::collections::HashSet::new());
-        }
-        guard.as_mut().unwrap().insert((class_id, name.to_string()));
-    });
-}
-
-/// Whether the prototype method `(class_id, name)` should be enumerable when
-/// mirrored onto a prototype object. Defaults to `true` (assignment semantics).
-pub(crate) fn class_prototype_method_is_enumerable(class_id: u32, name: &str) -> bool {
-    CLASS_PROTOTYPE_METHOD_NONENUM.with(|table| {
-        if let Ok(read) = table.read() {
-            if let Some(set) = read.as_ref() {
-                return !set.contains(&(class_id, name.to_string()));
-            }
-        }
-        true
-    })
 }
 
 crate::perry_thread_local! {
@@ -831,6 +766,24 @@ pub(crate) fn class_decl_prototype_object_root_store(class_id: u32, proto_ptr: *
     if class_id == 0 || proto_ptr.is_null() {
         return;
     }
+    // A declared prototype uses the same existing prototype mark as a chain
+    // hop. The mark gives it a private shape lineage, so a property-store PIC
+    // cannot learn on another object and later bypass this holder's first
+    // ordinary mutation (and current main's direct-call guard retirement).
+    // Marking may collect: root and reload before publishing the class link.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let prototype = scope.root_raw_mut_ptr(proto_ptr);
+    prototype.with_mut_ptr::<ObjectHeader, _>(|proto| unsafe {
+        crate::object::proto_validity::mark_object_as_prototype(proto as usize)
+    });
+    let proto_ptr = prototype.get_raw_mut_ptr::<ObjectHeader>();
+    link_decl_prototype_object(class_id, proto_ptr);
+}
+
+/// Publish the birth's rooted holder before installing its members: building
+/// a method value can ask for the class link again. No JavaScript observes the
+/// partial birth. The caller marks its completed shape before returning it.
+fn link_decl_prototype_object(class_id: u32, proto_ptr: *mut ObjectHeader) {
     let displaced =
         crate::object::class_value::class_decl_prototype_link_store(class_id, proto_ptr);
     // Its sole caller, `class_decl_prototype_value`, argues at length against
@@ -942,7 +895,7 @@ pub(crate) fn builtin_parent_ctor_in_chain(class_id: u32) -> Option<f64> {
 /// Reverse lookup: which declared class's `.prototype` is this heap object?
 /// Used by `Object.getOwnPropertyDescriptor(C.prototype, name)` to surface
 /// vtable accessors as own properties of the prototype object, and by
-/// `descriptor_state::disable_inline_guards_for_descriptor_target` on every
+/// `descriptor_state::invalidate_prototype_descriptor_guards` on every
 /// `Object.defineProperty`.
 ///
 /// Callers ask about arbitrary objects (#9180: on a bundled application most
@@ -1337,7 +1290,7 @@ fn class_parent_prototype_bits(value: f64) -> Option<u64> {
 /// identity, not merely by shape. Array/Map/Set/Error/typed-array subclasses
 /// have their own dedicated instance/prototype modeling and don't reach this
 /// fallback the same way.
-fn reserved_native_parent_prototype_bits(parent_id: u32) -> Option<u64> {
+pub(crate) fn reserved_native_parent_prototype_bits(parent_id: u32) -> Option<u64> {
     let web = match parent_id {
         crate::native_class_ids::EVENT_TARGET => Some("EventTarget"),
         crate::native_class_ids::EVENT => Some("Event"),
@@ -1452,8 +1405,8 @@ pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
     // read of one is then served by the inherited-read cache (spilled slots
     // never prime there).
     let members = class_prototype_member_names(class_id).len() as u32;
-    let proto = crate::object::js_object_alloc(class_id, members + 1);
-    if proto.is_null() {
+    let proto = scope.root_raw_mut_ptr(crate::object::js_object_alloc(class_id, members + 1));
+    if proto.get_raw_mut_ptr::<ObjectHeader>().is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     // #7769 follow-up: materializing a declared class's prototype object is
@@ -1473,55 +1426,81 @@ pub(crate) fn class_decl_prototype_value(class_id: u32) -> f64 {
     // Measured on `gc-handoff/apps/shapes.ts`: 384,000 of 384,000 shape-guard
     // probes failed here and nowhere else, and every element read fell back to
     // the generic index path for the same reason.
-    class_decl_prototype_object_root_store(class_id, proto);
+    proto.with_mut_ptr::<ObjectHeader, _>(|p| link_decl_prototype_object(class_id, p));
 
-    let constructor_key =
-        crate::string::js_string_from_bytes(b"constructor".as_ptr(), "constructor".len() as u32);
-    define_builtin_data_property(
-        proto,
-        constructor_key,
-        class_constructor_ref_value(class_id),
-        "constructor".to_string(),
-        PropertyAttrs::new(true, false, true),
-    );
-    install_class_decl_prototype_method_fields(proto, class_id);
-    install_class_decl_prototype_symbol_members(proto, class_id);
-
-    // #5024 followup: backfill assignment-registered prototype methods
-    // (`Class.prototype.m = fn`, stored in CLASS_PROTOTYPE_METHODS) onto the
-    // decl-proto object as ordinary enumerable own properties, so reflective
-    // own-key enumeration sees them. These typically run at module init,
-    // BEFORE any reflective `.prototype` read materialises this object, so the
-    // write-through in `class_prototype_method_root_store` had no decl-proto to
-    // target. Mirrors the existing CLASS_VTABLE_REGISTRY backfill above.
-    let registered: Vec<(String, u64)> = {
-        CLASS_PROTOTYPE_METHODS.with(|table| {
-            let guard = table.read().unwrap();
-            guard
-                .as_ref()
-                .and_then(|map| map.get(&class_id))
-                .map(|per_class| per_class.iter().map(|(k, &v)| (k.clone(), v)).collect())
-                .unwrap_or_default()
-        })
-    };
-    for (name, value_bits) in registered {
-        let enumerable = class_prototype_method_is_enumerable(class_id, &name);
-        unsafe { mirror_prototype_method_on_object(proto, &name, value_bits, enumerable) };
-    }
+    let constructor_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+        b"constructor".as_ptr(),
+        "constructor".len() as u32,
+    ));
+    let constructor = class_constructor_ref_value(class_id);
+    proto.with_mut_ptr::<ObjectHeader, _>(|p| {
+        constructor_key.with_const_ptr::<crate::StringHeader, _>(|key| {
+            define_builtin_data_property(
+                p,
+                key,
+                constructor,
+                "constructor".to_string(),
+                PropertyAttrs::new(true, false, true),
+            );
+        });
+    });
+    proto.with_mut_ptr(|p| install_class_decl_prototype_method_fields(p, class_id));
+    proto.with_mut_ptr(|p| install_class_decl_prototype_symbol_members(p, class_id));
 
     if parent_proto_bits.is_some() {
-        let proto = class_decl_prototype_object(class_id);
-        if !proto.is_null() {
+        proto.with_mut_ptr::<ObjectHeader, _>(|p| {
             super::super::prototype_chain::object_set_static_prototype(
-                proto as usize,
+                p as usize,
                 parent_proto.get_heap_word_u64(),
             );
-        }
+        });
     }
 
-    let proto = class_decl_prototype_object(class_id);
-    learn_decl_prototype_method_lanes(proto, class_id);
-    crate::value::js_nanbox_pointer(proto as i64)
+    // Birth installs declared facts, not prototype mutations. Only the
+    // completed holder becomes marked: its first ordinary store must retire
+    // direct-call guards, while these initialization stores must preserve them.
+    proto.with_mut_ptr::<ObjectHeader, _>(|p| unsafe {
+        crate::object::proto_validity::mark_object_as_prototype(p as usize)
+    });
+    proto.with_mut_ptr(|p| learn_decl_prototype_method_lanes(p, class_id));
+    proto.with_mut_ptr::<ObjectHeader, _>(|p| crate::value::js_nanbox_pointer(p as i64))
+}
+
+/// Read and validate one evaluation's superclass prototype with ordinary Get.
+/// No template prototype, memo or first-evaluation state can answer this read.
+pub(crate) fn evaluated_superclass_prototype(parent: f64) -> f64 {
+    if parent.to_bits() == crate::value::TAG_NULL {
+        return parent;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let parent = scope.root_nanbox_f64(parent);
+    let key = crate::string::canonical_key(b"prototype");
+    let parent_value = parent.get_nanbox_f64();
+    let value = if let Some(cid) = super::super::class_ref_id(parent_value) {
+        class_decl_prototype_value(cid)
+    } else {
+        super::super::field_get_set::js_object_get_field_by_name_f64(
+            crate::value::js_nanbox_get_pointer(parent_value) as *const ObjectHeader,
+            key,
+        )
+    };
+    class_parent_prototype_bits(value)
+        .map(f64::from_bits)
+        .unwrap_or_else(|| {
+            super::super::object_ops::throw_object_type_error(
+                b"Class extends value does not have valid prototype property",
+            )
+        })
+}
+
+/// Definition-time preparation for a fresh class evaluation. The resolved
+/// prototype travels through rooted generated operands into the new object.
+#[no_mangle]
+pub extern "C" fn js_class_evaluation_parent_prototype(class_id: u32, parent: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let parent = scope.root_nanbox_f64(parent);
+    super::parent_static::register_class_parent_dynamic(class_id, parent.get_nanbox_f64(), false);
+    evaluated_superclass_prototype(parent.get_nanbox_f64())
 }
 
 /// The [[Prototype]] of declared class `class_id`'s prototype object: its
@@ -1554,7 +1533,14 @@ fn decl_prototype_parent_bits(class_id: u32) -> Option<u64> {
                 };
                 class_parent_prototype_bits(f64::from_bits(parent_proto.bits()))
             } else {
-                None
+                let parent = JSValue::from_bits(parent_value.to_bits());
+                if parent.is_pointer()
+                    && crate::closure::is_closure_ptr(parent.as_pointer::<u8>() as usize)
+                {
+                    Some(evaluated_superclass_prototype(parent_value).to_bits())
+                } else {
+                    None
+                }
             }
         };
         let parent_proto = evaluated_parent_proto.or_else(|| {
@@ -1581,41 +1567,7 @@ fn decl_prototype_parent_bits(class_id: u32) -> Option<u64> {
                     reserved_native_parent_prototype_bits(parent_id)
                 })
         });
-        if parent_proto.is_some() {
-            parent_proto
-        } else {
-            // A runtime function-valued superclass (including Intl service
-            // constructors) has no class-id edge. Link the declared prototype
-            // to the parent's own `.prototype` exactly once, while this fresh
-            // class prototype is initialized. Construction must never rewrite
-            // this edge after user code mutates it.
-            let parent = JSValue::from_bits(dynamic_parent.get_nanbox_f64().to_bits());
-            if parent.is_pointer() {
-                let parent_addr = parent.as_pointer::<u8>() as usize;
-                if crate::closure::is_closure_ptr(parent_addr) {
-                    // Use the same observable `.prototype` read as ordinary
-                    // property access. Plain functions and bound native-module
-                    // constructor exports materialize this object lazily, while
-                    // explicit, deleted, and generator prototypes must retain
-                    // their own semantics.
-                    let parent_proto =
-                        super::function_prototype::js_function_prototype_value_for_read(
-                            dynamic_parent.get_nanbox_f64(),
-                        );
-                    if let Some(bits) = class_parent_prototype_bits(parent_proto) {
-                        Some(bits)
-                    } else {
-                        super::super::object_ops::throw_object_type_error(
-                            b"Class extends value does not have valid prototype property",
-                        );
-                    }
-                } else {
-                    global_object_prototype_bits()
-                }
-            } else {
-                global_object_prototype_bits()
-            }
-        }
+        parent_proto.or_else(global_object_prototype_bits)
     }
 }
 

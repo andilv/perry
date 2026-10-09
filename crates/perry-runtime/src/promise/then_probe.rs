@@ -46,9 +46,9 @@
 //!   WeakMap/WeakSet, Map/Set iterators, DisposableStack, boxed String,
 //!   AbortSignal and TTY hosts, so no `CLASS_VTABLE_REGISTRY` getter or method
 //!   named `then` and no class prototype chain is in play;
-//! * `native_this_alias::alias_active()` is false — `js_object_get_field_by_name_f64`
-//!   forwards a MISSED read to an aliased native handle, a layer above the
-//!   lookup this module models;
+//! * the receiver carries no native-this alias (`native_this_alias::object_alias`)
+//!   — `js_object_get_field_by_name_f64` forwards a MISSED read to an aliased
+//!   native handle, a layer above the lookup this module models;
 //! * `PROMISE_SUBCLASS_EVER` is false — the `class X extends Promise` arm is
 //!   keyed on `"then"` specifically and probes an INHERITED backing key;
 //! * no own `then` key (a direct dense scan of the keys array — this is the
@@ -519,9 +519,9 @@ unsafe fn prove_no_then(value: f64) -> Outcome {
     // native handle (`http.Server.call(this, …)` inherits pattern) — a layer
     // above `js_object_get_field_by_name` that this module does not model.
     // Aliased receivers are constructor-built and so carry a synthetic class
-    // id, but that is incidental; gate on the fact itself. One thread-local
-    // `Cell` read, false in every program that does not use the pattern.
-    if crate::object::native_this_alias::alias_active() {
+    // id, but that is incidental; gate on the fact itself: the alias word on
+    // the receiver's own meta record.
+    if crate::object::native_this_alias::object_alias(obj).is_some() {
         return Outcome::NativeAlias;
     }
     // `class X extends Promise` arms the `then`-keyed subclass probe in
@@ -636,7 +636,7 @@ fn class_id_admissible(class_id: u32) -> bool {
 /// nothing for `class_id`: no vtable (getters, setters, methods), no class
 /// prototype object of either flavour, and no parent edge. Those four
 /// registries are the entire input to `resolve_proto_chain_field_with_receiver`,
-/// `lookup_prototype_method`, `lookup_class_method_in_chain` and the
+/// the ordinary prototype read, `lookup_class_method_in_chain` and the
 /// `CLASS_VTABLE_REGISTRY` getter/method dispatch in the dynamic getter.
 pub(crate) fn class_registry_inert(class_id: u32) -> bool {
     if crate::object::get_parent_class_id(class_id).is_some() {

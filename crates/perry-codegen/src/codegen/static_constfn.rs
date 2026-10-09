@@ -3,10 +3,12 @@ use super::{BirthProto, BirthShape, ConstFnBirth, ModuleBirth};
 use perry_hir::{Class, Expr, Module, Stmt};
 use std::collections::{BTreeSet, HashMap};
 
-/// Executables build ConstFn lanes unless `PERRY_CONSTFN_SHAPE=0`; a dylib
-/// never does.
-pub(crate) fn enabled(output_type: &str) -> bool {
-    output_type == "executable" && std::env::var("PERRY_CONSTFN_SHAPE").as_deref() != Ok("0")
+/// Executables build ConstFn lanes unless the compile's options disable them
+/// (`CompileOptions::disable_constfn_shapes`); a dylib never does. Only the
+/// options decide: a process-wide input read here would let one compile's
+/// choice leak into another running in parallel.
+pub(crate) fn enabled(opts: &super::CompileOptions) -> bool {
+    opts.output_type == "executable" && !opts.disable_constfn_shapes
 }
 
 pub(crate) fn literal_final(
@@ -86,6 +88,7 @@ pub(crate) fn literal_final(
         constfn,
         private: Vec::new(),
         brands: Vec::new(),
+        attrs: Vec::new(),
     })
 }
 
@@ -462,7 +465,9 @@ pub(crate) fn static_method_lanes(
         return Vec::new();
     };
     if !class.is_literal_shape() {
-        return Vec::new();
+        return super::static_prototype::inherited_lane(ctx, &class_name, property)
+            .into_iter()
+            .collect();
     }
     let (Some(&class_id), Some(keys_global)) = (
         ctx.class_ids.get(&class_name),
@@ -582,6 +587,9 @@ fn finalize_shape(ctx: &mut crate::expr::FnCtx<'_>, shape: &BirthShape, object: 
                 &match shape.proto {
                     BirthProto::Literal => 0,
                     BirthProto::Class(cid) => cid,
+                    BirthProto::Prototype(..) => {
+                        unreachable!("prototype uses lazy materialization")
+                    }
                 }
                 .to_string(),
             ),

@@ -535,6 +535,8 @@ pub(super) fn compile_method(
         reassigned_locals.remove(&method.params[index].id);
     }
     let mut ctx = FnCtx {
+        program_has_worker: cross_module.program_has_worker,
+        program_has_thread_agents: cross_module.program_has_thread_agents,
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
         source_function: format!("{}.{}", class.name, method.name),
@@ -564,6 +566,7 @@ pub(super) fn compile_method(
         label_targets: HashMap::new(),
         pending_labels: Vec::new(),
         classes,
+        class_hierarchy: &cross_module.class_hierarchy,
         this_stack: vec![this_slot],
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,

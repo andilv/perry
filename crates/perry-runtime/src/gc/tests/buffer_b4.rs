@@ -352,15 +352,20 @@ fn views_observe_owner_resize_and_detach_after_a_live_collection() {
 
 #[test]
 fn pinned_inline_detach_retains_pages_until_the_last_unpin() {
+    // Exercise B4 Inline pin/page retention independently of the placement cutoff.
+    let _placement = policy::ByteStorePolicyTestGuard::new(usize::MAX);
     let _guard = CopyingNurseryTestGuard::new(0);
     gc_register_named_mutable_root_scanner("pinned", crate::gc::pin::scan_pinned_object_roots_mut);
     let handles = RuntimeHandleScope::new();
-    let owner = handles.root_raw_mut_ptr(buffer::buffer_alloc(64 * 1024));
+    let owner = handles.root_raw_mut_ptr(buffer::store::store_alloc(
+        GC_TYPE_BUFFER_ARRAY_BUFFER,
+        64 * 1024,
+        buffer::store::Init::Uninit,
+    ));
     let owner = owner.get_raw_mut_ptr::<buffer::BufferHeader>();
     unsafe {
-        (*owner).length = 64 * 1024;
+        crate::buffer::store::set_length(owner as usize, 64 * 1024);
     }
-    buffer::mark_as_array_buffer(owner as usize);
     assert!(!buffer::is_foreign_backed_buffer(owner as usize));
     let first = bytes::pin(bits(owner)).unwrap();
     let second = bytes::pin(bits(owner)).unwrap();
@@ -568,6 +573,10 @@ fn each_compatible_b4_sabotage_turns_its_witness_red() {
             "u32_admission",
             "typedarray::tests::owning_u32_admission_reads_current_header",
         ),
+        (
+            "view_bag_owner_not_first",
+            "gc::tests::buffer_b4::a_bagged_view_holds_its_owner_at_the_fixed_first_slot",
+        ),
     ] {
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", witness, "--nocapture"])
@@ -595,15 +604,18 @@ fn pool_identity_alignment_rollover_and_root_are_real_owner_edges() {
         gc_register_named_mutable_root_scanner("b4 pool", buffer::pool::scan_pool_roots_mut);
     }
     let first = buffer::pool::copy(3);
-    let second = buffer::pool::place(GC_TYPE_BUFFER, buffer::pool::Init::Unsafe, 5);
+    let second = buffer::pool::place(GC_TYPE_BUFFER, buffer::pool::Init::PoolUnsafe, 5);
     let owner = unsafe { buffer::store::owner(first as usize) };
     assert_ne!(owner, first as usize);
     assert_eq!(unsafe { buffer::store::owner(second as usize) }, owner);
-    assert_eq!(unsafe { (*first).capacity }, 0);
-    assert_eq!(unsafe { (*second).capacity }, 8);
+    assert_eq!(unsafe { crate::buffer::store::capacity(first as usize) }, 0);
+    assert_eq!(
+        unsafe { crate::buffer::store::capacity(second as usize) },
+        8
+    );
     assert_eq!(buffer::buffer_backing_array_buffer(first as usize), owner);
     assert_eq!(buffer::buffer_backing_array_buffer(second as usize), owner);
-    let unpooled = buffer::pool::place(GC_TYPE_BUFFER, buffer::pool::Init::Copy, 4096);
+    let unpooled = buffer::pool::place(GC_TYPE_BUFFER, buffer::pool::Init::PoolCopy, 4096);
     assert_eq!(
         unsafe { buffer::store::owner(unpooled as usize) },
         unpooled as usize
@@ -633,4 +645,43 @@ fn pool_identity_alignment_rollover_and_root_are_real_owner_edges() {
     let last = buffer::pool::copy(3000);
     assert_ne!(unsafe { buffer::store::owner(last as usize) }, owner);
     buffer::pool::reset_for_test();
+}
+
+/// Emitted view resolution reads a bagged view's owner at
+/// `BYTES_VIEW_BAG_OWNER` with one load. The bag is born with the owner in
+/// inline slot 0, and growth, deletes and a moving collection keep it there.
+#[test]
+fn a_bagged_view_holds_its_owner_at_the_fixed_first_slot() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _force = ForcedEvacuationTestGuard::on();
+    let owner = buffer::buffer_alloc(32) as usize;
+    unsafe { buffer::store::set_length(owner, 32) };
+    let view = buffer::store::new_view(GC_TYPE_BUFFER_UINT8ARRAY, owner, 4, 8, false) as usize;
+    for k in 0..40 {
+        buffer::buffer_set_own_prop(view, &format!("p{k}"), k as f64);
+    }
+    assert!(buffer::buffer_delete_own_prop(view, "p3"));
+    let holder = crate::array::js_array_alloc(1);
+    crate::array::js_array_push_f64(holder, bits(view as *const u8));
+    js_shadow_slot_set(0, ptr_bits(holder as usize));
+    let before = gc_total_collection_count();
+    let _ =
+        gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Direct));
+    assert!(gc_total_collection_count() > before);
+    unsafe {
+        let bag = buffer::store::bag(view) as usize;
+        assert_ne!(bag, 0, "the view must be bagged");
+        assert_eq!(
+            buffer::store::view_bag_owner(bag),
+            owner,
+            "the owner must sit at the bag's fixed first slot"
+        );
+        assert_eq!(buffer::store::owner(view), owner);
+        assert_eq!(
+            buffer::store::data(view) as usize,
+            buffer::store::owner_data(owner) as usize + 4
+        );
+        assert_eq!(buffer::store::length(view), 8);
+    }
+    assert_eq!(buffer::buffer_get_own_prop(view, "p39"), Some(39.0));
 }

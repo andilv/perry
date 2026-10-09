@@ -25,29 +25,13 @@
 //! alias for object receivers with no own method of that name and forwards
 //! the call to the handle, so the instance behaves as the native object.
 //!
-//! Storage is a small Vec (alias count is tiny — one per inherits-style
-//! server) with a GC root scanner that keeps both the object and the handle
-//! value alive and rewrites the object pointer if the GC moves it.
+//! Storage: `ObjectMeta.native_state` names a traced two-slot alias record
+//! (forwarding value, composite flag). A runtime stream keeps that same record
+//! in its NativeAlias slot. The forwarding value may be a small server handle
+//! or an ordinary payload-backed response. These are child edges, never roots;
+//! the alias, target, listeners and captured receiver can die as one cycle.
 
 use crate::value::JSValue;
-use std::cell::{Cell, RefCell};
-
-struct AliasEntry {
-    /// Raw heap address of the user object (`this`). Rewritten by the GC
-    /// scanner when the object is evacuated. Keyed by address (not NaN-box
-    /// bits) because `this` reaches the runtime both NaN-boxed
-    /// (POINTER_TAG) and as a raw i64 pointer bit-cast to f64, depending on
-    /// the codegen path.
-    obj_addr: usize,
-    /// NaN-boxed handle value the object forwards to.
-    handle_bits: u64,
-    /// Forward through the composite handle dispatcher (extensions first)
-    /// rather than the primary one. The server aliases stay primary-only (see
-    /// `handle_method_dispatch_primary`); a `ServerResponse` handle is served
-    /// by perry-ext-http's dispatch extension when that crate owns `http`, so
-    /// the primary dispatcher does not know it (#10454).
-    composite: bool,
-}
 
 /// Extract a plausible ObjectHeader address from a value that may be
 /// NaN-boxed (POINTER_TAG) or a raw i64 pointer bit-cast to f64 (top 16
@@ -79,56 +63,75 @@ fn plain_object_addr_of(value: f64) -> Option<usize> {
     .then_some(addr)
 }
 
-crate::perry_thread_local! {
-    static ALIAS_ACTIVE: Cell<bool> = const { Cell::new(false) };
-    static ALIASES: RefCell<Vec<AliasEntry>> = const { RefCell::new(Vec::new()) };
-    // The mutable-root scanner registry is thread-local, so this latch must be too.
-    static SCANNER_REGISTERED: Cell<bool> = const { Cell::new(false) };
-}
+/// A native-this alias is one traced two-slot record: forwarding value and
+/// composite-dispatch boolean. Both small handles and ordinary payload owners
+/// use this encoding. Unlike an id word, it can retain a payload owner without
+/// making the owner a global root. Stream records have their own fixed layout.
+const ALIAS_SLOTS: u32 = 2;
 
-fn ensure_scanner_registered() {
-    SCANNER_REGISTERED.with(|registered| {
-        if registered.get() {
-            return;
-        }
-        crate::gc::gc_register_mutable_root_scanner_named(
-            "runtime:native-this-alias",
-            scan_alias_roots,
-        );
-        registered.set(true);
-    });
-}
-
-fn scan_alias_roots(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    ALIASES.with(|a| {
-        for entry in a.borrow_mut().iter_mut() {
-            visitor.visit_usize_slot(&mut entry.obj_addr);
-            visitor.visit_nanbox_u64_slot(&mut entry.handle_bits);
-        }
-    });
-}
-
-/// Cheap per-call gate for `js_native_call_method`: true only after at least
-/// one alias has been registered on this thread.
 #[inline]
-pub(crate) fn alias_active() -> bool {
-    ALIAS_ACTIVE.with(|c| c.get())
+fn decode_alias_word(word: u64) -> Option<(f64, bool)> {
+    if !crate::native_payload::is_payload_state_word(word) {
+        return None;
+    }
+    let addr = (word & crate::value::POINTER_MASK) as usize;
+    let header = unsafe { crate::value::addr_class::try_read_gc_header(addr) }?;
+    if header.obj_type != crate::gc::GC_TYPE_ARRAY {
+        return None;
+    }
+    let record = addr as *const crate::array::ArrayHeader;
+    unsafe {
+        if (*record).length != ALIAS_SLOTS {
+            return None;
+        }
+        let slots = crate::array::array_elements_ptr(record);
+        Some((
+            f64::from_bits(*slots),
+            *slots.add(1) == crate::value::TAG_TRUE,
+        ))
+    }
 }
 
-/// Look up the forwarding handle for an object receiver (NaN-boxed or raw
+#[inline]
+pub(crate) fn is_alias_word(word: u64) -> bool {
+    decode_alias_word(word).is_some()
+}
+
+/// The alias an object carries, read from the object itself: its
+/// `native_state` word, or, when the runtime also keeps stream state for the
+/// object, the alias slot of that state record (`node_stream::state_record`;
+/// one word, one owner).
+///
+/// # Safety
+/// `obj` must be a live `GC_TYPE_OBJECT` header (the caller has classified
+/// it).
+#[inline]
+pub(crate) unsafe fn object_alias(obj: *const super::ObjectHeader) -> Option<(f64, bool)> {
+    let meta = (*obj).meta;
+    if meta.is_null() {
+        return None;
+    }
+    let word = (*meta).native_state;
+    decode_alias_word(word)
+        .or_else(|| decode_alias_word(crate::node_stream::record_alias_word(word)))
+}
+
+/// Look up the forwarding handle for an arbitrary receiver (NaN-boxed or raw
 /// pointer value), and whether to dispatch it through the composite
-/// dispatcher (`AliasEntry::composite`).
+/// dispatcher. None for anything that is not a live ordinary object carrying
+/// an alias.
 pub(crate) fn alias_handle_for_object(receiver: f64) -> Option<(f64, bool)> {
     let addr = object_addr_of(receiver);
     if addr == 0 {
         return None;
     }
-    ALIASES.with(|a| {
-        a.borrow()
-            .iter()
-            .find(|e| e.obj_addr == addr)
-            .map(|e| (f64::from_bits(e.handle_bits), e.composite))
-    })
+    let header = unsafe { crate::value::addr_class::try_read_gc_header(addr) }?;
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    {
+        return None;
+    }
+    unsafe { object_alias(addr as *const super::ObjectHeader) }
 }
 
 /// True when `(module, method)` names a native-module class export whose
@@ -147,43 +150,67 @@ fn is_construct_before_call_native_class(module: &str, method: &str) -> bool {
     module == "http" && method == "ServerResponse"
 }
 
-/// Register `this_arg → result` in the alias table when `result` is a
-/// NaN-boxed small native handle and `this_arg` is a real heap object (not a
-/// closure, not another handle).
-fn register_this_to_handle_alias(this_arg: f64, result: f64, composite: bool) {
+/// Alias `this_arg` to `result` using one traced record on the receiver, when
+/// `result` is a NaN-boxed native forwarding value and
+/// `this_arg` is a real heap object (not a closure, not another handle).
+pub(crate) fn register_this_to_handle_alias(this_arg: f64, result: f64, composite: bool) {
     let result_jv = JSValue::from_bits(result.to_bits());
     if !result_jv.is_pointer() {
         return;
     }
-    let handle_addr = (result.to_bits() & crate::value::POINTER_MASK) as usize;
-    if !crate::value::addr_class::is_small_handle(handle_addr) {
-        return;
-    }
-    // `this` must be a real heap object (not a closure, not another handle).
-    // Accept both the NaN-boxed and the raw-i64-pointer object shapes.
     let Some(obj_addr) = plain_object_addr_of(this_arg) else {
         return;
     };
-
-    ensure_scanner_registered();
-    ALIASES.with(|a| {
-        let mut aliases = a.borrow_mut();
-        if let Some(existing) = aliases.iter_mut().find(|e| e.obj_addr == obj_addr) {
-            existing.handle_bits = result.to_bits();
-            existing.composite = composite;
-        } else {
-            aliases.push(AliasEntry {
-                obj_addr,
-                handle_bits: result.to_bits(),
-                composite,
-            });
-        }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let object = scope.root_raw_mut_ptr(obj_addr as *mut super::ObjectHeader);
+    let result = scope.root_nanbox_f64(result);
+    object.with_mut_ptr(|obj: *mut super::ObjectHeader| unsafe { super::object_meta_ensure(obj) });
+    let record = crate::array::js_array_alloc_with_length_exact(ALIAS_SLOTS);
+    let record = scope.root_raw_mut_ptr(record);
+    record.with_mut_ptr(|r| {
+        crate::array::js_array_set_f64(r, 0, result.get_nanbox_f64());
+        crate::array::js_array_set_f64(
+            r,
+            1,
+            f64::from_bits(if composite {
+                crate::value::TAG_TRUE
+            } else {
+                crate::value::TAG_FALSE
+            }),
+        );
     });
-    ALIAS_ACTIVE.with(|c| c.set(true));
+    let installed = object.with_mut_ptr(|obj: *mut super::ObjectHeader| unsafe {
+        let meta = (*obj).meta;
+        let word = (*meta).native_state;
+        let alias = record
+            .with_mut_ptr(|r: *mut crate::array::ArrayHeader| {
+                crate::value::js_nanbox_pointer(r as i64)
+            })
+            .to_bits();
+        if crate::node_stream::store_record_alias_word(word, alias) {
+            return true;
+        }
+        if word != 0 && !is_alias_word(word) {
+            return false;
+        }
+        (*meta).native_state = alias;
+        crate::gc::runtime_write_barrier_slot(
+            meta as usize,
+            &(*meta).native_state as *const _ as usize,
+            alias,
+        );
+        true
+    });
+    if !installed {
+        return;
+    }
     // Native state is per receiver, not a fact of its ordinary shape. Move
     // onto an exotic-read lineage so pre-alias cached misses cannot survive
-    // construction or be shared with a sibling receiver (#11725).
-    unsafe { super::proto_validity::mark_exotic_read_receiver(obj_addr) };
+    // construction or be shared with a sibling receiver (#11725). The mark
+    // roots its receiver before it allocates.
+    object.with_mut_ptr(|obj: *mut super::ObjectHeader| unsafe {
+        super::proto_validity::mark_exotic_read_receiver(obj as usize)
+    });
 }
 
 /// Called from the `Function.prototype.call` / `.apply` arms after the callee
@@ -323,17 +350,9 @@ pub(crate) unsafe fn maybe_run_stream_subclass_init_via_this(
 /// static `Named("<fn>")` paths read the method as a property value first,
 /// then call it. Returns None when the receiver has no alias or the handle
 /// dispatcher yields undefined.
-pub(crate) fn alias_forward_property_read(obj_addr: usize, key: &str) -> Option<f64> {
-    if !alias_active() || obj_addr == 0 {
-        return None;
-    }
-    let (handle_bits, composite) = ALIASES.with(|a| {
-        a.borrow()
-            .iter()
-            .find(|e| e.obj_addr == obj_addr)
-            .map(|e| (e.handle_bits, e.composite))
-    })?;
-    let handle = (handle_bits & crate::value::POINTER_MASK) as i64;
+pub(crate) fn alias_forward_property_read(receiver: f64, key: &str) -> Option<f64> {
+    let (handle_val, composite) = alias_handle_for_object(receiver)?;
+    let handle = (handle_val.to_bits() & crate::value::POINTER_MASK) as i64;
     // Primary dispatcher only for the server aliases — see
     // handle_method_dispatch_primary (an id-colliding ext-net socket must not
     // answer for the server).
@@ -397,12 +416,13 @@ unsafe fn construct_native_http_class_with_this(
         args.as_ptr(),
         len,
     );
+    let result = scope.root_nanbox_f64(result);
     register_this_to_handle_alias(
         this_root.get_nanbox_f64(),
-        result,
+        result.get_nanbox_f64(),
         method == "ServerResponse",
     );
-    result
+    result.get_nanbox_f64()
 }
 
 /// Shared implementation for the `js_http(s)_server_construct_with_this`
@@ -488,13 +508,6 @@ const SERVER_RESPONSE_PROTOTYPE_METHODS: &[&str] = &[
     "prependOnceListener",
 ];
 
-crate::perry_thread_local! {
-    /// Re-entrancy latch for `server_response_prototype_method_thunk`: a
-    /// handle dispatcher that falls back to the receiver's prototype chain for
-    /// a name it does not own must not bounce back into the thunk forever.
-    static IN_SERVER_RESPONSE_FORWARD: Cell<bool> = const { Cell::new(false) };
-}
-
 /// Body of every `ServerResponse.prototype.<method>`: resolve `this` to its
 /// native handle — the receiver itself (`new ServerResponse(req)`), or the
 /// handle a `ServerResponse.call(this, req)` / `super(req)` aliased it to —
@@ -512,13 +525,19 @@ extern "C" fn server_response_prototype_method_thunk(
     let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
     let name_ptr = crate::closure::js_closure_get_capture_ptr(closure, 0) as *const u8;
     let name_len = crate::closure::js_closure_get_capture_ptr(closure, 1) as usize;
-    let receiver = this.as_f64();
+    let response_scope = crate::gc::RuntimeHandleScope::new();
+    let receiver_root = response_scope.root_nanbox_f64(this.as_f64());
+    let receiver = receiver_root.get_nanbox_f64();
     let receiver_jv = JSValue::from_bits(receiver.to_bits());
     let receiver_is_handle = receiver_jv.is_pointer()
         && crate::value::addr_class::is_small_handle(
             (receiver.to_bits() & crate::value::POINTER_MASK) as usize,
         );
-    let (handle_val, composite) = if receiver_is_handle {
+    let receiver_is_response = plain_object_addr_of(receiver).is_some_and(|a| unsafe {
+        (*(a as *const super::ObjectHeader)).class_id
+            == crate::native_class_ids::HTTP_SERVER_RESPONSE
+    });
+    let (handle_val, composite) = if receiver_is_handle || receiver_is_response {
         (receiver, true)
     } else if let Some(alias) = alias_handle_for_object(receiver) {
         alias
@@ -531,9 +550,7 @@ extern "C" fn server_response_prototype_method_thunk(
         );
         super::object_ops::throw_object_type_error(msg.as_bytes());
     };
-    if IN_SERVER_RESPONSE_FORWARD.with(|c| c.replace(true)) {
-        return undefined;
-    }
+    let target_root = response_scope.root_nanbox_f64(handle_val);
     let dispatch = if composite {
         super::class_handles::handle_method_dispatch()
     } else {
@@ -556,13 +573,47 @@ extern "C" fn server_response_prototype_method_thunk(
         },
         None => undefined,
     };
-    IN_SERVER_RESPONSE_FORWARD.with(|c| c.set(false));
     // Chainable methods (`setHeader`, `writeHead`, …) return the handle;
     // hand the aliasing object back instead, as Node returns `this`.
-    if result.to_bits() == handle_val.to_bits() {
-        receiver
+    if result.to_bits() == target_root.get_nanbox_f64().to_bits() {
+        receiver_root.get_nanbox_f64()
     } else {
         result
+    }
+}
+
+extern "C" fn response_property_get(
+    c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    unsafe { response_property_dispatch(c, this.as_f64(), None) }
+}
+extern "C" fn response_property_set(
+    c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    value: f64,
+) -> f64 {
+    unsafe { response_property_dispatch(c, this.as_f64(), Some(value)) }
+}
+unsafe fn response_property_dispatch(
+    c: *const crate::closure::ClosureHeader,
+    receiver: f64,
+    value: Option<f64>,
+) -> f64 {
+    let target = alias_handle_for_object(receiver).map_or(receiver, |a| a.0);
+    let name = crate::closure::js_closure_get_capture_ptr(c, 0) as *const u8;
+    let len = crate::closure::js_closure_get_capture_ptr(c, 1) as usize;
+    let h = (target.to_bits() & crate::value::POINTER_MASK) as i64;
+    if let Some(v) = value {
+        if let Some(f) = super::class_handles::handle_property_set_dispatch() {
+            f(h, name, len, v);
+        }
+        f64::from_bits(crate::value::TAG_UNDEFINED)
+    } else {
+        super::class_handles::handle_property_dispatch()
+            .map_or(f64::from_bits(crate::value::TAG_UNDEFINED), |f| {
+                f(h, name, len)
+            })
     }
 }
 
@@ -624,6 +675,49 @@ pub(crate) fn attach_http_server_response_prototype(constructor_value: f64) -> f
                     PropertyAttrs::new(true, false, true),
                 );
             });
+        });
+    }
+    for name in [
+        "statusCode",
+        "statusMessage",
+        "headersSent",
+        "writableEnded",
+        "writableFinished",
+        "finished",
+        "destroyed",
+        "sendDate",
+        "strictContentLength",
+        "socket",
+        "connection",
+        "req",
+        "writableLength",
+        "writableHighWaterMark",
+        "writableCorked",
+        "writableObjectMode",
+        "writableNeedDrain",
+    ] {
+        let get = crate::closure::js_closure_alloc(crate::fn_info!(response_property_get, 0), 2);
+        let get = scope.root_raw_mut_ptr(get);
+        let set = crate::closure::js_closure_alloc(crate::fn_info!(response_property_set, 1), 2);
+        let set = scope.root_raw_mut_ptr(set);
+        for c in [&get, &set] {
+            c.with_mut_ptr(|c| {
+                crate::closure::js_closure_set_capture_ptr(c, 0, name.as_ptr() as i64);
+                crate::closure::js_closure_set_capture_ptr(c, 1, name.len() as i64);
+            });
+        }
+        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        proto.with_mut_ptr(|p| unsafe {
+            super::install_own_builtin_accessor(
+                p,
+                key,
+                name,
+                get.with_mut_ptr(|c: *mut u8| crate::value::js_nanbox_pointer(c as i64))
+                    .to_bits(),
+                set.with_mut_ptr(|c: *mut u8| crate::value::js_nanbox_pointer(c as i64))
+                    .to_bits(),
+                PropertyAttrs::new(true, false, true),
+            );
         });
     }
     let closure_addr =

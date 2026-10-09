@@ -1175,6 +1175,8 @@ pub(super) fn compile_function(
     };
 
     let mut ctx = FnCtx {
+        program_has_worker: cross_module.program_has_worker,
+        program_has_thread_agents: cross_module.program_has_thread_agents,
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
         source_function: f.name.clone(),
@@ -1201,6 +1203,7 @@ pub(super) fn compile_function(
         label_targets: HashMap::new(),
         pending_labels: Vec::new(),
         classes,
+        class_hierarchy: &cross_module.class_hierarchy,
         this_stack,
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
@@ -1593,7 +1596,7 @@ pub(super) fn compile_function(
                 continue;
             }
             let object = perry_hir::Expr::LocalGet(param.id);
-            if crate::expr::u8_buffer_read::loop_param_is_read(&f.body, param.id) {
+            if crate::expr::u8_buffer_read::loop_param_is_accessed(&f.body, param.id) {
                 if let Some(kind) = crate::expr::ta_element_read::receiver_kind(&ctx, &object) {
                     if let Some(slot) = ctx.locals.get(&param.id).cloned() {
                         let boxed = ctx.block().load(DOUBLE, &slot);
@@ -1604,7 +1607,7 @@ pub(super) fn compile_function(
                 }
             }
             if !crate::expr::u8_buffer_read::u8_buffer_receiver_eligible(&ctx, &object)
-                || !crate::expr::u8_buffer_read::byte_view_param_is_read(&f.body, param.id)
+                || !crate::expr::u8_buffer_read::byte_view_param_is_used(&f.body, param.id)
             {
                 continue;
             }

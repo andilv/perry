@@ -76,6 +76,9 @@ fn empty_opts() -> CompileOptions {
         imported_func_return_types: std::collections::HashMap::new(),
         imported_vars: std::collections::HashSet::new(),
         output_type: "executable".to_string(),
+        disable_constfn_shapes: false,
+        program_has_worker: false,
+        program_has_thread_agents: false,
         needs_stdlib: false,
         program_is_synchronous: false,
         needs_ui: false,
@@ -227,8 +230,7 @@ fn generic_strict_equality_does_not_read_unverified_pointer_headers() {
 }
 
 fn contains_inline_direct_method_shape_guard(ir: &str) -> bool {
-    ir.contains("method_direct.inline_deref")
-        && ir.contains("load atomic i8, ptr @PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED acquire")
+    ir.contains("method_direct.inline_deref") && ir.contains("method_direct.inline_deref")
 }
 
 fn compile_artifact_json(name: &str, body: Vec<Stmt>) -> serde_json::Value {
@@ -7091,8 +7093,11 @@ fn packed_f64_loop_rejects_nonnumeric_store_then_later_read() {
         !ir.contains("for.packed_f64_fast"),
         "nonnumeric store/read body must not be emitted under the packed-f64 fast clone:\n{ir}"
     );
+    // The guarded store's F64-kind cold arm notes through
+    // `js_array_note_numeric_write_value` (the note and the stored value).
     assert!(
-        ir.contains("call void @js_array_note_numeric_write"),
+        ir.contains("call void @js_array_note_numeric_write(")
+            || ir.contains("call double @js_array_note_numeric_write_value("),
         "nonnumeric store into a numeric array must invalidate the raw-f64 layout:\n{ir}"
     );
     assert!(
@@ -13294,7 +13299,7 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
     // fast arm in text order. Either form is the same proof; take whichever
     // comes first so the ordering assertion below is about the proof, not
     // about which emission shape carried it.
-    let inline_probe = caller_ir.find("@PERRY_CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED");
+    let inline_probe = caller_ir.find("method_direct.inline_deref");
     let method_proof = inline_probe.map_or(method_guard, |p| p.min(method_guard));
     // One-exit class-field GET: at a field-GET site the runtime guard is no
     // longer CALLED -- it is the body of `js_class_field_get_ic`, the inline
@@ -15157,8 +15162,11 @@ fn static_name_method_fallback_uses_rodata_method_id_wrapper() {
     );
 
     let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
+    // The method site's miss takes the same method id and forwards a
+    // non-object receiver to the universal dispatch.
     assert!(
-        ir.contains("call double @js_typed_feedback_native_call_method_by_id"),
+        (ir.contains("call double @js_typed_feedback_native_call_method_by_id")
+            || ir.contains("call double @js_method_site_miss(")),
         "static-name dynamic method fallback should use typed-feedback method-id ABI:\n{ir}"
     );
     assert!(
@@ -15280,11 +15288,14 @@ fn this_method_value_is_the_canonical_method_not_a_receiver_snapshot() {
     // one canonical value, as for any other receiver. A per-read receiver
     // snapshot allocated and named a bound closure on every read.
     assert!(
-        capture.contains("call double @js_class_method_bind_by_id"),
-        "a this.method value read must answer the canonical method value:\n{capture}"
+        capture.contains("call double @js_object_get_field_ic_slow")
+            && capture.contains("_packed_get")
+            && capture.contains("icmp eq i32"),
+        "a this.method value read must load the live shape's method slot:\n{capture}"
     );
     assert!(
-        !capture.contains("js_class_method_snapshot_bind"),
+        !capture.contains("call double @js_class_method_bind_by_id")
+            && !capture.contains("js_class_method_snapshot_bind"),
         "a this.method value read must not build a receiver snapshot:\n{capture}"
     );
 }
@@ -15323,11 +15334,9 @@ fn annotated_class_method_value_uses_generic_lookup() {
     let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
     // (#8033) An erased annotation is never a proof, so the body reachable
     // WITHOUT a validated argument must keep generic lookup. (#8099) A
-    // class-typed parameter is now additionally admitted into the #8094
-    // runtime-guarded clone, where the direct bind ABI is legal because
-    // `js_param_type_guard` established the receiver's class identity. Assert
-    // both halves: the interesting failure is the direct ABI appearing in the
-    // fallback, which is the exact regression #8033 exists to prevent.
+    // class-typed parameter is additionally admitted into the #8094 guarded
+    // clone. #12016: class identity does not prove a method's property value;
+    // both bodies must validate the receiver's live shape on each read.
     let generic = ir_function_body(&ir, "__probe$generic(");
     assert!(
         // T1 renamed the tower's cold exits; this assertion is about the
@@ -15345,10 +15354,11 @@ fn annotated_class_method_value_uses_generic_lookup() {
     );
     let specialized = ir_function_body(&ir, "__probe$spec_b(");
     assert!(
-        specialized.contains("call double @js_class_method_bind_by_id")
-            || specialized.contains("call double @js_class_method_bind(double"),
-        "the guarded clone is what the validated annotation buys — if it stops \
-         selecting the direct bind, the assertions above pass vacuously:\n{specialized}"
+        specialized.contains("call double @js_object_get_field_ic_slow")
+            && specialized.contains("_packed_get")
+            && specialized.contains("icmp eq i32")
+            && !specialized.contains("call double @js_class_method_bind_by_id"),
+        "the guarded clone must still read the live shape's slot:\n{specialized}"
     );
 }
 

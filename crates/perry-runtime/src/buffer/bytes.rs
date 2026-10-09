@@ -58,6 +58,10 @@ thread_local! { static TEST_NATIVE_COPY: std::cell::Cell<bool> = const { std::ce
 #[cfg(test)]
 pub(crate) struct NativeCopyTestGuard(bool);
 #[cfg(test)]
+pub(crate) fn native_copy_fixture() -> bool {
+    TEST_NATIVE_COPY.with(|c| c.get())
+}
+#[cfg(test)]
 impl NativeCopyTestGuard {
     pub(crate) fn new() -> Self {
         Self(TEST_NATIVE_COPY.with(|c| c.replace(true)))
@@ -119,7 +123,7 @@ pub(crate) fn span(value: f64, writable: bool) -> Result<Span, NotBytes> {
     }
     #[cfg(test)]
     let ptr = if sabotage("view_window") && owner != addr && super::is_registered_buffer(owner) {
-        super::buffer_data(owner as *const super::BufferHeader) as *mut u8
+        unsafe { super::store::data(owner) }
     } else {
         ptr
     };
@@ -358,58 +362,51 @@ pub enum Brand {
     Uint8Array = 1,
     ArrayBuffer = 2,
     DataView = 3,
+    SharedArrayBuffer = 4,
+    SecretKey = 5,
+    CryptoKey = 6,
 }
-#[derive(Clone, Copy)]
 pub enum Init {
     Zero,
     Uninit,
+    /// An uninitialized destination for a Node Buffer copying factory.
+    PoolCopy,
+    AdoptVec(Vec<u8>),
+}
+
+impl Brand {
+    pub(crate) fn cell_type(self) -> u8 {
+        match self {
+            Self::SharedArrayBuffer => crate::gc::GC_TYPE_BUFFER_SHARED_ARRAY_BUFFER,
+            Self::SecretKey => crate::gc::GC_TYPE_BUFFER_SECRET_KEY,
+            Self::CryptoKey => crate::gc::GC_TYPE_BUFFER_CRYPTO_KEY,
+            Self::Buffer => crate::gc::GC_TYPE_BUFFER,
+            Self::Uint8Array => crate::gc::GC_TYPE_BUFFER_UINT8ARRAY,
+            Self::ArrayBuffer | Self::DataView => crate::gc::GC_TYPE_BUFFER_ARRAY_BUFFER,
+        }
+    }
 }
 
 fn allocate(brand: Brand, len: usize, init: Init) -> f64 {
-    assert_allocation_allowed();
-    let len = i32::try_from(len)
+    let len = u32::try_from(len)
         .unwrap_or_else(|_| crate::typedarray::throw_range_error(b"Invalid buffer size"));
-    #[cfg(test)]
-    let native_fixture = TEST_NATIVE_COPY.with(|c| c.get());
-    #[cfg(not(test))]
-    let native_fixture = false;
-    let ptr = if native_fixture {
-        // Test the future B3 placement through EXACTLY the same consumer.
-        super::buffer_alloc_owned(len as u32, len as u32)
-    } else if matches!(brand, Brand::Uint8Array) {
-        // Typed-array allocation does not participate in Buffer's pool.
-        let ptr = super::buffer_alloc(len as u32);
-        unsafe {
-            (*ptr).length = len as u32;
-        }
-        ptr
-    } else if matches!(brand, Brand::ArrayBuffer | Brand::DataView) {
-        // ArrayBuffer already uses native storage on main. Keep that rule.
-        super::js_array_buffer_new(len)
-    } else {
-        match init {
-            Init::Zero => super::js_buffer_alloc(len, 0),
-            Init::Uninit => super::js_buffer_alloc_unsafe(len),
-        }
+    let init = match init {
+        Init::Zero => super::store::Init::Zero,
+        Init::Uninit => super::store::Init::Uninit,
+        Init::PoolCopy => super::store::Init::PoolCopy,
+        Init::AdoptVec(body) => super::store::Init::AdoptVec(body),
     };
-    match brand {
-        Brand::Buffer => (),
-        Brand::Uint8Array => super::mark_as_uint8array(ptr as usize),
-        Brand::ArrayBuffer => super::mark_as_array_buffer(ptr as usize),
-        Brand::DataView => {
-            // DataView is always a view; the store itself is an ArrayBuffer.
-            super::mark_as_array_buffer(ptr as usize);
-            let view = super::store::new_view(
-                crate::gc::GC_TYPE_BUFFER_DATA_VIEW,
-                ptr as usize,
-                0,
-                len as u32,
-                false,
-            );
-            return crate::value::js_nanbox_pointer(view as i64);
-        }
+    let mut ptr = super::store::store_alloc(brand.cell_type(), len, init);
+    if matches!(brand, Brand::DataView) {
+        ptr = super::store::new_view(
+            crate::gc::GC_TYPE_BUFFER_DATA_VIEW,
+            ptr as usize,
+            0,
+            len,
+            false,
+        );
     }
-    f64::from_bits(JSValue::pointer(ptr.cast()).bits())
+    crate::value::js_nanbox_pointer(ptr as i64)
 }
 
 pub fn new_bytes(brand: Brand, len: usize, init: Init) -> (f64, Pinned) {
@@ -427,7 +424,7 @@ pub(crate) fn new_typed_bytes(kind: u8, length: u32) -> (f64, Pinned) {
         pin(value).unwrap_or_else(|error| unsafe {
             panic!("fresh typed bytes must be pinnable: {error:?}; kind={kind} length={length} type={} flags={} cell_len={} capacity={}",
                 (*super::store::header(ptr as usize)).obj_type,
-                (*super::store::header(ptr as usize))._reserved, (*ptr).length, (*ptr).capacity)
+                (*super::store::header(ptr as usize))._reserved, super::store::length(ptr as usize), super::store::capacity(ptr as usize))
         }),
     )
 }
@@ -520,36 +517,37 @@ pub(crate) fn copy_typed_range_with_collection(
 }
 
 pub fn from_slice(brand: Brand, input: &[u8]) -> f64 {
-    let value = allocate(brand, input.len(), Init::Uninit);
+    let ptr = super::store::store_alloc(
+        brand.cell_type(),
+        input.len().try_into().expect("byte length"),
+        super::store::Init::Copy(input),
+    );
+    let value = if matches!(brand, Brand::DataView) {
+        let view = super::store::new_view(
+            crate::gc::GC_TYPE_BUFFER_DATA_VIEW,
+            ptr as usize,
+            0,
+            input.len() as u32,
+            false,
+        );
+        crate::value::js_nanbox_pointer(view as i64)
+    } else {
+        crate::value::js_nanbox_pointer(ptr as i64)
+    };
     #[cfg(test)]
     if sabotage("inline_copy") {
-        let cell = JSValue::from_bits(value.to_bits())
-            .as_pointer::<u8>()
-            .cast_mut();
-        // Poison the pointer word, then let the witness inspect it BEFORE
-        // dereferencing it. This reproduces ump's corruption without a UAF.
         unsafe {
-            std::ptr::copy_nonoverlapping(input.as_ptr(), cell.add(8), input.len());
+            super::store::sabotage_inline_copy(value, input);
         }
         return value;
     }
-    no_gc(|_| unsafe {
-        // The factory proved the brand and created an owning Buffer-shaped
-        // cell. No JS or safepoint intervenes here, so generic view/detach
-        // admission would repeat checks whose result is already known. The
-        // canonical resolver still selects inline versus native storage.
-        let cell = JSValue::from_bits(value.to_bits())
-            .as_pointer::<super::BufferHeader>()
-            .cast_mut();
-        std::ptr::copy_nonoverlapping(input.as_ptr(), super::buffer_data_mut(cell), input.len());
-    });
     value
 }
 
 /// Copy a byte value into a new store. Root the input before allocating;
 /// resolve its span after allocation so no derived pointer crosses GC.
 pub fn copy_value(brand: Brand, input: f64) -> Result<f64, NotBytes> {
-    copy_value_inner(brand, input, 0, usize::MAX, |_| {})
+    copy_value_inner(brand, input, 0, usize::MAX, Init::Uninit, |_| {})
 }
 
 /// Copy a clamped byte range without retaining an interior pointer across
@@ -561,7 +559,7 @@ pub(crate) fn copy_range(
     start: usize,
     length: usize,
 ) -> Result<f64, NotBytes> {
-    copy_value_inner(brand, input, start, length, |_| {})
+    copy_value_inner(brand, input, start, length, Init::PoolCopy, |_| {})
 }
 
 fn copy_value_inner(
@@ -569,6 +567,7 @@ fn copy_value_inner(
     input: f64,
     start: usize,
     length: usize,
+    init: Init,
     after_allocation: impl FnOnce(f64),
 ) -> Result<f64, NotBytes> {
     let handles = crate::gc::RuntimeHandleScope::new();
@@ -580,7 +579,7 @@ fn copy_value_inner(
     let source_len = no_gc(|scope| bytes(current(), scope).map(<[u8]>::len))?;
     let start = start.min(source_len);
     let len = length.min(source_len - start);
-    let (output, pin) = new_bytes(brand, len, Init::Uninit);
+    let (output, pin) = new_bytes(brand, len, init);
     let output = handles.root_nanbox_f64(output);
     after_allocation(current());
     no_gc(|scope| {
@@ -597,7 +596,7 @@ pub(crate) fn copy_with_collection(
     input: f64,
     collect: impl FnOnce(f64),
 ) -> Result<f64, NotBytes> {
-    copy_value_inner(brand, input, 0, usize::MAX, collect)
+    copy_value_inner(brand, input, 0, usize::MAX, Init::Uninit, collect)
 }
 
 #[cfg(test)]
@@ -608,5 +607,5 @@ pub(crate) fn copy_range_with_collection(
     length: usize,
     collect: impl FnOnce(f64),
 ) -> Result<f64, NotBytes> {
-    copy_value_inner(brand, input, start, length, collect)
+    copy_value_inner(brand, input, start, length, Init::PoolCopy, collect)
 }

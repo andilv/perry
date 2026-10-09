@@ -97,11 +97,11 @@ fn native_backed_alloc_buffer_consumer_preserves_the_pointer_word() {
     };
     let cell = JSValue::from_bits(value.to_bits()).as_pointer::<buffer::BufferHeader>();
     assert!(buffer::is_foreign_backed_buffer(cell as usize));
-    let ptr_word = unsafe { *((cell as *const u8).add(8) as *const usize) };
+    let ptr_word = unsafe { buffer::store::raw_link(cell as usize) };
     assert_ne!(
         ptr_word,
         u64::from_ne_bytes(input) as usize,
-        "payload must never overwrite the native pointer at cell+8"
+        "payload must never overwrite the traced link word"
     );
     bytes::no_gc(|scope| assert_eq!(bytes::bytes(value, scope).unwrap(), &input));
 }
@@ -114,8 +114,7 @@ fn every_current_byte_placement_and_view_resolves_the_canonical_window() {
         buffer::js_buffer_set(ab, 4, 77);
     }
     let u8view = buffer::js_buffer_slice(ab, 4, 8);
-    let dv = buffer::js_buffer_slice(ab, 4, 8);
-    buffer::mark_as_data_view(dv as usize);
+    let dv = buffer::store::new_view(GC_TYPE_BUFFER_DATA_VIEW, ab as usize, 4, 4, false);
     let ta = crate::typedarray_view::js_typed_array_view(
         crate::typedarray::KIND_INT32 as i32,
         bits(ab),

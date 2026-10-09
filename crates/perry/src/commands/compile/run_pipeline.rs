@@ -645,6 +645,22 @@ pub fn run_with_parse_cache(
         }
     }
 
+    // Function layout (`perry_codegen::function_order`): a recording build or
+    // a recorded order, program-wide like the Worker flag. Set before module
+    // codegen; the object-cache key and the link read it back.
+    let function_layout = if args.record_function_order {
+        perry_codegen::FunctionLayout::Record
+    } else if let Some(path) = &args.function_order {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --function-order {}", path.display()))?;
+        perry_codegen::FunctionLayout::Order(std::sync::Arc::new(
+            perry_codegen::FunctionOrder::parse(&text),
+        ))
+    } else {
+        perry_codegen::FunctionLayout::Default
+    };
+    perry_codegen::set_program_function_layout(function_layout);
+
     // `--report-size` needs a symbol table to attribute size by crate, but not
     // full DWARF — reuse the lighter `PERRY_KEEP_SYMBOLS` strip-skip knob
     // rather than `PERRY_DEBUG_SYMBOLS`, so asking for a size report doesn't
@@ -1181,7 +1197,6 @@ pub fn run_with_parse_cache(
             });
             found
         });
-    perry_codegen::set_program_has_worker(program_has_worker);
     // Immutable module-global leaves (perry-codegen codegen/global_transfer.rs)
     // must be published by producer modules that never launch an agent
     // themselves, so the decision is whole-program, like the Worker flag.
@@ -1197,7 +1212,6 @@ pub fn run_with_parse_cache(
         });
         found
     });
-    perry_codegen::set_program_has_thread_agents(program_has_thread_agents);
     let thread_literal_module_prefixes: Vec<String> = if program_has_thread_agents {
         let mut prefixes: Vec<_> = ctx
             .native_modules
@@ -5686,6 +5700,9 @@ pub fn run_with_parse_cache(
 
             // Feature plumbing
             output_type: args.output_type.clone(),
+            disable_constfn_shapes: std::env::var("PERRY_CONSTFN_SHAPE").as_deref() == Ok("0"),
+            program_has_worker,
+            program_has_thread_agents,
             needs_stdlib: ctx.needs_stdlib,
             program_is_synchronous,
             needs_ui: ctx.needs_ui,
@@ -5842,7 +5859,9 @@ pub fn run_with_parse_cache(
     let mut class_final_shapes: BTreeMap<u32, Vec<(perry_codegen::BirthShape, u32)>> =
         BTreeMap::new();
     for (shape, &id) in &static_shape_ids {
-        if let perry_codegen::BirthProto::Class(cid) = shape.proto {
+        if let perry_codegen::BirthProto::Class(cid)
+        | perry_codegen::BirthProto::Prototype(cid, _) = shape.proto
+        {
             if shape.is_completed() {
                 class_final_shapes
                     .entry(cid)

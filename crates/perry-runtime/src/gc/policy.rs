@@ -756,13 +756,8 @@ pub(super) fn external_side_parse_pressure_due() -> bool {
     )
 }
 
-/// Record `bytes` of fresh external side-buffer allocation (Map entries /
-/// Set elements — creation or growth delta) and poke the trigger check when
-/// the accumulated churn window fills. Callers must invoke this only when
-/// the owning collection header is in a consistent state: a triggered cycle
-/// scans conservatively at this call point (`gc_check_trigger`'s direct
-/// arms use `force_full_scan`), which also keeps it non-moving, so raw
-/// header pointers held by the caller stay valid across the call.
+/// Account for external storage at birth. Allocation entries never collect;
+/// pressure is consumed at the collector's safepoints.
 pub(crate) fn gc_note_external_side_alloc(bytes: usize) {
     super::allocation_pacing::note_allocation(bytes, bytes >= 16 * 1024);
     GC_EXTERNAL_SIDE_LIVE_BYTES.with(|c| c.set(c.get().saturating_add(bytes)));
@@ -777,7 +772,16 @@ pub(crate) fn gc_note_external_side_alloc(bytes: usize) {
         }
     });
     if due {
-        gc_check_trigger();
+        #[cfg(test)]
+        if std::env::var("PERRY_B4_SABOTAGE").ok().as_deref() == Some("external_base") {
+            set_safepoint_pending(true);
+            return;
+        }
+        #[cfg(test)]
+        if std::env::var("PERRY_B4_SABOTAGE").ok().as_deref() == Some("birth_collect") {
+            super::js_gc_collect();
+        }
+        defer_nursery_cap_to_precise_safepoint();
     }
 }
 
@@ -5255,4 +5259,72 @@ pub extern "C" fn js_gc_exit_unsafe_zone() {
 #[no_mangle]
 pub extern "C" fn gc_check_trigger_export() {
     gc_check_trigger();
+}
+
+/// Placement owns both the Native cutoff and Node Buffer pooling eligibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ByteStorePlacement {
+    Inline,
+    Native,
+    PoolView { size: u32 },
+}
+/// Recheck this cutoff on the unified B4 layout in REPORT.md.
+pub(crate) const INLINE_MAX: usize = 4096;
+#[cfg(test)]
+thread_local! { static TEST_INLINE_MAX: Cell<Option<usize>> = const { Cell::new(None) }; }
+#[cfg(test)]
+pub(crate) struct ByteStorePolicyTestGuard(Option<usize>);
+#[cfg(test)]
+impl ByteStorePolicyTestGuard {
+    pub(crate) fn new(max: usize) -> Self {
+        Self(TEST_INLINE_MAX.with(|c| c.replace(Some(max))))
+    }
+}
+#[cfg(test)]
+impl Drop for ByteStorePolicyTestGuard {
+    fn drop(&mut self) {
+        TEST_INLINE_MAX.with(|c| c.set(self.0));
+    }
+}
+#[inline]
+pub(crate) fn byte_store_placement(
+    brand: u8,
+    init: &crate::buffer::store::Init<'_>,
+    byte_len: usize,
+) -> ByteStorePlacement {
+    use crate::buffer::store::Init;
+    if brand == super::GC_TYPE_BUFFER
+        && byte_len != 0
+        && matches!(init, Init::PoolCopy | Init::PoolUnsafe)
+    {
+        let requested = crate::object::native_module::buffer_pool_size();
+        // The threshold is JavaScript's ToUint32(poolSize) >>> 1.
+        let size = if requested.is_finite() {
+            requested.trunc().rem_euclid(4294967296.0) as u32
+        } else {
+            0
+        };
+        if byte_len < (size >> 1) as usize {
+            // The store entry validates capacity only when a new pool is needed.
+            return ByteStorePlacement::PoolView { size };
+        }
+    }
+    #[cfg(test)]
+    let max = TEST_INLINE_MAX.with(|c| c.get().unwrap_or(INLINE_MAX));
+    #[cfg(not(test))]
+    let max = INLINE_MAX;
+    if byte_len <= max {
+        ByteStorePlacement::Inline
+    } else {
+        ByteStorePlacement::Native
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn byte_store_test_collection_count() -> u64 {
+    super::telemetry::gc_total_collection_count()
+}
+#[cfg(test)]
+pub(crate) fn byte_store_test_external_live_bytes() -> usize {
+    external_side_live_bytes()
 }

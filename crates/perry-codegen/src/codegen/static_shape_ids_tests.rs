@@ -11,6 +11,7 @@ fn class(keys: &str, count: u32, cid: u32) -> BirthShape {
         constfn: Vec::new(),
         private: Vec::new(),
         brands: Vec::new(),
+        attrs: Vec::new(),
     }
 }
 
@@ -373,9 +374,21 @@ fn class_birth_reads_the_birth_rep_of_its_keys_global() {
     let reps: HashMap<String, u64> = [("perry_class_keys_m__Pair".to_string(), 0b0101u64)]
         .into_iter()
         .collect();
-    let b = class_birth(prefix, &pair, &images, &reps, &class_ids);
+    let b = class_birth(
+        prefix,
+        &pair,
+        &images,
+        &reps,
+        &ClassIdsByKeysName::new(&class_ids),
+    );
     assert_eq!(b.shape.unwrap().rep, 0b0101);
-    let b = class_birth(prefix, &pair, &images, &HashMap::new(), &class_ids);
+    let b = class_birth(
+        prefix,
+        &pair,
+        &images,
+        &HashMap::new(),
+        &ClassIdsByKeysName::new(&class_ids),
+    );
     assert_eq!(b.shape.unwrap().rep, 0);
 }
 
@@ -418,11 +431,29 @@ fn class_birth_names_anon_shapes_as_literals_and_skips_class_zero() {
         vec![],
         vec![],
     );
-    let a = class_birth(prefix, &anon, &images, &HashMap::new(), &class_ids);
+    let a = class_birth(
+        prefix,
+        &anon,
+        &images,
+        &HashMap::new(),
+        &ClassIdsByKeysName::new(&class_ids),
+    );
     assert_eq!(a.shape.unwrap().proto, BirthProto::Literal);
-    let p = class_birth(prefix, &point, &images, &HashMap::new(), &class_ids);
+    let p = class_birth(
+        prefix,
+        &point,
+        &images,
+        &HashMap::new(),
+        &ClassIdsByKeysName::new(&class_ids),
+    );
     assert_eq!(p.shape.unwrap().proto, BirthProto::Class(56));
-    let o = class_birth(prefix, &orphan, &images, &HashMap::new(), &class_ids);
+    let o = class_birth(
+        prefix,
+        &orphan,
+        &images,
+        &HashMap::new(),
+        &ClassIdsByKeysName::new(&class_ids),
+    );
     assert_eq!(o.class_id, 0);
     assert!(o.shape.is_none());
 }
@@ -751,6 +782,7 @@ fn a_literal_birth_mints_its_shape_with_the_plain_prototype_on_both_routes() {
         constfn: Vec::new(),
         private: Vec::new(),
         brands: Vec::new(),
+        attrs: Vec::new(),
     };
     let requested = SHAPE_ID_BASE + 7;
     let stat = String::from_utf8(

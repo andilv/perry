@@ -1841,7 +1841,7 @@
    "hook_file": "crates/perry-runtime/src/async_hooks/thread_exit.rs"
   },
   {
-   "file": "crates/perry-runtime/src/buffer/header.rs",
+   "file": "crates/perry-runtime/src/buffer/store/layout.rs",
    "names": [
     "EXTERNAL_CRYPTO_KEY_META_REGISTRY"
    ],
@@ -1850,7 +1850,7 @@
    "hook": "release_external_buffer_registries_in_freed_ranges"
   },
   {
-   "file": "crates/perry-runtime/src/buffer/header.rs",
+   "file": "crates/perry-runtime/src/buffer/store/layout.rs",
    "names": [
     "CRYPTO_KEY_DEATH_HOOK"
    ],
@@ -1858,7 +1858,7 @@
    "why": "Stores the extern \"C\" fn pointer installed once by perry-stdlib via js_set_crypto_key_death_hook (header.rs:80); code address."
   },
   {
-   "file": "crates/perry-runtime/src/buffer/header.rs",
+   "file": "crates/perry-runtime/src/buffer/store/layout.rs",
    "names": [
     "PERRY_U8_INLINE_CACHE"
    ],
@@ -1997,22 +1997,6 @@
    ],
    "verdict": "no_heap_address",
    "why": "OnceLock<(usize,usize)> caching major-GC pacing floor bytes and growth numerator from env; config."
-  },
-  {
-   "file": "crates/perry-runtime/src/object/descriptor_state.rs",
-   "names": [
-    "DECLARED_FIELD_NAME_HASHES"
-   ],
-   "verdict": "no_heap_address",
-   "why": "Set of FNV hashes of declared instance-field names, written at class registration; hashes, not addresses."
-  },
-  {
-   "file": "crates/perry-runtime/src/object/descriptor_state.rs",
-   "names": [
-    "PROTO_DESCRIPTOR_KEY_HASHES"
-   ],
-   "verdict": "no_heap_address",
-   "why": "Set of FNV key-name hashes installed on prototype descriptor targets; hashes, not addresses."
   },
   {
    "file": "crates/perry-runtime/src/pty/reactor.rs",
@@ -2330,14 +2314,6 @@
   {
    "file": "crates/perry-runtime/src/hot_diag.rs",
    "names": [
-    "LAYOUT_SINK"
-   ],
-   "verdict": "no_heap_address",
-   "why": "OnceLock of Option<Sink> (Sink::Stderr | Sink::File(String)) resolved once from an env var by the layout diagnostic sink getter; Rust-owned config, no addresses."
-  },
-  {
-   "file": "crates/perry-runtime/src/hot_diag.rs",
-   "names": [
     "ENUM_SINK"
    ],
    "verdict": "no_heap_address",
@@ -2514,22 +2490,6 @@
    "verdict": "thread_exit_invalidated",
    "why": "Shared list of raw stdin end closure pointers; freed ones are removed at thread exit.",
    "hook": "release_stdin_listeners_in_freed_ranges"
-  },
-  {
-   "file": "crates/perry-runtime/src/gc/layout_tables.rs",
-   "names": [
-    "PERRY_LAYOUT_ADDR_FILTER"
-   ],
-   "verdict": "conservative_filter",
-   "why": "Monotone 4096-bit hashed sketch of user_ptr addresses that ever got a per-object layout record, OR'd by layout_addr_filter_note (layout_tables.rs:754) and tested inline by codegen; a stale bit only yields a 'maybe' that falls through to the authoritative thread-local LAYOUT_SLOT_MASKS / TYPED_LAYOUTS maps (layout_tables.rs:39-43)."
-  },
-  {
-   "file": "crates/perry-runtime/src/gc/layout_tables.rs",
-   "names": [
-    "N"
-   ],
-   "verdict": "no_heap_address",
-   "why": "(layout_tables.rs:964, layout_mask_min_slots) cached PERRY_LAYOUT_MASK_MIN_SLOTS env value (default 4); config."
   },
   {
    "file": "crates/perry-runtime/src/bun_ffi/dlopen.rs",

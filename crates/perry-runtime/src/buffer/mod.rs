@@ -65,20 +65,20 @@ pub(crate) use header::is_small_buf_slab_addr;
 // #9342: primed by `typedarray::js_u8_buffer_read_f64` (codegen slow arm).
 pub(crate) use access::{admitted_u8_read, admitted_u8_write, is_admitted_u8_cell};
 // #10694: the brand is the cell's GC type byte; see `header`'s module note.
+#[cfg(test)]
+pub(crate) use header::buffer_alloc_foreign;
 pub use header::{
     asymmetric_key_meta, buffer_alloc, buffer_backing_array_buffer, buffer_byte_offset,
     buffer_data, buffer_data_mut, crypto_key_meta, ensure_buffer_ab_alias,
     external_registries_hold_for_test, is_any_array_buffer, is_array_buffer, is_data_view,
     is_registered_buffer, is_secret_key, is_shared_array_buffer, is_uint8array_buffer,
-    js_set_crypto_key_death_hook, mark_as_array_buffer, mark_as_asymmetric_key, mark_as_crypto_key,
-    mark_as_data_view, mark_as_secret_key, mark_as_shared_array_buffer, mark_as_uint8array,
-    register_buffer, CryptoKeyDeathHookFn,
-};
-pub(crate) use header::{
-    buffer_alloc_foreign, drop_owned_backing_at_thread_exit, finalize_collected_dead_buffer,
-    is_foreign_backed_buffer,
+    js_set_crypto_key_death_hook, mark_as_asymmetric_key, register_buffer, set_crypto_key_meta,
+    CryptoKeyDeathHookFn,
 };
 pub(crate) use header::{buffer_family_type_owned, header_is_owned};
+pub(crate) use header::{
+    drop_owned_backing_at_thread_exit, finalize_collected_dead_buffer, is_foreign_backed_buffer,
+};
 // Only the wasm host re-points a foreign wrapper (#9611); see the fn's docs.
 #[cfg(feature = "wasm-host")]
 pub(crate) use header::rebind_foreign_buffer;
@@ -95,7 +95,7 @@ pub use own_props::{
 };
 // ---- Re-exports: resizable ArrayBuffer (#10873) ----
 pub use header::resizable_max_byte_length;
-pub(crate) use header::{mark_as_resizable_buffer, resizable_info, ResizableInfo};
+pub(crate) use header::{resizable_info, set_resizable, ResizableInfo};
 pub(crate) use resizable::array_buffer_resize;
 pub use resizable::{
     is_out_of_bounds_data_view, is_resizable_buffer, js_array_buffer_new_with_options,
@@ -114,10 +114,10 @@ pub use exotic_view::{
 pub(crate) use from::buffer_string_bytes_for_encoding;
 pub use from::{
     js_array_buffer_new, js_array_buffer_new_value, js_buffer_alloc, js_buffer_alloc_fill_value,
-    js_buffer_alloc_unsafe, js_buffer_concat, js_buffer_concat_with_length, js_buffer_fill,
-    js_buffer_fill_range, js_buffer_fill_value_range, js_buffer_from_array,
-    js_buffer_from_arraybuffer_slice, js_buffer_from_string, js_buffer_from_value,
-    js_data_view_new, js_encoding_tag_from_value, js_shared_array_buffer_new,
+    js_buffer_alloc_unsafe, js_buffer_alloc_unsafe_slow, js_buffer_concat,
+    js_buffer_concat_with_length, js_buffer_fill, js_buffer_fill_range, js_buffer_fill_value_range,
+    js_buffer_from_array, js_buffer_from_arraybuffer_slice, js_buffer_from_string,
+    js_buffer_from_value, js_data_view_new, js_encoding_tag_from_value, js_shared_array_buffer_new,
     js_shared_array_buffer_new_value, js_uint8array_alloc, js_uint8array_from_array,
     js_uint8array_new, js_uint8array_view,
 };
@@ -202,10 +202,23 @@ pub use iter::{
     dispatch_buffer_iterator_method, js_buffer_entries, js_buffer_keys, js_buffer_values,
     BUFFER_ITERATOR_CLASS_ID,
 };
+pub(crate) use iter::{dispatch_buffer_iterator_method_builtin, dispatch_buffer_iterator_step};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_array_factories_keep_their_final_brand() {
+        let array = std::ptr::null();
+        let bytes = js_uint8array_from_array(array);
+        assert!(is_uint8array_buffer(bytes as usize));
+        assert!(!is_node_buffer(bytes as usize));
+        assert_eq!(js_buffer_length(bytes), 0);
+        let buffer = js_buffer_from_array(array);
+        assert!(is_node_buffer(buffer as usize));
+        assert_eq!(js_buffer_length(buffer), 0);
+    }
 
     /// The GC buffer sweep must drop the CryptoKey/secret-key side tables
     /// along with the buffer identity ones. They are plain `addr -> metadata`
@@ -216,15 +229,14 @@ mod tests {
     /// ABA class this finalizer exists to prevent.
     #[test]
     fn test_dead_buffer_finalize_prunes_crypto_key_side_tables() {
-        let buf = buffer_alloc(32);
+        let buf = store::alloc_test(crate::gc::GC_TYPE_BUFFER_CRYPTO_KEY, 32);
         assert!(!buf.is_null());
         let addr = buf as usize;
 
         // Shape a WebCrypto secret CryptoKey: HMAC / SHA-256 / secret. Its
         // brand is the cell's type byte (#10694); the metadata is the
         // attribute table this finalizer must drop.
-        mark_as_uint8array(addr);
-        mark_as_crypto_key(addr, 1, 2, 1);
+        set_crypto_key_meta(addr, 1, 2, 1);
 
         assert!(crypto_key_meta(addr).is_some(), "meta registered");
         assert!(
@@ -276,7 +288,7 @@ mod tests {
                 "cap={cap}: slab buffer not recognised by is_registered_buffer"
             );
             assert_eq!(
-                unsafe { (*buf).capacity },
+                unsafe { crate::buffer::store::capacity(buf as usize) },
                 cap,
                 "cap={cap}: wrong capacity stored in header"
             );
@@ -414,7 +426,10 @@ mod tests {
             is_registered_buffer(buf as usize),
             "large buffer not in BUFFER_REGISTRY"
         );
-        assert_eq!(unsafe { (*buf).capacity }, SMALL_BUF_THRESHOLD);
+        assert_eq!(
+            unsafe { crate::buffer::store::capacity(buf as usize) },
+            SMALL_BUF_THRESHOLD
+        );
     }
 
     #[test]
@@ -668,3 +683,6 @@ mod tests {
 
 #[cfg(feature = "node-api-host")]
 pub(crate) use header::{enqueue_all_foreign_finalizers, set_foreign_finalizer};
+
+#[cfg(test)]
+mod adopted_backing_tests;

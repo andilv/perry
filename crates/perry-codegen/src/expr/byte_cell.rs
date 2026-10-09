@@ -3,18 +3,34 @@ use super::FnCtx;
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
 /// Install the hoisted access proof of `id` for exactly `brands`. Every slot
-/// is initialized in the entry block, and the proof starts dirty: the first
-/// use resolves it, so installation order never matters.
+/// is initialized in the entry block, and the proof starts dirty. Installation
+/// must precede body lowering so every call edge can invalidate the proof.
 pub(crate) fn materialize_param(ctx: &mut FnCtx<'_>, id: u32, _boxed: &str, brands: &[u8]) {
-    let mut access = access_for(ctx, id, brands);
+    let mut access = install_loop_access(ctx, id, brands);
     // Callers install only parameters that are never reassigned or mutated.
     access.fixed_receiver = true;
     ctx.receiver_descriptors
         .materialize_byte_view_param(id, access);
 }
 
-/// The proof of `id` for `brands`, installing it on first request.
+/// Look up a proof installed by the pre-pass. An unregistered access must
+/// resolve its header each time: earlier calls cannot dirty a later install.
 pub(crate) fn access_for(
+    ctx: &mut FnCtx<'_>,
+    id: u32,
+    brands: &[u8],
+) -> Option<crate::collectors::ByteViewParamAccess> {
+    #[cfg(test)]
+    if std::env::var("PERRY_B4_SABOTAGE").ok().as_deref() == Some("lazy_install") {
+        return Some(install_loop_access(ctx, id, brands));
+    }
+    ctx.receiver_descriptors
+        .byte_view_access(id, brands)
+        .cloned()
+}
+
+/// Install only during parameter/loop preparation, before lowering calls.
+pub(super) fn install_loop_access(
     ctx: &mut FnCtx<'_>,
     id: u32,
     brands: &[u8],
@@ -51,6 +67,7 @@ pub(crate) fn access_for(
         data_i64: "0".into(),
         receiver_root_slot,
         owner_root_slot,
+        owner_raw_slot: ctx.func.alloca_entry(I64),
         data_slot: ctx.func.alloca_entry(I64),
         length_slot: ctx.func.alloca_entry(I32),
         valid_slot: state_slot,
@@ -58,6 +75,8 @@ pub(crate) fn access_for(
         fixed_receiver: false,
         brands: brands.to_vec(),
     };
+    ctx.func
+        .entry_allocas_push_store(I64, "0", &access.owner_raw_slot);
     ctx.func
         .entry_allocas_push_store(I64, "0", &access.data_slot);
     ctx.func
@@ -113,6 +132,9 @@ fn refresh_param(
     let data = ctx
         .block()
         .phi(I64, &[(&resolved.data, &hit_l), ("0", &miss_l)]);
+    let owner_raw = ctx
+        .block()
+        .phi(I64, &[(&resolved.owner, &hit_l), ("0", &miss_l)]);
     let len = ctx
         .block()
         .phi(I32, &[(&resolved.len, &hit_l), ("0", &miss_l)]);
@@ -124,6 +146,7 @@ fn refresh_param(
         .block()
         .phi(DOUBLE, &[(&owner, &hit_l), (&undef, &miss_l)]);
     ctx.block().store(DOUBLE, &owner, &access.owner_root_slot);
+    ctx.block().store(I64, &owner_raw, &access.owner_raw_slot);
     ctx.block().store(I64, &data, &access.data_slot);
     ctx.block().store(I32, &len, &access.length_slot);
     let state = ctx.block().select(I1, &valid, I8, "1", "2");
@@ -220,13 +243,7 @@ pub(crate) fn resolve(ctx: &mut FnCtx<'_>, boxed: &str, brands: &[u8], miss: &st
     let view = ctx.new_block("bytes.view");
     let view_owner = ctx.new_block("bytes.view.owner");
     let store = ctx.new_block("bytes.store");
-    let inline = ctx.new_block("bytes.inline");
-    let external = ctx.new_block("bytes.external");
-    let done = ctx.new_block("bytes.ready");
-    let labels = [
-        header, owner, view, view_owner, store, inline, external, done,
-    ]
-    .map(|b| ctx.block_label(b));
+    let labels = [header, owner, view, view_owner, store].map(|b| ctx.block_label(b));
     let bits = ctx.block().bitcast_double_to_i64(boxed);
     let raw = ctx.block().and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
     let tag = ctx.block().and(
@@ -276,29 +293,34 @@ pub(crate) fn resolve(ctx: &mut FnCtx<'_>, boxed: &str, brands: &[u8], miss: &st
         .block()
         .add(I64, &raw, &crate::runtime_abi::BYTES_LINK.to_string());
     let link_ptr = ctx.block().inttoptr(I64, &link);
-    let o = ctx.block().load(PTR, &link_ptr);
-    let o = ctx.block().ptrtoint(&o, I64);
+    let linked = ctx.block().load(PTR, &link_ptr);
+    let linked = ctx.block().ptrtoint(&linked, I64);
+    let linked_word = header_word(ctx.block(), &linked);
+    // A view links its owner or its bag, and a bag holds the owner, boxed, at
+    // its fixed first slot `BYTES_VIEW_BAG_OWNER`. The hop is straight-line:
+    // a bag reads that slot, a direct link re-reads the view's own link word
+    // (always readable, and its untagged pointer survives the mask). No block
+    // or join is added, so the resolution keeps main's CFG and the owner arm
+    // is untouched by views.
+    let linked_type = ctx.block().and(I64, &linked_word, "255");
+    let bagged = ctx.block().icmp_eq(
+        I64,
+        &linked_type,
+        &crate::runtime_abi::GC_TYPE_OBJECT.to_string(),
+    );
+    let bag_slot = ctx.block().add(
+        I64,
+        &linked,
+        &crate::runtime_abi::BYTES_VIEW_BAG_OWNER.to_string(),
+    );
+    let owner_addr = ctx.block().select(I1, &bagged, I64, &bag_slot, &link);
+    let owner_ptr = ctx.block().inttoptr(I64, &owner_addr);
+    let owner_bits = ctx.block().load(I64, &owner_ptr);
+    let o = ctx
+        .block()
+        .and(I64, &owner_bits, crate::nanbox::POINTER_MASK_I64);
     let ho = header_word(ctx.block(), &o);
-    let mask = 0xe0u64 | (1 << 23) | (1 << 24) | (1 << 30);
-    let state = ctx.block().and(I64, &ho, &mask.to_string());
-    let inl = ctx.block().icmp_eq(
-        I64,
-        &state,
-        &crate::runtime_abi::BYTES_TYPE_BASE.to_string(),
-    );
-    let ool = ctx.block().icmp_eq(
-        I64,
-        &state,
-        &(crate::runtime_abi::BYTES_TYPE_BASE as u64 | (1 << 23)).to_string(),
-    );
-    let admitted = ctx.block().or(I1, &inl, &ool);
-    // Shared and NativeArena owners retain their atomic/disposal runtime rules.
-    let owner_brand = ctx.block().and(I64, &ho, "31");
-    let shared = ctx.block().icmp_eq(I64, &owner_brand, "15");
-    let arena = ctx.block().icmp_eq(I64, &owner_brand, "18");
-    let special = ctx.block().or(I1, &shared, &arena);
-    let regular = ctx.block().icmp_eq(I1, &special, "false");
-    let admitted = ctx.block().and(I1, &admitted, &regular);
+    let admitted = plain_owner(ctx.block(), &ho);
     let offset_addr = ctx
         .block()
         .add(I64, &raw, &crate::runtime_abi::BYTES_AUX.to_string());
@@ -313,25 +335,7 @@ pub(crate) fn resolve(ctx: &mut FnCtx<'_>, boxed: &str, brands: &[u8], miss: &st
     let offset = ctx
         .block()
         .phi(I64, &[("0", &owner_end), (&offset, &view_end)]);
-    let base = ctx
-        .block()
-        .add(I64, &owning, &crate::runtime_abi::BYTES_STORE.to_string());
-    let flag = ctx.block().and(I64, &word, &(1u64 << 23).to_string());
-    let is_ool = ctx.block().icmp_ne(I64, &flag, "0");
-    ctx.block().cond_br(&is_ool, &labels[6], &labels[5]);
-    ctx.current_block = inline;
-    let inline_end = ctx.block().label.clone();
-    ctx.block().br(&labels[7]);
-    ctx.current_block = external;
-    let slot = ctx.block().inttoptr(I64, &base);
-    let data = ctx.block().load(PTR, &slot);
-    let data = ctx.block().ptrtoint(&data, I64);
-    let external_end = ctx.block().label.clone();
-    ctx.block().br(&labels[7]);
-    ctx.current_block = done;
-    let base = ctx
-        .block()
-        .phi(I64, &[(&base, &inline_end), (&data, &external_end)]);
+    let base = owner_data(ctx, &owning, &word, "bytes");
     let data = ctx.block().add(I64, &base, &offset);
     let len_ptr = ctx.block().inttoptr(I64, &raw);
     let len = ctx.block().load(I32, &len_ptr);
@@ -342,6 +346,69 @@ pub(crate) fn resolve(ctx: &mut FnCtx<'_>, boxed: &str, brands: &[u8], miss: &st
         data,
         len,
     }
+}
+
+/// Resolve an admitted owner's store. The header decides whether BYTES_STORE
+/// is the first inline byte or the out-of-line data word. This does not admit
+/// receivers or extend a pointer's lifetime: callers retain their existing
+/// owner roots and hoist only under their existing storage proof.
+pub(crate) fn owner_data(ctx: &mut FnCtx<'_>, raw: &str, word: &str, prefix: &str) -> String {
+    let base = ctx
+        .block()
+        .add(I64, raw, &crate::runtime_abi::BYTES_STORE.to_string());
+    #[cfg(test)]
+    if std::env::var("PERRY_B4_SABOTAGE").ok().as_deref() == Some("inline_data") {
+        return base;
+    }
+    let inline = ctx.new_block(&format!("{prefix}.inline"));
+    let external = ctx.new_block(&format!("{prefix}.external"));
+    let done = ctx.new_block(&format!("{prefix}.ready"));
+    let inline_l = ctx.block_label(inline);
+    let external_l = ctx.block_label(external);
+    let done_l = ctx.block_label(done);
+    let flag = ctx.block().and(I64, word, &(1u64 << 23).to_string());
+    let is_ool = ctx.block().icmp_ne(I64, &flag, "0");
+    ctx.block().cond_br(&is_ool, &external_l, &inline_l);
+    ctx.current_block = inline;
+    ctx.block().br(&done_l);
+    ctx.current_block = external;
+    let slot = ctx.block().inttoptr(I64, &base);
+    let data = ctx.block().load(PTR, &slot);
+    let data = ctx.block().ptrtoint(&data, I64);
+    ctx.block().br(&done_l);
+    ctx.current_block = done;
+    ctx.block()
+        .phi(I64, &[(&base, &inline_l), (&data, &external_l)])
+}
+
+/// A view's owner header admits the emitted path when it is an owner role,
+/// Inline or OutOfLine, neither RESIZABLE nor DETACHED, and not a Shared or
+/// NativeArena owner (those keep their atomic/disposal runtime rules). A bag
+/// header (`GC_TYPE_OBJECT`) never passes.
+fn plain_owner(blk: &mut crate::block::LlBlock, ho: &str) -> String {
+    let mask = 0xe0u64 | (1 << 23) | (1 << 24) | (1 << 30);
+    let state = blk.and(I64, ho, &mask.to_string());
+    let inl = blk.icmp_eq(
+        I64,
+        &state,
+        &crate::runtime_abi::BYTES_TYPE_BASE.to_string(),
+    );
+    let ool = blk.icmp_eq(
+        I64,
+        &state,
+        &(crate::runtime_abi::BYTES_TYPE_BASE as u64 | (1 << 23)).to_string(),
+    );
+    let admitted = blk.or(I1, &inl, &ool);
+    let owner_brand = blk.and(I64, ho, "31");
+    let shared = blk.icmp_eq(I64, &owner_brand, "15");
+    let arena = blk.icmp_eq(I64, &owner_brand, "18");
+    let special = blk.or(I1, &shared, &arena);
+    let regular = blk.icmp_eq(I1, &special, "false");
+    #[cfg(test)]
+    let shared_admit = std::env::var("PERRY_B4_SABOTAGE").ok().as_deref() == Some("shared_admit");
+    #[cfg(not(test))]
+    let shared_admit = false;
+    blk.and(I1, &admitted, if shared_admit { "true" } else { &regular })
 }
 
 /// Stores additionally reject a frozen receiver before deriving a writable access.
@@ -398,7 +465,7 @@ pub(crate) fn kind_and_width(blk: &mut crate::block::LlBlock, h: &str) -> (Strin
     (kind, blk.shl(I64, "1", &shift))
 }
 
-pub(crate) fn inline_owner_guard(ctx: &mut FnCtx<'_>, boxed: &str, brand: u8) -> (String, String) {
+pub(crate) fn owner_guard(ctx: &mut FnCtx<'_>, boxed: &str, brand: u8) -> (String, String) {
     let inspect = ctx.new_block("bytes.inline.guard");
     let done = ctx.new_block("bytes.inline.admission");
     let inspect_l = ctx.block_label(inspect);
@@ -428,9 +495,11 @@ pub(crate) fn inline_owner_guard(ctx: &mut FnCtx<'_>, boxed: &str, brand: u8) ->
     ctx.block().cond_br(&g, &inspect_l, &done_l);
     ctx.current_block = inspect;
     let h = header_word(ctx.block(), &raw);
-    let ty = ctx
-        .block()
-        .and(I64, &h, &(0xffu64 | (1 << 16) | (1 << 23)).to_string());
+    let ty = ctx.block().and(
+        I64,
+        &h,
+        &(0xffu64 | (1 << 16) | (1 << 24) | (1 << 30)).to_string(),
+    );
     let guard = ctx.block().icmp_eq(I64, &ty, &brand.to_string());
     ctx.block().br(&done_l);
     ctx.current_block = done;
@@ -499,8 +568,27 @@ pub(crate) fn retain_fresh_local_owner(ctx: &mut FnCtx<'_>, boxed: &str) {
 }
 
 #[cfg(test)]
+#[path = "native_owner_tests.rs"]
+mod native_owner_tests;
+
+#[cfg(test)]
 mod tests {
     use perry_hir::{types::Type, Expr, Stmt};
+
+    fn add_indexed_loop_read(function: &mut perry_hir::Function) {
+        let mut body = std::mem::take(&mut function.body);
+        body.insert(
+            0,
+            Stmt::Expr(Expr::IndexGet {
+                object: Box::new(Expr::LocalGet(1)),
+                index: Box::new(Expr::Integer(0)),
+            }),
+        );
+        function.body = vec![Stmt::While {
+            condition: Expr::Bool(true),
+            body,
+        }];
+    }
 
     #[test]
     fn tracked_local_keeps_receiver_and_owner_roots_across_a_collecting_call() {
@@ -617,6 +705,9 @@ mod tests {
                 was_plain_async: false,
                 was_unrolled: false,
             });
+            // A loop indexed read registers the proof before any call. A
+            // numeric intrinsic alone deliberately keeps per-access resolution.
+            add_indexed_loop_read(&mut module.functions[0]);
             let ir = String::from_utf8(
                 crate::compile_module(
                     &module,
@@ -736,6 +827,7 @@ mod tests {
             was_plain_async: false,
             was_unrolled: false,
         });
+        add_indexed_loop_read(&mut module.functions[0]);
         let ir = String::from_utf8(
             crate::compile_module(
                 &module,
@@ -747,24 +839,37 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let marker = ir
+        let states: Vec<String> = ir
             .lines()
-            .find(|line| line.contains("; bytes.hoist.roots "))
-            .expect("the Buffer parameter installs a proof");
-        let state = format!(
-            "%{}",
-            marker
-                .split("state=")
-                .nth(1)
-                .unwrap()
-                .split_whitespace()
-                .next()
-                .unwrap()
-        );
+            .filter(|line| line.contains("; bytes.hoist.roots "))
+            .map(|marker| {
+                format!(
+                    "store i8 0, ptr %{}",
+                    marker
+                        .split("state=")
+                        .nth(1)
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                )
+            })
+            .collect();
+        assert!(!states.is_empty(), "the Buffer parameter installs a proof");
         let lines: Vec<&str> = ir.lines().map(str::trim).collect();
-        let dirty = format!("store i8 0, ptr {state}");
-        let dirtied_call = lines.windows(2).any(|pair| {
-            pair[0] == dirty && (pair[1].starts_with("call ") || pair[1].contains(" = call "))
+        let dirtied_call = lines.iter().enumerate().any(|(index, line)| {
+            if !line.contains("call double @js_closure_call0(") {
+                return false;
+            }
+            let dirty_run: Vec<&str> = lines[..index]
+                .iter()
+                .rev()
+                .copied()
+                .take_while(|line| line.starts_with("store i8 0, ptr "))
+                .collect();
+            states
+                .iter()
+                .all(|state| dirty_run.contains(&state.as_str()))
         });
         assert!(
             dirtied_call,

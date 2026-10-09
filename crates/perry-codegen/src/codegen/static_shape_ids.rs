@@ -34,6 +34,8 @@ use crate::runtime_abi::{SHAPE_ID_BASE, STATIC_SHAPE_ID_COUNT};
 pub enum BirthProto {
     Literal,
     Class(u32),
+    /// A lazy declaration holder and its fixed parent declaration (0 = Object).
+    Prototype(u32, u32),
 }
 
 /// A typed class layout's masks (#8405): part of the content, so two layouts
@@ -79,13 +81,18 @@ pub struct BirthShape {
     /// A completed class content's sorted brand list (#11791). Empty for
     /// every other content.
     pub brands: Vec<u64>,
+    /// Complete prototype key attributes; empty for ordinary births.
+    pub attrs: Vec<u8>,
 }
 
 impl BirthShape {
     /// A completed (final) content: ConstFn lanes or private facts. Never an
     /// allocation's birth.
     pub fn is_completed(&self) -> bool {
-        !self.constfn.is_empty() || !self.private.is_empty() || !self.brands.is_empty()
+        matches!(self.proto, BirthProto::Prototype(..))
+            || !self.constfn.is_empty()
+            || !self.private.is_empty()
+            || !self.brands.is_empty()
     }
 
     /// A literal content without a typed layout: the runtime seed mints it
@@ -100,7 +107,7 @@ impl BirthShape {
     /// The facts the runtime mints for this content, without the masks: a
     /// typed layout and a structural mint of the same class share them. The
     /// rep is a runtime fact, so it is part of them.
-    pub(crate) fn structure(&self) -> (&[u8], u32, u32, &BirthProto, u64, &[ConstFnBirth]) {
+    pub(crate) fn structure(&self) -> (&[u8], u32, u32, &BirthProto, u64, &[ConstFnBirth], &[u8]) {
         (
             &self.keys,
             self.key_count,
@@ -108,6 +115,7 @@ impl BirthShape {
             &self.proto,
             self.rep,
             &self.constfn,
+            &self.attrs,
         )
     }
 
@@ -130,6 +138,11 @@ impl BirthShape {
             BirthProto::Class(cid) => {
                 eat(&[1]);
                 eat(&cid.to_le_bytes());
+            }
+            BirthProto::Prototype(cid, parent) => {
+                eat(&[6]);
+                eat(&cid.to_le_bytes());
+                eat(&parent.to_le_bytes());
             }
         }
         if let Some(masks) = &self.typed {
@@ -168,6 +181,10 @@ impl BirthShape {
             for b in &self.brands {
                 eat(&b.to_le_bytes());
             }
+        }
+        if !self.attrs.is_empty() {
+            eat(&[7]);
+            eat(&self.attrs);
         }
         h
     }
@@ -345,6 +362,41 @@ impl ProgramClassShapeIds {
     }
 }
 
+/// The module's class ids keyed the way a class keys global names its class.
+///
+/// The global is `perry_class_keys_<modprefix>__<sanitized class>`. Several
+/// names can sanitize alike; the smallest name wins so the choice is
+/// deterministic (the pre-pass and codegen must agree). Built once from
+/// `class_ids` per pass over the keys globals: resolving each global by
+/// rescanning and re-sanitizing every class name made each pass quadratic in
+/// the class count, which on a bundle with tens of thousands of classes and
+/// object-literal shapes was minutes of serial compile time.
+pub(crate) struct ClassIdsByKeysName(HashMap<String, (String, u32)>);
+
+impl ClassIdsByKeysName {
+    pub(crate) fn new(class_ids: &HashMap<String, u32>) -> Self {
+        let mut by_name: HashMap<String, (String, u32)> = HashMap::with_capacity(class_ids.len());
+        for (name, &id) in class_ids {
+            match by_name.entry(super::helpers::sanitize(name)) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if name < &slot.get().0 {
+                        slot.insert((name.clone(), id));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert((name.clone(), id));
+                }
+            }
+        }
+        Self(by_name)
+    }
+
+    /// The class id a keys global's sanitized class name resolves to, 0 = none.
+    pub(crate) fn get(&self, sanitized_class: &str) -> u32 {
+        self.0.get(sanitized_class).map_or(0, |&(_, id)| id)
+    }
+}
+
 /// One class keys global's birth, as the string pool mints it.
 pub(crate) struct ClassBirth {
     /// The class id the mint names (0 = none; such a birth has no content).
@@ -369,20 +421,12 @@ pub(crate) fn class_birth(
     entry: &ClassKeysInit,
     class_header_image_inits: &HashMap<String, (u32, u64, u32)>,
     class_birth_reps: &HashMap<String, u64>,
-    class_ids: &HashMap<String, u32>,
+    class_ids: &ClassIdsByKeysName,
 ) -> ClassBirth {
     let (global_name, packed, field_count, _raw_mask_words, _pointer_mask_words) = entry;
-    // The global is `perry_class_keys_<modprefix>__<sanitized class>`. Several
-    // names can sanitize alike; take the smallest name so the choice is
-    // deterministic (the pre-pass and codegen must agree).
     let prefix = format!("perry_class_keys_{}__", module_prefix);
     let sanitized_class = global_name.strip_prefix(&prefix).unwrap_or("");
-    let class_id = class_ids
-        .iter()
-        .filter(|(k, _)| super::helpers::sanitize(k) == sanitized_class)
-        .min_by(|a, b| a.0.cmp(b.0))
-        .map(|(_, &v)| v)
-        .unwrap_or(0);
+    let class_id = class_ids.get(sanitized_class);
     let image = class_header_image_inits.get(global_name);
     let wide_live = match image {
         Some(&(_, _, birth_live)) if birth_live > *field_count => birth_live,
@@ -411,6 +455,7 @@ pub(crate) fn class_birth(
         constfn: Vec::new(),
         private: Vec::new(),
         brands: Vec::new(),
+        attrs: Vec::new(),
     });
     ClassBirth {
         class_id,
@@ -458,6 +503,7 @@ pub(crate) fn set_module_static_ids(
     let map: HashMap<String, (u32, BirthShape)> = if by_content.is_empty() {
         HashMap::new()
     } else {
+        let class_ids = &ClassIdsByKeysName::new(class_ids);
         class_keys_init_data
             .iter()
             .filter_map(|entry| {
@@ -672,6 +718,7 @@ pub fn decode_static_seed(line: &str) -> Option<(u32, BirthShape)> {
             constfn,
             private: Vec::new(),
             brands: Vec::new(),
+            attrs: Vec::new(),
         },
     ))
 }
@@ -916,6 +963,7 @@ pub(crate) fn module_births(
     class_birth_reps: &HashMap<String, u64>,
     class_ids: &HashMap<String, u32>,
 ) -> Vec<ModuleBirth> {
+    let class_ids = &ClassIdsByKeysName::new(class_ids);
     class_keys_init_data
         .iter()
         .enumerate()
@@ -940,3 +988,13 @@ pub(crate) fn module_births(
 #[cfg(test)]
 #[path = "static_shape_ids_tests.rs"]
 mod tests;
+
+/// A prototype candidate from the program-wide completed content set.
+pub(crate) fn static_prototype_shape(cid: u32) -> Option<(u32, BirthShape)> {
+    MODULE_FINAL_IDS.with(|m| {
+        m.borrow().iter().find_map(|(shape, id)| {
+            matches!(shape.proto, BirthProto::Prototype(c, _) if c == cid)
+                .then(|| (*id, shape.clone()))
+        })
+    })
+}

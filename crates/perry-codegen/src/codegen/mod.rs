@@ -184,6 +184,7 @@ mod artifacts;
 pub(crate) mod boxed_locals;
 mod cjs_exports;
 mod class_artifacts;
+pub(crate) mod class_hierarchy;
 #[cfg(test)]
 mod clone_suffix_tests;
 mod closure;
@@ -229,11 +230,8 @@ mod tdz_names;
 // `pub(crate)` so `crate::linker` can read the inline-hot-small policy
 // (`inline_hot_small_enabled` / `inline_hot_small_hint_threshold`).
 pub(crate) mod helpers;
-// #10399: the driver sets this before any module codegen runs.
-pub use helpers::{
-    program_has_thread_agents, program_has_worker, set_program_has_thread_agents,
-    set_program_has_worker, set_worker_entries, worker_entries,
-};
+// #10399: worker entries supplied before any module codegen runs.
+pub use helpers::{set_worker_entries, worker_entries};
 pub(crate) mod global_transfer;
 mod literal_constructor;
 mod method;
@@ -259,7 +257,8 @@ pub(crate) mod static_constfn;
 pub(crate) mod static_constfn_class;
 pub(crate) mod static_fields;
 pub(crate) mod static_private_class;
-mod static_shape_ids;
+pub(crate) mod static_prototype;
+pub(crate) mod static_shape_ids;
 pub use static_shape_ids::{
     assign_static_shape_ids, decode_static_seed, encode_static_seed, take_module_static_seeds,
     BirthProto, BirthShape, ConstFnBirth, DefinedClassShape, ModuleBirth, ProgramClassShapeIds,
@@ -476,10 +475,9 @@ fn compile_module_impl(
     let collect_births = births.is_some();
     let (live_cjs_hir, cjs_property_exports) = cjs_exports::prepare(hir);
     let hir = live_cjs_hir.as_ref();
-    // The driver sets the whole-program perry/thread flag before any module
-    // codegen. A direct compile_module caller without callback prefixes also
-    // needs local launch detection for its string-preparation callback, even
-    // when the process flag is already set. Do not change shared compiler state.
+    // The driver supplies whole-program ownership in opts. Direct callers
+    // without callback prefixes also need local launch detection for their
+    // string-preparation callback. All decisions remain per compile.
     let mut local_thread_use = false;
     if opts.thread_literal_module_prefixes.is_empty() {
         perry_hir::for_each_module_expr(hir, &mut |expr| {
@@ -491,12 +489,14 @@ fn compile_module_impl(
             }
         });
     }
-    let thread_agents = program_has_thread_agents()
+    let thread_agents = opts.program_has_thread_agents
         || !opts.thread_literal_module_prefixes.is_empty()
         || local_thread_use;
-    let agent_strings_tls = program_has_worker() || thread_agents;
+    let agent_strings_tls = opts.program_has_worker || thread_agents;
     let progress = CompileProgress::new(&hir.name, module_callable_count(hir));
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
+    // ConstFn lanes are one decision for the whole compile, from its options.
+    let constfn_enabled = static_constfn::enabled(&opts);
     if let Some(refusal) = crate::target_layout::ilp32_codegen_refusal(&triple) {
         anyhow::bail!(refusal);
     }
@@ -544,6 +544,7 @@ fn compile_module_impl(
     let _opt_report_module_scope = crate::opt_report::enter_module(hir);
 
     let mut llmod = LlModule::new_with_fp_flags(&triple, fp_flags);
+    llmod.program_has_worker = opts.program_has_worker;
     runtime_decls::declare_phase1(&mut llmod);
 
     // Derive a per-module symbol prefix from the HIR module name:
@@ -2520,7 +2521,7 @@ fn compile_module_impl(
             &class_birth_reps_map,
             &class_ids,
         );
-        if static_constfn::enabled(&opts.output_type) {
+        if constfn_enabled {
             let reps = class_keys_globals_map
                 .iter()
                 .filter_map(|(name, keys)| {
@@ -2537,6 +2538,7 @@ fn compile_module_impl(
                 &class_ids,
             );
             births.extend(class_finals);
+            births.extend(static_prototype::collect(hir, &module_prefix, &class_ids));
             let widths = hir
                 .classes
                 .iter()
@@ -2581,7 +2583,7 @@ fn compile_module_impl(
         &opts.static_shape_ids,
         &opts.program_class_shape_ids,
     );
-    if !static_constfn::enabled(&opts.output_type) {
+    if !constfn_enabled {
         static_shape_ids::disable_static_final_shapes();
     }
     let class_header_images_map: std::collections::HashMap<String, (String, u64, u32)> =
@@ -2658,6 +2660,9 @@ fn compile_module_impl(
             .filter(|id| !funcs_reading_dynamic_this.contains(id))
             .collect();
     let mut cross_module = CrossModuleCtx {
+        program_has_worker: opts.program_has_worker,
+        program_has_thread_agents: thread_agents,
+        class_hierarchy: class_hierarchy::ClassHierarchy::default(),
         namespace_imports: opts.namespace_imports.iter().cloned().collect(),
         namespace_member_nested: opts.namespace_member_nested.iter().cloned().collect(),
         namespace_member_prefixes: opts.namespace_member_prefixes,
@@ -2986,7 +2991,7 @@ fn compile_module_impl(
         &cross_module.compile_time_constants,
         &module_prefix,
         &cjs_property_exports,
-        global_transfer::enabled(thread_agents),
+        global_transfer::enabled(thread_agents, opts.program_has_worker),
     );
     cross_module.module_global_proven_types = module_global_proven_types;
     cross_module.module_global_transfers = module_global_transfers;
@@ -3003,6 +3008,8 @@ fn compile_module_impl(
         &imported_class_source_name,
         &module_prefix,
     );
+    cross_module.class_hierarchy =
+        class_hierarchy::ClassHierarchy::new(&class_table, &method_names);
 
     // Representation-selection Phase 5a: now that the method registry exists,
     // drop any proven-`this` clone whose pair never made it into it. (Symbol
@@ -3983,7 +3990,7 @@ fn compile_module_impl(
     // after every function — and so every allocation site — exists.
     // Executables admit permanent ConstFn bodies unless explicitly disabled.
     // A dylib never advertises a permanent body, even with the knob set.
-    let constfn_body_metadata = static_constfn::enabled(&opts.output_type);
+    let constfn_body_metadata = constfn_enabled;
     if constfn_body_metadata {
         // Omitted/dead literals must not leave body-info relocations behind.
         static_constfn::emit_final_entries(
@@ -4049,6 +4056,11 @@ fn compile_module_impl(
     // the buffer's trailing NUL, and the closure-ABI rewrite needs the
     // module-wide set of closure bodies. Until then a large WASI module is
     // compiled as one unit.
+    // Every global exists now: fix the module's TLS model from this compile's
+    // own output kind before any emission path renders it.
+    if crate::expr::agent_ptr::program_tls_is_local_exec(&triple, &opts.output_type) {
+        llmod.use_local_exec_tls();
+    }
     let wasm32 = crate::target_layout::wasm32_lowering(&triple);
     let n_units = if opts.emit_ir_only || wasm32 {
         1

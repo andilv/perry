@@ -49,12 +49,6 @@ enum PayloadWalk {
     Word(u64),
     /// Every slot `next..count` (`AllPointers` / `All`: a `Range`).
     Range { next: usize, count: usize },
-    /// A mask wider than one word (the iterator's `Masked` arm).
-    Mask {
-        mask: LayoutSlotMask,
-        cursor: usize,
-        count: usize,
-    },
 }
 
 impl PlainObjectPlan {
@@ -82,15 +76,6 @@ impl PlainObjectPlan {
                 }
                 *next += 1;
                 *next - 1
-            }
-            PayloadWalk::Mask {
-                mask,
-                cursor,
-                count,
-            } => {
-                let index = mask.next_slot_at_or_after(*cursor, *count)?;
-                *cursor = index + 1;
-                index
             }
         };
         Some(self.payload.slot(index))
@@ -163,11 +148,6 @@ unsafe fn plain_object_plan(header: *mut GcHeader) -> PlainObjectPlan {
             ..
         }
         | HeapPayloadSlotSelection::All { .. } => PayloadWalk::Range { next: 0, count },
-        HeapPayloadSlotSelection::Masked { mask, .. } => PayloadWalk::Mask {
-            mask,
-            cursor: 0,
-            count,
-        },
     };
     #[cfg(test)]
     let walk = sabotage::perturb(walk);
@@ -243,14 +223,19 @@ impl CopyingNurseryCollector {
         }
         let _ = residual_slots;
         while let Some(slot) = plan.next_slot() {
-            let before = *slot;
-            self.visit_slot_with_parent_facts(
-                GcMutableSlot::new(slot, None),
-                header,
-                weak,
-                remembering,
-            );
-            changed |= *slot != before;
+            let slot = {
+                #[cfg(target_pointer_width = "32")]
+                if slot == plan.prefix[2] {
+                    GcMutableSlot::pointer(slot.cast())
+                } else {
+                    GcMutableSlot::new(slot, None)
+                }
+                #[cfg(target_pointer_width = "64")]
+                GcMutableSlot::new(slot, None)
+            };
+            let before = slot.read();
+            self.visit_slot_with_parent_facts(slot, header, weak, remembering);
+            changed |= slot.read() != before;
         }
         // The generic walk's last Object-arm edge, from the same side table.
         crate::object::visit_overflow_field_slots_mut(user_ptr, |slot| {

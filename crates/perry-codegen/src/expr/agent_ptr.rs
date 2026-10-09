@@ -70,6 +70,22 @@ pub(crate) fn set_output_is_executable(executable: bool) {
     OUTPUT_IS_EXECUTABLE.with(|c| c.set(executable));
 }
 
+/// Whether thread-locals of an `output_type` image for `triple` may be
+/// addressed as fixed offsets from the thread pointer (local-exec): only in
+/// an ELF executable, whose TLS block is the static one every thread is
+/// created with. A `dlopen`ed image (a plugin, a shared library) must keep
+/// the dynamic models. The compile applies it to its own module
+/// (`LlModule::use_local_exec_tls`), so the object emitters, which run on
+/// other threads, read the model from the IR rather than from shared state.
+pub(crate) fn program_tls_is_local_exec(triple: &str, output_type: &str) -> bool {
+    elf_triple(triple) && output_type == "executable"
+}
+
+fn elf_triple(triple: &str) -> bool {
+    (triple.contains("linux") || triple.contains("android"))
+        && (triple.starts_with("x86_64") || triple.starts_with("aarch64"))
+}
+
 /// How this compile reaches the block. `PERRY_AGENT_PTR_ACCESS=call` forces
 /// the call (A/B knob).
 pub(crate) fn agent_ptr_access(ctx: &FnCtx<'_>) -> AgentPtrAccess {
@@ -77,9 +93,7 @@ pub(crate) fn agent_ptr_access(ctx: &FnCtx<'_>) -> AgentPtrAccess {
         return AgentPtrAccess::Call;
     }
     let triple = ctx.target_triple;
-    let elf = (triple.contains("linux") || triple.contains("android"))
-        && (triple.starts_with("x86_64") || triple.starts_with("aarch64"));
-    if elf && OUTPUT_IS_EXECUTABLE.with(|c| c.get()) {
+    if elf_triple(triple) && OUTPUT_IS_EXECUTABLE.with(|c| c.get()) {
         return AgentPtrAccess::InitialExec;
     }
     if triple.starts_with("x86_64") && triple.contains("windows") {
@@ -179,6 +193,7 @@ pub(crate) fn emit_slot_addr(
 fn agent_ptr_accessor(slot: usize) -> &'static str {
     match slot {
         crate::runtime_abi::AGENT_PTR_SHAPE_DIR => "perry_shape_dir_cell",
+        crate::runtime_abi::AGENT_PTR_CLASS_VALUES => "perry_class_value_dir_cell",
         _ => unreachable!("agent pointer slot {slot} has no accessor"),
     }
 }

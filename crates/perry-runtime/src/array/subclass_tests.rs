@@ -585,7 +585,7 @@ fn fused_u31_push_reports_length_for_plain_and_subclass_arrays() {
     );
     assert_eq!(length, u32::MAX, "a declined push must not report a length");
     assert_eq!(
-        unsafe { (*exotic).length },
+        unsafe { crate::buffer::store::raw_length(exotic as usize) },
         4,
         "a declined push must not mutate the receiver"
     );
@@ -1280,9 +1280,9 @@ fn fused_ecs_guard_requires_distinct_owning_u32_columns_and_exact_entity_ids() {
     }
 
     let left =
-        crate::typedarray::js_typed_array_new_empty(crate::typedarray::KIND_UINT32 as i32, 16);
+        crate::typedarray::js_typed_array_new_empty(crate::typedarray::KIND_UINT32 as i32, 65536);
     let right =
-        crate::typedarray::js_typed_array_new_empty(crate::typedarray::KIND_UINT32 as i32, 16);
+        crate::typedarray::js_typed_array_new_empty(crate::typedarray::KIND_UINT32 as i32, 65536);
     let wrong_kind =
         crate::typedarray::js_typed_array_new_empty(crate::typedarray::KIND_INT32 as i32, 16);
     let short =

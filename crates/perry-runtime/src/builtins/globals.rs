@@ -606,7 +606,7 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
     }
 
     let src = addr as *mut crate::buffer::BufferHeader;
-    let src_len = unsafe { (*src).length };
+    let src_len = unsafe { crate::buffer::store::raw_length(src as usize) };
     // A constructor-created DataView has a private cached data pointer rather
     // than inline bytes. Clone its visible window into a fresh ArrayBuffer and
     // go through the constructor so the clone gets the same representation;
@@ -626,23 +626,23 @@ fn clone_buffer_header(addr: usize, detach_source: bool) -> f64 {
         return cloned;
     }
 
-    let value = crate::buffer::bytes::copy_value(
-        crate::buffer::bytes::Brand::Buffer,
-        crate::value::js_nanbox_pointer(addr as i64),
-    )
-    .expect("live buffer bytes");
+    let brand = if crate::buffer::is_array_buffer(addr) {
+        crate::buffer::bytes::Brand::ArrayBuffer
+    } else if crate::buffer::is_shared_array_buffer(addr) {
+        crate::buffer::bytes::Brand::SharedArrayBuffer
+    } else if crate::buffer::is_uint8array_buffer(addr) {
+        crate::buffer::bytes::Brand::Uint8Array
+    } else {
+        crate::buffer::bytes::Brand::Buffer
+    };
+    let value =
+        crate::buffer::bytes::copy_value(brand, crate::value::js_nanbox_pointer(addr as i64))
+            .expect("live buffer bytes");
     let dst = JSValue::from_bits(value.to_bits())
         .as_pointer::<crate::buffer::BufferHeader>()
         .cast_mut();
 
     let dst_addr = dst as usize;
-    if crate::buffer::is_array_buffer(addr) {
-        crate::buffer::mark_as_array_buffer(dst_addr);
-    } else if crate::buffer::is_shared_array_buffer(addr) {
-        crate::buffer::mark_as_shared_array_buffer(dst_addr);
-    } else if crate::buffer::is_uint8array_buffer(addr) {
-        crate::buffer::mark_as_uint8array(dst_addr);
-    }
 
     if detach_source {
         // Record only — detachment is deferred to
@@ -802,6 +802,15 @@ fn js_structured_clone_inner(value: f64, depth: usize) -> f64 {
             if crate::buffer::is_registered_buffer(addr) {
                 let memo_index = structured_clone_memo_reserve(value);
                 let cloned = clone_buffer_header(addr, transfer_requested(addr));
+                structured_clone_memo_record(memo_index, cloned);
+                return cloned;
+            }
+            if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
+                let memo_index = structured_clone_memo_reserve(value);
+                let cloned = crate::buffer::bytes::copy_typed_range(value, 0, usize::MAX, false)
+                    .unwrap_or_else(|_| {
+                        throw_data_clone_error("An ArrayBuffer is detached and could not be cloned")
+                    });
                 structured_clone_memo_record(memo_index, cloned);
                 return cloned;
             }

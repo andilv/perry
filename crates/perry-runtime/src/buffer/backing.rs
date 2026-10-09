@@ -1,13 +1,14 @@
 //! Owned, 8-aligned native bytes. The GC wrapper stays in its own heap;
 //! only this allocation crosses threads. Allocation and free both use Rust's
 //! process-global allocator (as SharedArrayBuffer does), including remote frees.
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::sync::Mutex;
 
 #[derive(Debug)]
 pub(crate) struct Backing {
     data: *mut u8,
     capacity: u32,
+    alignment: u32,
 }
 
 // Exclusive ownership crosses the queue; no JS access remains after detach.
@@ -22,7 +23,46 @@ impl Backing {
         }
         #[cfg(test)]
         LIVE_BACKINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self { data, capacity }
+        Self {
+            data,
+            capacity,
+            alignment: 8,
+        }
+    }
+
+    pub(crate) fn uninit(capacity: u32) -> Self {
+        let layout = Self::layout(capacity);
+        let data = unsafe { alloc(layout) };
+        if data.is_null() {
+            handle_alloc_error(layout);
+        }
+        #[cfg(test)]
+        LIVE_BACKINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            data,
+            capacity,
+            alignment: 8,
+        }
+    }
+
+    /// Preserve Vec's allocator layout and spare capacity when taking custody.
+    pub(crate) fn from_vec(mut bytes: Vec<u8>) -> Self {
+        if bytes.capacity() == 0
+            || bytes.capacity() > crate::object::shape_rule3::MAX_PLUS_FOUR_WORD as usize
+            || bytes.as_ptr().align_offset(8) != 0
+        {
+            return unsafe { Self::copy(bytes.as_ptr(), bytes.len() as u32) };
+        }
+        let data = bytes.as_mut_ptr();
+        let capacity = bytes.capacity() as u32;
+        std::mem::forget(bytes);
+        #[cfg(test)]
+        LIVE_BACKINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            data,
+            capacity,
+            alignment: 1,
+        }
     }
 
     fn layout(capacity: u32) -> Layout {
@@ -37,7 +77,7 @@ impl Backing {
     }
 
     pub(crate) unsafe fn copy(data: *const u8, length: u32) -> Self {
-        let backing = Self::zeroed(length);
+        let backing = Self::uninit(length);
         if length != 0 {
             std::ptr::copy_nonoverlapping(data, backing.data, length as usize);
         }
@@ -47,7 +87,10 @@ impl Backing {
 
 impl Drop for Backing {
     fn drop(&mut self) {
-        unsafe { dealloc(self.data, Self::layout(self.capacity)) };
+        let layout =
+            Layout::from_size_align((self.capacity as usize).max(1), self.alignment as usize)
+                .expect("buffer backing layout");
+        unsafe { dealloc(self.data, layout) };
         #[cfg(test)]
         LIVE_BACKINGS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -172,7 +215,7 @@ mod tests {
             )
             .unwrap();
             assert!(crate::buffer::is_detached_buffer(source as usize));
-            assert_eq!((*source).length, 0);
+            assert_eq!(crate::buffer::store::length(source as usize) as u32, 0);
             collect();
             assert_eq!(
                 count(),
@@ -190,7 +233,10 @@ mod tests {
                     original,
                     "transfer must move the original allocation"
                 );
-                assert_eq!((*received).length, 32 * 1024 * 1024);
+                assert_eq!(
+                    crate::buffer::store::length(received as usize) as u32,
+                    32 * 1024 * 1024
+                );
                 drop(message);
                 collect();
                 let received = (root.get_nanbox_u64() & POINTER_MASK) as *const BufferHeader;

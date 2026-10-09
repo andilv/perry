@@ -151,7 +151,7 @@ impl<'s> Reader<'s> {
             SerializedValue::ArrayBuffer(bytes) => array_buffer(bytes),
             SerializedValue::TransferredArrayBuffer(store) => {
                 let buffer = crate::buffer::buffer_adopt_backing(store.take(), store.length);
-                crate::buffer::mark_as_array_buffer(buffer as usize);
+
                 JSValue::pointer(buffer as *const u8).bits()
             }
             SerializedValue::View {
@@ -454,23 +454,22 @@ unsafe fn heap_string(bytes: &[u8]) -> *mut crate::string::StringHeader {
 
 /// Perry's Uint8Array is a `BufferHeader` plus a brand; restore both (#10103).
 unsafe fn owned_uint8array(bytes: &[u8]) -> u64 {
-    let buffer = new_buffer(bytes);
-    crate::buffer::mark_as_uint8array(buffer as usize);
+    let buffer = new_buffer(crate::buffer::bytes::Brand::Uint8Array, bytes);
     JSValue::pointer(buffer as *const u8).bits()
 }
 
 unsafe fn array_buffer(bytes: &[u8]) -> u64 {
-    let buffer = new_buffer(bytes);
-    crate::buffer::mark_as_array_buffer(buffer as usize);
+    let buffer = new_buffer(crate::buffer::bytes::Brand::ArrayBuffer, bytes);
     JSValue::pointer(buffer as *const u8).bits()
 }
 
-unsafe fn new_buffer(bytes: &[u8]) -> *mut crate::buffer::BufferHeader {
-    JSValue::from_bits(
-        crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::Buffer, bytes).to_bits(),
-    )
-    .as_pointer::<crate::buffer::BufferHeader>()
-    .cast_mut()
+unsafe fn new_buffer(
+    brand: crate::buffer::bytes::Brand,
+    bytes: &[u8],
+) -> *mut crate::buffer::BufferHeader {
+    JSValue::from_bits(crate::buffer::bytes::from_slice(brand, bytes).to_bits())
+        .as_pointer::<crate::buffer::BufferHeader>()
+        .cast_mut()
 }
 
 unsafe fn owned_typed_array(kind: u8, length: u32, bytes: &[u8]) -> u64 {

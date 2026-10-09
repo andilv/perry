@@ -585,30 +585,10 @@ unsafe fn materialize_class_prototype(obj: *const ObjectHeader) {
     crate::object::class_registry::class_decl_prototype_value(class_id);
 }
 
-/// Could a [[Get]] of `name` on `obj` run an accessor? The read-side form of
-/// `method_site::key_may_be_accessor`: a data property's attributes
-/// (non-enumerable, read-only, non-configurable: the meta record's
-/// `attr_key_bits`) do not change what a Get answers, so only the accessor
-/// Bloom bit short-cuts, and the authoritative descriptor state decides the
-/// rest. `%Object.prototype%.constructor` and every class prototype's methods
-/// are non-enumerable data properties.
+/// Accessor identity is a fact of the holder shape. Changing the entry
+/// publishes a new ShapeId and retires every memo of the previous holder.
 unsafe fn key_may_be_accessor(obj: *const ObjectHeader, name: &[u8]) -> bool {
-    let meta = (*obj).meta;
-    if !meta.is_null() {
-        let bit = 1u64 << (crate::object::key_bytes_hash(name.as_ptr(), name.len()) & 63);
-        if (*meta).accessor_key_bits & bit != 0 {
-            return true;
-        }
-    }
-    if crate::object::descriptor_state::object_has_descriptors(obj as usize) {
-        let Ok(name) = std::str::from_utf8(name) else {
-            return true;
-        };
-        if crate::object::descriptor_state::get_accessor_descriptor(obj as usize, name).is_some() {
-            return true;
-        }
-    }
-    false
+    crate::object::key_attrs::object_key_is_accessor(obj, name)
 }
 
 /// [`holder_name_admitted`] for an ordinary read site's receiver. The
@@ -650,7 +630,7 @@ struct Walk {
 
 /// A hop the entry may name: an ordinary, shaped, non-exotic object whose
 /// ShapeId records the prototype identity it really has.
-unsafe fn hop_admitted(addr: usize, name: &[u8]) -> bool {
+unsafe fn hop_admitted(addr: usize) -> bool {
     if !crate::value::addr_class::is_above_handle_band(addr)
         || !super::address_is_prime_stable(addr)
     {
@@ -675,7 +655,7 @@ unsafe fn hop_admitted(addr: usize, name: &[u8]) -> bool {
     {
         return false;
     }
-    !key_may_be_accessor(obj, name)
+    true
 }
 
 /// What `obj` says its prototype identity is
@@ -715,10 +695,25 @@ fn hop_identity_pins_link(pid: u64) -> bool {
 }
 
 /// [`admitted_proto_id`], with `obj`'s recorded word.
-unsafe fn admitted_link(obj: *const ObjectHeader) -> Option<(u64, u64)> {
+pub(super) unsafe fn admitted_link(obj: *const ObjectHeader) -> Option<(u64, u64)> {
     let pid = shape_proto_id(object_shape_stamp(obj))?;
     if !hop_identity_pins_link(pid) {
-        return None;
+        // Only a declaration's immutable parent proof admits bare CLASS.
+        // Reject other CLASS shapes before classifying their link: that
+        // classification can consult synthetic/generic declaration metadata.
+        let word = crate::object::shapes::object_prototype_word(obj);
+        if crate::object::shapes::declaration_parent_identity(obj, word) != Some(pid) {
+            return None;
+        }
+        // Preserve the read-semantics exclusions of object_proto_id_for.
+        let meta = (*obj).meta;
+        if (*obj).class_id == crate::object::NATIVE_MODULE_CLASS_ID
+            || (!meta.is_null()
+                && (*meta).flags & crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER != 0)
+        {
+            return None;
+        }
+        return Some((pid, word));
     }
     let (stated, word) = stated_link(obj);
     (stated == pid).then_some((pid, word))
@@ -743,7 +738,7 @@ pub(super) unsafe fn class_link(recv: *const ObjectHeader) -> Option<*const Obje
     let holder = if (PROTO_ID_MIXED..PROTO_ID_UNIQUE).contains(&pid) {
         next_from_word(recv, word)
     } else if (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&pid) {
-        crate::object::class_decl_prototype_object((*recv).class_id)
+        crate::object::class_decl_prototype_object(pid as u32)
     } else {
         return None;
     };
@@ -772,6 +767,12 @@ pub(crate) unsafe fn recorded_class_link(
         return Err(());
     }
     if (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&pid) {
+        if crate::object::shapes::declaration_parent_identity(recv, word) == Some(pid) {
+            let parent = next_from_word(recv, word);
+            return (!parent.is_null() && parent != recv)
+                .then_some(Some(parent))
+                .ok_or(());
+        }
         return Ok(None);
     }
     if !(PROTO_ID_MIXED..PROTO_ID_UNIQUE).contains(&pid) {
@@ -990,7 +991,7 @@ unsafe fn walk_to(
                 None => next_prototype(current),
             }
         };
-        if next.is_null() || next == current || next == recv || !hop_admitted(next as usize, name) {
+        if next.is_null() || next == current || next == recv || !hop_admitted(next as usize) {
             return None;
         }
         let shape = object_shape_descriptor(next)?;
@@ -1002,6 +1003,12 @@ unsafe fn walk_to(
             if let Some(s) =
                 crate::object::keys_find_slot_by_bytes_resolved(keys, shape.logical_key_count, name)
             {
+                // This exact slot, not another name walk, supplies the data
+                // admission proof kept by the existing holder memo. Its
+                // ShapeId compare invalidates it when the entry changes.
+                if crate::object::key_attrs::key_is_accessor_at(keys, s) {
+                    return None;
+                }
                 let s = holder_slot_word(next as usize, s, shape.live_inline_slot_count)?;
                 w.holder = next as usize;
                 w.holder_shape = object_shape_stamp(next);
@@ -1067,9 +1074,6 @@ pub(crate) unsafe fn dynamic_own_or_absent(
         return None;
     }
     let recv = ordinary_receiver(obj as usize)?;
-    if key_may_be_accessor(recv, name) {
-        return None;
-    }
     let shape = object_shape_descriptor(recv)?;
     if !shape.object_kind.is_ordinary_layout() {
         return None;
@@ -1079,6 +1083,9 @@ pub(crate) unsafe fn dynamic_own_or_absent(
         if let Some(slot) =
             crate::object::keys_find_slot_by_bytes_resolved(keys, shape.logical_key_count, name)
         {
+            if crate::object::key_attrs::key_is_accessor_at(keys, slot) {
+                return None;
+            }
             return Some(DynamicKeyVerdict::Own {
                 slot,
                 live: shape.live_inline_slot_count,
@@ -1150,7 +1157,7 @@ unsafe fn function_walk(closure: usize, name: &[u8]) -> Option<Walk> {
         return None;
     }
     let fp = crate::array::function_prototype_addr_if_resolved();
-    if fp == 0 || !hop_admitted(fp, name) {
+    if fp == 0 || !hop_admitted(fp) {
         return None;
     }
     let fp_obj = fp as *const ObjectHeader;
@@ -1164,6 +1171,9 @@ unsafe fn function_walk(closure: usize, name: &[u8]) -> Option<Walk> {
         if let Some(s) =
             crate::object::keys_find_slot_by_bytes_resolved(keys, shape.logical_key_count, name)
         {
+            if crate::object::key_attrs::key_is_accessor_at(keys, s) {
+                return None;
+            }
             return Some(Walk {
                 holder: fp,
                 holder_shape: fp_shape,
@@ -1895,5 +1905,52 @@ mod tests {
         );
         assert!(claimed >= crate::object::shapes::PROTO_ID_CLASS);
         assert_eq!(unsafe { admitted_proto_id(obj) }, None);
+    }
+
+    #[test]
+    fn static_declaration_parent_walk_can_publish_and_hit_an_absent_read() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let _no_move = crate::gc::GcSuppressScope::new();
+        const BASE: u32 = 0x6E91;
+        const CHILD: u32 = 0x6E92;
+        unsafe {
+            for (cid, name) in [
+                (BASE, b"FixedReadBase".as_slice()),
+                (CHILD, b"FixedReadChild"),
+            ] {
+                crate::object::js_register_class_name(cid, name.as_ptr(), name.len() as u32);
+            }
+            crate::object::js_register_class_parent(CHILD, BASE);
+            {
+                let mut registry = crate::object::CLASS_VTABLE_REGISTRY.write().unwrap();
+                for (cid, offset) in [(BASE, 989), (CHILD, 990)] {
+                    registry
+                        .get_or_insert_with(crate::fast_hash::new_ptr_hash_map)
+                        .entry(cid)
+                        .or_default()
+                        .prototype_birth_shape = crate::object::shapes::SHAPE_ID_BASE + offset;
+                }
+            }
+            let _ = crate::object::class_registry::class_decl_prototype_value(CHILD);
+            let recv = crate::object::js_object_alloc(CHILD, 0);
+            let name = b"absent_from_fixed_chain";
+            let key = crate::string::canonical_key(name);
+            let mut slot: PicCacheSlot = std::ptr::null_mut();
+            assert_eq!(
+                class_read::prime(recv, key, &mut slot, name).map(|v| v.bits()),
+                Some(crate::value::TAG_UNDEFINED)
+            );
+            assert_eq!(
+                class_read::try_hit(recv, &mut slot).map(|v| v.bits()),
+                Some(crate::value::TAG_UNDEFINED)
+            );
+            let holder = crate::object::class_decl_prototype_object(CHILD);
+            let target = crate::object::js_object_alloc(0, 0);
+            crate::object::js_object_set_prototype_of(
+                crate::value::js_nanbox_pointer(holder as i64),
+                crate::value::js_nanbox_pointer(target as i64),
+            );
+            assert!(class_read::try_hit(recv, &mut slot).is_none());
+        }
     }
 }

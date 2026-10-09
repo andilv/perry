@@ -10,7 +10,7 @@ use perry_hir::Expr;
 use crate::nanbox::double_literal;
 use crate::types::{DOUBLE, I32, I64, PTR};
 
-use super::{emit_string_literal_global, lower_expr, nanbox_pointer_inline, FnCtx};
+use super::{lower_expr, nanbox_pointer_inline, FnCtx};
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
@@ -88,14 +88,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         ));
                         (ptr_reg, n.to_string())
                     };
-                    let name_global = emit_string_literal_global(ctx, method);
+                    let key_box = emit_interned_super_key(ctx, method);
                     let rooted_result = ctx.block().call(
                         DOUBLE,
-                        "js_super_method_call_dynamic",
+                        "js_super_method_call_key",
                         &[
                             (I32, &cid.to_string()),
-                            (PTR, &name_global),
-                            (I64, &method.len().to_string()),
+                            (DOUBLE, &key_box),
                             (DOUBLE, &this_box),
                             (PTR, &args_ptr),
                             (I64, &args_len),
@@ -125,17 +124,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // name) sends the call to the runtime, which reads that chain.
             let home_cid = ctx.class_ids.get(&current_class_name).copied().unwrap_or(0);
             let guarded_merge = if home_cid != 0 {
-                let key_idx = ctx.strings.intern(method);
-                let slot = (ctx.strings.entry(key_idx).dispatch_hash & 0xffff).to_string();
                 let direct_idx = ctx.new_block("super_m.direct");
                 let dynamic_idx = ctx.new_block("super_m.dynamic");
                 let merge_idx = ctx.new_block("super_m.merge");
                 let direct_label = ctx.block_label(direct_idx);
                 let dynamic_label = ctx.block_label(dynamic_idx);
                 let merge_label = ctx.block_label(merge_idx);
-                let ok = crate::lower_call::method_override::emit_prototype_method_guard_ok(
-                    ctx.block(),
-                    &slot,
+                let ok = crate::lower_call::holder_shape_guard::super_guard(
+                    ctx,
+                    &current_class_name,
+                    method,
                 );
                 ctx.block().cond_br(&ok, &direct_label, &dynamic_label);
                 ctx.current_block = dynamic_idx;
@@ -155,14 +153,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ));
                     (ptr_reg, n.to_string())
                 };
-                let name_global = emit_string_literal_global(ctx, method);
+                let key_box = emit_interned_super_key(ctx, method);
                 let dynamic_value = ctx.block().call(
                     DOUBLE,
-                    "js_super_method_call_dynamic",
+                    "js_super_method_call_key",
                     &[
                         (I32, &home_cid.to_string()),
-                        (PTR, &name_global),
-                        (I64, &method.len().to_string()),
+                        (DOUBLE, &key_box),
                         (DOUBLE, &this_box),
                         (PTR, &args_ptr),
                         (I64, &args_len),
@@ -336,20 +333,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 group.release(ctx);
                 return r;
             }
-            let name_global = emit_string_literal_global(ctx, method);
             crate::expr::call_spread::bundle_args_rooted(ctx, args, false, |ctx, current| {
                 let args_array = nanbox_pointer_inline(ctx.block(), current);
                 let this_box = match ctx.this_stack.last().cloned() {
                     Some(slot) => ctx.block().load(DOUBLE, &slot),
                     None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
                 };
+                let key_box = emit_interned_super_key(ctx, method);
                 Ok(ctx.block().call(
                     DOUBLE,
-                    "js_super_method_call_dynamic_apply",
+                    "js_super_method_call_key_apply",
                     &[
                         (I32, &cid.to_string()),
-                        (PTR, &name_global),
-                        (I64, &method.len().to_string()),
+                        (DOUBLE, &key_box),
                         (DOUBLE, &this_box),
                         (DOUBLE, &args_array),
                     ],
@@ -423,20 +419,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 return Ok(runtime_get(ctx));
             };
             // The method above was resolved along the declared `extends`
-            // chain, which holds while no prototype surgery touched this
-            // name (the guard bytes `super.m()` reads too).
+            // chain, which holds while the home and intermediate holders
+            // retain their complete candidate shapes, as for `super.m()`.
             let guarded = if home_cid != 0 {
-                let key_idx = ctx.strings.intern(property);
-                let slot = (ctx.strings.entry(key_idx).dispatch_hash & 0xffff).to_string();
                 let direct_idx = ctx.new_block("super_get.direct");
                 let dynamic_idx = ctx.new_block("super_get.dynamic");
                 let merge_idx = ctx.new_block("super_get.merge");
                 let direct_label = ctx.block_label(direct_idx);
                 let dynamic_label = ctx.block_label(dynamic_idx);
                 let merge_label = ctx.block_label(merge_idx);
-                let ok = crate::lower_call::method_override::emit_prototype_method_guard_ok(
-                    ctx.block(),
-                    &slot,
+                let ok = crate::lower_call::holder_shape_guard::super_guard(
+                    ctx,
+                    &current_class_name,
+                    property,
                 );
                 ctx.block().cond_br(&ok, &direct_label, &dynamic_label);
                 ctx.current_block = dynamic_idx;
@@ -720,4 +715,11 @@ fn emit_super_get(ctx: &mut FnCtx<'_>, home_cid: u32, method: &str, this_box: &s
             (DOUBLE, this_box),
         ],
     )
+}
+
+/// Reload the program's rooted interned key at the call site.
+fn emit_interned_super_key(ctx: &mut FnCtx<'_>, method: &str) -> String {
+    let key_idx = ctx.strings.intern(method);
+    let key_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+    ctx.block().load(DOUBLE, &key_global)
 }

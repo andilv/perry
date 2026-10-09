@@ -796,10 +796,17 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // #7354 because funclet EH cannot coexist with rewrite-statepoints-for-gc
     // (see `stmt/try_stmt.rs::emit_eh_dispatch`).
     module.declare_function("js_eh_try_push", VOID, &[]);
+    if module.target_triple.starts_with("wasm32") {
+        module.declare_function("js_try_push", PTR, &[]);
+        module.declare_function("setjmp", I32, &[PTR]);
+    }
     module.declare_personality();
     module.declare_function("js_try_end", VOID, &[]);
     module.declare_function("js_get_exception", DOUBLE, &[]);
     module.declare_function("js_clear_exception", VOID, &[]);
+    // A catch entry's `js_try_end` + `js_get_exception` + `js_clear_exception`
+    // as one call (`stmt/try_stmt.rs`).
+    module.declare_function("js_catch_enter", DOUBLE, &[]);
     module.declare_function("js_has_exception", I32, &[]);
     module.declare_function("js_enter_finally", VOID, &[]);
     module.declare_function("js_leave_finally", VOID, &[]);

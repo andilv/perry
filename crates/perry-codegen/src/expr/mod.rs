@@ -34,7 +34,7 @@ pub(crate) fn emit_class_value_cached(ctx: &mut FnCtx<'_>, class_id: u32) -> Str
     let site = ctx.ic_site_counter;
     ctx.ic_site_counter += 1;
     let slot = format!("@{}_classval", inline_cache_global_name(ctx, site));
-    let tls = if crate::codegen::program_has_worker() {
+    let tls = if ctx.program_has_worker {
         "thread_local "
     } else {
         ""
@@ -242,6 +242,8 @@ mod index_set_barrier_tests;
 #[cfg(test)]
 mod instanceof_imported_rhs_tests;
 #[cfg(test)]
+mod method_value_shape_tests;
+#[cfg(test)]
 mod proven_view_guarded_tests;
 mod record_value;
 #[cfg(test)]
@@ -350,6 +352,8 @@ pub enum HeaderImageSource {
 }
 
 pub(crate) struct FnCtx<'a> {
+    pub program_has_worker: bool,
+    pub program_has_thread_agents: bool,
     /// Function being built (blocks, params, registers).
     pub func: &'a mut LlFunction,
     /// Stable slug for native-region ids derived from this module.
@@ -481,6 +485,9 @@ pub(crate) struct FnCtx<'a> {
     /// `compile_module` from `hir.classes`. Used by `Expr::New` to look up
     /// the field count, constructor body, and (eventually) method table.
     pub classes: &'a std::collections::HashMap<String, &'a perry_hir::Class>,
+    /// `classes` and `methods` inverted: subclasses per class and declaring
+    /// classes per method name (`codegen::class_hierarchy`).
+    pub class_hierarchy: &'a crate::codegen::class_hierarchy::ClassHierarchy,
     /// Map from interface name → HIR Interface definition. Built once
     /// from `hir.interfaces` and threaded via `cross_module.interfaces`.
     /// Consulted by `static_type_of` / `receiver_class_name` so a
@@ -1812,7 +1819,6 @@ pub(crate) struct VersionedIndexedMethodFact {
     pub this_slot: String,
     pub expected_class_id: String,
     pub expected_shape_id: String,
-    pub method_guard_slot: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3153,6 +3159,7 @@ pub(crate) mod element_shape_reads;
 pub(crate) mod ic_fast_split;
 mod js_runtime;
 mod literals_vars;
+pub(crate) use literals_vars::bind_lowered_value_to_local;
 mod logical_collections;
 mod math_simple;
 pub(crate) mod method_site;
@@ -4617,3 +4624,10 @@ pub(crate) use compare::try_lower_chain as try_lower_compare_chain;
 
 #[cfg(test)]
 mod compare_chain_tests;
+
+#[cfg(test)]
+mod byte_scanning_tests;
+
+#[cfg(test)]
+mod byte_prepass_tests;
+

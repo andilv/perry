@@ -8,7 +8,7 @@ use crate::destructuring::*;
 use crate::ir::*;
 use crate::lower::{
     collect_for_of_pattern_leaves, emit_for_of_pattern_binding, labeled_body_targets_loop,
-    lazy_iter_for_stmt, lazy_or_index_elem, lower_expr, wrap_lazy_for_of_body_close_on_throw,
+    lazy_iter_for_stmts, lazy_or_index_elem, lower_expr, wrap_lazy_for_of_body_close_on_throw,
     LoweringContext,
 };
 use crate::lower_patterns::*;
@@ -84,13 +84,27 @@ fn finish_for_with_property_array_hoist(
 /// a handful of ordinary nested blocks can overflow Rust's default 2 MiB test
 /// thread before expression lowering gets a chance to grow the stack (#9196).
 pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Vec<Stmt>> {
+    lower_body_stmt_with_for_of_mode(ctx, stmt, false)
+}
+
+// The guard's forced protocol mode belongs to one statement. Recursive body
+// lowering must let each nested loop choose its own iterable driver.
+fn lower_body_stmt_with_for_of_mode(
+    ctx: &mut LoweringContext,
+    stmt: &ast::Stmt,
+    force_lazy: bool,
+) -> Result<Vec<Stmt>> {
     stacker::maybe_grow(BODY_STMT_STACK_RED_ZONE, BODY_STMT_STACK_SEGMENT, || {
-        lower_body_stmt_impl(ctx, stmt)
+        lower_body_stmt_impl(ctx, stmt, force_lazy)
     })
 }
 
 #[inline(never)]
-fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Vec<Stmt>> {
+fn lower_body_stmt_impl(
+    ctx: &mut LoweringContext,
+    stmt: &ast::Stmt,
+    force_lazy: bool,
+) -> Result<Vec<Stmt>> {
     let mut result = Vec::new();
 
     match stmt {
@@ -341,19 +355,13 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                 || ctx.classes_index.contains_key(&class_name);
             if !already_exists {
                 let (class, decl_self_binding) = lower_body_class_decl(ctx, class_decl)?;
-                if let Some(extends_expr) = &class.extends_expr {
-                    result.push(Stmt::Expr(Expr::RegisterClassParentDynamic {
-                        class_name: class.name.clone(),
-                        parent_expr: extends_expr.clone(),
-                    }));
-                }
                 let (computed_name_evaluations, computed_keys) =
                     crate::lower_decl::prepare_ordered_class_computed_names(
                         &class_decl.class.body,
                         &class,
                         &class.name,
                     );
-                result.extend(computed_name_evaluations.into_iter().map(Stmt::Expr));
+
                 // A function-nested class that captures enclosing locals
                 // (`const n = require('x'); class C { m() { n.f() } }` — the
                 // webpack/zod bundle pattern) snapshots the CURRENT capture
@@ -420,6 +428,19 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     || shares_first_evaluation
                     // #11157: members that captured the self-binding need it.
                     || decl_self_binding.is_some();
+                let dynamic_parent = class.extends_expr.clone();
+                let definition_steps = if fresh_binding && !shares_first_evaluation {
+                    computed_name_evaluations
+                } else {
+                    if let Some(parent_expr) = dynamic_parent.clone() {
+                        result.push(Stmt::Expr(Expr::RegisterClassParentDynamic {
+                            class_name: class.name.clone(),
+                            parent_expr,
+                        }));
+                    }
+                    result.extend(computed_name_evaluations.into_iter().map(Stmt::Expr));
+                    Vec::new()
+                };
                 let named_statics: Vec<(String, Expr)> = if fresh_binding {
                     class
                         .static_fields
@@ -552,10 +573,11 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         ctx.shared_first_class_bindings
                             .insert(class_local, (template_name.clone(), statics));
                     }
-                    let evaluated_parent = ctx
-                        .evaluated_parent_bindings
-                        .get(&template_name)
-                        .map(|id| Box::new(Expr::LocalGet(*id)));
+                    let evaluated_parent = dynamic_parent.or_else(|| {
+                        ctx.evaluated_parent_bindings
+                            .get(&template_name)
+                            .map(|id| Box::new(Expr::LocalGet(*id)))
+                    });
                     result.push(Stmt::Let {
                         id: class_local,
                         name: binding_name,
@@ -572,6 +594,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                                 captured_args: captured_exprs,
                                 shared_first_evaluation,
                                 evaluated_parent,
+                                definition_steps,
                             },
                         )),
                         mutable: false,
@@ -1519,13 +1542,15 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                 } else {
                     raw_next_call
                 };
-                result.push(Stmt::Let {
-                    id: result_id,
-                    name: format!("__result_{}", result_id),
-                    ty: Type::Any,
-                    mutable: true,
-                    init: Some(Expr::Undefined),
-                });
+                if needs_await {
+                    result.push(Stmt::Let {
+                        id: result_id,
+                        name: format!("__result_{}", result_id),
+                        ty: Type::Any,
+                        mutable: true,
+                        init: Some(Expr::Undefined),
+                    });
+                }
 
                 let binding_pat: Option<&ast::Pat> =
                     if let ast::ForHead::VarDecl(var_decl) = &for_of_stmt.left {
@@ -1533,10 +1558,14 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     } else {
                         None
                     };
-                let value_expr = Expr::PropertyGet {
-                    byte_offset: 0,
-                    object: Box::new(Expr::LocalGet(result_id)),
-                    property: "value".to_string(),
+                let value_expr = if needs_await {
+                    Expr::PropertyGet {
+                        byte_offset: 0,
+                        object: Box::new(Expr::LocalGet(result_id)),
+                        property: "value".into(),
+                    }
+                } else {
+                    Expr::LocalGet(result_id)
                 };
                 let guard_binding = binding_pat.is_some_and(|p| !matches!(p, ast::Pat::Ident(_)));
                 let value_id = ctx.fresh_local();
@@ -1604,18 +1633,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         body_stmts,
                     );
                 } else {
-                    let mut loop_body = vec![
-                        Stmt::Expr(Expr::LocalSet(result_id, Box::new(next_call))),
-                        Stmt::If {
-                            condition: Expr::PropertyGet {
-                                byte_offset: 0,
-                                object: Box::new(Expr::LocalGet(result_id)),
-                                property: "done".to_string(),
-                            },
-                            then_branch: vec![Stmt::Break],
-                            else_branch: None,
-                        },
-                    ];
+                    let mut loop_body = Vec::new();
                     if guard_binding {
                         body_stmts.extend(user_body);
                         loop_body.push(value_stmt);
@@ -1636,10 +1654,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                             user_body,
                         ));
                     }
-                    result.push(Stmt::While {
-                        condition: Expr::Bool(true),
-                        body: loop_body,
-                    });
+                    result.extend(lazy_iter_for_stmts(ctx, iter_id, result_id, loop_body));
                 }
 
                 ctx.pop_block_scope(scope_mark);
@@ -1781,10 +1796,10 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             }
             // Lazy iterator protocol for generic iterables (see stmt_loops.rs).
             // #7760: the guard emission below lowers this same statement twice.
-            let use_lazy_iter = needs_runtime_iterator || ctx.for_of_force_lazy;
+            let use_lazy_iter = needs_runtime_iterator || force_lazy;
             // Guarded exactly when this would otherwise be a plain array index
             // loop, which ignores a patched `Array.prototype[Symbol.iterator]`.
-            let guard_with_lazy_arm = !ctx.for_of_force_lazy
+            let guard_with_lazy_arm = !force_lazy
                 && proven_array
                 && !needs_runtime_iterator
                 && !is_string_iter
@@ -2215,11 +2230,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                         name: format!("__forof_value_{id}"),
                         ty: Type::Any,
                         mutable: false,
-                        init: Some(Expr::PropertyGet {
-                            byte_offset: 0,
-                            object: Box::new(Expr::LocalGet(result_id)),
-                            property: "value".to_string(),
-                        }),
+                        init: Some(Expr::LocalGet(result_id)),
                     });
                     guarded_stmts.extend(binding_stmts);
                 } else {
@@ -2232,7 +2243,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                     for_of_stmt.span.lo.0,
                     guarded_stmts,
                 ));
-                result.push(lazy_iter_for_stmt(arr_id, result_id, full_body));
+                result.extend(lazy_iter_for_stmts(ctx, arr_id, result_id, full_body));
                 ctx.pop_block_scope(for_scope_mark);
                 return Ok(result);
             }
@@ -2294,9 +2305,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
                 // runtime flag. Re-lowering rather than cloning keeps the two
                 // arms from drifting and gives the lazy arm its own locals.
                 let index_arm: Vec<Stmt> = result.split_off(result_mark);
-                ctx.for_of_force_lazy = true;
-                let lazy_arm = lower_body_stmt(ctx, stmt);
-                ctx.for_of_force_lazy = false;
+                let lazy_arm = lower_body_stmt_with_for_of_mode(ctx, stmt, true);
                 result.push(Stmt::If {
                     condition: Expr::ArrayIterationPatched,
                     then_branch: lazy_arm?,

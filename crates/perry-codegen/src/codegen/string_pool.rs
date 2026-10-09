@@ -740,6 +740,7 @@ pub(super) fn emit_string_pool(
         .filter(|class| class.name.starts_with("__AnonShape_"))
         .filter_map(|class| class_ids.get(&class.name).copied())
         .collect();
+    let class_ids_by_keys_name = super::static_shape_ids::ClassIdsByKeysName::new(class_ids);
     for (idx, (global_name, packed, field_count, _raw_mask_words, _pointer_mask_words)) in
         class_keys_init_data.iter().enumerate()
     {
@@ -748,7 +749,7 @@ pub(super) fn emit_string_pool(
             &class_keys_init_data[idx],
             class_header_image_inits,
             class_birth_reps,
-            class_ids,
+            &class_ids_by_keys_name,
         );
         // Only synthetic ordinary-object layouts are safe before dependency
         // bodies. User-class keys, prototypes and methods stay in the late phase.
@@ -1225,6 +1226,17 @@ pub(super) fn emit_string_pool(
             "@{global} = internal global [{words} x i64] [i64 {words}{}]",
             ", i64 0".repeat(words - 1)
         ));
+    }
+    for class in module_classes {
+        if let Some(&cid) = class_ids.get(&class.name) {
+            if let Some((id, _)) = super::static_shape_ids::static_prototype_shape(cid) {
+                chunker.roll_if_full();
+                chunker.current_block().call_void(
+                    "js_register_class_prototype_shape",
+                    &[(I32, &cid.to_string()), (I32, &id.to_string())],
+                );
+            }
+        }
     }
     method_triples.sort_unstable();
     let mut method_entries: Vec<StaticMethodEntry> = Vec::new();
@@ -1763,13 +1775,14 @@ pub(super) fn emit_string_pool(
             .iter()
             .filter_map(|class| class_ids.get(&class.name).map(|cid| (*cid, class)))
             .collect();
+        let class_ids_by_keys_name = super::static_shape_ids::ClassIdsByKeysName::new(class_ids);
         for entry in class_keys_init_data {
             let birth = super::static_shape_ids::class_birth(
                 module_prefix,
                 entry,
                 class_header_image_inits,
                 class_birth_reps,
-                class_ids,
+                &class_ids_by_keys_name,
             );
             let Some(ordinary) = birth.shape else {
                 continue;
@@ -1831,13 +1844,14 @@ pub(super) fn emit_string_pool(
             .iter()
             .filter_map(|class| class_ids.get(&class.name).map(|cid| (*cid, class)))
             .collect();
+        let class_ids_by_keys_name = super::static_shape_ids::ClassIdsByKeysName::new(class_ids);
         for entry in class_keys_init_data {
             let birth = super::static_shape_ids::class_birth(
                 module_prefix,
                 entry,
                 class_header_image_inits,
                 class_birth_reps,
-                class_ids,
+                &class_ids_by_keys_name,
             );
             let Some(ordinary) = birth.shape else {
                 continue;
@@ -1929,7 +1943,7 @@ pub(super) fn emit_string_pool(
     // also reaches this guarded preparation without allocating a second pool.
     let prepare_name = format!("__perry_prepare_literals_{}", module_prefix);
     let prepared = format!("__perry_literals_ready_{}", module_prefix);
-    if super::program_has_worker() {
+    if llmod.program_has_worker {
         llmod.add_internal_thread_local_global(&prepared, I8, "0");
     } else {
         llmod.add_internal_global(&prepared, I8, "0");

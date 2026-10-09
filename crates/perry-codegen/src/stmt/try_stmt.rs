@@ -10,8 +10,9 @@
 //!      body emits becomes an `invoke` unwinding there
 //!      (`LlBlock::eh_invoke_suffix`).
 //!   3. The landing pad funnels into the catch entry, which runs
-//!      `js_try_end` → `js_get_exception` → `js_clear_exception` and binds
-//!      the catch parameter.
+//!      `js_try_end` → `js_get_exception` → `js_clear_exception` (one call,
+//!      `js_catch_enter`, when the handler was armed) and binds the catch
+//!      parameter.
 //!   4. Catch/finally bodies lower under the *enclosing* scope, so a throw
 //!      escaping them wires to the outer handler — or leaves the function
 //!      when there is none. Re-raise sites (`js_throw` after a finally copy)
@@ -25,6 +26,7 @@
 //! statepoint relocation write-back — the motivating defect, #7174).
 
 use super::*;
+use crate::types::{I32, PTR};
 
 /// Arm the handler and materialize the unwind-target block(s) that funnel
 /// the exception into `exc_label`. Returns the unwind label; the caller
@@ -69,6 +71,17 @@ fn emit_eh_dispatch_inner(
     normal_label: &str,
     registered: bool,
 ) -> String {
+    if ctx.target_triple.starts_with("wasm32") {
+        // WASI uses wasm SjLj. The jump target is this generated frame,
+        // never a Rust frame; the wasm backend rewrites setjmp into EH.
+        let env = ctx.block().call(PTR, "js_try_push", &[]);
+        let status = ctx.block().call(I32, "setjmp", &[(PTR, &env)]);
+        let thrown = ctx.block().next_reg();
+        ctx.block()
+            .emit_raw(format!("{thrown} = icmp ne i32 {status}, 0"));
+        ctx.block().cond_br(&thrown, exc_label, normal_label);
+        return String::new();
+    }
     if !registered {
         ctx.func.personality = Some("perry_iterator_eh_personality");
     } else if ctx.func.personality != Some("perry_iterator_eh_personality") {
@@ -154,12 +167,14 @@ pub(crate) fn lower_try(
 
     // --- catch (reached only through the landing pad) ---
     ctx.current_block = catch_idx;
-    if registered {
-        ctx.block().call_void("js_try_end", &[]);
-    }
     if let Some(clause) = catch {
-        let exc = ctx.block().call(DOUBLE, "js_get_exception", &[]);
-        ctx.block().call_void("js_clear_exception", &[]);
+        let exc = if registered {
+            ctx.block().call(DOUBLE, "js_catch_enter", &[])
+        } else {
+            let exc = ctx.block().call(DOUBLE, "js_get_exception", &[]);
+            ctx.block().call_void("js_clear_exception", &[]);
+            exc
+        };
         // Bind the catch param (if any) to the exception value.
         if let Some((id, _name)) = &clause.param {
             // Slot lives in the entry block — a closure inside the catch
@@ -226,6 +241,9 @@ pub(crate) fn lower_try(
         // exception path, then re-raise via js_throw — unless the finally
         // itself completed abruptly (a `return`/`throw` inside finally
         // overrides the pending exception, per spec).
+        if registered {
+            ctx.block().call_void("js_try_end", &[]);
+        }
         let exc = ctx.block().call(DOUBLE, "js_get_exception", &[]);
         if let Some(f) = finally {
             lower_stmts(ctx, f)?;

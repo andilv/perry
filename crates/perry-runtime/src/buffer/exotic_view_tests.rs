@@ -48,13 +48,14 @@ fn data_view(bytes: &[u8]) -> usize {
 }
 
 fn array_buffer(bytes: &[u8]) -> usize {
-    let buf = buffer_with(bytes) as usize;
-    crate::buffer::mark_as_array_buffer(buf);
+    let buf = (crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::ArrayBuffer, bytes)
+        .to_bits()
+        & crate::value::POINTER_MASK) as usize;
     buf
 }
 
 /// A node `Buffer`: registered, marked nothing. (`Buffer.from` does not call
-/// `mark_as_uint8array` — that mark distinguishes the `Uint8Array` CONSTRUCTOR
+/// the Uint8Array birth brand — it distinguishes the `Uint8Array` CONSTRUCTOR
 /// path, which is why `Object.keys` was right for one and `[]` for the other.)
 fn node_buffer(bytes: &[u8]) -> usize {
     buffer_with(bytes) as usize
@@ -95,8 +96,10 @@ fn only_array_buffer_and_data_view_are_non_indexed_views() {
     let dv = data_view(&[1, 2, 3, 4]);
     let ab = array_buffer(&[1, 2, 3, 4]);
     let b = node_buffer(&[1, 2, 3]);
-    let u8a = node_buffer(&[1, 2, 3]);
-    crate::buffer::mark_as_uint8array(u8a);
+    let u8a =
+        (crate::buffer::bytes::from_slice(crate::buffer::bytes::Brand::Uint8Array, &[1, 2, 3])
+            .to_bits()
+            & crate::value::POINTER_MASK) as usize;
 
     assert!(crate::buffer::is_non_indexed_buffer_view(dv));
     assert!(crate::buffer::is_non_indexed_buffer_view(ab));

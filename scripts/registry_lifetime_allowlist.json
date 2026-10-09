@@ -72,7 +72,7 @@
       "why": "Keyed by NEXT_WRITER_ID per getWriter(); releaseLock only sets locked=false and the only remove is in #[cfg(test)]"
     },
     {
-      "file": "crates/perry-runtime/src/buffer/header.rs",
+      "file": "crates/perry-runtime/src/buffer/store/layout.rs",
       "name": "ASYMMETRIC_KEY_REGISTRY",
       "verdict": "open_leak",
       "why": "Keyed by the address of a PEM-string KeyObject per createPublic/PrivateKey; finalize_collected_dead_buffer clears the other crypto tables but not this one"
@@ -153,13 +153,6 @@
       "name": "PRIMITIVE_DISPATCH",
       "verdict": "diagnostic_only",
       "why": "Primitive-method fallback histogram, written only when gc_diag_enabled() (PERRY_GC_DIAG) and printed at exit"
-    },
-    {
-      "file": "crates/perry-runtime/src/gc/layout_tables.rs",
-      "name": "LAYOUT_SLOT_MASKS",
-      "verdict": "removed_elsewhere",
-      "site": "crates/perry-runtime/src/gc/layout_tables.rs::slot_masks_remove",
-      "why": "Per-object masks are removed through the hot-TLS raw pointer (hot_layout_slot_masks), which the name walk cannot follow; also pruned per GC"
     },
     {
       "file": "crates/perry-runtime/src/module_require.rs",
@@ -353,18 +346,6 @@
       "name": "VERDICT_CLASSES",
       "verdict": "open_leak",
       "why": "Receiver class ids from packed_add store verdicts, including synthetic ids minted per closure; never pruned (small u32s)"
-    },
-    {
-      "file": "crates/perry-runtime/src/object/descriptor_state.rs",
-      "name": "DECLARED_FIELD_NAME_HASHES",
-      "verdict": "bounded_by_program",
-      "why": "FNV hashes of declared instance-field names harvested at class registration; bounded by source field names"
-    },
-    {
-      "file": "crates/perry-runtime/src/object/descriptor_state.rs",
-      "name": "PROTO_DESCRIPTOR_KEY_HASHES",
-      "verdict": "bounded_by_program",
-      "why": "Hashes of keys defineProperty'd onto prototype-level targets: per distinct key name, not per operation"
     },
     {
       "file": "crates/perry-runtime/src/object/field_get_set/ic_miss/private_guard_fast.rs",

@@ -87,6 +87,22 @@ pub(crate) fn collect_metadata_refs(text: &str, out: &mut HashSet<u32>) {
     }
 }
 
+/// `line` with its default-model (general-dynamic) `thread_local` specifier
+/// replaced by `thread_local(localexec)`, or `None` when it has none (not a
+/// thread-local, or one that already names its model).
+pub(crate) fn with_local_exec_tls(line: &str) -> Option<String> {
+    let (lhs, rhs) = line.split_once(" = ")?;
+    let at = rhs.find("thread_local ")?;
+    if at != 0 && !rhs[..at].ends_with(' ') {
+        return None;
+    }
+    Some(format!(
+        "{lhs} = {}thread_local(localexec) {}",
+        &rhs[..at],
+        &rhs[at + "thread_local ".len()..]
+    ))
+}
+
 /// True when a global definition already carries LOCAL linkage
 /// (`private`/`internal`). Those are the only definitions whose promotion
 /// `codegen_unit_parts` may skip: a local symbol cannot collide with anything
@@ -330,7 +346,7 @@ fn take_keyword<'a>(s: &'a str, keywords: &[&'static str]) -> (&'static str, &'a
 /// string/object paths read+parse and reach ToPrimitive),
 /// `js_value_length_f64` (Buffer/TypedArray registry lookups take locks —
 /// a lock acquisition writes memory).
-pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
+fn helper_decl_contract(name: &str) -> HelperDeclContract {
     match name {
         // These calls sit behind cache-hit / inactive-marking guards. Keep
         // register saves and code layout focused on the inline continuation.
@@ -344,7 +360,7 @@ pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
         // a declined GC-leaf hit. Still throwing, still GC-capable.
         | "js_object_get_field_ic_fast_miss"
         | "js_class_field_get_ic_fast_miss"
-        | "js_class_field_set_ic_fast_miss" => " cold",
+        | "js_class_field_set_ic_fast_miss" => HelperDeclContract::Cold,
         // PURE — each verified: pure bit tests/masking on the f64/i64 args,
         // total over arbitrary bits, no memory access anywhere in the body.
         //   js_nanbox_pointer        value/nanbox.rs — tag ladder, 0 → TAG_NULL
@@ -362,18 +378,18 @@ pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
         | "js_typed_i1_arg_guard"
         | "js_typed_i1_arg_to_raw"
         | "js_typed_i32_arg_to_raw"
-        | "js_typed_string_arg_guard" => " #2",
+        | "js_typed_string_arg_guard" => HelperDeclContract::Pure,
         // READONLY — verified: tag ladder plus reads of StringHeader.utf16_len
         // (via is_valid_string_ptr, a pure magnitude check) and BigInt limbs
         // (js_bigint_is_zero via clean_bigint_ptr, pure bit cleanup). No
         // registry/lock access, no allocation, no throw, no writes.
-        "js_is_truthy" => " #3",
+        "js_is_truthy" => HelperDeclContract::ReadOnly,
         // string/compare.rs: pointer magnitude guards, immutable byte views,
         // bounded word scans / UTF-16 decoder iteration only. No allocation,
         // GC, locks, writes, or JavaScript coercion. Read-any (not argmem:
         // operands are i64 handles) orders it against every GC-capable call.
         // js_string_compare_value is NOT eligible: number coercion allocates.
-        "js_string_compare" => " #3",
+        "js_string_compare" => HelperDeclContract::ReadOnly,
         // First-read D3 (`object/field_get_set/ic_miss/read_confirm.rs`): a
         // generic read site's miss front. Loads, compares and at most one
         // store (D3b re-aims the site's compact word); no allocation, lock,
@@ -381,7 +397,7 @@ pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
         // are bounded). NOT readonly: it writes the site word. Also a proven
         // `Leaf` in the generated call-effects table, so the call is
         // `"gc-leaf-function"`.
-        "js_object_get_field_ic_front" => " #4",
+        "js_object_get_field_ic_front" => HelperDeclContract::NoUnwind,
         // NOUNWIND+WILLRETURN only (#4, repsel Phase 4a.0) — each verified
         // (`typed_feedback.rs` / `array/header.rs`): no `js_throw` (longjmp)
         // anywhere in the body, every loop bounded by the 16M length/capacity
@@ -409,8 +425,41 @@ pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
         | "js_object_get_field_ic_fast"
         | "js_class_field_get_ic_fast"
         | "js_class_field_set_ic_fast"
-        | "js_put_value_set_packed_fast" => " #4",
-        _ => "",
+        | "js_put_value_set_packed_fast" => HelperDeclContract::NoUnwind,
+        _ => HelperDeclContract::Conservative,
+    }
+}
+
+enum HelperDeclContract {
+    Conservative,
+    Cold,
+    Pure,
+    ReadOnly,
+    NoUnwind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HelperMemoryEffect {
+    None,
+    ReadOnly,
+    MayWrite,
+}
+
+pub(crate) fn helper_memory_effect(name: &str) -> HelperMemoryEffect {
+    match helper_decl_contract(name) {
+        HelperDeclContract::Pure => HelperMemoryEffect::None,
+        HelperDeclContract::ReadOnly => HelperMemoryEffect::ReadOnly,
+        _ => HelperMemoryEffect::MayWrite,
+    }
+}
+
+pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
+    match helper_decl_contract(name) {
+        HelperDeclContract::Conservative => "",
+        HelperDeclContract::Cold => " cold",
+        HelperDeclContract::Pure => " #2",
+        HelperDeclContract::ReadOnly => " #3",
+        HelperDeclContract::NoUnwind => " #4",
     }
 }
 
@@ -438,15 +487,16 @@ pub(crate) fn declare_line_for(f: &LlFunction) -> String {
 /// Render a function with external linkage forced, promoting an `internal` /
 /// `private` definition so cross-unit calls can bind to it. Names are
 /// module-prefixed and unique, so promotion never collides.
-pub(crate) fn render_fn_external(f: &LlFunction) -> String {
-    render_fn_external_with_gc_leaf_callees(f, &HashSet::new())
-}
-
 pub(crate) fn render_fn_external_with_gc_leaf_callees(
     f: &LlFunction,
     gc_leaf_callees: &HashSet<String>,
 ) -> String {
-    let ir = f.to_ir_with_gc_leaf_callees(gc_leaf_callees);
+    force_external_linkage(f, f.to_ir_with_gc_leaf_callees(gc_leaf_callees))
+}
+
+/// `ir`, `f`'s rendering, with an `internal` / `private` definition promoted
+/// to external linkage (see [`render_fn_external_with_gc_leaf_callees`]).
+pub(crate) fn force_external_linkage(f: &LlFunction, ir: String) -> String {
     if f.linkage == "internal" || f.linkage == "private" {
         return ir.replacen(&format!("define {} ", f.linkage), "define ", 1);
     }

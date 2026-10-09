@@ -330,7 +330,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     if crate::buffer::is_registered_buffer(raw_ptr) {
         let buf = raw_ptr as *const crate::buffer::BufferHeader;
         if let Some(idx_i32) = finite_nonnegative_i32_index(index) {
-            let len = unsafe { (*buf).length };
+            let len = unsafe { crate::buffer::store::raw_length(buf as usize) };
             if (idx_i32 as u32) >= len {
                 return f64::from_bits(TAG_UNDEFINED);
             }
@@ -354,7 +354,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             let key_ptr = js_get_string_pointer_unified(index) as *const crate::StringHeader;
             if !key_ptr.is_null() {
                 if let Some(canon) = unsafe { canonical_buffer_index(key_ptr) } {
-                    let len = unsafe { (*buf).length };
+                    let len = unsafe { crate::buffer::store::raw_length(buf as usize) };
                     if canon >= len {
                         return f64::from_bits(TAG_UNDEFINED);
                     }
@@ -497,16 +497,14 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
                 return f64::from_bits(TAG_UNDEFINED);
             }
             let arr = raw_ptr as *const crate::array::ArrayHeader;
-            // When any property descriptor is live, an array element read may
-            // resolve to an index accessor descriptor — own (`Object.define-
-            // Property(arr, "0", {get})`) or inherited from a polluted
-            // `Array.prototype`/`Object.prototype` — rather than the raw slot.
-            // Route through `js_array_get_f64`, which fires the getter and
-            // applies the out-of-bounds prototype fallback. The raw-slot fast
-            // path below is preserved for the common no-descriptor case so the
-            // hot dynamic-index path is unchanged. (test262 Object/define-
-            // Propert{y,ies} Array-index accessor reads.)
-            if crate::object::descriptors_in_use() {
+            // Own descriptors are carried by this array's property-bag shape.
+            // The existing indexed-prototype guard handles inherited indices.
+            let header = unsafe {
+                &*((arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)
+            };
+            if header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+                || crate::array::array_index_fast_path_invalid_for(header._reserved)
+            {
                 return crate::array::js_array_get_f64(arr, idx_i32 as u32);
             }
             let length = unsafe { (*arr).length };

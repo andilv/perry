@@ -276,7 +276,11 @@ impl RegCounter {
 
     /// Landing pad of the innermost active handler scope, if any.
     pub fn current_eh_unwind_label(&self) -> Option<String> {
-        self.eh_unwind_labels.borrow().last().cloned()
+        self.eh_unwind_labels
+            .borrow()
+            .last()
+            .filter(|label| !label.is_empty())
+            .cloned()
     }
 
     pub fn next(&self) -> u32 {
@@ -440,7 +444,8 @@ impl LlBlock {
     /// observed after this call. Intrinsics cannot enter Perry or user code.
     /// Shadow-stack operations and write barriers are also safe: both families
     /// are noncollecting GC bookkeeping and cannot mutate the guarded object's
-    /// JS-visible shape, prototype, length, or indexed values. Every other
+    /// JS-visible shape, prototype, length, or indexed values. Audited pure
+    /// and readonly declarations share that same proof. Every other
     /// direct call stays conservative, including unknown GC-leaf helpers that
     /// may perform a semantic write without collecting.
     fn dirty_revalidations_before_call(&mut self, direct_callee: Option<&str>) {
@@ -448,6 +453,13 @@ impl LlBlock {
             callee.starts_with("llvm.")
                 || callee.starts_with("js_shadow_")
                 || callee.starts_with("js_write_barrier")
+                // The declaration's existing memory-effect contract is also
+                // the receiver proof's contract: no writes or collection can
+                // change its backing, bounds or JS-visible state.
+                || (matches!(crate::module::helper_memory_effect(callee),
+                    crate::module::HelperMemoryEffect::None | crate::module::HelperMemoryEffect::ReadOnly)
+                    && crate::gc_call_effects::classify_direct_callee(callee)
+                        == crate::gc_call_effects::GcCallEffect::CannotCollect)
         }) {
             return;
         }

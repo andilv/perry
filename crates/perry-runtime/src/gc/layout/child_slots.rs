@@ -291,7 +291,7 @@ pub(in crate::gc) unsafe fn heap_payload_slot_selection(
     header: *mut GcHeader,
     payload: HeapSlotRange,
 ) -> HeapPayloadSlotSelection {
-    heap_payload_slot_selection_impl(header, payload, |_, _| None)
+    heap_payload_slot_selection_impl(header, payload)
 }
 
 /// [`heap_payload_slot_selection`] for an ObjectFields receiver whose shape
@@ -318,12 +318,10 @@ pub(in crate::gc) unsafe fn heap_payload_slot_selection_from(
 unsafe fn heap_payload_slot_selection_impl(
     header: *mut GcHeader,
     payload: HeapSlotRange,
-    shared_mask: impl FnOnce(usize, *const GcHeader) -> Option<LayoutSlotMask>,
 ) -> HeapPayloadSlotSelection {
     if header.is_null() || payload.is_empty() {
         return HeapPayloadSlotSelection::Empty;
     }
-    let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE) as usize;
     // Objects are selected by shape (`heap_payload_slot_selection_from`), which
     // reports their skipped F64 lanes itself; nothing here is an object.
     let raw_numeric_object_slots = 0;
@@ -343,19 +341,7 @@ unsafe fn heap_payload_slot_selection_impl(
                     raw_numeric_recorded: false,
                 };
             }
-            let mask = per_object_slot_mask(user_ptr).or_else(|| shared_mask(user_ptr, header));
-            match mask {
-                Some(mask) => HeapPayloadSlotSelection::Masked {
-                    mask,
-                    cursor: 0,
-                    raw_numeric_object_slots,
-                    raw_numeric_recorded: false,
-                },
-                None => {
-                    set_layout_state(header, GC_LAYOUT_UNKNOWN);
-                    HeapPayloadSlotSelection::All { cursor: 0 }
-                }
-            }
+            HeapPayloadSlotSelection::All { cursor: 0 }
         }
         _ => HeapPayloadSlotSelection::All { cursor: 0 },
     }
@@ -437,7 +423,7 @@ pub(in crate::gc) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSl
             // it alive and evacuation rewrites it.
             let props = &mut (*closure).props as *mut _ as *mut u64;
             HeapChildSlotIterator::new(header, None, range)
-                .with_meta_slot((*props != 0).then_some(props))
+                .with_meta_slot((!(*closure).props.is_null()).then_some(props))
         }
         GcLayoutSlotKind::None => HeapChildSlotIterator::empty(),
     }
@@ -445,6 +431,8 @@ pub(in crate::gc) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSl
 
 #[derive(Clone, Copy)]
 pub(in crate::gc) struct GcMutableSlot {
+    #[cfg(target_pointer_width = "32")]
+    pointer_width: bool,
     pub(in crate::gc) slot: *mut u64,
     pub(in crate::gc) layout_kind: Option<HeapChildSlotReadKind>,
 }
@@ -452,7 +440,44 @@ pub(in crate::gc) struct GcMutableSlot {
 impl GcMutableSlot {
     #[inline]
     pub(in crate::gc) fn new(slot: *mut u64, layout_kind: Option<HeapChildSlotReadKind>) -> Self {
-        Self { slot, layout_kind }
+        Self {
+            slot,
+            layout_kind,
+            #[cfg(target_pointer_width = "32")]
+            pointer_width: false,
+        }
+    }
+
+    /// Retain the native pointer width with the slot address across budgeted scans.
+    /// A wasm32 pointer is four bytes; a JS value is always eight bytes.
+    #[inline]
+    pub(in crate::gc) fn pointer(slot: *mut usize) -> Self {
+        Self {
+            slot: slot.cast(),
+            layout_kind: None,
+            #[cfg(target_pointer_width = "32")]
+            pointer_width: true,
+        }
+    }
+
+    #[inline(always)]
+    pub(in crate::gc) unsafe fn read(self) -> u64 {
+        #[cfg(target_pointer_width = "32")]
+        if self.pointer_width {
+            return *self.slot.cast::<usize>() as u64;
+        }
+        *self.slot
+    }
+
+    #[inline(always)]
+    pub(in crate::gc) unsafe fn write(self, bits: u64) {
+        #[cfg(target_pointer_width = "32")]
+        if self.pointer_width {
+            debug_assert!(bits <= usize::MAX as u64);
+            *self.slot.cast::<usize>() = bits as usize;
+            return;
+        }
+        *self.slot = bits;
     }
 
     /// Is the slot's address outside old-gen? #10182: classified on demand (its

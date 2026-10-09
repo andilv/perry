@@ -133,6 +133,7 @@ pub mod fast_hash;
 pub mod ffi;
 pub mod frame;
 pub mod fs;
+pub mod function_order;
 pub mod gc;
 pub mod hot_diag;
 pub mod intl;
@@ -149,6 +150,7 @@ pub mod native_arena;
 pub mod native_handle;
 pub mod native_payload;
 pub mod native_payload_abi;
+pub mod native_payload_buffer;
 pub mod native_payload_stream_abi;
 #[cfg(target_os = "linux")]
 mod native_stack;
@@ -237,6 +239,9 @@ pub mod typedarray_view;
 // dependency itself; the web/WASI targets keep their host integration until
 // their backends are wired per agent.
 #[cfg(not(target_arch = "wasm32"))]
+pub mod turnloop_net;
+#[cfg(target_os = "wasi")]
+#[path = "wasi_net/mod.rs"]
 pub mod turnloop_net;
 // turnloop P2: child processes, their pipes, `process.stdin`, dgram sockets
 // and OS signals on turnloop handles (`turnloop_proc/mod.rs`). Same target

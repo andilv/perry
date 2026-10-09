@@ -51,6 +51,8 @@ fn push_statepoint_declarations(ir: &mut String) {
 }
 
 pub struct LlModule {
+    /// Per-compile module-state ownership, copied from CompileOptions.
+    pub(crate) program_has_worker: bool,
     pub target_triple: String,
     declarations: Vec<(String, String)>, // (name, full "declare …" line)
     declared_names: HashSet<String>,
@@ -103,6 +105,10 @@ pub struct LlModule {
     /// shared with every function's register counter; emitted by
     /// [`Self::emit_fn_infos`] once every function exists.
     fn_infos: Rc<RefCell<crate::fn_info::FnInfoState>>,
+    /// Whether this module's own thread-locals use the local-exec model
+    /// ([`Self::use_local_exec_tls`]). Module state: the output kind of the
+    /// compile that built this module decides it, never a process global.
+    local_exec_tls: bool,
 }
 
 /// The `source_filename` every Perry-emitted module records.
@@ -135,7 +141,7 @@ impl LlModule {
     pub(crate) fn thread_local_global_names(&self) -> std::collections::HashSet<String> {
         self.globals
             .iter()
-            .filter(|g| g.contains(" thread_local "))
+            .filter(|g| g.contains(" thread_local ") || g.contains(" thread_local("))
             .filter_map(|g| global_symbol_name(g).map(|s| s.trim_start_matches('@').to_string()))
             .collect()
     }
@@ -147,6 +153,7 @@ impl LlModule {
     pub fn new_with_fp_flags(target_triple: impl Into<String>, fp_flags: FpFlags) -> Self {
         Self {
             target_triple: target_triple.into(),
+            program_has_worker: false,
             declarations: Vec::new(),
             declared_names: HashSet::new(),
             functions: Vec::new(),
@@ -162,6 +169,46 @@ impl LlModule {
             fp_flags,
             preserve_none_fns: Rc::new(RefCell::new(HashSet::new())),
             fn_infos: Rc::new(RefCell::new(crate::fn_info::FnInfoState::default())),
+            local_exec_tls: false,
+        }
+    }
+
+    /// Address the module's own thread-locals as fixed offsets from the
+    /// thread pointer: the local-exec model, exact only in an ELF executable,
+    /// whose TLS block is the static one every thread starts with.
+    ///
+    /// Module state is thread-local when the program starts a Worker (#10399),
+    /// and the units are compiled position-independent, where LLVM must assume
+    /// a thread-local can live in any loaded image: every access became a
+    /// general-dynamic `__tls_get_addr` call that the register allocator
+    /// treated as a call clobbering every caller-saved register.
+    ///
+    /// Every definition and declaration still at the default
+    /// (general-dynamic) model is rewritten; a runtime thread-local declared
+    /// with the model its definition needs (`PERRY_AGENT_PTRS` is
+    /// `initialexec`) keeps it. The model is written into the module itself,
+    /// so the IR text (and the object-cache key derived from it) states it,
+    /// and an emitter running on another thread needs no outside input.
+    pub(crate) fn use_local_exec_tls(&mut self) {
+        self.local_exec_tls = true;
+        let lines = self
+            .globals
+            .iter_mut()
+            .chain(self.declarations.iter_mut().map(|(_, line)| line));
+        for line in lines {
+            if let Some(rewritten) = crate::module::linkage::with_local_exec_tls(line) {
+                *line = rewritten;
+            }
+        }
+    }
+
+    /// The TLS specifier a declaration this module adds later must carry to
+    /// agree with its definitions ([`Self::use_local_exec_tls`]).
+    pub(crate) fn thread_local_specifier(&self) -> &'static str {
+        if self.local_exec_tls {
+            "thread_local(localexec)"
+        } else {
+            "thread_local"
         }
     }
 
@@ -473,8 +520,10 @@ impl LlModule {
     /// the module graph the way Node and bun do. A program with no worker
     /// keeps the process-wide form and pays nothing.
     ///
-    /// The TLS model is left to LLVM: these are `internal`/hidden symbols in
-    /// the program being linked, so it relaxes them to local-exec on its own.
+    /// The TLS model is not spelled here: the units are compiled
+    /// position-independent, where LLVM must assume the general-dynamic model.
+    /// In an executable the in-process emitter switches every such global to
+    /// local-exec (`inprocess::optimize_emit::use_local_exec_tls`).
     pub fn add_thread_local_global(&mut self, name: &str, ty: LlvmType, init: &str) {
         self.globals
             .push(format!("@{} = thread_local global {} {}", name, ty, init));
@@ -500,7 +549,7 @@ impl LlModule {
     /// External linkage is preserved: module-global slots are deliberately
     /// non-`internal` so clang cannot constant-fold reads to 0.0 across TUs.
     pub fn add_module_state_global(&mut self, name: &str, ty: LlvmType, init: &str) {
-        if crate::codegen::program_has_worker() {
+        if self.program_has_worker {
             self.add_thread_local_global(name, ty, init);
         } else {
             self.add_global(name, ty, init);
@@ -509,7 +558,7 @@ impl LlModule {
 
     /// `internal`-linkage sibling of [`Self::add_module_state_global`].
     pub fn add_internal_module_state_global(&mut self, name: &str, ty: LlvmType, init: &str) {
-        if crate::codegen::program_has_worker() {
+        if self.program_has_worker {
             self.add_internal_thread_local_global(name, ty, init);
         } else {
             self.add_internal_global(name, ty, init);
@@ -521,7 +570,7 @@ impl LlModule {
     /// must match the definition or the link fails with
     /// "TLS definition ... mismatches non-TLS reference".
     pub fn add_external_module_state_global(&mut self, name: &str, ty: LlvmType) {
-        if crate::codegen::program_has_worker() {
+        if self.program_has_worker {
             // Same collection as `add_external_global`. Pushing to
             // `declarations` instead put the line outside the owner/dedup
             // bookkeeping that `globals` gets, and `freeze_unit` then copied
@@ -882,12 +931,13 @@ impl LlModule {
     /// into one object, keeping `compile_module`'s single-object API.
     pub(crate) fn codegen_unit_parts(&self, n: usize) -> Vec<CodegenUnitPart<'_>> {
         let funcs = self.deduped_function_refs();
-        let gc_leaf_callees = Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
-            crate::gc_call_effects::transitive_leaf_functions(&funcs)
-        } else {
-            HashSet::new()
-        });
         if n <= 1 || funcs.len() <= 1 {
+            let gc_leaf_callees =
+                Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
+                    crate::gc_call_effects::transitive_leaf_functions(&funcs)
+                } else {
+                    HashSet::new()
+                });
             return vec![CodegenUnitPart {
                 pre: String::new(),
                 post: String::new(),
@@ -895,8 +945,68 @@ impl LlModule {
                 gc_leaf_callees,
             }];
         }
-        let n = n.min(funcs.len());
+        self.layout_codegen_units(
+            funcs,
+            n,
+            crate::workers::unit_workers(),
+            |f, _text, _bytes| f,
+        )
+    }
 
+    /// Consuming twin of [`Self::codegen_unit_parts`] for the native LLVM API
+    /// path, for `n > 1` and more than one function. The layout is the same;
+    /// each function moves out of the module and is handed to `freeze`, in
+    /// unit order, together with its final text and estimated IR size, the
+    /// moment the layout's reference scan has rendered it. That one rendering
+    /// is all the native path needs from a function: `freeze` turns it into
+    /// the worker payload and the function's lowering-owned graph is released
+    /// right there, so the module is rendered once rather than once for the
+    /// scan and again per unit, and the payload replaces the graph instead of
+    /// accumulating beside it.
+    pub(crate) fn into_codegen_unit_parts_with<T>(
+        mut self,
+        n: usize,
+        workers: usize,
+        freeze: impl FnMut(LlFunction, &str, usize) -> T,
+    ) -> Vec<OwnedCodegenUnitPart<T>> {
+        let mut seen: HashSet<String> = HashSet::with_capacity(self.functions.len());
+        let funcs: Vec<LlFunction> = std::mem::take(&mut self.functions)
+            .into_iter()
+            .filter(|function| seen.insert(function.name.clone()))
+            .collect();
+        self.layout_codegen_units(funcs, n, workers, freeze)
+    }
+
+    /// The unit layout both unit backends share (`codegen_unit_parts`,
+    /// `into_codegen_unit_parts_with`): bucket the deduplicated `funcs`, scan
+    /// each function's final text for the globals, declarations and metadata
+    /// its unit needs, and assemble each unit's `pre`/`post`. `visit` receives
+    /// every function once, in unit order, with the text the scan read.
+    /// `workers` bounds the threads that finish the rendered texts.
+    ///
+    /// The scan reads `to_ir_with_gc_leaf_callees` — the exact text a unit
+    /// compiles. It names the same symbols and metadata as the forced-external
+    /// rendering: forcing external linkage only drops a `define` linkage word,
+    /// and the leaf annotation only appends a `"gc-leaf-function"` attribute.
+    fn layout_codegen_units<F, T>(
+        &self,
+        funcs: Vec<F>,
+        n: usize,
+        workers: usize,
+        mut visit: impl FnMut(F, &str, usize) -> T,
+    ) -> Vec<OwnedCodegenUnitPart<T>>
+    where
+        F: std::borrow::Borrow<LlFunction>,
+    {
+        let gc_leaf_callees = {
+            let refs: Vec<&LlFunction> = funcs.iter().map(|f| f.borrow()).collect();
+            Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
+                crate::gc_call_effects::transitive_leaf_functions(&refs)
+            } else {
+                HashSet::new()
+            })
+        };
+        let n = n.min(funcs.len());
         // Balance units by estimated byte size, not function count: minified
         // bundles have a few enormous functions (a 68MB IIFE in the cli.js
         // case), so contiguous count-chunking can clump them into one outsized
@@ -905,10 +1015,13 @@ impl LlModule {
         // functions and keeping the rest even. (A single function larger than
         // total/n is irreducible here; that requires structured outlining inside
         // codegen, not something inter-function partitioning can divide.)
-        let sizes: Vec<usize> = funcs.iter().map(|f| f.estimated_ir_bytes()).collect();
+        let sizes: Vec<usize> = funcs
+            .iter()
+            .map(|f| f.borrow().estimated_ir_bytes())
+            .collect();
         let mut order: Vec<usize> = (0..funcs.len()).collect();
         order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
-        let mut buckets: Vec<Vec<&LlFunction>> = vec![Vec::new(); n];
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut bucket_bytes = vec![0usize; n];
         for &i in &order {
             let target = bucket_bytes
@@ -917,9 +1030,18 @@ impl LlModule {
                 .min_by_key(|&(_, &b)| b)
                 .map(|(idx, _)| idx)
                 .unwrap_or(0);
-            buckets[target].push(funcs[i]);
+            buckets[target].push(i);
             bucket_bytes[target] += sizes[i];
         }
+        let bucket_names: Vec<Vec<String>> = buckets
+            .iter()
+            .map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|&i| funcs[i].borrow().name.clone())
+                    .collect()
+            })
+            .collect();
 
         // Definitions are carried in their ORIGINAL linkage here; the
         // duplicate-safe promotion below is applied per unit, and only to the
@@ -934,12 +1056,13 @@ impl LlModule {
         // the whole-module renderer and LLVM see, so split units must agree with
         // it too. Deduped by name so no unit emits a duplicate declaration.
         // BTreeMap keeps unit output deterministic.
-        let mut decl_by_name: BTreeMap<&str, String> = BTreeMap::new();
+        let mut decl_by_name: BTreeMap<String, String> = BTreeMap::new();
         for (name, decl) in &self.declarations {
-            decl_by_name.insert(name.as_str(), decl.clone());
+            decl_by_name.insert(name.clone(), decl.clone());
         }
         for f in &funcs {
-            decl_by_name.insert(f.name.as_str(), declare_line_for(f));
+            let f = f.borrow();
+            decl_by_name.insert(f.name.clone(), declare_line_for(f));
         }
         // #10399: the comment above promises this for anything "defined
         // locally", but only functions got it. A GLOBAL this module defines
@@ -987,12 +1110,35 @@ impl LlModule {
             (0..buckets.len()).map(|_| HashSet::new()).collect();
         let mut bucket_metadata_refs: Vec<HashSet<u32>> =
             (0..buckets.len()).map(|_| HashSet::new()).collect();
+        //
+        // Each unit's functions are rendered on this thread (the function
+        // graph is not shareable), their whole-function text passes run on
+        // the unit workers (`TextFinish` is a function of the text alone),
+        // and the finished texts are scanned and handed to `visit` in unit
+        // order — so the result does not depend on the worker count.
+        let mut slots: Vec<Option<F>> = funcs.into_iter().map(Some).collect();
+        let mut bucket_items: Vec<Vec<T>> = Vec::with_capacity(buckets.len());
         for (bi, bucket) in buckets.iter().enumerate() {
-            for func in bucket {
-                let text = render_fn_external(func);
+            let mut owned: Vec<F> = Vec::with_capacity(bucket.len());
+            let mut pending: Vec<(String, crate::function::TextFinish)> =
+                Vec::with_capacity(bucket.len());
+            for &i in bucket {
+                let func = slots[i].take().expect("each function belongs to one unit");
+                let function = func.borrow();
+                pending.push((
+                    function.render_unfinished(),
+                    function.text_finish(&gc_leaf_callees),
+                ));
+                owned.push(func);
+            }
+            let texts = finish_texts(pending, &gc_leaf_callees, workers);
+            let mut items = Vec::with_capacity(bucket.len());
+            for ((func, text), &i) in owned.into_iter().zip(texts).zip(bucket) {
                 collect_symbol_refs(&text, &mut bucket_refs[bi]);
                 collect_metadata_refs(&text, &mut bucket_metadata_refs[bi]);
+                items.push(visit(func, &text, sizes[i]));
             }
+            bucket_items.push(items);
         }
 
         // A global is emitted into every unit that REFERENCES it — normally
@@ -1118,8 +1264,8 @@ impl LlModule {
             .collect();
 
         let mut parts = Vec::with_capacity(n);
-        for (bi, bucket) in buckets.into_iter().enumerate() {
-            let defined: HashSet<&str> = bucket.iter().map(|f| f.name.as_str()).collect();
+        for (bi, items) in bucket_items.into_iter().enumerate() {
+            let defined: HashSet<&str> = bucket_names[bi].iter().map(String::as_str).collect();
             let mut pre = String::new();
             pre.push_str("; Generated by perry-codegen (codegen unit)\n");
             pre.push_str(&format!("source_filename = \"{MODULE_SOURCE_NAME}\"\n"));
@@ -1196,7 +1342,7 @@ impl LlModule {
                 }
             }
             for (name, decl) in &decl_by_name {
-                if defined.contains(name) || !needed.contains(*name) {
+                if defined.contains(name.as_str()) || !needed.contains(name.as_str()) {
                     continue;
                 }
                 pre.push_str(decl);
@@ -1207,58 +1353,14 @@ impl LlModule {
             }
             pre.push('\n');
 
-            parts.push(CodegenUnitPart {
+            parts.push(OwnedCodegenUnitPart {
                 pre,
                 post: unit_posts[bi].clone(),
-                funcs: bucket,
+                funcs: items,
                 gc_leaf_callees: Arc::clone(&gc_leaf_callees),
             });
         }
         parts
-    }
-
-    /// Consuming twin of [`Self::codegen_unit_parts`] for the native LLVM API
-    /// path. The borrowed partitioner computes the exact same deterministic
-    /// layout, then functions move out of the module and into their owning
-    /// unit. This lets the native freeze producer release each lowering-owned
-    /// function graph as soon as its immutable worker payload exists instead
-    /// of retaining the whole `LlModule` until every LLVM unit has finished.
-    pub(crate) fn into_codegen_unit_parts(mut self, n: usize) -> Vec<OwnedCodegenUnitPart> {
-        let layouts: Vec<(String, String, Vec<String>, Arc<HashSet<String>>)> = self
-            .codegen_unit_parts(n)
-            .into_iter()
-            .map(|part| {
-                (
-                    part.pre,
-                    part.post,
-                    part.funcs.iter().map(|func| func.name.clone()).collect(),
-                    part.gc_leaf_callees,
-                )
-            })
-            .collect();
-
-        let mut functions_by_name = HashMap::with_capacity(self.functions.len());
-        for function in std::mem::take(&mut self.functions) {
-            let name = function.name.clone();
-            functions_by_name.entry(name).or_insert(function);
-        }
-
-        layouts
-            .into_iter()
-            .map(|(pre, post, names, gc_leaf_callees)| OwnedCodegenUnitPart {
-                pre,
-                post,
-                funcs: names
-                    .into_iter()
-                    .map(|name| {
-                        functions_by_name
-                            .remove(&name)
-                            .expect("borrowed codegen partition named an owned function")
-                    })
-                    .collect(),
-                gc_leaf_callees,
-            })
-            .collect()
     }
 
     /// Render this module as `n` independent codegen-unit `.ll` texts (#5391).
@@ -1287,21 +1389,75 @@ impl LlModule {
     }
 }
 
+/// Apply each function's [`crate::function::TextFinish`] to its rendered text
+/// on up to `workers` threads. The result is in input order whatever the
+/// worker count, and identical to finishing each text on the calling thread.
+fn finish_texts(
+    pending: Vec<(String, crate::function::TextFinish)>,
+    gc_leaf_callees: &HashSet<String>,
+    workers: usize,
+) -> Vec<String> {
+    let workers = workers.min(pending.len());
+    if workers <= 1 {
+        return pending
+            .into_iter()
+            .map(|(text, finish)| finish.apply(text, gc_leaf_callees))
+            .collect();
+    }
+    let total = pending.len();
+    let queue: Vec<std::sync::Mutex<Option<(String, crate::function::TextFinish)>>> = pending
+        .into_iter()
+        .map(|item| std::sync::Mutex::new(Some(item)))
+        .collect();
+    let done: Vec<std::sync::Mutex<Option<String>>> =
+        (0..total).map(|_| std::sync::Mutex::new(None)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for worker in 0..workers {
+            let (queue, done, next) = (&queue, &done, &next);
+            // The precise-root lowering walks a whole function; a bundle's
+            // largest bodies are millions of instructions. Same deep stack as
+            // the LLVM unit workers.
+            std::thread::Builder::new()
+                .name(format!("perry-text-finish-{worker}"))
+                .stack_size(64 * 1024 * 1024)
+                .spawn_scoped(scope, move || loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    let (text, finish) = queue[i]
+                        .lock()
+                        .expect("text finish queue poisoned")
+                        .take()
+                        .expect("each text is finished once");
+                    let finished = finish.apply(text, gc_leaf_callees);
+                    *done[i].lock().expect("text finish results poisoned") = Some(finished);
+                })
+                .expect("spawn text finish worker");
+        }
+    });
+    done.into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("text finish results poisoned")
+                .expect("every text is finished")
+        })
+        .collect()
+}
+
 /// One codegen unit, pre-render: the textual skeleton around the functions
 /// (`pre` = header/strings/globals/cross-unit declares; `post` = shared
 /// attribute groups + metadata) plus the functions themselves, un-rendered so
 /// the native backend can construct them directly.
-pub(crate) struct CodegenUnitPart<'m> {
-    pub pre: String,
-    pub post: String,
-    pub funcs: Vec<&'m LlFunction>,
-    pub gc_leaf_callees: Arc<HashSet<String>>,
-}
+pub(crate) type CodegenUnitPart<'m> = OwnedCodegenUnitPart<&'m LlFunction>;
 
-pub(crate) struct OwnedCodegenUnitPart {
+/// One codegen unit as the layout produced it, with whatever the caller kept
+/// of each of its functions (a borrow, or the native worker payload).
+pub(crate) struct OwnedCodegenUnitPart<T> {
     pub pre: String,
     pub post: String,
-    pub funcs: Vec<LlFunction>,
+    pub funcs: Vec<T>,
     pub gc_leaf_callees: Arc<HashSet<String>>,
 }
 

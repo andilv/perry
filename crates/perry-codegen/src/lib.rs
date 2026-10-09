@@ -18,6 +18,7 @@ pub mod expr;
 pub mod ext_registry;
 pub(crate) mod fn_info;
 pub mod function;
+pub mod function_order;
 pub(crate) mod gc_call_effects;
 pub mod gc_map;
 #[cfg(feature = "llvm-inprocess")]
@@ -89,6 +90,7 @@ pub mod types;
 pub mod unit_cache;
 #[cfg(feature = "target-wasi")]
 mod wasm32;
+pub mod workers;
 
 pub use codegen::{
     assign_static_shape_ids, compile_module, context_free_ctor_abi, context_free_ctor_param_count,
@@ -101,12 +103,14 @@ pub use codegen::{
     NamespaceEntryKind, ObjectLiteralMethodCandidate, ProgramClassShapeIds,
     ResolvedConstructorContracts, ShortSpreadMethodCandidate, TypedMasks, STATIC_SEED_FORMAT,
 };
-// #10399: whole-program Worker flag, set by the driver before module codegen.
-pub use codegen::{
-    program_has_thread_agents, program_has_worker, set_program_has_thread_agents,
-    set_program_has_worker, set_worker_entries, worker_entries,
-};
+// #10399: worker entries supplied by the driver before module codegen.
+pub use codegen::{set_worker_entries, worker_entries};
 pub use collectors::CjsPreambleCensus;
+// Function layout from a recorded first-execution order, set by the driver.
+pub use function_order::{
+    program_function_layout, program_function_layout_key, set_program_function_layout,
+    FunctionLayout, FunctionOrder,
+};
 // #9843: the segment-view for-of matcher's counter. Exported so the
 // driver can run it at the HIR-trace point — after every transform, on
 // exactly the statements codegen consumes — instead of only inside a
@@ -283,3 +287,6 @@ pub fn cjs_wrap_create_require_local() -> &'static str {
 pub fn module_is_cjs_wrapped(hir: &perry_hir::Module) -> bool {
     collectors::is_cjs_wrapped_module(hir)
 }
+
+#[cfg(test)]
+mod receiver_call_effect_tests;

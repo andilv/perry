@@ -665,7 +665,9 @@ fn object_has_property_generic(obj: f64, key: f64) -> f64 {
             }
             if key_val.is_int32() {
                 let index = key_val.as_int32();
-                let present = unsafe { index >= 0 && (index as u32) < (*ta).length };
+                let present = unsafe {
+                    index >= 0 && (index as u32) < crate::buffer::store::raw_length(ta as usize)
+                };
                 return if present { nanbox_true } else { nanbox_false };
             }
             if key_val.is_number() {
@@ -675,7 +677,7 @@ fn object_has_property_generic(obj: f64, key: f64) -> f64 {
                         && f >= 0.0
                         && f.fract() == 0.0
                         && f <= i32::MAX as f64
-                        && (f as u32) < (*ta).length
+                        && (f as u32) < crate::buffer::store::raw_length(ta as usize)
                 };
                 return if present { nanbox_true } else { nanbox_false };
             }
@@ -1203,15 +1205,9 @@ unsafe fn ordinary_has_property(
         }
         // Own accessor property (also mirrored into `keys_array`, but check the
         // side table directly so a get-only accessor is never missed).
-        // #6748 follow-up: gate on the thread flag + the per-object
-        // `OBJ_FLAG_HAS_DESCRIPTORS` header bit (the same address-reuse-safe
-        // gate the [[Set]] path uses) — `get_accessor_descriptor` allocates a
-        // `String` map key per probe, and this ran per prototype level on
-        // EVERY `in`, dominating its profile (~60% of samples on a
-        // descriptor-less receiver).
+        // Accessor membership comes from the holder shape.
         if let Some(name) = key_name {
-            if crate::state::state().descriptors.accessors_in_use.get()
-                && crate::object::descriptor_state::object_has_descriptors(cur as usize)
+            if crate::object::descriptor_state::object_has_descriptors(cur as usize)
                 && get_accessor_descriptor(cur as usize, name).is_some()
             {
                 return true;
@@ -1278,8 +1274,7 @@ unsafe fn ordinary_has_property(
                     // the same hop here `in` and `getPrototypeOf` disagreed about the
                     // very same chain: `"m" in new C()` was false for any member that
                     // is not a vtable method — notably a method added by ASSIGNMENT
-                    // (`C.prototype.m = fn`, stored in `CLASS_PROTOTYPE_METHODS` and
-                    // mirrored onto the decl-proto object), which the
+                    // (`C.prototype.m = fn`, stored on the prototype itself), which the
                     // `class_instance_has_member` vtable fallback below does not cover.
                     // That divergence silently emptied `for…in` over an instance: the
                     // #6147 for-in desugar re-checks every snapshotted key with
@@ -1288,9 +1283,8 @@ unsafe fn ordinary_has_property(
                     //
                     // Resolve through the materializing accessor — the same one
                     // `js_object_get_prototype_of` uses — so the walk is
-                    // order-independent: a `C.prototype.m = fn` assignment registers the
-                    // method long before any reflective `C.prototype` read materializes
-                    // the decl-proto object.
+                    // order-independent, including a first read before any prototype
+                    // assignment has materialized the decl-proto object.
                     if let Some(decl_proto) =
                         crate::object::class_decl_prototype_value_for_instance_class(cur_class_id)
                     {

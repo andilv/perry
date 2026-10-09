@@ -15,10 +15,7 @@ mod common_methods;
 mod direct_site;
 mod disposal;
 mod function_shape;
-pub(crate) use function_shape::{
-    call_function_intrinsic, function_intrinsic_facts, function_prototype_built,
-    run_function_intrinsic, FunctionIntrinsicFacts,
-};
+pub(crate) use function_shape::run_function_intrinsic;
 mod handle_methods;
 mod memo_entries;
 mod namespace_override;
@@ -1754,7 +1751,7 @@ pub(crate) unsafe fn native_call_method_tower(
     // yield-star-* with `get next()`). `get_accessor_descriptor` is a cheap
     // keyed HashMap lookup (no deref), gated on the accessor hot-path flag so
     // non-accessor programs skip it entirely.
-    if jsval().is_pointer() && crate::state::state().descriptors.accessors_in_use.get() {
+    if jsval().is_pointer() {
         let obj_usize = crate::value::js_nanbox_get_pointer(object()) as usize;
         if crate::value::addr_class::is_above_handle_band(obj_usize) {
             if let Some(acc) = crate::object::get_accessor_descriptor(obj_usize, method_name) {
@@ -2523,31 +2520,29 @@ pub(crate) unsafe fn native_call_method_tower(
     // vtable, prototype walk) to their aliased native handle, so
     // `server.listen(...)` / `server.on(...)` on the plain-object `this`
     // behave as calls on the underlying server. See native_this_alias.rs.
-    if super::native_this_alias::alias_active() {
-        if let Some((handle_val, composite)) =
-            super::native_this_alias::alias_handle_for_object(object())
-        {
-            // Server aliases dispatch through the PRIMARY handle dispatcher
-            // only: the composite's extension dispatchers (ext-net) may own
-            // an id-colliding socket that would claim shared names like
-            // `address`/`on` first. A `ServerResponse` alias (#10454) needs
-            // the composite, whose http extension owns that handle.
-            let dispatch = if composite {
-                super::class_handles::handle_method_dispatch()
-            } else {
-                super::class_handles::handle_method_dispatch_primary()
-            };
-            if let Some(dispatch) = dispatch {
-                let handle = (handle_val.to_bits() & crate::value::POINTER_MASK) as i64;
-                let args = refreshed_args();
-                return dispatch(
-                    handle,
-                    method_name_ptr as *const u8,
-                    method_name_len,
-                    args.as_ptr(),
-                    args.len(),
-                );
-            }
+    if let Some((handle_val, composite)) =
+        super::native_this_alias::alias_handle_for_object(object())
+    {
+        // Server aliases dispatch through the PRIMARY handle dispatcher
+        // only: the composite's extension dispatchers (ext-net) may own
+        // an id-colliding socket that would claim shared names like
+        // `address`/`on` first. A `ServerResponse` alias (#10454) needs
+        // the composite, whose http extension owns that handle.
+        let dispatch = if composite {
+            super::class_handles::handle_method_dispatch()
+        } else {
+            super::class_handles::handle_method_dispatch_primary()
+        };
+        if let Some(dispatch) = dispatch {
+            let handle = (handle_val.to_bits() & crate::value::POINTER_MASK) as i64;
+            let args = refreshed_args();
+            return dispatch(
+                handle,
+                method_name_ptr as *const u8,
+                method_name_len,
+                args.as_ptr(),
+                args.len(),
+            );
         }
     }
 
@@ -2744,3 +2739,5 @@ mod receiver_repr_guard_tests {
         );
     }
 }
+
+mod compiled_target;

@@ -25,21 +25,6 @@ fn remember_class_keys(class_id: u32, field_count: u32, keys: crate::object::Obj
         .class_keys_by_id
         .borrow_mut()
         .insert(class_id, (keys.arr() as usize, field_count, keys.count()));
-    // #6759 C5a: harvest this class's declared instance-field names into
-    // the process-wide name-hash set the per-key inline-guard vetting
-    // consults — and retro-check them against prototype-level descriptor
-    // keys installed BEFORE this class registered (module-init ordering
-    // must not create an unsound skip).
-    unsafe {
-        let count = field_count.min(keys.count()) as usize;
-        let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-        for i in 0..count {
-            let v = keys.get(i as u32);
-            if let Some(b) = crate::string::js_string_key_bytes(v, &mut sso) {
-                super::descriptor_state::note_declared_instance_field_name(b);
-            }
-        }
-    }
 }
 
 /// GC root scanner: rewrite each remembered keys-array address across a move.
@@ -565,15 +550,6 @@ pub extern "C" fn js_build_class_keys_array(
     }
     let keys_bytes = unsafe { std::slice::from_raw_parts(packed_keys, packed_keys_len as usize) };
     let keys: Vec<&[u8]> = crate::object::packed_key_names(keys_bytes);
-    // This array is long-lived and never dies. Without the scope, the per-slot
-    // notes in the builder mint a per-object pointer mask for any class with
-    // enough keys, which arms `PERRY_PER_OBJECT_LAYOUTS_ANY` and puts the
-    // address filter probe on EVERY later allocation in the program (measured
-    // as 3% of an allocation-heavy ECS row: `layout_forget_object` from each
-    // object literal). Under the scope the notes settle on the tag-checked
-    // scan, and `layout_init_all_pointer_slots` below records the final
-    // all-pointer layout anyway.
-    let _immortal = crate::gc::ImmortalLayoutScope::new();
     // Issue #179: route the array and its key strings through the longlived
     // arena so general-arena block 0 doesn't get pinned by the first
     // `new C()` in a loop, which cascaded via block-persistence into every
@@ -583,14 +559,6 @@ pub extern "C" fn js_build_class_keys_array(
     // canonical keys array is immutable for the rest of the program (growing a
     // shape builds a NEW array — `shape_keys_grown`). Say that in the header
     // instead of leaving the per-element pointer mask behind.
-    //
-    // The mask is correct but permanent: the shape cache anchors this array for
-    // the program's lifetime (#179), so its `LAYOUT_SLOT_MASKS` entry never
-    // drains. One such entry is enough to keep the whole per-object side table
-    // non-empty — and every probe of it on the allocation, store, death and
-    // trace paths then has to hash instead of taking the emptiness fast path.
-    // Since ~every program builds at least one shape, that made the fast path
-    // essentially dead: on `churn_alloc` it fired once in 40 million calls.
     //
     // The per-element notes in the builder stay. They are what keeps the
     // already-stored prefix traceable if allocating the *next* key string
@@ -655,8 +623,13 @@ pub extern "C" fn js_object_alloc_class_with_keys(
     let (keys_arr, runtime_shape_id) = if !cached.is_null() {
         (cached, cached_runtime_id)
     } else {
-        let keys_bytes =
-            unsafe { std::slice::from_raw_parts(packed_keys, packed_keys_len as usize) };
+        // Legacy empty-shape callers pass a null pointer with length zero.
+        // Rust slices still require a non-null pointer for an empty slice.
+        let keys_bytes = if packed_keys_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(packed_keys, packed_keys_len as usize) }
+        };
         let keys: Vec<&[u8]> = crate::object::packed_key_names(keys_bytes);
         // Issue #179: shape-cache keys_array lives in the longlived arena
         // (see `js_build_class_keys_array` for the rationale).
@@ -867,8 +840,11 @@ pub extern "C" fn js_object_alloc_with_shape(
     let (keys_arr, runtime_shape_id) = if !cached.is_null() {
         (cached, cached_runtime_id)
     } else {
-        let keys_bytes =
-            unsafe { std::slice::from_raw_parts(packed_keys, packed_keys_len as usize) };
+        let keys_bytes = if packed_keys_len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(packed_keys, packed_keys_len as usize) }
+        };
         let keys: Vec<&[u8]> = crate::object::packed_key_names(keys_bytes);
         // Issue #179: shape-cache keys_array lives in the longlived arena.
         // The builder roots the unfinished array across its key allocations;

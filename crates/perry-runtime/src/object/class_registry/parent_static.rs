@@ -136,7 +136,19 @@ pub(crate) fn dynamic_value_class_id(value: f64) -> u32 {
 /// recursive helper that returns its receiver can't create a cycle — and the
 /// VALUE stash below applies the same rejection (`is_self_heritage_value`).
 #[no_mangle]
-pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_value: f64) {
+pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, parent_value: f64) {
+    register_class_parent_dynamic(class_id, parent_value, true);
+    // ClassDefinitionEvaluation fixes the instance prototype edge now,
+    // before a later assignment can replace the superclass's prototype.
+    // Store that edge on the existing prototype object, not a second table.
+    class_decl_prototype_value(class_id);
+}
+
+pub(crate) fn register_class_parent_dynamic(
+    class_id: u32,
+    parent_value: f64,
+    publish_shared: bool,
+) {
     // Stash the parent VALUE keyed by child class id so `super()` can read it
     // back (`js_get_dynamic_parent_value`) instead of re-evaluating the extends
     // expression inside the constructor scope. The decl-time call here runs in
@@ -249,7 +261,8 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
         // A native superclass is also the constructor's actual [[Prototype]].
         // Keep this edge on the class function shape, alongside instance
         // heritage, so static reads and their receivers use ordinary lookup.
-        if !crate::object::class_value::class_value_is_first_evaluation(class_id) {
+        if publish_shared && !crate::object::class_value::class_value_is_first_evaluation(class_id)
+        {
             let scope = crate::gc::RuntimeHandleScope::new();
             let parent = scope.root_nanbox_f64(parent_value);
             // Materialize the child before passing a raw parent to the store.
@@ -268,54 +281,9 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
         throw_object_type_error(b"Class extends value is not a constructor");
     }
 
-    // #5893 (ClassDefinitionEvaluation): once the superclass is confirmed a
-    // constructor (above), `Get(superclass, "prototype")` must be an Object or
-    // null, else a TypeError is thrown at class-definition time. A *bound*
-    // function (`fn.bind(...)`) has no intrinsic `.prototype`, so its
-    // `Get(_, "prototype")` yields either whatever a `defineProperty`
-    // accessor/data on the bound function provides or `undefined` — and
-    // `undefined`, a number, etc. are neither Object nor null. test262
-    // language/statements/class/definition/{constructable-but-no-prototype,
-    // prototype-getter,prototype-setter}.
-    //
-    // Scope to bound functions specifically: an ordinary function always
-    // carries a valid object prototype (even after unrelated `defineProperty`
-    // calls on it — see superclass-static-method-override), and a real class
-    // (ClassRef, INT32) or per-evaluation class object likewise. So this stays
-    // purely additive — it cannot reject anything Node accepts, since Node also
-    // throws for every `class C extends aBoundFunction` whose bound function
-    // lacks a valid `prototype`. The `prototype` read happens exactly once here
-    // — the getter-invocation count is observable (prototype-getter.js asserts
-    // the accessor runs exactly once per class definition).
-    if super::construct::is_bound_function_closure_value(parent_value) {
-        // `js_get_property` can run a user-defined `prototype` getter, which may
-        // allocate and move `parent_value`'s nan-boxed object under GC. Root it
-        // across the call and refresh from the handle so the later reuses below
-        // (`js_nanbox_get_pointer(parent_value)`) see the current address rather
-        // than a stale pre-evacuation pointer. (The `CLASS_DYNAMIC_PARENT_VALUE`
-        // stash above is a rewritten GC root — see `class_registry/gc_roots.rs`
-        // — so it needs no equivalent refresh.)
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let parent_handle = scope.root_nanbox_f64(parent_value);
-        let proto = unsafe {
-            crate::value::js_get_property(
-                parent_value,
-                b"prototype".as_ptr() as i64,
-                b"prototype".len() as i64,
-            )
-        };
-        parent_value = parent_handle.get_nanbox_f64();
-        const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
-        const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-        let pbits = proto.to_bits();
-        let proto_is_object_or_null =
-            pbits == TAG_NULL || (pbits & 0xFFFF_0000_0000_0000) == POINTER_TAG;
-        if !proto_is_object_or_null {
-            super::super::object_ops::throw_object_type_error(
-                b"Class extends value does not have valid prototype property",
-            );
-        }
-    }
+    // The shared prototype birth performs the ordinary superclass.prototype
+    // Get and validates object-or-null. Repeating it here for bound functions
+    // would invoke an observable getter twice during one class definition.
 
     let bits = parent_value.to_bits();
     let tag = bits & 0xFFFF_0000_0000_0000;
@@ -351,7 +319,9 @@ pub extern "C" fn js_register_class_parent_dynamic(class_id: u32, mut parent_val
     // method/`new`/instanceof dispatch on the existing fast path.
     // #11759 (c′): a later evaluation pins its parent on its own class object;
     // the template's static parent stays the first evaluation's.
-    if tag == POINTER_TAG && !crate::object::class_value::class_value_is_first_evaluation(class_id)
+    if publish_shared
+        && tag == POINTER_TAG
+        && !crate::object::class_value::class_value_is_first_evaluation(class_id)
     {
         let ptr = crate::value::js_nanbox_get_pointer(parent_value) as *mut ObjectHeader;
         if !ptr.is_null() && js_object_get_class_id(ptr as *const ObjectHeader) != 0 {
@@ -408,8 +378,17 @@ pub(crate) unsafe fn class_object_define_members(
         super::evaluation_heritage::CLASS_OBJECT_HERITAGE_PIN_LATCH.arm();
         let key_bytes = CLASS_OBJECT_PARENT_KEY.as_bytes();
         let key = crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
+        let key = scope.root_string_ptr(key);
         class.with_mut_ptr::<crate::object::ObjectHeader, _>(|obj| {
-            crate::object::js_object_set_field_by_name(obj, key, parent.get_nanbox_f64())
+            key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                crate::object::define_builtin_data_property(
+                    obj,
+                    key,
+                    parent.get_nanbox_f64(),
+                    CLASS_OBJECT_PARENT_KEY.to_string(),
+                    PropertyAttrs::new(true, true, true),
+                )
+            })
         });
     }
     class.with_mut_ptr::<crate::object::ObjectHeader, _>(|obj| {
@@ -988,6 +967,7 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
             throw_object_type_error(b"Classes may not have a static property named 'prototype'");
         }
         if is_static == 0 {
+            let newly_declared = class_own_accessor_ptrs(class_id, &name).is_none();
             let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
             if registry.is_none() {
                 *registry = Some(crate::fast_hash::new_ptr_hash_map());
@@ -996,7 +976,11 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
             vtable.declare_accessor_half(&name, getter_ptr as usize, false);
             vtable.declare_accessor_half(&name, setter_ptr as usize, true);
             drop(registry);
-            super::decl_accessors::note_instance_accessor_registered(class_id, &name);
+            super::decl_accessors::note_instance_accessor_registered(
+                class_id,
+                &name,
+                newly_declared,
+            );
         } else {
             {
                 let mut guard = CLASS_STATIC_ACCESSORS.write().unwrap();
@@ -1102,16 +1086,6 @@ pub(crate) fn lookup_static_method_owner(
         }
     }
     None
-}
-
-pub(crate) unsafe fn class_instance_setter_apply(
-    class_id: u32,
-    name: &str,
-    receiver: f64,
-    value: f64,
-) -> bool {
-    // Charter step 3: the accessor is a property of the class prototype chain.
-    super::decl_accessors::class_chain_setter_apply(class_id, name, receiver, value).is_some()
 }
 
 /// Spec `Function.prototype.length` for a class method named `name` — the
@@ -1490,7 +1464,7 @@ pub unsafe extern "C" fn js_class_static_method_call(
                 if !fv.is_undefined() && !fv.is_null() {
                     return crate::closure::js_native_call_value(
                         v,
-                        crate::closure::plain_call_receiver(),
+                        crate::closure::JsThis::from_f64(receiver),
                         args_ptr,
                         args_len,
                     );
@@ -1604,61 +1578,33 @@ pub unsafe extern "C" fn js_class_static_method_call(
             _ => {}
         }
     }
-    // #6475: `class X extends <function value>() {}` — a static member
-    // INHERITED from the parent FUNCTION's own properties, invoked as a call
-    // (`X.use(f)`, effect's `HttpRouter.Tag(id)().use`/`unwrap`/`serve`). The
-    // field-GET path already walks the parent closure
-    // (`get_field_by_name.rs` #36/#321: `closure_get_dynamic_prop(parent,
-    // name)`), so `typeof X.use === "function"` — but the fused static-CALL
-    // lowering routes here, and this helper only consulted CLASS_DYNAMIC_PROPS
-    // (which holds statics of a CLASS parent, not the own props of a runtime
-    // FUNCTION parent stored in the closure-props table). So the call missed,
-    // fell to the receiver fallback below, and effect's `X.use(f)` returned the
-    // class ref (`1`) instead of running the inherited arrow — every Tag-based
-    // Layer built through `.use`/`.serve` silently became the class itself.
-    // Walk the parent-closure chain and invoke the resolved callable with `this`
-    // bound to the receiver, mirroring the GET path.
-    if let Some(closure_ptr) = parent_closure_in_chain(class_id) {
-        let closure_val = f64::from_bits(
-            crate::value::POINTER_TAG | (closure_ptr as u64 & crate::value::POINTER_MASK),
+    // Inherited function properties and constructor prototypes use the same
+    // receiver-aware Get as a member read. A fresh class evaluation pins its
+    // heritage on the class object, not in the shared template's parent-closure
+    // metadata; a separate class-id walk therefore loses that edge. Keeping
+    // Get here also preserves accessor receivers and ordinary shadowing.
+    {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let receiver = scope.root_nanbox_f64(receiver);
+        let args = if args_ptr.is_null() || args_len == 0 {
+            Vec::new()
+        } else {
+            scope.root_nanbox_f64_slice(std::slice::from_raw_parts(args_ptr, args_len))
+        };
+        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let member = crate::object::js_object_get_property_key(
+            receiver.get_nanbox_f64(),
+            crate::value::js_nanbox_string(key as i64),
         );
-        let member = crate::closure::closure_get_dynamic_prop(closure_ptr, name);
-        let mv = crate::value::JSValue::from_bits(member.to_bits());
-        if !mv.is_undefined()
-            && !mv.is_null()
-            && crate::collection_iter::is_callable(member)
-            // Guard against the closure_get_dynamic_prop fallback returning the
-            // closure itself for an unknown key (it never should for a miss,
-            // but be defensive): a member equal to the parent closure value is
-            // not a real inherited member.
-            && member.to_bits() != closure_val.to_bits()
-        {
-            let result = crate::closure::native_call_value_this(
-                member,
-                crate::closure::JsThis::from_f64(receiver),
-                args_ptr,
-                args_len,
-            );
-            return result;
-        }
-    }
-    // #11492: the constructor chain ends at %Function.prototype% — a user
-    // method installed there (`Function.prototype.myHelper = fn`) is callable
-    // as `C.myHelper()` with `this` = the class, exactly as on a closure.
-    let fn_proto_member = if crate::object::class_prototype_ref_id(receiver).is_none() {
-        crate::closure::function_prototype_inherited_get(0, name, receiver)
-    } else {
-        None
-    };
-    if let Some(member) = fn_proto_member {
         if crate::collection_iter::is_callable(member) {
-            let result = crate::closure::native_call_value_this(
-                member,
-                crate::closure::JsThis::from_f64(receiver),
-                args_ptr,
-                args_len,
+            let member = scope.root_nanbox_f64(member);
+            let args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&args);
+            return crate::closure::native_call_value_this(
+                member.get_nanbox_f64(),
+                crate::closure::JsThis::from_f64(receiver.get_nanbox_f64()),
+                args.as_ptr(),
+                args.len(),
             );
-            return result;
         }
     }
     // True miss: no static method and no callable static field resolved on the

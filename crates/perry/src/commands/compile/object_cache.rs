@@ -319,11 +319,7 @@ fn compute_object_cache_key_with_env(
     // a worker-free build must never be served to a build that has one.
     h.field(
         "worker_tls_globals",
-        if perry_codegen::program_has_worker() {
-            "1"
-        } else {
-            "0"
-        },
+        if opts.program_has_worker { "1" } else { "0" },
     );
     // The entry module's `main` registers every worker entry of the program.
     if opts.is_entry_module {
@@ -335,7 +331,7 @@ fn compute_object_cache_key_with_env(
     // Both values change objects outside the module containing the launch.
     h.field(
         "thread_literal_tls",
-        if perry_codegen::program_has_thread_agents() {
+        if opts.program_has_thread_agents {
             "1"
         } else {
             "0"
@@ -346,7 +342,7 @@ fn compute_object_cache_key_with_env(
     // modules that never launch a thread; versioned with its runtime ABI.
     h.field(
         "thread_global_transfer",
-        if perry_codegen::program_has_thread_agents() && !perry_codegen::program_has_worker() {
+        if opts.program_has_thread_agents && !opts.program_has_worker {
             "leaf-v1"
         } else {
             "0"
@@ -387,6 +383,13 @@ fn compute_object_cache_key_with_env(
     // toggling the flag would serve the previously-cached object and the
     // source locations would silently not appear.
     h.field("dbgloc", if opts.debug_locations { "1" } else { "0" });
+    // `--record-function-order` instruments every function and
+    // `--function-order` moves listed ones into ranked sections; both change
+    // the emitted object (`perry_codegen::function_order`).
+    h.field(
+        "function_layout",
+        &perry_codegen::program_function_layout_key(),
+    );
     h.field(
         "verify_native_regions",
         if opts.verify_native_regions { "1" } else { "0" },
@@ -410,6 +413,14 @@ fn compute_object_cache_key_with_env(
     // Target + top-level shape.
     h.field("tgt", opts.target.as_deref().unwrap_or("host"));
     h.field("out", &opts.output_type);
+    h.field(
+        "constfn_off",
+        if opts.disable_constfn_shapes {
+            "1"
+        } else {
+            "0"
+        },
+    );
     h.field("entry", if opts.is_entry_module { "1" } else { "0" });
 
     // Feature flags that round-trip through opts. These influence which
