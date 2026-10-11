@@ -26,7 +26,8 @@
 //! its `!contains("@js_shadow_slot_bind")` is true of every program (hazard 4:
 //! the gate ran, its subject did not). Since #7876 every class-key cache also
 //! has one function-lifetime bind; that negative asserts there is exactly that
-//! one bind rather than no bind anywhere in the function.
+//! one bind on the legacy allocator. Inline births have no class-key cache,
+//! so their inert construction must have zero binds.
 //!
 //! The rest of this file is lowering-INDEPENDENT and deliberately unpinned.
 //!
@@ -174,6 +175,36 @@ fn allocating() -> Expr {
     Expr::Object(Vec::new())
 }
 
+// Both literal birth entries can collect. Match the actual allocation before
+// checking which value is rooted and reloaded across it.
+fn is_object_allocation(line: &str) -> bool {
+    line.contains("call i64 @js_object_alloc(") || line.contains("call i64 @js_object_alloc_plain(")
+}
+
+fn is_empty_object_allocation(line: &str) -> bool {
+    line.contains("= call i64 @js_object_alloc(i32 0, i32 0)")
+        || line.contains("= call i64 @js_object_alloc_plain(i32 0)")
+}
+
+fn object_allocation_count(ir: &str) -> usize {
+    ir.lines().filter(|line| is_object_allocation(line)).count()
+}
+
+fn first_object_allocation_result(ir: &str) -> Option<String> {
+    ir.lines()
+        .map(str::trim)
+        .filter_map(|line| line.split_once(" = "))
+        .find(|(_, def)| def.starts_with("call ") && is_object_allocation(def))
+        .map(|(dst, _)| dst.trim().to_string())
+}
+
+fn last_object_allocation(ir: &str) -> Option<usize> {
+    ir.rfind("call i64 @js_object_alloc(")
+        .into_iter()
+        .chain(ir.rfind("call i64 @js_object_alloc_plain("))
+        .max()
+}
+
 #[test]
 fn prototype_assignment_receiver_survives_an_allocating_rhs() {
     let ir = ir_for(
@@ -186,13 +217,11 @@ fn prototype_assignment_receiver_survives_an_allocating_rhs() {
     );
     let f = init_ir(&ir);
     assert_eq!(
-        f.lines()
-            .filter(|line| line.contains("call i64 @js_object_alloc("))
-            .count(),
+        f.lines().filter(|line| is_object_allocation(line)).count(),
         2,
         "both operands must allocate exactly once:\n{f}",
     );
-    let receiver = first_call_result(f, "js_object_alloc").expect("receiver allocation");
+    let receiver = first_object_allocation_result(f).expect("receiver allocation");
     assert_rooted_across(f, &receiver, "js_set_prototype_property", "#9365 receiver");
 }
 
@@ -217,7 +246,7 @@ fn map_set_key_is_rooted_across_an_allocating_value() {
     );
 
     let f = init_ir(&ir);
-    let key = first_call_result(f, "js_object_alloc")
+    let key = first_object_allocation_result(f)
         .unwrap_or_else(|| panic!("the key must allocate, or this proves nothing:\n{f}"));
     assert_rooted_across(f, &key, "js_map_set", "#6970 map.set key");
 
@@ -306,7 +335,7 @@ fn concat_accumulator_is_rooted_and_written_back() {
     );
 
     let f = init_ir(&ir);
-    let arg = first_call_result(f, "js_object_alloc").unwrap_or_else(|| {
+    let arg = first_object_allocation_result(f).unwrap_or_else(|| {
         panic!("the concat argument must allocate, or this proves nothing:\n{f}")
     });
     let slot = slot_holding(f, &arg).unwrap_or_else(|| {
@@ -415,8 +444,43 @@ fn ir_for_new(name: &str, args: Vec<Expr>) -> String {
         .expect("LLVM IR should be UTF-8")
 }
 
+// Class births can be a legacy runtime call or a fast/slow pair merged by
+// a phi. Select the completed instance, never an argument object allocation.
+fn class_allocation(line: &str) -> bool {
+    line.contains("call ")
+        && (line.contains("@js_object_alloc_class") || line.contains("@perry_birth_class("))
+}
+
+fn instance_result(f: &str) -> String {
+    let defs: std::collections::HashMap<_, _> = f
+        .lines()
+        .filter_map(|l| l.trim().split_once(" = "))
+        .collect();
+    // Both incoming VALUES must be class births; block labels are not values.
+    for (reg, rhs) in &defs {
+        if rhs.starts_with("phi i64 ") {
+            let incoming: Vec<_> = rhs
+                .split('[')
+                .skip(1)
+                .filter_map(|arm| arm.split_once(',').map(|(v, _)| v.trim()))
+                .collect();
+            if incoming.len() == 2
+                && incoming
+                    .iter()
+                    .all(|v| defs.get(v).is_some_and(|def| class_allocation(def)))
+            {
+                return reg.to_string();
+            }
+        }
+    }
+    f.lines()
+        .find(|l| class_allocation(l))
+        .and_then(|l| l.trim().split_once(" = ").map(|(r, _)| r.to_string()))
+        .unwrap_or_else(|| panic!("the instance allocation:\n{f}"))
+}
+
 /// Constructor arguments are all lowered before the instance is allocated, and
-/// that allocation always collects — so every heap-valued argument must be
+/// the slow allocation can collect — so every heap-valued argument must be
 /// rooted, and re-read after the allocation.
 ///
 /// The rooting must also be interleaved with the lowering, not appended after
@@ -437,7 +501,7 @@ fn constructor_arguments_are_rooted_across_the_instance_allocation() {
     let arg_allocs: Vec<(usize, String)> = f
         .lines()
         .enumerate()
-        .filter(|(_, l)| l.contains("call i64 @js_object_alloc("))
+        .filter(|(_, l)| is_object_allocation(l))
         .filter_map(|(i, l)| l.trim().split_once(" = ").map(|(r, _)| (i, r.to_string())))
         .collect();
     assert_eq!(arg_allocs.len(), 2, "both arguments allocate:\n{f}");
@@ -461,10 +525,12 @@ fn constructor_arguments_are_rooted_across_the_instance_allocation() {
     );
 
     // …and every argument is still rooted across the INSTANCE allocation, then
-    // re-read below it. That call is the one that always collects.
+    // re-read below it. The slow birth call is the collecting arm.
     let instance_alloc = f
         .lines()
-        .position(|l| l.contains("call i64 @js_object_alloc_class_inline_keys"))
+        .enumerate()
+        .filter_map(|(i, l)| class_allocation(l).then_some(i))
+        .last()
         .unwrap_or_else(|| panic!("the instance allocation:\n{f}"));
     assert!(
         traffic
@@ -474,6 +540,19 @@ fn constructor_arguments_are_rooted_across_the_instance_allocation() {
         "the arguments must be re-read from their slots AFTER the instance \
          allocation — a register held across it names from-space (#6969):\n{f}"
     );
+    for (_, arg) in &arg_allocs {
+        let slot = slot_holding(f, arg).expect("each constructor argument must be rooted");
+        let events = &traffic[&slot];
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SlotEvent::Store { line, .. } if *line < instance_alloc))
+                && events
+                    .iter()
+                    .any(|e| matches!(e, SlotEvent::Load { line, .. } if *line > instance_alloc)),
+            "argument {arg} must be stored before and reloaded after the collecting birth:\n{f}"
+        );
+    }
     // The scope cut comes after the arguments are consumed — per SLOT. A
     // module-wide "last load before any clear" would be answered by an
     // unrelated named local's slot, which is the class of mistake this whole
@@ -546,7 +625,14 @@ fn registered_root_operands_are_reloaded_rather_than_rooted() {
     );
 
     let alloc = ir
-        .find("call i64 @js_object_alloc_class_inline_keys")
+        .lines()
+        .scan(0, |offset, line| {
+            let start = *offset;
+            *offset += line.len() + 1;
+            Some((start, line))
+        })
+        .filter_map(|(offset, line)| class_allocation(line).then_some(offset))
+        .last()
         .expect("the instance allocation");
     assert!(
         loads[0] < alloc && loads.iter().any(|&l| l > alloc),
@@ -700,7 +786,7 @@ fn string_literal_concat_operand_is_re_derived_below_the_allocating_sibling() {
         "exactly one fused string+value concat in @main:\n{f}"
     );
     assert_eq!(
-        f.matches("call i64 @js_object_alloc(").count(),
+        object_allocation_count(f),
         1,
         "exactly one allocating sibling in @main:\n{f}"
     );
@@ -714,8 +800,7 @@ fn string_literal_concat_operand_is_re_derived_below_the_allocating_sibling() {
     );
 
     let concat = f.find("call double @js_string_concat_value_box(").unwrap();
-    let alloc = f[..concat]
-        .rfind("call i64 @js_object_alloc(")
+    let alloc = last_object_allocation(&f[..concat])
         .unwrap_or_else(|| panic!("the sibling must allocate before the concat:\n{f}"));
     let handle_load = f[..concat]
         .rfind(handle)
@@ -787,13 +872,13 @@ fn string_literal_array_element_is_re_derived_below_an_allocating_element() {
     let f = init_ir(&ir);
     let handle_pat = "load double, ptr @array_reload_ts_.str.";
     assert_eq!(
-        f.matches("call i64 @js_object_alloc(").count(),
+        object_allocation_count(f),
         1,
         "exactly one allocating element in @main:\n{f}"
     );
     let element_alloc = f
         .lines()
-        .position(|l| l.contains("call i64 @js_object_alloc("))
+        .position(|l| is_object_allocation(l))
         .expect("just counted it");
 
     // #7114's invariant admits TWO discharges, and which one a given operand
@@ -869,14 +954,14 @@ fn wtf8_literal_operand_is_rooted_under_shadow_lowering() {
          longer about the operand it names. Slots: {slots:?}\n{f}"
     );
     assert_eq!(
-        f.matches("call i64 @js_object_alloc(").count(),
+        object_allocation_count(f),
         1,
         "exactly one allocating sibling in @main:\n{f}"
     );
 
     let alloc = f
         .lines()
-        .position(|l| l.contains("call i64 @js_object_alloc("))
+        .position(|l| is_object_allocation(l))
         .expect("just counted it");
     let events = &slot_traffic(f)[&slots[0]];
     assert!(
@@ -910,7 +995,7 @@ fn wtf8_literal_operand_is_re_derived_under_native_lowering() {
     // is precisely the #7114 `Reuse` shape (suppressed, not re-derived).
     let alloc = f
         .lines()
-        .position(|l| l.contains("call i64 @js_object_alloc("))
+        .position(|l| is_object_allocation(l))
         .expect("the positive check counted it");
     let stale = f
         .lines()
@@ -973,7 +1058,7 @@ const REMAT_MARK_I64: i64 = 0x7FFC_0000_0000_4D52_u64 as i64;
 ///    re-read from the collector-rewritten global after the collection point,
 ///    and no pre-collection register leaks into it.
 fn wtf8_operand_is_re_derived(f: &str) -> Result<(), String> {
-    if f.matches("call i64 @js_object_alloc(").count() != 1 {
+    if object_allocation_count(f) != 1 {
         return Err("expected exactly one allocating sibling in @main".into());
     }
     if f.matches("@js_string_concat_value_box(").count() != 1 {
@@ -982,7 +1067,7 @@ fn wtf8_operand_is_re_derived(f: &str) -> Result<(), String> {
     let lines: Vec<&str> = f.lines().map(str::trim).collect();
     let alloc = lines
         .iter()
-        .position(|l| l.contains("call i64 @js_object_alloc("))
+        .position(|l| is_object_allocation(l))
         .expect("just counted it");
     let concat = lines
         .iter()
@@ -992,7 +1077,7 @@ fn wtf8_operand_is_re_derived(f: &str) -> Result<(), String> {
         return Err("the concat must consume the operand after the sibling ran".into());
     }
 
-    let marker_store = format!("store i64 {REMAT_MARK_I64}, ptr %");
+    let marker_store = format!("store double 0x{:016X}, ptr %", REMAT_MARK_I64 as u64);
     if !lines[..alloc].iter().any(|l| l.starts_with(&marker_store)) {
         return Err(format!(
             "the WTF-8 operand must reach its slot as the remat marker \
@@ -1089,7 +1174,7 @@ fn module_with_new_running_ctor(name: &str) -> Module {
 /// a *rooted* slot holding a dangling pointer, read back later as
 /// "TypeError: value is not a function".
 ///
-/// Sabotage check: drop the `reload_instance` call in `lower_new_impl_inner`
+/// Negative control: drop the `reload_instance` call in `lower_new_impl_inner`
 /// and the re-read disappears from between the allocation and the override.
 #[test]
 fn the_new_instance_is_rooted_across_the_constructor_body() {
@@ -1108,11 +1193,7 @@ fn the_new_instance_is_rooted_across_the_constructor_body() {
     // below the block that re-reads the root.
 
     // 1. The allocation's result reaches a rooted slot immediately.
-    let inst_reg = f
-        .lines()
-        .find(|l| l.contains("call i64 @js_object_alloc_class"))
-        .and_then(|l| l.trim().split_once(" = ").map(|(r, _)| r.to_string()))
-        .unwrap_or_else(|| panic!("the instance allocation:\n{f}"));
+    let inst_reg = instance_result(f);
     assert!(
         slot_holding(f, &inst_reg).is_some(),
         "the instance {inst_reg} must be rooted as soon as it is allocated, \
@@ -1168,7 +1249,7 @@ fn a_class_that_runs_no_user_code_emits_no_instance_root() {
 /// `the_new_instance_is_rooted_across_the_constructor_body` could not see it:
 /// that test walks the FIRST operand, which is the re-read one.
 ///
-/// Sabotage check: restore the `store double %obj_box, ptr %ctor_result_slot`
+/// Negative control: restore the `store double %obj_box, ptr %ctor_result_slot`
 /// seed in `lower_new_impl_inner` and this fails.
 #[test]
 fn the_inline_ctor_result_slot_never_carries_an_instance_address() {
@@ -1255,7 +1336,7 @@ fn the_inline_ctor_result_slot_never_carries_an_instance_address() {
 /// `js_shadow_slot_bind` records `slot_ptrs[idx] = alloca`, so evacuation
 /// rewrites it in place.
 ///
-/// Sabotage check: drop the `root_entry_alloca` call in `lower_new_impl_inner`
+/// Negative control: drop the `root_entry_alloca` call in `lower_new_impl_inner`
 /// and no bind names the `this` slot.
 #[test]
 fn the_inline_ctor_this_slot_is_bound_as_a_shadow_slot() {
@@ -1270,6 +1351,56 @@ fn the_inline_ctor_this_slot_is_bound_as_a_shadow_slot() {
     .expect("LLVM IR should be UTF-8");
     let f = init_ir(&ir);
 
+    assert_inline_instance_homes_bound(f);
+    // Negative control on real emitted IR: remove just the inline `this`
+    // bind, leaving the pooled temporary and class-key binds intact.
+    let temp = slot_holding(f, &instance_result(f)).expect("positive assertion found a root");
+    let homes = instance_homes(f);
+    let this_home = homes
+        .iter()
+        .find(|home| **home != temp)
+        .expect("inline this home");
+    let broken = f
+        .lines()
+        .filter(|l| {
+            !(l.contains("@js_shadow_slot_bind(")
+                && l.trim_end().ends_with(&format!("ptr {this_home})")))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(broken, f, "negative control must remove a live bind");
+    assert!(
+        std::panic::catch_unwind(|| assert_inline_instance_homes_bound(&broken)).is_err(),
+        "the instance-home assertion accepted a missing shadow bind"
+    );
+}
+
+fn instance_homes(f: &str) -> Vec<String> {
+    let instance = instance_result(f);
+    let instance_home = slot_holding(f, &instance)
+        .unwrap_or_else(|| panic!("the birthed instance {instance} has no root:\n{f}"));
+    // Check every home holding this instance, including the separate inline
+    // constructor `this` home. Removing that bind must not be masked by the
+    // caller's still-bound temporary root.
+    let mut homes = vec![instance_home];
+    for slot in slot_traffic(f).keys() {
+        let isolated = f
+            .lines()
+            .filter(|l| {
+                !l.trim().starts_with("store ")
+                    || l.contains(&format!(", ptr {slot},"))
+                    || l.trim().ends_with(&format!(", ptr {slot}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if slot_holding(&isolated, &instance).is_some() && !homes.contains(slot) {
+            homes.push(slot.clone());
+        }
+    }
+    homes
+}
+
+fn assert_inline_instance_homes_bound(f: &str) {
     // `this` is read by the field-initializer store; find the slot it loads
     // from by taking the alloca that a `js_shadow_slot_bind` names AND that is
     // stored with a nanboxed instance. Simpler and stronger: assert that every
@@ -1286,76 +1417,59 @@ fn the_inline_ctor_this_slot_is_bound_as_a_shadow_slot() {
         "expected at least one js_shadow_slot_bind in:\n{f}"
     );
 
-    // The instance's nanbox register: walk each `store double %X, ptr %S`
-    // backwards through the bit-level nanbox ops to see whether `%X` was
-    // produced by an object allocation. That is the `this` slot.
-    let def_of: std::collections::HashMap<&str, &str> = f
-        .lines()
-        .filter_map(|l| l.trim_start().split_once(" = "))
-        .map(|(r, rhs)| (r.trim(), rhs))
-        .collect();
-    fn reaches_alloc(
-        reg: &str,
-        def_of: &std::collections::HashMap<&str, &str>,
-        depth: usize,
-    ) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        let Some(rhs) = def_of.get(reg) else {
-            return false;
-        };
-        if rhs.contains("@js_object_alloc") {
-            return true;
-        }
-        // Only follow bit-level identity producers, exactly as the dominance
-        // checker's `provenance` does; anything else is a different value.
-        if !(rhs.starts_with("or i64")
-            || rhs.starts_with("bitcast")
-            || rhs.starts_with("inttoptr")
-            || rhs.starts_with("ptrtoint"))
-        {
-            return false;
-        }
-        rhs.split(|c: char| !(c.is_alphanumeric() || c == '%' || c == '.' || c == '_'))
-            .filter(|w| w.starts_with('%'))
-            .any(|w| reaches_alloc(w, def_of, depth - 1))
-    }
-
-    let this_slot = f
-        .lines()
-        .filter(|l| l.trim_start().starts_with("store double %"))
-        .find_map(|l| {
-            let (val, rest) = l
-                .trim_start()
-                .strip_prefix("store double ")?
-                .split_once(", ")?;
-            let slot = rest.strip_prefix("ptr ")?.trim();
-            reaches_alloc(val.trim(), &def_of, 8).then(|| slot.to_string())
-        })
-        .unwrap_or_else(|| panic!("no store of a freshly allocated instance into a slot in:\n{f}"));
-
+    let homes = instance_homes(f);
     assert!(
-        bound.contains(&this_slot),
-        "the inline-ctor `this` slot {this_slot} is a plain entry alloca that \
+        homes.len() >= 2,
+        "instance temp and inline `this` homes must be live:\n{f}"
+    );
+    for this_slot in homes {
+        assert!(
+            bound.contains(&this_slot),
+            "the inline-ctor `this` slot {this_slot} is a plain entry alloca that \
          the collector neither marks nor rewrites, yet it holds the instance \
          across the whole constructor body — it must be bound as a shadow slot \
          (#7202). Bound slots: {bound:?}\n{f}"
-    );
+        );
 
-    // The bind contract also requires an `undefined` seed: the bind is hoisted
-    // to entry setup, so the collector dereferences the alloca before the
-    // instance store executes.
-    assert!(
-        f.lines().any(|l| {
-            l.trim_start()
-                .starts_with("store double 0x7FFC000000000001")
-                && l.trim_end().ends_with(&format!("ptr {this_slot}"))
-        }),
-        "the `this` slot must be seeded with `undefined` in entry_allocas \
-         before the hoisted bind makes it live to the collector (#7202/#6968) \
-         — no such store for {this_slot}:\n{f}"
-    );
+        // A bound home must contain a valid non-pointer JSValue before its first
+        // bind. The pooled temporary uses +0.0; semantic locals use undefined.
+        // Check ordering as well as existence, and prove a missing seed fails.
+        let seeded_before_bind = |ir: &str| {
+            let first_bind = ir.lines().position(|l| {
+                l.contains("@js_shadow_slot_bind(")
+                    && l.trim_end().ends_with(&format!("ptr {this_slot})"))
+            });
+            let seed = ir.lines().position(|l| {
+                let l = l.trim();
+                (l.starts_with("store double 0.0, ")
+                    || l.starts_with("store double 0x7FFC000000000001, "))
+                    && l.ends_with(&format!("ptr {this_slot}"))
+            });
+            matches!((seed, first_bind), (Some(seed), Some(bind)) if seed < bind)
+        };
+        assert!(
+            seeded_before_bind(f),
+            "the `this` slot {this_slot} must contain a non-pointer JSValue before \
+         its first bind (#7202/#6968):\n{f}"
+        );
+        let missing_seed = f
+            .lines()
+            .filter(|l| {
+                !((l.trim().starts_with("store double 0.0, ")
+                    || l.trim().starts_with("store double 0x7FFC000000000001, "))
+                    && l.trim_end().ends_with(&format!("ptr {this_slot}")))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(
+            missing_seed, f,
+            "the seed negative control must alter the fixture"
+        );
+        assert!(
+            !seeded_before_bind(&missing_seed),
+            "the seed check accepted an uninitialized bound home"
+        );
+    }
 }
 
 /// #7200: `Object.assign(t, …sources)` threads its accumulator through a bare
@@ -1368,7 +1482,7 @@ fn the_inline_ctor_this_slot_is_bound_as_a_shadow_slot() {
 /// evidence. `Expr::Object` has rooted its accumulator since #6951; this arm
 /// never copied it.
 ///
-/// Sabotage check: drop the `temp_root_push_double`/`temp_root_set_double` pair
+/// Negative control: drop the `temp_root_push_double`/`temp_root_set_double` pair
 /// in the `Expr::ObjectAssign` arm and the accumulator operand stops being a
 /// `js_gc_temp_root_get` result.
 #[test]
@@ -1453,7 +1567,7 @@ fn the_object_assign_accumulator_is_rooted_across_each_source() {
 /// the value names from-space. `this.viaBlock = churn()` inside a
 /// `static { … }` block is the shipped shape.
 ///
-/// Sabotage check: remove the `guard_store_operand`/`reread_store_operand` pair
+/// Negative control: remove the `guard_store_operand`/`reread_store_operand` pair
 /// from the `dyn_inline` arm of `Expr::PutValueSet` and the handle load stops
 /// being re-emitted below the call.
 #[test]
@@ -1498,7 +1612,7 @@ fn a_put_value_set_key_is_re_derived_below_the_value() {
     // Before the fix there was exactly one such load and it sat above it.
     let alloc_idx = lines
         .iter()
-        .position(|l| l.contains("= call i64 @js_object_alloc(i32 0, i32 0)"))
+        .position(|l| is_empty_object_allocation(l))
         .and_then(|first| {
             // the value's allocation is the SECOND `js_object_alloc` (the first
             // is the receiver `o`)
@@ -1506,7 +1620,7 @@ fn a_put_value_set_key_is_re_derived_below_the_value() {
                 .iter()
                 .enumerate()
                 .skip(first + 1)
-                .find(|(_, l)| l.contains("= call i64 @js_object_alloc(i32 0, i32 0)"))
+                .find(|(_, l)| is_empty_object_allocation(l))
                 .map(|(i, _)| i)
         })
         .unwrap_or_else(|| panic!("no value allocation in:\n{f}"));
@@ -1529,7 +1643,7 @@ fn a_put_value_set_key_is_re_derived_below_the_value() {
 /// that can collect, so the slot cannot go stale and the frame must not grow
 /// for it.
 ///
-/// Sabotage check: drop the `instance_root.is_some()` guard around the bind in
+/// Negative control: drop the `instance_root.is_some()` guard around the bind in
 /// `lower_new_impl_inner` and this fails.
 #[test]
 fn a_collection_free_construction_emits_no_this_slot_root() {
@@ -1540,7 +1654,7 @@ fn a_collection_free_construction_emits_no_this_slot_root() {
     let ir = ir_for_new("new_inst_inert.ts", Vec::new());
     let f = init_ir(&ir);
     assert!(
-        f.contains("@js_object_alloc"),
+        f.lines().any(class_allocation),
         "the fixture must actually construct something:\n{f}"
     );
     assert_no_temp_rooting(
@@ -1549,11 +1663,14 @@ fn a_collection_free_construction_emits_no_this_slot_root() {
          instance temp root — the `this`-slot bind is gated on the same \
          predicate",
     );
+    // Inline births carry their header image directly and need no mutable
+    // class-key cache. The legacy allocator still needs that one cache bind.
+    let key_cache_binds = usize::from(!f.contains("@perry_birth_class("));
     assert_eq!(
         f.matches("@js_shadow_slot_bind").count(),
-        1,
-        "an inert construction needs only #7876's function-lifetime class-key \
-         root; it must not grow the shadow frame for a `this` slot that cannot \
-         go stale (#7202):\n{f}"
+        key_cache_binds,
+        "an inert construction needs only the legacy class-key cache root \
+         when that allocator is used; it must not grow the shadow frame for \
+         a `this` slot that cannot go stale (#7202):\n{f}"
     );
 }

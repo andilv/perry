@@ -588,6 +588,26 @@ pub(crate) fn gc_malloc_header_is_tracked(header: *const GcHeader) -> bool {
     })
 }
 
+/// Is `header` one of this agent's live malloc allocations? For cold
+/// paths only: precise-root verification, and the dirty-coverage repair that
+/// must prove a possibly stale external entry dereference-safe before touching
+/// it. Never on root admission. It leaves the lazy exact registry as it is: an
+/// active set answers directly, otherwise the live object vector is searched.
+#[cold]
+pub(crate) fn gc_malloc_header_is_local(header: *const GcHeader) -> bool {
+    if header.is_null() {
+        return false;
+    }
+    MALLOC_STATE.with(|s| {
+        let s = s.borrow();
+        if s.malloc_registry_available() {
+            s.set.contains(&(header as usize))
+        } else {
+            s.objects.contains(&(header as *mut GcHeader))
+        }
+    })
+}
+
 /// Reallocate a malloc-tracked object, preserving GcHeader.
 /// `old_user_ptr` is the pointer previously returned by gc_malloc.
 /// Returns new user pointer (after header).

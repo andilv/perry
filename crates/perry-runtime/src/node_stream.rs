@@ -24,9 +24,11 @@ use crate::closure::{
     js_closure_alloc, js_closure_get_capture_f64, js_closure_get_capture_ptr,
     js_closure_set_capture_f64, js_closure_set_capture_ptr, ClosureHeader,
 };
+#[cfg(test)]
+use crate::object::js_object_get_field_by_name_f64;
 use crate::object::js_object_set_field_by_name;
 #[cfg(test)]
-use crate::object::{js_object_get_field_by_name_f64, ObjectHeader};
+use crate::object::ObjectHeader;
 use crate::value::JSValue;
 
 pub(crate) mod async_iterator;
@@ -42,6 +44,7 @@ use event_emitter::{
     ns_prepend_once_listener2, ns_raw_listeners, ns_remove_all_listeners1, ns_remove_listener2,
     ns_set_max_listeners, remove_stream_listener_for_event, stream_listener_count_for_event,
 };
+pub(crate) use event_emitter::{emit_stream_event_rooted, RootedArgs};
 
 /// Dispatch `event` to the listeners registered on `stream` through node:stream's
 /// own emitter registry.
@@ -209,15 +212,9 @@ fn call_old_stream_on(old_stream: f64, event: &[u8], listener: *const ClosureHea
     let event_value = f64::from_bits(JSValue::string_ptr(event).bits());
     let listener_value = f64::from_bits(JSValue::pointer(listener as *const u8).bits());
     let args = [event_value, listener_value];
-    let method = b"on";
+    let method = crate::runtime_state_key!(b"on");
     unsafe {
-        let _ = crate::object::js_native_call_method(
-            old_stream,
-            method.as_ptr() as *const i8,
-            method.len(),
-            args.as_ptr(),
-            args.len(),
-        );
+        let _ = method.call_value(old_stream, args.as_ptr(), args.len());
     }
 }
 
@@ -405,7 +402,7 @@ extern "C" fn ns_finished_default_completion(
         || has_truthy_hidden(stream, hidden_end_emitted_key());
     let writable_done = !js_node_stream_has_writable_side(stream)
         || has_truthy_hidden(stream, hidden_finish_emitted_key());
-    let closed = has_truthy_hidden(stream, hidden_key(b"closed"));
+    let closed = has_truthy_hidden(stream, crate::runtime_state_key!(b"closed"));
     let error = readable_hidden_error(stream);
     if error.is_none() && !closed && !(readable_done && writable_done) {
         return f64::from_bits(TAG_UNDEFINED);
@@ -543,7 +540,28 @@ extern "C" fn ns_emit_rest(
         raw_ptr_from_value(rest) as *const _,
     )
 }
-/// A method-call site's miss (`NmEeOps::emit_call`): when `recv`'s shapes
+
+/// The prototype's emit body consumes the caller's argument slice directly.
+/// This same body is callable from holder entries and reflected method values.
+unsafe extern "C" fn ns_emit_args(
+    closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+    args: *const f64,
+    len: usize,
+) -> f64 {
+    let args = if args.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(args, len)
+    };
+    let target = this_value(closure, this);
+    match args.split_first() {
+        Some((event, rest)) => event_emitter::emit_stream_event(target, *event, rest),
+        None => event_emitter::emit_stream_event(target, f64::from_bits(TAG_UNDEFINED), &[]),
+    }
+}
+
+/// Test witness for argument-list emit dispatch: when `recv`'s shapes
 /// resolve the requested name to an ordinary data property holding
 /// the emitter `emit` body (every emitter prototype and stream table installs
 /// the one body), run it with the call's arguments as they arrived -- the
@@ -553,6 +571,7 @@ extern "C" fn ns_emit_rest(
 ///
 /// # Safety
 /// `args_ptr` holds `argc` values (or is null with `argc == 0`).
+#[cfg(test)]
 pub(crate) unsafe fn emitter_emit_call(
     recv: f64,
     key: i64,
@@ -576,7 +595,7 @@ pub(crate) unsafe fn emitter_emit_call(
     }
     let closure = addr as *const ClosureHeader;
     let info = (*closure).info.as_ref()?;
-    if info.code != ns_emit_rest as *const u8 {
+    if info.code != ns_emit_args as *const u8 {
         return None;
     }
     let args: &[f64] = if args_ptr.is_null() || argc == 0 {
@@ -674,7 +693,7 @@ fn append_readable_output_chunk(stream: f64, chunk: f64) -> f64 {
     let prev = get_hidden_value(stream, hidden_buffered_key()).unwrap_or(0.0);
     let total = prev + added;
     set_hidden_value(stream, hidden_buffered_key(), total);
-    set_hidden_value(stream, hidden_key(b"readableLength"), total);
+    set_hidden_value(stream, crate::runtime_state_key!(b"readableLength"), total);
     if added > 0.0 {
         push_readable_buffered_chunk(stream, chunk);
         mark_readable_live_push(stream);
@@ -903,7 +922,7 @@ fn unshift_chunk(stream: f64, chunk: f64) -> f64 {
     let prev = get_hidden_value(stream, hidden_buffered_key()).unwrap_or(0.0);
     let total = prev + added;
     set_hidden_value(stream, hidden_buffered_key(), total);
-    set_hidden_value(stream, hidden_key(b"readableLength"), total);
+    set_hidden_value(stream, crate::runtime_state_key!(b"readableLength"), total);
     if added > 0.0 {
         unshift_readable_buffered_chunk(stream, chunk);
         mark_readable_live_push(stream);
@@ -1324,7 +1343,8 @@ fn writable_default_encoding(stream: f64) -> f64 {
 
 fn writable_backpressure_return(stream: f64) -> f64 {
     let len = writable_length(stream);
-    let hwm = get_hidden_value(stream, hidden_key(b"writableHighWaterMark")).unwrap_or(16384.0);
+    let hwm = get_hidden_value(stream, crate::runtime_state_key!(b"writableHighWaterMark"))
+        .unwrap_or(16384.0);
     let ok = len < hwm || len == 0.0;
     set_writable_need_drain(stream, !ok);
     f64::from_bits(if ok { TAG_TRUE } else { TAG_FALSE })
@@ -1492,7 +1512,7 @@ pub extern "C" fn js_node_stream_method_unshift(stream_handle: i64, chunk: f64) 
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_readable_hwm(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, hidden_key(b"readableHighWaterMark")).unwrap_or(16384.0)
+    get_hidden_value(stream, crate::runtime_state_key!(b"readableHighWaterMark")).unwrap_or(16384.0)
 }
 
 /// `stream.readableLength` property getter on a typed instance.
@@ -1506,8 +1526,7 @@ pub extern "C" fn js_node_stream_method_readable_length(stream_handle: i64) -> f
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_readable_object_mode(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, hidden_key(b"readableObjectMode"))
-        .unwrap_or_else(|| f64::from_bits(TAG_FALSE))
+    get_hidden_value(stream, Slot::ReadableObjectMode).unwrap_or_else(|| f64::from_bits(TAG_FALSE))
 }
 
 /// `stream.readable` property getter on a typed readable-side instance.
@@ -1543,7 +1562,7 @@ pub extern "C" fn js_node_stream_method_readable_encoding(stream_handle: i64) ->
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_writable_hwm(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, hidden_key(b"writableHighWaterMark")).unwrap_or(16384.0)
+    get_hidden_value(stream, crate::runtime_state_key!(b"writableHighWaterMark")).unwrap_or(16384.0)
 }
 
 /// `stream.writableLength` property getter on a typed instance.
@@ -1567,8 +1586,7 @@ pub extern "C" fn js_node_stream_method_writable_need_drain(stream_handle: i64) 
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_writable_object_mode(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, hidden_key(b"writableObjectMode"))
-        .unwrap_or_else(|| f64::from_bits(TAG_FALSE))
+    get_hidden_value(stream, Slot::WritableObjectMode).unwrap_or_else(|| f64::from_bits(TAG_FALSE))
 }
 
 /// `stream.readableAborted` property getter on a typed readable-side instance.
@@ -1582,7 +1600,7 @@ pub extern "C" fn js_node_stream_method_readable_aborted(stream_handle: i64) -> 
 pub extern "C" fn js_node_stream_method_closed(stream_handle: i64) -> f64 {
     get_hidden_value(
         stream_value_from_handle(stream_handle),
-        hidden_key(b"closed"),
+        crate::runtime_state_key!(b"closed"),
     )
     .unwrap_or(f64::from_bits(TAG_FALSE))
 }
@@ -1653,7 +1671,7 @@ pub extern "C" fn js_node_stream_method_writable_finished(stream_handle: i64) ->
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_allow_half_open(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, hidden_key(b"allowHalfOpen"))
+    get_hidden_value(stream, crate::runtime_state_key!(b"allowHalfOpen"))
         .unwrap_or_else(|| f64::from_bits(TAG_UNDEFINED))
 }
 
@@ -1840,14 +1858,14 @@ mod destroy_state;
 pub(crate) mod native_hooks;
 mod proto_methods;
 mod state_record;
-#[cfg(test)]
-pub(crate) use state_record::{test_read_inert_slot, test_record_slot_bits, test_write_inert_slot};
+pub(crate) use proto_methods::{install_stream_prototype_methods, StreamProto};
+use state_record::*;
 pub(crate) use state_record::{
     is_stream_record_word, record_alias_word, record_payload_cell, store_record_alias_word,
     store_record_payload_cell,
 };
-use state_record::*;
-pub(crate) use proto_methods::{install_stream_prototype_methods, StreamProto};
+#[cfg(test)]
+pub(crate) use state_record::{test_read_inert_slot, test_record_slot_bits, test_write_inert_slot};
 mod write_state;
 pub use constructors::{init_transform_in_place, init_writable_payload_in_place};
 use write_state::*;

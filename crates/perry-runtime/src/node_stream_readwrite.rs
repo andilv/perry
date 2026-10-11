@@ -1,7 +1,10 @@
 //! node:stream readable/writable state, split from node_stream.rs for #1987.
 use super::*;
 use crate::closure::{js_closure_alloc, js_closure_set_capture_f64, js_closure_set_capture_ptr};
-use crate::object::{js_object_get_field_by_name_f64, js_object_set_field_by_name, ObjectHeader};
+use crate::gc::RuntimeHandle;
+#[cfg(test)]
+use crate::object::js_object_get_field_by_name_f64;
+use crate::object::{js_object_set_field_by_name, ObjectHeader};
 use crate::value::JSValue;
 
 /// Record that a consumer received a chunk — Node's
@@ -48,80 +51,24 @@ pub(super) unsafe fn own_field_by_key_bytes(obj: *const ObjectHeader, key: &[u8]
     None
 }
 
-crate::perry_thread_local! {
-    /// This thread's string for each hidden-key literal, by the literal's address.
-    ///
-    /// The values are raw heap addresses, so this table is a GC root: the
-    /// longlived arena is swept like any other (an unmarked longlived string
-    /// is reclaimed by a full mark-sweep), and only a registered scanner keeps
-    /// these strings marked and the addresses current. `hidden_key_root_scanner`
-    /// is that scanner, registered with the first entry on each thread.
-    static HIDDEN_KEYS: std::cell::RefCell<std::collections::HashMap<(usize, usize), usize>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    static HIDDEN_KEYS_SCANNER_REGISTERED: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
-}
-
-pub(crate) fn hidden_key_root_scanner(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    HIDDEN_KEYS.with(|keys| {
-        for key in keys.borrow_mut().values_mut() {
-            visitor.visit_tagged_usize_slot(key, crate::value::STRING_TAG);
-        }
-    });
-}
-
-fn ensure_hidden_key_scanner() {
-    HIDDEN_KEYS_SCANNER_REGISTERED.with(|registered| {
-        if !registered.get() {
-            crate::gc::gc_register_mutable_root_scanner_named(
-                "node_stream_hidden_keys",
-                hidden_key_root_scanner,
-            );
-            registered.set(true);
-        }
-    });
-}
-
-/// The string for a hidden-field name. Callers read the stream before they take
-/// the key (`set_hidden_value(stream, hidden_key(K), v)`), so taking a key must
-/// never collect (#11828). Each literal gets one longlived string per thread,
-/// made with collection held off and kept alive (and current) by
-/// `hidden_key_root_scanner`.
+/// Canonical trie keys share the runtime's existing atom and GC machinery.
+/// Taking a key cannot collect: callers may already hold an unrooted receiver.
 pub(super) fn hidden_key(bytes: &'static [u8]) -> *mut crate::string::StringHeader {
-    let id = (bytes.as_ptr() as usize, bytes.len());
-    if let Some(key) = HIDDEN_KEYS.with(|keys| keys.borrow().get(&id).copied()) {
-        return key as *mut crate::string::StringHeader;
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let hash = crate::object::key_bytes_hash(bytes.as_ptr(), bytes.len());
+    #[cfg(test)]
+    if std::env::var_os("PERRY_TEST_STREAM_LITERAL_KEY").is_some() {
+        return crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
     }
-    ensure_hidden_key_scanner();
-    let key = {
-        let _no_gc = crate::gc::GcSuppressScope::new();
-        crate::string::js_string_from_bytes_longlived(bytes.as_ptr(), bytes.len() as u32)
-    };
-    HIDDEN_KEYS.with(|keys| keys.borrow_mut().insert(id, key as usize));
-    key
+    // The canonical-keys trie adopts these same atoms (Appended::atomized).
+    // Resolve text identity at its source; traversing a singleton trie list
+    // here would add the trie's edge HashMap probe to every construction.
+    crate::string::js_string_pool_atom(bytes.as_ptr(), bytes.len() as u32, hash, 0)
 }
 
-/// Test hooks for `gc/tests/runtime_roots/hidden_keys.rs`.
 #[cfg(test)]
 pub(crate) fn hidden_key_for_test(bytes: &'static [u8]) -> *mut crate::string::StringHeader {
     hidden_key(bytes)
-}
-
-#[cfg(test)]
-pub(crate) fn hidden_key_peek_for_test(bytes: &'static [u8]) -> Option<usize> {
-    let id = (bytes.as_ptr() as usize, bytes.len());
-    HIDDEN_KEYS.with(|keys| keys.borrow().get(&id).copied())
-}
-
-#[cfg(test)]
-pub(crate) fn hidden_key_set_for_test(bytes: &'static [u8], addr: usize) {
-    let id = (bytes.as_ptr() as usize, bytes.len());
-    HIDDEN_KEYS.with(|keys| keys.borrow_mut().insert(id, addr));
-}
-
-#[cfg(test)]
-pub(crate) fn hidden_key_scanner_for_test() -> crate::gc::MutableRootScanner {
-    hidden_key_root_scanner
 }
 
 pub(super) fn string_value_eq(value: f64, expected: &[u8]) -> bool {
@@ -158,6 +105,7 @@ pub(super) fn object_ptr_from_value(value: f64) -> Option<*mut ObjectHeader> {
 /// on a prototype, so they are read as own properties: a missing private key
 /// must not walk the prototype chain. Public names (`destroyed`, `autoDestroy`, …) keep ordinary [[Get]],
 /// since a subclass or an options object may supply them by inheritance.
+#[cfg(test)]
 fn is_private_key(key: *const crate::string::StringHeader) -> bool {
     const PRIVATE: &[u8] = b"__perry";
     if key.is_null() {
@@ -182,9 +130,37 @@ pub(super) trait StateKey: Copy {
     fn write(self, value: f64, field_value: f64);
 }
 
+/// Named writes may still define a key; only named reads require a site.
+pub(super) trait StateKeyWrite: Copy {
+    fn write(self, value: f64, field_value: f64);
+}
+impl<K: StateKey> StateKeyWrite for K {
+    fn write(self, value: f64, field_value: f64) {
+        StateKey::write(self, value, field_value);
+    }
+}
+#[cfg(not(test))]
+impl StateKeyWrite for *mut crate::string::StringHeader {
+    fn write(self, value: f64, field_value: f64) {
+        set_named_hidden_value(value, self, field_value);
+    }
+}
+
 impl StateKey for Slot {
     #[inline]
     fn read(self, value: f64) -> Option<f64> {
+        #[cfg(test)]
+        if std::env::var_os("PERRY_TEST_STREAM_MODE_BY_NAME").is_some() {
+            match self {
+                Slot::ReadableObjectMode => {
+                    return StateKey::read(hidden_key(b"readableObjectMode"), value)
+                }
+                Slot::WritableObjectMode => {
+                    return StateKey::read(hidden_key(b"writableObjectMode"), value)
+                }
+                _ => {}
+            }
+        }
         read_slot(value, self)
     }
     #[inline]
@@ -193,6 +169,7 @@ impl StateKey for Slot {
     }
 }
 
+#[cfg(test)]
 impl StateKey for *mut crate::string::StringHeader {
     fn read(self, value: f64) -> Option<f64> {
         let obj = object_ptr_from_value(value)?;
@@ -210,6 +187,30 @@ impl StateKey for *mut crate::string::StringHeader {
     }
     fn write(self, value: f64, field_value: f64) {
         set_named_hidden_value(value, self, field_value)
+    }
+}
+
+impl StateKey for crate::runtime_state_key::NamedStateKey {
+    fn read(self, value: f64) -> Option<f64> {
+        // Use the site's existing checked receiver entry, rather than a
+        // buffer-registry lookup followed by the general GC type classifier.
+        let obj = crate::object::field_get_set::runtime_read_site::object_receiver(value)?;
+        let result = unsafe {
+            if self.bytes.starts_with(b"__perry") {
+                self.read_own(obj)?
+            } else {
+                self.read_object(obj)
+            }
+        };
+        (result.to_bits() != TAG_UNDEFINED).then_some(result)
+    }
+    fn write(self, value: f64, field_value: f64) {
+        if let Some(obj) = crate::object::field_get_set::runtime_read_site::object_receiver(value) {
+            if unsafe { self.write_existing(obj, field_value) } {
+                return;
+            }
+        }
+        set_named_hidden_value(value, hidden_key(self.bytes), field_value);
     }
 }
 
@@ -247,8 +248,8 @@ pub(crate) fn is_classic_stream_instance_of(value: f64, constructor_name: &str) 
 
 /// Write a stream's runtime state: a record slot, or a named property.
 #[inline]
-pub(super) fn set_hidden_value(value: f64, key: impl StateKey, field_value: f64) {
-    key.write(value, field_value)
+pub(super) fn set_hidden_value(value: f64, key: impl StateKeyWrite, field_value: f64) {
+    StateKeyWrite::write(key, value, field_value)
 }
 
 /// A named non-enumerable own property the runtime keeps on an object
@@ -284,11 +285,11 @@ pub(super) fn set_internal_value(value: f64, key: Slot, field_value: f64) {
 /// (`_readableState`, `_writableState`, `allowHalfOpen`): an ordinary store.
 pub(super) fn set_visible_own_value(
     value: f64,
-    key: *mut crate::string::StringHeader,
+    key: crate::runtime_state_key::NamedStateKey,
     field_value: f64,
 ) {
-    if let Some(obj) = object_ptr_from_value(value) {
-        js_object_set_field_by_name(obj, key, field_value);
+    if object_ptr_from_value(value).is_some() {
+        key.write_value(value, field_value);
     }
 }
 
@@ -325,15 +326,18 @@ pub(super) fn has_truthy_hidden(stream: f64, key: impl StateKey) -> bool {
 }
 
 pub(super) fn stream_destroyed(stream: f64) -> bool {
-    has_truthy_hidden(stream, hidden_key(b"destroyed"))
+    has_truthy_hidden(stream, crate::runtime_state_key!(b"destroyed"))
 }
 
-pub(super) fn set_stream_auto_destroy(stream: f64, opts: f64) {
-    let enabled = get_hidden_value(opts, hidden_key(b"autoDestroy"))
-        .map(|v| v.to_bits() != TAG_FALSE)
-        .unwrap_or(true);
+pub(super) fn set_stream_auto_destroy(stream: &RuntimeHandle<'_>, opts: &RuntimeHandle<'_>) {
+    let enabled = get_hidden_value(
+        opts.get_nanbox_f64(),
+        crate::runtime_state_key!(b"autoDestroy"),
+    )
+    .map(|v| v.to_bits() != TAG_FALSE)
+    .unwrap_or(true);
     set_hidden_value(
-        stream,
+        stream.get_nanbox_f64(),
         hidden_stream_auto_destroy_key(),
         f64::from_bits(if enabled { TAG_TRUE } else { TAG_FALSE }),
     );
@@ -345,12 +349,15 @@ pub(super) fn stream_auto_destroy_enabled(stream: f64) -> bool {
         .unwrap_or(true)
 }
 
-pub(super) fn set_stream_emit_close(stream: f64, opts: f64) {
-    let enabled = get_hidden_value(opts, hidden_key(b"emitClose"))
-        .map(|v| v.to_bits() != TAG_FALSE)
-        .unwrap_or(true);
+pub(super) fn set_stream_emit_close(stream: &RuntimeHandle<'_>, opts: &RuntimeHandle<'_>) {
+    let enabled = get_hidden_value(
+        opts.get_nanbox_f64(),
+        crate::runtime_state_key!(b"emitClose"),
+    )
+    .map(|v| v.to_bits() != TAG_FALSE)
+    .unwrap_or(true);
     set_hidden_value(
-        stream,
+        stream.get_nanbox_f64(),
         hidden_stream_emit_close_key(),
         f64::from_bits(if enabled { TAG_TRUE } else { TAG_FALSE }),
     );
@@ -371,14 +378,19 @@ pub(super) fn mark_stream_closed_and_emit_close(stream: f64) {
 }
 
 pub(super) fn mark_stream_destroyed(stream: f64) {
-    set_hidden_value(stream, hidden_key(b"destroyed"), f64::from_bits(TAG_TRUE));
+    set_hidden_value(
+        stream,
+        crate::runtime_state_key!(b"destroyed"),
+        f64::from_bits(TAG_TRUE),
+    );
     refresh_readable_aborted_flag(stream);
     // autoDestroy at normal completion releases a native stream's codec.
     super::native_hooks::release_on_destroy(stream);
 }
 
 pub(super) fn readable_flowing_value(stream: f64) -> f64 {
-    get_hidden_value(stream, readable_flowing_key()).unwrap_or(f64::from_bits(TAG_NULL))
+    get_hidden_value(stream, crate::runtime_state_key!(b"readableFlowing"))
+        .unwrap_or(f64::from_bits(TAG_NULL))
 }
 
 pub(super) fn readable_is_flowing(stream: f64) -> bool {
@@ -399,7 +411,7 @@ pub(super) fn should_defer_initial_data_emit(stream: f64) -> bool {
 
 pub(super) fn set_readable_flowing(stream: f64, value: f64) {
     if get_hidden_value(stream, hidden_readable_flag_key()).is_some() {
-        set_hidden_value(stream, readable_flowing_key(), value);
+        set_hidden_value(stream, crate::runtime_state_key!(b"readableFlowing"), value);
     }
 }
 
@@ -678,16 +690,12 @@ fn is_small_native_handle_destination(value: f64) -> bool {
     raw > 0 && raw < 0x0010_0000
 }
 
-fn call_small_native_pipe_method(dest: f64, method: &'static [u8], args: &[f64]) -> f64 {
-    unsafe {
-        crate::object::js_native_call_method(
-            dest,
-            method.as_ptr() as *const i8,
-            method.len(),
-            args.as_ptr(),
-            args.len(),
-        )
-    }
+fn call_small_native_pipe_method(
+    dest: f64,
+    method: crate::runtime_state_key::NamedStateKey,
+    args: &[f64],
+) -> f64 {
+    unsafe { method.call_value(dest, args.as_ptr(), args.len()) }
 }
 
 pub(super) fn remove_pipe_no_end_destination_once(stream: f64, dest: f64) -> bool {
@@ -891,7 +899,7 @@ pub(super) fn clear_readable_buffer(stream: f64) {
         box_pointer(crate::array::js_array_alloc(0) as *const u8),
     );
     set_hidden_value(stream, hidden_buffered_key(), 0.0);
-    set_hidden_value(stream, hidden_key(b"readableLength"), 0.0);
+    set_hidden_value(stream, crate::runtime_state_key!(b"readableLength"), 0.0);
 }
 
 pub(super) fn clear_pending_readable_chunks(stream: f64) {
@@ -1000,7 +1008,7 @@ pub(super) fn readable_hidden_chunks(value: f64) -> Option<f64> {
 }
 
 pub(super) fn readable_object_mode(value: f64) -> bool {
-    has_truthy_hidden(value, hidden_key(b"readableObjectMode"))
+    has_truthy_hidden(value, Slot::ReadableObjectMode)
 }
 
 pub(super) fn readable_chunks_nonempty(stream: f64) -> bool {
@@ -1027,7 +1035,7 @@ pub(super) fn readable_aborted_value(stream: f64) -> f64 {
     if get_hidden_value(stream, hidden_readable_flag_key()).is_none() {
         return f64::from_bits(TAG_FALSE);
     }
-    let destroyed = has_truthy_hidden(stream, hidden_key(b"destroyed"));
+    let destroyed = has_truthy_hidden(stream, crate::runtime_state_key!(b"destroyed"));
     let errored = readable_hidden_error(stream).is_some();
     let ended = stream_hidden_ended(stream) || has_truthy_hidden(stream, hidden_end_emitted_key());
     if (destroyed || errored) && !ended {
@@ -1041,7 +1049,7 @@ pub(super) fn refresh_readable_aborted_flag(stream: f64) {
     if get_hidden_value(stream, hidden_readable_flag_key()).is_some() {
         set_hidden_value(
             stream,
-            hidden_key(b"readableAborted"),
+            crate::runtime_state_key!(b"readableAborted"),
             readable_aborted_value(stream),
         );
     }
@@ -1162,7 +1170,7 @@ pub(super) fn set_writable_length(stream: f64, len: f64) {
     if get_hidden_value(stream, hidden_writable_flag_key()).is_some() {
         let len = len.max(0.0);
         set_hidden_value(stream, hidden_writable_length_key(), len);
-        set_hidden_value(stream, hidden_key(b"writableLength"), len);
+        set_hidden_value(stream, crate::runtime_state_key!(b"writableLength"), len);
     }
 }
 
@@ -1185,7 +1193,7 @@ pub(super) fn writable_need_drain_raw(stream: f64) -> bool {
 pub(super) fn writable_need_drain(stream: f64) -> bool {
     writable_need_drain_raw(stream)
         && !stream_hidden_ended(stream)
-        && !has_truthy_hidden(stream, hidden_key(b"destroyed"))
+        && !has_truthy_hidden(stream, crate::runtime_state_key!(b"destroyed"))
 }
 
 pub(super) fn set_writable_need_drain(stream: f64, need_drain: bool) {
@@ -1198,7 +1206,7 @@ pub(super) fn set_writable_need_drain(stream: f64, need_drain: bool) {
         );
         set_hidden_value(
             stream,
-            hidden_key(b"writableNeedDrain"),
+            crate::runtime_state_key!(b"writableNeedDrain"),
             f64::from_bits(value),
         );
     }
@@ -1208,7 +1216,7 @@ pub(super) fn set_writable_corked_count(stream: f64, count: f64) {
     if get_hidden_value(stream, hidden_writable_flag_key()).is_some() {
         let count = count.max(0.0);
         set_hidden_value(stream, hidden_writable_corked_key(), count);
-        set_hidden_value(stream, hidden_key(b"writableCorked"), count);
+        set_hidden_value(stream, crate::runtime_state_key!(b"writableCorked"), count);
     }
 }
 
@@ -1279,88 +1287,89 @@ pub(super) fn build_writev_chunks(buffered: *const crate::array::ArrayHeader, le
     box_pointer(chunks as *const u8)
 }
 
-pub(super) fn rebind_callback_this(callback: f64, stream: f64) -> f64 {
-    f64::from_bits(crate::closure::clone_closure_rebind_this(
-        callback.to_bits(),
-        stream,
-    ))
-}
-
 pub(super) fn read_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"read"))
+    get_hidden_value(opts, crate::runtime_state_key!(b"read"))
 }
 
 pub(super) fn write_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"write"))
+    get_hidden_value(opts, crate::runtime_state_key!(b"write"))
 }
 
 pub(super) fn writev_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"writev"))
+    get_hidden_value(opts, crate::runtime_state_key!(b"writev"))
 }
 
 pub(super) fn transform_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"transform"))
+    get_hidden_value(opts, crate::runtime_state_key!(b"transform"))
 }
 
 pub(super) fn transform_flush_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"flush"))
+    get_hidden_value(opts, crate::runtime_state_key!(b"flush"))
 }
 
 pub(super) fn construct_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"construct")).filter(|v| is_callable_value(*v))
+    get_hidden_value(opts, crate::runtime_state_key!(b"construct"))
+        .filter(|v| is_callable_value(*v))
 }
 
 pub(super) fn destroy_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"destroy")).filter(|v| is_callable_value(*v))
+    get_hidden_value(opts, crate::runtime_state_key!(b"destroy")).filter(|v| is_callable_value(*v))
 }
 
 pub(super) fn final_callback_from_options(opts: f64) -> Option<f64> {
-    get_hidden_value(opts, hidden_key(b"final")).filter(|v| is_callable_value(*v))
+    get_hidden_value(opts, crate::runtime_state_key!(b"final")).filter(|v| is_callable_value(*v))
 }
 
-pub(super) fn install_common_lifecycle_callbacks(stream: f64, opts: f64) {
-    if let Some(destroy) = destroy_callback_from_options(opts) {
-        set_hidden_value(
-            stream,
-            STREAM_DESTROY_KEY,
-            rebind_callback_this(destroy, stream),
-        );
+pub(super) fn install_common_lifecycle_callbacks(
+    stream: &RuntimeHandle<'_>,
+    opts: &RuntimeHandle<'_>,
+) {
+    if let Some(destroy) = destroy_callback_from_options(opts.get_nanbox_f64()) {
+        set_hidden_value(stream.get_nanbox_f64(), STREAM_DESTROY_KEY, destroy);
     }
 }
 
-pub(super) fn install_writable_lifecycle_callbacks(stream: f64, opts: f64) {
-    if let Some(final_callback) = final_callback_from_options(opts) {
+pub(super) fn install_writable_lifecycle_callbacks(
+    stream: &RuntimeHandle<'_>,
+    opts: &RuntimeHandle<'_>,
+) {
+    if let Some(final_callback) = final_callback_from_options(opts.get_nanbox_f64()) {
         set_hidden_value(
-            stream,
+            stream.get_nanbox_f64(),
             hidden_writable_final_key(),
-            rebind_callback_this(final_callback, stream),
+            final_callback,
         );
         set_hidden_value(
-            stream,
+            stream.get_nanbox_f64(),
             hidden_writable_final_invoked_key(),
             f64::from_bits(TAG_FALSE),
         );
         set_hidden_value(
-            stream,
+            stream.get_nanbox_f64(),
             hidden_writable_final_pending_key(),
             f64::from_bits(TAG_FALSE),
         );
     }
 }
 
-pub(super) fn invoke_construct_callback(stream: f64, opts: f64) {
-    let Some(construct) = construct_callback_from_options(opts) else {
+pub(super) fn invoke_construct_callback(stream: &RuntimeHandle<'_>, opts: &RuntimeHandle<'_>) {
+    let Some(construct) = construct_callback_from_options(opts.get_nanbox_f64()) else {
         return;
     };
-    let construct = rebind_callback_this(construct, stream);
-    set_hidden_value(stream, STREAM_CONSTRUCT_KEY, construct);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let construct = scope.root_nanbox_f64(construct);
+    set_hidden_value(
+        stream.get_nanbox_f64(),
+        STREAM_CONSTRUCT_KEY,
+        construct.get_nanbox_f64(),
+    );
     let cb = js_closure_alloc(crate::fn_info!(ns_construct_callback_done, 1), 1);
-    js_closure_set_capture_f64(cb, 0, stream);
+    js_closure_set_capture_f64(cb, 0, stream.get_nanbox_f64());
     let cb_value = f64::from_bits(JSValue::pointer(cb as *const u8).bits());
     unsafe {
         let _ = crate::closure::native_call_value_this(
-            construct,
-            crate::closure::JsThis::from_f64(stream),
+            construct.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(stream.get_nanbox_f64()),
             [cb_value].as_ptr(),
             1,
         );
@@ -1397,7 +1406,7 @@ fn resolve_read_callback(stream: f64) -> Option<f64> {
     if let Some(read) = get_hidden_value(stream, hidden_read_key()) {
         return Some(read);
     }
-    get_hidden_value(stream, hidden_key(b"_read")).filter(|v| is_callable_value(*v))
+    get_hidden_value(stream, crate::runtime_state_key!(b"_read")).filter(|v| is_callable_value(*v))
 }
 
 fn invoke_read_once_inner(stream: f64, emit_default_error: bool) {
@@ -1614,22 +1623,26 @@ pub(super) fn initialize_readable_from_buffered_length(readable: f64, chunks: f6
         bytes.len() as f64
     };
     set_hidden_value(readable, hidden_buffered_key(), length);
-    set_hidden_value(readable, hidden_key(b"readableLength"), length);
+    set_hidden_value(
+        readable,
+        crate::runtime_state_key!(b"readableLength"),
+        length,
+    );
 }
 
 pub(super) fn readable_from_options(opts: f64) -> f64 {
     let merged = crate::object::js_object_alloc(0, 2);
-    let object_mode =
-        get_hidden_value(opts, hidden_key(b"objectMode")).is_none_or(|v| v.to_bits() != TAG_FALSE);
+    let object_mode = get_hidden_value(opts, crate::runtime_state_key!(b"objectMode"))
+        .is_none_or(|v| v.to_bits() != TAG_FALSE);
     set_hidden_value(
         box_pointer(merged as *const u8),
-        hidden_key(b"objectMode"),
+        crate::runtime_state_key!(b"objectMode"),
         f64::from_bits(if object_mode { TAG_TRUE } else { TAG_FALSE }),
     );
-    let hwm = opt_number(opts, b"highWaterMark").unwrap_or(1.0);
+    let hwm = opt_number(opts, crate::runtime_state_key!(b"highWaterMark")).unwrap_or(1.0);
     set_hidden_value(
         box_pointer(merged as *const u8),
-        hidden_key(b"highWaterMark"),
+        crate::runtime_state_key!(b"highWaterMark"),
         hwm,
     );
     box_pointer(merged as *const u8)

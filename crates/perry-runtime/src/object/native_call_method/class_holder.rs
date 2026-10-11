@@ -121,7 +121,7 @@ pub(crate) unsafe fn key_position(
 /// no exotic read), so that its shape's key list plus its dictionary storage
 /// (when it has any) are all its own string-keyed properties?
 #[inline]
-unsafe fn shape_answers(addr: usize) -> bool {
+pub(crate) unsafe fn shape_answers(addr: usize) -> bool {
     if !crate::value::addr_class::is_above_handle_band(addr) {
         return false;
     }
@@ -142,13 +142,18 @@ unsafe fn shape_answers(addr: usize) -> bool {
     let meta = (*obj).meta;
     meta.is_null()
         || ((*meta).elements == 0
-            && (*meta).flags & crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER == 0)
+            && (*meta).flags
+                & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
+                    | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
+                == 0)
 }
 
 /// The [[Prototype]] of holder `obj` as its link records it: `Ok(Some)` an
 /// object, `Ok(None)` null, `Err(())` a link the shape alone does not name.
 #[inline]
-unsafe fn next_holder(obj: *const ObjectHeader) -> Result<Option<*const ObjectHeader>, ()> {
+pub(crate) unsafe fn next_holder(
+    obj: *const ObjectHeader,
+) -> Result<Option<*const ObjectHeader>, ()> {
     use crate::object::shapes::{PROTO_ID_DEFAULT, PROTO_ID_NULL};
     let word = crate::object::shapes::object_prototype_word(obj);
     if word != 0 {
@@ -281,7 +286,7 @@ pub(crate) unsafe fn class_instance_prototype(obj: *const ObjectHeader) -> *cons
         return word_object(word);
     }
     match shape_named_class(obj) {
-        Some(class_id) => crate::object::class_value::class_decl_prototype_link(class_id),
+        Some(class_id) => word_object(crate::object::class_holder_word_selected(class_id)),
         None => std::ptr::null(),
     }
 }
@@ -297,10 +302,6 @@ pub(crate) unsafe fn class_instance_prototype(obj: *const ObjectHeader) -> *cons
 /// `obj` is a live object that passed [`class_receiver_guard`].
 #[inline]
 unsafe fn guarded_class_instance_prototype(obj: *const ObjectHeader) -> *const ObjectHeader {
-    let own = crate::object::class_value::class_decl_prototype_link((*obj).class_id);
-    if !own.is_null() {
-        return own;
-    }
     class_instance_prototype(obj)
 }
 
@@ -324,23 +325,21 @@ fn word_object(word: u64) -> *const ObjectHeader {
 pub(crate) unsafe fn class_instance_prototype_built(
     obj: *const ObjectHeader,
 ) -> *const ObjectHeader {
-    let existing = class_instance_prototype(obj);
-    if !existing.is_null() {
-        return existing;
-    }
-    if crate::object::shapes::object_prototype_word(obj) != 0 {
-        return std::ptr::null();
+    let recorded = crate::object::shapes::object_prototype_word(obj);
+    if recorded != 0 {
+        return word_object(recorded);
     }
     let Some(class_id) = shape_named_class(obj) else {
         return std::ptr::null();
     };
-    let v = crate::object::class_registry::class_decl_prototype_value(class_id);
-    let v = crate::JSValue::from_bits(v.to_bits());
-    if v.is_pointer() {
-        v.as_pointer::<ObjectHeader>() as *const ObjectHeader
-    } else {
-        std::ptr::null()
+    let word = crate::object::class_holder_word_selected(class_id);
+    let existing = word_object(word);
+    if !existing.is_null() {
+        return existing;
     }
+    word_object(
+        crate::object::class_registry::class_decl_prototype_value_selected(class_id).to_bits(),
+    )
 }
 
 /// The iterator-helper names (`crate::iterator_helpers::is_iterator_helper_method`),
@@ -579,30 +578,22 @@ pub(crate) unsafe fn call_chain_value(
 /// # Safety
 /// `recv` roots a live object receiver.
 #[inline(never)]
-pub(crate) unsafe fn class_instance_method_value(
+pub(crate) unsafe fn class_instance_property_value(
     recv: &crate::gc::RuntimeHandle,
     key: &MethodKey<'_>,
 ) -> Option<u64> {
     let obj = crate::value::js_nanbox_get_pointer(recv.get_nanbox_f64()) as *const ObjectHeader;
     let start = class_instance_prototype_built(obj);
     if start.is_null() {
-        return None;
+        return (crate::object::shapes::object_prototype_word(obj) == crate::value::TAG_NULL)
+            .then_some(crate::value::TAG_UNDEFINED);
     }
     let holder = match chain_method(start, key) {
         // A built-in a prototype inherits from the realm (`toString` on
         // `%Object.prototype%`, a native base's methods) keeps the tower's
         // own native arms, exactly as before the chain answered.
-        ChainMethod::Data { value, .. } => {
-            // A no-op-backed intrinsic (`Response.prototype.text` on a native
-            // base) re-dispatches its call by name on the receiver (#11700):
-            // the tower's native arms answer it instead.
-            let name = std::str::from_utf8(key.bytes).ok()?;
-            if super::is_self_redispatching_proto_method(f64::from_bits(value), name) {
-                return None;
-            }
-            return is_user_function_value(value, key.bytes).then_some(value);
-        }
-        ChainMethod::Absent => return None,
+        ChainMethod::Data { value, .. } => return Some(value),
+        ChainMethod::Absent => return Some(crate::value::TAG_UNDEFINED),
         ChainMethod::Get { holder } => holder,
     };
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -623,7 +614,20 @@ pub(crate) unsafe fn class_instance_method_value(
     super::super::field_get_set::accessor_receiver_override_end(
         prev_override.map(|handle| handle.get_nanbox_f64()),
     );
-    (!value.is_undefined() && !value.is_null()).then_some(value.bits())
+    Some(value.bits())
+}
+
+/// The property's value when the tower's user-function arm may answer it.
+pub(crate) unsafe fn class_instance_method_value(
+    recv: &crate::gc::RuntimeHandle,
+    key: &MethodKey<'_>,
+) -> Option<u64> {
+    let value = class_instance_property_value(recv, key)?;
+    let name = std::str::from_utf8(key.bytes).ok()?;
+    if super::is_self_redispatching_proto_method(f64::from_bits(value), name) {
+        return None;
+    }
+    is_user_function_value(value, key.bytes).then_some(value)
 }
 
 /// A class member that is not a string-keyed property of its prototype: a
@@ -647,7 +651,7 @@ pub(crate) unsafe fn call_non_property_member(
         return None;
     }
     let (func_ptr, param_count, has_synthetic_arguments, has_rest) =
-        crate::object::class_registry::lookup_class_method_in_chain(class_id, name)?;
+        crate::object::class_registry::class_method_slot_target(class_id, name)?;
     Some(crate::object::class_registry::call_vtable_method_value(
         func_ptr,
         receiver,
@@ -736,3 +740,6 @@ pub(crate) unsafe fn call_class_ref_method(
         args.len(),
     ))
 }
+
+#[cfg(test)]
+mod selection_tests;

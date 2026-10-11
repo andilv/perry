@@ -129,7 +129,9 @@ pub(super) unsafe fn scan_dirty_header_once(
     stats.old_objects_considered += 1;
     stats.valid_roots += 1;
     stats.dirty_objects_scanned += 1;
-    let _ = scan_dirty_object_slots(header, dirty_pages, stats, visit_slot);
+    let _ = scan_dirty_object_slots(header, dirty_pages, stats, &mut |slot, _, stats| {
+        visit_slot(slot, stats);
+    });
 }
 
 #[inline]
@@ -140,42 +142,12 @@ pub(super) fn dirty_pages_contains_addr(
     dirty_pages.contains(&crate::arena::generation_page_for_addr(addr))
 }
 
-pub(super) unsafe fn scan_dirty_slot(
-    slot: GcMutableSlot,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
-    stats: &mut RememberedSetTraceStats,
-    visit_slot: &mut dyn FnMut(GcMutableSlot, &mut RememberedSetTraceStats),
-) {
-    if !dirty_pages_contains_addr(dirty_pages, slot.slot as usize) {
-        return;
-    }
-    stats.dirty_slots_scanned += 1;
-    crate::arena::old_page_account_dirty_slot(slot.slot as usize);
-    visit_slot(slot, stats);
-}
-
-pub(super) unsafe fn scan_dirty_slot_with_layout(
-    slot: GcMutableSlot,
-    layout_kind: HeapChildSlotReadKind,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
-    stats: &mut RememberedSetTraceStats,
-    visit_slot: &mut dyn FnMut(GcMutableSlot, &mut RememberedSetTraceStats),
-) {
-    if !dirty_pages_contains_addr(dirty_pages, slot.slot as usize) {
-        return;
-    }
-    record_layout_child_slot_read(layout_kind);
-    stats.dirty_slots_scanned += 1;
-    crate::arena::old_page_account_dirty_slot(slot.slot as usize);
-    visit_slot(slot, stats);
-}
-
 /// Scan the slots of `header` that lie on `dirty_pages`.
 ///
 /// Returns whether the scan was COMPLETE for the object (#9754): every pointer
 /// slot it owns lies on a dirty page AND inside its own allocation. For such
 /// an object the per-slot re-remembering the copying minor does in
-/// `visit_slot_with_parent` is exactly what the post-cycle
+/// `visit_remembered_slot` is exactly what the post-cycle
 /// `restore_surviving_dirty_coverage` re-derives — the same child predicate on
 /// the same post-visit value, and the same `external` verdict (an in-body slot
 /// of an old parent is not external under either the page rule used here or
@@ -187,13 +159,33 @@ pub(super) unsafe fn scan_dirty_object_slots(
     header: *mut GcHeader,
     dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
-    visit_slot: &mut dyn FnMut(GcMutableSlot, &mut RememberedSetTraceStats),
+    visit_slot: &mut dyn FnMut(GcMutableSlot, bool, &mut RememberedSetTraceStats),
 ) -> bool {
     let body_start = header as usize;
     let body_end = body_start.saturating_add((*header).size as usize);
     let in_body = |slot: *mut u64| {
         let addr = slot as usize;
         addr >= body_start && addr < body_end
+    };
+    // Custody belongs to the parent and descriptor, not to each child store.
+    // An old in-body slot is described by its page. Every other slot needs
+    // the owner entry, including a separate buffer that happens to be old.
+    let parent_old = crate::arena::pointer_in_old_gen(body_start + GC_HEADER_SIZE);
+    let mut acct_page = usize::MAX;
+    let mut acct_slots = 0usize;
+    let mut account = |slot: *mut u64, old: bool| {
+        if !old {
+            return;
+        }
+        let page = crate::arena::generation_page_for_addr(slot as usize);
+        if page != acct_page {
+            if acct_slots != 0 {
+                crate::arena::old_page_account_dirty_slots(acct_page, acct_slots);
+            }
+            acct_page = page;
+            acct_slots = 0;
+        }
+        acct_slots += 1;
     };
     super::ephemeron::discover(header);
     let mut complete = true;
@@ -203,43 +195,44 @@ pub(super) unsafe fn scan_dirty_object_slots(
                 if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
                     return;
                 }
-                complete &= in_body(slot.slot)
-                    && dirty_pages_contains_addr(dirty_pages, slot.slot as usize);
-                if let Some(layout_kind) = slot.layout_kind {
-                    scan_dirty_slot_with_layout(slot, layout_kind, dirty_pages, stats, visit_slot);
-                } else {
-                    scan_dirty_slot(slot, dirty_pages, stats, visit_slot);
+                let contained = in_body(slot.slot);
+                let dirty = dirty_pages_contains_addr(dirty_pages, slot.slot as usize);
+                complete &= contained && dirty;
+                if dirty {
+                    slot.record_layout_read();
+                    stats.dirty_slots_scanned += 1;
+                    let old = if contained {
+                        parent_old
+                    } else {
+                        !slot.external()
+                    };
+                    account(slot.slot, old);
+                    visit_slot(slot, !parent_old || !contained, stats);
                 }
             }
             GcMutableSlotDescriptor::Range { range, layout_kind } => {
-                // Three per-slot costs hoisted out of this loop, which is the
-                // copying minor's hottest (750 k iterations per cycle on
-                // `gc-handoff/bench/retain.ts`):
-                //
-                // * `is_weak_target_trace_slot` asks a question about the
-                //   PARENT — only a `WeakRef` / weak-entry / finalization-record
-                //   object has weak slots at all. Deciding that once per
-                //   descriptor instead of once per slot is exact, because a
-                //   parent that is not one of those three classes answers
-                //   `false` for every slot it owns.
-                // * `old_page_account_dirty_slot` is a page-keyed counter
-                //   reached through a hash map. Slots here are contiguous and
-                //   ascending, so 512 consecutive slots share one page: batch
-                //   the increment and pay one map probe per page.
-                // * the value in slot `i` is about to be classified, which
-                //   reads its target's (cold) GC header — prefetch ahead.
+                // A range belongs to one allocation. Read its custody and
+                // weak-holder fact once; batch old-page accounting across all
+                // descriptors of this parent, including individual slots.
                 let parent_has_weak_slots =
                     crate::weakref::header_may_hold_weak_target_slots(header);
                 let count = range.slot_count();
-                if count != 0 {
-                    complete &= in_body(range.slot(0)) && in_body(range.slot(count - 1));
-                }
+                let contained =
+                    count == 0 || (in_body(range.slot(0)) && in_body(range.slot(count - 1)));
+                complete &= contained;
+                let external = !parent_old || !contained;
+                let old = if contained {
+                    parent_old
+                } else {
+                    matches!(
+                        crate::arena::classify_heap_generation(range.slots() as usize),
+                        crate::arena::HeapGeneration::Old
+                    )
+                };
                 let mut visited_slots = 0usize;
                 for (start, end) in dirty_slot_ranges_for(range, dirty_pages, stats) {
                     visited_slots += end - start;
                     stats.dirty_slot_ranges_scanned += 1;
-                    let mut acct_page = usize::MAX;
-                    let mut acct_slots = 0usize;
                     for i in start..end {
                         let slot = range.slot(i);
                         if let Some(ahead) = (i + super::prefetch::PREFETCH_DISTANCE < end)
@@ -256,19 +249,8 @@ pub(super) unsafe fn scan_dirty_object_slots(
                             record_layout_child_slot_read(layout_kind);
                         }
                         stats.dirty_slots_scanned += 1;
-                        let page = crate::arena::generation_page_for_addr(slot as usize);
-                        if page != acct_page {
-                            if acct_slots != 0 {
-                                crate::arena::old_page_account_dirty_slots(acct_page, acct_slots);
-                            }
-                            acct_page = page;
-                            acct_slots = 0;
-                        }
-                        acct_slots += 1;
-                        visit_slot(GcMutableSlot::new(slot, layout_kind), stats);
-                    }
-                    if acct_slots != 0 {
-                        crate::arena::old_page_account_dirty_slots(acct_page, acct_slots);
+                        account(slot, old);
+                        visit_slot(GcMutableSlot::new(slot, layout_kind), external, stats);
                     }
                 }
                 complete &= visited_slots == count;
@@ -276,6 +258,9 @@ pub(super) unsafe fn scan_dirty_object_slots(
             GcMutableSlotDescriptor::PointerFreeRange(_) => {}
         }
     });
+    if acct_slots != 0 {
+        crate::arena::old_page_account_dirty_slots(acct_page, acct_slots);
+    }
     complete
 }
 
@@ -947,17 +932,12 @@ pub(super) fn barrier_parent_addr_is_dereferenceable(parent_addr: usize) -> bool
 /// of that program, ~657M instructions, with zero collections running), and
 /// the only one that answered a question the caller had already answered.
 ///
-/// Dropping the round-trip is outcome-preserving, including for the one
-/// operand class that reached the bare-pointer arm and failed it: a
-/// malloc-GC parent classifies `Unknown`, so `decode_heap_addr` used to
-/// return 0 and the barrier exited at `NonPointerParentSkips`. It now
-/// reaches `barrier_parent_needs_remembering(parent, external_slot)`, which
-/// classifies `Unknown`, is not `Old`, and — for the non-external callers
-/// that took this path — exits at `ParentNotOldSkips`. Different counter,
-/// same remembered-set effect (none). The external/malloc parents that
-/// genuinely need remembering arrive through
-/// [`runtime_write_barrier_external_slot`] / [`runtime_write_barrier_gc_slot`],
-/// which already tag their parent and are unaffected.
+/// A malloc-GC parent classifies `Unknown`, so `decode_heap_addr` used to
+/// return 0 for it and the barrier exited at `NonPointerParentSkips`. It now
+/// reaches [`barrier_remembering_parent`], which remembers its young edges
+/// in the external form whatever `external_slot` the caller passed — a
+/// malloc parent owes the remembered set the same entries an old one does
+/// (see [`RememberingParent`]).
 ///
 /// Callers must pass a real GC user pointer. `decode_heap_addr`'s shape
 /// pre-filter (48-bit, above the handle band, 8-aligned) is not applied
@@ -971,9 +951,9 @@ pub(super) fn write_barrier_decoded_parent(
     child_addr: usize,
     external_slot: bool,
 ) {
-    // Old → young check. Runtime-owned malloc GC objects are outside
-    // the nursery and must be treated as old when the caller uses the
-    // external-slot path for fields or side buffers.
+    // Old → young check. Runtime-owned malloc GC objects are outside the
+    // nursery and owe the remembered set exactly what an old parent owes,
+    // always in the external `(page, owner)` form (`RememberingParent`).
     // An inline slot whose page is the one the dirty-page cache names has
     // nothing left to owe the remembered set: the cache's invariant
     // (`dirty_page_cache`) is "cached ⟹ recorded in DIRTY_OLD_PAGES AND
@@ -988,10 +968,10 @@ pub(super) fn write_barrier_decoded_parent(
         bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageCacheHits);
         return;
     }
-    if !barrier_parent_needs_remembering(parent_addr, external_slot) {
+    let Some(parent_kind) = barrier_remembering_parent(parent_addr) else {
         bump_write_barrier_trace_counter(BarrierTraceCounter::ParentNotOldSkips);
         return;
-    }
+    };
     if !remembered_child_needs_tracking(child_addr) {
         bump_write_barrier_trace_counter(BarrierTraceCounter::ChildNotYoungSkips);
         return;
@@ -999,7 +979,7 @@ pub(super) fn write_barrier_decoded_parent(
 
     bump_write_barrier_trace_counter(BarrierTraceCounter::OldToYoungSlowHits);
     bump_write_barrier_trace_counter(BarrierTraceCounter::RememberedSetInsertAttempts);
-    let inserted = if external_slot {
+    let inserted = if external_slot || parent_kind == RememberingParent::Malloc {
         remember_old_to_young_external_slot(parent_addr, slot_addr)
     } else {
         remember_old_to_young_inline_slot(parent_addr, slot_addr)
@@ -1055,10 +1035,10 @@ pub(super) fn replay_old_parent_slot_range(parent_addr: usize, slots: *mut u64, 
         bump_write_barrier_trace_counter(BarrierTraceCounter::NonPointerParentSkips);
         return;
     }
-    if !barrier_parent_needs_remembering(parent_addr, false) {
+    let Some(parent_kind) = barrier_remembering_parent(parent_addr) else {
         bump_write_barrier_trace_counter(BarrierTraceCounter::ParentNotOldSkips);
         return;
-    }
+    };
     let mut dirtied_page = usize::MAX;
     for i in 0..count {
         let slot_addr = slots as usize + i * std::mem::size_of::<u64>();
@@ -1082,7 +1062,11 @@ pub(super) fn replay_old_parent_slot_range(parent_addr: usize, slots: *mut u64, 
         // Only a slot that classifies Old is described by its own page; the
         // fallback (`mark_dirty_parent_span`) covers the parent's whole span
         // and gives no single page to latch, so it must not arm the skip.
-        if matches!(
+        if parent_kind == RememberingParent::Malloc {
+            if remember_old_to_young_external_slot(parent_addr, slot_addr) {
+                bump_write_barrier_trace_counter(BarrierTraceCounter::NewInserts);
+            }
+        } else if matches!(
             crate::arena::classify_heap_generation(slot_addr),
             crate::arena::HeapGeneration::Old
         ) {
@@ -1152,7 +1136,7 @@ fn relocate_old_object_dirty_pages(
         return true;
     }
     if !barrier_parent_addr_is_dereferenceable(new_parent_addr)
-        || !barrier_parent_needs_remembering(new_parent_addr, false)
+        || !barrier_parent_needs_remembering(new_parent_addr)
     {
         return true;
     }
@@ -1246,18 +1230,45 @@ pub(crate) fn remembered_child_needs_tracking(child_addr: usize) -> bool {
     }
 }
 
+/// Which kind of parent owes the remembered set an entry for a young (or
+/// malloc) child it holds.
+///
+/// The remembered set has one job: keep every word a minor can neither
+/// reclaim nor is guaranteed to trace valid across that minor. A nursery
+/// parent is reclaimed or traced by every minor. Two kinds of parent are
+/// neither:
+///
+///   * an **old** parent is a black leaf in a minor;
+///   * a **malloc** parent is traced only when the minor reaches it, and freed
+///     only by a minor whose malloc sweep is due. A dead one survives every
+///     other minor untraced, and the conservative stack scan can reach it
+///     again afterwards (exact registry membership is its only test), so an
+///     unremembered young word in it goes stale exactly like one in a dead
+///     old parent.
+///
+/// Every slot of a malloc parent lies outside the old arena — the same answer
+/// `GcMutableSlot::external` gives the collector — so a malloc parent's
+/// entries always take the `(page, owner)` external form; a dirty page there
+/// would name memory no old-arena walk can find. Whether the CALLER called its
+/// slot external does not enter into it: the store sites that pass
+/// `external_slot = false` (`js_write_barrier_slot`, the bare runtime slot
+/// barrier) reach malloc parents too, and gating the malloc clause on that
+/// flag left their edges unremembered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RememberingParent {
+    Old,
+    Malloc,
+}
+
 #[inline]
-pub(super) fn barrier_parent_needs_remembering(parent_addr: usize, external_slot: bool) -> bool {
-    if matches!(
-        crate::arena::classify_heap_generation(parent_addr),
-        crate::arena::HeapGeneration::Old
-    ) {
-        // #7511: generated code skips this whole call when the parent's header
-        // has no `GC_FLAG_TENURED` (`emit_parent_may_need_remembering_check`),
-        // which is sound only while `Old ⟹ TENURED` — and nothing in the
-        // allocator enforces that, so it is pinned by
-        // `gc::tests::inline_generation_gate_contract` over the production
-        // birth paths instead.
+pub(crate) fn barrier_remembering_parent(parent_addr: usize) -> Option<RememberingParent> {
+    match crate::arena::classify_heap_generation(parent_addr) {
+        // #7511: generated code skips the barrier call when the parent's header
+        // is neither TENURED nor outside the arenas
+        // (`emit_parent_may_need_remembering_check`), which is sound only
+        // while `Old ⟹ TENURED` — and nothing in the allocator enforces that,
+        // so it is pinned by `gc::tests::inline_generation_gate_contract` over
+        // the production birth paths instead.
         //
         // A `debug_assert!` here was tried and REVERTED: it is the right
         // enforcement point in principle, but dozens of tests build old-gen
@@ -1265,9 +1276,19 @@ pub(super) fn barrier_parent_needs_remembering(parent_addr: usize, external_slot
         // (`alloc_old_test_object`, `alloc_old_test_promise`, the
         // `gc/tests/oldgen.rs` family), some deliberately. It fired on those,
         // not on a defect. Reinstating it means fixing those fixtures first.
-        return true;
+        crate::arena::HeapGeneration::Old => Some(RememberingParent::Old),
+        crate::arena::HeapGeneration::Unknown if malloc_gc_parent_addr(parent_addr) => {
+            Some(RememberingParent::Malloc)
+        }
+        _ => None,
     }
-    external_slot && malloc_gc_parent_addr(parent_addr)
+}
+
+/// Does a store into `parent_addr` owe the remembered set an entry? See
+/// [`RememberingParent`].
+#[inline]
+pub(crate) fn barrier_parent_needs_remembering(parent_addr: usize) -> bool {
+    barrier_remembering_parent(parent_addr).is_some()
 }
 
 /// #7187: this DEREFERENCES `parent_addr - GC_HEADER_SIZE`, and its only
@@ -1515,19 +1536,39 @@ pub(super) fn invalidate_external_dirty_slot_cache() {
 
 #[inline]
 pub(crate) fn runtime_write_barrier_root_heap_word(value_bits: u64) {
-    incremental_mark_barrier_value(value_bits);
+    // Kept as an exported ABI alias; generated/root-owned words are JSValues.
+    runtime_write_barrier_root_nanbox(value_bits);
 }
 
 #[inline]
 pub(crate) fn runtime_write_barrier_root_nanbox(value_bits: u64) {
-    incremental_mark_barrier_value(value_bits);
+    precise_root_write_barrier(super::PreciseRoot::JSValue(value_bits));
+}
+
+#[inline]
+fn precise_root_write_barrier(root: super::PreciseRoot) {
+    if incremental_mark_barrier_globally_idle() {
+        return;
+    }
+    precise_root_write_barrier_active(root);
+}
+
+#[cold]
+#[inline(never)]
+fn precise_root_write_barrier_active(root: super::PreciseRoot) {
+    let ptr = hot_incremental_mark_valid_ptrs().get();
+    if !ptr.is_null() {
+        super::mark_precise_root_in_scope(
+            root,
+            unsafe { &*ptr },
+            Some(hot_incremental_mark_minor_only().get()),
+        );
+    }
 }
 
 #[inline]
 pub(crate) fn runtime_write_barrier_root_raw_ptr<T>(ptr: *const T) {
-    if !ptr.is_null() {
-        incremental_mark_barrier_value(ptr as u64);
-    }
+    precise_root_write_barrier(super::PreciseRoot::GcPointer(ptr as usize));
 }
 
 #[inline]
@@ -1545,7 +1586,7 @@ pub(crate) unsafe fn runtime_store_root_raw_mut_ptr_slot<T>(slot: *mut *mut T, v
 #[inline]
 pub(crate) unsafe fn runtime_store_root_usize_slot(slot: *mut usize, value: usize) {
     std::ptr::write(slot, value);
-    runtime_write_barrier_root_heap_word(value as u64);
+    runtime_write_barrier_root_raw_ptr(value as usize as *const u8);
 }
 
 #[inline]
@@ -1565,7 +1606,7 @@ pub(crate) fn runtime_store_root_atomic_raw_i64(
     ordering: std::sync::atomic::Ordering,
 ) {
     slot.store(value, ordering);
-    runtime_write_barrier_root_heap_word(value as u64);
+    runtime_write_barrier_root_raw_ptr(value as usize as *const u8);
 }
 
 #[inline]
@@ -1578,7 +1619,7 @@ pub(crate) fn runtime_compare_exchange_root_atomic_raw_i64(
 ) -> Result<i64, i64> {
     let result = slot.compare_exchange(current, new, success, failure);
     if result.is_ok() {
-        runtime_write_barrier_root_heap_word(new as u64);
+        runtime_write_barrier_root_raw_ptr(new as usize as *const u8);
     }
     result
 }
@@ -1624,7 +1665,9 @@ mod maintenance;
 // Remembered-set root marking (dirty-slot work + `RememberedSetRootMarkState`)
 // lives in a sibling module for the 2000-line file-size gate (#10750).
 mod remembered_mark;
-pub(super) use leaf::{decode_raw_pointer_candidate, inline_slot_store_on_cached_dirty_page};
+pub(super) use leaf::{
+    decode_raw_pointer_candidate, inline_slot_store_on_cached_dirty_page, raw_child_needs_tracking,
+};
 pub(super) use remembered_mark::{dirty_slot_ranges_for, RememberedSetRootMarkState};
 
 pub(super) use super::barrier_store::{barrier_child_prologue, barrier_remembering_active};

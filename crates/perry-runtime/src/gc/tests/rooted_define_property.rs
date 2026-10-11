@@ -56,6 +56,20 @@ fn register_handle_scanner() {
     );
 }
 
+fn register_descriptor_cache_scanners() {
+    // CopyingNurseryTestGuard clears production scanner registration and
+    // suppresses lazy gc_init. These fixtures build ordinary shapes and fresh
+    // reflection records; their shared keys caches and authoritative shape
+    // descriptors must mark/rewrite their raw array edges, just as in gc_init.
+    // A handle keeps the receiver live but cannot refresh a cache's key pointer.
+    gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_transition_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
+    gc_register_mutable_root_scanner(crate::object::canonical_keys::scan_canonical_keys_roots_mut);
+    gc_register_mutable_root_scanner(crate::string::scan_intern_table_roots_mut);
+}
+
 fn string_value(text: &str) -> f64 {
     let ptr = crate::string::js_string_from_bytes(text.as_ptr(), text.len() as u32);
     f64::from_bits(string_bits(ptr as usize))
@@ -297,6 +311,7 @@ fn array_named_property_attributes_follow_a_move_in_the_final_descriptor_probe()
         );
         // Keep only an observation address across the move; never dereference it.
         let before = target.with_mut_ptr(|ptr: *mut crate::array::ArrayHeader| ptr as usize);
+        let descriptor = crate::object::object_ops::decode_property_descriptor(&scope, &bag);
         let applied = target.with_mut_ptr(|ptr: *mut crate::array::ArrayHeader| {
             // This runtime entry roots its receiver before probing the descriptor.
             crate::object::define_array_property(
@@ -304,7 +319,7 @@ fn array_named_property_attributes_follow_a_move_in_the_final_descriptor_probe()
                 f64::from_bits(ptr_bits(ptr as usize)),
                 string_ptr_of(key.get_nanbox_f64()),
                 Some("tag"),
-                bag.get_nanbox_f64(),
+                &descriptor,
             )
         });
         assert_eq!(applied, Some(true));
@@ -324,6 +339,525 @@ fn array_named_property_attributes_follow_a_move_in_the_final_descriptor_probe()
             assert!(!attrs.enumerable());
             assert!(!attrs.configurable());
         });
-        assert!(crate::object::descriptor_state::get_property_attrs(before, "tag").is_none());
+        // The old address is from-space: the nursery may already have reused
+        // it for another cell (a string, say), so it is never asked a
+        // descriptor question. What must hold is that the define left nothing
+        // under it in the one address-keyed store, the native-handle bag.
+        assert!(
+            crate::object::handle_expando::handle_property_bag(before as i64).is_null(),
+            "the attributes must not be filed under the evacuated address"
+        );
     }
 }
+
+extern "C" fn snapshot_accessor_body(
+    _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    42.0
+}
+extern "C" fn snapshot_late_moving_getter(
+    closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    unsafe {
+        let scope = RuntimeHandleScope::new();
+        let first = scope.root_nanbox_f64(crate::closure::js_closure_get_capture_f64(closure, 0));
+        let accessor =
+            scope.root_nanbox_f64(crate::closure::js_closure_get_capture_f64(closure, 1));
+        let result = scope.root_nanbox_f64(crate::closure::js_closure_get_capture_f64(closure, 2));
+        crate::object::js_object_set_property_key(
+            first.get_nanbox_f64(),
+            string_value("value"),
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        );
+        crate::object::js_object_set_property_key(
+            accessor.get_nanbox_f64(),
+            string_value("get"),
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        );
+        let trace = collect_minor_trace(GcTriggerKind::Direct);
+        GETTER_COPIED_OBJECTS
+            .with(|count| count.set(count.get() + trace.copying_nursery.copied_objects));
+        result.get_nanbox_f64()
+    }
+}
+
+#[test]
+fn descriptor_snapshot_collection_keeps_heap_value_and_accessor_after_copying() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    register_handle_scanner();
+    GETTER_COPIED_OBJECTS.with(|count| count.set(0));
+    unsafe {
+        let scope = RuntimeHandleScope::new();
+        let target = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        let properties = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        let first = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        let accessor = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        let payload = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        crate::object::js_object_set_property_key(
+            payload.get_nanbox_f64(),
+            string_value("token"),
+            string_value("saved"),
+        );
+        crate::object::js_object_set_property_key(
+            first.get_nanbox_f64(),
+            string_value("value"),
+            payload.get_nanbox_f64(),
+        );
+        payload.set_nanbox_u64(crate::value::TAG_UNDEFINED);
+        let getter = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
+            crate::closure::js_closure_alloc(crate::fn_info!(snapshot_accessor_body, 0), 0) as i64,
+        ));
+        crate::object::js_object_set_property_key(
+            accessor.get_nanbox_f64(),
+            string_value("get"),
+            getter.get_nanbox_f64(),
+        );
+        getter.set_nanbox_u64(crate::value::TAG_UNDEFINED);
+        crate::object::js_object_set_property_key(
+            properties.get_nanbox_f64(),
+            string_value("saved_snapshot_value"),
+            first.get_nanbox_f64(),
+        );
+        crate::object::js_object_set_property_key(
+            properties.get_nanbox_f64(),
+            string_value("saved_snapshot_accessor"),
+            accessor.get_nanbox_f64(),
+        );
+        let second = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        crate::object::js_object_set_property_key(
+            second.get_nanbox_f64(),
+            string_value("value"),
+            2.0,
+        );
+        let late = scope.root_raw_mut_ptr(crate::closure::js_closure_alloc(
+            crate::fn_info!(snapshot_late_moving_getter, 0),
+            3,
+        ));
+        crate::closure::js_closure_set_capture_f64(
+            late.get_raw_mut_ptr(),
+            0,
+            first.get_nanbox_f64(),
+        );
+        crate::closure::js_closure_set_capture_f64(
+            late.get_raw_mut_ptr(),
+            1,
+            accessor.get_nanbox_f64(),
+        );
+        crate::closure::js_closure_set_capture_f64(
+            late.get_raw_mut_ptr(),
+            2,
+            second.get_nanbox_f64(),
+        );
+        let late_bag = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+        crate::object::js_object_set_property_key(
+            late_bag.get_nanbox_f64(),
+            string_value("get"),
+            crate::value::js_nanbox_pointer(
+                late.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64,
+            ),
+        );
+        crate::object::js_object_set_property_key(
+            late_bag.get_nanbox_f64(),
+            string_value("enumerable"),
+            f64::from_bits(crate::value::TAG_TRUE),
+        );
+        crate::object::js_object_define_property(
+            properties.get_nanbox_f64(),
+            string_value("late"),
+            late_bag.get_nanbox_f64(),
+        );
+        let before = addr_of(target.get_nanbox_f64());
+        crate::object::js_object_define_properties(
+            target.get_nanbox_f64(),
+            properties.get_nanbox_f64(),
+        );
+        assert!(
+            GETTER_COPIED_OBJECTS.with(|count| count.get()) > 0,
+            "the fixture must actually copy nursery objects"
+        );
+        assert_ne!(
+            addr_of(target.get_nanbox_f64()),
+            before,
+            "the target must actually move"
+        );
+        let saved = scope.root_nanbox_f64(read_property(
+            target.get_nanbox_f64(),
+            "saved_snapshot_value",
+        ));
+        assert_string_bytes(
+            string_ptr_of(read_property(saved.get_nanbox_f64(), "token")),
+            b"saved",
+        );
+        assert_eq!(
+            read_property(target.get_nanbox_f64(), "saved_snapshot_accessor"),
+            42.0
+        );
+        assert_eq!(read_property(target.get_nanbox_f64(), "late"), 2.0);
+    }
+}
+
+/// Force the descriptor object's own allocation to copy its saved input fields.
+/// Existing test controls open the supported alloc-point relocation mode; no
+/// production allocation/GC hook is added. The next block allocation belongs
+/// to getOwnPropertyDescriptor. A definition validates against the holder's
+/// own facts and builds no record, so the redefining variant applies its
+/// generic descriptor first and then witnesses the record of the redefined
+/// property.
+#[test]
+fn descriptor_snapshot_current_record_fields_survive_alloc_point_copying() {
+    struct NoConservativeScan(Option<crate::gc::roots::ConservativeStackScanMode>);
+    impl Drop for NoConservativeScan {
+        fn drop(&mut self) {
+            crate::gc::roots::set_conservative_stack_scan_override(self.0);
+        }
+    }
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _pacing = crate::gc::policy::force_alloc_point_minor_pacing();
+    let _scan = NoConservativeScan(crate::gc::roots::set_conservative_stack_scan_override(
+        Some(crate::gc::roots::ConservativeStackScanMode::Disabled),
+    ));
+    let trigger = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    register_handle_scanner();
+    gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_transition_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
+    gc_register_mutable_root_scanner(crate::object::canonical_keys::scan_canonical_keys_roots_mut);
+    gc_register_mutable_root_scanner(crate::string::scan_intern_table_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_arguments_object_roots_mut);
+    unsafe {
+        for arguments in [false, true] {
+            for accessor in [false, true] {
+                for redefine in [false, true] {
+                    let scope = RuntimeHandleScope::new();
+                    let receiver = scope.root_nanbox_f64(if arguments {
+                        let args = scope.root_raw_mut_ptr(crate::array::js_array_alloc(0));
+                        object_value(crate::object::js_arguments_object_alloc(
+                            crate::value::js_nanbox_pointer(
+                                args.get_raw_mut_ptr::<crate::array::ArrayHeader>() as i64,
+                            ),
+                            f64::from_bits(crate::value::TAG_UNDEFINED),
+                            0,
+                        ))
+                    } else {
+                        object_value(crate::object::js_object_alloc(0, 0))
+                    });
+                    let key = scope.root_nanbox_f64(string_value("allocation_window"));
+                    let payload = scope.root_nanbox_f64(if accessor {
+                        crate::value::js_nanbox_pointer(crate::closure::js_closure_alloc(
+                            crate::fn_info!(snapshot_accessor_body, 0),
+                            0,
+                        ) as i64)
+                    } else {
+                        object_value(crate::object::js_object_alloc(0, 0))
+                    });
+                    let setter = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
+                        crate::closure::js_closure_alloc(
+                            crate::fn_info!(snapshot_accessor_body, 0),
+                            0,
+                        ) as i64,
+                    ));
+                    let initial =
+                        scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                    crate::object::js_object_set_property_key(
+                        initial.get_nanbox_f64(),
+                        string_value(if accessor { "get" } else { "value" }),
+                        payload.get_nanbox_f64(),
+                    );
+                    if accessor {
+                        crate::object::js_object_set_property_key(
+                            initial.get_nanbox_f64(),
+                            string_value("set"),
+                            setter.get_nanbox_f64(),
+                        );
+                    }
+                    crate::object::js_object_set_property_key(
+                        initial.get_nanbox_f64(),
+                        string_value("configurable"),
+                        f64::from_bits(crate::value::TAG_TRUE),
+                    );
+                    crate::object::js_object_define_property(
+                        receiver.get_nanbox_f64(),
+                        key.get_nanbox_f64(),
+                        initial.get_nanbox_f64(),
+                    );
+                    let generic =
+                        scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                    crate::object::js_object_set_property_key(
+                        generic.get_nanbox_f64(),
+                        string_value("enumerable"),
+                        f64::from_bits(crate::value::TAG_TRUE),
+                    );
+                    if redefine {
+                        crate::object::js_object_define_property(
+                            receiver.get_nanbox_f64(),
+                            key.get_nanbox_f64(),
+                            generic.get_nanbox_f64(),
+                        );
+                    }
+                    // Warm reflection shapes and intrinsics before arming. No
+                    // user callbacks or numeric/key conversions allocate here.
+                    crate::object::js_object_get_own_property_descriptor(
+                        receiver.get_nanbox_f64(),
+                        key.get_nanbox_f64(),
+                    );
+                    let before = addr_of(payload.get_nanbox_f64());
+                    let setter_before = addr_of(setter.get_nanbox_f64());
+                    let cycles = copying_minor_cycles();
+                    let moved = moved_objects_total();
+                    super::runtime_roots::force_next_general_arena_alloc_slow();
+                    trigger.make_arena_trigger_due();
+                    let result = crate::object::js_object_get_own_property_descriptor(
+                        receiver.get_nanbox_f64(),
+                        key.get_nanbox_f64(),
+                    );
+                    let result = scope.root_nanbox_f64(result);
+                    if redefine {
+                        assert_eq!(
+                            read_property(result.get_nanbox_f64(), "enumerable").to_bits(),
+                            crate::value::TAG_TRUE,
+                            "the generic redefinition must be applied"
+                        );
+                    }
+                    assert!(
+                        copying_minor_cycles() > cycles,
+                        "descriptor allocation must run a copying minor"
+                    );
+                    assert!(
+                        moved_objects_total() > moved,
+                        "descriptor allocation must relocate live objects"
+                    );
+                    assert_ne!(
+                        addr_of(payload.get_nanbox_f64()),
+                        before,
+                        "saved descriptor field must move in the allocation window"
+                    );
+                    assert_eq!(
+                        read_property(
+                            result.get_nanbox_f64(),
+                            if accessor { "get" } else { "value" }
+                        )
+                        .to_bits(),
+                        payload.get_nanbox_u64()
+                    );
+                    if accessor {
+                        assert_ne!(addr_of(setter.get_nanbox_f64()), setter_before);
+                        assert_eq!(
+                            read_property(result.get_nanbox_f64(), "set").to_bits(),
+                            setter.get_nanbox_u64()
+                        );
+                        assert_eq!(
+                            read_property(receiver.get_nanbox_f64(), "allocation_window"),
+                            42.0
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Public descriptor entries admit the historical raw object ABI. A collecting
+/// ToPropertyKey must see normalized roots before it can move either operand.
+extern "C" fn descriptor_key_with_copying(
+    _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    GETTER_COPIED_OBJECTS
+        .with(|count| count.set(count.get() + trace.copying_nursery.copied_objects));
+    string_value("normalized_key")
+}
+
+fn admitted_object_operand(handle: &crate::gc::RuntimeHandle<'_>, raw: bool) -> f64 {
+    if raw {
+        f64::from_bits(addr_of(handle.get_nanbox_f64()) as u64)
+    } else {
+        handle.get_nanbox_f64()
+    }
+}
+
+#[test]
+fn descriptor_snapshot_public_raw_and_tagged_operands_move_during_key_conversion() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    register_handle_scanner();
+    register_descriptor_cache_scanners();
+    unsafe {
+        for reflect in [false, true] {
+            for raw_receiver in [false, true] {
+                for raw_bag in [false, true] {
+                    let scope = RuntimeHandleScope::new();
+                    let receiver =
+                        scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                    let bag =
+                        scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                    let payload =
+                        scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                    // A descriptor FIELD is already a JSValue. Even bits equal
+                    // to a live heap address are a Number, never a raw operand.
+                    let numeric_bits = addr_of(payload.get_nanbox_f64()) as u64;
+                    crate::object::js_object_set_property_key(
+                        bag.get_nanbox_f64(),
+                        string_value("value"),
+                        f64::from_bits(numeric_bits),
+                    );
+                    let key =
+                        scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                    let method = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
+                        crate::closure::js_closure_alloc(
+                            crate::fn_info!(descriptor_key_with_copying, 0),
+                            0,
+                        ) as i64,
+                    ));
+                    crate::object::js_object_set_property_key(
+                        key.get_nanbox_f64(),
+                        string_value("toString"),
+                        method.get_nanbox_f64(),
+                    );
+                    let receiver_before = addr_of(receiver.get_nanbox_f64());
+                    let bag_before = addr_of(bag.get_nanbox_f64());
+                    GETTER_COPIED_OBJECTS.with(|count| count.set(0));
+                    let receiver_input = admitted_object_operand(&receiver, raw_receiver);
+                    let bag_input = admitted_object_operand(&bag, raw_bag);
+                    if reflect {
+                        assert_eq!(
+                            crate::proxy::js_reflect_define_property(
+                                receiver_input,
+                                key.get_nanbox_f64(),
+                                bag_input
+                            )
+                            .to_bits(),
+                            crate::value::TAG_TRUE
+                        );
+                    } else {
+                        let returned = crate::object::js_object_define_property(
+                            receiver_input,
+                            key.get_nanbox_f64(),
+                            bag_input,
+                        );
+                        assert_eq!(addr_of(returned), addr_of(receiver.get_nanbox_f64()));
+                    }
+                    assert!(GETTER_COPIED_OBJECTS.with(|count| count.get()) > 0);
+                    assert_ne!(addr_of(receiver.get_nanbox_f64()), receiver_before);
+                    assert_ne!(addr_of(bag.get_nanbox_f64()), bag_before);
+                    assert_ne!(addr_of(payload.get_nanbox_f64()) as u64, numeric_bits);
+                    assert_eq!(
+                        read_property(receiver.get_nanbox_f64(), "normalized_key").to_bits(),
+                        numeric_bits,
+                        "numeric descriptor fields must not be normalized or rewritten"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn descriptor_snapshot_collection_raw_and_tagged_operands_move_during_decode() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    register_handle_scanner();
+    register_descriptor_cache_scanners();
+    unsafe {
+        for raw_target in [false, true] {
+            for raw_properties in [false, true] {
+                let scope = RuntimeHandleScope::new();
+                let target =
+                    scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                let properties =
+                    scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+                let descriptor =
+                    scope.root_nanbox_f64(descriptor_bag_with_moving_value_getter(&scope));
+                crate::object::js_object_set_property_key(
+                    properties.get_nanbox_f64(),
+                    string_value("raw_collection"),
+                    descriptor.get_nanbox_f64(),
+                );
+                let target_before = addr_of(target.get_nanbox_f64());
+                let properties_before = addr_of(properties.get_nanbox_f64());
+                GETTER_COPIED_OBJECTS.with(|count| count.set(0));
+                eprintln!(
+                    "collection decode: raw_target={raw_target}, raw_properties={raw_properties}"
+                );
+                let result = crate::object::js_object_define_properties(
+                    admitted_object_operand(&target, raw_target),
+                    admitted_object_operand(&properties, raw_properties),
+                );
+                assert!(GETTER_COPIED_OBJECTS.with(|count| count.get()) > 0);
+                assert_ne!(addr_of(target.get_nanbox_f64()), target_before);
+                assert_ne!(addr_of(properties.get_nanbox_f64()), properties_before);
+                assert_eq!(addr_of(result), addr_of(target.get_nanbox_f64()));
+                assert_string_bytes(
+                    string_ptr_of(read_property(target.get_nanbox_f64(), "raw_collection")),
+                    b"payload",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn descriptor_snapshot_typed_array_legacy_receivers_keep_bags_through_moving_keys() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    register_handle_scanner();
+    register_descriptor_cache_scanners();
+    unsafe {
+        for representation in 0..3 {
+            let scope = RuntimeHandleScope::new();
+            let receiver = scope
+                .root_raw_mut_ptr(crate::typedarray::js_typed_array_new_empty(1, 1)
+                    as *mut crate::typedarray::TypedArrayHeader);
+            let bag = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+            crate::object::js_object_set_property_key(
+                bag.get_nanbox_f64(),
+                string_value("value"),
+                9.0,
+            );
+            let key = scope.root_nanbox_f64(object_value(crate::object::js_object_alloc(0, 0)));
+            let method = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
+                crate::closure::js_closure_alloc(crate::fn_info!(descriptor_key_with_copying, 0), 0)
+                    as i64,
+            ));
+            crate::object::js_object_set_property_key(
+                key.get_nanbox_f64(),
+                string_value("toString"),
+                method.get_nanbox_f64(),
+            );
+            let address =
+                receiver.get_raw_mut_ptr::<crate::typedarray::TypedArrayHeader>() as usize;
+            let input = match representation {
+                0 => crate::value::js_nanbox_pointer(address as i64),
+                1 => f64::from_bits(address as u64),
+                _ => address as f64,
+            };
+            assert!(crate::object::object_ops::definition_target_is_object(
+                input
+            ));
+            let bag_before = addr_of(bag.get_nanbox_f64());
+            GETTER_COPIED_OBJECTS.with(|count| count.set(0));
+            assert_eq!(
+                crate::proxy::js_reflect_define_property(
+                    input,
+                    key.get_nanbox_f64(),
+                    bag.get_nanbox_f64()
+                )
+                .to_bits(),
+                crate::value::TAG_TRUE
+            );
+            assert!(GETTER_COPIED_OBJECTS.with(|count| count.get()) > 0);
+            assert_ne!(addr_of(bag.get_nanbox_f64()), bag_before);
+            let current = crate::value::js_nanbox_pointer(
+                receiver.get_raw_mut_ptr::<crate::typedarray::TypedArrayHeader>() as i64,
+            );
+            assert_eq!(read_property(current, "normalized_key"), 9.0);
+        }
+    }
+}
+
+#[path = "rooted_array_accessors.rs"]
+mod array_rebind;

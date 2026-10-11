@@ -589,8 +589,8 @@ pub(crate) fn run_native_steps(stream: f64) {
             break;
         }
         let consumed = number_slot(st(), NATIVE_CONSUMED_KEY) as usize;
-        let chunk = get_hidden_value(st(), NATIVE_CHUNK_KEY)
-            .unwrap_or(f64::from_bits(TAG_UNDEFINED));
+        let chunk =
+            get_hidden_value(st(), NATIVE_CHUNK_KEY).unwrap_or(f64::from_bits(TAG_UNDEFINED));
         // Strings may need materialization, which precedes the no_gc borrow.
         let string = if op == REC_WRITE && JSValue::from_bits(chunk.to_bits()).is_any_string() {
             let mut bytes = Vec::new();
@@ -861,7 +861,7 @@ pub(super) fn release_on_destroy(stream: f64) {
     #[cfg(test)]
     if stream_sabotage("release_in_finalizer_only")
         || (stream_sabotage("skip_release_autodestroy")
-            && has_truthy_hidden(stream, hidden_key(b"readableEnded")))
+            && has_truthy_hidden(stream, crate::runtime_state_key!(b"readableEnded")))
     {
         return;
     }

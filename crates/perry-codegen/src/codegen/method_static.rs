@@ -133,7 +133,7 @@ pub(in crate::codegen) fn compile_static_method(
         }
         (this_slot, map)
     };
-    crate::codegen::arguments::box_rooted_parameter_slots(
+    let entry_param_cells = crate::codegen::arguments::box_rooted_parameter_slots(
         lf,
         &f.params,
         &static_boxed_vars,
@@ -300,6 +300,9 @@ pub(in crate::codegen) fn compile_static_method(
         trusted_box_captures: false,
         versioned_loop_deopt_context: None,
         trusted_box_capture_ptrs: HashMap::new(),
+        ready_cell_roots: crate::stmt::binding_cell::ReadyCellRoots::with_entry_cells(
+            entry_param_cells,
+        ),
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
@@ -328,6 +331,9 @@ pub(in crate::codegen) fn compile_static_method(
         interfaces: &cross_module.interfaces,
         try_depth: 0,
         pending_declares: Vec::new(),
+        pending_helpers: Vec::new(),
+        array_record_length_local: None,
+        array_stack_records: Default::default(),
         integer_locals: native_facts.integer_locals(),
         int_valued_i64_locals: native_facts.int_valued_i64_locals(),
         not_bigint_locals: native_facts.not_bigint_locals(),
@@ -354,6 +360,7 @@ pub(in crate::codegen) fn compile_static_method(
         region_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: HashMap::new(),
+        record_packed_admissions: std::collections::HashMap::new(),
         numeric_accumulator_f64_slots: HashMap::new(),
         transition_cache_base_slot: None,
         receiver_descriptors: Default::default(),

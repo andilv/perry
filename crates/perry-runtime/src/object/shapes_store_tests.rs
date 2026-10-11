@@ -46,10 +46,23 @@ fn kind_codes_round_trip() {
         ShapeObjectKind::OrdinaryUnmarked,
         ShapeObjectKind::OrdinaryNumericProof,
         ShapeObjectKind::NativeNamespace,
+        ShapeObjectKind::FunctionBoundCall,
+        ShapeObjectKind::FunctionBoundApply,
+        ShapeObjectKind::FunctionBound,
+        ShapeObjectKind::OrdinaryNativeAlias,
     ] {
+        assert_eq!(kind as u8, kind.code() as u8, "kind cache decoding ordinal");
         assert!(kind.code() as u32 <= RECORD_KIND_MAX_CODE);
-        let r = ShapeRecord::new(0x1000, 1, 1, 0, kind, 0);
+        let mut r = ShapeRecord::new(0x1000, 1, 1, 0, kind, 0)
+            .with_summary(crate::object::key_attrs::SUMMARY_KEY_BITS);
+        assert_eq!(r.summary(), crate::object::key_attrs::SUMMARY_KEY_BITS);
         assert_eq!(r.object_kind(), kind);
+        for births in [0, 1, 7, 8, 15, 16, u32::MAX] {
+            r.set_tracked_births(births);
+            assert_eq!(r.tracked_births(), births.min(15));
+            assert_eq!(r.object_kind(), kind, "birth count overlaps kind");
+            assert_eq!(r.summary(), 0x1F, "birth count overlaps summary");
+        }
         for other in [ShapeObjectKind::Ordinary, ShapeObjectKind::OrdinaryUnmarked] {
             if other != kind {
                 assert!(!r.facts_match(0x1000, 1, 1, 0, other, 0));
@@ -287,10 +300,11 @@ fn lifted_descriptor_mirrors_the_record_and_names_its_address() {
 /// 56 -> 64 is the record-owned ConstFn extension pointer; no side table
 /// or pointer to a heap closure participates in shape identity.
 /// The [[Prototype]] itself is NOT in the record: it is one word per prototype
-/// identity (`shapes_prototype`), so the record stays one cache line.
+/// identity (`shapes_prototype`). 64 -> 72 borrows that stable cell address
+/// to remove identity decoding and directory indexing from a prototype hop.
 #[test]
-fn the_record_geometry_is_free_and_facts_key_is_o1() {
-    assert_eq!(std::mem::size_of::<ShapeRecord>(), 64, "record grew");
+fn the_record_geometry_is_bounded_and_facts_key_is_o1() {
+    assert_eq!(std::mem::size_of::<ShapeRecord>(), 72, "record grew");
     assert_eq!(std::mem::align_of::<ShapeRecord>(), 8, "record realigned");
 
     // `facts_key` folds the keys ADDRESS; it must never dereference it.
@@ -368,7 +382,7 @@ fn special_body_identity_uses_record_owned_extension() {
     assert_eq!(special.special_constfn_mask(), 1);
     assert_eq!(special.constfn_infos(), &a);
     assert_eq!(special.position_bound_raw(), old.position_bound_raw());
-    assert_eq!(std::mem::size_of::<ShapeRecord>(), 64);
+    assert_eq!(std::mem::size_of::<ShapeRecord>(), 72);
     assert!(special.facts_match_proto_with_special(
         0x40,
         1,
@@ -786,7 +800,10 @@ fn weak_collection_summary_agrees_with_shape_brands() {
             };
             assert_eq!(record.weak_collection_brand(), expected);
             record.note_rollback_parent(SHAPE_ID_BASE);
-            record.set_tracked_births(1);
+            record.set_tracked_births(8);
+            record.note_descendant_width(64);
+            assert_eq!(record.descendant_width(), 64);
+            assert_eq!(record.tracked_births(), 8);
             record = record.with_summary(0xFF);
             assert_eq!(record.weak_collection_brand(), expected);
             unsafe {
@@ -795,4 +812,170 @@ fn weak_collection_summary_agrees_with_shape_brands() {
         }
     }
     assert_eq!(ShapeRecord::EMPTY.weak_collection_brand(), None);
+}
+
+#[test]
+fn weak_collection_header_brand_preserves_map_precedence() {
+    let mut record = ShapeRecord::new(0, 0, 0, 0, ShapeObjectKind::Ordinary, 0).with_special_facts(
+        0,
+        &[],
+        &[
+            u64::from(crate::weakref::CLASS_ID_WEAKMAP),
+            u64::from(crate::weakref::CLASS_ID_WEAKSET),
+        ],
+    );
+    assert_eq!(
+        record.weak_collection_brand(),
+        Some(crate::weakref::CLASS_ID_WEAKMAP)
+    );
+    record.note_descendant_width(u32::MAX);
+    assert_eq!(record.descendant_width(), 127);
+    assert_eq!(
+        record.weak_collection_brand(),
+        Some(crate::weakref::CLASS_ID_WEAKMAP)
+    );
+    unsafe {
+        record.release_extras();
+    }
+}
+
+#[test]
+fn symbol_absence_follows_the_published_immutable_prefix() {
+    let _gc = crate::gc::GcSuppressScope::new();
+    unsafe {
+        let object = crate::object::object_alloc_plain(0);
+        let key = crate::string::js_string_from_bytes(b"present".as_ptr(), 7);
+        crate::object::js_object_set_field_by_name(object, key, 1.0);
+        let proof = || {
+            super::super::shape_record_by_id(super::super::object_shape_stamp(object))
+                .unwrap()
+                .proves_no_symbols()
+        };
+        assert!(proof(), "the string-only prefix proves absence");
+        let symbol =
+            (crate::symbol::js_symbol_new_empty().to_bits() & crate::value::POINTER_MASK) as usize;
+        assert!(crate::object::shaped_symbols::define(
+            object as usize,
+            symbol,
+            2.0f64.to_bits(),
+            0
+        ));
+        assert!(!proof(), "adding a symbol must replace the absence proof");
+        assert!(crate::object::shaped_symbols::delete(
+            object as usize,
+            symbol
+        ));
+        assert!(
+            proof(),
+            "the surviving immutable string prefix proves absence again"
+        );
+    }
+}
+
+#[test]
+fn created_birth_relationship_preserves_identity_and_rollback_edge() {
+    let mut record = ShapeRecord::new(0, 0, 0, 7, ShapeObjectKind::Ordinary, 0);
+    let parent = 0x8000_1245;
+    record.note_rollback_parent(parent);
+    let facts = record.facts_key_with_keys(0);
+    assert_eq!(record.created_birth_shape(), 0);
+    record.note_created_birth_shape(0x8000_3456);
+    assert_eq!(record.created_birth_shape(), 0x8000_3456);
+    assert_eq!(record.rollback_parent(), parent);
+    assert_eq!(
+        record.facts_key_with_keys(0),
+        facts,
+        "a weak relationship is not identity"
+    );
+    assert!(record.constfn_infos().is_empty());
+    assert!(record.brands().is_empty());
+    record.note_created_birth_shape(0x8000_789a);
+    record.note_rollback_parent(parent + 1);
+    assert_eq!(record.created_birth_shape(), 0x8000_789a);
+    assert_eq!(record.rollback_parent(), parent + 1);
+    unsafe { record.release_extras() };
+}
+
+#[test]
+fn mutable_key_lists_cannot_publish_symbol_absence() {
+    let _gc = crate::gc::GcSuppressScope::new();
+    unsafe {
+        let keys = crate::array::js_array_alloc(1);
+        let text = crate::string::js_string_from_bytes(b"key".as_ptr(), 3);
+        let keys = crate::array::js_array_push(keys, crate::JSValue::string_ptr(text));
+        let mut record = ShapeRecord::new(keys as u64, 1, 1, 0, ShapeObjectKind::Ordinary, 0);
+        record.refresh_symbol_presence();
+        assert!(
+            !record.proves_no_symbols(),
+            "owned keys may be edited under the same id"
+        );
+        let mut empty = ShapeRecord::new(0, 0, 0, 0, ShapeObjectKind::Ordinary, 0);
+        empty.refresh_symbol_presence();
+        assert!(empty.proves_no_symbols());
+        empty.proto_id = super::super::PROTO_ID_PER_OBJECT;
+        empty.refresh_symbol_presence();
+        assert!(
+            !empty.proves_no_symbols(),
+            "exotic per-object surfaces are not described by this list"
+        );
+    }
+}
+
+/// Plain births combine presence and kind in one masked compare; neither
+/// absent Ordinary-zero nor a different kind of the same width may pass.
+#[test]
+fn plain_birth_validation_checks_presence_kind_and_width() {
+    let empty = ShapeRecord::EMPTY;
+    assert!(
+        !empty.admits_plain_birth(0),
+        "an absent zero-slot record is not a birth"
+    );
+    for kind in [
+        ShapeObjectKind::Ordinary,
+        ShapeObjectKind::Class,
+        ShapeObjectKind::Dictionary,
+        ShapeObjectKind::Function,
+        ShapeObjectKind::FunctionDictionary,
+        ShapeObjectKind::OrdinaryUnmarked,
+        ShapeObjectKind::OrdinaryNumericProof,
+        ShapeObjectKind::NativeNamespace,
+        ShapeObjectKind::FunctionBoundCall,
+        ShapeObjectKind::FunctionBoundApply,
+        ShapeObjectKind::FunctionBound,
+        ShapeObjectKind::OrdinaryNativeAlias,
+    ] {
+        let mut record = ShapeRecord::new(0, 0, 2, 0, kind, 0);
+        assert_eq!(
+            record.admits_plain_birth(2),
+            kind == ShapeObjectKind::Ordinary
+        );
+        assert!(
+            !record.admits_plain_birth(1),
+            "a different live width must miss"
+        );
+        // Carrier and summary changes must not invalidate immutable birth facts.
+        record.set(RECORD_FLAG_EXTERNAL_CARRIER, true);
+        record.set(RECORD_FLAG_CARRIED_SEEN, true);
+        assert_eq!(
+            record.admits_plain_birth(2),
+            kind == ShapeObjectKind::Ordinary
+        );
+    }
+}
+
+#[test]
+fn plain_birth_validation_rejects_ids_outside_the_ordinary_directory() {
+    for id in [
+        0,
+        SHAPE_ID_BASE - 1,
+        DICTIONARY_SHAPE_ID_BASE,
+        EXOTIC_SHAPE_ID_BASE,
+        super::super::SHAPE_ID_END,
+        u32::MAX,
+    ] {
+        assert!(
+            super::super::plain_birth_rep_by_id(id, 0).is_none(),
+            "id {id:#x}"
+        );
+    }
 }

@@ -8027,7 +8027,7 @@ fn module_tdz_check_reads_the_sentinel_seeded_global_not_the_folded_constant() {
 }
 
 #[test]
-fn boxed_param_slot_uses_i64_js_value_bits_until_helper_edges() {
+fn boxed_param_home_preserves_jsvalue_before_cell_pointer() {
     // Asserts the SHADOW-STACK spelling of the box-pointer slot: a plain
     // `store i64 <bits>, ptr %slot`. Under native roots the same slot is a
     // `ptr addrspace(1)` alloca and the store is `store ptr addrspace(1)
@@ -8052,9 +8052,26 @@ fn boxed_param_slot_uses_i64_js_value_bits_until_helper_edges() {
         !param_slot.contains("store double ") && !param_slot.contains("bitcast i64"),
         "boxed param slot setup must not materialize the box pointer as double:\n{param_slot}\n\n{ir}"
     );
+    let home = ir[..box_alloc]
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("store double %arg20, ptr "))
+        .expect("the incoming parameter must retain its JSValue encoding in the root home");
+    let reload = ir[..box_alloc]
+        .lines()
+        .find(|line| line.ends_with(&format!(" = load double, ptr {home}")))
+        .expect("boxing must reread the JSValue home after earlier allocations");
+    let reload_value = reload.trim().split(" = ").next().unwrap();
     assert!(
-        ir[..box_alloc].contains("bitcast double %arg20 to i64"),
-        "boxed param should convert the incoming JSValue ABI double to bits before allocation:\n{ir}"
+        ir[..box_alloc].contains(&format!("bitcast double {reload_value} to i64")),
+        "the reloaded JSValue becomes bits only at the box-value helper edge"
+    );
+    assert!(
+        ir[store_i64..]
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with(&format!(", ptr {home}")),
+        "the raw cell pointer replaces the value in the same root home"
     );
     assert!(
         !ir.contains("call i64 @js_box_alloc(double"),
@@ -13579,6 +13596,31 @@ fn artifact_records_typed_f64_closure_clone_selection() {
     );
 }
 
+/// The running closure's capture word `index`, read at entry by one inline
+/// load from the closure handle (`add i64 %this_closure, <header + 8*index>`,
+/// `inttoptr`, `load i64`): the body's own layout puts the index in range, so
+/// no checked `js_closure_get_capture_bits` call. The closure header is 24
+/// bytes on every 64-bit target.
+fn loads_entry_capture_word(ir: &str, index: u64) -> bool {
+    let add = format!("= add i64 %this_closure, {}", 24 + 8 * index);
+    let mut lines = ir.lines();
+    while let Some(line) = lines.next() {
+        if line.contains(&add) {
+            let reg = line
+                .trim()
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let cast = lines.next().unwrap_or_default();
+            let load = lines.next().unwrap_or_default();
+            return cast.contains(&format!("inttoptr i64 {reg} to ptr"))
+                && load.contains("load i64, ptr");
+        }
+    }
+    false
+}
+
 #[test]
 fn typed_f64_closure_clone_accepts_immutable_numeric_capture() {
     let ir = String::from_utf8(
@@ -13592,13 +13634,13 @@ fn typed_f64_closure_clone_accepts_immutable_numeric_capture() {
     let typed_ir = defined_function_ir_section(&ir, typed);
     let wrapper_ir = function_ir_section(&ir, public);
     assert!(
-        typed_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(typed_ir, 0)
             && typed_ir.contains("bitcast i64")
             && unboxes_number_arg(&typed_ir),
-        "typed-f64 captured closure should load immutable numeric capture as JSValue bits through the closure handle:\n{typed_ir}"
+        "typed-f64 captured closure should load immutable numeric capture as JSValue bits inline from the closure handle:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(wrapper_ir, 0)
             && guards_number_arg(&wrapper_ir),
         "public typed-f64 wrapper must validate capture bits before entering the raw clone:\n{wrapper_ir}"
     );
@@ -13734,13 +13776,13 @@ fn typed_i32_closure_clone_accepts_immutable_i32_capture() {
     let typed_ir = defined_function_ir_section(&ir, typed);
     let wrapper_ir = function_ir_section(&ir, public);
     assert!(
-        typed_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(typed_ir, 0)
             && typed_ir.contains("bitcast i64")
             && unboxes_i32_arg(&typed_ir),
         "typed-i32 captured closure should load immutable Int32 capture through the closure handle:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(wrapper_ir, 0)
             && guards_i32_arg(&wrapper_ir),
         "public typed-i32 wrapper must validate capture bits before entering the raw clone:\n{wrapper_ir}"
     );
@@ -14004,13 +14046,13 @@ fn typed_i1_closure_clone_accepts_immutable_boolean_capture() {
     let typed_ir = defined_function_ir_section(&ir, typed);
     let wrapper_ir = function_ir_section(&ir, public);
     assert!(
-        typed_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(typed_ir, 0)
             && typed_ir.contains("bitcast i64")
             && unboxes_bool_arg(&typed_ir),
         "typed-i1 captured closure should load immutable boolean capture as JSValue bits through the closure handle:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(wrapper_ir, 0)
             && guards_bool_arg(&wrapper_ir),
         "public typed-i1 wrapper must validate capture bits before entering the raw clone:\n{wrapper_ir}"
     );
@@ -14145,13 +14187,13 @@ fn typed_string_closure_clone_accepts_immutable_string_capture() {
     let typed_ir = defined_function_ir_section(&ir, typed);
     let wrapper_ir = function_ir_section(&ir, public);
     assert!(
-        typed_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(typed_ir, 0)
             && typed_ir.contains("bitcast i64")
             && typed_ir.contains("call i64 @js_typed_string_arg_to_raw"),
         "typed-string captured closure should load immutable string capture as guarded JSValue bits through the closure handle:\n{typed_ir}"
     );
     assert!(
-        wrapper_ir.contains("call i64 @js_closure_get_capture_bits(i64 %this_closure, i32 0)")
+        loads_entry_capture_word(wrapper_ir, 0)
             && guards_string_arg(&wrapper_ir),
         "public typed-string closure wrapper should guard immutable string captures before entering the raw clone:\n{wrapper_ir}"
     );

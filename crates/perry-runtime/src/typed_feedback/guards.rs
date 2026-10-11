@@ -39,48 +39,30 @@ fn object_has_own_key_bytes(obj: *const ObjectHeader, key_bytes: &[u8]) -> bool 
     }
 }
 
-fn vtable_method_matches(class_id: u32, method_name: &str, expected_func_ptr: usize) -> bool {
+/// Does `method_name` on an instance of `class_id` still resolve to the
+/// compiled body `expected_func_ptr`?
+///
+/// A built holder chain resolves the name through its shapes. The data slot
+/// carries the declaration's function object, including its retained raw
+/// body ABI. A lazy holder declines until a collecting path materializes it.
+fn declared_method_resolves_to(class_id: u32, method_name: &str, expected_func_ptr: usize) -> bool {
     if class_id == 0 || expected_func_ptr == 0 {
         return false;
     }
-    let Ok(registry) = crate::object::CLASS_VTABLE_REGISTRY.read() else {
+    let holder = crate::object::class_holder_prototype(class_id);
+    if holder.is_null() {
         return false;
+    }
+    let key =
+        crate::object::native_call_method::class_holder::MethodKey::bytes(method_name.as_bytes());
+    let value = match unsafe {
+        crate::object::native_call_method::class_holder::chain_method(holder, &key)
+    } {
+        crate::object::native_call_method::class_holder::ChainMethod::Data { value, .. } => value,
+        _ => return false,
     };
-    let Some(registry) = registry.as_ref() else {
-        return false;
-    };
-    let mut cid = class_id;
-    for _ in 0..32 {
-        if let Some(vtable) = registry.get(&cid) {
-            if let Some(entry) = vtable.methods.get(method_name) {
-                return entry.func_ptr == expected_func_ptr;
-            }
-        }
-        match crate::object::get_parent_class_id(cid) {
-            Some(parent) if parent != 0 && parent != cid => cid = parent,
-            _ => break,
-        }
-    }
-    false
-}
-
-fn prototype_may_override_method(class_id: u32, method_bytes: &[u8]) -> bool {
-    if class_id == 0 {
-        return false;
-    }
-
-    let mut cid = class_id;
-    for _ in 0..32 {
-        let proto = crate::object::class_prototype_object(cid);
-        if !proto.is_null() && object_has_own_key_bytes(proto, method_bytes) {
-            return true;
-        }
-        match crate::object::get_parent_class_id(cid) {
-            Some(parent) if parent != 0 && parent != cid => cid = parent,
-            _ => break,
-        }
-    }
-    false
+    unsafe { crate::object::class_method_value_target(value) }
+        .is_some_and(|target| target.0 == expected_func_ptr)
 }
 
 fn method_direct_call_contract(
@@ -140,8 +122,7 @@ fn method_direct_call_contract(
     }
 
     let expected_func = expected_func_ptr as usize;
-    let valid = vtable_method_matches(class_id, method_name, expected_func)
-        && !prototype_may_override_method(class_id, method_bytes);
+    let valid = declared_method_resolves_to(class_id, method_name, expected_func);
     (shape_addr, class_id, gc_type, name_hash, valid)
 }
 
@@ -1260,7 +1241,6 @@ pub unsafe extern "C" fn js_typed_feedback_method_direct_call_guard(
 pub unsafe extern "C" fn js_method_direct_shape_class(
     receiver: f64,
     out_shape_id: *mut u32,
-    _method_guard_slot: u32,
 ) -> u32 {
     if !out_shape_id.is_null() {
         *out_shape_id = 0;
@@ -1307,13 +1287,12 @@ pub unsafe extern "C" fn js_method_direct_shape_guard(
     receiver: f64,
     expected_class_id: u32,
     expected_shape_id: u32,
-    method_guard_slot: u32,
 ) -> i32 {
     if expected_class_id == 0 || !crate::object::shapes::is_shape_id(expected_shape_id) {
         return 0;
     }
     let mut shape_id = 0;
-    let class_id = js_method_direct_shape_class(receiver, &mut shape_id, method_guard_slot);
+    let class_id = js_method_direct_shape_class(receiver, &mut shape_id);
     (class_id == expected_class_id && shape_id == expected_shape_id) as i32
 }
 
@@ -1556,7 +1535,7 @@ mod keep_guard_symbols {
     #[cfg(feature = "keepalive-anchors")]
     #[used(compiler)] static G3C: unsafe extern "C" fn(f64, u32, u32, *const i8, usize, *const crate::closure::JsFunctionInfo, *mut MethodPicCacheSlot) -> u64 = js_object_own_method_cache_miss;
     #[cfg(feature = "keepalive-anchors")]
-    #[used(compiler)] static G4: unsafe extern "C" fn(f64, u32, u32, u32) -> i32 = js_method_direct_shape_guard;
+    #[used(compiler)] static G4: unsafe extern "C" fn(f64, u32, u32) -> i32 = js_method_direct_shape_guard;
     #[cfg(feature = "keepalive-anchors")]
-    #[used(compiler)] static G4B: unsafe extern "C" fn(f64, *mut u32, u32) -> u32 = js_method_direct_shape_class;
+    #[used(compiler)] static G4B: unsafe extern "C" fn(f64, *mut u32) -> u32 = js_method_direct_shape_class;
 }

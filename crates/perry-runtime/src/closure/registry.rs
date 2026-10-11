@@ -33,6 +33,18 @@ pub fn closure_info(closure: *const ClosureHeader) -> Option<&'static JsFunction
     (!info.is_null()).then(|| unsafe { &*info })
 }
 
+/// A body the call dispatcher can enter without constructor/export/proxy
+/// classification. Compiled bodies and real non-constructor builtin bodies
+/// carry that proof in their immutable record. No-op prototype placeholders
+/// still need the prototype-method forwarder; native export/bound sentinels
+/// do not carry these builtin/non-constructor flags.
+#[inline(always)]
+pub(crate) fn has_direct_call_body(info: &JsFunctionInfo) -> bool {
+    info.flags & crate::codegen_abi::FN_COMPILED_BODY != 0
+        || (info.flags & (FN_BUILTIN | FN_NON_CONSTRUCTOR) == (FN_BUILTIN | FN_NON_CONSTRUCTOR)
+            && info.code != crate::object::global_this_builtin_noop_thunk as *const u8)
+}
+
 /// The dispatch strategy `info` implies: pure bit tests on the body's own
 /// record.
 #[inline(always)]
@@ -47,6 +59,20 @@ pub fn resolve_strategy(info: &JsFunctionInfo) -> DispatchStrategy {
         DispatchKind::Arity(u32::from(info.params))
     };
     DispatchStrategy { kind }
+}
+
+/// Whether a call passing `argc` arguments reaches `info`'s body with nothing
+/// in between: the body is plain (`JsFunctionInfo::plain_params`) and the
+/// call passes at least as many arguments as it declares (over-application is
+/// safe on native ABIs; wasm needs the exact count, `arity_needs_dispatch`).
+/// One compare on the body's own record: a bound value, a rest or
+/// `arguments` body and every runtime-native info are `NOT_PLAIN`, which no
+/// count reaches.
+#[inline(always)]
+pub(crate) fn plain_admits(info: &JsFunctionInfo, argc: u32) -> bool {
+    let params = info.plain_params();
+    params != crate::codegen_abi::NOT_PLAIN
+        && !super::dispatch::arity_needs_dispatch(u32::from(params), argc)
 }
 
 /// `info`'s rest kind and its fixed parameter count, if it has one.
@@ -503,8 +529,8 @@ pub const BOUND_METHOD_FUNC_PTR: *const u8 = 0xBADD_DEAD_u64 as *const u8;
 ///   [0] = target closure value (f64, NaN-boxed)
 ///   [1] = bound `this` value (f64)
 ///   [2] = bound-args JS Array pointer (i64; 0 when no partial args)
-///   [3] = target name snapshot (for the `bound <name>` name)
-///   [4] = `length` snapshot
+///   [3] = target name snapshot (only in the observable metadata layout)
+///   [4] = `length` snapshot (only in the observable metadata layout)
 pub const BOUND_FUNCTION_FUNC_PTR: *const u8 = 0xBADD_B12D_u64 as *const u8;
 
 /// The info every bound-method value points to (its "code" is the
@@ -512,6 +538,13 @@ pub const BOUND_FUNCTION_FUNC_PTR: *const u8 = 0xBADD_B12D_u64 as *const u8;
 // SAFETY: the dispatchers route this sentinel by value; it is never called.
 pub static BOUND_METHOD_INFO: JsFunctionInfo =
     unsafe { JsFunctionInfo::from_code(BOUND_METHOD_FUNC_PTR, 0) };
+
+/// A native constructor's bound export has the ordinary three export captures
+/// plus its immutable class identity. The distinct info describes that capture
+/// layout; dispatch never infers a family from mutable function properties.
+// SAFETY: this is the same routed sentinel, never a callable code address.
+pub static BOUND_NATIVE_CONSTRUCTOR_INFO: JsFunctionInfo =
+    unsafe { JsFunctionInfo::from_code(BOUND_METHOD_FUNC_PTR, 2) };
 
 /// The info every `Function.prototype.bind` result points to (its "code" is
 /// the [`BOUND_FUNCTION_FUNC_PTR`] sentinel).

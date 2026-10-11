@@ -149,3 +149,37 @@ fn two_literal_sites_with_equal_length_patterns_keep_their_own_data() {
         }
     }
 }
+
+/// Every RegExp birth, from any literal site or the constructor, is the one
+/// shared birth on the agent's birth shape. A site holds only its matcher
+/// data: no birth state of its own.
+#[test]
+fn every_regexp_birth_shares_one_birth_shape() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let scope = RuntimeHandleScope::new();
+    let stamp = |re: &RuntimeHandle<'_>| {
+        re.with_const_ptr::<RegExpHeader, _>(|re| unsafe {
+            crate::object::shapes::object_shape_stamp(re)
+        })
+    };
+    let (one, two) = (word(), word());
+    let a = literal(&scope, one, "carried");
+    let b = literal(&scope, two, "other");
+    let c = literal(&scope, one, "carried");
+    let shape = stamp(&a);
+    assert_eq!(stamp(&b), shape, "two sites, one birth shape");
+    assert_eq!(stamp(&c), shape, "a site's later birth, the same shape");
+    let ctor = crate::regex::test_construct_regexp_and_exec_once("ctor", "");
+    assert_eq!(
+        unsafe { crate::object::shapes::object_shape_stamp(ctor) },
+        shape,
+        "the constructor's birth is the same birth"
+    );
+    for site in [one, two] {
+        assert_ne!(
+            unsafe { *site },
+            0,
+            "a site's one word holds its matcher data"
+        );
+    }
+}

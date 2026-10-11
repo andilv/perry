@@ -204,7 +204,7 @@ const SYNTHETIC_CLASS_ID_END: u32 =
 /// not a class id. The one place a class id becomes a table position (the
 /// compiled band's offset is the id itself, which is what
 /// [`class_value_cached`]'s fast path reads).
-fn class_value_band(class_id: u32) -> Option<(usize, u32)> {
+pub(super) fn class_value_band(class_id: u32) -> Option<(usize, u32)> {
     match class_id {
         0 => None,
         1..FIRST_RUNTIME_CLASS_ID => Some((0, class_id)),
@@ -419,12 +419,15 @@ fn class_value_mint(class_id: u32) -> *mut ClosureHeader {
     }
     // SAFETY: the slot is this agent's table entry for `class_id`.
     unsafe { *class_value_slot(class_id) = ptr };
-    crate::gc::runtime_write_barrier_root_heap_word(ptr as u64);
+    crate::gc::runtime_write_barrier_root_raw_ptr(ptr as *const u8);
     // Still inside the no-collect scope: the own-property object and its
     // keys allocate.
     for key in INTRINSIC_OWN_DATA_KEYS {
         install_intrinsic_own_data(class_id, key);
     }
+    // A worker realm that inherited this class's definition evaluation names
+    // its computed members now, before the prototype is born from them.
+    super::class_registry::inherited_evaluation::replay_inherited_evaluation(class_id);
     // MakeConstructor: `prototype` { !w, !e, !c } is created with the class,
     // after `length` and `name` and before every ClassBody static, so the own
     // key order is the bag's creation order.

@@ -117,6 +117,8 @@ mod property_get_names;
 mod proven_view_access;
 mod proven_view_guarded;
 mod range_facts;
+mod regex_literal;
+mod shape_chain;
 mod strings;
 mod typed_feedback;
 mod url_helpers;
@@ -150,9 +152,9 @@ pub(crate) use helpers::{
     buffer_alias_metadata_suffix, class_field_store_needs_string_addref,
     emit_all_pointer_array_declaration, emit_string_addref_if_heap_string,
     expr_has_numeric_pointer_free_array_layout, expr_produces_fresh_heap_allocation,
-    expr_produces_non_pointer_bits_by_construction, is_global_this_builtin_function_name,
-    is_global_this_builtin_name, lower_expr_with_expected_type, lower_js_args_array,
-    store_needs_string_addref, unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
+    expr_produces_non_pointer_bits_by_construction, is_global_this_builtin_name,
+    lower_expr_with_expected_type, lower_js_args_array, store_needs_string_addref,
+    unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
@@ -205,13 +207,12 @@ pub(crate) use write_barrier::{
     emit_jsvalue_slot_store_on_block, emit_jsvalue_slot_store_pointer_tested,
     emit_jsvalue_slot_store_scalar_aware_on_block, emit_jsvalue_slot_store_with_flags_on_block,
     emit_jsvalue_slot_store_with_value_bits_on_block, emit_layout_note_slot_on_block,
-    emit_may_carry_heap_pointer_check, emit_root_heap_word_store_on_block,
-    emit_root_nanbox_store_for_expr, emit_root_nanbox_store_on_block,
-    emit_scalar_aware_store_gated_on_pointerness, emit_write_barrier,
-    emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
-    emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
-    lower_event_emitter_async_resource_subclass_init, lower_event_emitter_subclass_init,
-    lower_node_stream_super_init, lower_stream_super_init,
+    emit_may_carry_heap_pointer_check, emit_root_nanbox_store_for_expr,
+    emit_root_nanbox_store_on_block, emit_scalar_aware_store_gated_on_pointerness,
+    emit_write_barrier, emit_write_barrier_slot_generation_tested,
+    emit_write_barrier_slot_on_block, emit_write_barrier_slot_value_and_generation_tested,
+    lower_array_super_init, lower_event_emitter_async_resource_subclass_init,
+    lower_event_emitter_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -778,6 +779,10 @@ pub(crate) struct FnCtx<'a> {
     /// for the invocation, so these SSA values remain valid across safepoints
     /// even though the closure object itself may relocate.
     pub trusted_box_capture_ptrs: std::collections::HashMap<u32, TrustedBoxCapturePtr>,
+    /// Cell roots a statement of an enclosing (or the current) statement
+    /// list initialized, so a closure born below needs no birth check for them
+    /// (`crate::stmt::binding_cell`).
+    pub ready_cell_roots: crate::stmt::binding_cell::ReadyCellRoots,
     /// Immutable local aliases of same-module function declarations.
     /// Calling one is semantically the same as calling its `FuncRef` directly;
     /// retain the runtime function object in the local for identity/property
@@ -949,6 +954,10 @@ pub(crate) struct FnCtx<'a> {
     /// cross-module call. Lazy emission tracks declares at the actual
     /// emission point so any path the lowering reaches automatically gets
     /// its declare — no walker to keep in sync.
+    pub pending_helpers: Vec<LlFunction>,
+    /// Entry-proved source, scoped to the existing length-property lowering.
+    pub array_record_length_local: Option<u32>,
+    pub array_stack_records: std::collections::HashMap<u32, crate::array_record_stack::Record>,
     pub pending_declares: Vec<(String, crate::types::LlvmType, Vec<crate::types::LlvmType>)>,
 
     /// LocalIds that are provably integer-valued — i.e., initialized from
@@ -1142,6 +1151,10 @@ pub(crate) struct FnCtx<'a> {
     /// on hot array-walking loops like `for (let i = 0; i < arr.length;
     /// i++) arr[i] = expr`.
     pub i32_counter_slots: std::collections::HashMap<u32, String>,
+    /// Array-record source local -> i1 slot holding the packed-f64 loop
+    /// admission its counted entry computed beside the shape proof. Written
+    /// at that entry, consumed by the versioned loop that reads the source.
+    pub record_packed_admissions: std::collections::HashMap<u32, String>,
     /// Unboxed reduce-accumulator redirect, active only while a packed fast
     /// clone is being lowered: local id -> plain (addrspace-0) F64 alloca.
     /// The clone's preheader tag-tested the local as a Number and moved its
@@ -2519,6 +2532,19 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
 /// inline hit path loads the slot through [`emit_inline_cache_slot`] and
 /// proves it non-null before reading a cache word; every runtime miss entry
 /// takes the slot's address.
+/// A fresh array-record entry site: one zeroed `i64` word the runtime uses
+/// as the site's memo of the intrinsic owners' validated ShapeIds
+/// (`perry_runtime::array::iterator_step::ArrayRecordSite`). It holds no heap
+/// pointer and is re-validated by ShapeId compare on every entry.
+pub(crate) fn array_record_site(ctx: &mut FnCtx<'_>) -> String {
+    let site_id = ctx.ic_site_counter;
+    ctx.ic_site_counter += 1;
+    let name = format!("{}_record", inline_cache_global_name(ctx, site_id));
+    ctx.typed_parse_rodata
+        .push(format!("@{name} = private global i64 0, align 8"));
+    format!("@{name}")
+}
+
 pub(crate) fn inline_cache_global_definition(name: &str) -> String {
     format!("@{name} = private global ptr null")
 }
@@ -3136,7 +3162,7 @@ mod unary_bigint_tests;
 mod unary_bitnot_tests;
 pub(crate) use index_get::{
     affine_counter_occurrences, affine_index_fits_i64, emit_affine_index_i64_with,
-    emit_array_region_guard, emit_typed_f64_region_guard,
+    emit_array_region_guard, emit_typed_f64_region_guard, lower_record_index, lower_record_next,
     numeric_index_has_integer_array_index_proof, packed_f64_loop_index_parts, ArrayRegionDense,
 };
 pub(crate) use masked_window::masked_window_fact_for_index;
@@ -3164,7 +3190,7 @@ mod logical_collections;
 mod math_simple;
 pub(crate) mod method_site;
 mod misc_methods;
-mod new_dynamic;
+pub(crate) mod new_dynamic;
 pub(crate) mod number_to_string_inline;
 #[cfg(test)]
 mod number_to_string_inline_tests;
@@ -3550,7 +3576,10 @@ pub(crate) fn load_boxed_local_pointer(ctx: &mut FnCtx<'_>, id: u32) -> Result<O
             "js_closure_get_capture_bits",
             &[(I64, &closure_ptr), (I32, &capture_idx.to_string())],
         );
-        return Ok(Some(cap_bits));
+        let cell = ctx
+            .block()
+            .and(I64, &cap_bits, crate::nanbox::POINTER_MASK_I64);
+        return Ok(Some(cell));
     }
     if let Some(slot) = ctx.locals.get(&id).cloned() {
         return Ok(Some(ctx.block().load(I64, &slot)));
@@ -4630,4 +4659,3 @@ mod byte_scanning_tests;
 
 #[cfg(test)]
 mod byte_prepass_tests;
-

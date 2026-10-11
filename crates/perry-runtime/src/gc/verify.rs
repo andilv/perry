@@ -47,13 +47,8 @@ pub(super) fn try_rewrite_value(bits: u64, valid_ptrs: &ValidPointerSet) -> Opti
 }
 
 pub(super) fn try_rewrite_nanboxed_value(bits: u64, valid_ptrs: &ValidPointerSet) -> Option<u64> {
-    let tag = bits & TAG_MASK;
-    if tag != POINTER_TAG && tag != STRING_TAG && tag != BIGINT_TAG {
-        return None;
-    }
-    let ptr_addr = (bits & POINTER_MASK) as usize;
-    let new_user = try_rewrite_raw_addr(ptr_addr, valid_ptrs)?;
-    Some(tag | (new_user as u64 & POINTER_MASK))
+    let word = decode_nanboxed_root_word(bits)?;
+    Some(word.encode(try_rewrite_raw_addr(word.addr(), valid_ptrs)?))
 }
 
 /// #8174: refuses a forwarding target that is not a heap object start, in
@@ -149,12 +144,8 @@ impl<'a> EvacuationVerifier<'a> {
     }
 
     pub(super) fn stale_nanboxed_value(self, bits: u64) -> Option<u64> {
-        let tag = bits & TAG_MASK;
-        if tag != POINTER_TAG && tag != STRING_TAG && tag != BIGINT_TAG {
-            return None;
-        }
-        let addr = self.stale_raw_addr((bits & POINTER_MASK) as usize)?;
-        Some(tag | (addr as u64 & POINTER_MASK))
+        let word = decode_nanboxed_root_word(bits)?;
+        Some(word.encode(self.stale_raw_addr(word.addr())?))
     }
 }
 
@@ -284,7 +275,7 @@ pub(super) unsafe fn remember_mutable_old_to_young_slot(
     mutable_slot: GcMutableSlot,
 ) -> bool {
     let slot = mutable_slot.slot;
-    if slot.is_null() {
+    if slot.is_null() || !mutable_slot.is_parent_owned() {
         return false;
     }
     let bits = mutable_slot.read();
@@ -304,6 +295,35 @@ pub(super) unsafe fn remember_mutable_old_to_young_slot(
     // Report the child's tracking requirement, not whether its page was new.
     // The repair diagnostic can count productive slots without decoding and
     // classifying the same child a second time.
+    true
+}
+
+/// Full mark's observer-free visit already decoded this immutable slot word.
+/// Do not use this entry across foreign handle observers; those visits retain
+/// the slot-reading wrapper above. Tracking is independent of marking success.
+#[inline(always)]
+pub(super) unsafe fn remember_decoded_full_mark_slot(
+    sticky: &mut StickyRememberedSet,
+    parent_header: *mut GcHeader,
+    mutable_slot: GcMutableSlot,
+    word: trace::FieldWord,
+) -> bool {
+    let slot = mutable_slot.slot;
+    if slot.is_null() || !mutable_slot.is_parent_owned() || !word.needs_tracking() {
+        return false;
+    }
+    #[cfg(test)]
+    if trace::remembered_mark_sabotage::drop_next_entry() {
+        return false;
+    }
+    let external = slot_is_external_to(parent_header, slot);
+    #[cfg(test)]
+    let external = if trace::full_mark_decode_sabotage::generation_only_custody() {
+        mutable_slot.external()
+    } else {
+        external
+    };
+    sticky.remember_slot(parent_header, slot, external);
     true
 }
 
@@ -500,15 +520,11 @@ fn restore_surviving_dirty_coverage_impl<const DIAGNOSTICS: bool>(
         // WITHOUT touching it: old/longlived arena pages are always
         // mapped; anything else must still be a registered malloc GC
         // object.
-        let deref_safe = matches!(
-            crate::arena::classify_heap_generation(header_addr),
-            crate::arena::HeapGeneration::Old | crate::arena::HeapGeneration::Longlived
-        ) || MALLOC_STATE.with(|s| {
-            s.borrow()
-                .objects
-                .iter()
-                .any(|&h| h as usize == header_addr)
-        });
+        let deref_safe =
+            matches!(
+                crate::arena::classify_heap_generation(header_addr),
+                crate::arena::HeapGeneration::Old | crate::arena::HeapGeneration::Longlived
+            ) || super::malloc::gc_malloc_header_is_local(header_addr as *const GcHeader);
         if deref_safe {
             visit_parent(header_addr as *mut GcHeader);
         }
@@ -604,7 +620,7 @@ unsafe fn remember_retained_old_to_young_slots(
         return;
     }
     let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
-    if !barrier_parent_needs_remembering(user_ptr as usize, true) {
+    if !barrier_parent_needs_remembering(user_ptr as usize) {
         return;
     }
     visit_gc_rewrite_slots(header, |slot| unsafe {
@@ -941,11 +957,10 @@ pub(super) unsafe fn verify_old_young_parent_slots_covered(
         {
             return;
         }
-        // #8112: the shape table's shared keys word is not a slot this parent
-        // owns, so per-parent coverage is the wrong question to ask of it.
-        // `gc/shape_keys_edge.rs` says why; the table's `old_carrier` root is
-        // what covers it instead.
-        if slot_is_shared_shape_keys_word(header, slot.slot) {
+        // Shared runtime-root words are traced through receivers, but their
+        // root scanner covers them between minors, independently of any one
+        // carrier's lifetime. Use the same custody as remembering.
+        if !slot.is_parent_owned() {
             return;
         }
         slot.record_layout_read();
@@ -1579,10 +1594,9 @@ pub(super) fn rewrite_remembered_dirty_ranges(valid_ptrs: &ValidPointerSet) {
 
 /// Walk every mutable root slot and rewrite forwarded pointers.
 ///
-/// `try_rewrite_value` accepts a heap reference in either form — NaN-boxed
-/// or bare — for BOTH slot kinds, and `mark_mutable_root_bits` accepts
-/// exactly the same set on the mark side (#6910). Do not narrow one without
-/// the other: a form this pass relocates but marking skips is swept live.
+/// The source owner selects the same decoder for marking and rewriting:
+/// global/native homes contain JSValues; untyped shadow homes may also contain
+/// bare pointers. Never relocate a numeric precise value as a pointer (#6910).
 pub(super) fn rewrite_mutable_root_slots(
     valid_ptrs: &ValidPointerSet,
     shadow_stats: Option<&mut ShadowRootTraceStats>,
@@ -1601,7 +1615,10 @@ pub(super) fn rewrite_mutable_root_slots_with_sources(
         if bits == 0 {
             return;
         }
-        if let Some(new_bits) = try_rewrite_value(bits, valid_ptrs) {
+        if let Some(new_bits) = slot
+            .pointer_word(bits)
+            .and_then(|_| try_rewrite_value(bits, valid_ptrs))
+        {
             slot.write(new_bits);
             record_mutable_slot_rewrite_source(slot, &mut root_sources);
             if matches!(slot.kind, MutableRootSlotKind::ShadowStack) {
@@ -1649,7 +1666,10 @@ pub(super) fn verify_mutable_root_slots(verifier: EvacuationVerifier<'_>) {
         if bits == 0 {
             return;
         }
-        if let Some(new_bits) = verifier.stale_value(bits) {
+        if let Some(new_bits) = slot
+            .pointer_word(bits)
+            .and_then(|_| verifier.stale_value(bits))
+        {
             let surface = match slot.kind {
                 MutableRootSlotKind::ShadowStack => "shadow stack roots",
                 MutableRootSlotKind::NativeStack => "native stack-map roots",

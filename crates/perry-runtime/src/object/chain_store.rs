@@ -57,7 +57,7 @@
 //!    `proto_validity` ([`ChainStoreEntry::validity`]);
 //! 3. the chain itself: `setPrototypeOf` / `__proto__` anywhere (semantic
 //!    epoch), class-prototype-object registration or replacement
-//!    (`class_lookup_surface_gen_bump`, which bumps `proto_validity`), and a
+//!    (the displaced holder changes ShapeId), and a
 //!    Proxy on the chain (the predicate refuses it, so no entry exists);
 //! 4. the receiver's own [[Prototype]] — the `proto_id` its shape records,
 //!    which every prototype change on the receiver transitions.
@@ -361,17 +361,6 @@ pub(crate) unsafe fn chain_store_proven(
         return false;
     };
     proto_id == entry.proto_id && entry.validity == crate::object::proto_validity::proto_validity()
-}
-
-/// The one word a key-add memo's chain verdict is keyed on: `proto_validity`.
-/// It moves when a MARKED prototype object changes structurally or gains a
-/// descriptor, including an accessor installed by a late class registration.
-/// The memo
-/// (`proxy::put_value::packed_add`) records it; its emitted hit reloads it
-/// from `PERRY_PROTO_VALIDITY`.
-#[inline]
-pub(crate) fn verdict_generation() -> u64 {
-    crate::object::proto_validity::proto_validity()
 }
 
 /// Count a store the lane served.
@@ -699,6 +688,7 @@ pub(crate) unsafe fn mark_chain_hops(scope: &crate::gc::RuntimeHandleScope, rece
 /// Root scan: every entry's key is a STRONG root — marked and rewritten. See
 /// the module docs.
 pub(crate) fn scan_chain_store_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    crate::proxy::scan_packed_add_roots_mut(visitor);
     CHAIN_STORE_ENTRIES.with(|cell| unsafe {
         for &entry in (*cell.get()).iter() {
             let entry = &mut *entry;

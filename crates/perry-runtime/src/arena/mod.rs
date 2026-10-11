@@ -42,11 +42,15 @@ pub(crate) use map_allocations::walk_map_allocations;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_alloc_fast;
+#[cfg(test)]
 mod tests_batch_unregister;
 #[cfg(test)]
 mod tests_page_meta_audit;
 #[cfg(test)]
 mod tests_promoted_runs;
+#[cfg(test)]
+mod tests_page_walk;
 
 // Cross-sibling shared types/thread-locals (used by sibling modules via
 // `use super::*;`). These are not part of the crate-public surface
@@ -86,6 +90,8 @@ pub(crate) use page_meta::{page_generation_cache_hot_addr, page_generations_hot_
 pub(crate) use block::block_pool_bytes;
 pub(crate) use page_meta::page_meta_census;
 pub(crate) use region::contains as region_contains;
+#[cfg(target_os = "linux")]
+pub(crate) use region::reservation::classify as region_classify;
 pub(crate) use stats::arena_free_list_bytes;
 pub(crate) use walk::arena_space_census;
 
@@ -167,9 +173,9 @@ pub(crate) use stats::{old_gen_in_use_bytes_recomputed, old_gen_in_use_bytes_res
 // page_meta.rs (public + pub(crate) classification/page-meta API)
 pub(crate) use page_meta::{
     arena_header_is_object_start, classify_heap_generation, classify_heap_space,
-    classify_heap_space_in_range, generation_page_for_addr,
+    classify_heap_space_in_range, classify_region_ownership, generation_page_for_addr,
     materialize_promoted_page_runs_for_object, old_arena_block_range_index,
-    old_arena_movable_block_ranges, old_arena_page_index_remove_object,
+    old_arena_headers_on_pages, old_arena_movable_block_ranges, old_arena_page_index_remove_object,
     old_arena_source_blocks_for_pages, old_arena_walk_objects_on_pages, old_object_page_overlaps,
     old_object_single_page, old_page_account_dirty_slot, old_page_account_dirty_slots,
     old_page_account_promoted_object, old_page_account_swept_object, old_page_account_swept_tally,
@@ -177,7 +183,7 @@ pub(crate) use page_meta::{
     old_pages_begin_gc_cycle, old_pages_reset_sweep_accounting, record_arena_object_start,
     uniform_heap_generation, unregister_old_object_pages, unregister_old_objects_batch,
     HeapGeneration, HeapSpace, OldArenaPageObjectCursor, OldArenaSourceBlockSelection, OldPageMeta,
-    OldPageSummary, OldPageSweepTally,
+    OldPageSummary, OldPageSweepTally, RegionOwnership,
 };
 
 #[cfg(test)]

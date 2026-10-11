@@ -111,15 +111,11 @@ pub(crate) use scan_fallback::*;
 // consumers for readability only — Rust module order is irrelevant.
 mod root_words;
 use root_words::*;
+pub(crate) use root_words::{mark_precise_root, PreciseRoot};
 mod layout;
 mod layout_slot_visit;
-use layout_slot_visit::*;
-/// #8112: the one question the remembered set asks about the shape table's
-/// shared keys word. Its own file because both `barrier/mod.rs` (1995 lines)
-/// and `cycle.rs` (1991) are at the 2000-line cap.
-mod shape_keys_edge;
 pub use layout::*;
-use shape_keys_edge::slot_is_shared_shape_keys_word;
+use layout_slot_visit::*;
 mod trace;
 pub(crate) use trace::*;
 mod barrier;
@@ -308,6 +304,12 @@ pub fn gc_collect_minor() -> u64 {
     }
     gc_collect_minor_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Direct))
         .emit_after_current()
+}
+
+/// Synchronous full collection for the default-off native payload acceptance census.
+#[cfg(feature = "native-payload-test-census")]
+pub fn native_payload_test_collect_full() {
+    gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Manual));
 }
 
 pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
@@ -987,6 +989,16 @@ macro_rules! reg_budgeted_scanner {
     };
 }
 
+/// The memoized intrinsic prototype addresses (`array::prototype_addr`) are
+/// runtime state, filled by the lazy realm build whenever it first runs. Every
+/// heap that can move them must rewrite them: `gc_init` registers this for a
+/// program, and a GC test window that starts from an empty scanner registry
+/// registers it too (`ScopedRootScannerRegistryGuard`), because the realm
+/// build can run inside that window.
+pub(crate) fn register_prototype_addr_cache_scanner() {
+    reg_scanner!(crate::array::scan_prototype_addr_cache_roots_mut);
+}
+
 pub fn gc_init() {
     // Idempotent per thread: production calls this at startup, and
     // `ensure_gc_initialized` calls it lazily on threads that don't. Latch the
@@ -1050,10 +1062,10 @@ pub fn gc_init() {
     // #8067: the descriptor table is weak. Live-object layout scans trace its
     // ordered-keys slot; this scanner only follows existing forwarding records
     // for descriptors and the pointer-keyed slot accelerator after evacuation.
+    // The same scanner visits the records' [[Prototype]] identity words
+    // (object::shapes_prototype): one registration for every heap word a
+    // shape record holds (#12313).
     reg_scanner!(crate::object::shapes::scan_shape_table_rekey_mut);
-    // The shape records' [[Prototype]] words and their identity index are
-    // strong roots (object::shapes_prototype).
-    reg_scanner!(crate::object::shapes::scan_shape_prototype_words_mut);
     reg_scanner!(crate::proxy::scan_proxy_roots_mut);
     // Object/string-valued `err.<prop> = v` user props live as raw bits in
     reg_scanner!(exception_mutable_root_scanner);
@@ -1080,7 +1092,7 @@ pub fn gc_init() {
     // that does not rewrite them leaves the hole/OOB read fallback comparing a
     // stale address against a forwarding-resolved receiver, which defeats its
     // own self-recursion guard and drives the mutator into unbounded recursion.
-    reg_scanner!(crate::array::scan_prototype_addr_cache_roots_mut);
+    register_prototype_addr_cache_scanner();
     // #6763: inherited-property resolution retains an owner while an accessor
     // or Proxy trap can re-enter after moving GC. Rewrite that temporary
     // identity so malformed prototype cycles remain bounded.

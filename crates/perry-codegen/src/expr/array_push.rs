@@ -70,7 +70,7 @@ use super::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_with_flags_on_block,
     emit_jsvalue_slot_store_with_value_bits_on_block, emit_layout_note_slot_on_block,
     emit_may_carry_heap_pointer_check, emit_root_nanbox_store_on_block,
-    emit_typed_feedback_register_site, emit_write_barrier,
+    emit_typed_feedback_register_site,
     emit_write_barrier_slot_generation_tested, expr_has_numeric_pointer_free_array_layout,
     lower_expr, lower_expr_native, nanbox_pointer_inline, raw_f64_layout_fact, unbox_to_i64, FnCtx,
     TypedFeedbackContract, TypedFeedbackKind,
@@ -360,10 +360,9 @@ fn emit_array_box_length(ctx: &mut FnCtx<'_>, array_box: &str, value_discarded: 
 /// Extracted verbatim from `Expr::ArrayPush`'s generic tail in #7634 so that
 /// the spread arm and the spec-order arm share one copy: three sites emitting
 /// the same five-way storage chain is three places for the #5459 fall-through
-/// to be got wrong. The two early `return`s are the boxed cases — they must NOT
-/// also take the capture-slot store below, which would clobber the box pointer
-/// in the capture slot with the array pointer, so the next push would treat the
-/// array as the box and silently lose the realloc write-back.
+/// to be got wrong. The shared boxed writer returns before the capture-slot
+/// store below. Replacing the box pointer in a capture with the array pointer
+/// would make the next push treat the array as the box and lose write-back.
 ///
 /// `what` names the caller for the "local not in scope" diagnostic.
 pub(super) fn emit_push_writeback(
@@ -374,46 +373,8 @@ pub(super) fn emit_push_writeback(
 ) -> Result<()> {
     // Boxed var takes priority: write through the box so every closure sharing
     // the box sees the new pointer.
-    if ctx.boxed_vars.contains(&array_id) {
-        let new_bits = ctx.block().bitcast_double_to_i64(new_box);
-        if crate::scope_env::access::write_scoped(ctx, array_id, &new_bits)? {
-            return Ok(());
-        }
-        // Captured-through-closure boxed var.
-        if let Some(&capture_idx) = ctx.closure_captures.get(&array_id) {
-            let closure_ptr =
-                super::current_closure_ptr_value(ctx, &format!("{what} boxed captured"))?;
-            let idx_str = capture_idx.to_string();
-            let blk = ctx.block();
-            let box_ptr = blk.call(
-                I64,
-                "js_closure_get_capture_bits",
-                &[(I64, &closure_ptr), (I32, &idx_str)],
-            );
-            let new_bits = blk.bitcast_double_to_i64(new_box);
-            blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &new_bits)]);
-            // Gen-GC Phase C2: the realloc'd array head is a (possibly young)
-            // heap pointer stored into an existing box — barrier the box parent
-            // so a minor GC can't miss it.
-            emit_write_barrier(ctx, &box_ptr, &new_bits);
-            return Ok(());
-        } else if let Some(slot) = ctx.locals.get(&array_id).cloned() {
-            let blk = ctx.block();
-            let box_ptr = blk.load(I64, &slot);
-            let new_bits = blk.bitcast_double_to_i64(new_box);
-            blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &new_bits)]);
-            // Gen-GC Phase C2: barrier the box parent (see capture path).
-            emit_write_barrier(ctx, &box_ptr, &new_bits);
-            return Ok(());
-        }
-        // #5459: `array_id` is in `boxed_vars` but has no box location in THIS
-        // context — it's a module-level global accessed directly from a nested
-        // function (the load path read `@global`, not a box-get). Returning here
-        // would skip the realloc write-back entirely, so the relocated array
-        // header is never stored to the registered GC-root global slot: the old
-        // head is freed on the next GC and the global dangles (use-after-free /
-        // corrupted length). Fall through to the module-global store-back below
-        // instead of returning.
+    if crate::scope_env::access::write_back_boxed_local(ctx, array_id, new_box)? {
+        return Ok(());
     }
     if let Some(&capture_idx) = ctx.closure_captures.get(&array_id) {
         let closure_ptr = super::current_closure_ptr_value(ctx, &format!("{what} captured"))?;
@@ -423,10 +384,7 @@ pub(super) fn emit_push_writeback(
             "js_closure_set_capture_bits",
             &[(I64, &closure_ptr), (I32, &idx_str), (I64, &new_bits)],
         );
-        // Gen-GC Phase C2: the realloc'd array head stored into the closure
-        // capture is a (possibly young) heap pointer — barrier the closure
-        // parent.
-        emit_write_barrier(ctx, &closure_ptr, &new_bits);
+        // The runtime capture setter owns the precise slot barrier.
     } else if let Some(slot) = ctx.locals.get(&array_id).cloned() {
         ctx.block().store(DOUBLE, new_box, &slot);
     } else if let Some(global_name) = ctx.module_globals.get(&array_id).cloned() {
@@ -1825,10 +1783,10 @@ mod parent_gate_tests {
     }
 
     /// Follow the `cond_br`'s condition back to its definition and require it to
-    /// be the `or` of a `GC_FLAG_TENURED` header test and the incremental-count
+    /// be the `or` of a `GC_FLAG_TENURED | GC_FLAG_ARENA` header test and the incremental-count
     /// test.
     ///
-    /// Checking only that the IR *contains* `and i8 …, 32` and the global's name
+    /// Checking only that the IR *contains* `and i8 …, 34` and the global's name
     /// is not enough, and this is not hypothetical: replacing the `or` with a
     /// constant-true left both of those substrings in place (the clauses are
     /// still computed, just no longer consulted) and the test stayed green while
@@ -1878,8 +1836,8 @@ mod parent_gate_tests {
             def_of(incremental)
         );
         assert!(
-            ir.contains("and i8") && ir.contains(", 32"),
-            "the header test must mask GC_FLAG_TENURED (0x20):\n{ir}"
+            ir.contains("and i8") && ir.contains(", 34"),
+            "the header test must mask GC_FLAG_TENURED | GC_FLAG_ARENA (0x22):\n{ir}"
         );
         assert!(
             ir.contains("@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT"),

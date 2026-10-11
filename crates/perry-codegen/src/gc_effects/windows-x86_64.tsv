@@ -367,7 +367,6 @@ js_bool_box_set	Leaf
 js_bootstrap_cjs_main_module_placeholder	Reenters
 js_box_alloc	AllocOnly
 js_box_alloc_bits	AllocOnly
-js_box_capture_cell_ptr	Leaf
 js_box_get	Reenters
 js_box_get_bits	Reenters
 js_box_get_bits_named	Reenters
@@ -540,6 +539,7 @@ js_callback_timer_has_pending	Leaf
 js_callback_timer_next_deadline	Reenters
 js_callback_timer_tick	Reenters
 js_cancel_frame	Leaf
+js_capture_cell_assert	Leaf
 js_catch_enter	Leaf
 js_checkpoint	Reenters
 js_cheerio_load	Reenters
@@ -591,7 +591,9 @@ js_class_env_register_slot	Leaf
 js_class_env_register_state	Leaf
 js_class_env_set	Reenters
 js_class_env_stamp	AllocOnly
+js_class_evaluation_finish_prototype	Reenters
 js_class_evaluation_object	Reenters
+js_class_evaluation_object_with_parent	Reenters
 js_class_evaluation_object_with_prototype	Reenters
 js_class_evaluation_parent_prototype	Reenters
 js_class_field_add	Reenters
@@ -1369,6 +1371,7 @@ js_get_string_pointer_unified	Reenters
 js_getenv	Reenters
 js_getenv_value	Reenters
 js_global_assign_existing_or_throw	Reenters
+js_global_get_field_ic_slow	Reenters
 js_global_get_optional	Reenters
 js_global_get_or_throw_unresolved	Reenters
 js_global_or_console_property_by_name	Reenters
@@ -1799,6 +1802,8 @@ js_net_validate_tos	Reenters
 js_new_from_handle	Leaf
 js_new_function_construct	Reenters
 js_new_function_construct_apply	Reenters
+js_new_function_construct_site	Reenters
+js_class_value_super_construct_site	Reenters
 js_new_function_construct_with_new_target	Reenters
 js_new_instance	Reenters
 js_new_target_get	Leaf
@@ -2086,6 +2091,7 @@ js_object_get_field_ic_nonptr	Reenters
 js_object_get_field_ic_overflow_load	Reenters
 js_object_get_field_ic_slow	Reenters
 js_object_get_index_polymorphic	Reenters
+js_object_get_own_field_ic_front	Leaf
 js_object_get_own_field_or_undef	Reenters
 js_object_get_own_field_or_undef_learn	Reenters
 js_object_get_own_property_descriptor	Reenters
@@ -2685,22 +2691,18 @@ js_register_class_computed_accessor	Reenters
 js_register_class_computed_method	Reenters
 js_register_class_constructor	Leaf
 js_register_class_constructor_flags	Leaf
+js_register_class_declaration	Reenters
 js_register_class_extends_data_view	Leaf
 js_register_class_extends_error	Leaf
 js_register_class_extends_typed_array	Leaf
 js_register_class_generic_origin	Reenters
-js_register_class_getter	Reenters
 js_register_class_has_instance	Leaf
 js_register_class_id	Leaf
 js_register_class_length	Reenters
-js_register_class_method	Leaf
 js_register_class_method_bind_length	Leaf
-js_register_class_method_entry	Leaf
-js_register_class_method_with_entry	Leaf
 js_register_class_name	Reenters
 js_register_class_parent	Leaf
 js_register_class_parent_dynamic	Reenters
-js_register_class_setter	Reenters
 js_register_class_source	Leaf
 js_register_class_source_static	Leaf
 js_register_class_static_getter	Reenters
@@ -2805,6 +2807,7 @@ js_request_new_from_init	Reenters
 js_request_new_from_input	Reenters
 js_request_subclass_init	Reenters
 js_request_text	Reenters
+js_region_holder_read	Leaf
 js_require_json_disk	Reenters
 js_require_object_coercible	Reenters
 js_require_path_module	Reenters
@@ -2843,7 +2846,6 @@ js_runtime_validate_crypto_key_arg	Reenters
 js_runtime_validate_integer_arg	Reenters
 js_runtime_validate_string_arg	Reenters
 js_scope_alloc	AllocOnly
-js_scope_capture_base	Leaf
 js_scope_set	Leaf
 js_sea_get_asset	Reenters
 js_sea_get_asset_as_blob	Reenters
@@ -3247,10 +3249,10 @@ js_timer_validate_callback	Reenters
 js_tls_check_server_identity	Reenters
 js_tls_client_check_identity	Reenters
 js_tls_client_check_identity_from_metadata	Reenters
-js_tls_client_is_connected	Leaf
+js_tls_client_is_connected	Reenters
 js_tls_client_preflight	Reenters
-js_tls_client_record_closed	Leaf
-js_tls_client_record_connected	Leaf
+js_tls_client_record_closed	Reenters
+js_tls_client_record_connected	Reenters
 js_tls_client_record_start	Reenters
 js_tls_convert_alpn_protocols	Reenters
 js_tls_create_secure_context	Reenters
@@ -3291,7 +3293,7 @@ js_tls_socket_get_protocol	Reenters
 js_tls_socket_get_session	Reenters
 js_tls_socket_get_shared_sigalgs	Reenters
 js_tls_socket_get_x509_certificate	Reenters
-js_tls_socket_is_session_reused	Leaf
+js_tls_socket_is_session_reused	Reenters
 js_tls_socket_set_key_cert	Reenters
 js_tls_socket_set_max_send_fragment	Reenters
 js_tls_tlssocket_constructor	Reenters
@@ -3971,4 +3973,8 @@ js_iterator_close_on_throw	Reenters
 js_iterator_delegate_return	Reenters
 js_iterator_delegate_throw	Reenters
 perry_class_value_dir_cell	Leaf
-js_register_class_prototype_shape	Leaf
+js_object_alloc_plain	Reenters
+js_method_site_chain_value	Leaf
+js_dyn_index_get_site	Reenters
+js_object_get_field_by_key_site	Reenters
+js_packed_add_chain_valid	Leaf

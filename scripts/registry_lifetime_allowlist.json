@@ -7,12 +7,6 @@
   ],
   "registries": [
     {
-      "file": "crates/perry-ext-http/src/client_request_surface.rs",
-      "name": "CLIENT_REQUEST_SURFACE",
-      "verdict": "open_leak",
-      "why": "Keyed by ClientRequest handle, one entry per outgoing request via with_state_mut's entry().or_default(); destroy() only flips `destroyed`, nothing removes the key"
-    },
-    {
       "file": "crates/perry-ext-http/src/client_turnloop/tls.rs",
       "name": "CONFIGS",
       "fn": "configs",
@@ -32,20 +26,6 @@
       "fn": "pending",
       "verdict": "open_leak",
       "why": "Keyed by runtime server handle; take_pending pops the deque but never removes the key, leaving one entry per created server after close"
-    },
-    {
-      "file": "crates/perry-ext-net/src/classes.rs",
-      "name": "MAP",
-      "fn": "block_lists",
-      "verdict": "open_leak",
-      "why": "Keyed by per-instance id from js_net_block_list_new: one entry per new BlockList(), and no production path removes it"
-    },
-    {
-      "file": "crates/perry-ext-net/src/classes.rs",
-      "name": "MAP",
-      "fn": "socket_addresses",
-      "verdict": "open_leak",
-      "why": "Keyed by per-instance handle: one SocketAddressState per new SocketAddress, production only inserts/reads"
     },
     {
       "file": "crates/perry-ext-streams/src/lib.rs",
@@ -342,22 +322,10 @@
       "why": "Key includes the runtime SymbolHeader.id: a re-evaluated class expression with computed [Symbol()] members adds entries each time"
     },
     {
-      "file": "crates/perry-runtime/src/object/class_registry/verdict_classes.rs",
-      "name": "VERDICT_CLASSES",
-      "verdict": "open_leak",
-      "why": "Receiver class ids from packed_add store verdicts, including synthetic ids minted per closure; never pruned (small u32s)"
-    },
-    {
       "file": "crates/perry-runtime/src/object/field_get_set/ic_miss/private_guard_fast.rs",
       "name": "PRIVATE_NAME_INTERNER",
       "verdict": "bounded_by_program",
       "why": "Interns #private name spellings, which are compile-time literals per access site: one per distinct name"
-    },
-    {
-      "file": "crates/perry-runtime/src/object/mod.rs",
-      "name": "CLASS_PROTOTYPE_METHOD_VALUES",
-      "verdict": "bounded_by_program",
-      "why": "(class_id, method name) -> bound method closure cache, filled only for vtable-registered methods"
     },
     {
       "file": "crates/perry-runtime/src/object/native_module.rs",

@@ -141,41 +141,37 @@ extern "C" fn describe(
     js_nanbox_string(crate::string::js_string_from_bytes(text.as_ptr(), text.len() as u32) as i64)
 }
 
-/// A string template's pieces stay native; a callback's do not.
+/// Every replacement builds its result in one native output, a template's
+/// and a callback's alike.
 ///
-/// The piece list was a JS array holding three `f64` per piece, which the
-/// collector traced and grew: about a kilobyte of live heap per piece, so a
-/// 550 KB subject with 100,000 matches peaked at 545 MB RSS against Node's
-/// 122 MB (#10411). A template's pieces are only ever spans of the subject or
-/// of the template, so they need no heap entry at all. A callback's
-/// replacement is a string user code produced, so those keep the list.
-///
-/// Sabotage-proved: building `Pieces::new` unconditionally in `replace` fails
-/// the first assertion with 0 native constructions; building
-/// `Pieces::new_native` unconditionally fails the second with 1.
+/// The piece list was once a JS array holding three `f64` per piece, which
+/// the collector traced and grew: about a kilobyte of live heap per piece, so
+/// a 550 KB subject with 100,000 matches peaked at 545 MB RSS against Node's
+/// 122 MB (#10411). The output now copies each piece when it is appended, so
+/// nothing is traced; a callback's string is copied as soon as it returns.
 #[test]
-fn a_template_replacement_keeps_its_pieces_native() {
+fn every_replacement_builds_one_native_output() {
     if !crate::object::method_site::run_with_fresh_worker_gate(
-        "gc::tests::runtime_roots::perex_replace_direct::a_template_replacement_keeps_its_pieces_native",
+        "gc::tests::runtime_roots::perex_replace_direct::every_replacement_builds_one_native_output",
     ) {
         return;
     }
     let _guard = CopyingNurseryTestGuard::new(0);
     let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     super::perex_public::register_host_roots();
-    let native = crate::regex::test_native_pieces;
+    let outputs = crate::regex::test_outputs;
 
-    let before = native();
+    let before = outputs();
     let (out, _, direct) = replace_all(b"[0-9]+", b"g", b"ab12 cd345;", template(b"[$&]"));
     assert!(direct, "fixture: the template must take the direct path");
     assert_eq!(String::from_utf8_lossy(&out), "ab[12] cd[345];");
     assert_eq!(
-        native() - before,
+        outputs() - before,
         1,
-        "a string template must record its pieces natively"
+        "a template replacement builds one output"
     );
 
-    let before = native();
+    let before = outputs();
     let (out, _, direct) = replace_all(b"(b)?a", b"g", "bä a ba".as_bytes(), |scope, _| {
         function(scope, crate::fn_info!(describe, 4; with_declared(4))).get_nanbox_f64()
     });
@@ -185,9 +181,9 @@ fn a_template_replacement_keeps_its_pieces_native() {
         "bä {a:undefined@3/8} {ba:b@5/8}"
     );
     assert_eq!(
-        native() - before,
-        0,
-        "a callback's replacement is a JS string, so its pieces keep the list"
+        outputs() - before,
+        1,
+        "a callback replacement builds one output"
     );
 }
 

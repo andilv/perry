@@ -273,31 +273,6 @@ fn typed_array_has_ordinary_own_prop(owner: usize, key: &str) -> bool {
     typed_array_own_prop_snapshot(owner, key).is_some()
 }
 
-unsafe fn descriptor_has(desc_ptr: *mut crate::object::ObjectHeader, name: &[u8]) -> bool {
-    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    crate::object::own_key_present(desc_ptr, key)
-}
-
-unsafe fn descriptor_read(
-    desc_ptr: *mut crate::object::ObjectHeader,
-    name: &[u8],
-) -> crate::JSValue {
-    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    crate::object::js_object_get_field_by_name(desc_ptr as *const crate::object::ObjectHeader, key)
-}
-
-unsafe fn descriptor_bool(desc_ptr: *mut crate::object::ObjectHeader, name: &[u8]) -> Option<bool> {
-    if !descriptor_has(desc_ptr, name) {
-        return None;
-    }
-    let value = descriptor_read(desc_ptr, name);
-    Some(crate::value::js_is_truthy(f64::from_bits(value.bits())) != 0)
-}
-
-fn throw_typed_array_define_error(message: String) -> ! {
-    throw_type_error(message.as_bytes())
-}
-
 pub(crate) fn typed_array_mark_no_extend(owner: usize) {
     unsafe {
         (*crate::buffer::store::header(owner))._reserved |= crate::gc::OBJ_FLAG_NO_EXTEND;
@@ -308,65 +283,53 @@ pub(crate) fn typed_array_owner_no_extend(owner: usize) -> bool {
     unsafe { (*crate::buffer::store::header(owner))._reserved & crate::gc::OBJ_FLAG_NO_EXTEND != 0 }
 }
 
-#[cold]
-fn throw_type_error(message: &[u8]) -> ! {
-    let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-    let err = crate::error::js_typeerror_new(msg);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
-}
-
 pub(crate) unsafe fn typed_array_define_own_property(
     obj_value: f64,
     ta: *mut TypedArrayHeader,
     key: *const crate::string::StringHeader,
     key_name: &str,
-    descriptor_value: f64,
-    desc_view: Option<&crate::object::object_ops::DescView<'_>>,
-) -> f64 {
+    descriptor: &crate::object::object_ops::DescView<'_>,
+) -> bool {
     if ta.is_null() {
-        return obj_value;
+        return true;
     }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    // typed_array_addr_from_value admits tagged and legacy raw receivers.
+    // Normalize at this boundary before the numeric value conversion can run JS.
+    let receiver = scope.root_nanbox_f64(crate::object::object_ops::normalize_descriptor_operand(
+        obj_value,
+    ));
+    let owner_root = scope.root_raw_mut_ptr(ta);
     let owner = ta as usize;
     let len = typed_array_owner_length(owner);
-    let desc_ptr = crate::object::extract_obj_ptr(descriptor_value);
-    if desc_ptr.is_null() {
-        return obj_value;
-    }
     match typed_array_string_key_kind(key_name, len) {
         TypedArrayStringKeyKind::InBoundsIndex(index) => {
-            let has_accessor = descriptor_has(desc_ptr, b"get") || descriptor_has(desc_ptr, b"set");
-            let writable = descriptor_bool(desc_ptr, b"writable");
-            let enumerable = descriptor_bool(desc_ptr, b"enumerable");
-            let configurable = descriptor_bool(desc_ptr, b"configurable");
+            let has_accessor = descriptor.has_named(b"get") || descriptor.has_named(b"set");
+            let writable = descriptor.flag(b"writable");
+            let enumerable = descriptor.flag(b"enumerable");
+            let configurable = descriptor.flag(b"configurable");
             if has_accessor
                 || writable.is_some_and(|value| !value)
                 || enumerable.is_some_and(|value| !value)
                 || configurable.is_some_and(|value| !value)
             {
-                throw_typed_array_define_error(format!("Cannot redefine property: {key_name}"));
+                return false;
             }
-            if descriptor_has(desc_ptr, b"value") {
-                let value = descriptor_read(desc_ptr, b"value");
+            if descriptor.has_named(b"value") {
+                let value = descriptor.read_named(b"value");
                 typed_array_owner_set(owner, index, f64::from_bits(value.bits()));
             }
-            obj_value
+            true
         }
-        TypedArrayStringKeyKind::IntegerIndex => {
-            throw_type_error(b"Invalid typed array index");
-        }
+        TypedArrayStringKeyKind::IntegerIndex => false,
         TypedArrayStringKeyKind::Ordinary => {
-            // OrdinaryDefineOwnProperty step 2: a brand-new key on a
-            // non-extensible typed array is rejected (`Object.defineProperty`
-            // throws; the `Reflect` path pre-checks extensibility itself and
-            // returns false before reaching here).
-            if !typed_array_has_ordinary_own_prop(owner, key_name)
-                && typed_array_owner_no_extend(owner)
-            {
-                throw_typed_array_define_error(format!(
-                    "Cannot define property {key_name}, object is not extensible"
-                ));
-            }
+            // OrdinaryDefineOwnProperty: a brand-new key on a non-extensible
+            // typed array is rejected; Object throws the verdict, Reflect
+            // returns it.
             let existing = typed_array_has_ordinary_own_prop(owner, key_name);
+            if !existing && typed_array_owner_no_extend(owner) {
+                return false;
+            }
             let current_attrs = existing
                 .then(|| crate::object::get_property_attrs(owner, key_name))
                 .flatten()
@@ -374,46 +337,61 @@ pub(crate) unsafe fn typed_array_define_own_property(
                     existing, existing, existing,
                 ));
             let current_accessor = crate::object::get_accessor_descriptor(owner, key_name);
-            if existing
-                && !current_attrs.configurable()
-                && !current_attrs.writable()
-                && current_accessor.is_none()
-            {
-                // Engine keys use the same immutable data descriptors as any
-                // other shaped property. A permitted redefinition is a no-op;
-                // never let it replace the view's traced owner or pin count.
-                crate::object::object_ops::validate_nonconfigurable_redefine(
-                    key_name,
-                    current_attrs,
-                    None,
+            if existing && !current_attrs.configurable() {
+                let current_value = if current_accessor.is_none() {
                     crate::buffer::buffer_get_own_prop(owner, key_name)
-                        .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED)),
-                    descriptor_value,
-                    desc_view,
-                );
-                return obj_value;
+                        .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+                } else {
+                    f64::from_bits(crate::value::TAG_UNDEFINED)
+                };
+                if !crate::object::object_ops::nonconfigurable_redefine_allowed(
+                    current_attrs,
+                    current_accessor,
+                    current_value,
+                    descriptor,
+                ) {
+                    return false;
+                }
+                // Engine keys use the same immutable data descriptors as any
+                // other shaped property. A permitted redefinition of an
+                // immutable data property is a no-op; never let it replace the
+                // view's traced owner or pin count.
+                if !current_attrs.writable() && current_accessor.is_none() {
+                    return true;
+                }
             }
-            let has_get = descriptor_has(desc_ptr, b"get");
-            let has_set = descriptor_has(desc_ptr, b"set");
+            let has_get = descriptor.has_named(b"get");
+            let has_set = descriptor.has_named(b"set");
             let has_accessor = has_get || has_set;
+            let prior_get =
+                scope.root_nanbox_u64(current_accessor.map(|accessor| accessor.get).unwrap_or(0));
+            let prior_set =
+                scope.root_nanbox_u64(current_accessor.map(|accessor| accessor.set).unwrap_or(0));
             if has_accessor {
-                let get_field = descriptor_read(desc_ptr, b"get");
-                let set_field = descriptor_read(desc_ptr, b"set");
-                let get_bits = if !has_get || get_field.is_undefined() {
+                let get_field = descriptor.read_named(b"get");
+                let get_bits = if !has_get {
+                    prior_get.get_nanbox_u64()
+                } else if get_field.is_undefined() {
                     0
                 } else {
                     crate::closure::clone_closure_rebind_this(get_field.bits(), obj_value)
                 };
-                let set_bits = if !has_set || set_field.is_undefined() {
+                let get_bits = scope.root_nanbox_u64(get_bits);
+                let set_field = descriptor.read_named(b"set");
+                let obj_value = f64::from_bits(receiver.get_nanbox_u64());
+                let set_bits = if !has_set {
+                    prior_set.get_nanbox_u64()
+                } else if set_field.is_undefined() {
                     0
                 } else {
                     crate::closure::clone_closure_rebind_this(set_field.bits(), obj_value)
                 };
+                let owner = owner_root.get_raw_mut_ptr::<TypedArrayHeader>() as usize;
                 crate::object::set_accessor_descriptor(
                     owner,
                     key_name.to_string(),
                     crate::object::AccessorDescriptor {
-                        get: get_bits,
+                        get: get_bits.get_nanbox_u64(),
                         set: set_bits,
                     },
                 );
@@ -423,32 +401,44 @@ pub(crate) unsafe fn typed_array_define_own_property(
                     f64::from_bits(crate::value::TAG_UNDEFINED),
                     false,
                 );
-            } else {
+            } else if descriptor.has_named(b"value")
+                || descriptor.has_named(b"writable")
+                || !existing
+            {
+                let previous = (current_accessor.is_none())
+                    .then(|| typed_array_own_prop_snapshot(owner, key_name))
+                    .flatten();
                 crate::object::clear_accessor_descriptor(owner, key_name);
-                let value = if descriptor_has(desc_ptr, b"value") {
-                    let value = descriptor_read(desc_ptr, b"value");
+                let value = if descriptor.has_named(b"value") {
+                    let value = descriptor.read_named(b"value");
                     f64::from_bits(value.bits())
                 } else {
-                    f64::from_bits(crate::value::TAG_UNDEFINED)
+                    previous
+                        .map(|property| property.value)
+                        .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
                 };
                 upsert_typed_array_own_prop(owner, key_name.to_string(), value, true);
             }
             let writable = if has_accessor {
                 false
             } else {
-                descriptor_bool(desc_ptr, b"writable").unwrap_or(current_attrs.writable())
+                descriptor
+                    .flag(b"writable")
+                    .unwrap_or(current_attrs.writable())
             };
-            let enumerable =
-                descriptor_bool(desc_ptr, b"enumerable").unwrap_or(current_attrs.enumerable());
-            let configurable =
-                descriptor_bool(desc_ptr, b"configurable").unwrap_or(current_attrs.configurable());
+            let enumerable = descriptor
+                .flag(b"enumerable")
+                .unwrap_or(current_attrs.enumerable());
+            let configurable = descriptor
+                .flag(b"configurable")
+                .unwrap_or(current_attrs.configurable());
             crate::object::set_property_attrs(
-                owner,
+                owner_root.get_raw_mut_ptr::<TypedArrayHeader>() as usize,
                 key_name.to_string(),
                 crate::object::PropertyAttrs::new(writable, enumerable, configurable),
             );
             let _ = key;
-            obj_value
+            true
         }
     }
 }

@@ -155,6 +155,7 @@ unsafe fn register_test_method(class_id: u32, name: &'static [u8]) {
         0,
         0,
     );
+    crate::object::class_decl_prototype_value(class_id);
 }
 
 fn plain_object_with_key(
@@ -1440,7 +1441,7 @@ fn representation_lowering_helpers_have_lto_keepalive_anchors() {
         (
             guards,
             "static G4",
-            "static G4: unsafe extern \"C\" fn(f64, u32, u32, u32) -> i32",
+            "static G4: unsafe extern \"C\" fn(f64, u32, u32) -> i32",
             "js_method_direct_shape_guard",
         ),
         (
@@ -2157,16 +2158,11 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     let (obj, _, _, receiver) = class_instance(class_id, b"x");
     let expected_shape_id = shape_id(obj);
     let method_name = "direct_shape_target_1061";
-    let method_slot = crate::object::class_prototype_method_guard_slot(method_name);
+    let _ = method_name;
 
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(
-                receiver,
-                class_id,
-                expected_shape_id,
-                method_slot,
-            )
+            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
         },
         1
     );
@@ -2176,7 +2172,6 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
                 receiver,
                 class_id.wrapping_add(1),
                 expected_shape_id,
-                method_slot,
             )
         },
         0
@@ -2194,12 +2189,7 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     );
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(
-                receiver,
-                class_id,
-                expected_shape_id,
-                method_slot,
-            )
+            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
         },
         1
     );
@@ -2211,12 +2201,7 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
         let original_reserved = (*gc)._reserved;
         (*gc)._reserved |= crate::gc::OBJ_FLAG_HAS_DESCRIPTORS;
         assert_eq!(
-            super::guards::js_method_direct_shape_guard(
-                receiver,
-                class_id,
-                expected_shape_id,
-                method_slot,
-            ),
+            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id,),
             0
         );
         (*gc)._reserved = original_reserved;
@@ -2230,12 +2215,7 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     }
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(
-                receiver,
-                class_id,
-                expected_shape_id,
-                method_slot,
-            )
+            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
         },
         0
     );
@@ -2257,12 +2237,7 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     );
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(
-                receiver,
-                class_id,
-                expected_shape_id,
-                method_slot,
-            )
+            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
         },
         1,
         "a different method name must not poison this direct guard",
@@ -2282,12 +2257,7 @@ fn method_direct_shape_guard_requires_the_exact_compiler_pair() {
     );
     assert_eq!(
         unsafe {
-            super::guards::js_method_direct_shape_guard(
-                receiver,
-                class_id,
-                expected_shape_id,
-                method_slot,
-            )
+            super::guards::js_method_direct_shape_guard(receiver, class_id, expected_shape_id)
         },
         1,
         "unrelated holder mutation must not retire this receiver layout proof",
@@ -2328,7 +2298,7 @@ fn typed_feedback_method_direct_guard_fails_for_own_method_replacement() {
 }
 
 #[test]
-fn typed_feedback_method_direct_guard_fails_after_method_invalidation() {
+fn typed_feedback_method_direct_guard_fails_after_holder_method_delete() {
     let _guard = typed_feedback_test_lock();
     reset_typed_feedback_for_tests();
     register(
@@ -2354,16 +2324,28 @@ fn typed_feedback_method_direct_guard_fails_after_method_invalidation() {
             test_direct_method_ptr(),
         )
     };
-    assert_eq!(guard(), 1);
+    assert_eq!(guard(), 1, "an unbuilt holder is pristine");
 
-    // A delete has no replacement value for the contract to discover. The
-    // sticky per-name latch is the authoritative evidence that the declared
-    // vtable method may no longer be callable.
-    crate::object::invalidate_class_prototype_fast_guards_for_method("deleted_9123");
-    assert_eq!(guard(), 0);
+    // Build the declared prototype and publish its birth shape P, as module
+    // init does for a compiled class: a holder carrying P still proves the
+    // declared body.
+    let proto = unsafe {
+        crate::object::js_register_class_name(class_id, b"Deleted9123".as_ptr(), 11);
+        let proto = crate::object::class_decl_prototype_value(class_id);
+        crate::value::js_nanbox_get_pointer(proto) as *mut crate::object::ObjectHeader
+    };
+    assert!(!proto.is_null());
+    crate::object::js_register_class_prototype_shape(class_id, shape_id(proto));
+    assert_eq!(guard(), 1, "a holder with its birth shape proves the body");
+
+    // A delete has no replacement value for the contract to discover; it
+    // moves the holder off P, and that is the evidence.
+    let key = crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32);
+    crate::object::js_object_delete_field(proto, key);
+    assert_eq!(guard(), 0, "a holder off its birth shape declines");
 
     let site = &typed_feedback_snapshot().sites[0];
-    assert_eq!(site.guard_passes, 1);
+    assert_eq!(site.guard_passes, 2);
     assert_eq!(site.guard_failures, 1);
 }
 

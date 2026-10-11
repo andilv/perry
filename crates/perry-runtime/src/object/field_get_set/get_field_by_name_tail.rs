@@ -420,10 +420,31 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                         );
                         return JSValue::from_bits(ctor.to_bits());
                     }
-                    let module = b"buffer.Buffer";
-                    return JSValue::from_bits(
-                        js_create_native_module_namespace(module.as_ptr(), module.len()).to_bits(),
-                    );
+                    // A Node `Buffer` inherits `constructor` from its actual
+                    // [[Prototype]] (`Buffer.prototype`, or a user subclass's
+                    // prototype). Ordinary [[Get]] through that link answers
+                    // the `Buffer` function itself; the namespace object this
+                    // arm used to synthesize is not callable, so axios-style
+                    // `val.constructor.isBuffer(val)` checks failed and
+                    // `buf.constructor === Buffer` was false.
+                    let scope = crate::gc::RuntimeHandleScope::new();
+                    let receiver_h = scope.root_raw_const_ptr(obj);
+                    let key_h = scope.root_raw_const_ptr(key);
+                    let proto = scope.root_nanbox_f64(crate::object::js_object_get_prototype_of(
+                        receiver_h.with_const_ptr(|r: *const ObjectHeader| {
+                            crate::value::js_nanbox_pointer(r as i64)
+                        }),
+                    ));
+                    return receiver_h.with_const_ptr(|receiver: *const ObjectHeader| {
+                        key_h.with_const_ptr(|key: *const crate::StringHeader| {
+                            super::super::prototype_chain::resolve_inherited_field_from_prototype(
+                                receiver as usize,
+                                proto.get_nanbox_u64(),
+                                key,
+                            )
+                            .unwrap_or_else(JSValue::undefined)
+                        })
+                    });
                 }
                 if crate::buffer::is_secret_key(obj as usize) {
                     if key_bytes == b"type" {
@@ -931,14 +952,14 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                 // date-fns / drizzle / lodash duck-typing path:
                 // `arr.constructor === Array`, `new arr.constructor(...)`,
                 // etc. expect a non-undefined function-typed value that
-                // refers back to the global `Array` constructor. Resolve
-                // through the singleton so this returns the same closure
-                // pointer as the bare `Array` identifier.
+                // refers back to the intrinsic Array constructor. Read the
+                // prototype's actual property, independently of its global
+                // binding and including user prototype mutations.
                 if key_bytes == b"constructor" {
                     // An own `constructor` expando (`arr.constructor = Foo`)
                     // shadows the intrinsic — observable via ArraySpeciesCreate
                     // (map/filter/slice/splice/concat) and reflection. Only fall
-                    // back to the global `Array` when there is no own write.
+                    // back to the inherited property when there is no own write.
                     if let Some(v) = own_data_field_by_name(obj, key) {
                         return v;
                     }
@@ -949,8 +970,11 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                     if let Some(v) = super::array_retargeted_proto::array_constructor_slot(obj) {
                         return v;
                     }
-                    let v = js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
-                    return JSValue::from_bits(v.to_bits());
+                    return super::accessors::array_prototype_property_value(
+                        "constructor",
+                        obj as usize,
+                    )
+                    .unwrap_or_else(JSValue::undefined);
                 }
                 if let Ok(name) = std::str::from_utf8(key_bytes) {
                     if let Some(index) = super::super::canonical_array_index(name) {
@@ -1019,8 +1043,11 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                     return JSValue::number(crate::array::js_array_length(arr) as f64);
                 }
                 if key_bytes == b"constructor" {
-                    let v = js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
-                    return JSValue::from_bits(v.to_bits());
+                    return super::accessors::array_prototype_property_value(
+                        "constructor",
+                        obj as usize,
+                    )
+                    .unwrap_or_else(JSValue::undefined);
                 }
             }
             // Any other property access force-materializes, then
@@ -1333,7 +1360,7 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                         }
                     }
                     if class_walk
-                        && lookup_class_method_in_chain(class_id, name).is_some()
+                        && class_method_slot_target(class_id, name).is_some()
                         && !super::class_object_template::evaluation_chain_lost_method(obj, key)
                     {
                         let heap_name = {
@@ -1708,7 +1735,7 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
             // through here — they lower directly to `js_native_call_method`.
             if let Ok(name) = std::str::from_utf8(key_bytes) {
                 if class_walk
-                    && lookup_class_method_in_chain(class_id, name).is_some()
+                    && class_method_slot_target(class_id, name).is_some()
                     && !super::class_object_template::evaluation_chain_lost_method(obj, key)
                 {
                     // Allocate a fresh i8 buffer for the method name owned

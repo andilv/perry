@@ -4,8 +4,7 @@
 use super::*;
 use crate::closure::{js_closure_alloc, ClosureHeader};
 use crate::object::{
-    js_object_alloc_with_shape, js_object_get_field_by_name_f64, js_object_set_field,
-    js_object_set_field_by_name, ObjectHeader,
+    js_object_alloc_with_shape, js_object_set_field, js_object_set_field_by_name, ObjectHeader,
 };
 use crate::value::JSValue;
 
@@ -73,7 +72,7 @@ pub(super) fn build_object(methods: &[(&str, StubFn)], shape_id: u32) -> *mut Ob
 /// populated at module init, long before any `new`, so the vtable is always
 /// live by the time a constructor runs `super()`.
 fn class_chain_overrides(class_id: u32, name: &str) -> bool {
-    class_id != 0 && crate::object::method_owner_class_id(class_id, name).is_some()
+    class_id != 0 && crate::object::class_method_slot_owner(class_id, name).is_some()
 }
 
 pub(crate) fn install_methods_on_existing_object(
@@ -282,11 +281,8 @@ fn event_emitter_async_resource_backing(receiver: f64) -> Option<i64> {
     if !crate::value::addr_class::is_plausible_heap_addr(raw) {
         return None;
     }
-    let key = scope.root_string_ptr(hidden_key(EVENT_EMITTER_ASYNC_RESOURCE_KEY));
-    let raw = (receiver.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK) as usize;
-    let value = key.with_const_ptr::<crate::StringHeader, _>(|key| {
-        js_object_get_field_by_name_f64(raw as *const ObjectHeader, key)
-    });
+    let value = crate::runtime_state_key!(EVENT_EMITTER_ASYNC_RESOURCE_KEY)
+        .read_value(receiver.get_nanbox_f64());
     if value.to_bits() >> 48 != 0x7FFD {
         return None;
     }

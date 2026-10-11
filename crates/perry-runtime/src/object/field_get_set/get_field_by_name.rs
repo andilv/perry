@@ -4,6 +4,8 @@
 
 use super::*;
 
+mod shape_inherited;
+
 /// Wall 10 — read a property a framework attached to a native registry handle
 /// via `Object.setPrototypeOf(handle, proto)` (Express's `res`/`req`). The link
 /// is keyed by the handle id in `OBJECT_PROTOTYPES`. Returns `None` (so the
@@ -142,7 +144,9 @@ pub(crate) fn class_value_get_field(
             && class_id != 0
             && class_has_own_method(class_id, name)
         {
-            let value = class_prototype_method_value_for_name(class_id, name);
+            let value = crate::object::class_method_slot_value(class_id, name)
+                .map(f64::from_bits)
+                .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
             return JSValue::from_bits(value.to_bits());
         }
         if name == "constructor"
@@ -216,7 +220,9 @@ pub(crate) fn class_value_get_field(
         // static methods are resolved below via
         // `lookup_static_method_in_chain`.
         if is_prototype_ref && class_id != 0 && class_has_own_method(class_id, name) {
-            let value = class_prototype_method_value_for_name(class_id, name);
+            let value = crate::object::class_method_slot_value(class_id, name)
+                .map(f64::from_bits)
+                .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
             return JSValue::from_bits(value.to_bits());
         }
         if is_prototype_ref {
@@ -889,7 +895,7 @@ fn get_field_by_name_past_data_probe(
                     // so check the class chain first and fall through to the normal
                     // class/prototype resolution when it shadows the backing size.
                     let class_id = super::super::js_object_get_class_id(obj);
-                    // #7341: BOTH helpers below allocate — `class_instance_has_member`
+                    // #7341: BOTH helpers below allocate — `class_instance_has_method`
                     // builds a `String` for its cache probe, and `subclass_backing_of`
                     // calls `js_string_from_bytes` to materialise its constant
                     // `BACKING_KEY` on every call. Either can drive an evacuating
@@ -906,7 +912,7 @@ fn get_field_by_name_past_data_probe(
                     // costs nothing on it.
                     let obj_h = &size_arm_obj;
                     let has_inherited_size = class_id != 0
-                        && super::super::native_module::class_instance_has_member(class_id, "size");
+                        && super::super::native_module::class_instance_has_method(class_id, "size");
                     if !has_inherited_size {
                         let obj_now = obj_h.get_raw_const_ptr::<ObjectHeader>();
                         let boxed = f64::from_bits(JSValue::pointer(obj_now as *const u8).bits());
@@ -929,6 +935,9 @@ fn get_field_by_name_past_data_probe(
                 obj = size_arm_obj.get_raw_const_ptr::<ObjectHeader>();
             }
         }
+    }
+    if let Some(value) = unsafe { shape_inherited::get(obj, key) } {
+        return value;
     }
     // WeakMap / WeakSet instance — a VALUE read of the collection methods
     // (`w.add`, `wm.set`, `typeof w.has`; react-server-dom's chunk-preload
@@ -1466,9 +1475,9 @@ fn get_field_by_name_past_data_probe(
             // #2138: auto-box the primitive number for the inherited
             // `.constructor` read so `n.constructor === Number` (and the
             // duck-type `value.constructor.name === "Number"` lodash/date-fns
-            // use to discriminate primitives). Route through the same
-            // `js_get_global_this_builtin_value` helper that backs bare-`Number`
-            // identifier resolution so identity comparison holds. Other unknown
+            // use to discriminate primitives). Read the actual intrinsic
+            // prototype, whose shape owns its constructor property. A replaced
+            // global binding does not change that prototype. Other unknown
             // keys still return undefined per #2128 (was SIGSEGV pre-#2128).
             if !key.is_null() {
                 unsafe {
@@ -1483,8 +1492,7 @@ fn get_field_by_name_past_data_probe(
                             return v;
                         }
                     }
-                    if let Some(v) =
-                        primitive_builtin_prototype_property(b"Number", key, f64::from_bits(bits))
+                    if let Some(v) = primitive_builtin_prototype_property(key, f64::from_bits(bits))
                     {
                         return v;
                     }
@@ -1889,7 +1897,7 @@ fn get_field_by_name_past_data_probe(
                         return v;
                     }
                 }
-                if let Some(v) = primitive_builtin_prototype_property(b"Number", key, f) {
+                if let Some(v) = primitive_builtin_prototype_property(key, f) {
                     return v;
                 }
                 if let Some(bound) = bind_primitive_proto_method_static(f, name_bytes) {

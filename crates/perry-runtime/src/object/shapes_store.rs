@@ -61,8 +61,14 @@ pub(super) struct ShapeExtras {
     pub(super) to_any: std::sync::atomic::AtomicU32,
     /// Weak reverse key-add edge. Never shape identity or a GC carrier.
     pub(super) rollback_parent: std::sync::atomic::AtomicU32,
+    /// Weak keyless receiver-birth ShapeId of this prototype's shape.
+    /// Not identity, a carrier, a width, or a GC edge. Revalidated at use.
+    pub(super) created_birth_shape: std::sync::atomic::AtomicU32,
 }
 const _: () = assert!(std::mem::align_of::<ShapeExtras>() >= 2);
+// The new scalar occupies the extension's existing tail padding on LP64.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ShapeExtras>() == 48);
 
 /// A brand list is strictly ascending: sorted with no duplicate, so equal
 /// sets are equal slices.
@@ -104,6 +110,9 @@ pub(super) const RECORD_FLAG_BIRTH_OWNER: u8 = 1 << 5;
 pub(super) const RECORD_FLAG_CARRIED_SEEN: u8 = 1 << 6;
 pub(super) const RECORD_FLAG_EXTERNAL_CARRIER: u8 = 1 << 7;
 
+#[path = "shapes_store/kind.rs"]
+mod kind;
+
 /// The table-owned record of one ShapeId. `keys` is first and 8-aligned: it
 /// is the word the collector marks through and rewrites in place.
 #[repr(C)]
@@ -121,13 +130,12 @@ pub(crate) struct ShapeRecord {
     pub(super) logical_key_count: u32,
     pub(super) live_inline_slot_count: u32,
     pub(super) hole_count: u32,
-    /// Low 8 bits: the `RECORD_FLAG_*` set. Bits 8-10: the `ShapeObjectKind`
-    /// discriminant (codes 0-6; the store facts F-A/F-B are kinds 5 and 6).
-    /// Bits 11-14: the births a keyless birth shape served while tracking its
-    /// width (#10905). Bit 15: derived WeakMap/WeakSet brand summary.
-    /// Bits 16-23: the
-    /// attribute SUMMARY byte (`key_attrs::SUMMARY_*`), an identity fact.
-    /// Bits 24-31: the inline width a keyless birth shape's descendants grow
+    /// Low 8 bits: the `RECORD_FLAG_*` set. Bits 8-11: `ShapeObjectKind`.
+    /// Bits 12-14 and 21: births a keyless birth shape served while tracking its
+    /// width (#10905). Bit 15: a weak-collection brand; bit 31 distinguishes WeakSet.
+    /// Bit 22: immutable key prefix proves symbol absence (derived, not identity).
+    /// attribute SUMMARY bits 16-20 (`key_attrs::SUMMARY_*`), an identity fact.
+    /// Bits 24-30: the inline width a keyless birth shape's descendants grow
     /// to (#10905). The two #10905 fields are learned facts of the record,
     /// never identity.
     ///
@@ -146,9 +154,7 @@ pub(crate) struct ShapeRecord {
     /// ONE field so the megamorphic read confirm (`js_object_read_confirm`)
     /// answers "is the guess a position of this shape" with one compare —
     /// `guess < position_bound` — instead of a flag test and a `min`.
-    /// Offset 40; the special-lane mask uses the former padding at 44, and
-    /// `rep` follows at 48. The extension word at 56 makes the record
-    /// 64 bytes; ordinary shapes keep any reverse edge in that word.
+    /// Offsets: bound 40, special mask 44, rep 48, extras 56, prototype cell 64.
     position_bound: u32,
     /// For a `REP_SPECIAL` lane, one means ConstFn and zero reserves the
     /// NoPointer interpretation for P5. This uses the old padding at 44;
@@ -163,15 +169,22 @@ pub(crate) struct ShapeRecord {
     /// [`ShapeExtras`] address. Ordinary reverse edges need no allocation.
     /// Fixed width keeps the slab layout identical on ILP32/LP64.
     extras: u64,
+    /// Borrowed stable identity-word address; zero for DEFAULT/null/per-object.
+    /// GC rewrites the word, not this derived address; no new identity fact.
+    pub(super) proto_cell: u64,
 }
 
+// Derived once from the immutable key prefix on slab publication. Owned
+// mutable lists carry no absence proof. This is not shape identity.
+const RECORD_KEYS_NO_SYMBOLS: u32 = 1 << 22;
 const RECORD_WEAK_COLLECTION: u32 = 1 << 15;
+const RECORD_WEAK_SET: u32 = 1 << 31;
 const RECORD_KIND_SHIFT: u32 = 8;
-const RECORD_KIND_MASK: u32 = 0b111 << RECORD_KIND_SHIFT;
-/// The largest `ShapeObjectKind::code()` (`NativeNamespace`, 7).
-/// `kind_codes_round_trip` pins every kind within this three-bit field.
-const RECORD_KIND_MAX_CODE: u32 = 7;
-const _: () = assert!(RECORD_KIND_MAX_CODE <= RECORD_KIND_MASK >> RECORD_KIND_SHIFT);
+const RECORD_KIND_MASK: u32 = 0xF << RECORD_KIND_SHIFT;
+/// The frequently decoded kind is one contiguous field.
+/// `kind_codes_round_trip` pins the encoding independently of record width.
+const RECORD_KIND_MAX_CODE: u32 = 11;
+const _: () = assert!(RECORD_KIND_MAX_CODE <= 15);
 /// Charter step 3: the summary of the attributes the shape's keys carry —
 /// what the chain store check and every per-key reader ask FIRST, so a shape
 /// whose keys are all default answers without touching its keys. Derived
@@ -180,18 +193,24 @@ const _: () = assert!(RECORD_KIND_MAX_CODE <= RECORD_KIND_MASK >> RECORD_KIND_SH
 /// shape publishes no keys and carries its private list's conservative
 /// summary here instead.
 const RECORD_SUMMARY_SHIFT: u32 = 16;
-const RECORD_SUMMARY_MASK: u32 = 0xFF << RECORD_SUMMARY_SHIFT;
+const RECORD_SUMMARY_MASK: u32 = 0x1F << RECORD_SUMMARY_SHIFT;
+const _: () = assert!(crate::object::key_attrs::SUMMARY_KEY_BITS == 0x1F);
 const _: () = assert!(RECORD_KIND_MASK & RECORD_SUMMARY_MASK == 0);
 const _: () = assert!(RECORD_KIND_MASK & 0xFF == 0);
 
-/// #10905 (`shapes_birth_width`): births served while tracking, bits 11-14.
-/// Four bits hold every count the tracker stores (it stops at
-/// `TRACKING_BIRTHS`, asserted below).
-const RECORD_BIRTHS_SHIFT: u32 = 11;
-const RECORD_BIRTHS_MASK: u32 = 0xF << RECORD_BIRTHS_SHIFT;
-/// #10905 (`shapes_birth_width`): the learned descendant width, bits 24-31.
+/// #10905: births served while tracking, low bits 12-14 and high bit 21.
+/// This count is decoded while tracking a keyless birth shape; move its
+/// high bit rather than making every shape-kind decode merge two fields.
+const RECORD_BIRTHS_SHIFT: u32 = 12;
+const RECORD_BIRTHS_HIGH: u32 = 1 << 21;
+const RECORD_BIRTHS_MASK: u32 = (7 << RECORD_BIRTHS_SHIFT) | RECORD_BIRTHS_HIGH;
+const RECORD_BIRTHS_MAX: u32 = 15;
+/// #10905 (`shapes_birth_width`): the learned descendant width, bits 24-30 (maximum 64).
 const RECORD_WIDTH_SHIFT: u32 = 24;
-const RECORD_WIDTH_MASK: u32 = 0xFF << RECORD_WIDTH_SHIFT;
+const RECORD_WIDTH_MASK: u32 = 0x7F << RECORD_WIDTH_SHIFT;
+const _: () = assert!(
+    super::shapes_birth_width::LEARNED_WIDTH_MAX <= RECORD_WIDTH_MASK >> RECORD_WIDTH_SHIFT
+);
 // The fields of `flags_and_kind` are pairwise disjoint.
 const _: () = {
     let fields = [
@@ -199,6 +218,8 @@ const _: () = {
         RECORD_KIND_MASK,
         RECORD_BIRTHS_MASK,
         RECORD_WEAK_COLLECTION,
+        RECORD_WEAK_SET,
+        RECORD_KEYS_NO_SYMBOLS,
         RECORD_SUMMARY_MASK,
         RECORD_WIDTH_MASK,
     ];
@@ -212,16 +233,15 @@ const _: () = {
         i += 1;
     }
 };
-const _: () = assert!(
-    super::shapes_birth_width::TRACKING_BIRTHS <= RECORD_BIRTHS_MASK >> RECORD_BIRTHS_SHIFT
-);
+const _: () = assert!(super::shapes_birth_width::TRACKING_BIRTHS <= RECORD_BIRTHS_MAX);
 
-const _: () = assert!(std::mem::size_of::<ShapeRecord>() == 64);
+const _: () = assert!(std::mem::size_of::<ShapeRecord>() == 72);
 const _: () = assert!(std::mem::align_of::<ShapeRecord>() == 8);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, position_bound) == 40);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, special_constfn_mask) == 44);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, rep) == 48);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, extras) == 56);
+const _: () = assert!(std::mem::offset_of!(ShapeRecord, proto_cell) == 64);
 
 impl ShapeRecord {
     #[inline]
@@ -252,6 +272,34 @@ impl ShapeRecord {
             .rollback_parent
             .store(parent, std::sync::atomic::Ordering::Relaxed);
     }
+    #[inline]
+    pub(super) fn created_birth_shape(&self) -> u32 {
+        if !self.has_boxed_extras() {
+            return 0;
+        }
+        // SAFETY: this live record owns its stable Rust extension.
+        unsafe { &*(self.extras as usize as *const ShapeExtras) }
+            .created_birth_shape
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record a weak shape relationship on the prototype's shape. An
+    /// existing extension has room for it; a plain record acquires the same
+    /// extension, preserving its scalar rollback edge.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_created_birth_shape(&mut self, birth: u32) {
+        if !self.has_boxed_extras() {
+            let rollback = self.rollback_parent();
+            self.extras = new_extras(&[], &[]);
+            self.note_rollback_parent(rollback);
+        }
+        // SAFETY: the present record owns this Rust extension, not GC storage.
+        unsafe { &*(self.extras as usize as *const ShapeExtras) }
+            .created_birth_shape
+            .store(birth, std::sync::atomic::Ordering::Relaxed);
+    }
+
     const EMPTY: ShapeRecord = ShapeRecord {
         keys: 0,
         semantic_generation: 0,
@@ -264,6 +312,7 @@ impl ShapeRecord {
         special_constfn_mask: 0,
         rep: 0,
         extras: 0,
+        proto_cell: 0,
     };
 
     #[inline]
@@ -307,8 +356,9 @@ impl ShapeRecord {
     /// The same record carrying attribute summary `summary`.
     #[inline(always)]
     pub(super) fn with_summary(mut self, summary: u8) -> ShapeRecord {
+        debug_assert_eq!(summary & !crate::object::key_attrs::SUMMARY_KEY_BITS, 0);
         self.flags_and_kind = (self.flags_and_kind & !RECORD_SUMMARY_MASK)
-            | (u32::from(summary) << RECORD_SUMMARY_SHIFT);
+            | ((u32::from(summary) << RECORD_SUMMARY_SHIFT) & RECORD_SUMMARY_MASK);
         // The summary is an input of the positional bit (an accessor key).
         self.refresh_positional();
         self
@@ -322,7 +372,7 @@ impl ShapeRecord {
     }
 
     /// Raise [`ShapeRecord::descendant_width`] to `width` (monotone,
-    /// saturating at the byte).
+    /// saturating at the seven-bit width).
     #[inline]
     pub(super) fn note_descendant_width(&mut self, width: u32) {
         let width = width.min(RECORD_WIDTH_MASK >> RECORD_WIDTH_SHIFT);
@@ -335,28 +385,14 @@ impl ShapeRecord {
     /// Births this keyless birth shape served while tracking (#10905).
     #[inline]
     pub(super) fn tracked_births(&self) -> u32 {
-        (self.flags_and_kind & RECORD_BIRTHS_MASK) >> RECORD_BIRTHS_SHIFT
+        ((self.flags_and_kind >> RECORD_BIRTHS_SHIFT) & 7) | ((self.flags_and_kind >> 18) & 8)
     }
 
     #[inline]
     pub(super) fn set_tracked_births(&mut self, births: u32) {
-        let births = births.min(RECORD_BIRTHS_MASK >> RECORD_BIRTHS_SHIFT);
-        self.flags_and_kind =
-            (self.flags_and_kind & !RECORD_BIRTHS_MASK) | (births << RECORD_BIRTHS_SHIFT);
-    }
-
-    #[inline]
-    pub(super) fn object_kind(&self) -> ShapeObjectKind {
-        match (self.flags_and_kind & RECORD_KIND_MASK) >> RECORD_KIND_SHIFT {
-            1 => ShapeObjectKind::Class,
-            2 => ShapeObjectKind::Dictionary,
-            3 => ShapeObjectKind::Function,
-            4 => ShapeObjectKind::FunctionDictionary,
-            5 => ShapeObjectKind::OrdinaryUnmarked,
-            6 => ShapeObjectKind::OrdinaryNumericProof,
-            7 => ShapeObjectKind::NativeNamespace,
-            _ => ShapeObjectKind::Ordinary,
-        }
+        let births = births.min(RECORD_BIRTHS_MAX);
+        let bits = ((births & 7) << RECORD_BIRTHS_SHIFT) | ((births & 8) << 18);
+        self.flags_and_kind = (self.flags_and_kind & !RECORD_BIRTHS_MASK) | bits;
     }
 
     /// A fresh, facts-indexed record with every liveness bit clear.
@@ -372,7 +408,12 @@ impl ShapeRecord {
         // The kind is a FIELD, not a flag: it has three values, and a record
         // that reported the wrong one would be a wrong identity match,
         // because `facts_match` compares the full enum.
-        let kind_bits = (object_kind.code() as u32) << RECORD_KIND_SHIFT;
+        let kind_code = object_kind.code() as u32;
+        debug_assert!(
+            kind_code <= RECORD_KIND_MAX_CODE,
+            "kind has no packed decoder"
+        );
+        let kind_bits = kind_code << RECORD_KIND_SHIFT;
         debug_assert!(kind_bits & !RECORD_KIND_MASK == 0, "kind does not fit");
         let mut record = ShapeRecord {
             keys,
@@ -386,6 +427,7 @@ impl ShapeRecord {
             special_constfn_mask: 0,
             rep: 0,
             extras: 0,
+            proto_cell: 0,
         };
         record.refresh_positional();
         record
@@ -562,6 +604,7 @@ impl ShapeRecord {
     #[inline(always)]
     pub(super) fn with_proto_id(mut self, proto_id: u64) -> ShapeRecord {
         self.proto_id = proto_id;
+        self.proto_cell = 0;
         self
     }
 
@@ -776,6 +819,7 @@ fn new_extras(infos: &[ConstFnSlotInfo], brands: &[u64]) -> u64 {
         to_nopointer: std::sync::atomic::AtomicU32::new(0),
         to_any: std::sync::atomic::AtomicU32::new(0),
         rollback_parent: std::sync::atomic::AtomicU32::new(0),
+        created_birth_shape: std::sync::atomic::AtomicU32::new(0),
     });
     Box::into_raw(extras) as usize as u64
 }
@@ -1287,6 +1331,12 @@ impl ShapeSlab {
             record.proto_id
         );
         let band = band as u8;
+        // Resolve once in this slab: workers install their own cells, and
+        // boxed word pages remain stable even when their directory grows.
+        record.proto_cell = self
+            .protos
+            .identity_slot_ensure(record.proto_id)
+            .map_or(0, |slot| slot as usize as u64);
         record.set(RECORD_FLAG_PRESENT, true);
         let (page, chunk, slot) = Self::split(index);
         let dir = self.dir_mut(band);
@@ -1302,6 +1352,7 @@ impl ShapeSlab {
         // A retire-and-reinsert edits facts on a removed copy: the positional
         // bit follows them.
         record.refresh_positional();
+        record.refresh_symbol_presence();
         *cell = record;
         if previous.is_none() {
             self.len += 1;
@@ -1975,3 +2026,6 @@ mod tests;
 
 #[path = "shapes_store_special.rs"]
 mod special;
+
+#[path = "shapes_store_symbol_presence.rs"]
+mod symbol_presence;

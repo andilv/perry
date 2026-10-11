@@ -4,11 +4,13 @@ use super::perex_api as api;
 use super::perex_dispatch as dispatch;
 use super::perex_match_search::{advance, scan_flags, subject};
 use super::perex_memory::{MemoryBudget, StorageError};
-use super::perex_replace_storage::{boxed, call, length, text, List, Pieces};
+use super::perex_output::{Offsets, Output, Text};
+use super::perex_replace_storage::{boxed, call, call_native, length, text, List, NativeArgs};
 use super::perex_runtime::{self as host, EngineError};
-use super::perex_substitution::Substitution;
+use super::perex_substitution::{emit, parse, Parts};
 use crate::gc::{RuntimeHandle, RuntimeHandleScope};
-use crate::value::{js_nanbox_string, TAG_NULL, TAG_UNDEFINED};
+use crate::string::StringHeader;
+use crate::value::{TAG_NULL, TAG_UNDEFINED};
 use perex::Budget;
 
 fn coercible(value: f64) -> Result<(), EngineError> {
@@ -22,6 +24,10 @@ fn coercible(value: f64) -> Result<(), EngineError> {
 }
 
 pub(super) fn callable(value: &RuntimeHandle<'_>) -> Result<bool, EngineError> {
+    // A primitive is never callable; a string replacement is the common case.
+    if crate::value::JSValue::from_bits(value.get_nanbox_u64()).is_any_string() {
+        return Ok(false);
+    }
     if crate::proxy::proxy_wraps_callable(value.get_nanbox_f64()) {
         return Ok(true);
     }
@@ -122,7 +128,8 @@ pub(crate) fn regexp(receiver: f64, argument: f64, replacement: f64) -> Result<f
     if results.len() == 0 {
         return Ok(boxed(&input));
     }
-    let mut output = Pieces::new(&scope)?;
+    let mut subject_text = Text::new(&bound)?;
+    let mut output = Output::with_capacity(byte_length(&input))?;
     let mut next_source = 0;
     for index in 0..results.len() {
         let local = RuntimeHandleScope::new();
@@ -154,9 +161,6 @@ pub(crate) fn regexp(receiver: f64, argument: f64, replacement: f64) -> Result<f
         }
         let groups = local.root_nanbox_f64(dispatch::get(&result, b"groups")?);
         let accepted = position >= next_source;
-        if accepted {
-            output.append(&input, next_source, position, &mut budget)?;
-        }
         if functional {
             let mut args = List::new(&local)?;
             args.push(boxed(&matched), &mut budget)?;
@@ -172,7 +176,8 @@ pub(crate) fn regexp(receiver: f64, argument: f64, replacement: f64) -> Result<f
             let value = local.root_nanbox_f64(call(&replacement, &this, &args, &memory)?);
             let value = text(&local, &value)?;
             if accepted {
-                output.whole(&value, &mut budget)?;
+                output.span(&mut subject_text, next_source, position, &mut budget)?;
+                output.string(&value, &mut budget)?;
             }
         } else {
             let groups = if groups.get_nanbox_f64().to_bits() == TAG_UNDEFINED {
@@ -183,15 +188,35 @@ pub(crate) fn regexp(receiver: f64, argument: f64, replacement: f64) -> Result<f
                     crate::object::js_object_coerce(groups.get_nanbox_f64())
                 })?))
             };
-            Substitution {
-                input: &input,
-                matched: &matched,
-                position,
-                captures: &captures,
-                groups: groups.as_ref(),
-                template: template.as_ref().unwrap(),
+            let template = template.as_ref().unwrap();
+            // A result's capture count and groups are its own, so the
+            // template is read against each result.
+            let tokens = parse(template, captures.len(), groups.is_some())?;
+            if accepted {
+                output.span(&mut subject_text, next_source, position, &mut budget)?;
             }
-            .append(&mut output, accepted, &mut budget)?;
+            // Named references Get from the groups object even for a result
+            // that is not replaced; the output is discarded then.
+            let mut scratch;
+            let target = if accepted {
+                &mut output
+            } else {
+                scratch = Output::with_capacity(0)?;
+                &mut scratch
+            };
+            emit(
+                &tokens,
+                template,
+                &mut subject_text,
+                position,
+                &mut Results {
+                    matched: &matched,
+                    captures: &captures,
+                    groups: groups.as_ref(),
+                },
+                target,
+                &mut budget,
+            )?;
         }
         if accepted {
             next_source = position + length(&matched);
@@ -199,11 +224,82 @@ pub(crate) fn regexp(receiver: f64, argument: f64, replacement: f64) -> Result<f
         host::poll()?;
     }
     if next_source < input_length {
-        output.append(&input, next_source, input_length, &mut budget)?;
+        output.span(&mut subject_text, next_source, input_length, &mut budget)?;
     }
-    output
-        .finish(&input, template.as_ref(), &mut budget)
-        .map(|s| js_nanbox_string(s as i64))
+    output.finish()
+}
+
+fn byte_length(s: &RuntimeHandle<'_>) -> usize {
+    s.with_const_ptr::<StringHeader, _>(|s| unsafe { (*s).byte_len as usize })
+}
+
+/// An exec result's parts: JS strings the result object supplied, which need
+/// not be spans of the subject.
+struct Results<'a, 's> {
+    matched: &'a RuntimeHandle<'s>,
+    captures: &'a List<'s>,
+    groups: Option<&'a RuntimeHandle<'s>>,
+}
+
+impl Parts for Results<'_, '_> {
+    fn matched_len(&self) -> usize {
+        length(self.matched)
+    }
+    fn matched(
+        &mut self,
+        _: &mut Text<'_, '_>,
+        output: &mut Output,
+        budget: &mut Budget,
+    ) -> Result<(), EngineError> {
+        output.string(self.matched, budget)
+    }
+    fn capture(
+        &mut self,
+        index: usize,
+        _: &mut Text<'_, '_>,
+        output: &mut Output,
+        budget: &mut Budget,
+    ) -> Result<(), EngineError> {
+        let value = self.captures.get(index - 1);
+        if value.to_bits() == TAG_UNDEFINED {
+            return Ok(());
+        }
+        let scope = RuntimeHandleScope::new();
+        let value = scope.root_nanbox_f64(value);
+        output.value(&value, budget)
+    }
+    fn groups(&self) -> Option<&RuntimeHandle<'_>> {
+        self.groups
+    }
+}
+
+/// A literal pattern's match: the matched text is a span of the subject.
+struct Literal {
+    start: usize,
+    length: usize,
+}
+
+impl Parts for Literal {
+    fn matched_len(&self) -> usize {
+        self.length
+    }
+    fn matched(
+        &mut self,
+        input: &mut Text<'_, '_>,
+        output: &mut Output,
+        budget: &mut Budget,
+    ) -> Result<(), EngineError> {
+        output.span(input, self.start, self.start + self.length, budget)
+    }
+    fn capture(
+        &mut self,
+        _: usize,
+        _: &mut Text<'_, '_>,
+        _: &mut Output,
+        _: &mut Budget,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::InvalidSpan)
+    }
 }
 
 /// `Some(global)` when `search` is an untouched RegExp whose `@@replace` is
@@ -229,11 +325,6 @@ pub(crate) fn string(
     replacement: f64,
 ) -> Result<f64, EngineError> {
     coercible(receiver)?;
-    if !all {
-        if let Some(result) = super::perex_remove::try_remove(receiver, search, replacement)? {
-            return Ok(result);
-        }
-    }
     if let Some(global) = builtin_replace(all, search) {
         // replaceAll's IsRegExp and flags Gets, and the @@replace Get, would
         // each reach a builtin without running code. Through the generic
@@ -281,52 +372,79 @@ pub(crate) fn string(
     } else {
         Some(text(&scope, &replacement)?)
     };
-    let mut positions = List::new(&scope)?;
+    let source = subject(input)?;
+    let pattern = subject(needle)?;
+    let mut positions = Offsets::new();
     super::perex_literal_search::positions(
-        &input,
-        &needle,
+        &source,
+        &pattern,
         all,
         &mut positions,
         &mut budget,
         &memory,
     )?;
-    if positions.len() == 0 {
+    if positions.values.is_empty() {
         return Ok(boxed(&input));
     }
-    let mut output = Pieces::new(&scope)?;
-    let captures = List::new(&scope)?;
-    let mut end = 0;
-    for index in 0..positions.len() {
-        let local = RuntimeHandleScope::new();
-        let position = positions.get(index) as usize;
-        output.append(&input, end, position, &mut budget)?;
-        if functional {
-            let mut args = List::new(&local)?;
-            args.push(boxed(&needle), &mut budget)?;
-            args.push(position as f64, &mut budget)?;
-            args.push(boxed(&input), &mut budget)?;
-            let this = local.root_nanbox_f64(f64::from_bits(TAG_UNDEFINED));
-            let value = local.root_nanbox_f64(call(&replacement, &this, &args, &memory)?);
-            let value = text(&local, &value)?;
-            output.whole(&value, &mut budget)?;
+    let tokens = template
+        .as_ref()
+        .map(|template| parse(template, 0, false))
+        .transpose()?;
+    let needle_length = length(&needle);
+    let input_length = length(&input);
+    let mut subject_text = Text::new(&source)?;
+    let mut output = Output::with_capacity(byte_length(&input))?;
+    // An ordinary replacer's arguments go straight into shadow-stack slots;
+    // a proxy's reach its `apply` trap as an array.
+    let mut native_args =
+        if functional && crate::proxy::js_proxy_is_proxy(replacement.get_nanbox_f64()) != 1 {
+            Some(NativeArgs::new(3)?)
         } else {
-            Substitution {
-                input: &input,
-                matched: &needle,
+            None
+        };
+    let this = scope.root_nanbox_f64(f64::from_bits(TAG_UNDEFINED));
+    let mut end = 0;
+    for &position in &positions.values {
+        let position = position as usize;
+        output.span(&mut subject_text, end, position, &mut budget)?;
+        match (&tokens, &template) {
+            (Some(tokens), Some(template)) => emit(
+                tokens,
+                template,
+                &mut subject_text,
                 position,
-                captures: &captures,
-                groups: None,
-                template: template.as_ref().unwrap(),
+                &mut Literal {
+                    start: position,
+                    length: needle_length,
+                },
+                &mut output,
+                &mut budget,
+            )?,
+            _ => {
+                let local = RuntimeHandleScope::new();
+                let value = match native_args.as_mut() {
+                    Some(args) => call_native(&replacement, &this, args, &memory, |set| {
+                        set(0, boxed(&needle));
+                        set(1, position as f64);
+                        set(2, boxed(&input));
+                        Ok(())
+                    })?,
+                    None => {
+                        let mut args = List::new(&local)?;
+                        args.push(boxed(&needle), &mut budget)?;
+                        args.push(position as f64, &mut budget)?;
+                        args.push(boxed(&input), &mut budget)?;
+                        call(&replacement, &this, &args, &memory)?
+                    }
+                };
+                let value = local.root_nanbox_f64(value);
+                output.value(&value, &mut budget)?;
             }
-            .append(&mut output, true, &mut budget)?;
         }
-        end = position + length(&needle);
-        host::poll()?;
+        end = position + needle_length;
     }
-    output.append(&input, end, length(&input), &mut budget)?;
-    output
-        .finish(&input, template.as_ref(), &mut budget)
-        .map(|s| js_nanbox_string(s as i64))
+    output.span(&mut subject_text, end, input_length, &mut budget)?;
+    output.finish()
 }
 
 pub(crate) extern "C" fn regexp_thunk(

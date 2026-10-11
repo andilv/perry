@@ -6,6 +6,7 @@
 //! [`retype_landing_pads_for_statepoints`], both called from
 //! `LlFunction::serialize`.
 
+mod decode_fold;
 mod remat;
 
 fn parse_shadow_bind(line: &str) -> Option<(usize, String)> {
@@ -59,7 +60,11 @@ fn is_local_name_char(c: char) -> bool {
 /// An empty `asm` with a tied `"=r,0"` operand: the standard register-level
 /// identity, zero machine instructions, and — unlike every pure IR spelling —
 /// something InstCombine cannot see through, so it can no longer read
-/// `inttoptr(ptrtoint X)` as an identity pair. Marked `"gc-leaf-function"` so
+/// `inttoptr(ptrtoint X)` as an identity pair. The input is the managed
+/// pointer itself and the output its ordinary i64 bits: the tied register
+/// crosses that representation boundary without a redundant `ptrtoint`.
+/// Keeping the pointer-typed input also preserves RS4GC liveness when LLVM
+/// simplifies integer consumers. Marked `"gc-leaf-function"` so
 /// RS4GC does not try to wrap the asm itself in a statepoint (which it rejects
 /// outright: "Cannot take the address of an inline asm!").
 ///
@@ -102,7 +107,7 @@ fn rewrite_root_access(
         *cast_counter += 1;
         let n = *cast_counter;
         return Some(format!(
-            "  %rs4gc.s{n} = inttoptr i64 {value} to ptr addrspace(1)\n  store ptr addrspace(1) %rs4gc.s{n}, ptr {ptr}\n"
+            "  %rs4gc.b{n} = or i64 {value}, 9222527611924643840\n  %rs4gc.s{n} = inttoptr i64 %rs4gc.b{n} to ptr addrspace(1)\n  store ptr addrspace(1) %rs4gc.s{n}, ptr {ptr}\n"
         ));
     }
     if let Some(rest) = trimmed.strip_prefix("store double ") {
@@ -111,6 +116,9 @@ fn rewrite_root_access(
             return None;
         }
         let value = value.trim();
+        if value == "0.0" {
+            return Some(format!("  store ptr addrspace(1) null, ptr {ptr}\n"));
+        }
         *cast_counter += 1;
         let n = *cast_counter;
         return Some(format!(
@@ -122,7 +130,7 @@ fn rewrite_root_access(
             return None;
         }
         return Some(format!(
-            "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result}.rs4i = ptrtoint ptr addrspace(1) {result}.rs4p to i64\n  {result} = {ROOT_RELOAD_LAUNDER}(i64 {result}.rs4i) \"gc-leaf-function\"\n"
+            "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result}.rs4o = {ROOT_RELOAD_LAUNDER}(ptr addrspace(1) {result}.rs4p) \"gc-leaf-function\"\n  {result} = and i64 {result}.rs4o, 281474976710655\n"
         ));
     }
     if let Some((result, ptr)) = trimmed.split_once(" = load double, ptr ") {
@@ -130,7 +138,7 @@ fn rewrite_root_access(
             return None;
         }
         return Some(format!(
-            "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result}.rs4i = ptrtoint ptr addrspace(1) {result}.rs4p to i64\n  {result}.rs4o = {ROOT_RELOAD_LAUNDER}(i64 {result}.rs4i) \"gc-leaf-function\"\n  {result} = bitcast i64 {result}.rs4o to double\n"
+            "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result}.rs4o = {ROOT_RELOAD_LAUNDER}(ptr addrspace(1) {result}.rs4p) \"gc-leaf-function\"\n  {result} = bitcast i64 {result}.rs4o to double\n"
         ));
     }
     None
@@ -363,7 +371,8 @@ pub(super) fn lower_precise_roots_to_native_stack(
                 report.note_call(root_ptrs.len());
                 crate::statepoint_report::record(report);
             }
-            out
+            // A reload decoded only to address a field becomes one `add`.
+            decode_fold::fuse_reload_decode_offsets(&out)
         }
         None => panic!(
             "perry: native-root lowering could not recognise a root-alloca use in @{} \
@@ -881,3 +890,6 @@ mod stack_map_tests {
 
 #[cfg(test)]
 mod equivalence_tests;
+
+#[cfg(test)]
+mod root_launder_budget_tests;

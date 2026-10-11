@@ -88,6 +88,10 @@ pub struct PayloadPrototype {
 }
 
 impl PayloadPrototype {
+    /// A builder over a prototype handed to a binding's installer.
+    pub(crate) fn from_raw(proto: *mut ObjectHeader) -> Self {
+        Self { proto }
+    }
     /// LazyTransform's inherited state getters (first state read initializes).
     pub fn lazy_stream_state_getters(&mut self) {
         crate::node_stream::native_hooks::install_lazy_state_getters(self.proto);
@@ -291,6 +295,21 @@ pub(crate) fn scan_payload_prototype_roots_mut(visitor: &mut crate::gc::RuntimeR
     });
 }
 
+/// A non-exported family's constructor: a named closure whose `prototype`
+/// becomes the family prototype.
+pub(crate) fn anonymous_constructor(name: &str, length: u32) -> f64 {
+    let closure = crate::closure::js_closure_alloc(
+        crate::fn_info!(payload_ctor_thunk, 0; with_declared(0)),
+        0,
+    );
+    if closure.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    crate::object::native_module::set_bound_native_closure_name(closure, name);
+    crate::object::native_module::set_builtin_closure_length(closure as usize, length);
+    crate::value::js_nanbox_pointer(closure as i64)
+}
+
 fn family_prototype(family: &NativePayloadFamily) -> *mut ObjectHeader {
     let index = slot_index(family.class_id);
     let existing = PAYLOAD_PROTOTYPES.with(|slots| slots[index].load(Ordering::Acquire));
@@ -306,22 +325,7 @@ fn family_prototype(family: &NativePayloadFamily) -> *mut ObjectHeader {
     // it published instead of building a second.
     let constructor = match family.constructor_export {
         Some((module, export)) => crate::object::bound_native_callable_export_value(module, export),
-        None => {
-            let closure = crate::closure::js_closure_alloc(
-                crate::fn_info!(payload_ctor_thunk, 0; with_declared(0)),
-                0,
-            );
-            if closure.is_null() {
-                f64::from_bits(crate::value::TAG_UNDEFINED)
-            } else {
-                crate::object::native_module::set_bound_native_closure_name(closure, family.name);
-                crate::object::native_module::set_builtin_closure_length(
-                    closure as usize,
-                    family.constructor_length,
-                );
-                crate::value::js_nanbox_pointer(closure as i64)
-            }
-        }
+        None => anonymous_constructor(family.name, family.constructor_length),
     };
     let existing = PAYLOAD_PROTOTYPES.with(|slots| slots[index].load(Ordering::Acquire));
     if existing != 0 {
@@ -862,44 +866,68 @@ fn attach_cell<T: 'static>(
     vtable: &'static PayloadVTable,
     external_bytes: usize,
 ) -> Result<(), AttachMiss> {
-    unsafe {
-        if (*cell).magic != crate::native_handle::NATIVE_HANDLE_MAGIC
-            || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
-        {
-            return Err(AttachMiss::Foreign);
-        }
-        if (*cell).finalized != 0 && !lifecycle_sabotage("attach_finalized") {
-            return Err(AttachMiss::Finalized);
-        }
-        if (*cell).flags & CLOSING != 0 || (*cell).busy != 0 {
-            return Err(AttachMiss::Closing);
-        }
-        if !(*cell).resource_ptr.is_null() {
-            return Err(AttachMiss::Open);
-        }
-        let tag = type_tag::<T>(family.class_id);
-        if (*cell).type_id != family.class_id as u64
-            && ((*cell).type_id != tag
-                || crate::native_handle::cell_drop_fn(cell).map(|f| f as usize)
-                    != Some(vtable.drop as usize))
-        {
-            return Err(AttachMiss::Foreign);
-        }
-        // alloc_closed cannot know T. Establish the layout/vtable on first
-        // attach; subsequent opens keep both unchanged.
-        if (*cell).type_id == family.class_id as u64 {
-            (*cell).type_id = tag;
-            (*cell).finalizer = vtable as *const PayloadVTable as *mut c_void;
-            (*cell).flags |= VTABLE_WORD;
-        }
-        let resource = Box::into_raw(Box::new(payload)) as *mut c_void;
-        crate::native_handle::native_handle_attach_rust_payload(cell, resource);
-        // Root the owner before reporting bytes: pacing can collect. The
-        // payload is already installed and reachable through the owner.
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let _owner = scope.root_nanbox_f64(value);
-        crate::native_handle::native_handle_set_external_bytes(cell, external_bytes);
+    let resource = Box::into_raw(Box::new(payload)) as *mut c_void;
+    let result = unsafe {
+        attach_external_cell(
+            value,
+            cell,
+            type_tag::<T>(family.class_id),
+            resource,
+            vtable,
+            external_bytes,
+        )
+    };
+    if result.is_err() {
+        unsafe { drop(Box::from_raw(resource as *mut T)) };
     }
+    result
+}
+
+/// Shared CLOSED -> OPEN installation for in-tree and C-ABI families.
+/// Ownership of resource transfers only on success.
+/// # Safety
+/// cell is a live cell, resource has tag's layout and vtable's payload type.
+pub(crate) unsafe fn attach_external_cell(
+    value: f64,
+    cell: *mut NativeHandleHeader,
+    tag: u64,
+    resource: *mut c_void,
+    vtable: &'static PayloadVTable,
+    external_bytes: usize,
+) -> Result<(), AttachMiss> {
+    if (*cell).magic != crate::native_handle::NATIVE_HANDLE_MAGIC
+        || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+    {
+        return Err(AttachMiss::Foreign);
+    }
+    if (*cell).finalized != 0 && !lifecycle_sabotage("attach_finalized") {
+        return Err(AttachMiss::Finalized);
+    }
+    if (*cell).flags & CLOSING != 0 || (*cell).busy != 0 {
+        return Err(AttachMiss::Closing);
+    }
+    if !(*cell).resource_ptr.is_null() {
+        return Err(AttachMiss::Open);
+    }
+
+    if (*cell).type_id != tag as u32 as u64
+        && ((*cell).type_id != tag
+            || crate::native_handle::cell_drop_fn(cell).map(|f| f as usize)
+                != Some(vtable.drop as usize))
+    {
+        return Err(AttachMiss::Foreign);
+    }
+    // alloc_closed cannot know T. Establish the layout/vtable on first
+    // attach; subsequent opens keep both unchanged.
+    if (*cell).type_id == tag as u32 as u64 {
+        (*cell).type_id = tag;
+        (*cell).finalizer = vtable as *const PayloadVTable as *mut c_void;
+        (*cell).flags |= VTABLE_WORD;
+    }
+    crate::native_handle::native_handle_attach_rust_payload(cell, resource);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let _owner = scope.root_nanbox_f64(value);
+    crate::native_handle::native_handle_set_external_bytes(cell, external_bytes);
     Ok(())
 }
 
@@ -954,6 +982,16 @@ pub fn close(value: f64, family: &NativePayloadFamily) -> CloseOutcome {
 #[repr(transparent)]
 pub struct OwnerLink(pub(crate) usize);
 
+/// Cell addresses carried in transport tokens must fit below 2^56.
+pub(crate) const LINK_ADDRESS_LIMIT: u64 = 1 << 56;
+
+/// The OPEN payload behind a live owner-thread link. No allocation or JS.
+/// # Safety
+/// The cell is kept alive by an outstanding resource or link_ref.
+pub(crate) unsafe fn link_open_payload(link: OwnerLink) -> *mut c_void {
+    crate::native_handle::rust_payload_ptr_on_owner_thread(link.0 as *mut NativeHandleHeader)
+}
+
 /// Obtain a link in any non-finalized state with the traced owner edge enabled.
 pub fn owner_link(value: f64, family: &NativePayloadFamily) -> Result<OwnerLink, PayloadMiss> {
     if !family.links_owner {
@@ -971,6 +1009,10 @@ pub fn owner_link(value: f64, family: &NativePayloadFamily) -> Result<OwnerLink,
             return Err(PayloadMiss::Foreign);
         }
     }
+    assert!(
+        (cell as u64) < LINK_ADDRESS_LIMIT && cell as usize & 7 == 0,
+        "a payload cell must be 8-aligned below 2^56 to travel in a link token"
+    );
     Ok(OwnerLink(cell as usize))
 }
 
@@ -1195,18 +1237,21 @@ fn state_field_memo(
     })
 }
 
-/// The slot a JS-state key had under one ShapeId, remembered per call site
-/// and per agent (ShapeIds are per agent), exactly like an emitted `o.key`
-/// site's compact word: one ShapeId compare, then one load. A miss walks the
-/// keys and re-primes. Declare one with [`state_key_memo!`].
-pub type StateKeyMemo = std::thread::LocalKey<std::cell::Cell<u64>>;
+/// One runtime call site's emitted read words, per agent. The own-only
+/// native-state entry and ordinary own/inherited/absent reads share these
+/// words and the existing PIC holder validation/rooting mechanism.
+pub type StateKeyMemo = std::thread::LocalKey<StateKeySite>;
 
-/// Declare a [`StateKeyMemo`]: `state_key_memo!(static MEMO_DB);`.
+/// The existing emitted read site, also used by native state slot accesses.
+pub use crate::object::field_get_set::runtime_read_site::RuntimeReadSite as StateKeySite;
+
+/// Declare a per-agent runtime call site: `state_key_memo!(static MEMO_DB);`.
 #[macro_export]
 macro_rules! state_key_memo {
     ($vis:vis static $name:ident) => {
         ::std::thread_local! {
-            $vis static $name: ::std::cell::Cell<u64> = const { ::std::cell::Cell::new(0) };
+            $vis static $name: $crate::native_payload::StateKeySite =
+                const { $crate::native_payload::StateKeySite::new() };
         }
     };
 }
@@ -1216,18 +1261,18 @@ unsafe fn state_key_index_memo(
     name: &[u8],
     memo: &'static StateKeyMemo,
 ) -> Option<usize> {
-    let shape = crate::object::shapes::object_shape_stamp(obj);
-    if shape != 0 {
-        let word = memo.with(|cell| cell.get());
-        if (word >> 32) as u32 == shape {
-            return Some((word as u32) as usize);
+    memo.with(|site| {
+        if let Some(slot) = site.own_slot(obj) {
+            return Some(slot as usize);
         }
-    }
-    let i = state_key_index(obj, name)?;
-    if shape != 0 {
-        memo.with(|cell| cell.set(((shape as u64) << 32) | i as u64));
-    }
-    Some(i)
+        let i = state_key_index(obj, name)?;
+        site.prime_own_slot(
+            crate::object::shapes::object_shape_stamp(obj),
+            i as u32,
+            crate::object::object_live_slot_count(obj),
+        );
+        Some(i)
+    })
 }
 
 /// Read a field of a live object through a memo. Never allocates, so no
@@ -1237,7 +1282,7 @@ unsafe fn raw_field_memo(obj: *mut ObjectHeader, key: &[u8], memo: &'static Stat
 }
 
 /// The JS state object of `obj` if it has one (no allocation).
-unsafe fn raw_js_state(obj: *mut ObjectHeader) -> Option<*mut ObjectHeader> {
+pub(crate) unsafe fn raw_js_state(obj: *mut ObjectHeader) -> Option<*mut ObjectHeader> {
     let state = raw_field_memo(obj, JS_STATE_KEY, &JS_STATE_MEMO);
     let js = crate::value::JSValue::from_bits(state.to_bits());
     js.is_pointer()
@@ -1600,50 +1645,11 @@ pub fn set_pending_exception(owner: f64, exception: f64) -> Result<(), ()> {
     }
 }
 
-/// # Safety
-/// Call on the creator thread with a live cell, once per outstanding item.
-pub unsafe fn link_ref(link: OwnerLink) {
-    let cell = link.0 as *mut NativeHandleHeader;
-    assert_eq!(
-        (*cell).creator_thread_id,
-        crate::native_handle::current_thread_id()
-    );
-    (*cell).refs = (*cell).refs.checked_add(1).expect("native refs overflow");
-    #[cfg(test)]
-    if callback_sabotage("pin") {
-        return;
-    }
-    if (*cell).refs == 1 {
-        #[cfg(test)]
-        if callback_sabotage("latch") {
-            crate::gc::pin_object(
-                (((*cell).owner & crate::value::POINTER_MASK) as *mut u8)
-                    .sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader,
-            );
-            return;
-        }
-        crate::gc::pin_object_non_young(
-            (cell as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader
-        );
-    }
-}
-
-/// # Safety
-/// Match a link_ref on the creator thread, even when explicitly closed.
-pub unsafe fn link_unref(link: OwnerLink) {
-    let cell = link.0 as *mut NativeHandleHeader;
-    assert_eq!(
-        (*cell).creator_thread_id,
-        crate::native_handle::current_thread_id()
-    );
-    assert_ne!((*cell).refs, 0, "unbalanced native unref");
-    (*cell).refs -= 1;
-    if (*cell).refs == 0 {
-        crate::gc::unpin_object(
-            (cell as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader
-        );
-    }
-}
+#[path = "native_payload_links.rs"]
+mod links;
+#[cfg(feature = "native-payload-test-census")]
+pub use links::test_census;
+pub use links::{link_ref, link_unref};
 
 /// Explicitly close a payload attached to an ordinary subclass instance.
 ///
@@ -1779,7 +1785,35 @@ pub fn js_state(value: f64, family: &NativePayloadFamily, create: bool) -> f64 {
     js_state_for_class(value, family.class_id, create)
 }
 
-fn js_state_for_class(value: f64, class_id: u32, create: bool) -> f64 {
+/// The class id carried by `value`'s attached payload cell (the family's,
+/// also for a source subclass instance), on the cell's creator thread.
+pub(crate) fn attached_family_class_id(value: f64) -> Option<u32> {
+    let obj = any_object(value)?;
+    let meta = unsafe { (*obj).meta };
+    if meta.is_null() {
+        return None;
+    }
+    let cell = payload_cell_of_word(unsafe { (*meta).native_state })?;
+    unsafe {
+        if (*cell).finalized != 0
+            || (*cell).creator_thread_id != crate::native_handle::current_thread_id()
+            || (*cell).owner != value.to_bits()
+        {
+            return None;
+        }
+        Some((*cell).type_id as u32)
+    }
+}
+
+/// The JS state of the actual object, whatever its own class id.
+pub(crate) fn js_state_object(value: f64, create: bool) -> f64 {
+    match any_object(value) {
+        Some(obj) => js_state_for_class(value, unsafe { (*obj).class_id }, create),
+        None => undefined(),
+    }
+}
+
+pub(crate) fn js_state_for_class(value: f64, class_id: u32, create: bool) -> f64 {
     let undefined = undefined();
     let Some(obj) = instance_of(value, class_id) else {
         return undefined;
@@ -1812,6 +1846,8 @@ pub(crate) fn export_class_id(module: &str, export: &str) -> Option<u32> {
     use crate::native_class_ids as ids;
     Some(match (module, export) {
         ("http", "ServerResponse") => ids::HTTP_SERVER_RESPONSE,
+        ("net", "Socket" | "Stream") => ids::NET_SOCKET,
+        ("net", "Server") => ids::NET_SERVER,
         ("crypto", "Hash") => ids::CRYPTO_HASH,
         ("crypto", "Hmac") => ids::CRYPTO_HMAC,
         ("crypto", "Cipheriv") => ids::CRYPTO_CIPHERIV,

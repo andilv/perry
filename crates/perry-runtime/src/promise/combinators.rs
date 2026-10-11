@@ -1368,7 +1368,7 @@ pub extern "C" fn js_assimilate_thenable(value: f64) -> f64 {
     // run `Call(thenAction, value, «resolve, reject»)`. Otherwise resolve plain
     // (return the value unchanged).
     let (then_func_ptr, then_param_count, _then_has_synthetic_arguments, _then_has_rest) =
-        match crate::object::lookup_class_method_in_chain(class_id, "then") {
+        match crate::object::class_method_slot_target(class_id, "then") {
             Some(p) => p,
             None => return assimilate_via_then_property(value),
         };
@@ -1402,12 +1402,12 @@ pub extern "C" fn js_assimilate_thenable(value: f64) -> f64 {
         })
     });
 
-    // The user's `then(onFulfilled, onRejected)` reads each parameter as a
-    // raw f64 closure pointer (matching the convention used by
-    // `js_promise_new_with_executor`).
-    let resolve_f64 =
-        resolve_handle.with_mut_ptr::<u8, _>(|resolve| f64::from_bits(resolve as u64));
-    let reject_f64 = reject_handle.with_mut_ptr::<u8, _>(|reject| f64::from_bits(reject as u64));
+    // Function-valued arguments obey the JSValue ABI, including when user
+    // code saves them in an array or holds them across a moving collection.
+    let resolve_f64 = resolve_handle
+        .with_mut_ptr::<u8, _>(|resolve| crate::value::js_nanbox_pointer(resolve as i64));
+    let reject_f64 = reject_handle
+        .with_mut_ptr::<u8, _>(|reject| crate::value::js_nanbox_pointer(reject as i64));
 
     // Invoke `value.then(resolve, reject)` via the vtable. Mirrors
     // `call_vtable_method` in object.rs: NaN-box `this` with POINTER_TAG so

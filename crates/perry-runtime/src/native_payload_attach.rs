@@ -122,6 +122,8 @@ pub(crate) fn attach_external_rooted(
             links_owner,
         )
     };
+    #[cfg(feature = "native-payload-test-census")]
+    super::test_census::created(unsafe { (*cell).type_id });
     let word = crate::value::JSValue::pointer(cell as *const u8).bits();
     obj.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
         let meta = (*obj).meta;
@@ -315,6 +317,11 @@ pub fn prototype(family: &NativePayloadFamily) -> f64 {
     }
 }
 
+/// The ordinary object `value` names, or `None`. Every payload entry point
+/// funnels an ARBITRARY receiver through here (a handle dispatcher's re-boxed
+/// `i64`, a TLS option, a foreign value), so the header read is the
+/// ownership-proving one: the allocator must own `addr` before a header byte
+/// is touched, and every id band is rejected first.
 #[inline]
 pub(crate) fn any_object(value: f64) -> Option<*mut ObjectHeader> {
     let bits = value.to_bits();
@@ -322,9 +329,11 @@ pub(crate) fn any_object(value: f64) -> Option<*mut ObjectHeader> {
         return None;
     }
     let addr = (bits & crate::value::POINTER_MASK) as usize;
-    let header = unsafe { crate::value::addr_class::try_read_gc_header(addr)? };
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT {
-        return None;
+    unsafe {
+        crate::value::addr_class::try_read_tracked_gc_header_of_type(
+            addr,
+            crate::gc::GC_TYPE_OBJECT,
+        )?;
     }
     Some(addr as *mut ObjectHeader)
 }

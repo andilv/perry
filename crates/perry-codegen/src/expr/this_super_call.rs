@@ -555,6 +555,41 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(double_literal(0.0));
                 }
             };
+            if let Some((module, export)) = current_class.native_extends.as_ref() {
+                if module.trim_start_matches("node:") == "net"
+                    && matches!(export.as_str(), "Socket" | "Stream" | "Server")
+                {
+                    let undef = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                    let (args, roots) = crate::lower_call::lower_call_args_rooted(ctx, super_args)?;
+                    let options = args.first().cloned().unwrap_or_else(|| undef.clone());
+                    let callback = args.get(1).cloned().unwrap_or_else(|| undef.clone());
+                    let this = ctx
+                        .this_stack
+                        .last()
+                        .cloned()
+                        .map(|slot| ctx.block().load(DOUBLE, &slot))
+                        .unwrap_or_else(|| undef.clone());
+                    let kind = u32::from(export == "Server").to_string();
+                    ctx.block().call(
+                        DOUBLE,
+                        "js_net_subclass_init",
+                        &[
+                            (DOUBLE, &this),
+                            (DOUBLE, &options),
+                            (DOUBLE, &callback),
+                            (I32, &kind),
+                        ],
+                    );
+                    bind_derived_this_after_super(ctx);
+                    crate::lower_call::apply_field_initializers_recursive(
+                        ctx,
+                        &current_class_name,
+                        crate::lower_call::FieldInitMode::SelfOnly,
+                    )?;
+                    roots.release(ctx);
+                    return Ok(undef);
+                }
+            }
             // #5437 (Next.js p-queue `PQueue`): when HIR captured a dynamic
             // `extends_expr` for this class, the parent is a LEXICAL runtime
             // value (an in-scope local / require result) — NOT the same-named
@@ -759,14 +794,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             // `this_box` as its receiver (unchanged behavior
                             // for every other runtime-value parent).
                             let nt_save = crate::rooting::new_target_save_for_super(ctx);
+                            let construct_site = crate::expr::new_dynamic::construct_site(ctx);
                             let parent_result = ctx.block().call(
                                 DOUBLE,
-                                "js_fetch_or_value_super",
+                                "js_class_value_super_construct_site",
                                 &[
                                     (DOUBLE, &parent_val),
                                     (DOUBLE, &this_box),
                                     (crate::types::PTR, &args_ptr),
                                     (I64, &args_len),
+                                    (crate::types::PTR, &construct_site),
                                 ],
                             );
                             if let Some(save) = nt_save.as_ref() {

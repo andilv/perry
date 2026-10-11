@@ -13,11 +13,6 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 perry-ffi.workspace = true
-# Zero-copy socket reads: each read is copied into a reused `BytesMut` and
-# `split_to(n).freeze()` carves each read off as a refcounted `Bytes` view,
-# which the 'data' event carries to the drain handler (it only borrows it as
-# `&[u8]`). Drops the per-read `Vec<u8>` alloc + memcpy.
-bytes.workspace = true
 # No tokio and no tokio-rustls: every socket, listener and TLS session lives
 # on the agent's turnloop loop (`turnloop_io`, `turnloop_tls_io`). A thread
 # that does not own that loop posts its submissions to the thread that does
@@ -59,4 +54,4 @@ perry-ffi = { workspace = true, features = ["runtime-link"] }
 # with the real perry-stdlib, so drop the bundled no-op stdlib_stubs that would
 # otherwise shadow perry-stdlib's real symbols (#6314). `default`: keep the copy
 # feature-identical to the shipped runtime so gated dispatchers behave (#6303).
-perry-runtime = { workspace = true, features = ["default", "stdlib"] }
+perry-runtime = { workspace = true, features = ["default", "stdlib", "native-payload-test-census"] }

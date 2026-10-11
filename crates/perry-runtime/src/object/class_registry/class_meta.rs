@@ -1,5 +1,5 @@
 use super::*;
-use crate::fast_hash::{new_ptr_hash_map, new_ptr_hash_set, PtrHashMap, PtrHashSet};
+use crate::fast_hash::{new_ptr_hash_map, new_ptr_hash_set, PtrHashMap};
 use crate::object::class_image::ImageTable;
 use std::borrow::Cow;
 use std::sync::RwLock;
@@ -59,7 +59,12 @@ pub unsafe extern "C" fn js_register_class_name(class_id: u32, name_ptr: *const 
         }
         guard.as_mut().unwrap().insert(class_id, name);
     }
+    // A declaration has a prototype surface even when its body is empty.
+    // Publish that fact at registration, including anonymous declarations;
+    // literal-only ids never register a declaration name.
+    super::registration::publish_unbuilt_holder(class_id);
     crate::object::class_value::note_intrinsic_registration(class_id, "name");
+    refresh_anon_declaration_role(class_id);
 }
 
 /// Look up the user-visible name of a registered class. Returns `None`
@@ -67,6 +72,16 @@ pub unsafe extern "C" fn js_register_class_name(class_id: u32, name_ptr: *const 
 pub fn class_name_for_id(class_id: u32) -> Option<String> {
     let guard = CLASS_NAMES.read().ok()?;
     guard.as_ref()?.get(&class_id).cloned()
+}
+
+/// Was `class_id` registered with a user-visible name? [`class_name_for_id`]
+/// without cloning the name, for the identity predicates on read misses.
+pub(crate) fn class_has_name(class_id: u32) -> bool {
+    CLASS_NAMES.read().ok().is_some_and(|guard| {
+        guard
+            .as_ref()
+            .is_some_and(|names| names.contains_key(&class_id))
+    })
 }
 
 /// #9413: `class_id → the class's original source text`. Populated by codegen
@@ -324,101 +339,14 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
     if !is_valid_obj_ptr(ptr as *const u8) {
         return None;
     }
-    // Identify by the closure's read-only `func_ptr` rather than the
-    // GC-movable ClosureHeader address. Both the date-fns ctor closure
-    // and the (later-evacuated) ctor closure carry the same
-    // `global_this_builtin_noop_thunk` function pointer, so this match
-    // survives GC moves. The per-name lookup must then walk the
-    // globalThis singleton's keys to recover the constructor name —
-    // accept the extra hop only when the func_ptr matches.
+    // Dedicated bodies prove their intrinsic declaration directly. A shared
+    // body's immutable capture supplies that declaration instead of a public
+    // property or a search through the writable global object.
     unsafe {
         if !crate::closure::closure_kind_probe(ptr as usize) {
             return None;
         }
         let func_ptr = (*ptr).code() as usize;
-        let is_global_builtin_func = func_ptr
-            == global_this_builtin_noop_thunk as *const u8 as usize
-            || func_ptr == typed_array_constructor_call_thunk as *const u8 as usize
-            // ArrayBuffer / SharedArrayBuffer / DataView carry the shared
-            // construct-only call thunk (populate.rs). When one is captured into
-            // a variable and constructed — `const D = DataView; new D(buf)`,
-            // `Reflect.construct(DataView, …)`, `class X extends DataView` — the
-            // dynamic-`new` path lands here and must recognize the thunk so the
-            // singleton walk recovers the name and construct.rs's
-            // "ArrayBuffer"/"SharedArrayBuffer"/"DataView" arms build it, instead
-            // of falling through to invoke the bare-call thunk (which throws
-            // "Constructor requires 'new'"). Minified bundles capture these
-            // globals into locals pervasively (the Claude Code cli.js bundle
-            // fails at module init without this). Regression from the thunk swap
-            // in 06e1ab349 — before it these carried the recognized noop thunk.
-            || func_ptr == construct_only_builtin_call_thunk as *const u8 as usize
-            // #4102: `Array`/`Object`/`Date` constructor *values* carry their own
-            // coercion thunks (not the shared noop thunk), so the dynamic
-            // `instanceof` / reflective `@@hasInstance` path could not recover
-            // their name. Accept those thunks too; the singleton walk below maps
-            // each back to "Array"/"Object"/"Date".
-            || func_ptr == global_this_array_thunk as *const u8 as usize
-            || func_ptr == global_this_object_thunk as *const u8 as usize
-            // #10423: `Function` carries its own call thunk now; `new F(…)` /
-            // `Reflect.construct(Function, …)` must still route to the
-            // from-strings constructor in construct.rs.
-            || func_ptr == global_this_function_call_thunk as *const u8 as usize
-            || func_ptr == global_this_date_thunk as *const u8 as usize
-            || func_ptr == global_this_blob_thunk as *const u8 as usize
-            || func_ptr == global_this_file_thunk as *const u8 as usize
-            || func_ptr == global_this_headers_thunk as *const u8 as usize
-            || func_ptr == global_this_request_thunk as *const u8 as usize
-            || func_ptr == global_this_response_thunk as *const u8 as usize
-            || func_ptr == global_this_string_thunk as *const u8 as usize
-            || func_ptr == global_this_number_thunk as *const u8 as usize
-            || func_ptr == global_this_boolean_thunk as *const u8 as usize
-            || func_ptr == global_this_bigint_thunk as *const u8 as usize
-            || func_ptr == global_this_symbol_thunk as *const u8 as usize
-            || func_ptr == error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == type_error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == range_error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == reference_error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == syntax_error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == eval_error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == uri_error_constructor_call_thunk as *const u8 as usize
-            || func_ptr == webcrypto_illegal_constructor_thunk as *const u8 as usize
-            // Map/Set/WeakMap/WeakSet/WeakRef constructor *values* carry their
-            // own "requires 'new'" thunks (global_this.rs). When obtained as a
-            // value and constructed via `new $WeakMap()` (e.g. qs's
-            // `side-channel`/`get-intrinsic` reads `%WeakMap%` into a variable),
-            // the call lands here, not the static codegen path. Accept the
-            // thunks so the singleton walk recovers the name and the match arms
-            // below dispatch into the real factory instead of invoking the
-            // bare-call thunk (which throws "Constructor WeakMap requires 'new'").
-            || func_ptr == map_constructor_call_thunk as *const u8 as usize
-            || func_ptr == set_constructor_call_thunk as *const u8 as usize
-            // #2889's own arm handles `new (rebound RegExp)(...)`, but this
-            // recognition step never accepted RegExp's dedicated thunk, so it
-            // never reached that arm: `const RegExpCtor = RegExp; new
-            // RegExpCtor(pattern)` (socket-lib's rolldown-bundled primordials
-            // module does exactly this) fell through to the generic
-            // empty-object path, producing an object `.source`/`.flags`
-            // readers reject as an unbranded receiver.
-            || func_ptr == regexp_constructor_call_thunk as *const u8 as usize
-            || func_ptr == weak_map_constructor_call_thunk as *const u8 as usize
-            || func_ptr == weak_set_constructor_call_thunk as *const u8 as usize
-            || func_ptr == weak_ref_constructor_call_thunk as *const u8 as usize
-            // `class X extends Promise` needs its parent VALUE recognized as the
-            // Promise constructor (for the runtime `new Subclass` /
-            // `NewPromiseCapability(Subclass)` path). The Promise ctor value
-            // carries `promise_constructor_call_thunk`.
-            || func_ptr == promise_constructor_call_thunk as *const u8 as usize
-            || func_ptr
-                == crate::messaging::js_message_channel_constructor_call_error as *const u8
-                    as usize
-            || func_ptr
-                == crate::messaging::js_message_port_constructor_call_error as *const u8 as usize
-            || func_ptr
-                == crate::messaging::js_broadcast_channel_constructor_call_error as *const u8
-                    as usize;
-        if !is_global_builtin_func {
-            return None;
-        }
         // #5989: dedicated per-builtin thunks map to their name DIRECTLY —
         // without consulting globalThis. The name-record/singleton-walk
         // fallbacks below break the moment user code REASSIGNS the global
@@ -428,7 +356,7 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
         // identification returned None, and `Reflect.construct(original,
         // args, newTarget)` fell to the generic tail → unbranded "Invalid
         // Date" instances). Only the SHARED thunks (noop, typed-array)
-        // still need the walk.
+        // carry an immutable declaration capture instead.
         let direct: Option<&'static str> =
             if func_ptr == global_this_date_thunk as *const u8 as usize {
                 Some("Date")
@@ -492,63 +420,41 @@ pub(crate) fn identify_global_builtin_constructor(func_value: f64) -> Option<&'s
         if direct.is_some() {
             return direct;
         }
-    }
-    // Prefer the per-closure built-in `.name` record. Full-suite Rust tests
-    // temporarily seed GLOBAL_THIS_PTR with GC fixture pointers; relying only
-    // on the singleton walk below makes unrelated tests race with constructor
-    // identity for globals such as TextEncoderStream.
-    let name_value = crate::value::JSValue::from_bits(
-        crate::closure::closure_get_dynamic_prop(ptr as usize, "name").to_bits(),
-    );
-    if name_value.is_string() {
-        let name_ptr = name_value.as_string_ptr();
-        if !name_ptr.is_null() {
-            let name_bytes = unsafe {
-                let data = (name_ptr as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                std::slice::from_raw_parts(data, (*name_ptr).byte_len as usize)
-            };
-            if let Ok(name) = std::str::from_utf8(name_bytes) {
-                for builtin in GLOBAL_THIS_BUILTIN_CONSTRUCTORS.iter().copied() {
-                    if builtin == name {
-                        return Some(builtin);
-                    }
-                }
-            }
-        }
-    }
-    // Find which builtin name maps to this exact closure header on the
-    // singleton. Walk via the existing
-    // `js_get_global_this_builtin_value` helper — short loop (≤ ~50
-    // entries), only fires on the constructFrom hot path.
-    //
-    // #7497: the same ordering defect `js_get_global_this_builtin_value` had,
-    // and worse here — the loop below allocates a fresh key string on EVERY
-    // iteration, so a `globalThis` address read once before the loop is exposed
-    // to ~50 collection points instead of one. Root it and re-read the address
-    // after each allocation.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let global_handle = scope.root_nanbox_f64(js_get_global_this());
-    // #7497 (CodeRabbit): the SEARCHED value needs the same treatment. `jv` was
-    // computed at entry and never refreshed; if a key allocation evacuates the
-    // ClosureHeader, the `globalThis` field slot is rewritten to the new address
-    // while `jv.bits()` still names from-space, the equality below never matches,
-    // and the caller silently falls through to the generic construct tail.
-    let func_handle = scope.root_nanbox_f64(func_value);
-    for name in GLOBAL_THIS_BUILTIN_CONSTRUCTORS.iter().copied() {
-        let (key, global_this_f64) = global_handle.across_nanbox(|| {
-            crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32)
-        });
-        let global_obj =
-            crate::value::js_nanbox_get_pointer(global_this_f64) as *const ObjectHeader;
-        if global_obj.is_null() {
+        // Shared bodies receive their intrinsic declaration identity at birth.
+        // Public `.name` is mutable and may be an accessor; it is never an
+        // identity proof and must not run during constructor classification.
+        if !shared_global_builtin_constructor_body(func_ptr)
+            || (*ptr).capture_count & crate::closure::NO_THIS_REBIND_FLAG == 0
+            || crate::closure::real_capture_count((*ptr).capture_count) != 1
+        {
             return None;
         }
-        let v = js_object_get_field_by_name(global_obj, key);
-        if v.bits() == func_handle.get_nanbox_f64().to_bits() {
-            return Some(name);
+        let identity = JSValue::from_bits(crate::closure::js_closure_get_capture_bits(ptr, 0));
+        if !identity.is_int32() {
+            return None;
         }
+        let index = identity.as_int32();
+        if index <= 0 {
+            return None;
+        }
+        GLOBAL_THIS_BUILTIN_CONSTRUCTORS
+            .get(index as usize - 1)
+            .map(|decl| decl.name)
     }
-    None
+}
+
+/// Existing shared constructor bodies whose declaration identity is an input
+/// to the closure. This is also used by the global constructor birth path.
+#[inline]
+pub(crate) fn shared_global_builtin_constructor_body(code: usize) -> bool {
+    code == global_this_builtin_noop_thunk as *const u8 as usize
+        || code == typed_array_constructor_call_thunk as *const u8 as usize
+        || code == construct_only_builtin_call_thunk as *const u8 as usize
+        || code == webcrypto_illegal_constructor_thunk as *const u8 as usize
+        || code == crate::messaging::js_message_channel_constructor_call_error as *const u8 as usize
+        || code == crate::messaging::js_message_port_constructor_call_error as *const u8 as usize
+        || code
+            == crate::messaging::js_broadcast_channel_constructor_call_error as *const u8 as usize
 }
 
 #[cfg(feature = "global-text")]
@@ -662,7 +568,7 @@ pub unsafe extern "C" fn js_text_encoding_stream_new() -> f64 {
 /// drizzle's `value.constructor === Object` duck checks, and the standard
 /// `({}).constructor === Object` semantics all match Node. The HIR
 /// lowering registers each anon shape's id here at module init.
-pub static ANON_SHAPE_CLASS_IDS: ImageTable<RwLock<Option<PtrHashSet<u32>>>> =
+pub static ANON_SHAPE_CLASS_IDS: ImageTable<RwLock<Option<PtrHashMap<u32, bool>>>> =
     ImageTable::new(|image| &image.anon_shape_class_ids);
 
 /// Mark `class_id` as a synthetic anon-shape class so `.constructor`
@@ -685,10 +591,9 @@ pub static ANON_SHAPE_CLASS_IDS: ImageTable<RwLock<Option<PtrHashSet<u32>>>> =
 /// before this was written: object literals ARE anon shapes, so such a flag is
 /// true in essentially every real program and the lock is taken anyway.
 ///
-/// The set is INSERT-ONLY — the registrar below only ever calls `insert`, and
-/// nothing removes — which is what makes an open-addressed mirror sound with
-/// no reclamation scheme: an entry, once published, stays valid for the life
-/// of the image.
+/// Membership is insert-only, so the open-addressed mirror needs no
+/// reclamation: a published id stays valid for the life of the image. Its
+/// declaration-role bit is refreshed when declaration metadata is registered.
 #[no_mangle]
 pub unsafe extern "C" fn js_register_anon_shape_class_id(class_id: u32) {
     if class_id == 0 {
@@ -698,12 +603,13 @@ pub unsafe extern "C" fn js_register_anon_shape_class_id(class_id: u32) {
     // not yet see it falls through to the locked set below, which the write
     // guard is about to update. The reverse order would let a reader miss in
     // both.
-    super::super::class_image::anon_fast_insert(class_id);
     let mut guard = ANON_SHAPE_CLASS_IDS.write().unwrap();
     if guard.is_none() {
-        *guard = Some(new_ptr_hash_set());
+        *guard = Some(new_ptr_hash_map());
     }
-    guard.as_mut().unwrap().insert(class_id);
+    let declared = declaration_has_identity(class_id);
+    super::super::class_image::anon_fast_insert(class_id, declared);
+    guard.as_mut().unwrap().insert(class_id, declared);
 }
 
 /// True when `class_id` is marked as an anon shape but is really a DECLARED
@@ -720,12 +626,54 @@ pub unsafe extern "C" fn js_register_anon_shape_class_id(class_id: u32) {
 /// `modifyOwnPropertyDescriptors` produced Unions whose `recur` was gone
 /// ("recur is not a function" at OpenCode startup).
 ///
-/// A registered class NAME plus a non-empty prototype vtable is positive
+/// A registered class NAME plus a published CLASS holder word is positive
 /// evidence of a real declared class; an anon shape has neither.
 pub fn declared_class_outranks_anon_shape(class_id: u32) -> bool {
-    is_anon_shape_class_id(class_id)
-        && class_name_for_id(class_id).is_some()
-        && !super::class_decl_prototype_method_names(class_id).is_empty()
+    anonymous_class_role(class_id) == Some(true)
+}
+
+/// One metadata read supplies both anonymous membership and declaration
+/// precedence: None for a non-member, false for a plain record, true for a
+/// colliding declaration. Shape minting must not probe membership separately.
+pub(crate) fn anonymous_class_role(class_id: u32) -> Option<bool> {
+    if class_id == 0 {
+        return None;
+    }
+    if let Some(role) = super::super::class_image::anon_role_lookup(class_id) {
+        return role;
+    }
+    ANON_SHAPE_CLASS_IDS
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref()?.get(&class_id).copied())
+}
+
+/// Registration-time projection, stored in the existing anonymous class
+/// metadata. No name cloning, method enumeration or second registry walk is
+/// required when an object shape is minted.
+fn declaration_has_identity(class_id: u32) -> bool {
+    let named = CLASS_NAMES.read().ok().is_some_and(|g| {
+        g.as_ref()
+            .is_some_and(|names| names.contains_key(&class_id))
+    });
+    named
+        && crate::object::shapes::identity_prototype_word(
+            crate::object::shapes::class_identity_proto_id(class_id),
+        ) != 0
+}
+
+/// Called after either declaration input is registered; supports any module
+/// initialization order, including an anonymous marking before the class.
+pub(crate) fn refresh_anon_declaration_role(class_id: u32) {
+    let mut guard = ANON_SHAPE_CLASS_IDS.write().unwrap();
+    if let Some(role) = guard.as_mut().and_then(|map| map.get_mut(&class_id)) {
+        // Serialize projection with anonymous registration. Input registrars
+        // release their own locks first, so a late refresh cannot overwrite
+        // a complete declaration with an earlier partial snapshot.
+        let declared = declaration_has_identity(class_id);
+        *role = declared;
+        super::super::class_image::anon_fast_insert(class_id, declared);
+    }
 }
 
 /// True if `class_id` was registered via `js_register_anon_shape_class_id`.
@@ -738,7 +686,7 @@ pub fn is_anon_shape_class_id(class_id: u32) -> bool {
     }
     if let Ok(guard) = ANON_SHAPE_CLASS_IDS.read() {
         if let Some(set) = guard.as_ref() {
-            return set.contains(&class_id);
+            return set.contains_key(&class_id);
         }
     }
     false
@@ -747,36 +695,87 @@ pub fn is_anon_shape_class_id(class_id: u32) -> bool {
 #[cfg(test)]
 mod anon_shape_collision_tests {
     use super::*;
-    use crate::object::class_registry::state::{
-        ClassVTable, VTableMethodEntry, CLASS_VTABLE_REGISTRY,
-    };
-    use std::collections::HashMap;
+
+    #[test]
+    fn declaration_role_survives_member_retirement() {
+        let id = 0x4322_1000;
+        unsafe {
+            js_register_anon_shape_class_id(id);
+            js_register_class_name(id, b"SymbolOnly".as_ptr(), 10);
+            crate::object::js_register_class_method(
+                id as i64,
+                b"@@iterator".as_ptr(),
+                10,
+                0x1000,
+                0,
+                0,
+                0,
+            );
+        }
+        assert_eq!(anonymous_class_role(id), Some(true));
+        super::super::registration::invalidate_class_string_member_order(id, "@@iterator", false);
+        assert_eq!(
+            anonymous_class_role(id),
+            Some(true),
+            "a declaration keeps its identity after delete"
+        );
+    }
+
+    #[test]
+    fn declaration_role_is_projected_for_every_registration_order() {
+        for (offset, order) in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = 0x4322_0000 + offset as u32;
+            let mut seen = [false; 3];
+            for operation in order {
+                unsafe {
+                    match operation {
+                        0 => js_register_anon_shape_class_id(id),
+                        1 => js_register_class_name(id, b"".as_ptr(), 0),
+                        2 => crate::object::js_register_class_method(
+                            id as i64,
+                            b"m".as_ptr(),
+                            1,
+                            0x1000,
+                            1,
+                            0,
+                            0,
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+                seen[operation] = true;
+                assert_eq!(declared_class_outranks_anon_shape(id), seen[0] && seen[1]);
+                assert_eq!(
+                    anonymous_class_role(id),
+                    seen[0].then_some(seen[1]),
+                    "one projection preserves membership and precedence"
+                );
+            }
+        }
+    }
 
     fn seed_declared_class(class_id: u32, name: &str, method: &str) {
         unsafe { js_register_class_name(class_id, name.as_ptr(), name.len() as u32) };
-        let mut methods = HashMap::new();
-        methods.insert(
-            method.to_string(),
-            VTableMethodEntry {
-                func_ptr: 0x1000,
-                param_count: 1,
-                has_synthetic_arguments: false,
-                has_rest: false,
-                entry: 0,
-            },
-        );
-        let mut guard = CLASS_VTABLE_REGISTRY.write().unwrap();
-        if guard.is_none() {
-            // #9203 moved this registry to a PtrHasher map; a plain
-            // `HashMap::new()` infers the default hasher and no longer type-checks.
-            *guard = Some(new_ptr_hash_map());
-        }
-        guard.as_mut().unwrap().insert(
+        crate::object::class_registry::declarations::test_declare_member_quiet(
             class_id,
-            ClassVTable {
-                methods,
-                ..ClassVTable::default()
-            },
+            method.as_bytes(),
+            crate::object::class_registry::declarations::test_method_member(
+                0x1000, 1, false, false, 0,
+            ),
+        );
+        crate::object::shapes::write_identity_word(
+            crate::object::shapes::class_identity_proto_id(class_id),
+            crate::value::TAG_UNDEFINED,
         );
     }
 

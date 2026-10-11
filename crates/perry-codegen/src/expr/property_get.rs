@@ -44,6 +44,7 @@ use super::property_get_names::{
 };
 
 mod accessor_arm;
+mod buffer_alias;
 pub(crate) mod generic_dispatch;
 pub(crate) mod globalget;
 mod helpers;
@@ -71,6 +72,9 @@ use super::{
 };
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+    if let Some(v) = crate::stmt::region_read_stmts::lower_keyed_get(ctx, expr)? {
+        return Ok(v);
+    }
     // Step 4b: a planned-bare read inside a region's F-body.
     if let Some(v) = crate::stmt::region_loop::try_lower_bare_get(ctx, expr)? {
         return Ok(v);
@@ -85,28 +89,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             return super::private_field_site::lower_get(ctx, site, property);
         }
     }
-    // #7219: reading `.buffer` on a tracked typed-array view HANDS OUT ITS
-    // STORAGE, so the local's inline-storage proof stops holding from here on.
-    //
-    // `js_typed_array_backing_buffer` materializes a backing `ArrayBuffer` for
-    // a typed array that owned its bytes and rebinds the array to alias it —
-    // element 0 no longer follows the header. The proven-view tiers
-    // (`proven_view_access`, `buffer_access`, `range_facts`, `i32_fast_path`)
-    // all read `header + 16 + idx*width` directly, so after
-    //
-    //     const words = new Uint32Array(1);      // storage_inline_proven
-    //     const bytes = new Uint8Array(words.buffer);
-    //     words[0] = 0x01020304;                 // <- wrote the ORPHANED bytes
-    //
-    // the write landed in the pre-materialization storage while `bytes` read
-    // the buffer, and neither direction aliased: the repro summed 0 instead of
-    // 10, and writing through `bytes` was equally invisible to `words`.
-    //
-    // The runtime side already guards its own inline reader with the typed
-    // array's storage byte, which `register_view_meta` sets. These tiers are
-    // the compile-time proof that skips that check entirely, so the hazard has
-    // to be recorded where the alias is created rather than where it is used.
-    // `MutableAlias` is exactly what this is.
     if let Expr::PropertyGet {
         object,
         property,
@@ -155,17 +137,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 return Ok(len);
             }
         }
-        if property == "buffer" {
-            if let Expr::LocalGet(id) = object.as_ref() {
-                if ctx.receiver_descriptors.contains_buffer_view(id) {
-                    super::invalidate_buffer_view_pointer(
-                        ctx,
-                        *id,
-                        crate::native_value::MaterializationReason::MutableAlias,
-                    );
-                }
-            }
-        }
+        buffer_alias::invalidate_buffer_alias_for_read(ctx, object, property);
     }
     // `split("literal")[constant].length` on a scalar-replaced split can
     // read the precomputed numeric length directly. The split part itself was
@@ -279,7 +251,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     | "try"
             ) =>
         {
-            Ok(lower_global_builtin_static_value(ctx, "Promise", property))
+            lower_global_builtin_static_value(ctx, "Promise", property)
         }
 
         Expr::PropertyGet {
@@ -447,7 +419,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // non-numeric `length`, a function, a typed array, `null` and
             // `undefined`, and require node-identical output. They run the
             // inline arm now instead of the generic tower.
-            && (is_array_expr(ctx, object)
+            && (matches!(object.as_ref(), Expr::LocalGet(id) if ctx.array_record_length_local == Some(*id))
+                || is_array_expr(ctx, object)
                 || is_string_expr(ctx, object)
                 || match crate::type_analysis::static_type_of(ctx, object) {
                     // A `Function`-typed receiver is a closure, not a
@@ -532,6 +505,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // was forced through `js_value_length_f64` (issue #128
             // follow-up — correctness-safe, but ~10x slower on the
             // `.length` hot path). Tag check is platform-independent.
+            // A compiler-owned record carries the entry proof. Preserve its
+            // compact guard without changing ordinary indexed-loop codegen.
+            if matches!(object.as_ref(), Expr::LocalGet(id)
+                if ctx.array_record_length_local == Some(*id)
+                    && ctx.array_stack_records.contains_key(id))
+            {
+                return Ok(composed_ics::emit_record_length(
+                    ctx,
+                    &recv_box,
+                    &recv_bits,
+                    &recv_handle,
+                ));
+            }
+            let blk = ctx.block();
             let recv_tag = blk.lshr(I64, &recv_bits, "48");
             let recv_tag_masked = blk.and(I64, &recv_tag, "65533"); // 0xFFFD
             let tag_ok = blk.icmp_eq(I64, &recv_tag_masked, "32765"); // 0x7FFD

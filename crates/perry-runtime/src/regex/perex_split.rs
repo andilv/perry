@@ -4,10 +4,11 @@ use super::perex_api as api;
 use super::perex_dispatch as dispatch;
 use super::perex_match_search::subject;
 use super::perex_memory::MemoryBudget;
+use super::perex_output::Output;
 use super::perex_owner::GcProgram;
 use super::perex_owner::HeapSubject;
 use super::perex_replace::{callable, index_property};
-use super::perex_replace_storage::{boxed, call, length, text, List, Pieces, Units};
+use super::perex_replace_storage::{boxed, call, length, text, List, Units};
 use super::perex_runtime::{self as host, CaptureMode, EngineError};
 use super::perex_strings::SpanCopies;
 use crate::gc::{RuntimeHandle, RuntimeHandleScope};
@@ -158,7 +159,8 @@ fn forward_split(
             api::QUANTUM,
             &mut host::poll,
         )?;
-        near = Some(position);
+        // The automaton answers without a position; keep the last one.
+        near = position.or(near);
         let Some(found) = found else {
             break;
         };
@@ -310,25 +312,23 @@ pub(crate) fn regexp(receiver: f64, argument: f64, limit_value: f64) -> Result<f
         }
     }
     let new_flags = if sticky {
-        flags
+        boxed(&flags)
     } else {
-        let y = scope.root_string_ptr(api::caught(|| {
-            crate::string::js_string_from_bytes(b"y".as_ptr(), 1)
-        })?);
-        let mut pieces = Pieces::new(&scope)?;
-        pieces.whole(&flags, &mut budget)?;
-        pieces.whole(&y, &mut budget)?;
-        scope.root_string_ptr(pieces.finish(&flags, Some(&y), &mut budget)?)
+        let mut output = Output::with_capacity(length(&flags) + 1)?;
+        output.string(&flags, &mut budget)?;
+        output.ascii(b"y")?;
+        output.finish()?
     };
+    let new_flags = scope.root_nanbox_f64(new_flags);
     let splitter = scope.root_nanbox_f64(api::caught(|| match &constructor {
         None => js_nanbox_pointer(super::js_regexp_construct(
             receiver.get_nanbox_f64(),
-            boxed(&new_flags),
+            new_flags.get_nanbox_f64(),
         ) as i64),
         Some(constructor) => crate::object::construct_two_rooted(
             constructor.get_nanbox_f64(),
             receiver.get_nanbox_f64(),
-            boxed(&new_flags),
+            new_flags.get_nanbox_f64(),
         ),
     })?);
     let mut output = List::new(&scope)?;

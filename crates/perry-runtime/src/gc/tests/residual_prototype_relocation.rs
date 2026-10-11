@@ -79,9 +79,13 @@ fn marked_prototype() -> usize {
 /// thread's string atom table. Without that table's scanner, a copying minor
 /// frees the atoms while the table still names them. The next intrinsic build
 /// then takes a freed address as a key, and a key list later reads a garbage
-/// length from it, up to the end of the 2 MiB block (#12137). Register the
-/// key tables as production does: the atom and intern table holds its strings,
-/// and the shape table and canonical keys trie follow moved keys arrays.
+/// length from it, up to the end of the 2 MiB block (#12137).
+///
+/// Register these tables as `gc_init` does: the atom and intern table holds
+/// its strings, and the shape table and canonical keys trie follow moved keys
+/// arrays. (The same lazy build also memoizes the intrinsic prototypes as raw
+/// addresses; every scoped test window registers that cache's scanner itself,
+/// see `ScopedRootScannerRegistryGuard::new`.)
 fn register_key_table_scanners() {
     gc_register_mutable_root_scanner(crate::string::scan_intern_table_roots_mut);
     gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
@@ -281,6 +285,13 @@ fn test_residual_prototype_owners_of_every_movable_kind_survive_a_copying_minor(
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_key_table_scanners();
+    // RegExp resolves its intrinsic from the lazy realm after the preceding
+    // copying minors. The isolation guard removed the normal realm scanner;
+    // restore it so that cache is marked and rewritten instead of naming a
+    // prototype freed by an earlier iteration. The custom prototypes below
+    // remain unrooted and are retained only through their tested owner edge.
+    gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
+    register_runtime_handle_root_scanner_for_tests();
 
     type Alloc = Box<dyn Fn() -> usize>;
     let mut owners: Vec<(&str, Alloc)> = vec![

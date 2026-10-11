@@ -73,7 +73,7 @@ fn find_birth_record(
     inner: &ShapeTableInner,
     slab: &shapes_store::ShapeSlab,
     proto_id: u64,
-) -> Option<*mut ShapeRecord> {
+) -> Option<(u32, *mut ShapeRecord)> {
     let facts =
         shapes_store::facts_key_proto(0, 0, 0, 0, ShapeObjectKind::Ordinary, 0, proto_id, 0, 0);
     let ids = inner.by_facts.get(&facts)?;
@@ -86,7 +86,7 @@ fn find_birth_record(
         if r.has(RECORD_FLAG_FACTS_INDEXED)
             && r.facts_match_proto(0, 0, 0, 0, ShapeObjectKind::Ordinary, 0, proto_id, 0, 0)
         {
-            return Some(record);
+            return Some((id, record));
         }
     }
     None
@@ -103,36 +103,52 @@ pub(super) fn note_descendant_width(
     if width <= crate::object::INLINE_SLOT_FLOOR as u32 || !is_prototype_serial(proto_id) {
         return;
     }
-    if let Some(record) = find_birth_record(inner, slab, proto_id) {
+    if let Some((_, record)) = find_birth_record(inner, slab, proto_id) {
         // SAFETY: a live slab record; single-threaded agent.
         unsafe { (*record).note_descendant_width(width.min(LEARNED_WIDTH_MAX)) };
     }
 }
 
-/// The inline width to allocate an object born on the keyless birth shape of
-/// `proto_id` with, or 0 for the allocator's floor. Mints the birth shape if
-/// it is absent (its first birth, or its first after a prune), counts this
-/// birth against the tracking window, and keeps the record through the next
-/// full collection.
-pub(crate) fn keyless_birth_width(proto_id: u64) -> u32 {
-    if !is_prototype_serial(proto_id) {
-        return 0;
+/// Scalar facts resolved for one keyless birth. The shape proves the zero
+/// logical live bound; the width is the allocation this birth was served.
+/// These may differ while tracking or after descendants grow past the floor.
+pub(crate) struct KeylessBirth {
+    shape: u32,
+    width: u32,
+}
+
+impl KeylessBirth {
+    /// Prototype kinds without a tracked ordinary birth resolve their shape
+    /// through the same final-birth interner, without a prior shape proof.
+    pub(crate) fn untracked() -> Self {
+        Self { shape: 0, width: 0 }
     }
-    let id = super::publish_shape_result(super::shape_descriptor_ensure_with_generation(
-        std::ptr::null(),
-        0,
-        0,
-        0,
-        ShapeObjectKind::Ordinary,
-        proto_id,
-        super::ReceiverFacts::NONE,
-    ));
-    let table = &crate::state::state().shapes;
-    let Some(record) = table.slab().record_ptr(id) else {
-        return 0;
+
+    pub(crate) fn width(&self) -> u32 {
+        self.width
+    }
+}
+
+/// Resolve the zero-live keyless birth shape of `proto_id` and choose this
+/// birth's allocation width (0 means the allocator's floor). Mints the shape
+/// if absent (its first birth, or its first after a prune), counts this birth
+/// against the tracking window, and keeps the record through the next full
+/// collection.
+pub(crate) fn keyless_birth_width(proto_id: u64, prototype_shape: u32) -> KeylessBirth {
+    if !is_prototype_serial(proto_id) {
+        return KeylessBirth::untracked();
+    }
+    // A prototype shape names its receivers' keyless birth record. This is
+    // a weak scalar relationship, not a carrier: pruning still retires the
+    // birth record, and every use validates its complete facts.
+    let prior = shapes_store::ShapeSlab::agent_record_present(prototype_shape)
+        .map_or(0, |record| unsafe { (*record).created_birth_shape() });
+    let resolved = birth_record_for_prototype(prior, proto_id);
+    let Some((id, record)) = resolved.or_else(|| resolve_birth_record(proto_id)) else {
+        return KeylessBirth::untracked();
     };
-    // SAFETY: a live slab record; single-threaded agent. No table borrow is
-    // held (`shape_descriptor_ensure_with_generation` released it).
+    // SAFETY: a live slab record validated for this use, or just resolved
+    // through the sole interner. No allocating call follows before the read.
     let r = unsafe { &mut *record };
     r.set(RECORD_FLAG_BIRTH_OWNER, true);
     let learned = r.descendant_width();
@@ -143,27 +159,85 @@ pub(crate) fn keyless_birth_width(proto_id: u64) -> u32 {
     } else {
         learned
     };
-    if width <= crate::object::INLINE_SLOT_FLOOR as u32 {
+    let width = if width <= crate::object::INLINE_SLOT_FLOOR as u32 {
         0
     } else {
         width.min(LEARNED_WIDTH_MAX)
+    };
+    if prior != id {
+        // Resolve the producer record again after minting. The link stores
+        // only a ShapeId; its extension allocation is Rust-owned metadata,
+        // with no nursery allocation or collection point.
+        if let Some(prototype) = shapes_store::ShapeSlab::agent_record_present(prototype_shape) {
+            unsafe { (*prototype).note_created_birth_shape(id) };
+        }
     }
+    KeylessBirth { shape: id, width }
+}
+
+/// Validate the prototype shape's weak birth relationship now. Width and
+/// tracking state remain solely on the referenced live birth record.
+#[inline]
+fn birth_record_for_prototype(id: u32, proto_id: u64) -> Option<(u32, *mut ShapeRecord)> {
+    if id == 0 {
+        return None;
+    }
+    let record = shapes_store::ShapeSlab::agent_record_present(id)?;
+    // SAFETY: this agent's present record, consumed without a safepoint.
+    let r = unsafe { &*record };
+    (r.has(RECORD_FLAG_FACTS_INDEXED)
+        && r.facts_match_proto(0, 0, 0, 0, ShapeObjectKind::Ordinary, 0, proto_id, 0, 0))
+    .then_some((id, record))
+}
+
+/// An absent or retired birth relationship resolves through the existing
+/// exact index/interner. No second index or allocation path is introduced.
+#[cold]
+#[inline(never)]
+fn resolve_birth_record(proto_id: u64) -> Option<(u32, *mut ShapeRecord)> {
+    let table = &crate::state::state().shapes;
+    let resolved = {
+        let inner = table.inner.borrow();
+        find_birth_record(&inner, table.slab(), proto_id)
+    };
+    let resolved = resolved.or_else(|| {
+        let id = super::publish_shape_result(super::shape_descriptor_ensure_with_generation(
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            ShapeObjectKind::Ordinary,
+            proto_id,
+            super::ReceiverFacts::NONE,
+        ));
+        Some((id, table.slab().record_ptr(id)?))
+    })?;
+    Some(resolved)
 }
 
 /// Resolve an ordinary keyless birth on its final prototype, including the
 /// slack slots this birth was served. The identity word is an edge of its
 /// carriers, not a permanent root; the caller roots the prototype until the
 /// newborn carries this shape.
-pub(crate) fn created_birth_shape(proto_id: u64, proto_bits: u64, width: u32) -> u32 {
+pub(crate) fn created_birth_shape(proto_id: u64, proto_bits: u64, birth: &KeylessBirth) -> u32 {
     // An identity names one prototype for its lifetime. GC rewrites its word;
     // another birth need not write it or append another young-log entry.
     if super::shapes_prototype::identity_prototype_word(proto_id) != proto_bits {
         super::shapes_prototype::write_identity_word(proto_id, proto_bits);
     }
+    // A floor birth already resolved these exact facts while selecting its
+    // allocation width. Tracking/wider births require a different live bound.
+    // The proof is scalar, so revalidate presence before reusing it: a full
+    // collection can retire an uncarried shape between resolution and use.
+    if birth.width == 0
+        && super::shape_is_keyless_birth_of(birth.shape, proto_id, 0, ShapeObjectKind::Ordinary)
+    {
+        return birth.shape;
+    }
     super::publish_shape_result(super::shape_descriptor_ensure_with_generation(
         std::ptr::null(),
         0,
-        width,
+        birth.width,
         0,
         ShapeObjectKind::Ordinary,
         proto_id,

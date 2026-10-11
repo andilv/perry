@@ -43,8 +43,8 @@ fn refcount(input: &RuntimeHandle<'_>) -> u32 {
     input.with_const_ptr::<StringHeader, _>(|s| unsafe { (*s).refcount })
 }
 
-/// Run one builtin exec, reporting every capture span, with `poll` as the
-/// search's safepoint.
+/// Run one builtin search in place (RegExpBuiltinExec on raw addresses),
+/// reporting every capture span, with `poll` as the search's safepoint.
 fn spans(
     receiver: &RuntimeHandle<'_>,
     input: &RuntimeHandle<'_>,
@@ -52,17 +52,29 @@ fn spans(
 ) -> Option<Vec<u32>> {
     let memory = MemoryBudget::new(api::SCRATCH_BYTES);
     let mut budget = Budget::new(api::WORK);
-    let mut spans = Vec::new();
-    let found = api::finish(api::execute_rooted(
-        receiver,
-        input,
-        ExecOutput::Spans(&mut spans),
+    let mut captures = None;
+    let found = api::finish(api::search_builtin(
+        api::regexp(receiver),
+        crate::regex::regexp_data_ptr(api::regexp(receiver)),
+        input.with_const_ptr::<StringHeader, _>(|s| s),
+        crate::regex::get_last_index(api::regexp(receiver)),
+        crate::regex::perex_runtime::CaptureMode::All,
         &mut budget,
         &memory,
+        &mut captures,
         poll,
-        None,
     ));
-    found.map(|_| spans)
+    found.map(|_| {
+        captures
+            .as_ref()
+            .expect("a match under All carries its captures")
+            .iter()
+            .flat_map(|capture| match capture {
+                Some(span) => [span.start() as u32, span.end() as u32],
+                None => [u32::MAX, u32::MAX],
+            })
+            .collect()
+    })
 }
 
 #[test]
@@ -248,7 +260,9 @@ fn perex_test_entry_holds_no_handle_and_reads_every_base_back_after_a_moving_pol
         crate::arena::ProtectionModeGuard::set(crate::arena::FromSpaceProtection::PoisonOnly);
     register_host_roots();
     let scope = RuntimeHandleScope::new();
-    let receiver = regex(&scope, "(a+)(b)", "g");
+    // The lookahead keeps the lazy automaton out (it reads no lookaround): this
+    // is the evaluator's search, which pauses and polls between quanta.
+    let receiver = regex(&scope, "(a+)(?=b)(b)", "g");
     let units = 3 * api::QUANTUM;
     let mut bytes = vec![b'a'; units];
     bytes.push(b'b');
@@ -270,6 +284,7 @@ fn perex_test_entry_holds_no_handle_and_reads_every_base_back_after_a_moving_pol
         api::regexp(&receiver),
         crate::regex::regexp_data_ptr(api::regexp(&receiver)),
         input.with_const_ptr::<StringHeader, _>(|s| s),
+        crate::regex::get_last_index(api::regexp(&receiver)),
         crate::regex::perex_runtime::CaptureMode::Full,
         &mut budget,
         &memory,

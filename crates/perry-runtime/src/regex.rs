@@ -16,7 +16,7 @@ mod escape;
 #[cfg(feature = "regex-engine")]
 mod flags;
 #[cfg(feature = "regex-engine")]
-mod instance;
+pub(crate) mod instance;
 #[cfg(feature = "regex-engine")]
 pub(crate) use instance::intrinsic_prototype;
 #[cfg(feature = "regex-engine")]
@@ -56,7 +56,7 @@ pub(crate) mod perex_owner;
 #[cfg(feature = "regex-engine")]
 pub(crate) mod perex_position_hint;
 #[cfg(feature = "regex-engine")]
-mod perex_remove;
+mod perex_output;
 #[cfg(feature = "regex-engine")]
 pub(crate) mod perex_replace;
 #[cfg(feature = "regex-engine")]
@@ -64,11 +64,11 @@ pub(crate) mod perex_replace_direct;
 #[cfg(feature = "regex-engine")]
 mod perex_replace_storage;
 
-/// Test-only reader for the native-piece counter (#10411): which backing a
-/// replacement's pieces took, rather than a timing that only implies it.
+/// Test-only reader for the finished-output counter: which builder a
+/// replacement took, rather than a timing that only implies it.
 #[cfg(test)]
-pub(crate) fn test_native_pieces() -> usize {
-    perex_replace_storage::NATIVE_PIECES.with(std::cell::Cell::get)
+pub(crate) fn test_outputs() -> usize {
+    perex_output::OUTPUTS.with(std::cell::Cell::get)
 }
 #[cfg(feature = "regex-engine")]
 mod literal;
@@ -192,6 +192,19 @@ pub(crate) const REGEXP_MATCHER: &str = "[[RegExpMatcher]]";
 crate::perry_thread_local! {
     static MATCHER_READ: crate::object::IntrinsicPrivateReadSite =
         const { crate::object::IntrinsicPrivateReadSite::new(REGEXP_MATCHER) };
+}
+
+/// The slot of the intrinsic private matcher in a shape's key list: the
+/// brand as a fact of that shape.
+///
+/// # Safety
+/// `keys` is a live canonical key list with `count` logical keys.
+#[cfg(feature = "regex-engine")]
+pub(crate) unsafe fn matcher_slot(
+    keys: *const crate::array::ArrayHeader,
+    count: u32,
+) -> Option<u32> {
+    MATCHER_READ.with(|site| site.slot_in(keys, count))
 }
 
 /// Read an already branded receiver's immutable data before the next
@@ -350,12 +363,6 @@ pub(crate) fn regex_last_index_offset(re: *const RegExpHeader) -> usize {
     let scope = crate::gc::RuntimeHandleScope::new();
     let stored = scope.root_nanbox_f64(stored);
     perex_api::finish(perex_dispatch::to_length(&stored)) as usize
-}
-
-#[cfg(feature = "regex-engine")]
-#[inline]
-pub(crate) fn store_last_index_number(re: *mut RegExpHeader, n: usize) {
-    set_last_index(re, n as f64);
 }
 
 /// Spec `Set(R, "lastIndex", n, true)` — the lastIndex updates in

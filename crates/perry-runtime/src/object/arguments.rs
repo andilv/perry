@@ -13,6 +13,7 @@
 //! dead-owner prune on every collection. On the record it moves with its owner
 //! and dies with it, and needs none of the three.
 
+use super::descriptors::{build_accessor_descriptor, build_data_descriptor};
 use super::*;
 
 // The encodings of `ObjectMeta::arguments`. The word is NaN-boxed so the meta
@@ -230,14 +231,6 @@ fn key_name(key: *const crate::StringHeader) -> Option<String> {
 
 fn intern_key(name: &str) -> *const crate::StringHeader {
     crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32)
-}
-
-fn bool_value(value: bool) -> f64 {
-    f64::from_bits(if value {
-        crate::value::TAG_TRUE
-    } else {
-        crate::value::TAG_FALSE
-    })
 }
 
 extern "C" fn arguments_throw_type_error(
@@ -897,7 +890,7 @@ pub(crate) unsafe fn arguments_object_before_delete(
 pub(crate) unsafe fn arguments_object_after_define(
     obj: *mut ObjectHeader,
     key: *const crate::StringHeader,
-    descriptor_value: f64,
+    descriptor: &super::object_ops::DescView<'_>,
 ) {
     let Some(name) = key_name(key) else {
         return;
@@ -905,47 +898,22 @@ pub(crate) unsafe fn arguments_object_after_define(
     let Some(index) = super::canonical_array_index(&name) else {
         return;
     };
-    let desc_ptr = super::extract_obj_ptr(descriptor_value);
-    if desc_ptr.is_null() {
-        return;
-    }
-    // The descriptor reads below intern their keys and may run getters, so
-    // both objects are rooted across them and re-read afterwards.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let obj = scope.root_raw_mut_ptr(obj);
-    let desc = scope.root_raw_mut_ptr(desc_ptr);
-    let value_key = intern_key("value");
-    let value = if desc.with_mut_ptr(|desc| super::own_key_present(desc, value_key)) {
-        Some(f64::from_bits(
-            desc.with_const_ptr(|desc| js_object_get_field_by_name(desc, value_key))
-                .bits(),
-        ))
-    } else {
-        None
-    };
-    let value = value.map(|value| scope.root_nanbox_f64(value));
-    let get_key = intern_key("get");
-    let set_key = intern_key("set");
-    let writable_key = intern_key("writable");
-    let has_accessor = desc.with_mut_ptr(|desc| {
-        super::own_key_present(desc, get_key) || super::own_key_present(desc, set_key)
-    });
-    let writable_false = if desc.with_mut_ptr(|desc| super::own_key_present(desc, writable_key)) {
-        let writable = desc.with_const_ptr(|desc| js_object_get_field_by_name(desc, writable_key));
-        crate::value::js_is_truthy(f64::from_bits(writable.bits())) == 0
-    } else {
-        false
-    };
-    let Some(state) = obj.with_mut_ptr(|obj: *mut ObjectHeader| arguments_state(obj)) else {
+    let Some(state) = arguments_state(obj) else {
         return;
     };
     let Some(box_ptr) = state.mapped_box(index) else {
         return;
     };
-    if let Some(value) = value {
-        crate::r#box::js_box_set(box_ptr, value.get_nanbox_f64());
+    if descriptor.has_named(b"value") {
+        crate::r#box::js_box_set(
+            box_ptr,
+            f64::from_bits(descriptor.read_named(b"value").bits()),
+        );
     }
-    if has_accessor || writable_false {
+    if descriptor.has_named(b"get")
+        || descriptor.has_named(b"set")
+        || descriptor.flag(b"writable") == Some(false)
+    {
         state.unmap(index);
     }
 }
@@ -1188,40 +1156,4 @@ unsafe fn write_ordinary_own_value(
             return;
         }
     }
-}
-
-unsafe fn build_data_descriptor(
-    value: f64,
-    writable: bool,
-    enumerable: bool,
-    configurable: bool,
-) -> f64 {
-    let packed = b"value\0writable\0enumerable\0configurable";
-    let desc = js_object_alloc_with_shape(0x0D_A6_50, 4, packed.as_ptr(), packed.len() as u32);
-    let fields = (desc as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut f64;
-    // GC_STORE_AUDIT(BARRIERED): fresh descriptor fields are replayed by the rebuild below.
-    *fields = value;
-    *fields.add(1) = bool_value(writable);
-    *fields.add(2) = bool_value(enumerable);
-    *fields.add(3) = bool_value(configurable);
-    super::rebuild_object_field_layout(desc, 4);
-    crate::value::js_nanbox_pointer(desc as i64)
-}
-
-unsafe fn build_accessor_descriptor(
-    get: f64,
-    set: f64,
-    enumerable: bool,
-    configurable: bool,
-) -> f64 {
-    let packed = b"get\0set\0enumerable\0configurable";
-    let desc = js_object_alloc_with_shape(0x0D_A6_51, 4, packed.as_ptr(), packed.len() as u32);
-    let fields = (desc as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut f64;
-    // GC_STORE_AUDIT(BARRIERED): fresh descriptor fields are replayed by the rebuild below.
-    *fields = get;
-    *fields.add(1) = set;
-    *fields.add(2) = bool_value(enumerable);
-    *fields.add(3) = bool_value(configurable);
-    super::rebuild_object_field_layout(desc, 4);
-    crate::value::js_nanbox_pointer(desc as i64)
 }

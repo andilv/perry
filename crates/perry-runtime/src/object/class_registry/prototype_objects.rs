@@ -442,6 +442,45 @@ pub extern "C" fn js_set_function_prototype(func: f64, proto: f64) -> u32 {
     new_cid
 }
 
+/// The prototype holder an instance of class `class_id` reads through next:
+/// the declared `class X {}` prototype when this agent built it, otherwise the
+/// synthetic-class prototype object, otherwise null (not built yet).
+///
+/// One precedence for every consumer: the read walk
+/// (`prototype_chain::class_link_prototype`), the prototype-method
+/// registration that writes the holder (`class_prototype_set`), and the
+/// typed-feedback direct-call guard that proves the holder unchanged. A
+/// writer and a guard that each picked their own registry could disagree
+/// about which object holds `C.prototype.m`.
+#[inline]
+pub(crate) fn class_holder_prototype(class_id: u32) -> *mut ObjectHeader {
+    let word = class_holder_word(class_id);
+    let value = crate::JSValue::from_bits(word);
+    if value.is_pointer() {
+        value.as_pointer::<ObjectHeader>() as *mut ObjectHeader
+    } else {
+        std::ptr::null_mut()
+    }
+}
+
+/// The CLASS surface fact: zero means absent, undefined means declared but
+/// unbuilt, and a pointer names the actual holder.
+#[inline]
+pub(crate) fn class_holder_word(class_id: u32) -> u64 {
+    class_holder_word_selected(decl_prototype_identity_id(class_id))
+}
+
+/// Read the identity word for an origin already selected by the caller.
+/// Keeping selection outside this helper avoids projecting an alias twice.
+#[inline]
+pub(crate) fn class_holder_word_selected(selected: u32) -> u64 {
+    crate::object::shapes::identity_prototype_word(if selected == 0 {
+        crate::object::shapes::PROTO_ID_DEFAULT
+    } else {
+        crate::object::shapes::PROTO_ID_CLASS | u64::from(selected)
+    })
+}
+
 /// Lookup helper for the dispatch chain walk: returns the prototype
 /// object pointer for a synthetic class id, or null if none.
 #[inline]
@@ -591,19 +630,6 @@ unsafe fn evaluated_parent_instance_field(
     None
 }
 
-/// Has a user operation (`Object.setPrototypeOf(C.prototype, X)`,
-/// `C.prototype.__proto__ = X`) replaced the `[[Prototype]]` of class
-/// `cid`'s declared prototype? Then `get_parent_class_id(cid)` no longer
-/// names the next hop of an instance chain, and walks over the class
-/// registry must stop at `cid` (the recorded link continues the chain).
-pub(crate) fn class_decl_prototype_relinked(cid: u32) -> bool {
-    if !super::super::prototype_chain::any_class_chain_relinked() {
-        return false;
-    }
-    let decl_proto = class_decl_prototype_object(cid);
-    !decl_proto.is_null() && unsafe { decl_prototype_relinked(cid, decl_proto) }
-}
-
 /// Is `decl_proto` (class `cid`'s declaration prototype) standing on
 /// anything but what its declaration links it to — the parent class's
 /// declaration prototype, or `Object.prototype` for a base class? Read from
@@ -656,10 +682,7 @@ unsafe fn relinked_decl_prototype_field(
     key: *const crate::StringHeader,
     receiver: f64,
 ) -> RelinkedRead {
-    if key.is_null()
-        || !super::super::prototype_chain::any_class_chain_relinked()
-        || !decl_prototype_relinked(cid, decl_proto)
-    {
+    if key.is_null() || !decl_prototype_relinked(cid, decl_proto) {
         return RelinkedRead::NotRelinked;
     }
     // A link recorded as the class default (or never recorded) keeps the
@@ -720,14 +743,14 @@ unsafe fn relinked_decl_prototype_field(
 /// up in `get_field_by_name.rs` plugged the same hole on the direct-vtable
 /// door for #1021/NestJS; this is that door's chain-walk twin.
 ///
-/// The exclusion is keyed on `class_instance_has_member` — the exact
+/// The exclusion is keyed on `class_instance_has_method` — the exact
 /// "is this a prototype method / getter / setter of the chain" predicate —
 /// plus the `constructor` back-edge, and NOT on "skip the decl-prototype
 /// entirely": a blanket skip would also hide a user's own
 /// `Object.defineProperty(C.prototype, ...)` data field from this walk.
 ///
 /// #9467: `constructor` is the one decl-prototype data field that is NOT an
-/// instance member by `class_instance_has_member`'s definition, and walking
+/// instance member by `class_instance_has_method`'s definition, and walking
 /// into it from the constructor side answered `C.constructor === C`. Node says
 /// `C.constructor === Function` — a constructor object's own chain is
 /// `C → Function.prototype`, with no back-edge to `C`; only
@@ -793,7 +816,7 @@ unsafe fn resolve_proto_chain_field_inner(
             }
         }
     }
-    // Resolved once: `class_instance_has_member` already walks the parent
+    // Resolved once: `class_instance_has_method` already walks the parent
     // chain, so a parent's instance method is excluded from a subclass's
     // constructor read too.
     let skip_decl_prototype = constructor_side && !key.is_null() && {
@@ -803,7 +826,7 @@ unsafe fn resolve_proto_chain_field_inner(
             .map(|name| {
                 // #9467: `C.prototype.constructor` is `C`; `C.constructor` is
                 // `Function` (the class-ref arm's tail fallback), never `C`.
-                name == "constructor" || crate::object::class_instance_has_member(class_id, name)
+                name == "constructor" || crate::object::class_instance_has_method(class_id, name)
             })
             .unwrap_or(false)
     };
@@ -864,7 +887,7 @@ unsafe fn resolve_proto_chain_field_inner(
                             let name = name.to_string();
                             let scope = crate::gc::RuntimeHandleScope::new();
                             let value = scope.root_nanbox_u64(value.bits());
-                            let receiver = scope.root_heap_word_u64(receiver.to_bits());
+                            let receiver = scope.root_nanbox_u64(receiver.to_bits());
                             if super::super::native_module::class_has_own_method(cid, &name)
                                 && value.get_nanbox_u64()
                                     == super::super::native_module::class_prototype_method_value_for_name(
@@ -872,7 +895,7 @@ unsafe fn resolve_proto_chain_field_inner(
                                     )
                                     .to_bits()
                             {
-                                let receiver = f64::from_bits(receiver.get_heap_word_u64());
+                                let receiver = f64::from_bits(receiver.get_nanbox_u64());
                                 if let Some(brand) =
                                     super::super::private_evaluation_brand_value(receiver)
                                 {

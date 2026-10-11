@@ -1,23 +1,28 @@
 use super::*;
+use perry_ffi::TransientRootScope;
 
 /// Drain the pending HTTP-event queue and fire user callbacks. Events remain
 /// in the shared queue until selected so re-entrant event-loop pumps can make
 /// progress on later response chunks (#5783).
 #[no_mangle]
 pub unsafe extern "C" fn js_http_process_pending() -> i32 {
+    let owner = perry_ffi::agent_post::current_agent();
     let mut count = 0i32;
     loop {
         let ev = match HTTP_PENDING_EVENTS.lock() {
-            Ok(mut q) => {
-                if q.is_empty() {
-                    None
-                } else {
-                    Some(q.remove(0))
-                }
-            }
+            Ok(mut q) => take_event(&mut q, owner),
             Err(_) => return count,
         };
-        let Some(ev) = ev else { break };
+        let Some(mut ev) = ev else { break };
+        // Queue ownership ends here. Root a transported Socket before async
+        // hooks or listeners can collect and rewrite its ordinary object.
+        let scope = TransientRootScope::enter();
+        let socket = match &ev {
+            PendingHttpEvent::Upgrade { socket_handle, .. } => {
+                Some(scope.root_addr(*socket_handle))
+            }
+            _ => None,
+        };
         count += 1;
         let request_handle = pending_request_handle(&ev);
         let terminal = terminal_http_event(&ev);
@@ -28,6 +33,10 @@ pub unsafe extern "C" fn js_http_process_pending() -> i32 {
         if async_id != 0 {
             js_async_hooks_provider_enter(async_id);
         }
+        if let (PendingHttpEvent::Upgrade { socket_handle, .. }, Some(socket)) = (&mut ev, &socket)
+        {
+            *socket_handle = socket.get();
+        }
         match ev {
             PendingHttpEvent::Socket { request_handle } => {
                 client_events::fire_request_socket_event(request_handle);
@@ -35,12 +44,6 @@ pub unsafe extern "C" fn js_http_process_pending() -> i32 {
             PendingHttpEvent::SignalAbort { request_handle } => {
                 client_abort::handle_request_signal_abort(request_handle);
             }
-            PendingHttpEvent::AgentIdleExpire {
-                agent_handle,
-                key,
-                socket,
-                generation,
-            } => agent::expire_free_socket(agent_handle, &key, socket, generation),
             PendingHttpEvent::Response {
                 request_handle,
                 status,
@@ -141,4 +144,38 @@ pub unsafe extern "C" fn js_http_process_pending() -> i32 {
         }
     }
     count
+}
+
+/// Select the next event of this heap, preserving each agent's FIFO order.
+fn take_event(queue: &mut Vec<(u64, PendingHttpEvent)>, owner: u64) -> Option<PendingHttpEvent> {
+    let index = queue.iter().position(|(agent, _)| *agent == owner)?;
+    Some(queue.remove(index).1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_events_stay_queued_and_own_events_keep_fifo_order() {
+        let mut queue = vec![
+            (2, PendingHttpEvent::Abort { request_handle: 20 }),
+            (1, PendingHttpEvent::Abort { request_handle: 10 }),
+            (2, PendingHttpEvent::Abort { request_handle: 21 }),
+        ];
+        assert_eq!(
+            pending_request_handle(&take_event(&mut queue, 1).unwrap()),
+            10
+        );
+        assert!(take_event(&mut queue, 1).is_none());
+        assert_eq!(
+            pending_request_handle(&take_event(&mut queue, 2).unwrap()),
+            20
+        );
+        assert_eq!(
+            pending_request_handle(&take_event(&mut queue, 2).unwrap()),
+            21
+        );
+        assert!(queue.is_empty());
+    }
 }

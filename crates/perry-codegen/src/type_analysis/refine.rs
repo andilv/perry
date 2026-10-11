@@ -186,7 +186,15 @@ pub(crate) fn declared_property_type_from_annotation(
 /// whose result has another kind. New expression variants are unproven by
 /// default until their full lowering contract is explicitly reviewed here.
 pub(crate) fn proven_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirType> {
+    if let Some(kind) = super::iterator_record_primitive_type(init) {
+        return Some(kind);
+    }
     match init {
+        Expr::IndexGet { .. } | Expr::Uint8ArrayGet { .. } | Expr::BufferIndexGet { .. }
+            if crate::expr::ta_element_read::byte_read_is_numeric(ctx, init) =>
+        {
+            Some(HirType::Union(vec![HirType::Number, HirType::Void]))
+        }
         // #11759 (c′): `new C()` guarded on the first evaluation proves what
         // its static construction proves.
         Expr::Conditional {

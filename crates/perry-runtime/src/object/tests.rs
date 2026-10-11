@@ -21,13 +21,22 @@ fn call_method_depth_drop_is_idempotent_after_exception_restore() {
 }
 
 fn test_global_this_builtin_constructor_value(name: &str) -> f64 {
+    let identity = GLOBAL_THIS_BUILTIN_CONSTRUCTORS
+        .iter()
+        .position(|decl| decl.name == name)
+        .unwrap();
     let closure_ptr = crate::closure::js_closure_alloc(
         crate::fn_info!(crate::object::global_this_builtin_noop_thunk, 1; with_declared(0)),
-        0,
+        1 | crate::closure::NO_THIS_REBIND_FLAG,
     );
     if closure_ptr.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
+    crate::closure::js_closure_set_capture_bits(
+        closure_ptr,
+        0,
+        JSValue::int32(identity as i32 + 1).bits(),
+    );
     super::native_module::set_bound_native_closure_name(closure_ptr, name);
     if let Some(len) = crate::object::builtin_constructor_spec_length(name) {
         super::native_module::set_builtin_closure_length(closure_ptr as usize, len);
@@ -1370,7 +1379,8 @@ fn global_builtin_constructor_values_are_not_redispatched_by_name() {
 
     let mut with_recorded_length = 0usize;
     let mut offenders: Vec<String> = Vec::new();
-    for name in GLOBAL_THIS_BUILTIN_CONSTRUCTORS.iter().copied() {
+    for declaration in GLOBAL_THIS_BUILTIN_CONSTRUCTORS {
+        let name = declaration.name;
         let ctor_raw = test_global_this_builtin_constructor_value(name);
         let ctor = JSValue::from_bits(ctor_raw.to_bits());
         assert!(

@@ -98,6 +98,59 @@ pub(crate) unsafe fn own_data_field_by_name(
     .map(OwnSlot::data_or_undefined)
 }
 
+/// Callback-free read of an opaque binding record's own data property.
+/// No string allocation, prototype lookup, accessor invocation or safepoint.
+///
+/// # Safety
+/// obj and key must be readable. The caller retains the object during the read.
+#[no_mangle]
+pub unsafe extern "C" fn js_object_record_get_by_bytes(
+    obj: *const ObjectHeader,
+    key: *const u8,
+    len: usize,
+) -> JSValue {
+    let key = std::slice::from_raw_parts(key, len);
+    own_property_slot(obj, |keys, count| {
+        crate::object::keys_find_property_slot_by_bytes(keys, count, key)
+    })
+    .map(OwnSlot::data_or_undefined)
+    .unwrap_or_else(JSValue::undefined)
+}
+
+/// Overwrite an existing data field of an opaque binding-owned record.
+/// Missing keys and accessors are refused; the caller can use ordinary Set.
+/// The indexed store retains the runtime's exact-slot write barrier.
+///
+/// # Safety
+/// obj is a rooted, mutable ordinary binding record, inaccessible to JS; key
+/// is readable for len bytes. This call neither allocates GC cells nor runs JS.
+#[no_mangle]
+pub unsafe extern "C" fn js_object_record_set_by_bytes(
+    obj: *mut ObjectHeader,
+    key: *const u8,
+    len: usize,
+    value: JSValue,
+) -> i32 {
+    let key = std::slice::from_raw_parts(key, len);
+    let mut index = 0;
+    let Some(OwnSlot::Data(_)) = own_property_slot(obj, |keys, count| {
+        index = crate::object::keys_find_property_slot_by_bytes(keys, count, key)?;
+        Some(index)
+    }) else {
+        return 0;
+    };
+    let inline_limit =
+        crate::object::object_live_slot_count(obj).max(crate::object::INLINE_SLOT_FLOOR as u32);
+    if index < inline_limit {
+        js_object_set_field(obj, index, value);
+    } else {
+        // The ordinary overflow store supplies the corresponding root/slot
+        // barrier. A key index need not be an inline physical field index.
+        crate::object::overflow_set(obj as usize, index as usize, value.bits());
+    }
+    1
+}
+
 /// [[Get]] of an own property of `obj` named by the bytes `key` (a method
 /// name from rodata, so no key string is built): a data value as stored,
 /// `undefined` included; an accessor through its getter, called on
@@ -666,18 +719,14 @@ pub(crate) unsafe fn primitive_object_prototype_accessor(
     name: &str,
     receiver: f64,
 ) -> Option<JSValue> {
-    let object_ctor = super::super::js_get_global_this_builtin_value(b"Object".as_ptr(), 6);
-    let ctor_value = JSValue::from_bits(object_ctor.to_bits());
-    if !ctor_value.is_pointer() {
+    // A primitive inherits from this realm's intrinsic, independently of
+    // assignments to the writable global constructor binding. The existing
+    // movable intrinsic root supplies that identity; its shape still owns
+    // every property and accessor change.
+    let proto_ptr = crate::array::object_prototype_addr();
+    if proto_ptr == 0 {
         return None;
     }
-    let ctor_ptr = ctor_value.as_pointer::<crate::closure::ClosureHeader>() as usize;
-    let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
-    let proto_value = JSValue::from_bits(proto.to_bits());
-    if !proto_value.is_pointer() {
-        return None;
-    }
-    let proto_ptr = proto_value.as_pointer::<ObjectHeader>() as usize;
     let acc = get_accessor_descriptor(proto_ptr, name)?;
     if acc.get == 0 {
         return Some(JSValue::undefined());
@@ -698,28 +747,28 @@ unsafe fn bind_closure_value_to_receiver(value: JSValue, receiver: f64) -> JSVal
 }
 
 pub(crate) unsafe fn primitive_builtin_prototype_property(
-    builtin_name: &[u8],
-    key: *const crate::StringHeader,
-    receiver: f64,
+    mut key: *const crate::StringHeader,
+    mut receiver: f64,
 ) -> Option<JSValue> {
     if key.is_null() {
         return None;
     }
-    let ctor = js_get_global_this_builtin_value(builtin_name.as_ptr(), builtin_name.len());
-    let ctor_value = JSValue::from_bits(ctor.to_bits());
-    if !ctor_value.is_pointer() {
+    let mut proto_addr = crate::array::primitive_wrapper_prototype_addr(receiver);
+    if proto_addr == 0 {
+        // The first observable primitive read may need realm bootstrap.
+        // Both borrowed arguments must be refreshed if bootstrap collects.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let key_root = scope.root_string_ptr(key);
+        let receiver_root = scope.root_nanbox_f64(receiver);
+        super::super::js_get_global_this();
+        key = key_root.get_raw_const_ptr::<crate::StringHeader>();
+        receiver = receiver_root.get_nanbox_f64();
+        proto_addr = crate::array::primitive_wrapper_prototype_addr(receiver);
+    }
+    if proto_addr == 0 {
         return None;
     }
-    let ctor_ptr = ctor_value.as_pointer::<crate::closure::ClosureHeader>() as usize;
-    let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
-    let proto_value = JSValue::from_bits(proto.to_bits());
-    if !proto_value.is_pointer() {
-        return None;
-    }
-    let proto_ptr = proto_value.as_pointer::<ObjectHeader>();
-    if proto_ptr.is_null() {
-        return None;
-    }
+    let proto_ptr = proto_addr as *const ObjectHeader;
     // An ACCESSOR installed on the builtin prototype
     // (`Object.defineProperty(Number.prototype, "x", { get(){…} })`) must run
     // with the ORIGINAL primitive receiver — boxed/raw per getter strictness
@@ -879,11 +928,8 @@ pub(crate) unsafe fn array_prototype_property_value(
     // straight out of the key `StringHeader`'s payload
     // (`slice::from_raw_parts(key_ptr, key_len)`), so it is a BORROW OF THE GC
     // HEAP — and a borrow is exactly the thing the collector cannot see or
-    // rewrite. Every call below allocates: `js_get_global_this_builtin_value`
-    // interns `"Array"`, `closure_get_dynamic_prop` can run an accessor, and
-    // `js_string_from_bytes` reads its SOURCE bytes *after* its own
-    // `string_storage_alloc`. Any one of those can move the key out from under
-    // `name`.
+    // rewrite. Intrinsic resolution and a cold canonical-key intern can
+    // allocate. Either can move the source key out from under `name`.
     //
     // A `RuntimeHandleScope` cannot fix this: rooting the key would keep the
     // object alive and rewrite the slot, but `name`'s pointer is a `&str`, not
@@ -911,7 +957,7 @@ pub(crate) unsafe fn array_prototype_property_value(
         let scope = crate::gc::RuntimeHandleScope::new();
         let receiver_h =
             scope.root_nanbox_f64(crate::value::js_nanbox_pointer(receiver_addr as i64));
-        let proto_h = scope.root_heap_word_u64(proto_bits);
+        let proto_h = scope.root_nanbox_u64(proto_bits);
         let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         if key.is_null() {
             return None;
@@ -923,31 +969,34 @@ pub(crate) unsafe fn array_prototype_property_value(
             as *const crate::StringHeader;
         return super::super::prototype_chain::resolve_inherited_field_from_prototype(
             receiver_addr,
-            proto_h.get_heap_word_u64(),
+            proto_h.get_nanbox_u64(),
             key,
         );
     }
 
     let scope = crate::gc::RuntimeHandleScope::new();
     let receiver_h = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(receiver_addr as i64));
-    let ctor = super::super::js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
-    let ctor_value = JSValue::from_bits(ctor.to_bits());
-    if !ctor_value.is_pointer() {
-        return None;
+    // An array inherits the realm's intrinsic prototype, independently of
+    // the writable global Array binding. Its existing rooted address also
+    // avoids looking up that constructor and its prototype on every miss.
+    let mut proto_addr = crate::array::array_prototype_addr();
+    if proto_addr == 0 {
+        // Identity-only array write paths deliberately leave the realm lazy.
+        // An observable inherited read must complete it on first use.
+        crate::object::js_get_global_this();
+        proto_addr = crate::array::array_prototype_addr();
+        if proto_addr == 0 {
+            return None;
+        }
     }
-    let ctor_ptr = ctor_value.as_pointer::<u8>() as usize;
-    let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
-    let proto_value = JSValue::from_bits(proto.to_bits());
-    if !proto_value.is_pointer() {
-        return None;
-    }
-    // #7498: the receiver is rooted before the allocating global lookup above;
-    // `Array.prototype` and the fresh key are rooted before the calls below,
+    let proto = crate::value::js_nanbox_pointer(proto_addr as i64);
+    // #7498: the receiver is rooted before intrinsic resolution above;
+    // Array.prototype and the canonical key are rooted before the calls below,
     // which can collect (`js_object_get_field_by_name` runs getters and
     // `default_object_prototype_property_value` interns another key).
     let proto_h = scope.root_nanbox_f64(proto);
     let key_h = scope.root_nanbox_f64(crate::value::nanbox_string_key(
-        crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32),
+        crate::string::canonical_key(name.as_bytes()),
     ));
     let proto_ptr = || crate::value::js_nanbox_get_pointer(proto_h.get_nanbox_f64()) as usize;
     let receiver_addr =

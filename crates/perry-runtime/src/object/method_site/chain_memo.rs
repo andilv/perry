@@ -203,6 +203,13 @@ unsafe fn ways_lookup(
         if keyed && (way.key_len as usize != name.len() || way.key[..name.len()] != *name) {
             continue;
         }
+        // A CLASS identity can publish or replace its holder while the
+        // receiver's header word stays unchanged.
+        if super::read_holder::class_link(recv as *const ObjectHeader)
+            != Some(way.hops[0] as *const ObjectHeader)
+        {
+            continue;
+        }
         let depth = way.depth as usize;
         for i in 0..depth {
             if header_word(way.hops[i]) != way.words[i] {
@@ -246,7 +253,10 @@ unsafe fn hop_admitted(addr: usize) -> bool {
     meta.is_null()
         || ((*meta).elements == 0
             && (*meta).dictionary_keys == 0
-            && (*meta).flags & crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER == 0)
+            && (*meta).flags
+                & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
+                    | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
+                == 0)
 }
 
 /// The next hop after `hop`, when `hop`'s shape pins it: a serial identity
@@ -385,3 +395,7 @@ pub(crate) fn scan_chain_memo_roots_mut(visitor: &mut crate::gc::RuntimeRootVisi
         }
     }
 }
+
+#[cfg(test)]
+#[path = "chain_memo_tests.rs"]
+mod tests;

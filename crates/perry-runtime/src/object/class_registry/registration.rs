@@ -1,35 +1,29 @@
 use super::*;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
-/// Returns true if `class_id` corresponds to a registered class. Used by
-/// `js_value_typeof` (refs #618 / #420 followup) to distinguish a class
-/// reference (NaN-boxed INT32 with class_id payload) from a regular int32
-/// numeric value — JS spec says `typeof <class>` is "function", but
-/// Perry's INT32_TAG storage shape is shared with numeric int32, so the
-/// runtime needs an explicit registry check. Consults both
-/// REGISTERED_CLASS_IDS (every class) and CLASS_VTABLE_REGISTRY (classes
-/// with methods) so even classes registered before the explicit-id call
-/// runs still detect via the vtable.
+/// A registered class identity; method registration also publishes it here.
 pub fn is_class_id_registered(class_id: u32) -> bool {
-    if class_id == 0 {
-        return false;
+    class_id != 0
+        && REGISTERED_CLASS_IDS
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|set| set.contains(&class_id)))
+            .unwrap_or(false)
+}
+
+/// An unbuilt holder is a CLASS identity fact. Registration precedes
+/// instances, and publishing its surface makes negative probes decline.
+pub(super) fn publish_unbuilt_holder(class_id: u32) {
+    let pid = crate::object::shapes::PROTO_ID_CLASS | u64::from(class_id);
+    if crate::object::shapes::identity_prototype_word(pid) == 0
+        && (!super::is_anon_shape_class_id(class_id) || super::class_meta::class_has_name(class_id))
+    {
+        crate::object::shapes::write_identity_word(pid, crate::value::TAG_UNDEFINED);
     }
-    if let Ok(guard) = REGISTERED_CLASS_IDS.read() {
-        if let Some(set) = guard.as_ref() {
-            if set.contains(&class_id) {
-                return true;
-            }
-        }
-    }
-    let registry = match CLASS_VTABLE_REGISTRY.read() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    registry
-        .as_ref()
-        .map(|m| m.contains_key(&class_id))
-        .unwrap_or(false)
+    let mut registered = REGISTERED_CLASS_IDS.write().unwrap();
+    registered
+        .get_or_insert_with(Default::default)
+        .insert(class_id);
 }
 
 pub(crate) fn record_class_string_member_order(
@@ -56,6 +50,10 @@ pub(crate) fn record_class_string_member_order(
         // property without moving it in [[OwnPropertyKeys]].
         .and_modify(|order| *order = (*order).min(definition_order))
         .or_insert(definition_order);
+    drop(guard);
+    if !is_static {
+        super::class_meta::refresh_anon_declaration_role(class_id);
+    }
 }
 
 /// A configurable class element that is deleted and later recreated is a new
@@ -77,6 +75,10 @@ pub(crate) fn invalidate_class_string_member_order(class_id: u32, name: &str, is
         .as_mut()
         .unwrap()
         .insert((class_id, is_static, name.to_string()), u32::MAX);
+    drop(guard);
+    if !is_static {
+        super::class_meta::refresh_anon_declaration_role(class_id);
+    }
 }
 
 pub(crate) unsafe fn record_class_symbol_member_order(
@@ -136,9 +138,9 @@ static KEEP_REGISTER_CLASS_STRING_MEMBER_ORDER: unsafe extern "C" fn(
     i64,
 ) = js_register_class_string_member_order;
 
-/// Register a class method in the vtable registry.
-/// Called at startup from the init function for every class method/getter.
-#[no_mangle]
+/// Unit tests declare a class's methods one at a time (codegen emits one
+/// constant declaration per class, `declarations.rs`).
+#[cfg(test)]
 pub unsafe extern "C" fn js_register_class_method(
     class_id: i64,
     name_ptr: *const u8,
@@ -160,24 +162,9 @@ pub unsafe extern "C" fn js_register_class_method(
     );
 }
 
-#[cfg(feature = "keepalive-anchors")]
-#[used(compiler)]
-static KEEP_REGISTER_CLASS_METHOD_WITH_ENTRY: unsafe extern "C" fn(
-    i64,
-    *const u8,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-    i64,
-) = js_register_class_method_with_entry;
-
-/// [`js_register_class_method`] of a compiled instance method together with
-/// its closure-convention entry `entry` (`<method>__eclo`'s JsFunctionInfo,
-/// 0 for none): the function object a prototype holds for the method runs
-/// it. One registration per method, as module init always made.
-#[no_mangle]
+/// [`js_register_class_method`] with the method's closure-convention entry.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn js_register_class_method_with_entry(
     class_id: i64,
     name_ptr: *const u8,
@@ -188,33 +175,46 @@ pub unsafe extern "C" fn js_register_class_method_with_entry(
     has_rest: i64,
     entry: i64,
 ) {
-    // `name_len == 0` is a legal empty-string member key (`get ''()`), so only
-    // reject a negative length / null pointer.
-    let name = if name_ptr.is_null() || name_len < 0 {
+    if name_ptr.is_null() || name_len < 0 {
         return;
-    } else {
-        match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
-            Ok(s) => s.to_string(),
-            Err(_) => return,
-        }
-    };
-    let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
-    if registry.is_none() {
-        *registry = Some(crate::fast_hash::new_ptr_hash_map());
     }
-    let reg = registry.as_mut().unwrap();
-    let vtable = reg.entry(class_id as u32).or_default();
-    vtable.methods.insert(
+    let name = std::slice::from_raw_parts(name_ptr, name_len as usize);
+    super::declarations::test_declare_member(
+        class_id as u32,
         name,
-        VTableMethodEntry {
-            func_ptr: func_ptr as usize,
-            param_count: param_count as u32,
-            has_synthetic_arguments: has_synthetic_arguments != 0,
-            has_rest: has_rest != 0,
-            entry: entry as usize,
-        },
+        super::declarations::test_method_member(
+            func_ptr as usize,
+            param_count as u32,
+            has_synthetic_arguments != 0,
+            has_rest != 0,
+            entry as usize,
+        ),
     );
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
+}
+
+/// Unit tests set a declared method's closure-convention entry after
+/// declaring it.
+#[cfg(test)]
+pub unsafe extern "C" fn js_register_class_method_entry(
+    class_id: i64,
+    name_ptr: *const u8,
+    name_len: i64,
+    entry: i64,
+) {
+    if class_id == 0 || name_ptr.is_null() || name_len <= 0 || entry == 0 {
+        return;
+    }
+    let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize))
+    else {
+        return;
+    };
+    super::declarations::test_set_method_entry(class_id as u32, name, entry as usize);
+}
+
+/// Unit tests set a class's compiler birth-shape candidate.
+#[cfg(test)]
+pub extern "C" fn js_register_class_prototype_shape(class_id: u32, shape_id: u32) {
+    super::declarations::test_declare_birth_shape(class_id, shape_id);
 }
 
 /// The ClassBody's own public instance accessor declaration for `class_id` +
@@ -226,8 +226,7 @@ pub unsafe extern "C" fn js_register_class_method_with_entry(
 /// accessor property is the truth, and `defineProperty` / `delete` may have
 /// changed it.
 pub(crate) fn class_own_accessor_ptrs(class_id: u32, name: &str) -> Option<(usize, usize)> {
-    let guard = CLASS_VTABLE_REGISTRY.read().ok()?;
-    let decl = guard.as_ref()?.get(&class_id)?.accessor_decl(name)?;
+    let decl = super::declarations::class_accessor_decl(class_id, name)?;
     (decl.get != 0 || decl.set != 0).then_some((decl.get, decl.set))
 }
 
@@ -253,12 +252,7 @@ pub(crate) fn class_own_setter_length(class_id: u32, name: &str, is_static: bool
         let guard = CLASS_STATIC_ACCESSORS.read().ok()?;
         guard.as_ref()?.get(&class_id)?.get(name)?.set_length
     } else {
-        let guard = CLASS_VTABLE_REGISTRY.read().ok()?;
-        guard
-            .as_ref()?
-            .get(&class_id)?
-            .accessor_decl(name)?
-            .set_length
+        super::declarations::class_accessor_decl(class_id, name)?.set_length
     }
 }
 
@@ -438,60 +432,32 @@ pub(crate) fn class_accessor_function_value(
         "name".to_string(),
         crate::object::PropertyAttrs::new(false, false, true),
     );
-    crate::gc::runtime_write_barrier_root_heap_word(closure as u64);
+    crate::gc::runtime_write_barrier_root_raw_ptr(closure as *const u8);
     crate::value::js_nanbox_pointer(closure as i64)
 }
 
-/// Register a class getter in the vtable registry.
-#[no_mangle]
+/// Unit tests declare a class's accessor halves one at a time (codegen emits
+/// one constant declaration per class, `declarations.rs`).
+#[cfg(test)]
 pub unsafe extern "C" fn js_register_class_getter(
     class_id: i64,
     name_ptr: *const u8,
     name_len: i64,
     func_ptr: i64,
 ) {
-    // `name_len == 0` is a legal empty-string member key (`get ''()`), so only
-    // reject a negative length / null pointer.
-    let name = if name_ptr.is_null() || name_len < 0 {
+    if name_ptr.is_null() || name_len < 0 || func_ptr == 0 {
         return;
-    } else {
-        match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
-            Ok(s) => s.to_string(),
-            Err(_) => return,
-        }
-    };
-    let newly_declared = class_own_accessor_ptrs(class_id as u32, &name).is_none();
-    let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
-    if registry.is_none() {
-        *registry = Some(crate::fast_hash::new_ptr_hash_map());
     }
-    let reg = registry.as_mut().unwrap();
-    let vtable = reg.entry(class_id as u32).or_default();
-    vtable.declare_accessor_half(&name, func_ptr as usize, false);
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
-    drop(registry);
-    super::decl_accessors::note_instance_accessor_registered(
+    super::declarations::test_declare_member(
         class_id as u32,
-        &name,
-        newly_declared,
+        std::slice::from_raw_parts(name_ptr, name_len as usize),
+        super::declarations::test_accessor_member(func_ptr as usize, false, None),
     );
 }
 
-/// Register a class setter in the vtable registry.
-///
-/// Refs #486 (hono): hono's Context has `set res(_res) { ...; this.#res = _res;
-/// this.finalized = true; }`. Without setter dispatch in `js_object_set_field_by_name`,
-/// `c.res = response` from inside compose's `await handler(c, next)` chain stored
-/// the response into a regular field slot but never ran the setter body — so
-/// `this.finalized = true` never executed, `c.finalized` stayed false, and
-/// hono-base's `if (!context.finalized) throw …` fired.
-///
-/// Setter signature: `fn(this_f64, value_f64) -> f64` (returns ignored, but
-/// codegen emits a return so the LLVM signature matches a regular method body).
-#[no_mangle]
-///
-/// `spec_length` is the setter's spec `.length` (0 for `set m(x = 1)`), kept
-/// with the setter for descriptor reflection.
+/// The setter half of [`js_register_class_getter`]; `spec_length` is the
+/// setter's spec `.length`.
+#[cfg(test)]
 pub unsafe extern "C" fn js_register_class_setter(
     class_id: i64,
     name_ptr: *const u8,
@@ -499,35 +465,17 @@ pub unsafe extern "C" fn js_register_class_setter(
     func_ptr: i64,
     spec_length: i32,
 ) {
-    // `name_len == 0` is a legal empty-string member key (`get ''()`), so only
-    // reject a negative length / null pointer.
-    let name = if name_ptr.is_null() || name_len < 0 {
+    if name_ptr.is_null() || name_len < 0 || func_ptr == 0 {
         return;
-    } else {
-        match std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize)) {
-            Ok(s) => s.to_string(),
-            Err(_) => return,
-        }
-    };
-    let newly_declared = class_own_accessor_ptrs(class_id as u32, &name).is_none();
-    let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
-    if registry.is_none() {
-        *registry = Some(crate::fast_hash::new_ptr_hash_map());
     }
-    let reg = registry.as_mut().unwrap();
-    let vtable = reg.entry(class_id as u32).or_default();
-    vtable.declare_accessor_half_with_length(
-        &name,
-        func_ptr as usize,
-        true,
-        u32::try_from(spec_length).ok(),
-    );
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
-    drop(registry);
-    super::decl_accessors::note_instance_accessor_registered(
+    super::declarations::test_declare_member(
         class_id as u32,
-        &name,
-        newly_declared,
+        std::slice::from_raw_parts(name_ptr, name_len as usize),
+        super::declarations::test_accessor_member(
+            func_ptr as usize,
+            true,
+            u32::try_from(spec_length).ok(),
+        ),
     );
 }
 
@@ -580,35 +528,6 @@ static KEEP_REGISTER_STATIC_SETTER: unsafe extern "C" fn(i64, *const u8, i64, i6
 
 /// Record the spec `.length` (params before the first default/rest) for a class
 /// method or accessor. Codegen emits one call per method at module init.
-/// Register the closure-convention entry of method `name` of class
-/// `class_id` on its vtable entry, which `js_register_class_method` created
-/// first.
-#[no_mangle]
-pub unsafe extern "C" fn js_register_class_method_entry(
-    class_id: i64,
-    name_ptr: *const u8,
-    name_len: i64,
-    entry: i64,
-) {
-    if class_id == 0 || name_ptr.is_null() || name_len <= 0 || entry == 0 {
-        return;
-    }
-    let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len as usize))
-    else {
-        return;
-    };
-    let Ok(mut guard) = CLASS_VTABLE_REGISTRY.write() else {
-        return;
-    };
-    if let Some(method) = guard
-        .as_mut()
-        .and_then(|all| all.get_mut(&(class_id as u32)))
-        .and_then(|vtable| vtable.methods.get_mut(name))
-    {
-        method.entry = entry as usize;
-    }
-}
-
 #[no_mangle]
 pub unsafe extern "C" fn js_register_class_method_bind_length(
     class_id: i64,
@@ -712,18 +631,5 @@ unsafe fn register_class_static_accessor_half(
             entry.set_length = set_length;
         }
     }
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
     crate::object::class_value::note_intrinsic_registration(class_id as u32, &name);
-}
-
-/// Register materialization input in the declaration record.
-#[no_mangle]
-pub extern "C" fn js_register_class_prototype_shape(class_id: u32, shape_id: u32) {
-    if let Ok(mut registry) = CLASS_VTABLE_REGISTRY.write() {
-        registry
-            .get_or_insert_with(crate::fast_hash::new_ptr_hash_map)
-            .entry(class_id)
-            .or_default()
-            .prototype_birth_shape = shape_id;
-    }
 }

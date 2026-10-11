@@ -53,22 +53,28 @@ pub(crate) use shapes_linked_birth::{
     complete_layout_generation, declaration_parent_identity, mutation_generation,
     pristine_declaration_holder, stamp_linked_final_shape, stamp_linked_final_shape_requested,
 };
+#[cfg(all(test, feature = "regex-engine"))]
+#[path = "regex_direct_admission_tests.rs"]
+mod regex_direct_admission_tests;
 #[path = "shapes_slot_list.rs"]
 mod shapes_slot_list;
 #[path = "shapes_store.rs"]
 mod shapes_store;
 #[path = "shapes_worker_seed.rs"]
 mod shapes_worker_seed;
+#[cfg(test)]
+pub(crate) use shapes_prototype::clear_class_identity_words;
 pub(crate) use shapes_prototype::{
-    identity_word_slot, note_full_trace_begin, proto_id_carries_word, prune_dead_shape_prototypes,
-    scan_shape_prototype_words_mut, shape_prototype_word,
+    identity_prototype_word, identity_word_slot, note_full_trace_begin, proto_id_carries_word,
+    prune_dead_shape_prototypes, shape_prototype_word, write_identity_word,
 };
 #[path = "shapes_store_kind.rs"]
 pub(crate) mod store_kind;
-pub(crate) use shapes_birth_width::{created_birth_shape, keyless_birth_width, note_spill_width};
+pub(crate) use shapes_birth_width::{
+    created_birth_shape, keyless_birth_width, note_spill_width, KeylessBirth,
+};
 #[cfg(test)]
 pub(crate) use shapes_slot_list::shape_descriptor_keys_slot;
-pub(crate) use shapes_slot_list::shape_id_owns_keys_slot;
 pub(crate) use shapes_slot_list::{
     object_shape_hole_count, publish_object_shape_delete_transition, publish_object_shape_holes,
     rekey_stable_tombstone_shape_after_squeeze, retire_owned_shape_history,
@@ -189,7 +195,7 @@ impl ShapeDescriptor {
     /// set; methods on that key keep the ordinary property read.
     pub(crate) fn implicit_own_keys(&self) -> &'static [&'static [u8]] {
         match self.object_kind {
-            ShapeObjectKind::Function => &[b"name", b"length", b"prototype"],
+            kind if kind.is_function_layout() => &[b"name", b"length", b"prototype"],
             _ => &[],
         }
     }
@@ -278,6 +284,12 @@ impl ShapeDescriptor {
 pub(crate) struct ShapeRecordRef(std::ptr::NonNull<ShapeRecord>);
 
 impl ShapeRecordRef {
+    #[inline(always)]
+    pub(crate) fn prototype_word(self) -> u64 {
+        // SAFETY: this handle borrows a live slab record of this agent.
+        unsafe { (*self.0.as_ptr()).prototype_word() }
+    }
+
     #[inline]
     pub(crate) fn proto_id(self) -> u64 {
         // A live slab record; the identity is immutable.
@@ -303,6 +315,11 @@ impl ShapeRecordRef {
     pub(crate) fn live_inline_slot_count(self) -> u32 {
         // SAFETY: a live slab record (type docs).
         unsafe { (*self.0.as_ptr()).live_inline_slot_count }
+    }
+
+    #[inline]
+    pub(crate) fn proves_no_symbols(self) -> bool {
+        unsafe { (*self.0.as_ptr()).proves_no_symbols() }
     }
 
     /// The record's attribute summary (`key_attrs::SUMMARY_*`): one load,
@@ -403,6 +420,12 @@ impl ShapeRecordRef {
         let next = with_slot_rep(rep, slot, REP_F64_DEPRECATED);
         word.store(next, std::sync::atomic::Ordering::Release);
         true
+    }
+
+    /// Stable representation-word address. A persistent borrower must own
+    /// this ShapeId as a cache carrier so full-trace pruning retains its slab.
+    pub(crate) fn rep_address(self) -> usize {
+        self.rep_word() as *const std::sync::atomic::AtomicU64 as usize
     }
 
     #[inline]
@@ -969,15 +992,41 @@ pub(crate) enum ShapeObjectKind {
     /// export surface. The namespace brand is part of shape identity, so an
     /// ordinary record with a module name in a data slot cannot impersonate it.
     NativeNamespace,
+    /// A bound call/apply adapter with the ordinary five bound slots plus a
+    /// resolved function operand in slot 5. Appended to preserve every earlier
+    /// ordinal and the packed kind field of existing shape records.
+    FunctionBoundCall,
+    FunctionBoundApply,
+    /// Ordinary bound function: target, receiver and partial-argument slots.
+    FunctionBound,
+    /// Ordinary slots and links, plus receiver-local native fallback when
+    /// an ordinary read produces undefined. Absence proofs must retain
+    /// collecting native forwarding.
+    OrdinaryNativeAlias,
 }
 
 impl ShapeObjectKind {
+    #[inline]
+    pub(crate) fn is_function_layout(self) -> bool {
+        matches!(
+            self,
+            Self::Function
+                | Self::FunctionBoundCall
+                | Self::FunctionBoundApply
+                | Self::FunctionBound
+        )
+    }
+
     /// A non-`GC_TYPE_OBJECT` receiver kind: minted in the exotic band.
     #[inline]
     pub(crate) fn is_exotic(self) -> bool {
         matches!(
             self,
-            ShapeObjectKind::Function | ShapeObjectKind::FunctionDictionary
+            ShapeObjectKind::Function
+                | ShapeObjectKind::FunctionDictionary
+                | ShapeObjectKind::FunctionBoundCall
+                | ShapeObjectKind::FunctionBoundApply
+                | ShapeObjectKind::FunctionBound
         )
     }
 
@@ -992,6 +1041,7 @@ impl ShapeObjectKind {
                 | ShapeObjectKind::OrdinaryUnmarked
                 | ShapeObjectKind::OrdinaryNumericProof
                 | ShapeObjectKind::NativeNamespace
+                | ShapeObjectKind::OrdinaryNativeAlias
         )
     }
 
@@ -1008,81 +1058,12 @@ impl ShapeObjectKind {
             ShapeObjectKind::OrdinaryUnmarked => 5,
             ShapeObjectKind::OrdinaryNumericProof => 6,
             ShapeObjectKind::NativeNamespace => 7,
+            ShapeObjectKind::FunctionBoundCall => 8,
+            ShapeObjectKind::FunctionBoundApply => 9,
+            ShapeObjectKind::FunctionBound => 10,
+            ShapeObjectKind::OrdinaryNativeAlias => 11,
         }
     }
-}
-
-/// Per-agent direct cache for the immutable `object_kind` half of a ShapeId.
-/// A collision only falls back to the descriptor table. Entries contain no
-/// managed address, and descriptor retirement clears a matching id before it
-/// can be observed without the authoritative table record.
-pub(crate) const SHAPE_KIND_CACHE_SIZE: usize = 16_384;
-const SHAPE_KIND_CACHE_MASK: usize = SHAPE_KIND_CACHE_SIZE - 1;
-const SHAPE_KIND_ORDINARY: u64 = 1;
-const SHAPE_KIND_CLASS: u64 = 2;
-const SHAPE_KIND_DICTIONARY: u64 = 3;
-const SHAPE_KIND_FUNCTION: u64 = 4;
-const SHAPE_KIND_FUNCTION_DICTIONARY: u64 = 5;
-const SHAPE_KIND_ORDINARY_UNMARKED: u64 = 6;
-const SHAPE_KIND_ORDINARY_NUMERIC_PROOF: u64 = 7;
-const SHAPE_KIND_NATIVE_NAMESPACE: u64 = 8;
-
-#[inline(always)]
-fn shape_kind_cache_slot(shape_id: u32) -> usize {
-    let mixed = u64::from(shape_id).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (mixed ^ (mixed >> 32)) as usize & SHAPE_KIND_CACHE_MASK
-}
-
-#[inline]
-fn cached_shape_object_kind(shape_id: u32) -> Option<ShapeObjectKind> {
-    let cache = unsafe { &mut *crate::state::state().object_hot.shape_kind_cache.get() };
-    let packed = cache[shape_kind_cache_slot(shape_id)];
-    if (packed >> 32) as u32 != shape_id {
-        return None;
-    }
-    match packed & 0xFFFF_FFFF {
-        SHAPE_KIND_ORDINARY => Some(ShapeObjectKind::Ordinary),
-        SHAPE_KIND_CLASS => Some(ShapeObjectKind::Class),
-        SHAPE_KIND_DICTIONARY => Some(ShapeObjectKind::Dictionary),
-        SHAPE_KIND_FUNCTION => Some(ShapeObjectKind::Function),
-        SHAPE_KIND_FUNCTION_DICTIONARY => Some(ShapeObjectKind::FunctionDictionary),
-        SHAPE_KIND_ORDINARY_UNMARKED => Some(ShapeObjectKind::OrdinaryUnmarked),
-        SHAPE_KIND_ORDINARY_NUMERIC_PROOF => Some(ShapeObjectKind::OrdinaryNumericProof),
-        SHAPE_KIND_NATIVE_NAMESPACE => Some(ShapeObjectKind::NativeNamespace),
-        _ => None,
-    }
-}
-
-#[inline]
-fn publish_shape_object_kind(shape_id: u32, kind: ShapeObjectKind) {
-    let cache = unsafe { &mut *crate::state::state().object_hot.shape_kind_cache.get() };
-    let tag = match kind {
-        ShapeObjectKind::Ordinary => SHAPE_KIND_ORDINARY,
-        ShapeObjectKind::Class => SHAPE_KIND_CLASS,
-        ShapeObjectKind::Dictionary => SHAPE_KIND_DICTIONARY,
-        ShapeObjectKind::Function => SHAPE_KIND_FUNCTION,
-        ShapeObjectKind::FunctionDictionary => SHAPE_KIND_FUNCTION_DICTIONARY,
-        ShapeObjectKind::OrdinaryUnmarked => SHAPE_KIND_ORDINARY_UNMARKED,
-        ShapeObjectKind::OrdinaryNumericProof => SHAPE_KIND_ORDINARY_NUMERIC_PROOF,
-        ShapeObjectKind::NativeNamespace => SHAPE_KIND_NATIVE_NAMESPACE,
-    };
-    cache[shape_kind_cache_slot(shape_id)] = (u64::from(shape_id) << 32) | tag;
-}
-
-#[inline]
-fn retire_cached_shape_object_kind(shape_id: u32) {
-    let cache = unsafe { &mut *crate::state::state().object_hot.shape_kind_cache.get() };
-    let entry = &mut cache[shape_kind_cache_slot(shape_id)];
-    if (*entry >> 32) as u32 == shape_id {
-        *entry = 0;
-    }
-}
-
-#[cfg(test)]
-#[inline]
-fn clear_shape_object_kind_cache() {
-    let cache = unsafe { &mut *crate::state::state().object_hot.shape_kind_cache.get() };
-    cache.fill(0);
 }
 
 struct ShapeTableInner {
@@ -1459,7 +1440,10 @@ pub(crate) fn shape_word_may_be_linked(header_word: u32) -> bool {
 /// `proto_id`.
 #[inline]
 pub(crate) fn proto_id_kind(proto_id: u64) -> u32 {
-    if proto_id == PROTO_ID_NULL {
+    if (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&proto_id) {
+        // The identity word is an implied class link, not an instance override.
+        SHAPE_ID_KIND_PLAIN
+    } else if proto_id == PROTO_ID_NULL {
         SHAPE_ID_KIND_NULL
     } else if shapes_prototype::proto_id_carries_word(proto_id) {
         SHAPE_ID_KIND_WORD
@@ -2501,6 +2485,21 @@ pub(crate) fn shape_record_by_id(shape_id: u32) -> Option<ShapeRecordRef> {
     std::ptr::NonNull::new(record).map(ShapeRecordRef)
 }
 
+/// Validate a plain birth in the authoritative ordinary-band record.
+/// Dictionary/exotic ids cannot carry an ordinary birth layout; the existing
+/// ordinary-directory probe rejects them with its page bound, avoiding the
+/// general lookup's band selection. No prototype word or pointer is memoized.
+#[inline(always)]
+pub(crate) fn plain_birth_rep_by_id(shape_id: u32, field_count: u32) -> Option<u64> {
+    // SAFETY: the directory is this agent's live published ordinary band.
+    let record =
+        unsafe { ShapeSlab::ordinary_record_in(ShapeSlab::ordinary_dir_addr(), shape_id) }?;
+    record.admits_plain_birth(field_count).then(|| {
+        // SAFETY: a present record, read before any collection point.
+        unsafe { ShapeRecordRef(std::ptr::NonNull::from(record)).rep() }
+    })
+}
+
 /// Whether a previously published ShapeId no longer names a live record in
 /// this agent's shape table. ShapeIds are never reused: a retired receiver
 /// cannot compete with a live one in a read cache.
@@ -2529,17 +2528,11 @@ pub(crate) fn shape_rep_by_id(shape_id: u32) -> u64 {
     }
 }
 
-/// Immutable ordinary-vs-class fact with a pointer-free, per-agent direct
-/// cache. The first observation remains the authoritative descriptor lookup_ways;
-/// subsequent observations avoid the hot ShapeId HashMap borrow.
+/// The authoritative kind of a live shape in this agent. Presence and kind
+/// come from the same slab record; retirement needs no separate invalidation.
 #[inline]
 pub(crate) fn shape_object_kind_by_id(shape_id: u32) -> Option<ShapeObjectKind> {
-    if let Some(kind) = cached_shape_object_kind(shape_id) {
-        return Some(kind);
-    }
-    let kind = shape_descriptor_by_id(shape_id)?.object_kind;
-    publish_shape_object_kind(shape_id, kind);
-    Some(kind)
+    shape_record_by_id(shape_id).map(ShapeRecordRef::object_kind)
 }
 
 /// Record that a shape is carried by an OLD-generation receiver.
@@ -4549,7 +4542,17 @@ pub(crate) unsafe fn restamp_object_proto_id(obj: *mut crate::object::ObjectHead
     if obj.is_null() || !shape_word_is_writable(obj) || object_shape_stamp(obj) == 0 {
         return 0;
     }
-    transition_object_shape_prototype(obj, object_proto_id(obj), object_prototype_word(obj));
+    let proto_id = object_proto_id(obj);
+    let recorded = object_prototype_word(obj);
+    // A class-id rewrite on an instance has no recorded prototype word.
+    // Its bare CLASS identity already owns the materialized holder; zero
+    // here means the implicit link, not a request to clear that holder.
+    let bits = if recorded == 0 && (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&proto_id) {
+        shapes_prototype::identity_prototype_word(proto_id)
+    } else {
+        recorded
+    };
+    transition_object_shape_prototype(obj, proto_id, bits);
     // A `class_id` rewrite is also an F-A input (charter step 3, R4): a
     // prototype transition re-derives it, but an unchanged prototype
     // identity mints nothing, so re-derive explicitly.
@@ -4617,11 +4620,27 @@ pub(crate) fn fresh_unique_proto_id() -> u64 {
 fn vtable_class(class_id: u32) -> u32 {
     if class_id == 0
         || class_id >= crate::object::class_registry::prototype_objects::SYNTHETIC_CLASS_ID_BASE
-        || crate::object::is_anon_shape_class_id(class_id)
     {
         return 0;
     }
+    // Module-local anonymous ids may collide with declarations. Project the
+    // existing reflective precedence when minting the shape, so a CLASS
+    // link remains a shape fact instead of a registry check on every read.
+    if crate::object::class_registry::anonymous_class_role(class_id) == Some(false) {
+        return 0;
+    }
     crate::object::class_generic_origin(class_id).unwrap_or(class_id)
+}
+
+/// The CLASS word of a class identity, including a closed-literal id that
+/// later collides with a declaration. Receiver birth classification is a
+/// separate fact: an anon receiver can have DEFAULT while its class acquires
+/// a holder, and probes must observe that publication.
+pub(crate) fn class_identity_proto_id(class_id: u32) -> u64 {
+    if class_id == 0 {
+        return PROTO_ID_DEFAULT;
+    }
+    PROTO_ID_CLASS | u64::from(crate::object::class_generic_origin(class_id).unwrap_or(class_id))
 }
 
 /// The prototype identity an instance of `class_id` is BORN with, before any
@@ -4871,9 +4890,14 @@ unsafe fn null_linked_prototype_word(obj: *const crate::object::ObjectHeader) ->
 unsafe fn linked_object_prototype_word(obj: *const crate::object::ObjectHeader) -> u64 {
     // The agent directory read: never null, an absent id reads the empty
     // record (identity 0, the default).
-    let proto_id = (*ShapeSlab::agent_record(object_shape_stamp(obj))).proto_id;
+    let record = &*ShapeSlab::agent_record(object_shape_stamp(obj));
+    let proto_id = record.proto_id;
+    if (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&proto_id) {
+        // CLASS is an implied link, rather than an instance override.
+        return 0;
+    }
     if proto_id != PROTO_ID_NULL {
-        return shapes_prototype::identity_prototype_word(proto_id);
+        return record.prototype_word();
     }
     match crate::value::addr_class::try_read_gc_header(obj as usize) {
         Some(header) if header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0 => 0,
@@ -5171,7 +5195,6 @@ fn remove_descriptor_indexed_under(inner: &mut ShapeTableInner, id: u32, indexed
     };
     #[cfg(feature = "shape-mint-diag")]
     crate::object::shape_mint_census::note_retire(id);
-    retire_cached_shape_object_kind(id);
     if record.has(RECORD_FLAG_FACTS_INDEXED) {
         inner.facts_remove(record.facts_key_with_keys(indexed), id);
     }
@@ -5286,7 +5309,7 @@ pub(crate) unsafe fn clear_object_shape_stamp(obj: *mut crate::object::ObjectHea
 /// any such array sees is a canonical backing's tip append, past every
 /// published count (`canonical_keys::append_at_tip`); every other writer
 /// copies first. So one index serves every list on it.
-unsafe fn keys_prefix_is_immutable(keys: *const ArrayHeader) -> bool {
+pub(crate) unsafe fn keys_prefix_is_immutable(keys: *const ArrayHeader) -> bool {
     crate::value::addr_class::try_read_gc_header(keys as usize).is_some_and(|gc| {
         gc.obj_type == crate::gc::GC_TYPE_ARRAY
             && gc.gc_flags & crate::gc::GC_FLAG_SHAPE_SHARED != 0
@@ -5663,6 +5686,21 @@ fn retire_shape_keys_entries(inner: &mut ShapeTableInner, keys: u64) {
     }
 }
 
+/// The shape table's one collector entry: every heap word a shape record
+/// holds, visited by one scanner. A record holds two kinds: its canonical
+/// `keys` word ([`scan_shape_table_keys_mut`]) and, through its `proto_id`,
+/// its identity's [[Prototype]] word
+/// (`shapes_prototype::scan_shape_prototype_words_mut`). One table, one
+/// registration: a collection that repaired a record's keys but not its
+/// prototype word would leave a record that outlives its last receiver (an
+/// external or cache carrier, re-stamped from a scalar memo that never
+/// re-publishes the word) naming a from-space prototype after evacuation
+/// (#12313).
+pub(crate) fn scan_shape_table_rekey_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    scan_shape_table_keys_mut(visitor);
+    shapes_prototype::scan_shape_prototype_words_mut(visitor);
+}
+
 /// Metadata-only forwarding repair for the weak descriptor table and
 /// pointer-keyed slot indices. Mark/copy mode does not root anything; live
 /// object scans provide descriptor reachability, and post-copy rewrite follows
@@ -5676,7 +5714,7 @@ fn retire_shape_keys_entries(inner: &mut ShapeTableInner, keys: u64) {
 /// MARKING visit when any of its descriptors is a carrier, which is exactly
 /// the rooting duty the #8112 gate assigns: the keys array must survive while
 /// an old receiver or a cache still names one of its shapes.
-pub(crate) fn scan_shape_table_rekey_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+fn scan_shape_table_keys_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     let table = &crate::state::state().shapes;
     let mut inner = table.inner.borrow_mut();
     let carrier_notes = SHAPE_CARRIER_YOUNG_KEYS.with(|log| log.borrow_mut().take_sorted());

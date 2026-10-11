@@ -405,14 +405,15 @@ pub(crate) fn exotic_own_keys(kind: ExoticKind, addr: usize, enumerable_only: bo
 /// (`Object.defineProperty(dateObj, "prop", {...})`). Mirrors the ordinary
 /// ValidateAndApplyPropertyDescriptor flow against the side tables: absent
 /// fields default to `false`/`undefined` for NEW properties and are
-/// retained from the current state when REDEFINING. Throws TypeError on
-/// forbidden non-configurable redefines and non-extensible additions.
+/// retained from the current state when REDEFINING. Returns `false` (the
+/// definition's verdict) on forbidden non-configurable redefines and
+/// non-extensible additions, before any mutation.
 pub(crate) unsafe fn exotic_define_own_property(
     addr: usize,
     kind: ExoticKind,
     name: &str,
-    descriptor_value: f64,
-) {
+    descriptor: &crate::object::object_ops::DescView<'_>,
+) -> bool {
     // Error instances expose `message`/`stack` as builtin own properties
     // (writable, non-enumerable, configurable) even before any user write.
     let is_error_builtin = kind == ExoticKind::Error && matches!(name, "message" | "stack");
@@ -432,14 +433,14 @@ pub(crate) unsafe fn exotic_define_own_property(
         None
     };
 
-    let has_get = super::desc_has_field(descriptor_value, b"get");
-    let has_set = super::desc_has_field(descriptor_value, b"set");
-    let has_value = super::desc_has_field(descriptor_value, b"value");
-    let has_writable = super::desc_has_field(descriptor_value, b"writable");
-    let has_enumerable = super::desc_has_field(descriptor_value, b"enumerable");
-    let has_configurable = super::desc_has_field(descriptor_value, b"configurable");
+    let has_get = descriptor.has_named(b"get");
+    let has_set = descriptor.has_named(b"set");
+    let has_value = descriptor.has_named(b"value");
+    let has_writable = descriptor.has_named(b"writable");
+    let has_enumerable = descriptor.has_named(b"enumerable");
+    let has_configurable = descriptor.has_named(b"configurable");
     let read_bool = |field: &[u8]| -> bool {
-        let v = super::desc_read_field(descriptor_value, field);
+        let v = descriptor.read_named(field);
         crate::value::js_is_truthy(f64::from_bits(v.bits())) != 0
     };
 
@@ -448,22 +449,19 @@ pub(crate) unsafe fn exotic_define_own_property(
             let cur_value = existing_value
                 .map(f64::from_bits)
                 .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
-            super::validate_nonconfigurable_redefine(
-                name,
+            if !super::nonconfigurable_redefine_allowed(
                 cur,
                 existing_accessor,
                 cur_value,
-                descriptor_value,
-                None,
-            );
+                descriptor,
+            ) {
+                return false;
+            }
         }
     } else {
         let gc = (addr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         if (*gc)._reserved & crate::gc::OBJ_FLAG_NO_EXTEND != 0 {
-            super::throw_object_type_error_with_suffix(
-                "Cannot define property ",
-                &format!("{name}, object is not extensible"),
-            );
+            return false;
         }
     }
 
@@ -486,8 +484,8 @@ pub(crate) unsafe fn exotic_define_own_property(
     };
 
     if has_get || has_set {
-        let get_field = super::desc_read_field(descriptor_value, b"get");
-        let set_field = super::desc_read_field(descriptor_value, b"set");
+        let get_field = descriptor.read_named(b"get");
+        let set_field = descriptor.read_named(b"set");
         let merged = super::AccessorDescriptor {
             get: if has_get {
                 if get_field.is_undefined() {
@@ -515,7 +513,7 @@ pub(crate) unsafe fn exotic_define_own_property(
             name.to_string(),
             super::PropertyAttrs::new(false, enumerable, configurable),
         );
-        return;
+        return true;
     }
 
     if existing_accessor.is_some() && (has_value || has_writable) {
@@ -523,7 +521,7 @@ pub(crate) unsafe fn exotic_define_own_property(
         super::clear_accessor_descriptor(addr, name);
     }
     if has_value {
-        let v = super::desc_read_field(descriptor_value, b"value");
+        let v = descriptor.read_named(b"value");
         value_store(kind, addr, name, v.bits());
     } else if !exists {
         // New property with absent [[Value]] reads as undefined.
@@ -537,6 +535,7 @@ pub(crate) unsafe fn exotic_define_own_property(
         name.to_string(),
         super::PropertyAttrs::new(writable, enumerable, configurable),
     );
+    true
 }
 
 /// Assignment `PutValue` arm for exotic receivers, used by

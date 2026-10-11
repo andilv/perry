@@ -44,6 +44,9 @@
 
 #![deny(missing_docs)]
 
+mod runtime_state_key;
+pub use runtime_state_key::StateKeySite;
+
 mod async_runtime;
 pub use async_runtime::{
     nanbox_string_bits, run_pending, spawn_blocking, JsNativeAsyncCompletion, JsPromise,
@@ -105,7 +108,8 @@ pub use jsvalue::{
     alloc_null_proto_object, alloc_object, alloc_set, build_object_shape, js_array_alloc,
     js_array_get, js_array_length, js_array_push, js_array_set, js_object_alloc_with_shape,
     js_object_get_field, js_object_live_slot_count, js_object_set_field, object_field_by_name,
-    set_add, set_delete, string_arg_ptr, JsValue, SHORT_STRING_MAX_LEN,
+    object_record_field, object_record_set, set_add, set_delete, string_arg_ptr, JsValue,
+    SHORT_STRING_MAX_LEN,
 };
 
 mod closure;

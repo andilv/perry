@@ -1,89 +1,14 @@
 use super::*;
 use crate::JSValue;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // Class-method calls through the vtable's function pointers (constructors,
-// private and symbol-keyed members, the method-value trampoline), and the
-// registration generation the store-plan cache keys on.
+// private and symbol-keyed members, the method-value trampoline).
 //
 // A by-name call of a class instance's string-keyed method is answered by its
 // prototype chain's shapes (`native_call_method::class_holder`), not here: the
 // per-(class, name) caches this module used to keep for it are gone.
 // ============================================================================
-
-pub(crate) static VTABLE_GEN: AtomicU64 = AtomicU64::new(1);
-
-/// Current vtable generation — consumed by caches (the store-plan cache in
-/// `object::prop_plan`) that must invalidate on any class
-/// registration/mutation.
-#[inline]
-pub(crate) fn vtable_generation() -> u64 {
-    VTABLE_GEN.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-pub(crate) fn test_bump_vtable_generation() {
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
-}
-
-/// Generation counter for the class-registry lookup surfaces that
-/// [`VTABLE_GEN`] deliberately does NOT cover.
-///
-/// `VTABLE_GEN` tracks method/getter/setter REGISTRATION. Four other writes
-/// change what a class-chain walk would ANSWER without touching a vtable, and
-/// none of them may bump `VTABLE_GEN`: materializing a declared class's
-/// prototype OBJECT is explicitly documented as a dispatch deoptimization to
-/// avoid (`class_registry/state.rs`, #7769 — "384,000 of 384,000 shape-guard
-/// probes failed here"). They are:
-///
-/// * `class_prototype_object_root_store` — NULL to a real
-///   `CLASS_PROTOTYPE_OBJECTS` entry (a reflective `F.prototype` read,
-///   `Object.create`, the lazy builtin prototype installers);
-/// * `class_decl_prototype_object_root_store` — NULL to a real
-///   `CLASS_DECL_PROTOTYPE_OBJECTS` entry (any `C.prototype`, `instanceof`,
-///   `Object.getPrototypeOf(instance)`, a `super` chain);
-/// * `js_register_class_generic_origin` — redirects BOTH prototype-object
-///   readers and the ordinary prototype read's chain hop to another class id;
-///
-/// Bumped INSIDE those three writers, after the store, so a new call site
-/// cannot forget it — the same enforced-funnel rule `prop_plan_epoch_bump`
-/// follows. Kept separate from `VTABLE_GEN` precisely so that a consumer of
-/// this counter does not impose the dispatch-speculation cost that bumping
-/// `VTABLE_GEN` in those writers would.
-///
-/// Garbage collection is NOT an input: the class side-table scanners
-/// (`object/class_gc_roots.rs`, `class_registry/gc_roots.rs`) only rewrite
-/// EXISTING slots, so no collection can add a registry key, and the
-/// dead-owner prune only removes entries. Keying a hot cache on a GC-bumped
-/// counter is a measured performance CLIFF, not merely waste — see
-/// `object::prop_plan`'s module docs (#7910).
-///
-/// First consumer: the per-`class_id` `toJSON` verdict memo in
-/// `json::stringify_tojson_probe` (#10696).
-pub(crate) static CLASS_LOOKUP_SURFACE_GEN: AtomicU64 = AtomicU64::new(1);
-
-/// Current class lookup-surface generation — see [`CLASS_LOOKUP_SURFACE_GEN`].
-#[inline]
-pub(crate) fn class_lookup_surface_generation() -> u64 {
-    CLASS_LOOKUP_SURFACE_GEN.load(Ordering::Relaxed)
-}
-
-/// Invalidate every cache keyed on [`CLASS_LOOKUP_SURFACE_GEN`]. One relaxed
-/// add; every caller is a one-shot-per-class materializer or a `delete`
-/// recovery path.
-#[inline]
-pub(crate) fn class_lookup_surface_gen_bump() {
-    CLASS_LOOKUP_SURFACE_GEN.fetch_add(1, Ordering::Release);
-    // An inherited-read entry whose chain was resolved through
-    // `class_prototype_object` names the object that registry held AT PRIME
-    // TIME. Replacing the registration leaves the receiver's class id, ShapeId
-    // and recorded prototype bits all unchanged and the old prototype object
-    // unmutated, so nothing else in that entry's guard can see it — and the
-    // entry would then answer with a different object than the chain walk
-    // beside it. All three callers are registry stores on cold paths.
-    crate::object::proto_validity::bump_proto_validity();
-}
 
 /// Maximum positional arity `call_vtable_method` can invoke directly. The
 /// dispatch builds a fixed-arity `extern "C"` fn signature for each arity up to

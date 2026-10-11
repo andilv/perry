@@ -376,8 +376,9 @@ fn static_write_pic_guards_its_bookkeeping_behind_a_live_pointer_test() {
         "the barrier gate must be a LIVE header test: {barrier_branch}"
     );
     assert!(
-        barrier_pred.contains("and i8") && barrier_pred.contains(", 32"),
-        "the barrier gate must mask GC_FLAG_TENURED out of the parent's gc_flags:\n{barrier_pred}"
+        barrier_pred.contains("and i8") && barrier_pred.contains(", 34"),
+        "the barrier gate must mask GC_FLAG_TENURED | GC_FLAG_ARENA out of the parent's \
+         gc_flags:\n{barrier_pred}"
     );
     assert!(
         barrier_pred.contains("@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT"),
@@ -553,10 +554,14 @@ fn assert_constfn_body_compare(ir: &str) {
         .next()
         .unwrap_or("")
         .to_string();
-    let site_gep = header.lines().any(|l| {
-        l.contains("getelementptr")
-            && l.contains("_packed_set")
-            && l.trim_end().ends_with(", i64 4")
+    let site_gep = ir.lines().any(|l| {
+        let Some((result, instruction)) = l.trim().split_once(" = ") else {
+            return false;
+        };
+        instruction.contains("getelementptr")
+            && instruction.contains("_packed_set")
+            && instruction.trim_end().ends_with(", i64 4")
+            && body_load.contains(&format!("ptr {result} "))
     });
     assert!(
         site_gep,
@@ -780,4 +785,43 @@ fn store_ic_emits_no_constfn_admission_for_a_value_that_cannot_be_a_closure() {
             "a value that may be a closure keeps `{stem}`:\n{ir}"
         );
     }
+}
+
+#[test]
+fn constructed_scalar_rhs_omits_every_store_bookkeeping_instruction() {
+    for value in [
+        Expr::Compare {
+            op: perry_hir::CompareOp::Eq,
+            left: Box::new(Expr::LocalGet(VALUE)),
+            right: Box::new(Expr::Number(80.0)),
+        },
+        Expr::Binary {
+            op: perry_hir::BinaryOp::BitOr,
+            left: Box::new(Expr::LocalGet(VALUE)),
+            right: Box::new(Expr::Number(0.0)),
+        },
+        Expr::Unary {
+            op: perry_hir::UnaryOp::Not,
+            operand: Box::new(Expr::LocalGet(VALUE)),
+        },
+    ] {
+        let ir = write_pic_ir("scalar_store_cost", value);
+        assert!(
+            block(&ir, HIT_STORE).unwrap().contains("store double"),
+            "slot store must remain: {ir}"
+        );
+        for helper in [ADDREF, BARRIER_CALL] {
+            assert_eq!(
+                ir.matches(helper).count(),
+                0,
+                "scalar bookkeeping instruction ratchet: {ir}"
+            );
+        }
+        assert!(!ir.contains(CLASSIFY), "no scalar pointer guard: {ir}");
+    }
+    let control = write_pic_ir("scalar_store_control", Expr::LocalGet(VALUE));
+    assert!(
+        control.contains(CLASSIFY) && control.contains(BARRIER_CALL),
+        "unknown values must retain their barrier: {control}"
+    );
 }

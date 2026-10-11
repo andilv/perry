@@ -91,7 +91,8 @@ fn workspace_root_from_exe(exe: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Find the Perry workspace root by searching upward from the executable location.
+/// Find workspace source via an override, the executable, its build checkout,
+/// or the current directory.
 pub fn find_perry_workspace_root() -> Option<PathBuf> {
     // Explicit override: npm/homebrew installs place the perry binary
     // outside the workspace, so neither the exe walk nor the cwd walk
@@ -109,15 +110,50 @@ pub fn find_perry_workspace_root() -> Option<PathBuf> {
              Perry workspace (missing crates/perry-runtime); ignoring it"
         );
     }
-    // First try: relative to the perry executable
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = workspace_root_from_exe(&exe) {
-            return Some(root);
-        }
+    workspace_root_from_locations(
+        std::env::current_exe().ok().as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        Path::new(env!("PERRY_BUILD_WORKSPACE_ROOT")),
+    )
+}
+
+/// The embedded checkout is only a hint: an installed compiler can outlive it,
+/// or the directory can be reused for another checkout. Require a Perry
+/// workspace at the compiler's version before building libraries from it.
+fn workspace_root_from_build_record(root: &Path) -> Option<PathBuf> {
+    if !is_perry_workspace_root(root) {
+        return None;
     }
-    // Second try: current working directory or its ancestors
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut dir = cwd.as_path();
+    let manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("Cargo.toml")).ok()?).ok()?;
+    let version = manifest
+        .get("workspace")?
+        .get("package")?
+        .get("version")?
+        .as_str()?;
+    if version != env!("CARGO_PKG_VERSION") {
+        return None;
+    }
+    let compiler: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("crates/perry/Cargo.toml")).ok()?).ok()?;
+    if compiler.get("package")?.get("name")?.as_str()? != "perry" {
+        return None;
+    }
+    root.canonicalize().ok()
+}
+
+fn workspace_root_from_locations(
+    exe: Option<&Path>,
+    cwd: Option<&Path>,
+    build_root: &Path,
+) -> Option<PathBuf> {
+    if let Some(root) = exe.and_then(workspace_root_from_exe) {
+        return Some(root);
+    }
+    if let Some(root) = workspace_root_from_build_record(build_root) {
+        return Some(root);
+    }
+    if let Some(mut dir) = cwd {
         loop {
             if is_perry_workspace_root(dir) {
                 return Some(dir.to_path_buf());
@@ -129,11 +165,16 @@ pub fn find_perry_workspace_root() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+mod build_workspace_tests;
+
+#[cfg(test)]
 mod bun_store_tests;
 #[cfg(test)]
 mod declaration_map_source_tests;
 #[cfg(test)]
 mod extension_resolution_tests;
+#[cfg(test)]
+mod package_enumeration_tests;
 #[cfg(test)]
 mod package_instance_tests;
 #[cfg(test)]
@@ -257,9 +298,6 @@ pub(super) fn enumerate_installed_package_roots(
     project_root: &Path,
 ) -> HashMap<String, Vec<PathBuf>> {
     let mut out = HashMap::new();
-    if let Some(nm) = find_node_modules(project_root) {
-        collect_packages_in_node_modules(&nm, &mut out);
-    }
     // #5914: bun's "flat"/isolated linker layout keeps non-hoisted transitive
     // dependencies solely inside `node_modules/.bun/<pkg>@<version>/node_modules/<pkg>`
     // (and the scoped `@scope+pkg@<version>` variant), with no corresponding
@@ -270,20 +308,21 @@ pub(super) fn enumerate_installed_package_roots(
     // those transitive-only packages are invisible to the `"*"` /
     // `"@scope/*"` wildcard expansion above.
     //
-    // Worse, in a bun workspace/monorepo the `.bun` store typically lives
-    // ONLY at the true root, while `find_node_modules` stops at the
-    // *nearest* ancestor `node_modules` — a workspace member commonly has
-    // its own (bun-created, `.bun`-less) `node_modules` for its first-party
-    // sibling-package symlinks, so `nm` above is very often NOT the root and
-    // never sees `.bun` at all. Walk every ancestor's `node_modules/.bun`,
-    // not just the nearest `node_modules` dir, so a workspace-member
-    // `project_root` still finds root-level bun-only transitive deps.
-    let mut dir = project_root.to_path_buf();
-    loop {
-        collect_packages_in_bun_store(&dir.join("node_modules"), &mut out);
-        if !dir.pop() {
-            break;
-        }
+    // Walk every ancestor in Node resolution order. A package-local cache or
+    // a workspace member's node_modules must not hide packages further up.
+    for nm in ancestor_node_modules_dirs(project_root) {
+        collect_packages_in_node_modules(&nm, &mut out);
+        collect_packages_in_bun_store(&nm, &mut out);
+    }
+    // Symlinks and recursively discovered nested packages can expose the same
+    // physical root more than once. Keep its first occurrence, preserving the
+    // nearest-first order rather than sorting paths lexically.
+    for roots in out.values_mut() {
+        let mut seen = HashSet::new();
+        roots.retain_mut(|root| {
+            *root = fs::canonicalize(&*root).unwrap_or_else(|_| root.clone());
+            seen.insert(root.clone())
+        });
     }
     out
 }
@@ -386,7 +425,7 @@ pub(super) fn ancestor_node_modules_dirs(start: &Path) -> Vec<PathBuf> {
     loop {
         // A dir literally named `node_modules` hosts packages itself; its
         // `node_modules/node_modules` join below would never exist.
-        if current.file_name().is_some_and(|n| n != "node_modules") {
+        if !current.file_name().is_some_and(|n| n == "node_modules") {
             let node_modules = current.join("node_modules");
             if node_modules.is_dir() {
                 dirs.push(node_modules);

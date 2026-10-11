@@ -326,10 +326,19 @@ pub struct JsFunctionInfo {
     /// [`FN_HAS_DECLARED`]): what `.length` falls back to. It can differ
     /// from `params`, the ABI width a caller pads to.
     pub declared: u16,
-    /// Padding (zero). Private, so an info can only be built through
-    /// [`JsFunctionInfo::of`] (typed) or the `unsafe`
-    /// [`JsFunctionInfo::from_code`].
-    reserved: u16,
+    /// One plus the fewest JS arguments a call may hand straight to `code`: `params + 1`
+    /// for a PLAIN body, one nothing stands between a call and (no bound
+    /// value, no rest or `arguments` bundling, compiled from JS source), else
+    /// zero, the legacy padding value, when no direct call is permitted. It is written with
+    /// `code`, once, when the info is born: codegen renders it for each body
+    /// it emits, and every info the runtime or an addon builds is
+    /// zero. A call passing at least the decoded count jumps to
+    /// `code` with its registers untouched (`js_closure_call{N}`); any other
+    /// call takes the dispatcher. Private, so an info can only be built
+    /// through [`JsFunctionInfo::of`] (typed) or the `unsafe`
+    /// [`JsFunctionInfo::from_code`], and made plain only by
+    /// [`JsFunctionInfo::plain`].
+    plain_params: u16,
     /// The versioned-loop clone's boxed-capture mask. When
     /// [`FN_HAS_SOURCE`] is set and `versioned_code` is null, this otherwise
     /// idle word instead carries the signed 64-bit source displacement.
@@ -350,6 +359,11 @@ pub const FN_REST_USER_AND_ARGUMENTS: u32 = 1 << 2;
 /// [`JsNativeArgsBody`] `(callee, this, args, len)`: no array is built for
 /// them. `rest_fixed` is its JS-visible declared count.
 pub const FN_REST_NATIVE_ARGS: u32 = 1 << 16;
+/// The builtin body resolves an Array `this` to its live forwarding head
+/// before using it. A receiver-validated site may supply the head it already
+/// proved, avoiding a second walk. This does not waive its descriptor,
+/// prototype, frozen or extensibility checks, or change generic callers.
+pub const FN_RESOLVES_ARRAY_THIS: u32 = 1 << 17;
 /// Any rest kind.
 pub const FN_REST_MASK: u32 =
     FN_REST_USER | FN_REST_SYNTHETIC_ARGUMENTS | FN_REST_USER_AND_ARGUMENTS | FN_REST_NATIVE_ARGS;
@@ -409,6 +423,12 @@ pub const JS_FUNCTION_INFO_CODE_OFFSET: usize = 0;
 pub const JS_FUNCTION_INFO_PARAMS_OFFSET: usize = 8;
 pub const JS_FUNCTION_INFO_FLAGS_OFFSET: usize = 12;
 pub const JS_FUNCTION_INFO_SIZE: usize = 64;
+/// Former zero padding; nonzero records opt in to plain closure dispatch.
+pub const JS_FUNCTION_INFO_PLAIN_PARAMS_OFFSET: usize =
+    core::mem::offset_of!(JsFunctionInfo, plain_params);
+
+/// [`JsFunctionInfo::plain_params`] of a body no call reaches directly.
+pub const NOT_PLAIN: u16 = u16::MAX;
 
 impl JsFunctionInfo {
     /// The info of the body at `code` declaring `params` JS parameters, with
@@ -431,7 +451,7 @@ impl JsFunctionInfo {
             versioned_code: core::ptr::null(),
             versioned_captures: 0,
             declared: 0,
-            reserved: 0,
+            plain_params: 0,
             versioned_boxed_mask: 0,
         }
     }
@@ -470,9 +490,31 @@ impl JsFunctionInfo {
         info
     }
 
+    /// [`JsFunctionInfo::plain_params`]: the fewest arguments a call may hand
+    /// straight to `code`, or [`NOT_PLAIN`].
+    pub const fn plain_params(&self) -> u16 {
+        self.plain_params.wrapping_sub(1)
+    }
+
+    /// A plain body: a call passing at least `params` arguments jumps to
+    /// `code` with nothing in between. A body with a rest kind stays
+    /// [`NOT_PLAIN`] (its arguments are bundled first). Adding a rest kind
+    /// later also revokes direct-call eligibility.
+    pub const fn plain(mut self) -> Self {
+        self.plain_params = if self.flags & FN_REST_MASK == 0 {
+            self.params.wrapping_add(1)
+        } else {
+            0
+        };
+        self
+    }
+
     /// With `FN_*` bits set.
     pub const fn with_flags(mut self, flags: u32) -> Self {
         self.flags |= flags;
+        if self.flags & FN_REST_MASK != 0 {
+            self.plain_params = 0;
+        }
         self
     }
 
@@ -494,6 +536,7 @@ impl JsFunctionInfo {
     pub const fn with_rest(mut self, fixed: u16) -> Self {
         self.rest_fixed = fixed;
         self.flags = (self.flags & !FN_REST_MASK) | FN_REST_USER;
+        self.plain_params = 0;
         self
     }
 
@@ -502,6 +545,7 @@ impl JsFunctionInfo {
     pub const fn with_rest_kind(mut self, fixed: u16, kind: u32) -> Self {
         self.rest_fixed = fixed;
         self.flags = (self.flags & !FN_REST_MASK) | kind;
+        self.plain_params = 0;
         self
     }
 
@@ -727,12 +771,28 @@ pub const METHOD_SITE_FUNCTION_BAG: u64 = 1 << 61;
 /// A method body using the native argument-list ABI (callee, this, args, argc).
 /// Composes with each storage kind; never with ConstFn.
 pub const METHOD_SITE_NATIVE_ARGS: u64 = 1 << 60;
+/// Method-entry info marker for current-value invocation. Function-info pointers
+/// are aligned, so this cannot match a live body (or a null info). It keeps the
+/// direct-body hit unchanged; only a failed body comparison checks this format.
+pub const METHOD_SITE_VALUE_INFO: u64 = 1;
 /// An own inline method whose ShapeId fixes one static body. The hit loads
 /// the receiver's current closure slot for captures, but needs no closure
 /// kind or info load after the shape compare.
 pub const METHOD_SITE_CONSTFN: u64 = 1 << 59;
+pub const METHOD_SITE_CHAIN: u64 = 1 << 58;
+/// Entry-owned shape proof ABI: native (address, shape word) pairs.
+pub const SHAPE_CHAIN_LEN_OFFSET: usize = 8;
+pub const SHAPE_CHAIN_HOP_BYTES: usize = 24;
+pub const ADD_CHAIN_REP_OFFSET: usize = 16;
+pub const METHOD_CHAIN_HOLDER_OFFSET: usize = 16;
+pub const METHOD_CHAIN_SLOT_OFFSET: usize = 24;
+/// Shared holder entry offsets for the 64-bit emitted own-symbol guard.
+pub const KEYED_HOLDER_TOKEN_OFFSET: usize = 32;
+pub const KEYED_HOLDER_KEY_OFFSET: usize = 40;
+pub const KEYED_HOLDER_ABSENT_OFFSET: usize = 52;
+
 /// The index bits of an entry's `slot` word (bit 60 is NativeArgs; bit 59 is ConstFn).
-pub const METHOD_SITE_INDEX_MASK: u64 = (1 << 59) - 1;
+pub const METHOD_SITE_INDEX_MASK: u64 = (1 << 58) - 1;
 /// What `js_method_site_prepare` answers for a call whose method read nothing
 /// can observe: dispatch by name after the arguments (#11910). The array-hole
 /// marker, a bit pattern no JS value takes.
@@ -766,6 +826,9 @@ pub const PACKED_SET_CONSTFN_SLOT: u64 = 1 << 62;
 /// ConstFn (the slot field is the guard's low 16 bits; bit 15 is the `F64`
 /// lane bit, the index is below bit 14).
 pub const PACKED_ADD_CONSTFN_SLOT: u64 = 1 << 14;
+/// Both otherwise exclusive value flags: an Any target with typed prefix
+/// lanes. Validate its representation, but impose no value restriction.
+pub const PACKED_ADD_REP_ONLY_SLOT: u64 = (1 << 15) | PACKED_ADD_CONSTFN_SLOT;
 /// `closure::CAPTURES_THIS_FLAG` / `closure::NO_THIS_REBIND_FLAG`, the high
 /// bits of `ClosureHeader::capture_count`. A closure with the first and not
 /// the second is a rebindable `this` clone, which never satisfies a ConstFn
@@ -800,3 +863,41 @@ pub const AGENT_PTR_CLASS_VALUES: usize = 3;
 
 /// Declaration class function capture holding its immutable prototype link.
 pub const CLASS_PROTOTYPE_LINK_CAPTURE: usize = 2;
+
+/// `PERRY_NANBOX_OPERANDS` (`perry-runtime/src/value/tags.rs`): the read-only
+/// table x86-64 generated code reads its most frequent 64-bit operands from
+/// instead of encoding each use as a 10-byte `movabs`
+/// (`perry-codegen/src/inprocess/nanbox_operands.rs`): NaN-box tags, masks
+/// and their negations, and the method-site word masks. Every entry needs a
+/// 64-bit immediate; the set is the head of the `movabs` census of compiled
+/// programs (Claude Code, tsc). Codegen finds an operand's entry by value,
+/// so order and length are free to change; the runtime asserts the NaN-box
+/// entries against its own constants.
+pub const NANBOX_OPERANDS: [u64; 26] = [
+    0x7FFD_0000_0000_0000, // POINTER_TAG
+    0x7FFC_0000_0000_0010, // TAG_HOLE (also METHOD_SITE_BY_NAME)
+    0xFFFF_0000_0000_0000, // TAG_MASK
+    0x7FF8_0000_0000_0000, // the canonical NaN
+    TAG_UNDEFINED,
+    TAG_UNDEFINED.wrapping_neg(),
+    0x7FFD_0000_0000_0000_u64.wrapping_neg(), // -POINTER_TAG: payload = bits - POINTER_TAG
+    0x7FFF_0000_0000_0000,                    // STRING_TAG
+    (1 << 48) - RECEIVER_HANDLE_FLOOR as u64, // pointer payload span above the handle band
+    (1 << 47) - RECEIVER_HANDLE_FLOOR as u64, // user address span above the handle band
+    0x7FF9_0000_0000_0000,                    // SHORT_STRING_TAG
+    0x7FFC_0000_0000_0004,                    // TAG_TRUE
+    (0x7FFD_0000_0000_0000 + RECEIVER_HANDLE_FLOOR as u64).wrapping_neg(), // -(POINTER_TAG + floor)
+    0xFFFF_FFFF_0000_0000,                    // the ShapeId half of an object's header word
+    !METHOD_SITE_NATIVE_ARGS,
+    METHOD_SITE_SPILL,     // bit 62, also the token bit of a static ShapeId operand
+    0xFFFD_0000_0000_0000, // collapses POINTER_TAG and STRING_TAG
+    0x7FFE_0000_0000_0000, // INT32_TAG
+    (1 << 48) - 4096,      // masks a 48-bit address down to its page
+    ((METHOD_SITE_SHAPE_ONLY_FROM as u64) << 32) - 1, // below the exotic ShapeId band
+    METHOD_SITE_FUNCTION_BAG,
+    0x7FFA_0000_0000_0000, // BIGINT_TAG
+    0x7FFC_0000_0000_0011, // TAG_TDZ
+    0x7FFC_0000_0000_0003, // TAG_FALSE
+    0x7FFC_0000_0000_0002, // TAG_NULL
+    0x7FFC_0000_0000_0000, // TAG_MARKER
+];

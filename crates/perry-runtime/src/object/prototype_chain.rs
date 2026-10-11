@@ -211,31 +211,6 @@ pub(crate) fn test_resolution_stack_enter_and_forget(owner: usize) -> bool {
 /// an object — the overwhelmingly common case.
 static OBJECT_PROTOTYPES_NONEMPTY: AtomicBool = AtomicBool::new(false);
 
-/// Latched true by the first user relink of a CLASS CHAIN link: a class
-/// declaration prototype (`Object.setPrototypeOf(C.prototype, X)`,
-/// `util.inherits`), a class constructor, or a function object. Those are the
-/// events that make a class's registered parent edges stop describing the
-/// live chain, which the class-id shortcuts (vtable, decl-proto and static
-/// walks) assume. Ordinary receivers re-pointed by `setPrototypeOf`,
-/// `__proto__` or `Object.create` do not set it: their prototype is a fact of
-/// their own shape. While it is clear, `class_decl_prototype_relinked` and the
-/// super/static relink probes answer `false` in one load; once set, they read
-/// the recorded `[[Prototype]]` of the link in question.
-static CLASS_CHAIN_RELINKED_EVER: AtomicBool = AtomicBool::new(false);
-
-/// Has any class chain link (see [`CLASS_CHAIN_RELINKED_EVER`]) ever been
-/// re-pointed by a user operation? `false` proves every class's registered
-/// parent edges still describe its live chain.
-#[inline]
-pub(crate) fn any_class_chain_relinked() -> bool {
-    CLASS_CHAIN_RELINKED_EVER.load(Ordering::Acquire)
-}
-
-/// Arm [`any_class_chain_relinked`] (`class_prototype_relinked`).
-pub(crate) fn note_class_chain_relinked() {
-    CLASS_CHAIN_RELINKED_EVER.store(true, Ordering::Release);
-}
-
 /// #10362: mark `obj_ptr`'s own header as an owner in the residual registry.
 ///
 /// Called under the registry lock and BEFORE the insert, the same discipline
@@ -463,7 +438,7 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
     // that allocation may have moved.
     let scope = crate::gc::RuntimeHandleScope::new();
     let owner_handle = scope.root_raw_mut_ptr(obj_ptr as *mut u8);
-    let prototype_handle = scope.root_heap_word_u64(proto_bits);
+    let prototype_handle = scope.root_nanbox_u64(proto_bits);
     let (prototype_serial, obj_ptr): (Option<u64>, *mut u8) =
         owner_handle.across_mut::<u8, _>(|| unsafe {
             let prototype = crate::value::JSValue::from_bits(proto_bits);
@@ -514,7 +489,7 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
         }
     }
     let obj_ptr = obj_ptr;
-    let proto_bits = prototype_handle.get_heap_word_u64();
+    let proto_bits = prototype_handle.get_nanbox_u64();
     // A per-instance prototype override invalidates class-keyed interception
     // verdicts (the overridden chain can differ from the class chain), and the
     // object itself must never satisfy a class-keyed plan again.
@@ -550,7 +525,7 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
         if let Some(obj) = meta_capable_object(obj_ptr) {
             let scope = crate::gc::RuntimeHandleScope::new();
             let obj_handle = scope.root_raw_mut_ptr(obj);
-            let proto_handle = scope.root_heap_word_u64(proto_bits);
+            let proto_handle = scope.root_nanbox_u64(proto_bits);
             // The identity reads the receiver's class and classification and
             // the prototype's serial — never this receiver's meta word — so
             // it is taken before anything allocates. A prototype with no
@@ -580,7 +555,7 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                     crate::object::object_meta_ensure(obj)
                 });
                 obj = moved;
-                let word = proto_handle.get_heap_word_u64();
+                let word = proto_handle.get_nanbox_u64();
                 (*meta).prototype = word;
                 // GC_STORE_AUDIT(BARRIERED): meta-record prototype slot store —
                 // the record is an arena allocation, so the ordinary
@@ -591,16 +566,7 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                     word,
                 );
             }
-            if user_override {
-                // A user relink of a class declaration prototype retires the
-                // class's prototype-method fast guards and arms
-                // `any_class_chain_relinked`; so does one of a class object.
-                if crate::object::class_registry::is_class_object_ptr(obj.cast()) {
-                    note_class_chain_relinked();
-                }
-                crate::object::class_registry::class_prototype_relinked(obj);
-            }
-            let proto_bits = proto_handle.get_heap_word_u64();
+            let proto_bits = proto_handle.get_nanbox_u64();
             #[cfg(feature = "shape-mint-diag")]
             if link_kind != PrototypeLinkKind::ClassDefault {
                 crate::object::shape_mint_census::note_proto_divergence(
@@ -614,11 +580,6 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
             crate::gc::runtime_shade_external_edge(proto_bits);
             return;
         }
-    }
-    if user_override {
-        // A function object (a class constructor or a plain function whose
-        // `.prototype` other chains name) re-pointed by a user operation.
-        note_class_chain_relinked();
     }
     let mut slot_addr = 0usize;
     if let Ok(mut map) = get_object_prototypes().lock() {
@@ -820,11 +781,7 @@ unsafe fn class_link_prototype(obj_ptr: usize) -> usize {
     if class_id == 0 {
         return 0;
     }
-    let declared = super::class_decl_prototype_object(class_id);
-    if !declared.is_null() {
-        return declared as usize;
-    }
-    super::class_prototype_object(class_id) as usize
+    super::class_registry::class_holder_prototype(class_id) as usize
 }
 
 /// Was this cell allocated with no prototype (`Object.create(null)`,
@@ -848,27 +805,40 @@ unsafe fn cell_is_born_null_proto(obj_ptr: usize) -> bool {
 /// shape's prototype identity is not the one its class implies — a user
 /// `setPrototypeOf`/`__proto__`, an evaluated class's prototype, runtime
 /// wiring to anything but the class's own declaration prototype. A shape
-/// read (`shapes::object_shape_identity`), not a flag. A receiver with no
-/// class surface (class id 0, a synthetic class) never needs this.
+/// read, not a flag. An explicit null edge is authoritative even without a
+/// declared class surface; otherwise a class-id-zero receiver has no class
+/// surface for its chain to replace.
 #[inline]
 pub(crate) fn object_has_individual_class_prototype(obj_ptr: usize) -> bool {
     unsafe {
         let Some(obj) = meta_capable_object(obj_ptr) else {
             return false;
         };
-        // An unlinked identity (the ShapeId says so) is the default, a
-        // class's or a per-object one: never another class's link, since a
-        // link of a class instance to anything but its own class's
-        // declaration prototype is a linked identity.
-        if !crate::object::shapes::shape_word_may_be_linked((*obj).parent_class_id) {
+        let word = (*obj).parent_class_id;
+        // Plain shapes cannot replace a class surface. Preserve this
+        // header-only admission before validating a linked ShapeId.
+        if !crate::object::shapes::shape_word_may_be_linked(word) {
             return false;
         }
-        let implied = crate::object::shapes::class_proto_id((*obj).class_id);
-        if implied == crate::object::shapes::PROTO_ID_DEFAULT {
+        let stamp = crate::object::shapes::object_shape_stamp(obj);
+        // The null identity is already encoded in the ShapeId. Read that
+        // fact before the class eligibility guard, without fetching a slab.
+        if crate::object::shapes::shape_word_kind(stamp)
+            == crate::object::shapes::SHAPE_ID_KIND_NULL
+        {
+            return true;
+        }
+        // A non-class receiver has no shared class surface to supersede.
+        // This eligibility guard does not select any default prototype.
+        if (*obj).class_id == 0 {
             return false;
         }
         let pid = crate::object::shapes::object_shape_identity(obj);
-        pid != implied && pid != crate::object::shapes::PROTO_ID_PER_OBJECT
+        // CLASS is already the selected origin, DEFAULT/serial describe
+        // ordinary chains. A MIXED identity carries a declared class plus
+        // its evaluation/override link. No registry re-derives these facts.
+        pid >= crate::object::shapes::PROTO_ID_MIXED
+            && pid != crate::object::shapes::PROTO_ID_PER_OBJECT
     }
 }
 
@@ -889,8 +859,8 @@ pub(crate) fn object_prototype_is_foreign(obj_ptr: usize) -> bool {
             return false;
         }
         // A class object's [[Prototype]] is its heritage (the parent
-        // constructor): its declared static chain. A user relink of one arms
-        // `any_class_chain_relinked`, which the static walks consult.
+        // constructor): its static chain, which the static walks read from
+        // its recorded link.
         if crate::object::class_registry::is_class_object_ptr(obj.cast()) {
             return false;
         }
@@ -1291,7 +1261,7 @@ mod tests {
 
         // "Individual" is read from the shape: a compiled class's instance
         // whose identity names anything but its class's prototype. Receivers
-        // with no class surface (class id 0) never are.
+        // with no class surface still carry an authoritative explicit null edge.
         const CLASS: u32 = 0x7A;
         let fresh = crate::object::js_object_alloc(CLASS, 0);
         assert!(!object_has_individual_class_prototype(fresh as usize));
@@ -1299,10 +1269,10 @@ mod tests {
         object_link_class_evaluation_prototype(evaluated as usize, crate::value::TAG_NULL);
         assert!(object_has_individual_class_prototype(evaluated as usize));
         assert!(unsafe { (*evaluated).meta }.is_null(), "no flag, no record");
-        assert!(!object_has_individual_class_prototype(
+        assert!(object_has_individual_class_prototype(
             class_default as usize
         ));
-        assert!(!object_has_individual_class_prototype(
+        assert!(object_has_individual_class_prototype(
             runtime_wired as usize
         ));
 
@@ -1558,3 +1528,56 @@ mod latch_drain_tests_7737 {
 #[cfg(test)]
 #[path = "proxy_reentry_tests.rs"]
 mod proxy_reentry_tests;
+
+#[cfg(test)]
+mod readpath_null_tests {
+    #[test]
+    fn nonclass_link_keeps_ordinary_reads_without_a_class_surface() {
+        use crate::object::{self, prototype_chain as chain};
+        let _no_move = crate::gc::GcSuppressScope::new();
+        let prototype = object::js_object_alloc(0, 0);
+        let receiver = object::js_object_alloc(0, 0);
+        chain::object_set_user_prototype(
+            receiver as usize,
+            crate::value::js_nanbox_pointer(prototype as i64).to_bits(),
+        );
+        assert!(!chain::object_has_individual_class_prototype(
+            receiver as usize
+        ));
+        let key = crate::string::js_string_from_bytes(b"k".as_ptr(), 1);
+        object::js_object_set_field_by_name(prototype, key, 42.0);
+        assert_eq!(
+            object::js_object_get_field_by_name(receiver, key).as_number(),
+            42.0
+        );
+        chain::object_set_user_prototype(receiver as usize, crate::value::TAG_NULL);
+        assert!(chain::object_has_individual_class_prototype(
+            receiver as usize
+        ));
+        assert!(object::js_object_get_field_by_name(receiver, key).is_undefined());
+    }
+
+    #[test]
+    fn synthetic_instance_null_edge_overrides_constructor_surface() {
+        use crate::object::{self, prototype_chain as chain};
+        let _no_move = crate::gc::GcSuppressScope::new();
+        let cid = object::class_registry::prototype_objects::alloc_synthetic_class_id();
+        let prototype = object::js_object_alloc(0, 0);
+        object::class_registry::class_prototype_object_root_store(cid, prototype);
+        let instance = object::js_object_alloc(cid, 0);
+        chain::object_link_class_default_prototype(
+            instance as usize,
+            crate::value::js_nanbox_pointer(prototype as i64).to_bits(),
+        );
+        chain::object_set_user_prototype(instance as usize, crate::value::TAG_NULL);
+        assert!(
+            chain::object_has_individual_class_prototype(instance as usize),
+            "the live null edge must be authoritative even for a synthetic class"
+        );
+        let key = crate::string::js_string_from_bytes(b"k".as_ptr(), 1);
+        unsafe {
+            object::js_object_set_field_by_name(prototype, key, 42.0);
+            assert!(object::js_object_get_field_by_name(instance, key).is_undefined());
+        }
+    }
+}

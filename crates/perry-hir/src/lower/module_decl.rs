@@ -187,7 +187,7 @@ pub(crate) fn lower_module_decl(
             // Without this, `import type { Foo }` dropped Foo's class
             // metadata before it reached compile.rs, so codegen lost the
             // method registry — `obj.method()` worked only via the
-            // CLASS_VTABLE_REGISTRY runtime fallback (#392 followup) and
+            // runtime class-prototype fallback (#392 followup) and
             // `typeof obj.method` returned `"undefined"`. Issue #446.
             native_profile_import::register_native_profile_type_imports(ctx, &source, import_decl);
             if import_decl.type_only && is_native {
@@ -624,6 +624,21 @@ pub(crate) fn lower_module_decl(
                         // #10363: `export declare const x` is erased like
                         // `export declare function`: no binding, no export.
                         if super::ambient::declarator_binds_nothing(var_decl, decl) {
+                            continue;
+                        }
+                        if lower_class_expression_declarator(
+                            ctx,
+                            module,
+                            decl,
+                            var_decl.kind != ast::VarDeclKind::Const,
+                            var_decl.kind == ast::VarDeclKind::Var,
+                        )? {
+                            let name = get_binding_name(&decl.name)?;
+                            module.exports.push(Export::Named {
+                                local: name.clone(),
+                                exported: name.clone(),
+                            });
+                            module.exported_objects.push(name);
                             continue;
                         }
                         if is_destructuring_pattern(&decl.name) {

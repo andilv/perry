@@ -27,8 +27,7 @@ fn set_stream_max_listeners(stream: f64, value: f64) -> f64 {
     let stream = scope.root_nanbox_f64(stream);
     state_set(
         stream.get_nanbox_f64(),
-        &MAX_LISTENERS_SLOT,
-        MAX_LISTENERS_KEY,
+        crate::runtime_state_key!(MAX_LISTENERS_KEY),
         value,
     );
     stream.get_nanbox_f64()
@@ -99,7 +98,7 @@ pub extern "C" fn js_node_stream_method_get_max_listeners(stream_handle: i64) ->
 
 fn stream_max_listeners(stream: f64) -> f64 {
     // node: `_maxListeners === undefined ? defaultMaxListeners : _maxListeners`.
-    let max = state_get(stream, &MAX_LISTENERS_SLOT, MAX_LISTENERS_KEY);
+    let max = state_get(stream, crate::runtime_state_key!(MAX_LISTENERS_KEY));
     if is_undefined(max) {
         default_max_listeners()
     } else {
@@ -313,6 +312,23 @@ pub extern "C" fn js_node_stream_method_listener_count(stream_handle: i64, event
     stream_listener_count_for_event(stream, event) as f64
 }
 
+/// Callback-free listener facts for a short native event name. A negative
+/// answer asks the binding to use the ordinary accessor-aware dispatch path.
+/// # Safety
+/// event is readable for len bytes; stream is live for this read.
+#[no_mangle]
+pub unsafe extern "C" fn js_node_stream_listener_count_fast(
+    stream: f64,
+    event: *const u8,
+    len: usize,
+) -> i64 {
+    let Some(event) = JSValue::try_short_string(std::slice::from_raw_parts(event, len)) else {
+        return -1;
+    };
+    listeners_of_fast(stream, f64::from_bits(event.bits()))
+        .map_or(-1, |list| listener_list_len(list) as i64)
+}
+
 pub(super) extern "C" fn ns_event_names(
     closure: *const ClosureHeader,
     this: crate::closure::JsThis,
@@ -480,13 +496,13 @@ fn get_key(target: f64, key: f64) -> f64 {
     if let Some(Some(found)) = with_string_bytes(key, |bytes| shape_get(target, bytes)) {
         return found;
     }
-    unsafe { crate::object::js_object_get_property_key(target, key) }
+    crate::runtime_state_key::read_computed(target, key)
 }
 
 /// `events[name]` for one of node's meta-event names (`newListener`,
 /// `removeListener`), answered by the shape when it can.
-fn get_event_named(events: f64, name: &[u8]) -> f64 {
-    own_get(events, 0, name).unwrap_or_else(|| get_named(events, name))
+fn get_event_named(events: f64, name: crate::runtime_state_key::NamedStateKey) -> f64 {
+    get_named(events, name)
 }
 
 /// `target[key] = value`: the full [[Set]], after the shapes had their say.
@@ -519,85 +535,12 @@ fn name_key(name: &[u8]) -> f64 {
     f64::from_bits(JSValue::string_ptr(crate::string::intern_ascii_literal(name) as *mut _).bits())
 }
 
-fn get_named(target: f64, name: &[u8]) -> f64 {
-    // An emitter's state keys are its own: the receiver's own key list
-    // answers them for a subclass instance too, which the chain lookup
-    // below refuses (so it is not tried for one).
-    match own_data_lookup(target, name) {
-        Some(Some(own)) => return own,
-        Some(None) if declared_class_instance(target) => {
-            if let Some(found) = chain_own_lookup(target, name) {
-                return found;
-            }
-        }
-        _ => {
-            if let Some(found) = shape_get(target, name) {
-                return found;
-            }
-        }
-    }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let target = scope.root_nanbox_f64(target);
-    let key = name_key(name);
-    unsafe { crate::object::js_object_get_property_key(target.get_nanbox_f64(), key) }
+fn get_named(target: f64, key: crate::runtime_state_key::NamedStateKey) -> f64 {
+    key.read_value(target)
 }
 
-fn set_named(target: f64, name: &[u8], value: f64) {
-    // An own data key is overwritten in place; an absent one is an add,
-    // which only the full `[[Set]]` may make (the chain may intercept it).
-    if shape_set_existing(target, name, value) {
-        return;
-    }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let target = scope.root_nanbox_f64(target);
-    let value = scope.root_nanbox_f64(value);
-    let key = name_key(name);
-    unsafe {
-        crate::object::js_object_set_property_key(
-            target.get_nanbox_f64(),
-            key,
-            value.get_nanbox_f64(),
-        );
-    }
-}
-
-/// `target[name]` for a key `target` lacks, walking its `[[Prototype]]`s
-/// and asking each one's own key list (`a class X extends EventEmitter`
-/// instance's `_maxListeners` lives on `EventEmitter.prototype`). `None`
-/// when some hop cannot answer by its shape (the full `[[Get]]` then runs).
-fn chain_own_lookup(target: f64, name: &[u8]) -> Option<f64> {
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let mut hop = scope.root_nanbox_f64(target);
-    for _ in 0..16 {
-        let proto = crate::object::js_object_get_prototype_of(hop.get_nanbox_f64());
-        let proto_value = JSValue::from_bits(proto.to_bits());
-        if proto_value.is_null() {
-            return Some(undefined_value());
-        }
-        if !proto_value.is_pointer() {
-            return None;
-        }
-        match own_data_lookup(proto, name)? {
-            Some(found) => return Some(found),
-            None => hop = scope.root_nanbox_f64(proto),
-        }
-    }
-    None
-}
-
-/// An instance of a declared (compiled) class: its chain is the class
-/// registry's, which the shape-chain lookup does not walk.
-fn declared_class_instance(target: f64) -> bool {
-    let jsval = JSValue::from_bits(target.to_bits());
-    if !jsval.is_pointer() {
-        return false;
-    }
-    // SAFETY: only called after `own_data_lookup` validated the receiver as
-    // a live ordinary object.
-    let class_id = unsafe { (*jsval.as_pointer::<crate::object::ObjectHeader>()).class_id };
-    class_id != 0
-        && class_id < crate::object::SYNTHETIC_CLASS_ID_BASE
-        && !crate::object::is_anon_shape_class_id(class_id)
+fn set_named(target: f64, name: crate::runtime_state_key::NamedStateKey, value: f64) {
+    name.write_value(target, value);
 }
 
 /// `target`'s OWN data property `name`, from its shape's key list alone (any
@@ -720,11 +663,14 @@ fn reset_events(target: f64) {
     if reset_events_fast(target.get_nanbox_f64(), events) {
         return;
     }
-    state_set(target.get_nanbox_f64(), &EVENTS_SLOT, EVENTS_KEY, events);
     state_set(
         target.get_nanbox_f64(),
-        &EVENTS_COUNT_SLOT,
-        EVENTS_COUNT_KEY,
+        crate::runtime_state_key!(EVENTS_KEY),
+        events,
+    );
+    state_set(
+        target.get_nanbox_f64(),
+        crate::runtime_state_key!(EVENTS_COUNT_KEY),
         0.0,
     );
 }
@@ -733,23 +679,30 @@ fn adjust_events_count(target: f64, delta: f64) -> f64 {
     // An own plain `_eventsCount` (every emitter's): read and write its slot.
     if let Some((obj, slot, flags)) = state_slot(target, &EVENTS_COUNT_SLOT, EVENTS_COUNT_KEY) {
         if flags & crate::gc::OBJ_FLAG_FROZEN == 0 {
-            // SAFETY: `state_slot` resolved the key's own inline data slot on
+            // SAFETY: `state_slot` resolved the key's own data position on
             // the live object; nothing below allocates.
-            let count = number_of(f64::from_bits(unsafe { slot_bits(obj, slot) })) + delta;
-            unsafe { crate::object::store_object_field_slot(obj, slot as usize, count.to_bits()) };
+            let count = number_of(f64::from_bits(unsafe { state_bits(obj, slot) })) + delta;
+            unsafe { state_store(obj, slot, count.to_bits()) };
             return count;
         }
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(target);
-    let count = number_of(get_named(target.get_nanbox_f64(), EVENTS_COUNT_KEY)) + delta;
-    set_named(target.get_nanbox_f64(), EVENTS_COUNT_KEY, count);
+    let count = number_of(get_named(
+        target.get_nanbox_f64(),
+        crate::runtime_state_key!(EVENTS_COUNT_KEY),
+    )) + delta;
+    set_named(
+        target.get_nanbox_f64(),
+        crate::runtime_state_key!(EVENTS_COUNT_KEY),
+        count,
+    );
     count
 }
 
 /// The receiver's `_events` when it is an object.
 fn events_of(target: f64) -> Option<f64> {
-    let events = state_get(target, &EVENTS_SLOT, EVENTS_KEY);
+    let events = state_get(target, crate::runtime_state_key!(EVENTS_KEY));
     is_object_value(events).then_some(events)
 }
 
@@ -776,11 +729,15 @@ pub(crate) fn init_event_emitter_state(target: f64) {
         }
     };
     let reset = !has_own || {
-        let events = scope.root_nanbox_f64(get_named(target.get_nanbox_f64(), EVENTS_KEY));
+        let events = scope.root_nanbox_f64(get_named(
+            target.get_nanbox_f64(),
+            crate::runtime_state_key!(EVENTS_KEY),
+        ));
         is_undefined(events.get_nanbox_f64()) || {
             let proto = crate::object::js_object_get_prototype_of(target.get_nanbox_f64());
             is_object_value(proto)
-                && get_named(proto, EVENTS_KEY).to_bits() == events.get_nanbox_f64().to_bits()
+                && get_named(proto, crate::runtime_state_key!(EVENTS_KEY)).to_bits()
+                    == events.get_nanbox_f64().to_bits()
         }
     };
     if reset {
@@ -788,8 +745,7 @@ pub(crate) fn init_event_emitter_state(target: f64) {
     }
     let max = state_get(
         target.get_nanbox_f64(),
-        &MAX_LISTENERS_SLOT,
-        MAX_LISTENERS_KEY,
+        crate::runtime_state_key!(MAX_LISTENERS_KEY),
     );
     let max = if crate::value::js_is_truthy(max) != 0 {
         max
@@ -798,8 +754,7 @@ pub(crate) fn init_event_emitter_state(target: f64) {
     };
     state_set(
         target.get_nanbox_f64(),
-        &MAX_LISTENERS_SLOT,
-        MAX_LISTENERS_KEY,
+        crate::runtime_state_key!(MAX_LISTENERS_KEY),
         max,
     );
 }
@@ -807,16 +762,28 @@ pub(crate) fn init_event_emitter_state(target: f64) {
 /// The data properties node's `EventEmitter.prototype` carries ahead of its
 /// methods: `_events: undefined`, `_eventsCount: 0`, `_maxListeners: undefined`.
 pub(crate) fn install_event_emitter_prototype_state(proto: f64) {
-    set_named(proto, EVENTS_KEY, undefined_value());
-    set_named(proto, EVENTS_COUNT_KEY, 0.0);
-    set_named(proto, MAX_LISTENERS_KEY, undefined_value());
+    set_named(
+        proto,
+        crate::runtime_state_key!(EVENTS_KEY),
+        undefined_value(),
+    );
+    set_named(proto, crate::runtime_state_key!(EVENTS_COUNT_KEY), 0.0);
+    set_named(
+        proto,
+        crate::runtime_state_key!(MAX_LISTENERS_KEY),
+        undefined_value(),
+    );
 }
 
 /// Call `target[name](...args)` with `this = target`, as node's emitter does
 /// for `this.emit('newListener', …)`, `this.removeListener(…)` and
 /// `this.removeAllListeners(…)`, so a subclass override sees those calls.
 /// `None` when the receiver has no callable `name`.
-fn call_method(target: f64, name: &[u8], args: &[f64]) -> Option<f64> {
+fn call_method(
+    target: f64,
+    name: crate::runtime_state_key::NamedStateKey,
+    args: &[f64],
+) -> Option<f64> {
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(target);
     let arg_handles = scope.root_nanbox_f64_slice(args);
@@ -836,7 +803,7 @@ fn call_method(target: f64, name: &[u8], args: &[f64]) -> Option<f64> {
 }
 
 fn emit_via_method(target: f64, args: &[f64]) {
-    if call_method(target, b"emit", args).is_none() {
+    if call_method(target, crate::runtime_state_key!(b"emit"), args).is_none() {
         if let Some((event, rest)) = args.split_first() {
             let _ = emit_stream_event(target, *event, rest);
         }
@@ -861,10 +828,11 @@ fn unwrap_listener(listener: f64) -> f64 {
 
 /// The body of node's `onceWrapper`: captures `[target, type, listener,
 /// fired]`; the first call removes the wrapper and forwards to the listener.
-extern "C" fn ns_once_wrapper(
+unsafe extern "C" fn ns_once_wrapper(
     closure: *const ClosureHeader,
     _this: crate::closure::JsThis,
-    rest: f64,
+    args: *const f64,
+    argc: usize,
 ) -> f64 {
     if closure.is_null() {
         return undefined_value();
@@ -877,20 +845,22 @@ extern "C" fn ns_once_wrapper(
     let target = scope.root_nanbox_f64(js_closure_get_capture_f64(closure, 0));
     let event = scope.root_nanbox_f64(js_closure_get_capture_f64(closure, 1));
     let listener = scope.root_nanbox_f64(js_closure_get_capture_f64(closure, 2));
-    let args = {
-        let arr = super::raw_ptr_from_value(rest) as *const crate::array::ArrayHeader;
-        let len = if arr.is_null() || !is_array_value(rest) {
-            0
-        } else {
-            crate::array::js_array_length(arr)
-        };
-        (0..len)
-            .map(|i| crate::array::js_array_get_f64(arr, i))
-            .collect::<Vec<f64>>()
+    // The native argument ABI supplies the values directly. Root before
+    // removeListener: its override may run JS and move every argument.
+    let args = if argc == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args, argc)
     };
-    let arg_handles = scope.root_nanbox_f64_slice(&args);
+    let arg_handles = RootedArgs::new(&scope, args);
     let removal = [event.get_nanbox_f64(), wrapper.get_nanbox_f64()];
-    if call_method(target.get_nanbox_f64(), b"removeListener", &removal).is_none() {
+    if call_method(
+        target.get_nanbox_f64(),
+        crate::runtime_state_key!(b"removeListener"),
+        &removal,
+    )
+    .is_none()
+    {
         remove_stream_listener_for_event(
             target.get_nanbox_f64(),
             event.get_nanbox_f64(),
@@ -899,18 +869,17 @@ extern "C" fn ns_once_wrapper(
     }
     let wrapper_ptr = super::raw_ptr_from_value(wrapper.get_nanbox_f64()) as *mut ClosureHeader;
     js_closure_set_capture_f64(wrapper_ptr, 3, f64::from_bits(super::TAG_TRUE));
-    let live_args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
     if !is_callable_value(listener.get_nanbox_f64()) {
         return undefined_value();
     }
-    unsafe {
+    arg_handles.with_live(|live_args| {
         crate::closure::native_call_value_this(
             listener.get_nanbox_f64(),
             crate::closure::JsThis::from_f64(target.get_nanbox_f64()),
             live_args.as_ptr(),
             live_args.len(),
         )
-    }
+    })
 }
 
 /// node's `_onceWrap(target, type, listener)`.
@@ -919,17 +888,22 @@ fn once_wrap(target: f64, event: f64, listener: f64) -> f64 {
     let target = scope.root_nanbox_f64(target);
     let event = scope.root_nanbox_f64(event);
     let listener = scope.root_nanbox_f64(listener);
-    let wrapper = js_closure_alloc(crate::fn_info!(ns_once_wrapper, 1; with_rest(0)), 4);
+    let wrapper = js_closure_alloc(crate::fn_info!(native_args ns_once_wrapper, 0), 4);
     js_closure_set_capture_f64(wrapper, 0, target.get_nanbox_f64());
     js_closure_set_capture_f64(wrapper, 1, event.get_nanbox_f64());
     js_closure_set_capture_f64(wrapper, 2, listener.get_nanbox_f64());
     js_closure_set_capture_f64(wrapper, 3, f64::from_bits(super::TAG_FALSE));
     let wrapper = scope.root_nanbox_f64(super::box_pointer(wrapper as *const u8));
-    set_named(
-        wrapper.get_nanbox_f64(),
-        b"listener",
-        listener.get_nanbox_f64(),
-    );
+    // `.listener` is observable through rawListeners(), so retain an ordinary
+    // function property, born at its fixed slot instead of added afterward.
+    unsafe {
+        let installed = crate::closure::props::bag_born_with_attrs(
+            super::raw_ptr_from_value(wrapper.get_nanbox_f64()),
+            &[("listener", listener.get_nanbox_f64())],
+            &[],
+        );
+        debug_assert!(installed, "a fresh once wrapper has no property bag");
+    }
     wrapper.get_nanbox_f64()
 }
 
@@ -961,6 +935,19 @@ fn add_stream_listener_for_event_with_options(
         cb.get_nanbox_f64()
     };
     let stored = scope.root_nanbox_f64(stored);
+    // A once wrapper is an ordinary callable once constructed. The same
+    // first-listener operation applies; its meta-event guard preserves the
+    // slow path's announcement of the original listener.
+    if once
+        && add_first_listener_fast(
+            target.get_nanbox_f64(),
+            event.get_nanbox_f64(),
+            stored.get_nanbox_f64(),
+        )
+    {
+        listener_added(target.get_nanbox_f64(), event.get_nanbox_f64());
+        return;
+    }
 
     let events = match events_of(target.get_nanbox_f64()) {
         None => {
@@ -968,7 +955,10 @@ fn add_stream_listener_for_event_with_options(
             events_of(target.get_nanbox_f64())
         }
         Some(events) => {
-            if !is_undefined(get_event_named(events, b"newListener")) {
+            if !is_undefined(get_event_named(
+                events,
+                crate::runtime_state_key!(b"newListener"),
+            )) {
                 let announced = if once {
                     cb.get_nanbox_f64()
                 } else {
@@ -1068,7 +1058,7 @@ fn check_listener_limit(target: f64, event: f64, list: f64) {
     if !(max > 0.0) || len <= max {
         return;
     }
-    if crate::value::js_is_truthy(get_named(list, b"warned")) != 0 {
+    if crate::value::js_is_truthy(get_named(list, crate::runtime_state_key!(b"warned"))) != 0 {
         return;
     }
     warn_listener_limit(target, event, list, len, max);
@@ -1081,13 +1071,21 @@ fn warn_listener_limit(target: f64, event: f64, list: f64, len: f64, max: f64) {
     let target = scope.root_nanbox_f64(target);
     let event = scope.root_nanbox_f64(event);
     let list = scope.root_nanbox_f64(list);
-    set_named(list.get_nanbox_f64(), b"warned", bool_value(true));
+    set_named(
+        list.get_nanbox_f64(),
+        crate::runtime_state_key!(b"warned"),
+        bool_value(true),
+    );
     let type_name = value_text(event.get_nanbox_f64());
     // node: `inspect(target, { depth: -1 })`, e.g. `[EventEmitter]`.
     let options = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
         crate::object::js_object_alloc(0, 1) as i64,
     ));
-    set_named(options.get_nanbox_f64(), b"depth", -1.0);
+    set_named(
+        options.get_nanbox_f64(),
+        crate::runtime_state_key!(b"depth"),
+        -1.0,
+    );
     let shown = value_text(crate::builtins::js_util_inspect(
         target.get_nanbox_f64(),
         options.get_nanbox_f64(),
@@ -1109,14 +1107,26 @@ fn warn_listener_limit(target: f64, event: f64, list: f64, len: f64, max: f64) {
         ))
         .bits(),
     ));
-    set_named(warning.get_nanbox_f64(), b"name", name.get_nanbox_f64());
     set_named(
         warning.get_nanbox_f64(),
-        b"emitter",
+        crate::runtime_state_key!(b"name"),
+        name.get_nanbox_f64(),
+    );
+    set_named(
+        warning.get_nanbox_f64(),
+        crate::runtime_state_key!(b"emitter"),
         target.get_nanbox_f64(),
     );
-    set_named(warning.get_nanbox_f64(), b"type", event.get_nanbox_f64());
-    set_named(warning.get_nanbox_f64(), b"count", len);
+    set_named(
+        warning.get_nanbox_f64(),
+        crate::runtime_state_key!(b"type"),
+        event.get_nanbox_f64(),
+    );
+    set_named(
+        warning.get_nanbox_f64(),
+        crate::runtime_state_key!(b"count"),
+        len,
+    );
     // node: `process.emitWarning(w)` with the Error itself, which the
     // 'warning' listeners receive as is.
     crate::process::schedule_warning(
@@ -1167,7 +1177,10 @@ fn throw_invalid_listener_type(listener: f64) -> ! {
 }
 
 fn emit_remove_listener_if_watched(target: f64, events: f64, event: f64, listener: f64) {
-    if is_undefined(get_event_named(events, b"removeListener")) {
+    if is_undefined(get_event_named(
+        events,
+        crate::runtime_state_key!(b"removeListener"),
+    )) {
         return;
     }
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -1218,7 +1231,10 @@ pub(super) fn remove_stream_listener_for_event(stream: f64, event: f64, cb: f64)
                 event.get_nanbox_f64(),
             );
             // node announces `list.listener || listener`.
-            if !is_undefined(get_event_named(events.get_nanbox_f64(), b"removeListener")) {
+            if !is_undefined(get_event_named(
+                events.get_nanbox_f64(),
+                crate::runtime_state_key!(b"removeListener"),
+            )) {
                 let announced = unwrap_listener(list.get_nanbox_f64());
                 emit_remove_listener_if_watched(
                     target.get_nanbox_f64(),
@@ -1286,7 +1302,10 @@ fn remove_all_stream_listeners_for_event(stream: f64, event: f64) {
     };
     let events = scope.root_nanbox_f64(events);
     let all = is_undefined(event.get_nanbox_f64());
-    if is_undefined(get_event_named(events.get_nanbox_f64(), b"removeListener")) {
+    if is_undefined(get_event_named(
+        events.get_nanbox_f64(),
+        crate::runtime_state_key!(b"removeListener"),
+    )) {
         if all {
             reset_events(target.get_nanbox_f64());
         } else if !is_undefined(get_key(events.get_nanbox_f64(), event.get_nanbox_f64())) {
@@ -1345,13 +1364,25 @@ fn remove_all_stream_listeners_for_event(stream: f64, event: f64) {
 }
 
 fn remove_via_method(target: f64, event: f64, listener: f64) {
-    if call_method(target, b"removeListener", &[event, listener]).is_none() {
+    if call_method(
+        target,
+        crate::runtime_state_key!(b"removeListener"),
+        &[event, listener],
+    )
+    .is_none()
+    {
         remove_stream_listener_for_event(target, event, listener);
     }
 }
 
 fn remove_all_via_method(target: f64, event: f64) {
-    if call_method(target, b"removeAllListeners", &[event]).is_none() {
+    if call_method(
+        target,
+        crate::runtime_state_key!(b"removeAllListeners"),
+        &[event],
+    )
+    .is_none()
+    {
         remove_all_stream_listeners_for_event(target, event);
     }
 }
@@ -1411,8 +1442,7 @@ fn stream_event_names_array(stream: f64) -> *mut crate::array::ArrayHeader {
     let target = scope.root_nanbox_f64(stream);
     let count = number_of(state_get(
         target.get_nanbox_f64(),
-        &EVENTS_COUNT_SLOT,
-        EVENTS_COUNT_KEY,
+        crate::runtime_state_key!(EVENTS_COUNT_KEY),
     ));
     match events_of(target.get_nanbox_f64()) {
         Some(events) if count > 0.0 => {
@@ -1533,7 +1563,7 @@ pub(crate) fn init_event_emitter_capture(target: f64, options: f64) {
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(target);
-    let value = get_named(options, b"captureRejections");
+    let value = get_named(options, crate::runtime_state_key!(b"captureRejections"));
     if crate::value::js_is_truthy(value) == 0 {
         return;
     }
@@ -1624,7 +1654,7 @@ pub(super) fn has_stream_listeners(stream: f64, event: f64) -> bool {
 /// [`INLINE_ARGS`] are held without a heap allocation.
 const INLINE_ARGS: usize = 4;
 
-enum RootedArgs<'scope> {
+pub(crate) enum RootedArgs<'scope> {
     Inline(
         [Option<crate::gc::RuntimeHandle<'scope>>; INLINE_ARGS],
         usize,
@@ -1633,7 +1663,7 @@ enum RootedArgs<'scope> {
 }
 
 impl<'scope> RootedArgs<'scope> {
-    fn new(scope: &'scope crate::gc::RuntimeHandleScope, args: &[f64]) -> Self {
+    pub(crate) fn new(scope: &'scope crate::gc::RuntimeHandleScope, args: &[f64]) -> Self {
         if args.len() > INLINE_ARGS {
             return RootedArgs::Heap(scope.root_nanbox_f64_slice(args));
         }
@@ -1645,7 +1675,7 @@ impl<'scope> RootedArgs<'scope> {
     }
 
     /// The arguments as they are now (a collection may have moved them).
-    fn with_live<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
+    pub(crate) fn with_live<R>(&self, f: impl FnOnce(&[f64]) -> R) -> R {
         match self {
             RootedArgs::Inline(handles, len) => {
                 let mut live = [0f64; INLINE_ARGS];
@@ -1671,6 +1701,18 @@ pub(super) fn emit_stream_event(stream: f64, event: f64, args: &[f64]) -> f64 {
     let event_h = scope.root_nanbox_f64(event);
     let arg_handles = RootedArgs::new(&scope, args);
 
+    emit_stream_event_rooted(&scope, &stream_h, &event_h, &arg_handles)
+}
+
+/// Native events share their dispatch roots with the async-provider boundary.
+pub(crate) fn emit_stream_event_rooted(
+    scope: &crate::gc::RuntimeHandleScope,
+    stream_h: &crate::gc::RuntimeHandle<'_>,
+    event_h: &crate::gc::RuntimeHandle<'_>,
+    arg_handles: &RootedArgs<'_>,
+) -> f64 {
+    let stream = stream_h.get_nanbox_f64();
+    let event = event_h.get_nanbox_f64();
     let is_error = super::string_value_eq(event, b"error");
     if !is_error {
         // The shapes' answer for `this._events[type]`: no listener, or one.
@@ -1680,14 +1722,14 @@ pub(super) fn emit_stream_event(stream: f64, event: f64, args: &[f64]) -> f64 {
             }
             if is_callable_value(handler) {
                 let handler = scope.root_nanbox_f64(handler);
-                dispatch_listener(&stream_h, &event_h, &arg_handles, &handler, false);
+                dispatch_listener(stream_h, event_h, arg_handles, &handler, false);
                 return f64::from_bits(super::TAG_TRUE);
             }
         }
     }
     if is_error {
-        if let Some(first) = args.first() {
-            let first = scope.root_nanbox_f64(*first);
+        if let Some(first) = arg_handles.with_live(|args| args.first().copied()) {
+            let first = scope.root_nanbox_f64(first);
             let key = super::hidden_error_key();
             super::set_hidden_value(stream_h.get_nanbox_f64(), key, first.get_nanbox_f64());
             super::refresh_readable_aborted_flag(stream_h.get_nanbox_f64());
@@ -1701,12 +1743,15 @@ pub(super) fn emit_stream_event(stream: f64, event: f64, args: &[f64]) -> f64 {
                 let found = scope.root_nanbox_f64(found);
                 let monitor = error_monitor_event();
                 if !is_undefined(get_key(found.get_nanbox_f64(), monitor)) {
-                    let mut monitor_args = Vec::with_capacity(args.len() + 1);
+                    let mut monitor_args = Vec::new();
                     monitor_args.push(monitor);
                     arg_handles.with_live(|live| monitor_args.extend_from_slice(live));
                     emit_via_method(stream_h.get_nanbox_f64(), &monitor_args);
                 }
-                unhandled_error = is_undefined(get_event_named(found.get_nanbox_f64(), b"error"));
+                unhandled_error = is_undefined(get_event_named(
+                    found.get_nanbox_f64(),
+                    crate::runtime_state_key!(b"error"),
+                ));
                 // A monitor listener may have replaced `_events`.
                 events = events_of(stream_h.get_nanbox_f64());
             }
@@ -1732,7 +1777,7 @@ pub(super) fn emit_stream_event(stream: f64, event: f64, args: &[f64]) -> f64 {
     if is_callable_value(handler) {
         // One listener: nothing to snapshot.
         let handler = scope.root_nanbox_f64(handler);
-        dispatch_listener(&stream_h, &event_h, &arg_handles, &handler, is_error);
+        dispatch_listener(stream_h, event_h, arg_handles, &handler, is_error);
         return f64::from_bits(super::TAG_TRUE);
     }
     // node clones the array before dispatch, so listeners added or removed
@@ -1747,7 +1792,7 @@ pub(super) fn emit_stream_event(stream: f64, event: f64, args: &[f64]) -> f64 {
     };
     let listener_handles = scope.root_nanbox_f64_slice(&listener_values);
     for handle in &listener_handles {
-        dispatch_listener(&stream_h, &event_h, &arg_handles, handle, is_error);
+        dispatch_listener(stream_h, event_h, arg_handles, handle, is_error);
     }
     f64::from_bits(super::TAG_TRUE)
 }
@@ -1796,7 +1841,10 @@ fn dispatch_listener(
 fn emit_unhandled_error_to_domain(target: f64, error: Option<f64>) -> bool {
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(target);
-    let domain = get_named(target.get_nanbox_f64(), b"domain");
+    let domain = get_named(
+        target.get_nanbox_f64(),
+        crate::runtime_state_key!(b"domain"),
+    );
     let domain_value = JSValue::from_bits(domain.to_bits());
     if domain_value.is_undefined() || domain_value.is_null() || !domain_value.is_pointer() {
         return false;
@@ -1825,15 +1873,9 @@ fn emit_unhandled_error_to_domain(target: f64, error: Option<f64>) -> bool {
         }
     }
     let args = [name_key(b"error"), error.get_nanbox_f64()];
-    let method = b"emit";
+    let method = crate::runtime_state_key!(b"emit");
     unsafe {
-        crate::object::js_native_call_method(
-            domain.get_nanbox_f64(),
-            method.as_ptr() as *const i8,
-            method.len(),
-            args.as_ptr(),
-            args.len(),
-        );
+        method.call_value(domain.get_nanbox_f64(), args.as_ptr(), args.len());
     }
     true
 }

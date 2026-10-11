@@ -97,6 +97,50 @@ fn direct_literal_test_constructs_data_site_and_uses_generic_method_call() {
     assert_generic(&ir);
 }
 
+/// A literal evaluation is one call to the shared runtime entry, whose birth
+/// is the runtime's ordinary RegExp birth: the site emits no birth sequence
+/// (no inline arena bump, no birth seed) and pays only the call and its
+/// operands.
+#[test]
+fn literal_site_is_one_call_to_the_shared_birth_entry() {
+    let ir = compile(vec![function(
+        1,
+        "fresh",
+        Vec::new(),
+        vec![Stmt::Return(Some(Expr::RegExp {
+            pattern: "x".into(),
+            flags: "".into(),
+        }))],
+        Type::Any,
+    )]);
+    // The function's own body: the module's init and entry may allocate.
+    let start = ir
+        .lines()
+        .position(|l| l.starts_with("define") && l.contains("fresh"))
+        .expect("the literal's function");
+    let body = ir
+        .lines()
+        .skip(start)
+        .take_while(|l| *l != "}")
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        body.matches("call i64 @js_regexp_literal(").count(),
+        1,
+        "{ir}"
+    );
+    for inline in [
+        // A function prologue may initialize its arena state independently
+        // of this literal. The allocation itself must stay in the shared
+        // helper, including the object header write and birth seed.
+        "store <2 x i64>",
+        "js_gc_note_black_birth",
+        "PERRY_METHOD_SITE_WORKERS_PRESENT",
+    ] {
+        assert!(!body.contains(inline), "{inline} in a literal site: {ir}");
+    }
+}
+
 #[test]
 fn factory_test_uses_generic_method_call() {
     let factory = function(

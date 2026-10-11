@@ -1046,6 +1046,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3772,6 +3781,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libz-ng-sys"
+version = "1.1.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879917b256f6317769b9f374b435805a8697013098aacce5a38ac106cd6a9469"
+dependencies = [
+ "cmake",
+ "libc",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4520,6 +4539,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "openssl-src"
+version = "300.6.1+3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "openssl-sys"
+version = "0.9.117"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
+dependencies = [
+ "cc",
+ "libc",
+ "openssl-src",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4784,9 +4825,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perex"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86d57d56f880b3ce759f0423b632c7522e5faa05227b8785154797e749fdc9eb"
+checksum = "cce9fa3a84ee8c8c49873b937167a284f5446a67ace8eeac986bf9a97592f01e"
 
 [[package]]
 name = "perry"
@@ -5116,7 +5157,6 @@ dependencies = [
 name = "perry-ext-net"
 version = "0.5.1659"
 dependencies = [
- "bytes",
  "perry-ffi",
  "perry-runtime",
  "rustls",
@@ -5208,6 +5248,7 @@ dependencies = [
 name = "perry-ext-ws"
 version = "0.5.1659"
 dependencies = [
+ "perry-ext-net",
  "perry-ffi",
  "perry-http-server",
  "perry-runtime",
@@ -5225,6 +5266,7 @@ dependencies = [
  "adler2",
  "brotli 9.0.0",
  "flate2",
+ "libz-ng-sys",
  "miniz_oxide 0.9.1",
  "perry-ffi",
  "perry-runtime",
@@ -5339,6 +5381,8 @@ dependencies = [
  "mimalloc",
  "node-semver",
  "notify",
+ "num-bigint",
+ "num-traits",
  "perex",
  "perry-abi",
  "perry-base64",
@@ -5408,6 +5452,7 @@ dependencies = [
  "libc",
  "md-5 0.11.0",
  "ml-kem",
+ "openssl-sys",
  "p256",
  "p384",
  "p521",

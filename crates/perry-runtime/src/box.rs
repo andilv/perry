@@ -133,7 +133,12 @@ fn is_registered_bool_box_ptr(ptr: *mut BoolBox) -> bool {
 
 /// Thread serialization unwraps an explicitly captured mutable cell.
 pub fn box_slot_contents_bits(bits: u64) -> Option<u64> {
-    let ptr = bits as usize as *mut Box;
+    let addr = if bits & crate::value::TAG_MASK == crate::value::POINTER_TAG {
+        bits & crate::value::POINTER_MASK
+    } else {
+        bits
+    };
+    let ptr = addr as usize as *mut Box;
     is_registered_box_ptr(ptr).then(|| unsafe { (*ptr).value })
 }
 
@@ -211,23 +216,34 @@ fn box_get_bits_named(ptr: *mut Box, name: f64) -> i64 {
     }
 }
 
-/// Immutable fallback for a missing capture. Generated code must root every
-/// real cell address across collection points; the fallback itself never moves.
-static BOX_CAPTURE_UNDEFINED_CELL: Box = Box {
-    value: crate::value::TAG_UNDEFINED,
-};
+/// True when `bits` is a live capture cell: a JSValue, i32 or bool box, or a
+/// scope object. A closure's cell capture slot holds one from birth on.
+pub fn is_live_capture_cell(bits: u64) -> bool {
+    let addr = (bits & crate::value::POINTER_MASK) as usize;
+    has_box_type(addr, crate::gc::GC_TYPE_BOX)
+        || has_box_type(addr, crate::gc::GC_TYPE_I32_BOX)
+        || has_box_type(addr, crate::gc::GC_TYPE_BOOL_BOX)
+        || crate::r#box::scope::is_scope_ptr(addr as u64)
+}
 
-/// Resolve a live GC box or the immutable undefined fallback. The returned
-/// address must be rooted/reloaded across a collection point.
+/// The birth check codegen emits under `PERRY_ASSERT_CAPTURE_CELLS=1` for each
+/// cell word a closure is born with. A word that is not a live cell means a
+/// birth path skipped the cell rule; abort at the birth, not at some later
+/// read through the slot.
 #[no_mangle]
-pub extern "C" fn js_box_capture_cell_ptr(bits: i64) -> i64 {
-    let ptr = bits as usize as *mut Box;
-    if is_registered_box_ptr(ptr) {
-        bits
-    } else {
-        &BOX_CAPTURE_UNDEFINED_CELL as *const Box as i64
+pub extern "C" fn js_capture_cell_assert(bits: i64) {
+    if !is_live_capture_cell(bits as u64) {
+        eprintln!(
+            "[PERRY FATAL] closure born with a capture slot that is not a cell: {:#x}",
+            bits as u64
+        );
+        std::process::abort();
     }
 }
+
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_JS_CAPTURE_CELL_ASSERT: extern "C" fn(i64) = js_capture_cell_assert;
 
 #[no_mangle]
 pub unsafe extern "C" fn js_box_get_bits_trusted(ptr: *mut Box) -> i64 {

@@ -9,7 +9,6 @@ use crate::arena::arena_alloc_gc;
 use crate::ArrayHeader;
 use crate::JSValue;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -57,12 +56,14 @@ pub(crate) mod alloc_plain;
 mod assign;
 pub use alloc::{
     js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent,
-    js_object_alloc_null_proto, js_object_alloc_with_parent, js_object_coerce,
+    js_object_alloc_null_proto, js_object_alloc_plain, js_object_alloc_with_parent,
+    js_object_coerce,
 };
 #[cfg(feature = "regex-engine")]
 pub(crate) use alloc_basic::object_alloc_plain_born;
 pub(crate) use alloc_basic::{
-    object_alloc_born, object_alloc_filled_birth, object_alloc_plain, object_alloc_unpublished,
+    object_alloc_born, object_alloc_branded, object_alloc_filled_birth, object_alloc_plain,
+    object_alloc_unpublished,
 };
 #[allow(unused_imports)]
 pub(crate) use alloc_plain::mark_object_plain_ordinary;
@@ -89,6 +90,8 @@ mod class_gc_roots;
 mod class_handles;
 pub mod class_image;
 mod class_registry;
+/// A perry/thread worker realm inheriting its spawner's class evaluations.
+pub(crate) use class_registry::inherited_evaluation;
 mod class_super_chain;
 pub(crate) mod class_value;
 #[cfg(test)]
@@ -98,7 +101,9 @@ pub(crate) use class_registry::async_resource_prototype_value;
 pub(crate) use class_registry::class_registry_census;
 #[cfg(feature = "regex-engine")]
 pub(crate) use class_registry::construct_two_rooted;
-pub(crate) use class_registry::{construct_rooted_arguments, scan_current_new_target_root_mut};
+pub(crate) use class_registry::{
+    construct_rooted_arguments, scan_current_new_target_root_mut, ClassDeclarationValueKind,
+};
 pub(crate) mod accessor_pair;
 #[cfg(feature = "attr-census")]
 pub(crate) mod attr_census;
@@ -139,6 +144,7 @@ pub(crate) use global_fetch::scan_pending_fetch_signal_root_mut;
 /// the GC contract.
 pub(crate) mod chain_store;
 mod global_this;
+pub(crate) mod shape_chain;
 #[cfg(feature = "dyn-eval")]
 pub(crate) use global_this::install_dyn_eval;
 #[cfg(feature = "temporal")]
@@ -194,15 +200,15 @@ pub mod method_site;
 mod slot_store;
 pub(crate) use slot_store::{store_object_field_slot, store_object_field_slot_layout_deferred};
 mod namespace_create;
-mod native_call_method;
+pub(crate) mod native_call_method;
 pub(crate) mod native_get;
 // `pub(crate)` since #340/#341: a family that owns its prototypes outside this
 // module (`timer.rs`) installs their method names and `.length` through here.
 pub(crate) mod native_module;
 mod nm_namespace_hooks;
-pub(crate) use native_module::class_instance_has_member;
 pub(crate) use native_module::class_ref_id;
 pub(crate) use native_module::install_native_module_vtable;
+pub(crate) use native_module::{class_instance_has_method, class_method_value_target};
 pub(crate) use native_module::{
     class_method_entry_source_func_ptr, class_prototype_ref_id, SYMBOL_BOUND_METHOD_NAME,
 };
@@ -217,7 +223,7 @@ pub(crate) use native_module_registry::nm_ctor_lookup;
 // (`fs/promises` → `fs.constants`, `sys` → `util`).
 pub(crate) use native_module_registry::{
     js_install_global_value_surfaces, js_nm_install_events, js_nm_install_fs, js_nm_install_module,
-    js_nm_install_perf, js_nm_install_readline, js_nm_install_util,
+    js_nm_install_perf, js_nm_install_readline, js_nm_install_tls, js_nm_install_util,
 };
 mod literal_constructor;
 mod native_module_stream;
@@ -257,6 +263,8 @@ mod reserved_floor;
 pub(crate) use reserved_floor::{
     ensure_reserved_floor_keys, reserved_slot_floor_for_class_id, reserved_slot_floor_for_object,
 };
+#[cfg(all(test, feature = "regex-engine"))]
+mod regex_direct_test_tests;
 pub(crate) mod regex_proto_thunks;
 #[cfg(feature = "regex-engine")]
 pub(crate) mod regex_read_sites;
@@ -322,8 +330,9 @@ pub(crate) use global_this_tables::*;
 pub use groupby::*;
 pub use instanceof::*;
 pub(crate) use iterator_prototypes::{
-    attach_iterator_prototype, call_overridden_iterator_next, iterator_prototype_for_class_id,
-    iterator_step_is_builtin, iterator_step_method_is_builtin,
+    attach_iterator_prototype, call_overridden_iterator_next, ensure_iterator_prototypes,
+    iterator_prototype_for_class_id, iterator_prototypes_materialized, iterator_step_is_builtin,
+    iterator_step_method_is_builtin,
 };
 pub use namespace_create::*;
 pub use native_call_method::*;
@@ -574,10 +583,6 @@ pub fn global_this_root_slot_for_test() -> i64 {
 //
 // This handles cases like Object.assign() adding many fields to an object
 // that was allocated with only 8 slots (e.g., @noble/curves Fp field with 21 properties).
-crate::perry_thread_local! {
-    static CLASS_PROTOTYPE_METHOD_VALUES: RefCell<HashMap<(u32, String), u64>> =
-        RefCell::new(HashMap::new());
-}
 
 /// #6759 Phase A: object field-storage side tables and the shape/transition
 /// caches, grouped as the `object_hot` field of
@@ -602,12 +607,6 @@ pub(crate) struct ObjectHotTables {
     /// and keys_array == null.
     pub(crate) shape_inline_cache:
         std::cell::UnsafeCell<[ShapeCacheEntry; SHAPE_INLINE_CACHE_SIZE]>,
-    /// Pointer-free direct cache for immutable ShapeId object-kind facts.
-    /// ShapeIds are monotone and never reused; descriptor retirement clears a
-    /// matching entry. Keeping this beside the other per-agent shape tables
-    /// avoids borrowing the descriptor HashMap on repeated regular-object
-    /// checks (notably homogeneous Array element stores).
-    pub(crate) shape_kind_cache: std::cell::UnsafeCell<Box<[u64]>>,
     /// Overflow map for shape_ids that collide in the inline cache. Values
     /// are `(keys_array, runtime_shape_id, key_count)` — see
     /// [`ShapeCacheEntry`].
@@ -691,9 +690,6 @@ impl ObjectHotTables {
                     key_count: 0,
                     keys_array: std::ptr::null_mut(),
                 }; SHAPE_INLINE_CACHE_SIZE],
-            ),
-            shape_kind_cache: std::cell::UnsafeCell::new(
-                vec![0; shapes::SHAPE_KIND_CACHE_SIZE].into_boxed_slice(),
             ),
             shape_cache_overflow: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
             class_keys_by_id: RefCell::new(crate::fast_hash::new_ptr_hash_map()),
@@ -1781,6 +1777,7 @@ pub(crate) unsafe fn object_keys_and_live_slots(
 }
 
 pub(crate) mod meta_flags;
+pub(crate) use meta_flags::OBJECT_META_FLAG_NATIVE_ALIAS;
 pub(crate) use meta_flags::{OBJECT_META_FLAG_EXOTIC_READ_RECEIVER, OBJECT_META_FLAG_IS_PROTOTYPE};
 
 pub(crate) mod meta_record;
@@ -1952,47 +1949,10 @@ mod wide_field_read_tests;
 #[cfg(test)]
 mod wide_object_membership_tests;
 
-/// The key names in a compiler-packed key list. Codegen writes every name
-/// followed by a NUL (`codegen/mod.rs`, `expr/object_literal.rs`,
-/// `lower_call/new_alloc.rs`), so the names are the segments between the
-/// terminators, and an empty segment is a name: the key `""`. Only the empty
-/// segment after the final terminator is dropped.
-///
-/// Every reader used to drop ALL empty segments, so `{ "": v }` built a keys
-/// array shorter than its count and the shape mint refused the facts (an
-/// abort at the literal), and two modules' `{ "": v }` -- equal contents under
-/// one static ShapeId -- each built their own empty array, so the second
-/// module's static mint was refused (OpenCode's TUI: json5's reviver holder
-/// `{ "": root }`).
-pub(crate) fn packed_key_names(bytes: &[u8]) -> Vec<&[u8]> {
-    let mut names: Vec<&[u8]> = bytes.split(|&b| b == 0).collect();
-    if names.last().is_some_and(|s| s.is_empty()) {
-        names.pop();
-    }
-    names
-}
+mod packed_keys;
+pub(crate) use packed_keys::packed_key_names;
 
-#[cfg(test)]
-mod packed_key_names_tests {
-    use super::packed_key_names;
-
-    #[test]
-    fn the_empty_key_is_a_name_and_only_the_final_terminator_is_dropped() {
-        let names =
-            |b: &[u8]| -> Vec<Vec<u8>> { packed_key_names(b).iter().map(|s| s.to_vec()).collect() };
-        assert_eq!(names(b"a\0b\0"), vec![b"a".to_vec(), b"b".to_vec()]);
-        assert_eq!(
-            names(b"\0"),
-            vec![b"".to_vec()],
-            "{{ \"\": v }} has one key"
-        );
-        assert_eq!(names(b"\0a\0"), vec![b"".to_vec(), b"a".to_vec()]);
-        assert_eq!(names(b"a\0\0"), vec![b"a".to_vec(), b"".to_vec()]);
-        assert_eq!(
-            names(b"a\0b"),
-            vec![b"a".to_vec(), b"b".to_vec()],
-            "an unterminated last name"
-        );
-        assert!(names(b"").is_empty());
-    }
-}
+pub(crate) use iterator_prototypes::array_record_close_is_absent;
+pub(crate) use iterator_prototypes::{
+    array_iterator_next_is_intrinsic, array_iterator_prototype_addr, shape_member_body_is,
+};

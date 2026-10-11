@@ -9,7 +9,7 @@ crate::perry_thread_local! {
     /// through it returns `undefined`, or worse derefs an invalid header. Caching
     /// the global per thread means we only ever hand back a global this thread
     /// created, and never dereference another thread's pointer to "validate" it.
-    static THREAD_GLOBAL_THIS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    static THREAD_GLOBAL_THIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -53,7 +53,7 @@ pub extern "C" fn js_module_top_this() -> f64 {
     THREAD_MODULE_TOP_THIS.with(|c| c.set(val.to_bits()));
     // Keep it alive across GCs — the cell is a raw bits cache, not a scanned
     // root, so register the slot address as a global root once.
-    crate::gc::runtime_write_barrier_root_heap_word(obj as u64);
+    crate::gc::runtime_write_barrier_root_raw_ptr(obj as *const u8);
     let slot = THREAD_MODULE_TOP_THIS.with(|c| c.as_ptr() as usize);
     crate::gc::js_gc_register_global_root(slot as i64);
     val
@@ -90,7 +90,9 @@ pub(crate) fn global_this_is_materialized() -> bool {
 /// `vm` context or an eval realm that `populate_global_this_builtins` also
 /// fills (each of those gets its own intrinsics).
 pub(crate) fn is_thread_realm_global(obj: *mut ObjectHeader) -> bool {
-    !obj.is_null() && THREAD_GLOBAL_THIS.with(|c| c.get()) == obj as i64
+    !obj.is_null()
+        && THREAD_GLOBAL_THIS.with(|c| c.get())
+            == crate::value::js_nanbox_pointer(obj as i64).to_bits()
 }
 
 /// Issue #611: lazily allocate `globalThis` for computed global access.
@@ -98,7 +100,7 @@ pub(crate) fn is_thread_realm_global(obj: *mut ObjectHeader) -> bool {
 pub extern "C" fn js_get_global_this() -> f64 {
     let mine = THREAD_GLOBAL_THIS.with(|c| c.get());
     if mine != 0 {
-        return crate::value::js_nanbox_pointer(mine);
+        return f64::from_bits(mine);
     }
     // Register this thread's GC root scanners before the global exists, so the
     // global (and the `Array`/`Object` intrinsics it holds) is born under a live
@@ -113,20 +115,13 @@ pub extern "C" fn js_get_global_this() -> f64 {
     }
     // First access on this thread — allocate our own global.
     let new_ptr = js_object_alloc(0, 0) as i64;
-    THREAD_GLOBAL_THIS.with(|c| c.set(new_ptr));
-    // The thread-local cache above stores a *raw* heap pointer. Unlike
-    // `GLOBAL_THIS_PTR` (a scanned static that `scan_object_cache_roots_mut`
-    // relocates), this cache slot is otherwise invisible to the GC, so a
-    // copying collection that evacuates `globalThis` leaves the cache pointing
-    // at the stale from-space address. Later `js_get_global_this()` calls then
-    // read a dead object whose overflow fields (e.g. `globalThis.Error`) have
-    // already been rekeyed to the moved copy — the reads return `undefined`.
-    // Register the cache slot as a mutable global root (mirroring
-    // `js_module_top_this`) so the collector rewrites it to the forwarding
-    // address on every move; bare-pointer slots are handled by
-    // `mark_mutable_root_bits` / `rewrite_value_bits` (both decode through
-    // `gc::root_words::decode_root_word`).
-    crate::gc::runtime_write_barrier_root_heap_word(new_ptr as u64);
+    THREAD_GLOBAL_THIS.with(|c| c.set(crate::value::js_nanbox_pointer(new_ptr).to_bits()));
+    // The thread-local cache stores the tagged JSValue, independently of
+    // GLOBAL_THIS_PTR's raw pointer field. Register its writable word so marking
+    // uses that encoding and every copying collection rewrites the cache too.
+    // Otherwise later js_get_global_this() calls could read the from-space
+    // object after its overflow fields were rekeyed to the moved copy.
+    crate::gc::runtime_write_barrier_root_raw_ptr(new_ptr as *const u8);
     let cache_slot = THREAD_GLOBAL_THIS.with(|c| c.as_ptr() as usize);
     crate::gc::js_gc_register_global_root(cache_slot as i64);
     // Publish to the process-global GC-root slot so this thread's collector marks
@@ -147,7 +142,11 @@ pub extern "C" fn js_get_global_this() -> f64 {
     // likewise rewritten by `scan_object_cache_roots_mut`.) Falling back to
     // `new_ptr` keeps the pre-existing behaviour if the cache was cleared.
     let current = THREAD_GLOBAL_THIS.with(|c| c.get());
-    crate::value::js_nanbox_pointer(if current != 0 { current } else { new_ptr })
+    if current != 0 {
+        f64::from_bits(current)
+    } else {
+        crate::value::js_nanbox_pointer(new_ptr)
+    }
 }
 
 #[no_mangle]
@@ -662,22 +661,102 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
             b"Super constructor null is not a constructor",
         );
     }
-    // Resolve the parent to a bound native-module export VALUE, independent
-    // of how the heritage expression reached it: a bare import, a local
-    // alias, a namespace member, and a CJS destructured `require()` all
-    // produce the identical bound-closure representation (see
-    // `bound_native_callable_module_and_method`), even though only the bare
-    // import shape is recognized statically at HIR-lowering time.
-    let bound_native_parent = super::super::native_module::bound_native_callable_module_and_method(
-        parent_val,
-    )
-    .or_else(|| {
-        let obj = subclass_this_object_ptr(this_box)?;
-        let cid = crate::object::js_object_get_class_id(obj);
-        super::super::native_module::bound_native_callable_module_and_method(
-            crate::object::class_registry::js_get_dynamic_parent_value(cid),
-        )
-    });
+    // A dynamic parent that resolved to a ClassRef (INT32-tagged) is a
+    // real registered Perry class — `class X extends _mod.default`
+    // where the default export is a user class (Next.js
+    // `NextNodeServer extends base-server`'s default `Server`). A
+    // ClassRef is NaN-tagged, so `js_native_call_value` below would
+    // early-return `undefined` (it treats NaN as not callable) and the
+    // base constructor would never run — parent `this.<field> = …`
+    // writes (e.g. `this.nextConfig = opts`) would be lost. Invoke the
+    // class constructor directly on `this` instead.
+    if let Some(parent_cid) = crate::object::class_value::class_value_id(parent_val) {
+        if let Some(obj) = subclass_this_object_ptr(this_box) {
+            return super::super::class_constructors::run_class_constructor_on_this_flat(
+                parent_cid, obj as i64, args_ptr, args_len,
+            );
+        }
+        // A ClassRef is NaN-tagged and is NEVER callable via
+        // `js_native_call_value` (it early-returns `undefined`). Return
+        // here unconditionally — whether or not a constructor was found
+        // and run — instead of falling through to the closure-dispatch
+        // path below, which would (a) silently produce `undefined` and
+        // (b) skip the `parent_closure_in_chain` recovery that only
+        // applies to closure/object parents, not a ClassRef.
+        return undef;
+    }
+    // #6530: the parent can be a per-evaluation CLASS OBJECT — what a
+    // capture-carrying class statement materializes as (bundled zod's
+    // `class ZodEffects extends ZodType` where ZodType captures module
+    // helpers, registered via `js_register_class_parent_dynamic`).
+    // Dispatching it through `js_native_call_value` below hits that
+    // helper's class-object arm, which CONSTRUCTS a fresh parent
+    // instance — and this super leg drops the result, so the parent
+    // constructor never ran on `this` and every base-ctor field
+    // (zod's `_def`, the bound methods) stayed undefined. Route
+    // through the same flat constructor-on-`this` dispatch as the
+    // ClassRef arm above, using the template class id stamped on the
+    // class object at `js_object_alloc` time.
+    if super::super::class_registry::is_class_object_value(parent_val) {
+        let p = (parent_val.to_bits() & crate::value::POINTER_MASK) as usize;
+        if super::super::class_registry::is_class_object_ptr(p as *const u8) {
+            let parent_cid =
+                crate::object::js_object_get_class_id(p as *const crate::object::ObjectHeader);
+            if parent_cid != 0 {
+                if let Some(obj) = subclass_this_object_ptr(this_box) {
+                    // A fresh class object's constructor environment
+                    // is per evaluation. Replaying by class id alone
+                    // consults the template-wide declaration snapshot
+                    // and drops captured values such as a factory's
+                    // `tag`. Use the class-object replay path so this
+                    // exact parent's `__perry_ctor_caps` supplies its
+                    // synthesized capture params.
+                    return super::super::class_constructors::replay_class_object_constructor(
+                        parent_val, parent_cid, obj, args_ptr, args_len,
+                    );
+                }
+            }
+            return undef;
+        }
+    }
+
+    // Resolve each candidate once. Ordinary parents must not pay a second
+    // closure/header probe or repeat the dynamic-parent registry lookup just
+    // because native net constructors now carry an immutable class fact.
+    let native_parent =
+        super::super::native_module::bound_native_parent(parent_val).or_else(|| {
+            let obj = subclass_this_object_ptr(this_box)?;
+            super::super::native_module::bound_native_parent(
+                crate::object::class_registry::js_get_dynamic_parent_value(
+                    crate::object::js_object_get_class_id(obj),
+                ),
+            )
+        });
+    let bound_native_parent = match native_parent {
+        Some(super::super::native_module::BoundNativeParent::NativeClass(class)) => {
+            let options = if args_len > 0 && !args_ptr.is_null() {
+                *args_ptr
+            } else {
+                undef
+            };
+            let callback = if args_len > 1 && !args_ptr.is_null() {
+                *args_ptr.add(1)
+            } else {
+                undef
+            };
+            super::super::native_module_dispatch::js_net_subclass_init(
+                this_box,
+                options,
+                callback,
+                u32::from(class == crate::native_class_ids::NET_SERVER),
+            );
+            return undef;
+        }
+        Some(super::super::native_module::BoundNativeParent::Export(module, method)) => {
+            Some((module, method))
+        }
+        None => None,
+    };
     if bound_native_parent
         .as_ref()
         .is_some_and(|(module, method)| {
@@ -1109,65 +1188,6 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
             const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
             const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
             const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
-            // A dynamic parent that resolved to a ClassRef (INT32-tagged) is a
-            // real registered Perry class — `class X extends _mod.default`
-            // where the default export is a user class (Next.js
-            // `NextNodeServer extends base-server`'s default `Server`). A
-            // ClassRef is NaN-tagged, so `js_native_call_value` below would
-            // early-return `undefined` (it treats NaN as not callable) and the
-            // base constructor would never run — parent `this.<field> = …`
-            // writes (e.g. `this.nextConfig = opts`) would be lost. Invoke the
-            // class constructor directly on `this` instead.
-            if let Some(parent_cid) = crate::object::class_value::class_value_id(parent_val) {
-                if let Some(obj) = subclass_this_object_ptr(this_box) {
-                    return super::super::class_constructors::run_class_constructor_on_this_flat(
-                        parent_cid, obj as i64, args_ptr, args_len,
-                    );
-                }
-                // A ClassRef is NaN-tagged and is NEVER callable via
-                // `js_native_call_value` (it early-returns `undefined`). Return
-                // here unconditionally — whether or not a constructor was found
-                // and run — instead of falling through to the closure-dispatch
-                // path below, which would (a) silently produce `undefined` and
-                // (b) skip the `parent_closure_in_chain` recovery that only
-                // applies to closure/object parents, not a ClassRef.
-                return undef;
-            }
-            // #6530: the parent can be a per-evaluation CLASS OBJECT — what a
-            // capture-carrying class statement materializes as (bundled zod's
-            // `class ZodEffects extends ZodType` where ZodType captures module
-            // helpers, registered via `js_register_class_parent_dynamic`).
-            // Dispatching it through `js_native_call_value` below hits that
-            // helper's class-object arm, which CONSTRUCTS a fresh parent
-            // instance — and this super leg drops the result, so the parent
-            // constructor never ran on `this` and every base-ctor field
-            // (zod's `_def`, the bound methods) stayed undefined. Route
-            // through the same flat constructor-on-`this` dispatch as the
-            // ClassRef arm above, using the template class id stamped on the
-            // class object at `js_object_alloc` time.
-            if bits & TAG_MASK == POINTER_TAG {
-                let p = (bits & PTR_MASK) as usize;
-                if super::super::class_registry::is_class_object_ptr(p as *const u8) {
-                    let parent_cid = crate::object::js_object_get_class_id(
-                        p as *const crate::object::ObjectHeader,
-                    );
-                    if parent_cid != 0 {
-                        if let Some(obj) = subclass_this_object_ptr(this_box) {
-                            // A fresh class object's constructor environment
-                            // is per evaluation. Replaying by class id alone
-                            // consults the template-wide declaration snapshot
-                            // and drops captured values such as a factory's
-                            // `tag`. Use the class-object replay path so this
-                            // exact parent's `__perry_ctor_caps` supplies its
-                            // synthesized capture params.
-                            return super::super::class_constructors::replay_class_object_constructor(
-                                parent_val, parent_cid, obj, args_ptr, args_len,
-                            );
-                        }
-                    }
-                    return undef;
-                }
-            }
             let usable = if bits & TAG_MASK == POINTER_TAG {
                 let p = (bits & PTR_MASK) as usize;
                 // A real callability test for the remaining pointer values.

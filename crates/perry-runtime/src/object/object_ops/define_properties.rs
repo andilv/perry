@@ -1,186 +1,138 @@
 //! `Object.defineProperties` and `Object.setPrototypeOf`.
 use super::*;
 
-/// `Object.defineProperties(target, descriptors)` — iterate the descriptor
-/// object's own keys and invoke `js_object_define_property` for each one.
-/// Used by chalk's `Object.defineProperties(createChalk.prototype, styles)`
-/// where `styles` is built via `Object.create(null)` + dynamic assignment,
-/// so the static `Object(...)` literal desugar in the HIR lowering can't
-/// fire and we fall here.
+/// Snapshot all keys, collect current enumerable descriptors, then apply.
 ///
-/// Returns the target. Spec also returns target — Perry's lowering relies
-/// on that so `const x = Object.defineProperties(...)` still binds `x`.
+/// Both key snapshots are fresh arrays (`getOwnPropertyNames` /
+/// `getOwnPropertySymbols`, or the Proxy's validated `ownKeys` list) rooted
+/// before any per-key callback. Each collected definition is a contiguous
+/// record of rooted handles in this operation's own scope
+/// (`DescView::collected_words`), so the operation owns no Rust-heap buffer:
+/// an abrupt completion leaves nothing to release, and the thrower's
+/// savepoint truncates the records with the rest of the handle stack. No
+/// protected frame is needed.
 #[no_mangle]
-pub extern "C" fn js_object_define_properties(target: f64, descriptors: f64) -> f64 {
-    crate::array::subclass_elements::deopt_value(target);
-    // #2817: target must be an object (or class-ref). Node throws
-    // `Object.defineProperties called on non-object` for primitives.
-    //
-    // #6363: a native HANDLE target (a pointer-tagged registry id — zlib stream,
-    // fetch Headers/Request/Response/Blob, crypto hash, …) is an ordinary
-    // extensible object in Node but is not a heap `ObjectHeader`, so it fails
-    // `value_is_object_like` and used to throw here. Let it through: the per-key
-    // `js_object_define_property` below recognises the handle band and routes
-    // each descriptor to the handle's own-property storage.
-    let target_is_class_ref = super::super::class_ref_id(target).is_some();
-    let target_is_handle = {
-        let jv = crate::value::JSValue::from_bits(target.to_bits());
-        jv.is_pointer() && crate::value::addr_class::is_small_handle(jv.as_pointer::<u8>() as usize)
-    };
-    if !target_is_class_ref && !target_is_handle && !unsafe { value_is_object_like(target) } {
-        throw_object_type_error(b"Object.defineProperties called on non-object");
-    }
-    // ToObject(Properties) below may allocate a primitive wrapper. Root both
-    // inputs first so a moving collection cannot leave the target or a heap
-    // string primitive stale before the main algorithm starts.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let target_handle = scope.root_nanbox_f64(target);
-    let descriptors_input_handle = scope.root_nanbox_f64(descriptors);
-    // #2817: the properties bag must be coercible to an object. Node throws
-    // `Cannot convert undefined or null to object` for null/undefined, and
-    // primitives are boxed (no own enumerable keys → no-op). Match the nullish
-    // case explicitly.
-    let descriptors = {
-        let descriptors = descriptors_input_handle.get_nanbox_f64();
-        let jv = crate::value::JSValue::from_bits(descriptors.to_bits());
-        if jv.is_undefined() || jv.is_null() {
+pub extern "C" fn js_object_define_properties(target: f64, properties: f64) -> f64 {
+    unsafe {
+        if !definition_target_is_object(target) {
+            throw_object_type_error(b"Object.defineProperties called on non-object");
+        }
+        let scope = crate::gc::RuntimeHandleScope::new();
+        // Legacy raw object operands are admitted at this public boundary only;
+        // normalize them before any enumeration or descriptor callback.
+        let target = scope.root_nanbox_f64(normalize_descriptor_operand(target));
+        let properties = scope.root_nanbox_f64(normalize_descriptor_operand(properties));
+        let value = f64::from_bits(properties.get_nanbox_u64());
+        if matches!(
+            value.to_bits(),
+            crate::value::TAG_NULL | crate::value::TAG_UNDEFINED
+        ) {
             throw_object_type_error(b"Cannot convert undefined or null to object");
         }
-        // ObjectDefineProperties step 2 is ToObject(Properties), not merely a
-        // nullish check. In particular, a non-empty string becomes a String
-        // exotic with enumerable index keys; reading its first descriptor
-        // value then fails ToPropertyDescriptor because that value is a
-        // primitive character. Other primitive wrappers have no enumerable
-        // own keys and are a no-op. Preserve class refs (INT32-tagged
-        // constructor objects) rather than boxing them as Numbers.
-        if super::super::class_ref_id(descriptors).is_some()
-            || crate::proxy::js_proxy_is_proxy(descriptors) != 0
-            || unsafe { value_is_object_like(descriptors) }
-        {
-            descriptors
+        let properties = scope.root_nanbox_u64(if definition_target_is_object(value) {
+            value.to_bits()
         } else {
-            super::super::js_object_coerce(descriptors)
-        }
-    };
-    let descriptors_handle = scope.root_nanbox_f64(descriptors);
-    let desc_obj = unsafe { extract_obj_ptr(descriptors) };
-    if crate::proxy::js_proxy_is_proxy(descriptors) == 0
-        && (desc_obj.is_null() || !is_valid_obj_ptr(desc_obj as *const u8))
-    {
-        return target_handle.get_nanbox_f64();
-    }
-    // #7949: everything below spans allocations — `propertyIsEnumerable` and
-    // the `[[Get]]` can run user accessors, key coercion can allocate, and
-    // `js_object_define_property` grows the target. The receiver, the
-    // properties bag, the own-keys array and the collected key list are all
-    // rooted for the duration, and each is re-read out of its root after every
-    // call that could have moved it. A bare `Vec<f64>` of keys is invisible to
-    // every scanner, so under an evacuating collection the second loop used to
-    // define properties under stale key strings.
-    // Snapshot the descriptor object's own keys array. We collect into a
-    // rooted list first so adding properties via `js_object_define_property`
-    // (which can resize the target's keys_array) can't perturb iteration
-    // — descriptors and target are usually different objects, but a
-    // defensive copy costs ~ngc and protects against a user who passes
-    // `Object.defineProperties(obj, obj)` aliasing.
-    // Spec (ObjectDefineProperties): the property keys come from the properties
-    // object's own keys, but only the ones whose own descriptor is ENUMERABLE
-    // participate — and the descriptor object for each is read through `[[Get]]`
-    // (so accessors on the properties bag run). Using the full own-key set is
-    // wrong for native namespaces like `Math` (whose `E`/`PI`/... are
-    // non-enumerable) and for any object with non-enumerable own props.
-    let mut keys = crate::gc::RootedValues::new(&scope);
-    // A Proxy must observe exactly one [[OwnPropertyKeys]] call, and its
-    // returned string/Symbol order is used verbatim. Asking
-    // getOwnPropertyNames and getOwnPropertySymbols separately would fire the
-    // trap twice; the names helper also filters via [[GetOwnProperty]] before
-    // this algorithm can perform its own observable descriptor read.
-    let descriptors_is_proxy =
-        crate::proxy::js_proxy_is_proxy(descriptors_handle.get_nanbox_f64()) != 0;
-    let names = if descriptors_is_proxy {
-        crate::proxy::js_proxy_own_keys(descriptors_handle.get_nanbox_f64())
-    } else {
-        js_object_get_own_property_names(descriptors_handle.get_nanbox_f64())
-    };
-    let names_handle = scope.root_nanbox_f64(names);
-    let names_arr = crate::value::js_nanbox_get_pointer(names_handle.get_nanbox_f64())
-        as *const crate::array::ArrayHeader;
-    let names_len = if names_arr.is_null() {
-        0
-    } else {
-        crate::array::js_array_length(names_arr) as usize
-    };
-    const TAG_TRUE: u64 = 0x7FFC_0000_0000_0004;
-    for i in 0..names_len {
-        let names_arr = crate::value::js_nanbox_get_pointer(names_handle.get_nanbox_f64())
-            as *const crate::array::ArrayHeader;
-        let k = crate::array::js_array_get_f64(names_arr, i as u32);
-        let k_handle = scope.root_nanbox_f64(k);
-        // Skip non-enumerable own keys (spec step: descriptor must be
-        // enumerable). `propertyIsEnumerable` returns false for absent or
-        // non-enumerable keys.
-        let enumerable = js_object_property_is_enumerable(
-            descriptors_handle.get_nanbox_f64(),
-            k_handle.get_nanbox_f64(),
-        );
-        if enumerable.to_bits() == TAG_TRUE {
-            keys.push(k_handle.get_nanbox_f64());
-        }
-    }
-    // OrdinaryOwnPropertyKeys orders Symbols after all string keys. The Proxy
-    // arm above already received both kinds in one array, so only ordinary
-    // descriptor bags need the second source appended here.
-    if !descriptors_is_proxy {
-        let symbols = unsafe {
-            crate::symbol::js_object_get_own_property_symbols(descriptors_handle.get_nanbox_f64())
+            super::super::js_object_coerce(value).to_bits()
+        });
+        let current_properties = || f64::from_bits(properties.get_nanbox_u64());
+        let proxy = crate::proxy::js_proxy_is_proxy(current_properties()) != 0;
+        let names = if proxy {
+            None
+        } else {
+            Some(super::super::descriptors::OwnNamesSnapshot::collect(
+                &scope,
+                &properties,
+            ))
         };
-        if symbols != 0 {
-            let symbols_handle = scope.root_raw_mut_ptr(symbols as *mut crate::array::ArrayHeader);
-            let symbols_len =
-                symbols_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|symbols| {
-                    crate::array::js_array_length(symbols)
+        let proxy_names = proxy.then(|| {
+            scope.root_raw_mut_ptr(extract_obj_ptr(crate::proxy::js_proxy_own_keys(
+                current_properties(),
+            )) as *mut crate::array::ArrayHeader)
+        });
+        // Root the name array while enumerating symbols; both snapshots are
+        // complete before any per-key own-descriptor/Get callback.
+        let symbols = if proxy {
+            None
+        } else {
+            let raw = crate::symbol::js_object_get_own_property_symbols(current_properties());
+            (raw != 0).then(|| scope.root_raw_mut_ptr(raw as *mut crate::array::ArrayHeader))
+        };
+        let length_of = |array: &crate::gc::RuntimeHandle<'_>| {
+            array.with_const_ptr::<crate::array::ArrayHeader, _>(|array| {
+                crate::array::js_array_length(array)
+            })
+        };
+        let name_count = names
+            .as_ref()
+            .map(|names| names.count())
+            .unwrap_or_else(|| length_of(proxy_names.as_ref().unwrap()));
+        let key_count = name_count + symbols.as_ref().map(length_of).unwrap_or(0);
+        // Per-key work runs in its own scope; only the finished record is
+        // pushed into `scope`, so records sit back to back from `base`.
+        let base = crate::gc::runtime_handle_stack_savepoint();
+        let mut entries = 0usize;
+        for index in 0..key_count {
+            let words = {
+                let key_scope = crate::gc::RuntimeHandleScope::new();
+                let key = key_scope.root_nanbox_f64(match (&symbols, index < name_count) {
+                    (_, true) => match &names {
+                        Some(names) => names.key(index),
+                        None => proxy_names
+                            .as_ref()
+                            .unwrap()
+                            .with_const_ptr::<crate::array::ArrayHeader, _>(|array| {
+                                crate::array::js_array_get_f64(array, index)
+                            }),
+                    },
+                    (Some(symbols), false) => symbols
+                        .with_const_ptr::<crate::array::ArrayHeader, _>(|array| {
+                            crate::array::js_array_get_f64(array, index - name_count)
+                        }),
+                    (None, false) => unreachable!("key_count counts only snapshot entries"),
                 });
-            for i in 0..symbols_len {
-                let symbol =
-                    symbols_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|symbols| {
-                        crate::array::js_array_get_f64(symbols, i)
-                    });
-                let symbol_handle = scope.root_nanbox_f64(symbol);
-                let enumerable = js_object_property_is_enumerable(
-                    descriptors_handle.get_nanbox_f64(),
-                    symbol_handle.get_nanbox_f64(),
-                );
-                if enumerable.to_bits() == TAG_TRUE {
-                    keys.push(symbol_handle.get_nanbox_f64());
-                }
+                // `props.[[GetOwnProperty]](key)` read for its [[Enumerable]]
+                // only: the source family answers from its own facts (a
+                // Proxy runs its getOwnPropertyDescriptor trap exactly once),
+                // so no reflection record is built per source key.
+                let data = if index < name_count {
+                    names
+                        .as_ref()
+                        .and_then(|names| names.data_value(&properties, index))
+                } else {
+                    None
+                };
+                let bag = if let Some(value) = data {
+                    key_scope.root_nanbox_f64(value)
+                } else {
+                    if js_object_property_is_enumerable(current_properties(), key.get_nanbox_f64())
+                        .to_bits()
+                        != crate::value::TAG_TRUE
+                    {
+                        continue;
+                    }
+                    key_scope.root_nanbox_f64(super::super::js_object_get_property_key(
+                        current_properties(),
+                        key.get_nanbox_f64(),
+                    ))
+                };
+                let descriptor = decode_property_descriptor(&key_scope, &bag);
+                let words = descriptor.collected_words(key.get_nanbox_u64());
+                words
+            };
+            // No allocation between reading the words and rooting them.
+            for word in words {
+                scope.root_nanbox_u64(word);
+            }
+            entries += 1;
+        }
+        for entry in 0..entries {
+            let (key, descriptor) = DescView::collected_at(&scope, base, entry);
+            if !define_own_property_decoded(&scope, &target, &key, &descriptor) {
+                throw_definition_rejected(&scope, &target, &key);
             }
         }
+        f64::from_bits(target.get_nanbox_u64())
     }
-    for i in 0..keys.len() {
-        // Read the descriptor through `[[Get]]` so accessors on the properties
-        // bag are honored, then ToPropertyDescriptor + DefinePropertyOrThrow.
-        //
-        // Use the value-level getter (keyed off the `descriptors` *value*, not a
-        // raw `ObjectHeader` deref): the properties bag is `ToObject(Properties)`
-        // and may be ANY object — a Date, array, boxed primitive, class
-        // instance, etc. `Object.create({}, new Date(0))` previously bit-cast the
-        // Date's `DateCell` pointer to an `ObjectHeader` and segfaulted. The
-        // property-key getter dispatches on the receiver's real type and keeps
-        // Symbol keys intact.
-        let descriptor = unsafe {
-            super::super::js_object_get_property_key(
-                descriptors_handle.get_nanbox_f64(),
-                keys.get(i),
-            )
-        };
-        let descriptor_handle = scope.root_nanbox_f64(descriptor);
-        js_object_define_property(
-            target_handle.get_nanbox_f64(),
-            keys.get(i),
-            descriptor_handle.get_nanbox_f64(),
-        );
-    }
-    target_handle.get_nanbox_f64()
 }
 
 /// `Object.setPrototypeOf(obj, proto)` — chalk's callable-with-getter-bag
@@ -478,23 +430,6 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
         && !crate::closure::is_closure_ptr(obj_ptr_for_record)
         && is_valid_obj_ptr(obj_ptr_for_record as *const u8)
     {
-        // This is keyless prototype surgery: unlike `C.prototype.m = value`,
-        // there is no method name with which to retire only one direct-method
-        // guard slot. The lower-level recorder is also used to wire runtime
-        // builtin prototype objects during startup, so invalidate here at the
-        // user-visible `Object.setPrototypeOf` entry rather than poisoning the
-        // fast path for every program during initialization.
-        // A target on no declared class chain cannot move a compiled direct
-        // arm (#10504), so only the runtime caches restart for it.
-        if unsafe {
-            crate::object::class_registry::prototype_relink_may_retarget_direct_arms(
-                obj_ptr_for_record,
-            )
-        } {
-            crate::object::invalidate_class_prototype_fast_guards();
-        } else {
-            crate::object::class_registry::retire_prototype_caches_without_direct_arms();
-        }
         super::super::prototype_chain::object_set_user_prototype(obj_ptr_for_record, proto_bits);
         // A grown array's local may still hold the FORWARDED (old) pointer;
         // the spec [[HasProperty]]/[[Get]] helpers look the prototype up by

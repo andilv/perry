@@ -24,10 +24,11 @@ use super::*;
 /// `js_object_alloc(0, N)` is the fallback for dynamic cases.
 pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("perry_class_value_dir_cell", PTR, &[]);
+    // A class's instance members: its image declaration constant.
     module.declare_function(
-        "js_register_class_prototype_shape",
+        "js_register_class_declaration",
         crate::types::VOID,
-        &[I32, I32],
+        &[I32, PTR],
     );
     module.declare_function(
         "js_literal_shape_initialize",
@@ -101,6 +102,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // #9342: Uint8Array inline-read admission cache (buffer/header.rs).
     module.add_external_global("PERRY_TYPED_NAMED_PROPS_INVALIDATED", I8);
     module.declare_function("js_object_alloc", I64, &[I32, I32]);
+    module.declare_function("js_object_alloc_plain", I64, &[I32]);
     module.declare_function("js_event_target_subclass_init", DOUBLE, &[DOUBLE, I32]);
     // #3149: `Object(value)` plain-call coercion. Takes & returns a NaN-boxed
     // JSValue (DOUBLE): nullish/primitive -> fresh {}, object passes through.
@@ -120,6 +122,18 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_class_evaluation_object_with_prototype",
         I64,
         &[I32, I32, I32, PTR, DOUBLE, DOUBLE],
+    );
+    // A class with computed instance members: the evaluation's object first,
+    // its prototype once the definition named them.
+    module.declare_function(
+        "js_class_evaluation_object_with_parent",
+        I64,
+        &[I32, I32, I32, PTR, DOUBLE],
+    );
+    module.declare_function(
+        "js_class_evaluation_finish_prototype",
+        VOID,
+        &[I64, I32, DOUBLE, DOUBLE],
     );
     module.declare_function("js_class_object_set_ctor_caps", VOID, &[I64, DOUBLE, PTR]);
     // Shape-cache-aware variant: pre-populates keys_array via SHAPE_INLINE_CACHE,
@@ -299,12 +313,8 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         I32,
         &[I64, DOUBLE, I32, I32, PTR, I64, PTR],
     );
-    module.declare_function(
-        "js_method_direct_shape_guard",
-        I32,
-        &[DOUBLE, I32, I32, I32],
-    );
-    module.declare_function("js_method_direct_shape_class", I32, &[DOUBLE, PTR, I32]);
+    module.declare_function("js_method_direct_shape_guard", I32, &[DOUBLE, I32, I32]);
+    module.declare_function("js_method_direct_shape_class", I32, &[DOUBLE, PTR]);
     module.declare_function(
         "js_typed_feedback_closure_direct_call_guard",
         I32,
@@ -455,6 +465,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // Heap-pointer receiver: (masked obj_handle, key_handle, per-site IC cache
     // SLOT, per-site packed MRU word) -> field value.
     module.declare_function("js_object_get_field_ic_slow", DOUBLE, &[I64, I64, PTR, PTR]);
+    module.declare_function("js_global_get_field_ic_slow", DOUBLE, &[I64, I64, PTR, PTR]);
     // First-read D3: a generic read site's ShapeId miss asks this GC leaf
     // first (the agent's shape-directory mirror or null, receiver payload,
     // the key as its pool global holds it, the site's cache slot and compact
@@ -463,6 +474,11 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // cannot read the agent's pointer block inline. Both GC leaves.
     module.declare_function(
         "js_object_get_field_ic_front",
+        DOUBLE,
+        &[PTR, I64, I64, PTR, PTR],
+    );
+    module.declare_function(
+        "js_object_get_own_field_ic_front",
         DOUBLE,
         &[PTR, I64, I64, PTR, PTR],
     );
@@ -649,8 +665,9 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("perry_transition_cache_base", PTR, &[]);
     module.declare_function("js_transition_ic_note_hit", VOID, &[]);
     // The per-agent pointer block (`expr/agent_ptr.rs`), read inline on ELF
-    // executables through the initial-exec TLS model; its slot-1 accessor,
-    // and the method-call site's miss entry (`expr/method_site.rs`).
+    // executables (where `use_local_exec_tls` turns this model into
+    // local-exec); its slot-1 accessor, and the method-call site's miss entry
+    // (`expr/method_site.rs`).
     module.add_external_tls_global(
         crate::expr::agent_ptr::AGENT_PTRS_SYMBOL,
         &format!("[{} x ptr]", crate::expr::agent_ptr::AGENT_PTR_SLOTS),
@@ -661,7 +678,9 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // TLS block. Declarations only; no other target references them.
     module.add_external_global(crate::expr::agent_ptr::TLS_INDEX_SYMBOL, I32);
     module.add_external_global(crate::expr::agent_ptr::AGENT_PTRS_SECREL_SYMBOL, I32);
-    // #10812: the prologue stack check (`expr/stack_guard.rs`).
+    // #10812: the prologue stack check (`expr/stack_guard.rs`): the stack
+    // pointer it compares, and the overflow arm's (`cold`) throw.
+    module.declare_function("llvm.read_register.i64", I64, &["metadata"]);
     module.declare_function("js_stack_overflow", VOID, &[]);
     module.declare_function(
         "js_method_site_miss",
@@ -804,4 +823,31 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
 
     declare_stdlib_ffi(module);
     declare_stdlib_ffi_part2(module);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn s7b_direct_method_shape_guards_use_the_runtime_arity() {
+        let mut module = crate::module::LlModule::new("x86_64-unknown-linux-gnu");
+        super::declare_phase_b_objects(&mut module);
+        for (name, parameters) in [
+            ("js_method_direct_shape_guard", "double, i32, i32"),
+            ("js_method_direct_shape_class", "double, ptr"),
+        ] {
+            let declaration = module
+                .declaration_lines()
+                .find(|(n, _)| *n == name)
+                .unwrap()
+                .1;
+            let actual = declaration
+                .split_once('(')
+                .unwrap()
+                .1
+                .split_once(')')
+                .unwrap()
+                .0;
+            assert_eq!(actual, parameters, "runtime ABI for {name}");
+        }
+    }
 }

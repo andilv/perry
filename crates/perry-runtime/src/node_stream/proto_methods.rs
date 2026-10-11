@@ -38,9 +38,14 @@ pub(crate) fn install_stream_prototype_methods(proto: *mut ObjectHeader, kind: S
     let writable = writable_methods();
     let methods: Vec<(&'static str, StubFn)> = match kind {
         StreamProto::Readable => readable.to_vec(),
+        // The base hook is a runtime builtin: the constructor's subclass-hook
+        // capture (`user_hook`) skips builtins, so an inherited base body is
+        // never mistaken for a subclass override. Without the flag
+        // `class P extends PassThrough {}` captured this throwing body as its
+        // transform and lost PassThrough's identity transform.
         StreamProto::Transform => vec![(
             "_transform",
-            crate::fn_info!(ns_transform3, 3; with_declared(3)),
+            crate::fn_info!(ns_transform3, 3; with_declared(3), with_flags(crate::closure::FN_BUILTIN)),
         )],
         // `_write` is the user's hook, not a prototype method the runtime
         // calls: a prototype `_write` would read as a subclass override.
@@ -144,9 +149,17 @@ pub(super) fn alloc_stream_instance(name: &str) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let proto = scope.root_nanbox_f64(stream_prototype_value(name));
     if !JSValue::from_bits(proto.get_nanbox_u64()).is_pointer() {
-        return box_pointer(crate::object::js_object_alloc(0, 0) as *const u8);
+        // The writable constructor `.prototype` can be replaced by a
+        // primitive. Keep the ordinary fallback prototype while still
+        // allocating the data layout required by slot initialization.
+        let ordinary = scope.root_nanbox_f64(box_pointer(
+            crate::object::js_object_alloc(0, 0) as *const u8
+        ));
+        proto.set_nanbox_f64(crate::object::js_object_get_prototype_of(
+            ordinary.get_nanbox_f64(),
+        ));
     }
-    crate::object::js_object_create(proto.get_nanbox_f64())
+    super::constructors::alloc_initialized_stream_shell(proto.get_nanbox_f64())
 }
 
 /// Does `value`'s prototype chain reach `stream.<name>.prototype`? (node's

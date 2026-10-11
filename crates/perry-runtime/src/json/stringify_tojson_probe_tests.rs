@@ -188,11 +188,11 @@ fn json_tojson_marker_comparisons_stop_before_guard_page() {
 // ─── #10696: the invalidation funnel behind the per-`class_id` memo ──────────
 //
 // `class_chain_may_have_to_json` is memoized per class id under three
-// generations. The dangerous staleness direction is a cached `false` that
+// shape and epoch facts. The dangerous staleness direction is a cached `false` that
 // should have become `true`, so every writer that can flip it that way must be
 // IN the funnel. Each test below primes the memo with a `false`, performs one
 // such write, and requires the answer to flip — so deleting that writer's bump
-// makes exactly one test fail, by name.
+// makes the corresponding test fail, by name.
 
 /// A unique-per-test class id that no other test or builtin claims.
 fn probe_test_class_id(n: u32) -> u32 {
@@ -215,30 +215,25 @@ fn class_chain_tojson_memo_reuses_a_verdict_until_a_generation_moves() {
     assert_eq!(
         super::test_class_chain_tojson_recomputes(),
         1,
-        "an unchanged generation triple must reuse the recorded verdict"
-    );
-
-    crate::object::test_bump_vtable_generation();
-    assert_eq!(super::test_class_chain_may_have_to_json(class_id), first);
-    assert_eq!(
-        super::test_class_chain_tojson_recomputes(),
-        2,
-        "a vtable registration must retire the entry"
+        "an unchanged generation pair must reuse the recorded verdict"
     );
 
     crate::object::prop_plan::prop_plan_epoch_bump();
     assert_eq!(super::test_class_chain_may_have_to_json(class_id), first);
     assert_eq!(
         super::test_class_chain_tojson_recomputes(),
-        3,
+        2,
         "a semantic property mutation must retire the entry"
     );
 
-    crate::object::class_lookup_surface_gen_bump();
-    assert_eq!(super::test_class_chain_may_have_to_json(class_id), first);
+    crate::object::shapes::write_identity_word(
+        crate::object::shapes::PROTO_ID_CLASS | u64::from(class_id),
+        crate::value::TAG_UNDEFINED,
+    );
+    assert!(super::test_class_chain_may_have_to_json(class_id));
     assert_eq!(
         super::test_class_chain_tojson_recomputes(),
-        4,
+        3,
         "a class lookup-surface mutation must retire the entry"
     );
 }

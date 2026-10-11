@@ -50,9 +50,9 @@ mod holder_edit;
 use super::accessor_pair::{descriptor_from, own_accessor, pair_from, store_own_accessor};
 pub(crate) use holder_edit::HolderEdit;
 #[cfg(test)]
-mod native_owner_tests;
-#[cfg(test)]
 mod holder_route_tests;
+#[cfg(test)]
+mod native_owner_tests;
 #[cfg(test)]
 mod tests;
 
@@ -65,16 +65,6 @@ mod tests;
 pub(crate) struct AccessorDescriptor {
     pub get: u64, // NaN-boxed closure f64 bits, 0 = absent
     pub set: u64, // NaN-boxed closure f64 bits, 0 = absent
-}
-
-/// Retire existing class method guards when a prototype descriptor changes.
-pub(crate) fn invalidate_prototype_descriptor_guards(obj: usize, key: &str) {
-    if crate::array::object_prototype_addr_matches(obj)
-        || class_registry::is_registered_class_prototype_object(obj)
-        || class_registry::class_id_for_decl_prototype_object(obj).is_some()
-    {
-        class_registry::invalidate_class_prototype_fast_guards_for_method(key);
-    }
 }
 
 /// True when a write of `key` to a plain object whose prototype is the canonical
@@ -128,6 +118,7 @@ pub(crate) unsafe fn class_instance_set_may_intercept(
     // Walk the actual prototype objects; their shapes own all accessors.
     let mut proto = js_object_get_prototype_of(crate::value::js_nanbox_pointer(obj_addr as i64));
     let mut depth = 0u32;
+    let mut previous = 0usize;
     loop {
         depth += 1;
         if depth > 64 {
@@ -161,6 +152,15 @@ pub(crate) unsafe fn class_instance_set_may_intercept(
         } else {
             return true;
         };
+        // A prototype that answers itself is a cycle, and a cycle has only
+        // the conservative answer the depth bound above gives it. Give it on
+        // the first repeat: an fs stream (whose [[Prototype]] resolves to the
+        // stream itself) otherwise paid 64 prototype resolutions on every
+        // property store, ~7 ms per stream (#10544).
+        if p == previous {
+            return true;
+        }
+        previous = p;
         if crate::array::object_prototype_addr_matches(p) {
             // Reached the canonical Object.prototype: per-key check, then done.
             return object_proto_may_intercept_key(key);
@@ -563,7 +563,6 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
     crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
     super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     note_data_descriptor_target(obj, &key, attrs);
-    invalidate_prototype_descriptor_guards(obj, &key);
     // Charter step 3: an ordinary object's attributes live with its keys
     // (recorded by the funnel above) and nowhere else.
     if unsafe {
@@ -591,9 +590,6 @@ pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAtt
         .map(|&(key, attrs)| AttrsEdit::Data(key.as_bytes(), attrs.bits))
         .collect();
     note_descriptor_target_edits(obj, &edits);
-    for &(key, _) in entries {
-        invalidate_prototype_descriptor_guards(obj, key);
-    }
 }
 
 /// Remove a customized property descriptor for (obj, key), restoring default
@@ -708,10 +704,10 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
     // the own-property shadow check inside the loop) were raw Rust locals
     // across it. Both stay rooted for the walk.
     let scope = crate::gc::RuntimeHandleScope::new();
-    let value_handle = scope.root_heap_word_u64(value.to_bits());
+    let value_handle = scope.root_nanbox_u64(value.to_bits());
     let key_handle = scope.root_nanbox_f64(key);
     let key_str = crate::builtins::js_string_coerce(key_handle.get_nanbox_f64());
-    let value = f64::from_bits(value_handle.get_heap_word_u64());
+    let value = f64::from_bits(value_handle.get_nanbox_u64());
     if key_str.is_null() {
         return None;
     }
@@ -733,11 +729,11 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
     // `current` walks the chain through its own handle: `obj_value_has_own_key`
     // and `js_object_get_prototype_of` both allocate, so the link a raw local
     // held could be evacuated out from under the next iteration (#6943).
-    let current_handle = scope.root_heap_word_u64(value.to_bits());
+    let current_handle = scope.root_nanbox_u64(value.to_bits());
     // Bounded to guard against a cyclic prototype side-table; real chains are
     // a handful of links deep.
     for _ in 0..10_000 {
-        let current = f64::from_bits(current_handle.get_heap_word_u64());
+        let current = f64::from_bits(current_handle.get_nanbox_u64());
         let obj = unsafe { extract_obj_ptr(current) };
         if obj.is_null() {
             return None;
@@ -756,12 +752,12 @@ pub(crate) fn reflect_getter_closure_bits(value: f64, key: f64) -> Option<u64> {
         if obj_value_has_own_key(current, key_handle.get_nanbox_f64()) {
             return None;
         }
-        let current = f64::from_bits(current_handle.get_heap_word_u64());
+        let current = f64::from_bits(current_handle.get_nanbox_u64());
         let proto = crate::object::js_object_get_prototype_of(current);
         if unsafe { extract_obj_ptr(proto) }.is_null() {
             return None;
         }
-        current_handle.set_heap_word_u64(proto.to_bits());
+        current_handle.set_nanbox_u64(proto.to_bits());
     }
     None
 }
@@ -819,7 +815,6 @@ pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDesc
         None
     };
     note_accessor_descriptor_target(obj, &key, &acc);
-    invalidate_prototype_descriptor_guards(obj, &key);
     if in_keys {
         // Charter step 3: the pair lives in the key's slot.
         unsafe { store_own_accessor(obj, &key, Some(pair_from(&acc))) };
@@ -877,7 +872,6 @@ pub(crate) fn install_fresh_accessor_property(
         ],
     );
     let in_keys = unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) };
-    invalidate_prototype_descriptor_guards(obj, &key);
     if in_keys {
         // The pair lives in the key's ordinary value slot.
         unsafe { store_own_accessor(obj, &key, Some(pair_from(&acc))) };

@@ -45,6 +45,12 @@ pub struct LlFunction {
     /// When true, keep a small routing wrapper as an optimization boundary.
     /// Used when inlining would duplicate guarded fast/fallback call graphs.
     pub no_inline: bool,
+    /// The module links the runtime's NaN-box operand table into the same
+    /// image, so the backend may read 64-bit NaN-box operands from it
+    /// (`inprocess/nanbox_operands.rs`); rendered as the
+    /// `"perry-nanbox-operands"` attribute on the define line, so the IR
+    /// states it for the emitter that runs on another thread.
+    pub nanbox_operands: bool,
     /// When true (and `force_inline` is not), emit the `inlinehint` attribute.
     /// Unlike `alwaysinline`, `inlinehint` only *raises* LLVM's inline
     /// threshold for this callee — LLVM keeps its `-O3` growth budget and can
@@ -286,6 +292,7 @@ impl LlFunction {
             force_inline: false,
             pre_statepoint_inline: false,
             no_inline: false,
+            nanbox_operands: false,
             inline_hint: false,
             hot_loop_callee: false,
             alloc_hot: false,
@@ -567,6 +574,46 @@ impl LlFunction {
         self.entry_allocas
             .push(format!("  {} = alloca [{} x {}]", r, count, elem_ty));
         r
+    }
+
+    /// A compiler-owned stack record is a range of ordinary GC words.
+    /// Native emission publishes the range through the existing home map;
+    /// the shadow backend binds its fields to the existing frame instead.
+    pub(crate) fn alloca_entry_root_record(&mut self, count: usize) -> (String, Vec<String>) {
+        let native = crate::codegen::helpers::native_stack_roots_enabled();
+        let record = format!("%r{}", self.reg_counter.next());
+        let elem = if native { "ptr addrspace(1)" } else { "double" };
+        let metadata = if native {
+            ", !perry.native.home !{}"
+        } else {
+            ""
+        };
+        self.entry_allocas.push(format!(
+            "  {record} = alloca [{count} x {elem}], align 8{metadata}"
+        ));
+        let mut fields = Vec::new();
+        for i in 0..count {
+            let field = format!("%r{}", self.reg_counter.next());
+            self.entry_allocas.push(format!(
+                "  {field} = getelementptr double, ptr {record}, i64 {i}"
+            ));
+            self.entry_allocas
+                .push(format!("  store double 0.0, ptr {field}"));
+            let slot = self
+                .reserve_shadow_slot()
+                .expect("record needs a root frame");
+            if !native {
+                self.entry_setup_call_void(
+                    "js_shadow_slot_bind",
+                    &[
+                        (crate::types::I32, &slot.to_string()),
+                        (crate::types::PTR, &field),
+                    ],
+                );
+            }
+            fields.push(field);
+        }
+        (record, fields)
     }
 
     /// Allocate a byte buffer in the entry block with an explicit ABI
@@ -927,6 +974,8 @@ impl LlFunction {
         // so splitting is carried, not refused.
         let cconv: String = if self.is_preserve_none() {
             format!("{} ", crate::inst::PRESERVE_NONE_CC)
+        } else if let Some(cc) = crate::expr::inline_birth::calling_convention(&self.name) {
+            format!("{cc} ")
         } else {
             String::new()
         };
@@ -984,8 +1033,13 @@ impl LlFunction {
             Some(p) => format!(" personality ptr @{}", p),
             None => String::new(),
         };
+        let nanbox_operands = if self.nanbox_operands {
+            " \"perry-nanbox-operands\""
+        } else {
+            ""
+        };
         format!(
-            "define {}{}{} @{}({}){}{}{}{}{} {{",
+            "define {}{}{} @{}({}){}{}{}{}{}{} {{",
             linkage,
             cconv,
             self.return_type,
@@ -994,6 +1048,7 @@ impl LlFunction {
             attrs,
             size_attrs,
             frame_pointer,
+            nanbox_operands,
             gc_strategy,
             personality
         )

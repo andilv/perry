@@ -352,6 +352,37 @@ fn lower_class_method_bind(
 // counter), so the guard takes only `idx_i32` (no `f64` index) — keeping the
 // int→fp conversion out of the hot region. The boxed fallback still needs the
 // `f64` index, so it is materialized lazily inside the (cold) fallback block.
+/// A packed-f64 loop fact is a runtime proof: the versioned loop's guard
+/// admitted this receiver local's live layout and its matched body cannot
+/// replace the receiver or change its length. The declared type only chose
+/// the lowering, so an erased (`any`) receiver reads the same raw slot.
+fn lower_guard_proven_packed_read(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    index: &Expr,
+) -> Result<Option<String>> {
+    let Expr::LocalGet(arr_id) = object else {
+        return Ok(None);
+    };
+    if let Some((fact, idx_id, offset, needs_bounds_check)) =
+        packed_f64_loop_offset_read(ctx, *arr_id, index)
+    {
+        if let Some(i32_slot) = ctx.i32_counter_slots.get(&idx_id).cloned() {
+            let arr_box = lower_expr(ctx, object)?;
+            let idx_i32 = load_packed_loop_index_i32(ctx, &i32_slot, offset);
+            return Ok(Some(lower_packed_f64_loop_index_get(
+                ctx,
+                *arr_id,
+                &arr_box,
+                &idx_i32,
+                &fact,
+                needs_bounds_check,
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Repsel 4a.2 (#6904): the receiver's repairable local slot, when it is a
 /// plain (non-boxed, non-captured) stack local. The guard tiers' COLD arm
 /// stores the chain-followed live array head back into it so a stale
@@ -396,7 +427,7 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
         }
     }
     if !is_array_expr(ctx, object) || !expr_has_numeric_pointer_free_array_layout(ctx, object) {
-        return Ok(None);
+        return lower_guard_proven_packed_read(ctx, object, index);
     }
 
     // A scalar-replaced array has no heap allocation at all: its elements live
@@ -788,11 +819,47 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     }
     match expr {
         Expr::IndexGet { object, index } => {
+            // The private record cursor starts at zero, advances only after a
+            // successful read, and is bounded by the array's u32 length here.
+            // Consume that proof in the ordinary guarded indexed backend.
+            if let Expr::NativeMethodCall {
+                module,
+                class_name: None,
+                object: None,
+                method,
+                args,
+            } = index.as_ref()
+            {
+                if module == "__perry_runtime" && method == "arrayRecordIndex" {
+                    if let Some(value) = crate::array_record_stack::read(ctx, object, &args[0])? {
+                        return Ok(value);
+                    }
+                    let repair_slot = receiver_repair_slot(ctx, object);
+                    return rooting::with_operands_rooted(
+                        ctx,
+                        &[object, &args[0]],
+                        |ctx, values| {
+                            guarded_array::lower_unsigned_array_index_get(
+                                ctx,
+                                &values[0],
+                                &values[1],
+                                repair_slot.as_deref(),
+                            )
+                        },
+                    );
+                }
+            }
             // #10509: must precede every receiver-proof tier below.
             if let Some(v) =
                 crate::codegen::arguments::try_lower_elided_arguments_index_get(ctx, object, index)?
             {
                 return Ok(v);
+            }
+            // A declared array keeps its own tier order below.
+            if !is_array_expr(ctx, object) {
+                if let Some(value) = lower_guard_proven_packed_read(ctx, object, index)? {
+                    return Ok(value);
+                }
             }
             if let Some(value) =
                 crate::stmt::stable_packed_loop::try_lower_index_get(ctx, object, index)
@@ -1237,9 +1304,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // falling back to `js_dyn_index_get` on any guard miss. Removes
                     // the per-element out-of-line call + `lookup_typed_array_kind` +
                     // `js_number_coerce` on bcrypt's hot Int32Array `S[i]`/`P[i]`.
-                    Ok(lower_inline_dyn_typed_array_get(
-                        ctx, &obj_box, &idx_d, false,
-                    ))
+                    Ok(symbol_ic::lower_unknown_key_get(ctx, &obj_box, &idx_d))
                 });
             }
             // Three cases:
@@ -1517,10 +1582,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "object[index]",
                         TypedFeedbackContract::object_get_by_name(),
                     );
+                    let slot = keyed_slot(ctx);
                     Ok(ctx.block().call(
                         DOUBLE,
-                        "js_typed_feedback_object_get_field_by_key_f64",
+                        "js_object_get_field_by_key_site",
                         &[
+                            (crate::types::PTR, &slot),
                             (I64, &site_id),
                             (I64, &obj_handle),
                             (DOUBLE, key_box),
@@ -1631,10 +1698,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 );
                 // #10753: the by-key entry answers from shapes before it
                 // takes the by-value read (see the dynamic-string arm above).
+                let slot = keyed_slot(ctx);
                 let v_str = ctx.block().call(
                     DOUBLE,
-                    "js_typed_feedback_object_get_field_by_key_f64",
+                    "js_object_get_field_by_key_site",
                     &[
+                        (crate::types::PTR, &slot),
                         (I64, &site_id),
                         (I64, &str_obj_handle),
                         (DOUBLE, &idx_box),
@@ -1691,4 +1760,39 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // need static type analysis to recognize the shape.
         _ => unreachable!("expr/mod.rs dispatched a variant not handled by this submodule"),
     }
+}
+
+#[cfg(test)]
+mod array_record_tests;
+
+pub(crate) fn lower_record_index(
+    ctx: &mut FnCtx<'_>,
+    array: &str,
+    index: &str,
+    record: &str,
+    payload_slot: &str,
+    index_slot: &str,
+) -> Result<String> {
+    guarded_array::lower_record_index(ctx, array, index, record, payload_slot, index_slot)
+}
+
+pub(crate) fn lower_record_next(
+    ctx: &mut FnCtx<'_>,
+    array: &str,
+    index: &str,
+    protocol: &str,
+    record: &str,
+    index_slot: &str,
+    value_slot: &str,
+) -> Result<(String, String)> {
+    guarded_array::lower_record_next(ctx, array, index, protocol, record, index_slot, value_slot)
+}
+
+/// A keyed read owns one lazy PIC slot, just like a named read.
+pub(super) fn keyed_slot(ctx: &mut FnCtx<'_>) -> String {
+    let site = ctx.ic_site_counter;
+    ctx.ic_site_counter += 1;
+    let name = crate::expr::inline_cache_global_name(ctx, site);
+    ctx.ic_globals.push(name.clone());
+    format!("@{name}")
 }

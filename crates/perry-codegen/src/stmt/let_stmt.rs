@@ -27,6 +27,19 @@ pub(crate) fn lower_let(
     ty: &perry_hir::types::Type,
     mutable: bool,
 ) -> Result<()> {
+    // A loop-local const can bind a different view on each iteration even
+    // when the initializer emits no call. Invalidate its existing proof at
+    // the binding, then use the same receiver-invariance proof as parameters.
+    let immutable = !mutable && !ctx.reassigned_locals.contains(&id);
+    for state in ctx
+        .receiver_descriptors
+        .byte_receiver_binding(id, immutable)
+    {
+        ctx.block().store(I8, "0", &state);
+    }
+    if crate::array_record_stack::bind_field(ctx, id, name, init, ty)? {
+        return Ok(());
+    }
     // #7771 / #10123: inside an element-shape fast clone the body's `const`
     // binding is VIRTUAL — the element binding emits nothing and the derived
     // index emits one `srem`. Both live with the clone, which is where their
@@ -949,12 +962,10 @@ pub(crate) fn lower_let(
         // loads an uninitialized slot — LLVM folds that load to `undef`
         // and regalloc substitutes whatever register happens to be live,
         // handing `js_box_set_bits`/`js_box_get_bits` an arbitrary "plausible"
-        // pointer. Initialize the slot to TAG_UNDEFINED in the entry
-        // block (mirroring the non-boxed path) so skipped-init paths
-        // read a defined non-pointer sentinel that the runtime rejects
-        // deterministically.
-        let undef_bits = crate::nanbox::TAG_UNDEFINED_I64.to_string();
-        ctx.func.entry_allocas_push_store(I64, &undef_bits, &slot);
+        // pointer. Initialize the raw-pointer home to null in the entry
+        // block so skipped-init paths read a defined empty cell. JSValue
+        // sentinels belong in the cell's value, not its pointer home.
+        ctx.func.entry_allocas_push_store(I64, "0", &slot);
         // Step 1: allocate the box (#10464: released by this frame).
         let box_ptr = super::boxed_frame_release::mint_frame_cell(
             ctx,
@@ -963,6 +974,7 @@ pub(crate) fn lower_let(
             &[(I64, crate::nanbox::TAG_UNDEFINED_I64)],
         );
         super::record_boxed_slot_js_value_bits(ctx, id, &box_ptr, "boxed_let.box_ptr_slot");
+        ctx.ready_cell_roots.note_stored(id);
         // Step 2: register BEFORE lowering init.
         ctx.locals.insert(id, slot);
         ctx.local_types.insert(id, refined_ty.clone());

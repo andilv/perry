@@ -11,6 +11,10 @@ pub(crate) use chain::try_lower as try_lower_chain;
 #[path = "compare_short_string.rs"]
 mod short_string;
 
+#[cfg(all(test, feature = "llvm-inprocess"))]
+#[path = "emitted_operation_tests.rs"]
+mod emitted_operation_tests;
+
 use anyhow::Result;
 use perry_hir::types::Type as HirType;
 use perry_hir::{CompareOp, Expr};
@@ -660,6 +664,24 @@ fn lower_strict_eq_inline_any(ctx: &mut FnCtx<'_>, l: &str, r: &str) -> String {
     )
 }
 
+/// Checked numeric bytes use raw doubles or the undefined tag, never the
+/// compact-integer tag. The same scoped scalar-union proof applies to their
+/// immutable result locals. Keep Number-or-undefined distinct from Number:
+/// two undefined operands still need ordinary identity equality.
+fn is_plain_number_or_undefined(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
+    match expr {
+        Expr::LocalGet(id) => {
+            !ctx.shadow_slot_map.contains_key(id)
+                && !ctx.boxed_vars.contains(id)
+                && ctx.stable_local_type_proof(id).is_some_and(|ty| {
+                    matches!(ty, HirType::Union(types) if !types.is_empty()
+                        && types.iter().all(|ty| matches!(ty, HirType::Number | HirType::Void)))
+                })
+        }
+        _ => super::ta_element_read::byte_read_is_numeric(ctx, expr),
+    }
+}
+
 /// Normalize Perry's compact INT32 immediate to an ordinary IEEE double.
 /// Every other bit pattern is left unchanged. That makes a subsequent `fcmp`
 /// exact for an arbitrary JS value against a proven Number: non-number tags
@@ -678,37 +700,65 @@ fn normalize_int32_immediate(ctx: &mut FnCtx<'_>, value: &str) -> String {
 
 /// Strict equality where exactly one operand is a proven Number.
 ///
-/// Compare raw double encodings, then compare the varying value's compact
-/// INT32 payload against the Number's exact integer encoding. Normalizing the
-/// varying operand first speculates an integer-to-double conversion even for
-/// ordinary doubles, extending byte-dependent loop recurrences. Encoding the
-/// proven operand leaves that conversion off the varying operand's dependency
-/// chain and folds away for constants. Saturation avoids poison for NaN,
-/// infinity and out-of-range Numbers; the round trip rejects those and fractions.
+/// An i32-proven operand needs one numeric comparison after compact INT32
+/// normalization. General Numbers keep the encoding comparison: encode the
+/// proven operand rather than converting the varying operand, preserving
+/// fractional byte-dependent recurrences. Saturation and the round trip reject
+/// NaN, infinity, out-of-range Numbers and fractions on the compact arm.
 fn lower_strict_eq_against_number(
     ctx: &mut FnCtx<'_>,
+    dynamic_expr: &Expr,
     op: CompareOp,
     l: &str,
     r: &str,
     dynamic_is_left: bool,
+    integer_operand: bool,
 ) -> String {
+    let plain = is_plain_number_or_undefined(ctx, dynamic_expr);
+    // Raw checked bytes must not take compact-integer normalization. Keep
+    // this admission compatible with main's integer-operand emitter.
+    let integer_operand = integer_operand && !plain;
+    let _ = integer_operand;
     let (dynamic, number) = if dynamic_is_left { (l, r) } else { (r, l) };
+    if integer_operand {
+        let dynamic = normalize_int32_immediate(ctx, dynamic);
+        let number = normalize_int32_immediate(ctx, number);
+        let predicate = if matches!(op, CompareOp::Ne) {
+            "une"
+        } else {
+            "oeq"
+        };
+        let bit = ctx.block().fcmp(predicate, &dynamic, &number);
+        let tagged = ctx.block().select(
+            I1,
+            &bit,
+            I64,
+            crate::nanbox::TAG_TRUE_I64,
+            crate::nanbox::TAG_FALSE_I64,
+        );
+        return ctx.block().bitcast_i64_to_double(&tagged);
+    }
     let number = normalize_int32_immediate(ctx, number);
     let number = number.as_str();
     let bits = ctx.block().bitcast_double_to_i64(dynamic);
-    let tag = ctx.block().lshr(I64, &bits, "48");
-    let is_i32 = ctx
-        .block()
-        .icmp_eq(I64, &tag, crate::nanbox::INT32_TAG_TOP16_I64);
-    let integer = ctx
-        .block()
-        .call(I32, "llvm.fptosi.sat.i32.f64", &[(DOUBLE, number)]);
-    let roundtrip = ctx.block().sitofp(I32, &integer, DOUBLE);
-    let exact = ctx.block().fcmp("oeq", &roundtrip, number);
-    let payload = ctx.block().trunc(I64, &bits, I32);
-    let same_integer = ctx.block().icmp_eq(I32, &payload, &integer);
-    let compact = ctx.block().and(I1, &is_i32, &exact);
-    let compact = ctx.block().and(I1, &compact, &same_integer);
+    let compact = if plain {
+        None
+    } else {
+        let tag = ctx.block().lshr(I64, &bits, "48");
+        let is_i32 = ctx
+            .block()
+            .icmp_eq(I64, &tag, crate::nanbox::INT32_TAG_TOP16_I64);
+        let integer = ctx
+            .block()
+            .call(I32, "llvm.fptosi.sat.i32.f64", &[(DOUBLE, number)]);
+        let roundtrip = ctx.block().sitofp(I32, &integer, DOUBLE);
+        let exact = ctx.block().fcmp("oeq", &roundtrip, number);
+        let payload = ctx.block().trunc(I64, &bits, I32);
+        let same_integer = ctx.block().icmp_eq(I32, &payload, &integer);
+        let compact = ctx.block().and(I1, &is_i32, &exact);
+        let compact = ctx.block().and(I1, &compact, &same_integer);
+        Some(compact)
+    };
     // Raw doubles compare by bits, except that both signed zeros are equal and
     // NaN is unequal to itself. Keeping the NaN check on the proven operand
     // avoids a floating-point round trip through the varying value as well.
@@ -722,7 +772,10 @@ fn lower_strict_eq_against_number(
     let raw = ctx.block().or(I1, &same_bits, &both_zero);
     let ordered = ctx.block().fcmp("oeq", number, number);
     let raw = ctx.block().and(I1, &raw, &ordered);
-    let equal = ctx.block().or(I1, &raw, &compact);
+    let equal = match compact {
+        Some(compact) => ctx.block().or(I1, &raw, &compact),
+        None => raw,
+    };
     let bit = if matches!(op, CompareOp::Ne) {
         ctx.block().xor(I1, &equal, "true")
     } else {
@@ -1773,10 +1826,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if matches!(op, CompareOp::Eq | CompareOp::Ne) && exactly_one_numeric {
                     return Ok(lower_strict_eq_against_number(
                         ctx,
+                        if left_numeric { right } else { left },
                         *op,
                         &l,
                         &r,
                         !left_numeric,
+                        matches!(if left_numeric { left.as_ref() } else { right.as_ref() },
+                            Expr::Integer(n) if i32::try_from(*n).is_ok())
+                            || matches!(if left_numeric { left.as_ref() } else { right.as_ref() },
+                                Expr::Number(n) if n.is_finite() && n.fract() == 0.0
+                                    && *n >= i32::MIN as f64 && *n <= i32::MAX as f64)
+                            || super::i32_fast_path::is_known_i32_range(
+                                ctx,
+                                if left_numeric { left } else { right },
+                            ),
                     ));
                 }
                 if is_relational_op && !both_numeric {

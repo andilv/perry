@@ -183,10 +183,12 @@ impl LlModule {
     /// general-dynamic `__tls_get_addr` call that the register allocator
     /// treated as a call clobbering every caller-saved register.
     ///
-    /// Every definition and declaration still at the default
-    /// (general-dynamic) model is rewritten; a runtime thread-local declared
-    /// with the model its definition needs (`PERRY_AGENT_PTRS` is
-    /// `initialexec`) keeps it. The model is written into the module itself,
+    /// Every definition and declaration is rewritten, the runtime's own
+    /// thread-locals included: the runtime archive is linked into the same
+    /// executable, so `PERRY_AGENT_PTRS` (declared `initialexec`, the model
+    /// any other output may use) sits at a fixed offset in the same static
+    /// TLS block, and its stack-limit slot folds into the prologue's compare
+    /// (`expr/stack_guard.rs`). The model is written into the module itself,
     /// so the IR text (and the object-cache key derived from it) states it,
     /// and an emitter running on another thread needs no outside input.
     pub(crate) fn use_local_exec_tls(&mut self) {
@@ -199,6 +201,18 @@ impl LlModule {
             if let Some(rewritten) = crate::module::linkage::with_local_exec_tls(line) {
                 *line = rewritten;
             }
+        }
+    }
+
+    /// Let the backend read 64-bit NaN-box operands from the runtime's
+    /// operand table rather than encode them as immediates
+    /// (`inprocess/nanbox_operands.rs`). Only for an image the runtime archive
+    /// is linked into: the table is referenced `hidden`. Marks every function
+    /// the module defines; the mark is a function attribute, so each emitted
+    /// unit states it in its own IR.
+    pub(crate) fn read_nanbox_operands_from_runtime(&mut self) {
+        for f in &mut self.functions {
+            f.nanbox_operands = true;
         }
     }
 
@@ -355,6 +369,18 @@ impl LlModule {
         func.set_null_guard_global(&self.null_guard_global());
         self.functions.push(func);
         self.functions.last_mut().unwrap()
+    }
+
+    /// Publish one shared cold lowering per module, keeping the caller's
+    /// existing per-site cache as an explicit argument.
+    pub(crate) fn add_outlined_helper(&mut self, func: LlFunction) {
+        if !self.defined_names.insert(func.name.clone()) {
+            return;
+        }
+        func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
+        func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_null_guard_global(&self.null_guard_global());
+        self.functions.push(func);
     }
 
     /// Record a fact about `body`, a JS body this module defines, in its

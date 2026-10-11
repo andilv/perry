@@ -1,3 +1,8 @@
+mod region_class;
+pub(crate) use region_class::{
+    classify_heap_generation, classify_heap_space_in_range, classify_region_ownership,
+    uniform_heap_generation,
+};
 mod maintenance;
 pub(crate) use maintenance::shrink_page_tables;
 
@@ -11,6 +16,18 @@ pub(crate) const GENERATION_PAGE_SHIFT: usize = 12;
 // churn before the first GC.
 pub(crate) const GENERATION_CLASS_SHIFT: usize = 20;
 pub(crate) const GENERATION_PAGE_SIZE: usize = 1 << GENERATION_PAGE_SHIFT;
+
+/// Which heap owns an address, from arena region metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegionOwnership {
+    /// A live region of this thread's heap.
+    Current,
+    /// A live region of another thread's heap. Every native thread owns its
+    /// heap and its collector; this collector never marks or moves it.
+    OtherHeap,
+    /// Not in any live arena region this thread can attribute.
+    Outside,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapGeneration {
@@ -419,6 +436,13 @@ pub(crate) fn register_block_space_with_object_starts(
     if base == 0 || size == 0 || matches!(generation, HeapGeneration::Unknown) {
         return;
     }
+    #[cfg(target_os = "linux")]
+    if super::region::reservation::set_space(base, size, space, Some(object_starts as usize)) {
+        if matches!(generation, HeapGeneration::Old) {
+            register_old_block_pages(base, size);
+        }
+        return;
+    }
     let end = base + size;
     let range = PageGenerationRange {
         base,
@@ -504,6 +528,13 @@ fn retag_block_space_inner(
     register_old_pages: bool,
 ) {
     if base == 0 || size == 0 || matches!(generation, HeapGeneration::Unknown) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if super::region::reservation::set_space(base, size, space, None) {
+        if register_old_pages && matches!(generation, HeapGeneration::Old) {
+            register_old_block_pages(base, size);
+        }
         return;
     }
     let end = base + size;
@@ -795,6 +826,18 @@ pub(crate) fn unregister_block_generation(base: usize, size: usize) {
     if base == 0 || size == 0 {
         return;
     }
+    #[cfg(target_os = "linux")]
+    if let Some(generation) = super::region::reservation::owned_generation(base) {
+        let was_old = generation == HeapGeneration::Old;
+        super::region::reservation::set_space(base, size, HeapSpace::Unknown, Some(0));
+        if was_old {
+            let pages: Vec<usize> = (generation_page_for_addr(base)
+                ..=generation_page_for_addr(base + size - 1))
+                .collect();
+            unregister_old_block_pages(&pages);
+        }
+        return;
+    }
     let end = base + size;
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
@@ -851,8 +894,10 @@ pub(crate) fn unregister_block_generation(base: usize, size: usize) {
 /// call paid its own `_tlv_get_addr`. Out-of-lining the miss lets the hit arm
 /// inline, and LLVM then CSEs the one remaining hot-TLS resolution across
 /// every classification in the barrier.
+
+#[cfg(any(not(target_os = "linux"), test))]
 #[inline(always)]
-pub(crate) fn classify_heap_generation(addr: usize) -> HeapGeneration {
+fn legacy_classify_heap_generation(addr: usize) -> HeapGeneration {
     if addr == 0 {
         return HeapGeneration::Unknown;
     }
@@ -874,7 +919,9 @@ pub(crate) fn classify_heap_generation(addr: usize) -> HeapGeneration {
 /// across registrations). A whole arena block is registered as one range, so
 /// this answers "what generation is this block" without classifying each
 /// object on it.
-pub(crate) fn uniform_heap_generation(base: usize, end: usize) -> Option<HeapGeneration> {
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn legacy_uniform_heap_generation(base: usize, end: usize) -> Option<HeapGeneration> {
     if base == 0 || end <= base {
         return None;
     }
@@ -889,6 +936,7 @@ pub(crate) fn uniform_heap_generation(base: usize, end: usize) -> Option<HeapGen
 /// Cache-miss arm of [`classify_heap_generation`]: consult the page map and
 /// re-prime the one-entry cache.
 #[inline(never)]
+#[cfg(any(not(target_os = "linux"), test))]
 fn classify_heap_generation_uncached(addr: usize, key: usize) -> HeapGeneration {
     let found = {
         let pages = hot_page_generations().borrow();
@@ -925,8 +973,10 @@ pub(crate) fn classify_heap_space(addr: usize) -> HeapSpace {
 /// the cache base. This one is the copying minor's inner loop —
 /// `CopyingPointerSet::classify_arena` calls it once per visited slot — so on a
 /// promotion-heavy cycle it runs millions of times per collection.
+
+#[cfg(any(not(target_os = "linux"), test))]
 #[inline(always)]
-pub(crate) fn classify_heap_space_in_range(addr: usize) -> Option<(HeapSpace, usize, *mut u64)> {
+fn legacy_classify_heap_space_in_range(addr: usize) -> Option<(HeapSpace, usize, *mut u64)> {
     if addr == 0 {
         return None;
     }
@@ -940,6 +990,7 @@ pub(crate) fn classify_heap_space_in_range(addr: usize) -> Option<(HeapSpace, us
 
 /// Cache-miss arm of [`classify_heap_space_in_range`].
 #[inline(never)]
+#[cfg(any(not(target_os = "linux"), test))]
 fn classify_heap_space_in_range_uncached(
     addr: usize,
     key: usize,
@@ -960,6 +1011,11 @@ fn classify_heap_space_in_range_uncached(
 /// avoid this metadata write on their bump-allocation path.
 #[inline(always)]
 pub(crate) fn record_arena_object_start(header_addr: usize, obj_type: u8) {
+    #[cfg(target_os = "linux")]
+    if obj_type == crate::gc::GC_TYPE_NATIVE_HANDLE {
+        super::region::reservation::note_payload_cell(header_addr);
+    }
+
     if !matches!(
         obj_type,
         crate::gc::GC_TYPE_MAP
@@ -1695,8 +1751,21 @@ pub(crate) fn old_arena_walk_objects_on_pages(
     pages: &crate::fast_hash::PtrHashSet<usize>,
     mut callback: impl FnMut(*mut u8),
 ) -> usize {
+    let headers = old_arena_headers_on_pages(pages);
+    let count = headers.len();
+    for header_addr in headers {
+        callback(header_addr as *mut u8);
+    }
+    count
+}
+
+/// Snapshot the unique owners on these pages before any visitor mutates the
+/// heap. Collectors may use its length to bound their own coverage bookkeeping.
+pub(crate) fn old_arena_headers_on_pages(
+    pages: &crate::fast_hash::PtrHashSet<usize>,
+) -> Vec<usize> {
     if pages.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     // #7624 READER: promotions land in old-gen mid-cycle (a copying minor's
@@ -1706,26 +1775,32 @@ pub(crate) fn old_arena_walk_objects_on_pages(
     // RUN READER: a promoted page's list is built on demand.
     materialize_promoted_page_runs(pages.iter().copied());
 
+    // The index contains an object once on EVERY page its body overlaps.
+    // Visit selected pages in address order: if a header starts on or before
+    // the preceding selected page, this object was already emitted there.
+    // This removes the per-object exact set and its rehashes. The page index
+    // remains the single authority, including for objects spanning clean gaps.
+    let mut ordered_pages: Vec<_> = pages.iter().copied().collect();
+    ordered_pages.sort_unstable();
     let mut headers = Vec::new();
-    let mut seen = crate::fast_hash::new_ptr_hash_set();
     OLD_GEN_PAGE_OBJECTS.with(|index| {
         let index = index.borrow();
-        for page in pages {
-            if let Some(page_headers) = index.get(page) {
-                for header_addr in page_headers.iter(*page) {
-                    if seen.insert(header_addr) {
+        let mut previous_page = None;
+        for page in ordered_pages {
+            if let Some(page_headers) = index.get(&page) {
+                for header_addr in page_headers.iter(page) {
+                    if previous_page
+                        .is_none_or(|previous| generation_page_for_addr(header_addr) > previous)
+                    {
                         headers.push(header_addr);
                     }
                 }
             }
+            previous_page = Some(page);
         }
     });
 
-    let count = headers.len();
-    for header_addr in headers {
-        callback(header_addr as *mut u8);
-    }
-    count
+    headers
 }
 
 pub(crate) struct OldArenaPageObjectCursor {

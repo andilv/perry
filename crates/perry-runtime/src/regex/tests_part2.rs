@@ -190,7 +190,7 @@ fn exec_from(
     last_index: usize,
 ) -> Option<(String, f64, usize)> {
     let re = js_regexp_new(make_string(pattern), make_string(flags));
-    store_last_index_number(re, last_index);
+    set_last_index(re, last_index as f64);
     let arr = js_regexp_exec(re, make_string(subject));
     if arr.is_null() {
         assert_eq!(
@@ -309,25 +309,25 @@ fn stateful_test_reports_the_same_answer_as_exec() {
     // `test` routes global/sticky through `exec`; these are the rows where a
     // sliced haystack flipped the boolean.
     let sticky_anchor = js_regexp_new(make_string("^b"), make_string("y"));
-    store_last_index_number(sticky_anchor, 1);
+    set_last_index(sticky_anchor, 1.0);
     assert_eq!(js_regexp_test(sticky_anchor, make_string("ab")), 0);
 
     let global_anchor = js_regexp_new(make_string("^b"), make_string("g"));
-    store_last_index_number(global_anchor, 1);
+    set_last_index(global_anchor, 1.0);
     assert_eq!(js_regexp_test(global_anchor, make_string("ab")), 0);
 
     let behind = js_regexp_new(make_string("(?<=a)b"), make_string("g"));
-    store_last_index_number(behind, 1);
+    set_last_index(behind, 1.0);
     assert_eq!(js_regexp_test(behind, make_string("ab")), 1);
     assert_eq!(regex_last_index_offset(behind), 2);
 
     let past_end = js_regexp_new(make_string("a*"), make_string("g"));
-    store_last_index_number(past_end, 5);
+    set_last_index(past_end, 5.0);
     assert_eq!(js_regexp_test(past_end, make_string("ab")), 0);
 
     // A non-global, non-sticky regex ignores lastIndex entirely.
     let plain = js_regexp_new(make_string("^b"), make_string(""));
-    store_last_index_number(plain, 1);
+    set_last_index(plain, 1.0);
     assert_eq!(js_regexp_test(plain, make_string("ab")), 0);
     assert_eq!(regex_last_index_offset(plain), 1, "plain test leaves it be");
 }

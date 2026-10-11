@@ -651,7 +651,6 @@ pub(crate) unsafe fn rekey_stable_tombstone_shape_after_squeeze(
     record.live_inline_slot_count = live_inline_slot_count;
     record.semantic_generation = generation;
     record.hole_count = hole_count;
-    super::retire_cached_shape_object_kind(old_id);
     unsafe { table.slab_mut().insert(new_id, record) };
     let replaced = inner
         .families
@@ -1048,7 +1047,6 @@ fn rekey_predecessor_for_delete(
     record.semantic_generation = semantic_generation;
     record.hole_count = hole_count;
     record.set(RECORD_FLAG_FACTS_INDEXED, false);
-    super::retire_cached_shape_object_kind(predecessor);
     // SAFETY: as above.
     unsafe { table.slab_mut().insert(id, record) };
     let replaced = inner
@@ -1271,35 +1269,6 @@ pub(crate) fn shape_descriptor_keys_slot(shape_id: u32) -> Option<*mut u64> {
         .slab()
         .record_ptr(shape_id)
         .map(|record| record as *mut u64)
-}
-
-/// Is `slot` the shared `keys` word of `shape_id`'s descriptor record?
-///
-/// #8112: that word is a TABLE root, not a slot any receiver owns. Every
-/// sibling of the shape enumerates it, so a rewrite performed while tracing
-/// one receiver silently changes the edge of every other — including old
-/// receivers a minor never visits, for which no per-parent remembered-set page
-/// could ever be armed. The remembered-set and old→young verification paths
-/// therefore skip it and let the shape table's own root scanner cover it.
-#[inline]
-pub(crate) fn shape_id_owns_keys_slot(shape_id: u32, slot: *mut u64) -> bool {
-    if !super::is_shape_id(shape_id) {
-        return false;
-    }
-    // No table borrow at all: this runs inside collector walks, and a
-    // `RefCell` borrow here would make the predicate itself a re-entrancy
-    // hazard. The slab is read through a raw pointer.
-    crate::state::state()
-        .shapes
-        .slab()
-        .record_ptr(shape_id)
-        .is_some_and(|record| {
-            // The keys word is the record's first field; the identity's
-            // [[Prototype]] word (`shapes_prototype`) is the same kind of
-            // shared edge.
-            record as *mut u64 == slot
-                || super::identity_word_slot(unsafe { (*record).proto_id }) == Some(slot)
-        })
 }
 
 #[cfg(test)]

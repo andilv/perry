@@ -7,7 +7,6 @@ use super::*;
 
 use anyhow::{anyhow, Result};
 
-use perry_hir::types::Type as HirType;
 use perry_hir::{BinaryOp, Expr, UnaryOp};
 
 use crate::types::{I32, I64, PTR};
@@ -26,8 +25,9 @@ use crate::types::{I32, I64, PTR};
 /// pointer at all (top-level functions/methods).
 pub(crate) fn try_current_closure_ptr_value(ctx: &mut FnCtx<'_>) -> Option<String> {
     if let Some(slot) = ctx.current_closure_slot.clone() {
-        let bits = ctx.block().load(I64, &slot);
-        return Some(ctx.block().and(I64, &bits, crate::nanbox::POINTER_MASK_I64));
+        // The slot is an `i64` root home holding the raw closure pointer
+        // (`codegen/closure.rs`); its reload is already decoded.
+        return Some(ctx.block().load(I64, &slot));
     }
     ctx.current_closure_ptr.clone()
 }
@@ -65,18 +65,13 @@ pub(crate) fn expr_is_known_non_pointer_shadow_value(ctx: &FnCtx<'_>, expr: &Exp
             // `local_is_inert_primitive` never listed `Symbol`; this copy and
             // `collectors/pointer_locals.rs` were the two that did.
             //
-            // Derived from the one definition rather than restated, but kept
-            // NON-`Union` on purpose: `type_is_pointer_bearing` answers `false`
-            // for an all-scalar union (`number | undefined`), which would
-            // WIDEN this suppression to locals it never covered. That is a
-            // plausible optimisation and an unmeasured one; it is not this
-            // change. The guard makes the arm exactly the old list minus
-            // `Symbol`.
+            // Only scoped dataflow proofs enter this map. A scalar union,
+            // including the checked byte read's Number-or-undefined result,
+            // has no heap edge either.
             !ctx.shadow_slot_map.contains_key(id)
-                && ctx.stable_local_type_proof(id).is_some_and(|ty| {
-                    !matches!(ty, HirType::Union(_))
-                        && !crate::typed_shape::type_is_pointer_bearing(ty)
-                })
+                && ctx
+                    .stable_local_type_proof(id)
+                    .is_some_and(|ty| !crate::typed_shape::type_is_pointer_bearing(ty))
         }
         Expr::Compare { .. } | Expr::Void(_) => true,
         Expr::Unary { op, operand } => match op {
@@ -111,6 +106,7 @@ pub(crate) fn expr_is_known_non_pointer_shadow_value(ctx: &FnCtx<'_>, expr: &Exp
                 object.as_ref(),
                 Expr::LocalGet(arr_id) if packed_loop_counter_read_is_numeric(ctx, *arr_id, index)
             ) || super::is_proven_u32_view_read(ctx, expr)
+                || super::ta_element_read::byte_read_is_numeric(ctx, expr)
         }
         // Checked byte reads can use boxed property lookup on a lying
         // receiver. Only construction/B4 admission plus a numeric key
@@ -242,6 +238,9 @@ pub(crate) fn enable_persistent_shadow_slot_for_array_alias(
     local_id: u32,
     init: &Expr,
 ) {
+    if expr_is_known_non_pointer_shadow_value(ctx, init) {
+        return;
+    }
     let Expr::IndexGet { object, .. } = init else {
         return;
     };

@@ -274,12 +274,6 @@ pub extern "C" fn js_object_delete_field(
                             return 0;
                         }
                     }
-                    // Deleting an accessor from a class/Object prototype changes
-                    // method resolution for this key just like installing it.
-                    super::descriptor_state::invalidate_prototype_descriptor_guards(
-                        obj as usize,
-                        name,
-                    );
                     super::clear_accessor_descriptor(obj as usize, name);
                     super::clear_property_attrs(obj as usize, name);
                     // defineProperty may ALSO have planted a keys_array
@@ -317,9 +311,16 @@ pub extern "C" fn js_object_delete_field(
                     {
                         return 0;
                     }
-                    if name == "constructor"
-                        || super::class_registry::class_own_accessor_ptrs(cid, name).is_some()
-                        || super::native_module::class_has_own_method(cid, name)
+                    // An evaluation owns physical keys on this object. It
+                    // must not query or materialize the canonical holder of
+                    // its template merely to delete one of those keys.
+                    if super::field_get_set::class_evaluation_prototype_class_id(obj as usize)
+                        .is_none()
+                        && (name == "constructor"
+                            || super::key_attrs::object_key_entry(obj, name.as_bytes())
+                                & super::key_attrs::ENTRY_ACCESSOR
+                                != 0
+                            || super::native_module::class_has_own_method(cid, name))
                     {
                         // The member's storage is this object's key (removed
                         // by the scan below) plus, for a runtime prototype
@@ -327,21 +328,14 @@ pub extern "C" fn js_object_delete_field(
                         // evaluation's prototype (`ClassExprFresh`) owns its
                         // members alone: the template's records belong to
                         // every evaluation, so they stay.
-                        if super::field_get_set::class_evaluation_prototype_class_id(obj as usize)
-                            .is_none()
-                        {
-                            // The shared class may itself be the first
-                            // evaluation (#11759 c′). Its live key is deleted,
-                            // but later evaluations still start from ClassBody.
-                            if !super::class_value::class_value_is_first_evaluation(cid) {
-                                super::class_registry::invalidate_class_string_member_order(
-                                    cid, name, false,
-                                );
-                            }
+                        // The shared class may itself be the first
+                        // evaluation (#11759 c′). Its live key is deleted,
+                        // but later evaluations still start from ClassBody.
+                        if !super::class_value::class_value_is_first_evaluation(cid) {
+                            super::class_registry::invalidate_class_string_member_order(
+                                cid, name, false,
+                            );
                         }
-                        super::class_registry::invalidate_class_prototype_fast_guards_for_method(
-                            name,
-                        );
                         crate::typed_feedback::invalidate_method_change(cid);
                         // Methods and (S2) accessors are physical keys: fall
                         // through so the scan below removes the key.
@@ -387,9 +381,6 @@ pub extern "C" fn js_object_delete_field(
                     // must not govern a later assignment that recreates it.
                     super::clear_property_attrs(obj as usize, name);
                 }
-                // A configurable data method on a class/Object prototype is about
-                // to disappear. Retire only this name's direct-method guards.
-                super::descriptor_state::invalidate_prototype_descriptor_guards(obj as usize, name);
             }
         }
 

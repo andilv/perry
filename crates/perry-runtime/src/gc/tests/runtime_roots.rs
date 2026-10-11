@@ -16,6 +16,7 @@ mod hidden_keys;
 mod hook_dispatch_handles;
 mod interned_string_caches;
 mod iter_result_keys;
+mod iterator_helper_roots;
 mod json_construction;
 mod json_key_lifetime;
 mod json_record_output;
@@ -63,6 +64,7 @@ mod perex_strings;
 #[cfg(feature = "regex-engine")]
 mod perex_work_policy;
 mod prototype_addr_cache;
+mod regexp_birth_shape;
 mod regexp_last_index;
 mod segment_record_keys;
 mod side_table_scanners;
@@ -208,7 +210,9 @@ fn test_scoped_root_scanner_registry_guard_restores_counts() {
         register_runtime_handle_root_scanner_for_tests();
         let during = root_scanner_registry_counts();
         assert_eq!(during.0, before.0 + 1);
-        assert_eq!(during.1, before.1 + 1);
+        // The guard starts the mutable registry from its one runtime-cache
+        // scanner (the intrinsic prototype addresses), then the handle scanner.
+        assert_eq!(during.1, 2);
         assert_eq!(during.2, before.2);
         assert_eq!(during.3, before.3);
     }
@@ -344,7 +348,7 @@ fn test_rewrite_mutable_root_slots_updates_shadow_and_global_roots() {
     let shadow = js_shadow_frame_push(1);
     js_shadow_slot_set(0, shadow_bits);
 
-    let mut global_bits = nursery_user as u64;
+    let mut global_bits = POINTER_TAG | (nursery_user as u64 & POINTER_MASK);
     js_gc_register_global_root((&mut global_bits as *mut u64) as i64);
 
     rewrite_mutable_root_slots(&valid_ptrs, None);
@@ -355,7 +359,8 @@ fn test_rewrite_mutable_root_slots_updates_shadow_and_global_roots() {
         "shadow stack slot should be rewritten to the forwarding target"
     );
     assert_eq!(
-        global_bits, old_user as u64,
+        global_bits,
+        POINTER_TAG | (old_user as u64 & POINTER_MASK),
         "registered global root slot should be rewritten in place"
     );
 

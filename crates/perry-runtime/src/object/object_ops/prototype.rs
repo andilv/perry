@@ -60,24 +60,26 @@ pub extern "C" fn js_get_global_this_builtin_value(name_ptr: *const u8, name_len
 /// Object.create(proto) — create an empty object with an owner-traced prototype.
 #[no_mangle]
 pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
-    // Keep the existing accepted prototype kinds, but store their identity on
-    // the instance instead of permanently rooting them under a new class id.
-    let valid = crate::proxy::js_proxy_is_proxy(proto_value) != 0
-        || crate::typedarray_props::typed_array_addr_from_value(proto_value).is_some()
-        || {
-            let value = crate::value::JSValue::from_bits(proto_value.to_bits());
-            if value.is_pointer() {
-                let ptr = value.as_pointer::<ObjectHeader>();
-                let addr = ptr as usize;
-                crate::value::addr_class::is_above_handle_band(addr)
-                    && !crate::set::is_registered_set(addr)
-                    && !crate::map::is_registered_map(addr)
-                    && is_valid_obj_ptr(ptr as *const u8)
-            } else {
-                false
-            }
-        };
-    if !valid {
+    let proto_value = unsafe { normalize_descriptor_operand(proto_value) };
+    // #2816 prototype validation: only an object or `null` is permitted. A
+    // Symbol is pointer-tagged but not an object, so reject it explicitly.
+    let proto_jv = crate::value::JSValue::from_bits(proto_value.to_bits());
+    let proto_is_symbol = unsafe { crate::symbol::js_is_symbol(proto_value) != 0 };
+    let proto_ok = proto_jv.is_null()
+        || crate::proxy::js_proxy_is_proxy(proto_value) != 0
+        || (!proto_is_symbol
+            && (unsafe { value_is_object_like(proto_value) }
+                || super::class_ref_id(proto_value).is_some()));
+    if !proto_ok {
+        // V8 renders the offending value: `... an Object or null: 5`.
+        let rendered = unsafe { describe_value_for_type_error(proto_value) };
+        throw_object_type_error_with_suffix(
+            "Object prototype may only be an Object or null: ",
+            &rendered,
+        );
+    }
+
+    if proto_jv.is_null() {
         return crate::value::js_nanbox_pointer(js_object_alloc_null_proto(0, 0) as i64);
     }
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -97,9 +99,17 @@ pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
             None
         }
     };
-    let birth_width = serial.map_or(0, crate::object::shapes::keyless_birth_width);
+    let birth = serial.map_or_else(crate::object::shapes::KeylessBirth::untracked, |proto_id| {
+        // Marking may move the prototype; read its producer ShapeId
+        // through the rooted value now, and carry only that scalar.
+        let value = crate::value::JSValue::from_bits(proto.get_nanbox_u64());
+        let producer = unsafe {
+            crate::object::shapes::object_shape_stamp(value.as_pointer::<ObjectHeader>())
+        };
+        crate::object::shapes::keyless_birth_width(proto_id, producer)
+    });
     let proto_id = serial.unwrap_or_else(crate::object::shapes::fresh_unique_proto_id);
-    let born = crate::object::alloc_basic::object_alloc_created(&proto, proto_id, birth_width);
+    let born = crate::object::alloc_basic::object_alloc_created(&proto, proto_id, birth);
     crate::value::js_nanbox_pointer(born as i64)
 }
 
@@ -172,24 +182,47 @@ fn net_socket_prototype_value() -> f64 {
 }
 
 /// The resolution itself; see [`js_object_get_prototype_of`].
-/// `%Object.prototype%` for an ordinary object whose ShapeId records the
-/// default [[Prototype]] link and agrees with the object's own state, else
-/// `None`. Allocation-free.
+/// The ordinary shape's resolved [[Prototype]] link. Structural writes mint
+/// successor shapes, so rediscovering this identity through class metadata
+/// cannot strengthen its proof. A missing realm default needs lazy resolution.
 ///
 /// # Safety
 /// `obj` is a live `GC_TYPE_OBJECT` cell.
-unsafe fn default_link_prototype(obj: *const ObjectHeader) -> Option<f64> {
-    use crate::object::shapes::{object_proto_id, object_shape_stamp, shape_proto_id};
-    let stamp = object_shape_stamp(obj);
-    if stamp == 0
-        || shape_proto_id(stamp) != Some(crate::object::shapes::PROTO_ID_DEFAULT)
-        || object_proto_id(obj) != crate::object::shapes::PROTO_ID_DEFAULT
+unsafe fn shape_link_prototype(obj: *const ObjectHeader, default_only: bool) -> Option<f64> {
+    use crate::object::shapes as s;
+    let record = s::shape_record_by_id(s::object_shape_stamp(obj))?;
+    if !record.object_kind().is_ordinary_layout() || record.weak_collection_brand().is_some() {
+        return None;
+    }
+    let pid = record.proto_id();
+    if default_only && pid != s::PROTO_ID_DEFAULT {
+        return None;
+    }
+    let header = crate::gc::header_from_trusted_user_ptr(obj.cast());
+    if (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        || (*header)._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
     {
         return None;
+    }
+    if pid == s::PROTO_ID_NULL {
+        return Some(f64::from_bits(crate::value::TAG_NULL));
+    }
+    if pid != s::PROTO_ID_DEFAULT {
+        if pid >= s::PROTO_ID_CLASS {
+            return None;
+        }
+        let word = s::object_prototype_word(obj);
+        return (word != 0).then_some(f64::from_bits(word));
     }
     let proto = crate::array::object_prototype_addr_if_resolved();
     (proto != 0 && proto != obj as usize)
         .then(|| f64::from_bits(crate::value::js_nanbox_pointer(proto as i64).to_bits()))
+}
+
+// Only the realm default may bypass js_object_get_prototype_of's exposure
+// publication. Serial links (notably iterator prototypes) use its full exit.
+unsafe fn default_link_prototype(obj: *const ObjectHeader) -> Option<f64> {
+    shape_link_prototype(obj, true)
 }
 
 pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
@@ -201,6 +234,23 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
         let jv = crate::value::JSValue::from_bits(obj_value.to_bits());
         if jv.is_null() || jv.is_undefined() {
             throw_object_type_error(b"Cannot convert undefined or null to object");
+        }
+        if jv.is_pointer() {
+            let addr = jv.as_pointer::<ObjectHeader>();
+            if crate::value::addr_class::is_plausible_heap_addr(addr as usize) {
+                // Rule 3: a live ordinary ShapeId proves this cell's layout.
+                // Arrays, closures, handles, class and exotic identities
+                // decline without consulting their registries on this arm.
+                let id = unsafe { (*addr).parent_class_id };
+                if id.wrapping_sub(crate::object::shapes::SHAPE_ID_BASE)
+                    < crate::object::shapes::DICTIONARY_SHAPE_ID_BASE
+                        - crate::object::shapes::SHAPE_ID_BASE
+                {
+                    if let Some(proto) = unsafe { shape_link_prototype(addr, false) } {
+                        return proto;
+                    }
+                }
+            }
         }
     }
     // A Proxy is a small registered id, NOT a heap object — the handle path
@@ -904,3 +954,6 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
     }
     f64::from_bits(TAG_NULL)
 }
+
+#[cfg(test)]
+mod shape_link_tests;

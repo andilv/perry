@@ -284,7 +284,9 @@ fn store_parts(line: &str) -> Option<(&str, &str)> {
 }
 
 fn is_clear(line: &str) -> bool {
-    line.starts_with("store i64 0,") || line.starts_with("store ptr addrspace(1) null,")
+    line.starts_with("store i64 0,")
+        || line.starts_with("store double 0.0,")
+        || line.starts_with("store ptr addrspace(1) null,")
 }
 
 fn derives_from(ir: &str, value: &str, ancestor: &str, depth: usize) -> bool {
@@ -935,7 +937,11 @@ fn imported_constructor_receiver_refreshes_after_initializers_and_call_preparati
                 let allocation = cfg
                     .sites()
                     .into_iter()
-                    .find(|site| site.text.contains(" = call i64 @js_object_alloc_class_"))
+                    .find(|site| {
+                        site.text.contains(" = call i64 @js_object_alloc_class_")
+                            || (site.label.starts_with("alloc.merge")
+                                && site.text.contains(" = ptrtoint ptr "))
+                    })
                     .expect("fixture must allocate a class instance");
                 let allocated = allocation.text.split_once(" = ").unwrap().0;
                 let publications: Vec<_> = cfg

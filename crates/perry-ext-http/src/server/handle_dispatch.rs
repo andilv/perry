@@ -177,6 +177,19 @@ extern "C" {
 /// misroute.
 #[no_mangle]
 pub extern "C" fn js_ext_http_server_is_handle(handle: i64) -> i32 {
+    // These three server families still own numeric FFI ids. A heap receiver
+    // cannot be one of them; reject it from the value's encoding before any
+    // registry probe. Server object conversion must replace the positive arm
+    // with its class/native-state brand at the same time as the constructors.
+    #[cfg(test)]
+    let sabotage = std::env::var_os("PERRY_TEST_HTTP_SERVER_PROBE").is_some();
+    #[cfg(not(test))]
+    let sabotage = false;
+    if (handle as usize) >= perry_ffi::RECEIVER_HANDLE_FLOOR && !sabotage {
+        return 0;
+    }
+    #[cfg(test)]
+    SERVER_REGISTRY_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if get_handle::<HttpServer>(handle).is_some()
         || get_handle::<HttpsServer>(handle).is_some()
         || get_handle::<Http2SecureServer>(handle).is_some()
@@ -1019,7 +1032,7 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_method(
             // The socket closes immediately and an in-flight request gets a
             // reset, which is what Node's `socket.destroy()` does.
             if let Some((conn, _)) = turnloop {
-                crate::server::turnloop_serve::destroy_connection(conn);
+                crate::server::turnloop_route::destroy(&conn.root());
             }
             handle_to_pointer_f64(response_root.get())
         }
@@ -1210,11 +1223,6 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property(
         return bind_handle_method(response_root.get(), name);
     }
 
-    if let Some(v) = super::response_payload::closed_property(response_root.get(), &property) {
-        if v.to_bits() != TAG_UNDEFINED {
-            return v;
-        }
-    }
     match property.as_str() {
         "statusCode" => js_node_http_res_get_status(response_root.get()),
         "statusMessage" => js_node_http_res_get_status_message(response_root.get()),
@@ -1280,22 +1288,27 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property_set(
     let response_root = response_scope.root_addr(handle);
     let value_root = response_scope.root_nanbox(value);
     let property = method_name(property_ptr, property_len);
-    if super::response_payload::closed_property(response_root.get(), &property).is_some()
-        && matches!(
-            property.as_str(),
-            "statusCode" | "statusMessage" | "sendDate" | "strictContentLength" | "destroyed"
-        )
-    {
-        super::response_payload::set(response_root.get(), &property, value_root.get());
-        return 1;
-    }
     let value = value_root.get();
     match property.as_str() {
         "statusCode" => {
+            if super::response_payload::set_closed_property(
+                response_root.get(),
+                super::response_payload::Key::StatusCode,
+                value,
+            ) {
+                return 1;
+            }
             js_node_http_res_set_status(response_root.get(), number_arg(Some(value), 200.0));
             1
         }
         "statusMessage" => {
+            if super::response_payload::set_closed_property(
+                response_root.get(),
+                super::response_payload::Key::StatusMessage,
+                value,
+            ) {
+                return 1;
+            }
             let msg = string_value_arg(value);
             if !msg.is_null() {
                 js_node_http_res_set_status_message(response_root.get(), msg);
@@ -1303,14 +1316,35 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property_set(
             1
         }
         "sendDate" => {
+            if super::response_payload::set_closed_property(
+                response_root.get(),
+                super::response_payload::Key::SendDate,
+                value,
+            ) {
+                return 1;
+            }
             js_node_http_res_set_send_date(response_root.get(), value);
             1
         }
         "strictContentLength" => {
+            if super::response_payload::set_closed_property(
+                response_root.get(),
+                super::response_payload::Key::StrictContentLength,
+                value,
+            ) {
+                return 1;
+            }
             js_node_http_res_set_strict_content_length(response_root.get(), value);
             1
         }
         "destroyed" => {
+            if super::response_payload::set_closed_property(
+                response_root.get(),
+                super::response_payload::Key::Destroyed,
+                value,
+            ) {
+                return 1;
+            }
             if let Some(sr) = super::response::response_state_mut(response_root.get()) {
                 sr.destroyed = JsValue::from_bits(value.to_bits()).to_bool();
             }
@@ -1406,8 +1440,13 @@ fn response_socket_value(handle: i64) -> f64 {
         }
     }
     if let Some(sr) = super::response::response_state(handle) {
-        if sr.socket_handle != 0 {
-            return handle_to_pointer_f64(sr.socket_handle);
+        if let Some((crate::server::turnloop_route::ResponseConnection::Socket { owner, .. }, _)) =
+            sr.turnloop
+        {
+            return owner;
+        }
+        if !JsValue::from_bits(sr.socket_value.to_bits()).is_undefined() {
+            return sr.socket_value;
         }
     }
     let req_handle = unsafe { js_node_http_res_req_handle(handle) };
@@ -1421,16 +1460,18 @@ fn response_socket_value(handle: i64) -> f64 {
 #[cfg(test)]
 mod response_socket_tests {
     use super::*;
-    use crate::server::request::{
-        alloc_connection_socket, alloc_incoming_message, incoming_socket_assign,
-    };
+    use crate::server::request::{alloc_incoming_message, incoming_socket_assign};
     use perry_ffi::{drop_handle, register_handle};
     use std::collections::HashMap;
 
     #[test]
     fn response_socket_retains_initial_socket_after_request_reassignment() {
-        let socket_handle = alloc_connection_socket("127.0.0.1".into(), 1234);
-        let socket = handle_to_pointer_f64(socket_handle);
+        let scope = perry_ffi::TransientRootScope::enter();
+        let socket = scope.root_nanbox(perry_ext_net::native_transport::new_socket(
+            0,
+            f64::from_bits(TAG_UNDEFINED),
+        ));
+        let socket = socket.get();
         for _ in 0..2 {
             let request = alloc_incoming_message(IncomingMessage::new(
                 "GET".into(),
@@ -1443,10 +1484,7 @@ mod response_socket_tests {
             ));
             assert!(incoming_socket_assign(request, socket));
             let response = crate::server::response::alloc_http1_server_response_for_turnloop(
-                0,
-                0,
-                request,
-                socket_handle,
+                socket, 0, request,
             );
             assert_eq!(response_socket_value(response).to_bits(), socket.to_bits());
             assert!(incoming_socket_assign(request, 42.0));
@@ -1463,7 +1501,7 @@ mod response_socket_tests {
             socket.to_bits()
         );
         drop_handle(standalone);
-        drop_handle(socket_handle);
+        perry_ext_net::native_transport::destroy(socket);
     }
 
     #[test]
@@ -1715,5 +1753,37 @@ fn promise_rejected_server_not_running() -> f64 {
         );
         let reason = js_nanbox_pointer(err as i64);
         js_nanbox_pointer(js_promise_rejected(reason) as i64)
+    }
+}
+
+#[cfg(test)]
+static SERVER_REGISTRY_PROBES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+mod server_probe_tests {
+    use super::*;
+    #[test]
+    fn heap_receivers_do_not_probe_the_server_registry() {
+        let obj = perry_runtime::object::js_object_alloc(0, 0);
+        let before = SERVER_REGISTRY_PROBES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(js_ext_http_server_is_handle(obj as i64), 0);
+        assert_eq!(
+            SERVER_REGISTRY_PROBES.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "heap receiver must not probe the server registry"
+        );
+        let server = perry_ffi::register_handle(HttpServer::with_handler(0));
+        assert_eq!(js_ext_http_server_is_handle(server), 1);
+        assert!(perry_ffi::drop_handle(server));
+    }
+    #[test]
+    fn registry_probe_sabotage_reddens_the_heap_witness() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server::handle_dispatch::server_probe_tests::heap_receivers_do_not_probe_the_server_registry", "--nocapture"])
+            .env("PERRY_TEST_HTTP_SERVER_PROBE", "1").output().unwrap();
+        assert!(!out.status.success(), "registry-probe sabotage must fail");
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains("heap receiver must not probe the server registry"));
     }
 }

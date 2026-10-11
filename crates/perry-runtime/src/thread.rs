@@ -141,6 +141,7 @@
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
+#[cfg(test)]
 use crate::bigint::BIGINT_LIMBS;
 use crate::closure::{self, real_capture_count, ClosureHeader};
 use crate::gc;
@@ -272,8 +273,8 @@ pub enum SerializedValue {
     /// the receiving thread. Like `BoxedCapture`, only in capture position.
     ScopeCapture(Vec<SerializedValue>),
 
-    /// A BigInt: 16 x u64 limbs in little-endian order.
-    BigInt([u64; BIGINT_LIMBS]),
+    /// A BigInt: owned two's-complement limbs in little-endian order.
+    BigInt(Vec<u64>),
 
     /// A Date: its millisecond timestamp (may be NaN for an Invalid Date).
     /// Re-allocated as a fresh `DateCell` on the receiving thread (#2089) —
@@ -561,7 +562,7 @@ pub(crate) unsafe fn test_store_thread_object_field(
 
 #[cfg(test)]
 pub(crate) unsafe fn test_deserialize_bigint_limbs(limbs: [u64; BIGINT_LIMBS]) -> u64 {
-    deserialize_nanbox_on_current_thread(&SerializedValue::BigInt(limbs))
+    deserialize_nanbox_on_current_thread(&SerializedValue::BigInt(limbs.to_vec()))
 }
 
 /// Run image-local, string-only initialization on the current worker. This
@@ -760,6 +761,9 @@ unsafe fn parallel_map_impl(array_val: f64, closure_val: f64, literal_prepare: i
     // Charter step 5, P4: the worker installs the spawner's codegen ShapeIds
     // (with their reps) before any allocation; see `shapes_worker_seed`.
     let shape_seed = crate::object::shapes::worker_shape_seed();
+    // The worker's realm inherits the class definitions this agent sees
+    // evaluated (their computed member keys); see `inherited_evaluation`.
+    let inherited_classes = crate::object::inherited_evaluation::inherited_evaluations_for_spawn();
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(chunks.len());
 
@@ -768,6 +772,7 @@ unsafe fn parallel_map_impl(array_val: f64, closure_val: f64, literal_prepare: i
             let class_image = class_image.clone();
             let path_inits = path_inits.clone();
             let shape_seed = shape_seed.clone();
+            let inherited_classes = inherited_classes.clone();
 
             let handle = scope.spawn(move || {
                 crate::object::class_image::adopt_image(class_image);
@@ -783,6 +788,7 @@ unsafe fn parallel_map_impl(array_val: f64, closure_val: f64, literal_prepare: i
                 // and sweeps everything it just deserialized.
                 crate::gc::ensure_gc_initialized();
                 crate::object::shapes::install_worker_shape_seed(&shape_seed);
+                crate::object::inherited_evaluation::adopt_inherited_evaluations(inherited_classes);
                 unsafe { prepare_worker_literals(literal_prepare) };
                 let mut results = Vec::with_capacity(chunk.len());
 
@@ -1042,6 +1048,9 @@ unsafe fn parallel_filter_impl(array_val: f64, closure_val: f64, literal_prepare
     // Charter step 5, P4: the worker installs the spawner's codegen ShapeIds
     // (with their reps) before any allocation; see `shapes_worker_seed`.
     let shape_seed = crate::object::shapes::worker_shape_seed();
+    // The worker's realm inherits the class definitions this agent sees
+    // evaluated (their computed member keys); see `inherited_evaluation`.
+    let inherited_classes = crate::object::inherited_evaluation::inherited_evaluations_for_spawn();
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(chunks.len());
 
@@ -1050,6 +1059,7 @@ unsafe fn parallel_filter_impl(array_val: f64, closure_val: f64, literal_prepare
             let class_image = class_image.clone();
             let path_inits = path_inits.clone();
             let shape_seed = shape_seed.clone();
+            let inherited_classes = inherited_classes.clone();
 
             let handle = scope.spawn(move || {
                 // See parallel_map's worker: adopt the spawning image (#8546),
@@ -1062,6 +1072,7 @@ unsafe fn parallel_filter_impl(array_val: f64, closure_val: f64, literal_prepare
                 let worker_agent = crate::agent::enter_worker_agent();
                 crate::gc::ensure_gc_initialized();
                 crate::object::shapes::install_worker_shape_seed(&shape_seed);
+                crate::object::inherited_evaluation::adopt_inherited_evaluations(inherited_classes);
                 unsafe { prepare_worker_literals(literal_prepare) };
                 let mut kept = Vec::new();
 
@@ -1291,6 +1302,9 @@ unsafe fn spawn_impl(closure_val: f64, literal_prepare: i64) -> *mut crate::prom
     // Charter step 5, P4: the worker installs the spawner's codegen ShapeIds
     // (with their reps) before any allocation; see `shapes_worker_seed`.
     let shape_seed = crate::object::shapes::worker_shape_seed();
+    // The worker's realm inherits the class definitions this agent sees
+    // evaluated (their computed member keys); see `inherited_evaluation`.
+    let inherited_classes = crate::object::inherited_evaluation::inherited_evaluations_for_spawn();
 
     // ── 3. Spawn background thread ───────────────────────────────────
     ACTIVE_THREAD_JOBS.fetch_add(1, Ordering::SeqCst);
@@ -1305,6 +1319,7 @@ unsafe fn spawn_impl(closure_val: f64, literal_prepare: i64) -> *mut crate::prom
         // cross a GC trigger (see the parallel_map worker for rationale).
         crate::gc::ensure_gc_initialized();
         crate::object::shapes::install_worker_shape_seed(&shape_seed);
+        crate::object::inherited_evaluation::adopt_inherited_evaluations(inherited_classes);
         unsafe { prepare_worker_literals(literal_prepare) };
         // Reconstruct closure in this thread's arena, rooted across the
         // capture-deserialization allocations.

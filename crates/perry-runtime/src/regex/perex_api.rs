@@ -171,16 +171,15 @@ where
     Ok(bound)
 }
 
-/// Bind a whole heap string, in constant work when this header was validated
-/// before (#10166). The first binding decodes it; if that succeeds and its
-/// UTF-16 length matches the header, the header is marked
-/// `STRING_FLAG_WTF8_VALIDATED` and later bindings use `new_counted`.
+/// Bind a whole heap string in constant work when construction or a previous
+/// binding proved its encoding/count (#10166). Otherwise, checked binding
+/// establishes that same proof when its UTF-16 length matches the header.
 ///
 /// Perry strings are not all valid WTF-8 (raw Buffer and FFI payloads reach
 /// here too), so validity is never assumed: a string that fails to validate is
 /// never marked and keeps failing exactly as before. `HeapSubject::new` has
-/// already marked the header shared, so a marked payload is never mutated in
-/// place, and the mark is never copied to another string (see the flag).
+/// already marked the header shared, so this subject is never mutated in
+/// place. String producers preserve/intersect proof for their own payloads.
 pub(crate) fn bind_heap_subject(
     input: RuntimeHandle<'_>,
 ) -> Result<BoundSubject<HeapSubject<'_>>, EngineError> {
@@ -211,7 +210,7 @@ pub(crate) fn bind_heap_subject_observed(
     // `HeapSubject::new` already wrote this header's refcount, so it is writable.
     let bound = bind_counted(owner, utf16_len, validated, || {
         input.with_const_ptr::<StringHeader, _>(|s| unsafe {
-            (*(s as *mut StringHeader)).flags |= STRING_FLAG_WTF8_VALIDATED;
+            crate::string::mark_wtf8_validated(s as *mut StringHeader);
         })
     })?;
     Ok((bound, identity))
@@ -347,6 +346,48 @@ impl<'b, 's> Reuse<'b, 's> {
             .flatten()
     }
 
+    /// How many capture groups (group zero included) the reused program has.
+    pub(crate) fn capture_count(&self) -> Option<usize> {
+        let reused = self.program.as_ref()?;
+        reused
+            .bound
+            .with_view(|program| program.capture_count())
+            .ok()
+    }
+
+    /// One search of the reused program over the reused subject from `start`,
+    /// seeking from where the previous one stood. Only RegExpBuiltinExec's
+    /// search: it neither reads nor writes `lastIndex`, whose steps belong to
+    /// a caller that has proven them unobservable. The bindings reacquire
+    /// their storage, so a collection between searches does not matter.
+    pub(crate) fn find<'mem>(
+        &self,
+        start: usize,
+        mode: CaptureMode,
+        budget: &mut Budget,
+        memory: &'mem MemoryBudget,
+        captures: &mut Option<host::Captures<'mem>>,
+    ) -> Result<Option<Span>, EngineError> {
+        let reused = self.program.as_ref().ok_or(EngineError::InvalidSpan)?;
+        let (full, position) = host::find_near_into(
+            &reused.bound,
+            self.subject,
+            start,
+            self.near.get(),
+            true,
+            mode,
+            budget,
+            memory,
+            QUANTUM,
+            captures,
+            &mut host::poll,
+        )?;
+        if position.is_some() {
+            self.near.set(position);
+        }
+        Ok(full)
+    }
+
     fn program_for(&self, current: *const RegExpHeader) -> Option<&BoundProgram<GcProgram<'s>>> {
         let reused = self.program.as_ref()?;
         let bound = reused.receiver.with_const_ptr::<RegExpHeader, _>(|p| p);
@@ -480,22 +521,18 @@ pub(crate) fn execute_with_resources(
 }
 
 /// What a builtin search produces when it matches.
-pub(crate) enum ExecOutput<'v> {
+pub(crate) enum ExecOutput {
     /// Only the full match (`test`).
     Test,
     /// The exec result array and its groups object.
     Object,
-    /// Every capture span, group zero first, appended to the vector as
-    /// UTF-16 `start, end` pairs, with `u32::MAX, u32::MAX` for an unset
-    /// group. No JS object is created (#10165).
-    Spans(&'v mut Vec<u32>),
 }
 
 /// [`execute_with_resources`] with an explicit output.
 pub(crate) fn execute_output(
     receiver: *mut RegExpHeader,
     input: *const StringHeader,
-    output: ExecOutput<'_>,
+    output: ExecOutput,
     budget: &mut Budget,
     memory: &MemoryBudget,
     poll: &mut impl FnMut() -> Result<(), EngineError>,
@@ -528,7 +565,7 @@ pub(crate) fn regexp(receiver: &RuntimeHandle<'_>) -> *mut RegExpHeader {
 pub(crate) fn execute_rooted(
     receiver: &RuntimeHandle<'_>,
     input: &RuntimeHandle<'_>,
-    output: ExecOutput<'_>,
+    output: ExecOutput,
     budget: &mut Budget,
     memory: &MemoryBudget,
     poll: &mut impl FnMut() -> Result<(), EngineError>,
@@ -548,6 +585,7 @@ pub(crate) fn execute_rooted(
         regexp(receiver),
         input.with_const_ptr::<StringHeader, _>(|s| s),
         stateful,
+        super::get_last_index(regexp(receiver)),
     )?
     .map(Start::at) else {
         return Ok(None);
@@ -570,6 +608,7 @@ pub(crate) fn execute_rooted(
                 subject,
                 start,
                 reuse.near(),
+                true,
                 mode,
                 budget,
                 memory,
@@ -577,7 +616,9 @@ pub(crate) fn execute_rooted(
                 &mut captures,
                 poll,
             )?;
-            reuse.near.set(Some(found.1));
+            if found.1.is_some() {
+                reuse.near.set(found.1);
+            }
             if stateful {
                 store_last_index(regexp(receiver), found.0.map_or(0, |full| full.end()))?;
             }
@@ -628,30 +669,12 @@ pub(crate) fn execute_rooted(
                     bound_subject,
                     bound_program,
                     &found,
-                    Some(position),
+                    position,
                     has_indices,
                     budget,
                     poll,
                 )
             })??
-        }
-        ExecOutput::Spans(spans) => {
-            let captures = captures.as_ref().ok_or(EngineError::InvalidSpan)?;
-            spans
-                .try_reserve(captures.len() * 2)
-                .map_err(|_| StorageError::Allocation)?;
-            for capture in captures.iter() {
-                let (start, end) = match capture {
-                    Some(span) => (
-                        u32::try_from(span.start()).map_err(|_| StorageError::Limit)?,
-                        u32::try_from(span.end()).map_err(|_| StorageError::Limit)?,
-                    ),
-                    None => (u32::MAX, u32::MAX),
-                };
-                spans.push(start);
-                spans.push(end);
-            }
-            (std::ptr::null_mut(), std::ptr::null_mut())
         }
         ExecOutput::Test => (std::ptr::null_mut(), std::ptr::null_mut()),
     };
@@ -667,8 +690,9 @@ pub(crate) fn execute_rooted(
 /// string's own bytes, and the `lastIndex` update of a g/y RegExp. Returns the
 /// full match and where the search stood, or `None` for no match.
 ///
-/// `re` is a branded RegExp whose immutable data is `data`, and `input` a heap
-/// string, all at their current addresses: the caller runs nothing that can
+/// `re` is a branded RegExp whose immutable data is `data`, `input` a heap
+/// string, and `last_index` the value of `re`'s own `lastIndex` read with
+/// nothing run since, all at their current addresses: the caller runs nothing that can
 /// collect between reading them and this call. Nothing here roots, copies or
 /// marks anything unless a non-Number `lastIndex` runs user code or the
 /// search polls (`perex_owner::InPlace`), so a short `test` holds no handle at
@@ -682,14 +706,15 @@ pub(crate) fn search_builtin<'mem>(
     re: *mut RegExpHeader,
     data: *const super::RegExpData,
     input: *const StringHeader,
+    last_index: f64,
     mode: CaptureMode,
     budget: &mut Budget,
     memory: &'mem MemoryBudget,
     captures: &mut Option<host::Captures<'mem>>,
     poll: &mut impl FnMut() -> Result<(), EngineError>,
-) -> Result<Option<(Span, Position)>, EngineError> {
+) -> Result<Option<(Span, Option<Position>)>, EngineError> {
     let stateful = unsafe { (*data).global || (*data).sticky };
-    let Some(start) = exec_start(re, input, stateful)? else {
+    let Some(start) = exec_start(re, input, stateful, last_index)? else {
         return Ok(None);
     };
     let (re, data, input) = match start {
@@ -728,7 +753,7 @@ fn search_from<'mem>(
     memory: &'mem MemoryBudget,
     captures: &mut Option<host::Captures<'mem>>,
     poll: &mut impl FnMut() -> Result<(), EngineError>,
-) -> Result<Option<(Span, Position)>, EngineError> {
+) -> Result<Option<(Span, Option<Position>)>, EngineError> {
     let (found, position, re) = host::find_in_place(
         re, program, input, start,
         // Only g/y searches can start away from zero. A non-stateful call
@@ -759,15 +784,17 @@ impl Start {
     }
 }
 
-/// RegExpBuiltinExec steps 4-12: the search's start. `None` when the start is
-/// past the end, after a g/y RegExp's `lastIndex` was reset to 0.
+/// RegExpBuiltinExec steps 4-12: the search's start from `stored`, the value
+/// `Get(R, "lastIndex")` returned. `None` when the start is past the end,
+/// after a g/y RegExp's `lastIndex` was reset to 0.
 #[inline(always)]
 fn exec_start(
     re: *mut RegExpHeader,
     input: *const StringHeader,
     stateful: bool,
+    stored: f64,
 ) -> Result<Option<Start>, EngineError> {
-    let stored = crate::value::JSValue::from_bits(super::get_last_index(re).to_bits());
+    let stored = crate::value::JSValue::from_bits(stored.to_bits());
     // ToLength(Get(R, "lastIndex")) is observable only when it is not a
     // Number (it may call `valueOf`); a Number matters only to g/y.
     let start = if stored.is_number() {

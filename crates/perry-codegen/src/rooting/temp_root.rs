@@ -138,11 +138,11 @@ fn temp_pool_acquire(ctx: &mut FnCtx<'_>) -> Option<String> {
         return None;
     };
     ctx.temp_roots.alloca_mode = Some(true);
-    let alloca = ctx.func.alloca_entry(I64);
+    let alloca = ctx.func.alloca_entry(DOUBLE);
     // Null-init at entry: the slot is scanned from bind onward, and the
     // RS4GC retype pass re-emits exactly this `store i64 0` as a null
     // `addrspace(1)` store.
-    ctx.func.entry_allocas_push_store(I64, "0", &alloca);
+    ctx.func.entry_allocas_push_store(DOUBLE, "0.0", &alloca);
     ctx.temp_roots.slots.push((alloca.clone(), slot_idx));
     ctx.temp_roots.active += 1;
     Some(alloca)
@@ -153,27 +153,41 @@ fn temp_pool_acquire(ctx: &mut FnCtx<'_>) -> Option<String> {
 /// generated root, so its bind needs no per-store shading. The bind must
 /// be emitted here — after the store, before whatever collects — so the
 /// rooted location dominates the collection point (#7192's invariant).
-fn temp_slot_store(ctx: &mut FnCtx<'_>, handle: &str, value_i64: &str) {
-    ctx.block().store(I64, value_i64, handle);
+///
+/// The access type states the slot's contents to the native-root lowering
+/// (`function::precise_roots`): an `i64` access stores a raw heap pointer,
+/// which the lowering encodes as a JSValue word at rest and decodes on every
+/// reload; a `double` access stores a JSValue word unchanged. Pooled slots
+/// carry either kind over their lifetime, so the access, not the alloca,
+/// says which. Codegen never re-encodes around that lowering.
+fn temp_slot_store(ctx: &mut FnCtx<'_>, handle: &str, ty: &'static str, value: &str) {
+    ctx.block().store(ty, value, handle);
     let idx = ctx.temp_roots.frame_idx(handle);
     crate::expr::shadow_slot::emit_shadow_slot_bind_ptr(ctx, idx, handle);
 }
 
-/// Push `value_i64` (a bare heap pointer or NaN-boxed bits) and return the
-/// slot handle.
+/// Push `value_i64` (a bare heap pointer) and return the slot handle.
 pub(in crate::rooting) fn temp_root_push_i64(ctx: &mut FnCtx<'_>, value_i64: &str) -> String {
     if let Some(handle) = temp_pool_acquire(ctx) {
-        temp_slot_store(ctx, &handle, value_i64);
+        temp_slot_store(ctx, &handle, I64, value_i64);
         return handle;
     }
+    let bits = ctx
+        .block()
+        .or(I64, value_i64, &crate::nanbox::POINTER_TAG.to_string());
     ctx.block()
-        .call(I32, "js_gc_temp_root_push", &[(I64, value_i64)])
+        .call(I32, "js_gc_temp_root_push", &[(I64, &bits)])
 }
 
 /// Push a NaN-boxed `double` temporary and return the slot-index register.
 pub(in crate::rooting) fn temp_root_push_double(ctx: &mut FnCtx<'_>, value: &str) -> String {
+    if let Some(handle) = temp_pool_acquire(ctx) {
+        temp_slot_store(ctx, &handle, DOUBLE, value);
+        return handle;
+    }
     let bits = ctx.block().bitcast_double_to_i64(value);
-    temp_root_push_i64(ctx, &bits)
+    ctx.block()
+        .call(I32, "js_gc_temp_root_push", &[(I64, &bits)])
 }
 
 /// Re-read slot `idx` as a raw `i64`.
@@ -185,12 +199,17 @@ pub(in crate::rooting) fn temp_root_get_i64(ctx: &mut FnCtx<'_>, idx: &str) -> S
     if ctx.temp_roots.alloca_mode == Some(true) {
         return ctx.block().load(I64, idx);
     }
-    ctx.block().call(I64, "js_gc_temp_root_get", &[(I32, idx)])
+    let bits = ctx.block().call(I64, "js_gc_temp_root_get", &[(I32, idx)]);
+    ctx.block()
+        .and(I64, &bits, &crate::nanbox::POINTER_MASK.to_string())
 }
 
 /// Re-read slot `idx` as a NaN-boxed `double`.
 pub(in crate::rooting) fn temp_root_get_double(ctx: &mut FnCtx<'_>, idx: &str) -> String {
-    let bits = temp_root_get_i64(ctx, idx);
+    if ctx.temp_roots.alloca_mode == Some(true) {
+        return ctx.block().load(DOUBLE, idx);
+    }
+    let bits = ctx.block().call(I64, "js_gc_temp_root_get", &[(I32, idx)]);
     ctx.block().bitcast_i64_to_double(&bits)
 }
 
@@ -201,11 +220,14 @@ pub(in crate::rooting) fn temp_root_get_double(ctx: &mut FnCtx<'_>, idx: &str) -
 /// string and the old one stops being the value that must stay alive.
 pub(in crate::rooting) fn temp_root_set_i64(ctx: &mut FnCtx<'_>, idx: &str, value_i64: &str) {
     if ctx.temp_roots.alloca_mode == Some(true) {
-        temp_slot_store(ctx, idx, value_i64);
+        temp_slot_store(ctx, idx, I64, value_i64);
         return;
     }
+    let bits = ctx
+        .block()
+        .or(I64, value_i64, &crate::nanbox::POINTER_TAG.to_string());
     ctx.block()
-        .call_void("js_gc_temp_root_set", &[(I32, idx), (I64, value_i64)]);
+        .call_void("js_gc_temp_root_set", &[(I32, idx), (I64, &bits)]);
 }
 
 /// Overwrite slot `idx` with a new NaN-boxed `double`.
@@ -214,8 +236,13 @@ pub(in crate::rooting) fn temp_root_set_i64(ctx: &mut FnCtx<'_>, idx: &str, valu
 /// one: `js_object_assign_one` returns the target's *post-collection* address,
 /// so each link must republish rather than keep the address it passed in.
 pub(in crate::rooting) fn temp_root_set_double(ctx: &mut FnCtx<'_>, idx: &str, value: &str) {
+    if ctx.temp_roots.alloca_mode == Some(true) {
+        temp_slot_store(ctx, idx, DOUBLE, value);
+        return;
+    }
     let bits = ctx.block().bitcast_double_to_i64(value);
-    temp_root_set_i64(ctx, idx, &bits);
+    ctx.block()
+        .call_void("js_gc_temp_root_set", &[(I32, idx), (I64, &bits)]);
 }
 
 /// Drop slot `idx` and everything pushed above it.
@@ -235,7 +262,7 @@ pub(in crate::rooting) fn temp_root_truncate(ctx: &mut FnCtx<'_>, idx: &str) {
             ctx.temp_roots.slots[pos..ctx.temp_roots.active].to_vec();
         ctx.temp_roots.active = pos;
         for (alloca, slot_idx) in released {
-            ctx.block().store(I64, "0", &alloca);
+            ctx.block().store(DOUBLE, "0.0", &alloca);
             crate::expr::shadow_slot::emit_shadow_slot_clear(ctx, slot_idx);
         }
         return;
@@ -254,11 +281,11 @@ pub(in crate::rooting) fn temp_root_truncate(ctx: &mut FnCtx<'_>, idx: &str) {
 /// the cheaper form and the fused helper stays FFI-fallback-only.
 pub(in crate::rooting) fn temp_rooted_array_push(ctx: &mut FnCtx<'_>, idx: &str, value: &str) {
     if ctx.temp_roots.alloca_mode == Some(true) {
-        let arr = ctx.block().load(I64, idx);
+        let arr = temp_root_get_i64(ctx, idx);
         let new_arr = ctx
             .block()
             .call(I64, "js_array_push_f64", &[(I64, &arr), (DOUBLE, value)]);
-        temp_slot_store(ctx, idx, &new_arr);
+        temp_root_set_i64(ctx, idx, &new_arr);
         return;
     }
     ctx.block().call_void(

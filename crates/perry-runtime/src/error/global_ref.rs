@@ -38,9 +38,9 @@ pub extern "C-unwind" fn js_global_get_or_throw_unresolved(name_value: f64) -> f
         // was extracted into a raw Rust local *before* the coercion and
         // dereferenced by `js_object_get_field_by_name` after it. Root the
         // receiver and re-derive the header from the refreshed value.
-        let g_handle = scope.root_heap_word_u64(g.to_bits());
+        let g_handle = scope.root_nanbox_u64(g.to_bits());
         let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
-        let g = f64::from_bits(g_handle.get_heap_word_u64());
+        let g = f64::from_bits(g_handle.get_nanbox_u64());
         let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
         if !gptr.is_null() && !key.is_null() {
             let v = crate::object::js_object_get_field_by_name(gptr, key);
@@ -55,7 +55,7 @@ pub extern "C-unwind" fn js_global_get_or_throw_unresolved(name_value: f64) -> f
             // the property actually exists (as an OWN property — a global var
             // binding always is) before falling through to the throw.
             let has = crate::object::js_object_has_own(
-                f64::from_bits(g_handle.get_heap_word_u64()),
+                f64::from_bits(g_handle.get_nanbox_u64()),
                 name_handle.get_nanbox_f64(),
             );
             if crate::value::js_is_truthy(has) != 0 {
@@ -63,7 +63,11 @@ pub extern "C-unwind" fn js_global_get_or_throw_unresolved(name_value: f64) -> f
             }
         }
     }
-    let name = value_to_lossy_string(name_handle.get_nanbox_f64());
+    throw_missing_global(name_handle.get_nanbox_f64())
+}
+
+fn throw_missing_global(name_value: f64) -> ! {
+    let name = value_to_lossy_string(name_value);
     let msg = format!("{} is not defined", name);
     let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
     let err_ptr = js_referenceerror_new(msg_str);
@@ -105,12 +109,12 @@ pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix
     // from the pre-coercion `gj`) and the coerced key string were raw Rust
     // locals across all of it, and `gptr` is the receiver of the WRITE-BACK at
     // the end. Root both and re-derive the header at each use.
-    let g_handle = scope.root_heap_word_u64(g.to_bits());
+    let g_handle = scope.root_nanbox_u64(g.to_bits());
     let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
     let key_handle = scope.root_string_ptr(key);
     let mut present = false;
     let old = if gj.is_pointer() && !key.is_null() {
-        let g = f64::from_bits(g_handle.get_heap_word_u64());
+        let g = f64::from_bits(g_handle.get_nanbox_u64());
         let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
         if !gptr.is_null() {
             let v = crate::object::js_object_get_field_by_name(
@@ -119,7 +123,7 @@ pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix
             );
             if !v.is_undefined()
                 || crate::object::js_object_has_own(
-                    f64::from_bits(g_handle.get_heap_word_u64()),
+                    f64::from_bits(g_handle.get_nanbox_u64()),
                     name_handle.get_nanbox_f64(),
                 )
                 .to_bits()
@@ -147,7 +151,7 @@ pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix
     let stepped =
         unsafe { crate::value::js_numeric_step(numeric_handle.get_nanbox_f64(), is_increment) };
     let stepped_handle = scope.root_nanbox_f64(stepped);
-    let g = f64::from_bits(g_handle.get_heap_word_u64());
+    let g = f64::from_bits(g_handle.get_nanbox_u64());
     let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *mut crate::object::ObjectHeader;
     crate::object::js_object_set_field_by_name(
         gptr,
@@ -197,12 +201,12 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
     // the not-defined path (`js_string_from_bytes`, `js_referenceerror_new`)
     // allocate on top of that, and `gptr` is the receiver of the final write.
     // Root the global, the coerced key and `value` for the whole helper.
-    let g_handle = scope.root_heap_word_u64(g.to_bits());
+    let g_handle = scope.root_nanbox_u64(g.to_bits());
     let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
     let key_handle = scope.root_string_ptr(key);
     let mut present = false;
     if gj.is_pointer() && !key.is_null() {
-        let g = f64::from_bits(g_handle.get_heap_word_u64());
+        let g = f64::from_bits(g_handle.get_nanbox_u64());
         let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
         if !gptr.is_null() {
             let v = crate::object::js_object_get_field_by_name(
@@ -211,7 +215,7 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
             );
             if !v.is_undefined()
                 || crate::object::js_object_has_own(
-                    f64::from_bits(g_handle.get_heap_word_u64()),
+                    f64::from_bits(g_handle.get_nanbox_u64()),
                     name_handle.get_nanbox_f64(),
                 )
                 .to_bits()
@@ -228,7 +232,7 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
         let err_ptr = js_referenceerror_new(msg_str);
         crate::exception::js_throw(crate::value::js_nanbox_pointer(err_ptr as i64));
     }
-    let g = f64::from_bits(g_handle.get_heap_word_u64());
+    let g = f64::from_bits(g_handle.get_nanbox_u64());
     let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *mut crate::object::ObjectHeader;
     crate::object::js_object_set_field_by_name(
         gptr,
@@ -253,9 +257,9 @@ pub extern "C" fn js_global_get_optional(name_value: f64) -> f64 {
     if gj.is_pointer() {
         // #6943: root the global across the GC-capable coercion and re-derive
         // its header afterwards — see `js_global_get_or_throw_unresolved`.
-        let g_handle = scope.root_heap_word_u64(g.to_bits());
+        let g_handle = scope.root_nanbox_u64(g.to_bits());
         let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
-        let g = f64::from_bits(g_handle.get_heap_word_u64());
+        let g = f64::from_bits(g_handle.get_nanbox_u64());
         let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
         if !gptr.is_null() && !key.is_null() {
             let v = crate::object::js_object_get_field_by_name(gptr, key);
@@ -264,3 +268,59 @@ pub extern "C" fn js_global_get_optional(name_value: f64) -> f64 {
     }
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
+
+/// Environment-record adapter for an ordinary read-site miss. Resolve
+/// HasBinding before Get: an undefined-returning getter runs once, including
+/// one that deletes its own global property while it runs.
+fn global_binding_scope<'scope>(
+    scope: &'scope crate::gc::RuntimeHandleScope,
+    obj: f64,
+    key: *const crate::StringHeader,
+) -> (
+    crate::gc::RuntimeHandle<'scope>,
+    crate::gc::RuntimeHandle<'scope>,
+) {
+    let receiver = scope.root_nanbox_f64(obj);
+    let name = scope.root_string_ptr(key);
+    let present = name.with_const_ptr(|key: *const crate::StringHeader| {
+        crate::object::js_object_has_property(
+            receiver.get_nanbox_f64(),
+            crate::value::js_nanbox_string(key as i64),
+        )
+    });
+    if crate::value::js_is_truthy(present) == 0 {
+        name.with_const_ptr(|key: *const crate::StringHeader| {
+            throw_missing_global(crate::value::js_nanbox_string(key as i64));
+        });
+    }
+    (receiver, name)
+}
+
+#[no_mangle]
+pub extern "C-unwind" fn js_global_get_field_ic_slow(
+    obj_handle: i64,
+    key: *const crate::StringHeader,
+    cache_slot: *mut crate::object::PicCacheSlot,
+    packed: *const std::sync::atomic::AtomicU64,
+) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let (receiver, name) =
+        global_binding_scope(&scope, crate::value::js_nanbox_pointer(obj_handle), key);
+    name.with_const_ptr(|key| {
+        crate::object::field_get_set::js_object_get_field_ic_slow(
+            crate::value::js_nanbox_get_pointer(receiver.get_nanbox_f64()),
+            key,
+            cache_slot,
+            packed,
+        )
+    })
+}
+
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_JS_GLOBAL_GET_FIELD_IC_SLOW: extern "C-unwind" fn(
+    i64,
+    *const crate::StringHeader,
+    *mut crate::object::PicCacheSlot,
+    *const std::sync::atomic::AtomicU64,
+) -> f64 = js_global_get_field_ic_slow;

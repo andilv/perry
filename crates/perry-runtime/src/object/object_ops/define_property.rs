@@ -18,27 +18,20 @@ use super::*;
 ///
 /// The caller has already established that `hid` is in the handle band and that
 /// the receiver is not a Proxy (proxies are handle-band ids too, and are routed
-/// to their `[[DefineOwnProperty]]` trap earlier).
+/// to their `[[DefineOwnProperty]]` trap earlier). A handle is always
+/// extensible (`js_object_is_extensible` agrees), so only a non-configurable
+/// expando can reject; the return value is the definition's verdict.
 unsafe fn define_property_on_handle(
+    scope: &crate::gc::RuntimeHandleScope,
     obj_value: f64,
     hid: i64,
     key_value: f64,
-    descriptor_value: f64,
-) -> f64 {
+    descriptor: &crate::object::object_ops::DescView<'_>,
+) -> bool {
     use crate::object::descriptor_state::{
         set_accessor_descriptor, set_property_attrs, AccessorDescriptor,
     };
     use crate::object::handle_expando as hx;
-
-    // A handle IS an object in Node, so the ordinary descriptor validation
-    // applies: the descriptor must be an object, data and accessor fields can't
-    // be mixed, and a present `get`/`set` must be callable.
-    if !value_is_object_like(descriptor_value) || crate::symbol::js_is_symbol(descriptor_value) != 0
-    {
-        let desc = describe_value_for_type_error(descriptor_value);
-        throw_object_type_error_with_suffix("Property description must be an object: ", &desc);
-    }
-    validate_property_descriptor(descriptor_value);
 
     // A Symbol key goes to the symbol side table (`SYMBOL_PROPERTIES`), which is
     // keyed by the NaN-box payload — a handle id works there unchanged, and it's
@@ -46,80 +39,64 @@ unsafe fn define_property_on_handle(
     // file the value under a `"Symbol(x)"` STRING name, unreachable by the
     // symbol-keyed reader. (This is the Next.js `PATCHED_SET_HEADER` shape.)
     if crate::symbol::js_is_symbol(key_value) != 0 {
-        let has_get = desc_has_field(descriptor_value, b"get");
-        let has_set = desc_has_field(descriptor_value, b"set");
-        if has_get || has_set {
-            let get_field = desc_read_field(descriptor_value, b"get");
-            let set_field = desc_read_field(descriptor_value, b"set");
-            let get_bits = if !has_get || get_field.is_undefined() {
-                0
-            } else {
-                crate::closure::clone_closure_rebind_this(get_field.bits(), obj_value)
-            };
-            let set_bits = if !has_set || set_field.is_undefined() {
-                0
-            } else {
-                crate::closure::clone_closure_rebind_this(set_field.bits(), obj_value)
-            };
-            crate::symbol::set_symbol_accessor_property(obj_value, key_value, get_bits, set_bits);
-        } else if desc_has_field(descriptor_value, b"value") {
-            let value_field = desc_read_field(descriptor_value, b"value");
-            crate::symbol::js_object_set_symbol_property(
-                obj_value,
-                key_value,
-                f64::from_bits(value_field.bits()),
-            );
-        }
-        let read_flag = |name: &[u8]| -> Option<bool> {
-            desc_has_field(descriptor_value, name).then(|| {
-                crate::value::js_is_truthy(f64::from_bits(
-                    desc_read_field(descriptor_value, name).bits(),
-                )) != 0
-            })
-        };
-        crate::symbol::set_symbol_property_attrs(
-            crate::symbol::obj_key_from_f64(obj_value),
-            crate::symbol::sym_key_from_f64(key_value),
-            PropertyAttrs::new(
-                read_flag(b"writable").unwrap_or(has_get || has_set),
-                read_flag(b"enumerable").unwrap_or(false),
-                read_flag(b"configurable").unwrap_or(false),
-            ),
+        return super::define_symbol_property::define_symbol_property(
+            scope, obj_value, obj_value, key_value, descriptor,
         );
-        return obj_value;
     }
 
     let Some(key) = super::super::metadata_key_to_string(key_value) else {
-        return obj_value;
+        return true;
     };
 
     // The property's CURRENT shape, captured before any mutation below.
-    let had_accessor = hx::handle_expando_accessor(hid, &key).is_some();
+    let prior = hx::handle_expando_accessor(hid, &key);
+    let had_accessor = prior.is_some();
+    let prior_get = scope.root_nanbox_u64(prior.map(|accessor| accessor.get).unwrap_or(0));
+    let prior_set = scope.root_nanbox_u64(prior.map(|accessor| accessor.set).unwrap_or(0));
     let had_data = hx::handle_expando_data_get(hid, &key).is_some();
     // Spec retention (ValidateAndApplyPropertyDescriptor): redefining an
     // EXISTING own property keeps the attributes the descriptor omits; a brand
     // new one defaults them to `false`.
     let existing: Option<PropertyAttrs> =
         (had_accessor || had_data).then(|| hx::handle_expando_attrs(hid, &key));
+    if let Some(attrs) = existing.filter(|attrs| !attrs.configurable()) {
+        let current_value = if had_accessor {
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        } else {
+            hx::handle_expando_data_get(hid, &key)
+                .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
+        };
+        if !nonconfigurable_redefine_allowed(
+            attrs,
+            had_accessor.then(|| AccessorDescriptor {
+                get: prior_get.get_nanbox_u64(),
+                set: prior_set.get_nanbox_u64(),
+            }),
+            current_value,
+            descriptor,
+        ) {
+            return false;
+        }
+    }
 
-    let has_get = desc_has_field(descriptor_value, b"get");
-    let has_set = desc_has_field(descriptor_value, b"set");
+    let has_get = descriptor.has_named(b"get");
+    let has_set = descriptor.has_named(b"set");
     let has_accessor = has_get || has_set;
-    let has_value = desc_has_field(descriptor_value, b"value");
+    let has_value = descriptor.has_named(b"value");
 
     if has_accessor {
-        // The descriptor literal's `get()`/`set()` shorthands were lowered with
-        // their reserved `this` slot pointing at the DESCRIPTOR object; rebind to
-        // the handle so the accessor sees the right receiver — same clone the
-        // ordinary object path does.
-        let get_field = desc_read_field(descriptor_value, b"get");
-        let set_field = desc_read_field(descriptor_value, b"set");
-        let get_bits = if !has_get || get_field.is_undefined() {
+        let get_field = descriptor.read_named(b"get");
+        let get_bits = scope.root_nanbox_u64(if !has_get {
+            prior_get.get_nanbox_u64()
+        } else if get_field.is_undefined() {
             0
         } else {
             crate::closure::clone_closure_rebind_this(get_field.bits(), obj_value)
-        };
-        let set_bits = if !has_set || set_field.is_undefined() {
+        });
+        let set_field = descriptor.read_named(b"set");
+        let set_bits = if !has_set {
+            prior_set.get_nanbox_u64()
+        } else if set_field.is_undefined() {
             0
         } else {
             crate::closure::clone_closure_rebind_this(set_field.bits(), obj_value)
@@ -128,11 +105,11 @@ unsafe fn define_property_on_handle(
             hid as usize,
             key.clone(),
             AccessorDescriptor {
-                get: get_bits,
+                get: get_bits.get_nanbox_u64(),
                 set: set_bits,
             },
         );
-    } else {
+    } else if has_value || descriptor.has_named(b"writable") || existing.is_none() {
         // A data descriptor (`value`/`writable`) OR a generic one
         // (`{ enumerable: true }` alone). Drop any accessor that used to occupy
         // the key so the store can't fire a stale setter.
@@ -151,9 +128,7 @@ unsafe fn define_property_on_handle(
         // recording only the attribute bits would leave every own-key probe reporting
         // it absent.
         let new_value = if has_value {
-            Some(f64::from_bits(
-                desc_read_field(descriptor_value, b"value").bits(),
-            ))
+            Some(f64::from_bits(descriptor.read_named(b"value").bits()))
         } else if had_accessor || !had_data {
             Some(f64::from_bits(crate::value::TAG_UNDEFINED))
         } else {
@@ -165,10 +140,8 @@ unsafe fn define_property_on_handle(
     }
 
     let read_flag = |name: &[u8]| -> Option<bool> {
-        desc_has_field(descriptor_value, name).then(|| {
-            crate::value::js_is_truthy(f64::from_bits(
-                desc_read_field(descriptor_value, name).bits(),
-            )) != 0
+        descriptor.has_named(name).then(|| {
+            crate::value::js_is_truthy(f64::from_bits(descriptor.read_named(name).bits())) != 0
         })
     };
     set_property_attrs(
@@ -183,35 +156,140 @@ unsafe fn define_property_on_handle(
                 .unwrap_or_else(|| existing.map(|a| a.configurable()).unwrap_or(false)),
         ),
     );
-    obj_value
+    true
 }
 
-/// Object.defineProperty(obj, key, descriptor) — set the value AND record the
-/// `writable` / `enumerable` / `configurable` attribute flags in the side table.
-/// Returns the object (NaN-boxed pointer).
+/// Object validates and coerces the key before decoding the descriptor once.
+#[no_mangle]
+pub extern "C" fn js_object_define_property(obj: f64, key: f64, bag: f64) -> f64 {
+    unsafe {
+        if !definition_target_is_object(obj) {
+            throw_object_type_error(b"Object.defineProperty called on non-object");
+        }
+        let scope = crate::gc::RuntimeHandleScope::new();
+        // This entry also admits legacy module raw object operands. Normalize
+        // before any collecting key conversion, then keep JSValue roots only.
+        let receiver = scope.root_nanbox_f64(normalize_descriptor_operand(obj));
+        let bag = scope.root_nanbox_f64(normalize_descriptor_operand(bag));
+        // A string key is already its own property key; only other values
+        // run the (possibly user-observable, collecting) ToPropertyKey.
+        let key = scope.root_nanbox_f64(if super::super::property_key_coercion_is_inert(key) {
+            key
+        } else {
+            super::super::js_to_property_key(key)
+        });
+        let descriptor = decode_property_descriptor(&scope, &bag);
+        if !define_own_property_decoded(&scope, &receiver, &key, &descriptor) {
+            throw_definition_rejected(&scope, &receiver, &key);
+        }
+        f64::from_bits(receiver.get_nanbox_u64())
+    }
+}
+
+/// Object's rejection is thrown only after all temporary formatting buffers
+/// have been freed; Reflect returns the same core verdict directly.
+pub(crate) unsafe fn throw_definition_rejected(
+    scope: &crate::gc::RuntimeHandleScope,
+    receiver: &crate::gc::RuntimeHandle<'_>,
+    key: &crate::gc::RuntimeHandle<'_>,
+) -> ! {
+    let obj = f64::from_bits(receiver.get_nanbox_u64());
+    if crate::proxy::js_proxy_is_proxy(obj) != 0 {
+        throw_object_type_error(b"'defineProperty' on proxy: trap returned falsish");
+    }
+    let current = scope.root_nanbox_f64(js_object_get_own_property_descriptor(
+        obj,
+        key.get_nanbox_f64(),
+    ));
+    let no_extend = current.get_nanbox_u64() == crate::value::TAG_UNDEFINED
+        && crate::value::js_is_truthy(js_object_is_extensible(f64::from_bits(
+            receiver.get_nanbox_u64(),
+        ))) == 0;
+    let name = describe_value_for_type_error(key.get_nanbox_f64());
+    let message = if no_extend {
+        format!("Cannot define property {name}, object is not extensible")
+    } else {
+        format!("Cannot redefine property: {name}")
+    };
+    let string = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
+    drop(message);
+    drop(name);
+    let error = crate::error::js_typeerror_new(string);
+    crate::exception::js_throw(crate::value::js_nanbox_pointer(error as i64));
+}
+
+pub(crate) unsafe fn definition_target_is_object(value: f64) -> bool {
+    value_is_object_like(value)
+        || super::super::class_ref_id(value).is_some()
+        || crate::proxy::js_proxy_is_proxy(value) != 0
+        || {
+            let value = crate::JSValue::from_bits(value.to_bits());
+            value.is_pointer()
+                && crate::value::addr_class::is_small_handle(value.as_pointer::<u8>() as usize)
+        }
+}
+
+/// One decoded [[DefineOwnProperty]] boundary for public entries and forwarding.
+pub(crate) unsafe fn define_own_property_decoded(
+    scope: &crate::gc::RuntimeHandleScope,
+    receiver: &crate::gc::RuntimeHandle<'_>,
+    key: &crate::gc::RuntimeHandle<'_>,
+    descriptor: &DescView<'_>,
+) -> bool {
+    let current = f64::from_bits(receiver.get_nanbox_u64());
+    if crate::array::subclass_elements::backed_value(current).is_some()
+        && crate::array::subclass_elements::key_of_value(key.get_nanbox_f64()).is_some()
+    {
+        crate::array::subclass_elements::deopt_value(current);
+    }
+    if crate::proxy::js_proxy_is_proxy(f64::from_bits(receiver.get_nanbox_u64())) != 0 {
+        return crate::proxy::proxy_define_own_property_decoded(scope, receiver, key, descriptor);
+    }
+    // A complete, default-attribute data definition is exactly
+    // CreateDataProperty. Use its existing shape-owned definition mechanism:
+    // it proves the receiver's extensibility and the key's current facts,
+    // and never consults or invokes an inherited setter.
+    if descriptor.has(DESC_VALUE)
+        && !descriptor.has(DESC_GET)
+        && !descriptor.has(DESC_SET)
+        && descriptor.flag(b"writable") == Some(true)
+        && descriptor.flag(b"enumerable") == Some(true)
+        && descriptor.flag(b"configurable") == Some(true)
+        && super::super::define_own_data::define_own_data_from_shape(
+            receiver.get_nanbox_f64(),
+            key.get_nanbox_f64(),
+            f64::from_bits(descriptor.read(DESC_VALUE).bits()),
+        )
+        .is_some()
+    {
+        return true;
+    }
+    super::super::reflect_support::reflect_define_property_decoded(scope, receiver, key, descriptor)
+}
+
+/// The ordinary `[[DefineOwnProperty]]` (ValidateAndApplyPropertyDescriptor)
+/// for every non-proxy receiver family: each family arm reads its own current
+/// facts, validates the decoded descriptor against them (one shared predicate,
+/// `nonconfigurable_redefine_allowed`, plus the family's extensibility bit)
+/// and only then stores the value and the `writable` / `enumerable` /
+/// `configurable` attribute flags. Returns the verdict and never throws a
+/// rejection: `Object.*` throws `false` as its TypeError, `Reflect.*` returns
+/// it. No descriptor record is materialized to validate.
 ///
 /// IMPORTANT: writes the value via `js_object_set_field_by_name` BEFORE recording
 /// the descriptor — otherwise a `writable: false` descriptor would block its own
 /// initial value from being stored.
-#[no_mangle]
 // `across!` (defined in the ordinary arm below) rebinds ALL FIVE roots on every
 // use, by design: the shape must not depend on which of them the next statement
 // happens to read. The final rebind of each is therefore dead, which is the
 // point — nothing may name a pre-collection address.
 #[allow(unused_assignments)]
-pub extern "C" fn js_object_define_property(
+pub(crate) unsafe fn apply_property_descriptor(
+    scope: &crate::gc::RuntimeHandleScope,
     obj_value: f64,
     key_value: f64,
-    descriptor_value: f64,
-) -> f64 {
-    // An index or `length` descriptor on an elements-backed Array-subclass
-    // instance leaves the elements representation for good (the shape-carried
-    // machinery models descriptors); other keys keep the store.
-    if crate::array::subclass_elements::backed_value(obj_value).is_some()
-        && crate::array::subclass_elements::key_of_value(key_value).is_some()
-    {
-        crate::array::subclass_elements::deopt_value(obj_value);
-    }
+    descriptor: &crate::object::object_ops::DescView<'_>,
+) -> bool {
     unsafe {
         // #6748 follow-up: classify the receiver ONCE. A `GC_TYPE_OBJECT` that
         // is not an exotic cell (RegExp is the one OBJECT-typed exotic) cannot
@@ -229,32 +307,6 @@ pub extern "C" fn js_object_define_property(
                 ) && super::super::exotic_expando::exotic_expando_kind(a).is_none()
             }
         };
-        // A Proxy receiver is a small registered id, not a heap object — it
-        // fails the `value_is_object_like` test below (so it would wrongly throw
-        // "called on non-object") and the ordinary paths would deref the fake
-        // pointer and segfault. Per spec, Object.defineProperty(proxy, …):
-        // validate the descriptor (ToPropertyDescriptor), invoke the
-        // `[[DefineOwnProperty]]` trap, and throw a TypeError if it reports
-        // failure. (Proxy crash cluster.)
-        if !receiver_plain_object && crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
-            if !value_is_object_like(descriptor_value)
-                || crate::symbol::js_is_symbol(descriptor_value) != 0
-            {
-                let desc = describe_value_for_type_error(descriptor_value);
-                throw_object_type_error_with_suffix(
-                    "Property description must be an object: ",
-                    &desc,
-                );
-            }
-            validate_property_descriptor(descriptor_value);
-            let ok =
-                crate::proxy::js_reflect_define_property(obj_value, key_value, descriptor_value);
-            if crate::value::js_is_truthy(ok) == 0 {
-                throw_object_type_error(b"'defineProperty' on proxy: trap returned falsish");
-            }
-            return obj_value;
-        }
-
         // A numeric key defined on `Object.prototype` (data or accessor) shows
         // through array hole/OOB reads — flip the global flag.
         {
@@ -278,114 +330,20 @@ pub extern "C" fn js_object_define_property(
             }
         }
 
-        // #2817: ES Object.defineProperty validation.
-        //   1. Target must be an object (or class-ref / function — all objects
-        //      in Node). Primitives / null / undefined throw.
-        //   2. Descriptor must be an object; otherwise
-        //      `Property description must be an object: <desc>`.
-        //   3. Accessor + data fields can't be mixed.
-        //   4. Present `get`/`set` must be callable.
-        let target_is_class_ref = super::super::class_ref_id(obj_value).is_some();
-        let target = crate::value::JSValue::from_bits(obj_value.to_bits());
-        let target_is_handle = !receiver_plain_object
-            && target.is_pointer()
-            && crate::value::addr_class::is_small_handle(target.as_pointer::<u8>() as usize);
-        if !target_is_class_ref && (target_is_handle || !value_is_object_like(obj_value)) {
-            // A native HANDLE target (a pointer-tagged registry id — a zlib
-            // stream, a fetch Request/Response/Headers/Blob, a crypto hash, an
-            // http ServerResponse, a timer) is not a heap `ObjectHeader`, so it
-            // fails `value_is_object_like`. In Node these are ORDINARY,
-            // extensible objects and `Object.defineProperty(handle, …)` is
-            // everyday code (Next.js `patchSetHeaderWithCookieSupport` marks
-            // `res` with a Symbol; libraries add non-enumerable metadata all the
-            // time). Route the define to the handle's own-property storage
-            // instead of throwing — see `define_property_on_handle`. Test the
-            // entire handle band explicitly: on Linux, the broad object-like
-            // pointer window also admits fetch-band ids above 0x10000.
-            //
-            // #6363: the band test here was a hand-typed `p < 0x10000` — one zero
-            // short of `HANDLE_BAND_MAX` (0x100000), so only the LOW common
-            // registry (crypto, timers, sockets) was recognised. The fetch band
-            // (0x40000..0xE0000) and the zlib band (0xE0000..0xF0000) fell past it
-            // and hit the `throw` below: `Object.defineProperty(gzipStream, …)` /
-            // `(headers, …)` raised a bogus TypeError. Use the centralized
-            // predicate — the same correction `js_object_set_field_by_name` and
-            // `js_delete_property` already carry.
-            let jv = crate::value::JSValue::from_bits(obj_value.to_bits());
-            let handle_id = jv
-                .is_pointer()
-                .then(|| jv.as_pointer::<u8>() as usize)
-                .filter(|p| crate::value::addr_class::is_small_handle(*p));
-            if let Some(hid) = handle_id {
-                return define_property_on_handle(
-                    obj_value,
-                    hid as i64,
-                    key_value,
-                    descriptor_value,
-                );
-            }
-            throw_object_type_error(b"Object.defineProperty called on non-object");
-        }
-        // A descriptor must be an Object; a Symbol is pointer-tagged but not an
-        // object, so `ToPropertyDescriptor(Symbol())` throws (test262
-        // property-description-must-be-an-object-not-symbol).
-        if !value_is_object_like(descriptor_value)
-            || crate::symbol::js_is_symbol(descriptor_value) != 0
-        {
-            let desc = describe_value_for_type_error(descriptor_value);
-            throw_object_type_error_with_suffix("Property description must be an object: ", &desc);
-        }
-        // #7963: ONE handle scope for everything below. The decoded descriptor's
-        // field values, the receiver, the coerced key string and the accessor
-        // closures are all live across calls that allocate, and this scope is
-        // what makes them GC roots. It is deliberately a single scope: an inner
-        // `RuntimeHandleScope` dropped while an outer one is still taking
-        // handles truncates the outer container's newest entries (see
-        // `gc::RootedValues`' module docs), so the arms below share this one.
-        let scope = crate::gc::RuntimeHandleScope::new();
-        // #8507: root the three entry operands before descriptor validation and
-        // the TypedArray exotic probe. The latter can coerce an object key and
-        // then return `NotTypedArray`; its private roots keep the operands live
-        // only inside that helper, so the caller must re-read its own roots
-        // before continuing into the expando/closure/ordinary paths.
-        let obj_value_handle = scope.root_heap_word_u64(obj_value.to_bits());
-        let desc_handle = scope.root_nanbox_f64(descriptor_value);
+        let obj_value_handle = scope.root_nanbox_u64(obj_value.to_bits());
         let key_handle = scope.root_nanbox_f64(key_value);
-        // #6748 follow-up: decode the descriptor's 6 fields in ONE pass when it
-        // is a plain default-prototype object (the overwhelming majority) —
-        // the per-field `desc_has_field`/`desc_read_field` helpers each cost a
-        // key-string alloc plus a HasProperty/[[Get]] walk. `None` keeps the
-        // spec-general per-field path everywhere below.
-        let desc_view = try_decode_descriptor(&scope, desc_handle.get_nanbox_f64());
-        match &desc_view {
-            Some(v) => validate_property_descriptor_view(v),
-            None => validate_property_descriptor(desc_handle.get_nanbox_f64()),
+        let target = crate::JSValue::from_bits(obj_value.to_bits());
+        if target.is_pointer()
+            && crate::value::addr_class::is_small_handle(target.as_pointer::<u8>() as usize)
+        {
+            return define_property_on_handle(
+                scope,
+                obj_value,
+                target.as_pointer::<u8>() as i64,
+                key_value,
+                descriptor,
+            );
         }
-
-        // TypedArrays are Integer-Indexed exotic objects: a canonical numeric
-        // index key bypasses ordinary define entirely (validate the index, then
-        // either write the element or reject with a TypeError).
-        if !receiver_plain_object {
-            match super::super::typed_array_define_own_property(
-                f64::from_bits(obj_value_handle.get_heap_word_u64()),
-                key_handle.get_nanbox_f64(),
-                desc_handle.get_nanbox_f64(),
-            ) {
-                super::super::TypedArrayDefineOutcome::Defined => {
-                    return f64::from_bits(obj_value_handle.get_heap_word_u64());
-                }
-                super::super::TypedArrayDefineOutcome::Rejected => {
-                    throw_object_type_error(b"Cannot redefine property")
-                }
-                super::super::TypedArrayDefineOutcome::NotTypedArray => {}
-            }
-        }
-
-        // Everything below must start from the post-probe addresses. The
-        // ordinary arm keeps re-reading these same handles via `across!`.
-        let obj_value = f64::from_bits(obj_value_handle.get_heap_word_u64());
-        let descriptor_value = desc_handle.get_nanbox_f64();
-        let key_value = key_handle.get_nanbox_f64();
 
         // Buffer / ArrayBuffer / SharedArrayBuffer / DataView use
         // `BufferHeader` storage, but are ordinary extensible objects for
@@ -405,9 +363,9 @@ pub extern "C" fn js_object_define_property(
             .filter(|addr| crate::buffer::is_registered_buffer(*addr))
             .filter(|addr| !crate::buffer::is_uint8array_buffer(*addr));
         if buffer_addr.is_some() {
-            let current_obj = || f64::from_bits(obj_value_handle.get_heap_word_u64());
+            let current_obj = || f64::from_bits(obj_value_handle.get_nanbox_u64());
             let current_addr = || crate::value::js_nanbox_get_pointer(current_obj()) as usize;
-            let current_desc = || desc_handle.get_nanbox_f64();
+
             let current_key = || key_handle.get_nanbox_f64();
 
             // Symbol keys stay Symbols; string coercion would create an
@@ -418,8 +376,7 @@ pub extern "C" fn js_object_define_property(
                     current_obj(),
                     current_obj(),
                     current_key(),
-                    current_desc(),
-                    desc_view.as_ref(),
+                    descriptor,
                 );
             }
 
@@ -443,27 +400,25 @@ pub extern "C" fn js_object_define_property(
                             .unwrap_or(PropertyAttrs::new(true, true, true))
                     });
                 if let Some(attrs) = existing_attrs {
-                    if !attrs.configurable() {
-                        validate_nonconfigurable_redefine(
-                            &name,
+                    if !attrs.configurable()
+                        && !nonconfigurable_redefine_allowed(
                             attrs,
                             existing_accessor,
                             existing_data_value.get_nanbox_f64(),
-                            current_desc(),
-                            desc_view.as_ref(),
-                        );
+                            descriptor,
+                        )
+                    {
+                        return false;
                     }
                 }
 
-                let has_get = desc_has_field(current_desc(), b"get");
-                let has_set = desc_has_field(current_desc(), b"set");
-                let has_value = desc_has_field(current_desc(), b"value");
-                let has_writable = desc_has_field(current_desc(), b"writable");
+                let has_get = descriptor.has_named(b"get");
+                let has_set = descriptor.has_named(b"set");
+                let has_value = descriptor.has_named(b"value");
+                let has_writable = descriptor.has_named(b"writable");
                 if has_get || has_set {
-                    let get_field =
-                        scope.root_nanbox_u64(desc_read_field(current_desc(), b"get").bits());
-                    let set_field =
-                        scope.root_nanbox_u64(desc_read_field(current_desc(), b"set").bits());
+                    let get_field = scope.root_nanbox_u64(descriptor.read_named(b"get").bits());
+                    let set_field = scope.root_nanbox_u64(descriptor.read_named(b"set").bits());
                     let get_bits = scope.root_nanbox_u64(
                         if has_get && get_field.get_nanbox_u64() != crate::value::TAG_UNDEFINED {
                             crate::closure::clone_closure_rebind_this(
@@ -502,7 +457,7 @@ pub extern "C" fn js_object_define_property(
                     let addr = current_addr();
                     super::super::clear_accessor_descriptor(addr, &name);
                     let value = if has_value {
-                        f64::from_bits(desc_read_field(current_desc(), b"value").bits())
+                        f64::from_bits(descriptor.read_named(b"value").bits())
                     } else if existing_accessor.is_some() || existing_data.is_none() {
                         f64::from_bits(crate::value::TAG_UNDEFINED)
                     } else {
@@ -512,9 +467,9 @@ pub extern "C" fn js_object_define_property(
                 }
 
                 let read_flag = |field: &[u8]| -> Option<bool> {
-                    desc_has_field(current_desc(), field).then(|| {
+                    descriptor.has_named(field).then(|| {
                         crate::value::js_is_truthy(f64::from_bits(
-                            desc_read_field(current_desc(), field).bits(),
+                            descriptor.read_named(field).bits(),
                         )) != 0
                     })
                 };
@@ -537,7 +492,7 @@ pub extern "C" fn js_object_define_property(
                 );
                 super::super::set_property_attrs(current_addr(), name, attrs);
             }
-            return current_obj();
+            return true;
         }
 
         // Date / RegExp / Error instances are exotic cells, not
@@ -549,69 +504,97 @@ pub extern "C" fn js_object_define_property(
             .flatten()
         {
             if crate::symbol::js_is_symbol(key_value) != 0 {
-                let value_field = desc_read_field(descriptor_value, b"value");
-                crate::symbol::js_object_set_symbol_property(
-                    obj_value,
-                    key_value,
-                    f64::from_bits(value_field.bits()),
+                return super::define_symbol_property::define_symbol_property(
+                    scope, obj_value, obj_value, key_value, descriptor,
                 );
-                return obj_value;
             }
             if let Some(name) = super::super::metadata_key_to_string(key_value) {
-                super::super::exotic_expando::exotic_define_own_property(
-                    addr,
-                    kind,
-                    &name,
-                    descriptor_value,
+                return super::super::exotic_expando::exotic_define_own_property(
+                    addr, kind, &name, descriptor,
                 );
             }
-            return obj_value;
+            return true;
         }
 
         // Legacy prototype refs denote the same ordinary object as a
         // reflective C.prototype read. Define the descriptor on that holder.
         if let Some(cid) = super::super::class_prototype_ref_id(obj_value) {
             let proto = super::super::class_registry::class_decl_prototype_value(cid);
-            js_object_define_property(proto, key_handle.get_nanbox_f64(), desc_handle.get_nanbox_f64());
-            return f64::from_bits(obj_value_handle.get_heap_word_u64());
+            let proto = scope.root_nanbox_u64(proto.to_bits());
+            return define_own_property_decoded(scope, &proto, &key_handle, descriptor);
         }
         // Constructor refs use their static property storage.
         if let Some(target_cid) = super::super::class_ref_id(obj_value) {
             if crate::symbol::js_is_symbol(key_value) != 0 {
                 crate::symbol::CLASS_STATIC_SYMBOLS_LATCH.arm();
                 let owner = super::super::class_value::class_value_ptr(target_cid);
-                super::define_symbol_property::define_symbol_property(
+                return super::define_symbol_property::define_symbol_property(
                     &scope,
                     f64::from_bits(crate::JSValue::pointer(owner.cast()).bits()),
                     obj_value,
                     key_value,
-                    descriptor_value,
-                    desc_view.as_ref(),
+                    descriptor,
                 );
-                return f64::from_bits(obj_value_handle.get_heap_word_u64());
             }
             if let Some(name) = super::super::metadata_key_to_string(key_value) {
                 // #10480: a declared accessor — instance on the prototype ref,
                 // static on the class ref — keeps its get/set under a generic
                 // descriptor; only its attributes change.
-                if super::define_class_accessor::define_declared_class_accessor(
+                if let Some(verdict) = super::define_class_accessor::define_declared_class_accessor(
                     target_cid,
                     super::super::class_prototype_ref_id(obj_value).is_none(),
                     &name,
-                    desc_handle.get_nanbox_f64(),
-                    desc_view.as_ref(),
+                    descriptor,
                 ) {
-                    return obj_value;
+                    return verdict;
                 }
-                let descriptor_value = desc_handle.get_nanbox_f64();
-                let has_get = desc_has_field(descriptor_value, b"get");
-                let has_set = desc_has_field(descriptor_value, b"set");
+                // A non-configurable own static (a dynamic accessor or a
+                // defined data property) validates against its current facts,
+                // read from the same tables its descriptor reflects.
+                if !super::super::class_registry::class_static_key_deleted(target_cid, &name) {
+                    let current = if let Some((accessor, attrs)) =
+                        super::super::class_registry::class_dynamic_static_accessor_descriptor(
+                            target_cid, &name, obj_value,
+                        ) {
+                        Some((attrs, Some(accessor), crate::value::TAG_UNDEFINED))
+                    } else {
+                        super::super::class_registry::class_own_static_field_value(
+                            target_cid, &name,
+                        )
+                        .map(|value| {
+                            let (writable, enumerable, configurable) =
+                                super::super::class_registry::class_static_defined_attrs(
+                                    target_cid, &name,
+                                )
+                                .unwrap_or((true, true, true));
+                            (
+                                PropertyAttrs::new(writable, enumerable, configurable),
+                                None,
+                                value.to_bits(),
+                            )
+                        })
+                    };
+                    if let Some((attrs, accessor, value)) = current {
+                        if !attrs.configurable()
+                            && !nonconfigurable_redefine_allowed(
+                                attrs,
+                                accessor,
+                                f64::from_bits(value),
+                                descriptor,
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                }
+
+                let has_get = descriptor.has_named(b"get");
+                let has_set = descriptor.has_named(b"set");
                 if super::super::class_prototype_ref_id(obj_value).is_none() && (has_get || has_set)
                 {
-                    let descriptor_value = desc_handle.get_nanbox_f64();
-                    let get_field = desc_read_field(descriptor_value, b"get");
+                    let get_field = descriptor.read_named(b"get");
                     let get_field = scope.root_nanbox_u64(get_field.bits());
-                    let set_field = desc_read_field(desc_handle.get_nanbox_f64(), b"set");
+                    let set_field = descriptor.read_named(b"set");
                     let set_field = scope.root_nanbox_u64(set_field.bits());
                     let get_bits = has_get.then(|| {
                         (get_field.get_nanbox_u64() != crate::value::TAG_UNDEFINED)
@@ -623,18 +606,17 @@ pub extern "C" fn js_object_define_property(
                             .then(|| set_field.get_nanbox_u64())
                             .unwrap_or(0)
                     });
-                    let class_value = f64::from_bits(obj_value_handle.get_heap_word_u64());
-                    let descriptor_value = desc_handle.get_nanbox_f64();
-                    let enumerable = desc_has_field(descriptor_value, b"enumerable")
-                        .then(|| descriptor_enumerable(desc_handle.get_nanbox_f64()));
-                    let descriptor_value = desc_handle.get_nanbox_f64();
-                    let configurable =
-                        desc_has_field(descriptor_value, b"configurable").then(|| {
-                            crate::value::js_is_truthy(f64::from_bits(
-                                desc_read_field(desc_handle.get_nanbox_f64(), b"configurable")
-                                    .bits(),
-                            )) != 0
-                        });
+                    let class_value = f64::from_bits(obj_value_handle.get_nanbox_u64());
+
+                    let enumerable = descriptor
+                        .has_named(b"enumerable")
+                        .then(|| descriptor.flag(b"enumerable").unwrap_or(false));
+
+                    let configurable = descriptor.has_named(b"configurable").then(|| {
+                        crate::value::js_is_truthy(f64::from_bits(
+                            descriptor.read_named(b"configurable").bits(),
+                        )) != 0
+                    });
                     super::super::class_registry::register_class_dynamic_static_accessor(
                         target_cid,
                         class_value,
@@ -644,15 +626,12 @@ pub extern "C" fn js_object_define_property(
                         enumerable,
                         configurable,
                     );
-                    return obj_value;
+                    return true;
                 }
-                let desc_ptr = extract_obj_ptr(descriptor_value);
-                if !desc_ptr.is_null() {
-                    let value_key = crate::string::js_string_from_bytes(b"value".as_ptr(), 5);
-                    let value_field =
-                        js_object_get_field_by_name(desc_ptr as *const ObjectHeader, value_key);
-                    let descriptor_value = desc_handle.get_nanbox_f64();
-                    let has_value = desc_has_field(descriptor_value, b"value");
+                {
+                    let value_field = descriptor.read_named(b"value");
+
+                    let has_value = descriptor.has_named(b"value");
                     // ECMA-262 ValidateAndApplyPropertyDescriptor: an existing own
                     // static keeps every attribute the descriptor omits (a
                     // declared `static x` is writable+enumerable+configurable);
@@ -713,23 +692,23 @@ pub extern "C" fn js_object_define_property(
                             // `configurable: true`, which is why redefining
                             // `name` without saying `configurable` must stay
                             // configurable — while a brand-new key must not.
-                            let has_cfg = desc_has_field(descriptor_value, b"configurable");
+                            let has_cfg = descriptor.has_named(b"configurable");
                             let configurable = if has_cfg {
                                 crate::value::js_is_truthy(f64::from_bits(
-                                    desc_read_field(descriptor_value, b"configurable").bits(),
+                                    descriptor.read_named(b"configurable").bits(),
                                 )) != 0
                             } else {
                                 existing_static
                                     .map(|(_, _, cfg)| cfg)
                                     .unwrap_or(matches!(name.as_str(), "name" | "length"))
                             };
-                            let writable = if desc_has_field(descriptor_value, b"writable") {
-                                descriptor_writable(descriptor_value)
+                            let writable = if descriptor.has_named(b"writable") {
+                                descriptor.flag(b"writable").unwrap_or(false)
                             } else {
                                 existing_static.is_some_and(|(w, _, _)| w)
                             };
-                            let enumerable = if desc_has_field(descriptor_value, b"enumerable") {
-                                descriptor_enumerable(descriptor_value)
+                            let enumerable = if descriptor.has_named(b"enumerable") {
+                                descriptor.flag(b"enumerable").unwrap_or(false)
                             } else {
                                 existing_static.is_some_and(|(_, e, _)| e)
                             };
@@ -740,12 +719,12 @@ pub extern "C" fn js_object_define_property(
                                 enumerable,
                                 configurable,
                             );
-                            return obj_value;
+                            return true;
                         }
                     }
                 }
             }
-            return obj_value;
+            return true;
         }
 
         // Closures are object-like but not ObjectHeader-backed, so descriptor
@@ -773,33 +752,27 @@ pub extern "C" fn js_object_define_property(
         if let Some(closure_ptr) = target_closure_ptr {
             if crate::symbol::js_is_symbol(key_value) != 0 {
                 return super::define_symbol_property::define_symbol_property(
-                    &scope,
-                    obj_value,
-                    obj_value,
-                    key_value,
-                    descriptor_value,
-                    desc_view.as_ref(),
+                    &scope, obj_value, obj_value, key_value, descriptor,
                 );
             }
             // #6943: `js_string_coerce` on an object key runs a user
             // `toString` / `valueOf`, and allocates the stringified form for
             // every primitive key — either can trigger a GC that **evacuates**
-            // live objects. `obj_value` (the receiver), `descriptor_value`, and
+            // live objects. `obj_value` (the receiver), `descriptor`, and
             // the already-dereferenced `closure_ptr` were raw Rust locals
             // across the call — neither GC roots nor shadow slots. A stale
             // receiver rebinds the accessors onto a forwarding stub; a stale
             // `closure_ptr` files the property under a dead address, where the
             // matching read can never find it. Root all three across the
             // coercion and read them back through their handles.
-            let obj_handle = scope.root_heap_word_u64(obj_value.to_bits());
-            let desc_handle = scope.root_nanbox_f64(descriptor_value);
+            let obj_handle = scope.root_nanbox_u64(obj_value.to_bits());
             let closure_handle = scope.root_raw_mut_ptr(closure_ptr as *mut u8);
             let key_str = crate::builtins::js_string_coerce(key_value);
-            let obj_value = f64::from_bits(obj_handle.get_heap_word_u64());
-            let descriptor_value = desc_handle.get_nanbox_f64();
+            let obj_value = f64::from_bits(obj_handle.get_nanbox_u64());
+
             let closure_ptr = closure_handle.get_raw_mut_ptr::<u8>() as usize;
             if key_str.is_null() {
-                return obj_value;
+                return true;
             }
             let key_rust: Option<String> = {
                 let name_ptr =
@@ -809,12 +782,8 @@ pub extern "C" fn js_object_define_property(
                 std::str::from_utf8(name_bytes).ok().map(|s| s.to_string())
             };
             let Some(key_rust) = key_rust else {
-                return obj_value;
+                return true;
             };
-            let desc_ptr = extract_obj_ptr(descriptor_value);
-            if desc_ptr.is_null() {
-                return obj_value;
-            }
 
             // Spec retention: redefining an existing own property keeps the
             // attributes the descriptor omits (see the object-path comment).
@@ -845,7 +814,7 @@ pub extern "C" fn js_object_define_property(
             if existing_attrs.is_none()
                 && crate::value::js_is_truthy(js_object_is_extensible(obj_value)) == 0
             {
-                throw_object_type_error_with_suffix("Cannot define property: ", &key_rust);
+                return false;
             }
             // ValidateAndApplyPropertyDescriptor: a non-configurable existing own
             // property of a function object can only be redefined within the
@@ -861,59 +830,61 @@ pub extern "C" fn js_object_define_property(
                     } else {
                         f64::from_bits(crate::value::TAG_UNDEFINED)
                     };
-                    validate_nonconfigurable_redefine(
-                        &key_rust,
+                    if !nonconfigurable_redefine_allowed(
                         cur_attrs,
                         cur_accessor,
                         cur_value,
-                        descriptor_value,
-                        desc_view.as_ref(),
-                    );
+                        descriptor,
+                    ) {
+                        return false;
+                    }
                 }
             }
 
-            let get_key = crate::string::js_string_from_bytes(b"get".as_ptr(), 3);
-            let set_key = crate::string::js_string_from_bytes(b"set".as_ptr(), 3);
-            let get_field = js_object_get_field_by_name(desc_ptr as *const ObjectHeader, get_key);
-            let set_field = js_object_get_field_by_name(desc_ptr as *const ObjectHeader, set_key);
-            let has_get = desc_has_field(descriptor_value, b"get");
-            let has_set = desc_has_field(descriptor_value, b"set");
+            let get_field = descriptor.read_named(b"get");
+            let has_get = descriptor.has_named(b"get");
+            let has_set = descriptor.has_named(b"set");
             let current_accessor = get_accessor_descriptor(closure_ptr, &key_rust);
             let has_accessor = has_get
                 || has_set
                 || (current_accessor.is_some()
-                    && !desc_has_field(descriptor_value, b"value")
-                    && !desc_has_field(descriptor_value, b"writable"));
+                    && !descriptor.has_named(b"value")
+                    && !descriptor.has_named(b"writable"));
 
+            let prior_get =
+                scope.root_nanbox_u64(current_accessor.map(|accessor| accessor.get).unwrap_or(0));
+            let prior_set =
+                scope.root_nanbox_u64(current_accessor.map(|accessor| accessor.set).unwrap_or(0));
             if has_accessor {
                 let get_bits = if !has_get {
-                    current_accessor.map_or(0, |acc| acc.get)
+                    prior_get.get_nanbox_u64()
                 } else if get_field.is_undefined() {
                     0
                 } else {
                     crate::closure::clone_closure_rebind_this(get_field.bits(), obj_value)
                 };
+                let get_bits = scope.root_nanbox_u64(get_bits);
+                let set_field = descriptor.read_named(b"set");
+                let obj_value = f64::from_bits(obj_handle.get_nanbox_u64());
                 let set_bits = if !has_set {
-                    current_accessor.map_or(0, |acc| acc.set)
+                    prior_set.get_nanbox_u64()
                 } else if set_field.is_undefined() {
                     0
                 } else {
                     crate::closure::clone_closure_rebind_this(set_field.bits(), obj_value)
                 };
                 set_accessor_descriptor(
-                    closure_ptr,
+                    closure_handle.get_raw_mut_ptr::<u8>() as usize,
                     key_rust.clone(),
                     AccessorDescriptor {
-                        get: get_bits,
+                        get: get_bits.get_nanbox_u64(),
                         set: set_bits,
                     },
                 );
             } else {
-                let value_key = crate::string::js_string_from_bytes(b"value".as_ptr(), 5);
-                let value_field =
-                    js_object_get_field_by_name(desc_ptr as *const ObjectHeader, value_key);
+                let value_field = descriptor.read_named(b"value");
                 clear_accessor_descriptor(closure_ptr, &key_rust);
-                if desc_has_field(descriptor_value, b"value") {
+                if descriptor.has_named(b"value") {
                     crate::closure::closure_define_dynamic_prop(
                         closure_ptr,
                         &key_rust,
@@ -928,15 +899,7 @@ pub extern "C" fn js_object_define_property(
                 }
             }
 
-            let read_bool = |name: &[u8]| -> Option<bool> {
-                let k = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-                let v = js_object_get_field_by_name(desc_ptr as *const ObjectHeader, k);
-                if v.is_undefined() {
-                    None
-                } else {
-                    Some(crate::value::js_is_truthy(f64::from_bits(v.bits())) != 0)
-                }
-            };
+            let read_bool = |name: &[u8]| -> Option<bool> { descriptor.flag(name) };
             let writable = !has_accessor
                 && read_bool(b"writable")
                     .unwrap_or_else(|| existing_attrs.map(|a| a.writable()).unwrap_or(false));
@@ -945,11 +908,11 @@ pub extern "C" fn js_object_define_property(
             let configurable = read_bool(b"configurable")
                 .unwrap_or_else(|| existing_attrs.map(|a| a.configurable()).unwrap_or(false));
             set_property_attrs(
-                closure_ptr,
+                closure_handle.get_raw_mut_ptr::<u8>() as usize,
                 key_rust,
                 PropertyAttrs::new(writable, enumerable, configurable),
             );
-            return obj_value;
+            return true;
         }
 
         if let Some(addr) = (!receiver_plain_object)
@@ -963,70 +926,22 @@ pub extern "C" fn js_object_define_property(
             // (defineProperty defaults absent fields to false, unlike a plain
             // `ta[sym] = v` write). Mirrors the generic symbol-define block.
             if crate::symbol::js_is_symbol(key_value) != 0 {
-                let desc_ptr = extract_obj_ptr(descriptor_value);
-                if desc_ptr.is_null() {
-                    return obj_value;
-                }
-                let has_get = desc_has_field(descriptor_value, b"get");
-                let has_set = desc_has_field(descriptor_value, b"set");
-                let has_accessor = has_get || has_set;
-                if has_accessor {
-                    let get_field = desc_read_field(descriptor_value, b"get");
-                    let set_field = desc_read_field(descriptor_value, b"set");
-                    let get_bits = if !has_get || get_field.is_undefined() {
-                        0
-                    } else {
-                        crate::closure::clone_closure_rebind_this(get_field.bits(), obj_value)
-                    };
-                    let set_bits = if !has_set || set_field.is_undefined() {
-                        0
-                    } else {
-                        crate::closure::clone_closure_rebind_this(set_field.bits(), obj_value)
-                    };
-                    crate::symbol::set_symbol_accessor_property(
-                        obj_value, key_value, get_bits, set_bits,
-                    );
-                } else {
-                    let value_field = desc_read_field(descriptor_value, b"value");
-                    crate::symbol::js_object_set_symbol_property(
-                        obj_value,
-                        key_value,
-                        f64::from_bits(value_field.bits()),
-                    );
-                }
-                let read_flag = |name: &[u8]| -> Option<bool> {
-                    if !desc_has_field(descriptor_value, name) {
-                        return None;
-                    }
-                    let v = desc_read_field(descriptor_value, name);
-                    Some(crate::value::js_is_truthy(f64::from_bits(v.bits())) != 0)
-                };
-                let owner = crate::symbol::obj_key_from_f64(obj_value);
-                let sym_key = crate::symbol::sym_key_from_f64(key_value);
-                crate::symbol::set_symbol_property_attrs(
-                    owner,
-                    sym_key,
-                    PropertyAttrs::new(
-                        read_flag(b"writable").unwrap_or(has_accessor),
-                        read_flag(b"enumerable").unwrap_or(false),
-                        read_flag(b"configurable").unwrap_or(false),
-                    ),
+                return super::define_symbol_property::define_symbol_property(
+                    scope, obj_value, obj_value, key_value, descriptor,
                 );
-                return obj_value;
             }
             // #6943: same GC-capable coercion as the closure arm above. Here
             // the raw local at risk is `addr` — the TypedArray's heap address,
             // resolved from `obj_value` *before* the coercion and dereferenced
             // as a `TypedArrayHeader` after it.
-            let obj_handle = scope.root_heap_word_u64(obj_value.to_bits());
-            let desc_handle = scope.root_nanbox_f64(descriptor_value);
+            let obj_handle = scope.root_nanbox_u64(obj_value.to_bits());
             let addr_handle = scope.root_raw_mut_ptr(addr as *mut u8);
             let key_str = crate::builtins::js_string_coerce(key_value);
-            let obj_value = f64::from_bits(obj_handle.get_heap_word_u64());
-            let descriptor_value = desc_handle.get_nanbox_f64();
+            let obj_value = f64::from_bits(obj_handle.get_nanbox_u64());
+
             let addr = addr_handle.get_raw_mut_ptr::<u8>() as usize;
             if key_str.is_null() {
-                return obj_value;
+                return true;
             }
             let key_rust: Option<String> = {
                 let name_ptr =
@@ -1041,16 +956,15 @@ pub extern "C" fn js_object_define_property(
                     addr as *mut crate::typedarray::TypedArrayHeader,
                     key_str,
                     key_name,
-                    descriptor_value,
-                    desc_view.as_ref(),
+                    descriptor,
                 );
             }
-            return obj_value;
+            return true;
         }
 
         let obj = extract_obj_ptr(obj_value);
         if obj.is_null() {
-            return obj_value;
+            return true;
         }
         // #1250: when the key is a Symbol, route into the symbol side
         // table (`SYMBOL_PROPERTIES`) the same way `obj[sym] = value`
@@ -1058,113 +972,28 @@ pub extern "C" fn js_object_define_property(
         // would drop the symbol and try to coerce it to a string,
         // which is exactly the failure mode reported for
         // `Object.defineProperty(obj, inspect.custom, …)`.
-        let key_bits = key_value.to_bits();
-        let key_tag = key_bits & 0xFFFF_0000_0000_0000;
-        if key_tag == 0x7FFD_0000_0000_0000 {
-            let raw_ptr = (key_bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::symbol::SymbolHeader;
-            if !raw_ptr.is_null()
-                && (raw_ptr as usize) >= 0x1000
-                && (*raw_ptr).magic == crate::symbol::SYMBOL_MAGIC
-            {
-                let desc_ptr = extract_obj_ptr(descriptor_value);
-                if !desc_ptr.is_null() {
-                    let get_key = crate::string::js_string_from_bytes(b"get".as_ptr(), 3);
-                    let set_key = crate::string::js_string_from_bytes(b"set".as_ptr(), 3);
-                    let get_field =
-                        js_object_get_field_by_name(desc_ptr as *const ObjectHeader, get_key);
-                    let set_field =
-                        js_object_get_field_by_name(desc_ptr as *const ObjectHeader, set_key);
-                    let has_get = own_key_present(desc_ptr, get_key);
-                    let has_set = own_key_present(desc_ptr, set_key);
-                    let has_accessor = has_get || has_set;
-                    if has_accessor {
-                        let get_bits = if !has_get || get_field.is_undefined() {
-                            0
-                        } else {
-                            crate::closure::clone_closure_rebind_this(get_field.bits(), obj_value)
-                        };
-                        let set_bits = if !has_set || set_field.is_undefined() {
-                            0
-                        } else {
-                            crate::closure::clone_closure_rebind_this(set_field.bits(), obj_value)
-                        };
-                        crate::symbol::set_symbol_accessor_property(
-                            obj_value, key_value, get_bits, set_bits,
-                        );
-                    } else {
-                        let value_key = crate::string::js_string_from_bytes(b"value".as_ptr(), 5);
-                        if own_key_present(desc_ptr, value_key) {
-                            let value_field = js_object_get_field_by_name(
-                                desc_ptr as *const ObjectHeader,
-                                value_key,
-                            );
-                            crate::symbol::define_symbol_data_property(
-                                obj_value,
-                                key_value,
-                                f64::from_bits(value_field.bits()),
-                            );
-                        }
-                    }
-                    let read_bool = |name: &[u8]| -> Option<bool> {
-                        let k =
-                            crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-                        let v = js_object_get_field_by_name(desc_ptr as *const ObjectHeader, k);
-                        if v.is_undefined() {
-                            None
-                        } else {
-                            Some(crate::value::js_is_truthy(f64::from_bits(v.bits())) != 0)
-                        }
-                    };
-                    let writable = read_bool(b"writable").unwrap_or(has_accessor);
-                    let enumerable = read_bool(b"enumerable").unwrap_or(false);
-                    let configurable = read_bool(b"configurable").unwrap_or(false);
-                    crate::symbol::set_symbol_property_attrs(
-                        obj as usize,
-                        raw_ptr as usize,
-                        PropertyAttrs::new(writable, enumerable, configurable),
-                    );
-                }
-                return obj_value;
-            }
+        if crate::symbol::js_is_symbol(key_value) != 0 {
+            return super::define_symbol_property::define_symbol_property(
+                scope, obj_value, obj_value, key_value, descriptor,
+            );
         }
-        // Extract key string.
-        //
-        // #6943 / #7963: the ordinary arm carries TWO raw heap pointers all the
-        // way to the end of this function — `obj`, the receiver's
-        // `ObjectHeader`, and `key_str`, the coerced key — plus three NaN-boxed
-        // words (`obj_value`, `descriptor_value`, `key_value`). Between here
-        // and the last use it runs a dozen calls that can allocate and
-        // therefore EVACUATE: `js_string_coerce` itself,
-        // `define_array_property`, `enforce_define_property_invariants`,
-        // `obj_value_has_own_key`, `ensure_key_in_keys_array`,
-        // `clone_closure_rebind_this`, `define_property_force_store_value`, and
-        // every `desc_has_field` / `desc_read_field` (each allocates a
-        // field-name string, and on a non-plain descriptor runs a USER GETTER).
-        // A raw Rust local is neither a shadow slot nor a temp root nor
-        // reachable from any registered scanner, so the collector can neither
-        // keep those objects alive nor rewrite the local.
-        //
-        // The stale receiver is worse than a stale read: `obj as usize` is the
-        // OWNER KEY of the per-property descriptor side tables, so a define
-        // that lands after a collection files its attributes and accessors
-        // under a dead address, where the matching read can never find them.
-        //
-        // `across!` below is the only way to name any of them across a call: it
-        // runs the call FIRST and rebinds every one from its root afterwards,
-        // so a pre-collection address is never nameable.
+        // Keep receiver and coerced key rooted across shape growth, array
+        // conversion, accessor rebinding and stores. Descriptor fields remain
+        // rooted in the caller's immutable view. Reload addresses after each
+        // allocating operation before using receiver-owned metadata.
         let obj_handle = scope.root_raw_mut_ptr(obj);
         let (key_str, mut obj) = obj_handle
             .across_mut::<ObjectHeader, _>(|| crate::builtins::js_string_coerce(key_value));
-        let mut obj_value = f64::from_bits(obj_value_handle.get_heap_word_u64());
-        let mut descriptor_value = desc_handle.get_nanbox_f64();
+        let mut obj_value = f64::from_bits(obj_value_handle.get_nanbox_u64());
+
         let mut key_value = key_handle.get_nanbox_f64();
         if key_str.is_null() {
-            return obj_value;
+            return true;
         }
         let key_str_handle = scope.root_string_ptr(key_str);
         let mut key_str = key_str;
         // Run `$call` — which may allocate, and therefore may MOVE any of the
-        // five values above — then rebind all five from their roots. Never bind
+        // receiver and key above — then rebind all five from their roots. Never bind
         // the pre-call address to anything that outlives the call.
         macro_rules! across {
             ($call:expr) => {{
@@ -1174,8 +1003,8 @@ pub extern "C" fn js_object_define_property(
                     });
                 obj = refreshed_obj;
                 key_str = refreshed_key;
-                obj_value = f64::from_bits(obj_value_handle.get_heap_word_u64());
-                descriptor_value = desc_handle.get_nanbox_f64();
+                obj_value = f64::from_bits(obj_value_handle.get_nanbox_u64());
+
                 key_value = key_handle.get_nanbox_f64();
                 result
             }};
@@ -1198,11 +1027,10 @@ pub extern "C" fn js_object_define_property(
                     obj as *mut crate::typedarray::TypedArrayHeader,
                     key_str,
                     key_name,
-                    descriptor_value,
-                    desc_view.as_ref(),
+                    descriptor,
                 );
             }
-            return obj_value;
+            return true;
         }
         let array_outcome = if receiver_plain_object {
             None
@@ -1212,41 +1040,27 @@ pub extern "C" fn js_object_define_property(
                 obj_value,
                 key_str,
                 key_rust.as_deref(),
-                descriptor_value,
+                descriptor,
             ))
         };
         if let Some(ok) = array_outcome {
-            if ok {
-                return obj_value;
-            }
-            // A rejected array `[[DefineOwnProperty]]` (e.g. redefining the
-            // non-configurable / non-writable `length`, or a forbidden change to
-            // a non-configurable index property) throws under
-            // `Object.defineProperty`.
-            let k = key_rust.as_deref().unwrap_or("length");
-            throw_object_type_error_with_suffix("Cannot redefine property: ", k);
+            return ok;
         }
-        // #2843: enforce frozen / sealed / non-extensible invariants BEFORE any
-        // mutation, so a rejected definition leaves the object untouched and the
-        // thrown TypeError matches Node.
+        // #2843: validate frozen / sealed / non-extensible invariants BEFORE
+        // any mutation, so a rejected definition leaves the object untouched.
         if let Some(ref k) = key_rust {
-            across!(enforce_define_property_invariants(
-                obj,
-                key_str,
-                k,
-                descriptor_value,
-                desc_view.as_ref(),
-            ));
+            if !across!(enforce_define_property_invariants(
+                obj, key_str, k, descriptor,
+            )) {
+                return false;
+            }
         }
         // A compatible definition of an immutable virtual index is a no-op.
         // The invariant check above has already rejected every actual change.
         if super::super::string_wrapper::has_index_key(obj as usize, key_str) {
-            return obj_value;
+            return true;
         }
         // Extract descriptor object
-        if extract_obj_ptr(descriptor_value).is_null() {
-            return obj_value;
-        }
 
         // Spec (OrdinaryDefineOwnProperty / ValidateAndApplyPropertyDescriptor):
         // when the property ALREADY EXISTS as an own property, attribute fields
@@ -1285,22 +1099,9 @@ pub extern "C" fn js_object_define_property(
         // first `clone_closure_rebind_this` both run before the second is read.
         let get_field_slot = scope.root_nanbox_u64(crate::value::TAG_UNDEFINED);
         let set_field_slot = scope.root_nanbox_u64(crate::value::TAG_UNDEFINED);
-        let (desc_has_get, desc_has_set) = match &desc_view {
-            Some(v) => {
-                get_field_slot.set_nanbox_u64(v.read(DESC_GET).bits());
-                set_field_slot.set_nanbox_u64(v.read(DESC_SET).bits());
-                (v.has(DESC_GET), v.has(DESC_SET))
-            }
-            None => {
-                let has_get = across!(desc_has_field(descriptor_value, b"get"));
-                let has_set = across!(desc_has_field(descriptor_value, b"set"));
-                let get_bits = across!(desc_read_field(descriptor_value, b"get").bits());
-                get_field_slot.set_nanbox_u64(get_bits);
-                let set_bits = across!(desc_read_field(descriptor_value, b"set").bits());
-                set_field_slot.set_nanbox_u64(set_bits);
-                (has_get, has_set)
-            }
-        };
+        get_field_slot.set_nanbox_u64(descriptor.read(DESC_GET).bits());
+        set_field_slot.set_nanbox_u64(descriptor.read(DESC_SET).bits());
+        let (desc_has_get, desc_has_set) = (descriptor.has(DESC_GET), descriptor.has(DESC_SET));
         let has_accessor = desc_has_get || desc_has_set;
 
         // The existing accessor (if the property is currently an accessor) —
@@ -1383,14 +1184,8 @@ pub extern "C" fn js_object_define_property(
             // descriptor (only `enumerable`/`configurable`). Detect by own-field
             // presence so `{ value: undefined }` (present) stores `undefined`,
             // while a generic descriptor on an existing accessor leaves it intact.
-            let (desc_has_value, desc_has_writable) = match &desc_view {
-                Some(v) => (v.has(DESC_VALUE), v.has(DESC_WRITABLE)),
-                None => {
-                    let has_value = across!(desc_has_field(descriptor_value, b"value"));
-                    let has_writable = across!(desc_has_field(descriptor_value, b"writable"));
-                    (has_value, has_writable)
-                }
-            };
+            let (desc_has_value, desc_has_writable) =
+                (descriptor.has(DESC_VALUE), descriptor.has(DESC_WRITABLE));
             let is_data = desc_has_value || desc_has_writable;
 
             if is_data {
@@ -1409,10 +1204,7 @@ pub extern "C" fn js_object_define_property(
                 // `value` is omitted (a `{ writable: ... }`-only descriptor on a
                 // brand-new property) the value defaults to `undefined`.
                 if desc_has_value {
-                    let value_bits = match &desc_view {
-                        Some(v) => v.read(DESC_VALUE).bits(),
-                        None => across!(desc_read_field(descriptor_value, b"value").bits()),
-                    };
+                    let value_bits = descriptor.read(DESC_VALUE).bits();
                     across!(define_property_force_store_value(
                         obj,
                         key_str,
@@ -1450,38 +1242,10 @@ pub extern "C" fn js_object_define_property(
         // retained-attrs rule doesn't apply across the kind switch).
         let accessor_to_data = had_existing_accessor
             && !has_accessor
-            && match &desc_view {
-                Some(v) => v.has(DESC_VALUE) || v.has(DESC_WRITABLE),
-                None => {
-                    let has_value = across!(desc_has_field(descriptor_value, b"value"));
-                    let has_writable = across!(desc_has_field(descriptor_value, b"writable"));
-                    has_value || has_writable
-                }
-            };
-        // Read attribute flags from descriptor. JS defaults when omitted in
-        // `Object.defineProperty` are `false` (NOT `true` like for direct
-        // assignment). Each field is converted to a plain `bool` immediately
-        // after its read — `is_undefined` / `js_is_truthy` cannot allocate — so
-        // no NaN-boxed word survives the NEXT field's read.
-        let flag_of = |bits: u64| -> Option<bool> {
-            if crate::value::JSValue::from_bits(bits).is_undefined() {
-                None
-            } else {
-                Some(crate::value::js_is_truthy(f64::from_bits(bits)) != 0)
-            }
-        };
-        let writable_flag = flag_of(match &desc_view {
-            Some(v) => v.read(DESC_WRITABLE).bits(),
-            None => across!(desc_read_field(descriptor_value, b"writable").bits()),
-        });
-        let enumerable_flag = flag_of(match &desc_view {
-            Some(v) => v.read(DESC_ENUMERABLE).bits(),
-            None => across!(desc_read_field(descriptor_value, b"enumerable").bits()),
-        });
-        let configurable_flag = flag_of(match &desc_view {
-            Some(v) => v.read(DESC_CONFIGURABLE).bits(),
-            None => across!(desc_read_field(descriptor_value, b"configurable").bits()),
-        });
+            && (descriptor.has(DESC_VALUE) || descriptor.has(DESC_WRITABLE));
+        let writable_flag = descriptor.flag(b"writable");
+        let enumerable_flag = descriptor.flag(b"enumerable");
+        let configurable_flag = descriptor.flag(b"configurable");
         let writable = writable_flag.unwrap_or_else(|| {
             if accessor_to_data {
                 false
@@ -1501,8 +1265,7 @@ pub extern "C" fn js_object_define_property(
                 PropertyAttrs::new(writable, enumerable, configurable),
             );
         }
-        super::super::arguments_object_after_define(obj, key_str, descriptor_value);
-        // Return the object
-        obj_value
+        super::super::arguments_object_after_define(obj, key_str, descriptor);
+        true
     }
 }

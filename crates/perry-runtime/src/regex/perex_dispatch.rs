@@ -188,6 +188,15 @@ fn execute_override(
 }
 
 pub(crate) fn to_string(value: &RuntimeHandle<'_>) -> Result<*mut StringHeader, EngineError> {
+    // A string is its own ToString: no conversion runs, so no trap is armed.
+    // An immediate is copied to the heap, which allocates but never throws.
+    let v = crate::value::JSValue::from_bits(value.get_nanbox_u64());
+    if v.is_string() || v.is_short_string() {
+        let string = crate::value::js_get_string_pointer_unified(value.get_nanbox_f64())
+            as *mut StringHeader;
+        crate::string::js_string_addref(string);
+        return Ok(string);
+    }
     let scope = RuntimeHandleScope::new();
     let primitive = if crate::proxy::reflect_value_is_object(value.get_nanbox_f64()) {
         scope.root_nanbox_f64(to_primitive(value, true)?)
@@ -323,22 +332,13 @@ pub(crate) fn same_value(
 /// polls (`api::search_builtin`). Any other receiver takes the observable
 /// path, rooted, exactly as `execute` runs it.
 pub(crate) fn test_string(receiver: f64, input: *const StringHeader) -> Result<bool, EngineError> {
+    if let Some(data) = crate::object::regex_read_sites::builtin_exec_data(receiver) {
+        // The proof read the receiver's shape: it is an object pointer.
+        let re = (receiver.to_bits() & crate::value::POINTER_MASK) as *mut RegExpHeader;
+        return test_builtin(re, data, input, super::get_last_index(re));
+    }
     let mut budget = Budget::new(api::WORK);
     let memory = MemoryBudget::new(api::SCRATCH_BYTES);
-    if let Some(data) = crate::object::regex_read_sites::builtin_exec_data(receiver) {
-        return api::search_builtin(
-            // The proof read the receiver's shape: it is an object pointer.
-            (receiver.to_bits() & crate::value::POINTER_MASK) as *mut RegExpHeader,
-            data,
-            input,
-            host::CaptureMode::Full,
-            &mut budget,
-            &memory,
-            &mut None,
-            &mut host::poll,
-        )
-        .map(|found| found.is_some());
-    }
     let scope = RuntimeHandleScope::new();
     let receiver = scope.root_nanbox_f64(receiver);
     let input = scope.root_string_ptr(input);
@@ -352,6 +352,35 @@ pub(crate) fn test_string(receiver: f64, input: *const StringHeader) -> Result<b
         None,
     )
     .map(|result| result.is_some())
+}
+
+/// RegExpBuiltinExec for `test` once `Get(R, "exec")` is known to be the
+/// builtin: no handle, the search roots what it needs only if it polls. The
+/// one entry every builtin `test` takes into the search: the generic thunk
+/// after its exec proof, and a method site whose ShapeIds proved it. The
+/// caller reads `re`'s data and its `lastIndex` value (nothing may run
+/// between that read and this call).
+#[inline(always)]
+pub(crate) fn test_builtin(
+    re: *mut RegExpHeader,
+    data: *const super::RegExpData,
+    input: *const StringHeader,
+    last_index: f64,
+) -> Result<bool, EngineError> {
+    let mut budget = Budget::new(api::WORK);
+    let memory = MemoryBudget::new(api::SCRATCH_BYTES);
+    let found = api::search_builtin(
+        re,
+        data,
+        input,
+        last_index,
+        host::CaptureMode::Full,
+        &mut budget,
+        &memory,
+        &mut None,
+        &mut host::poll,
+    )?;
+    Ok(found.is_some())
 }
 
 pub(crate) fn test_value(

@@ -16,6 +16,9 @@ workspace = true
 crate-type = ["rlib"]
 
 [features]
+# Phase A acceptance census and fault hooks. Scalar counts only; compiled out
+# of shipped builds. Ext-net's dev dependency enables the binding witnesses.
+native-payload-test-census = []
 # #10868 measurement: `PERRY_SHAPE_MINT_DIAG`, the per-mint cause /
 # key-list-identity / call-site / transition-cache-outcome census.
 #
@@ -368,6 +371,8 @@ node-api-host = ["dep:perry-hex", "dep:sha2"]
 dyn-eval = ["dep:perry-parser", "dep:perry-diagnostics"]
 
 [dependencies]
+num-bigint = "0.4.6"
+num-traits = "0.2"
 # #9500: the CJS-default module table (`<mod>.default` <-> base) is shared
 # with perry-hir through perry-dispatch, so the runtime's property-read and
 # method-call paths and the HIR's import lowering cannot drift apart.

@@ -19,9 +19,9 @@ use crate::types::{DOUBLE, I32, I64};
 use super::{
     can_lower_expr_as_i32_in_current_region, emit_gated_root_nanbox_store,
     emit_root_nanbox_store_for_expr, emit_root_nanbox_store_on_block, emit_shadow_slot_clear,
-    emit_shadow_slot_update_for_expr, emit_write_barrier, is_global_this_builtin_function_name,
-    lower_expr, lower_expr_as_i32, lower_pod_local_reassignment, materialize_pod_value_copy,
-    nanbox_string_inline, FnCtx, TrustedBoxCapturePtr,
+    emit_shadow_slot_update_for_expr, emit_write_barrier, lower_expr, lower_expr_as_i32,
+    lower_pod_local_reassignment, materialize_pod_value_copy, nanbox_string_inline, FnCtx,
+    TrustedBoxCapturePtr,
 };
 
 /// Only TDZ-capable source bindings need a named accessor. Ordinary boxes
@@ -279,6 +279,22 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             //     the namespace-member class case `Lib.A`) lower as
             //     INT32-tagged class ids → typeof reads "number". Emit
             //     "function" to match JS spec for class objects.
+            if let Expr::PropertyGet {
+                object, property, ..
+            } = operand.as_ref()
+            {
+                if matches!(object.as_ref(), Expr::GlobalGet(_))
+                    && super::is_global_this_builtin_name(property)
+                {
+                    super::property_get::globalget::emit_global_value_installs(ctx, property);
+                    let value =
+                        super::property_get::globalget::lower_optional_global_read(ctx, property)?;
+                    let handle = ctx
+                        .block()
+                        .call(I64, "js_value_typeof", &[(DOUBLE, &value)]);
+                    return Ok(nanbox_string_inline(ctx.block(), &handle));
+                }
+            }
             let typeof_short_circuit = typeof_compile_time_answer(ctx, operand.as_ref());
             if let Some(s) = typeof_short_circuit {
                 let idx = ctx.strings.intern(s);
@@ -331,6 +347,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             crate::rooting::lower_scoped_binding(ctx, *id, value, body)
         }
         Expr::LocalGet(id) => {
+            if let Some(value) = crate::array_record_stack::read_local(ctx, *id) {
+                return Ok(value);
+            }
             if let Some(value) = crate::rooting::read_scoped_binding(ctx, *id) {
                 return Ok(value);
             }
@@ -356,7 +375,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     }
                     let closure_ptr =
                         super::current_closure_ptr_value(ctx, "captured boxed local")?;
-                    let box_ptr = load_closure_capture_bits_inline(ctx, &closure_ptr, capture_idx);
+                    let word = load_closure_capture_bits_inline(ctx, &closure_ptr, capture_idx);
+                    let box_ptr = ctx.block().and(I64, &word, crate::nanbox::POINTER_MASK_I64);
                     let bits = emit_box_read(ctx, *id, &box_ptr, ctx.trusted_box_captures);
                     let value = ctx.block().bitcast_i64_to_double(&bits);
                     demote_extracted_string_binding(ctx, *id, &value);
@@ -791,6 +811,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_closure_get_capture_bits",
                         &[(I64, &closure_ptr), (I32, &idx_str)],
                     );
+                    let box_ptr = ctx
+                        .block()
+                        .and(I64, &box_ptr, crate::nanbox::POINTER_MASK_I64);
                     let old_bits = emit_box_read(ctx, *id, &box_ptr, ctx.trusted_box_captures);
                     let blk = ctx.block();
                     let old = blk.bitcast_i64_to_double(&old_bits);
@@ -804,11 +827,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "js_closure_get_capture_bits",
                         &[(I64, &closure_ptr), (I32, &idx_str)],
                     );
+                    let box_ptr = ctx
+                        .block()
+                        .and(I64, &box_ptr, crate::nanbox::POINTER_MASK_I64);
                     ctx.block()
                         .call_void(setter, &[(I64, &box_ptr), (I64, &new_bits)]);
-                    // Gen-GC Phase C2: `++`/`--` on a BigInt yields a heap
-                    // pointer via js_numeric_step — barrier the box parent.
-                    emit_write_barrier(ctx, &box_ptr, &new_bits);
+                    // Only the trusted setter omits its own precise barrier.
+                    if ctx.trusted_box_captures {
+                        emit_write_barrier(ctx, &box_ptr, &new_bits);
+                    }
                     return Ok(if *prefix { new } else { old });
                 }
                 let closure_ptr = super::current_closure_ptr_value(ctx, "captured local update")?;
@@ -842,9 +869,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_closure_set_capture_bits",
                     &[(I64, &closure_ptr), (I32, &idx_str), (I64, &new_bits)],
                 );
-                // Gen-GC Phase C2: barrier — closure is the parent (BigInt
-                // `++`/`--` can store a young heap pointer).
-                emit_write_barrier(ctx, &closure_ptr, &new_bits);
+                // The runtime capture setter owns the precise slot barrier.
                 return Ok(if *prefix { new } else { old });
             }
             // Boxed enclosing-scope var: load slot (box ptr), deref,
@@ -875,9 +900,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let new_bits = blk.bitcast_double_to_i64(&new);
                     let box_ptr = blk.load(I64, &slot);
                     blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &new_bits)]);
-                    // Gen-GC Phase C2: barrier — box is the parent (BigInt
-                    // `++`/`--` can store a young heap pointer).
-                    emit_write_barrier(ctx, &box_ptr, &new_bits);
+                    // js_box_set_bits owns the precise cell barrier.
                     return Ok(if *prefix { new } else { old });
                 }
             }
@@ -1109,34 +1132,6 @@ pub(crate) fn typeof_compile_time_answer(ctx: &FnCtx<'_>, operand: &Expr) -> Opt
                 } else {
                     None
                 }
-            } else if matches!(object.as_ref(), Expr::GlobalGet(_)) {
-                // Issue #623: `(globalThis as any).process` /
-                // `globalThis.console` — known Node globals that are
-                // objects in spec. The codegen lowers
-                // `globalThis.<name>` to a generic property read that
-                // produces a stub double; typeof would read "number"
-                // without this short-circuit. Function-shaped globals
-                // (Buffer, Promise, URL, etc.) intentionally fall
-                // through so `typeof Buffer === "function"` keeps
-                // working through the existing class-ref path.
-                //
-                // lodash followup: built-in constructors exposed on
-                // globalThis (`Array`, `Object`, `Function`, …) now
-                // also lower the bare PropertyGet to a real value
-                // (a backing-object pointer materialized by
-                // `js_get_global_this`'s singleton populator).
-                // Without the typeof short-circuit, `typeof
-                // globalThis.Array` would read "object" (the value
-                // is a real pointer); spec says "function". Math /
-                // JSON / Reflect stay "object" — they're namespaces,
-                // not constructors.
-                match property.as_str() {
-                    "process" | "console" | "globalThis" | "performance" | "navigator"
-                    | "crypto" | "localStorage" | "sessionStorage" => Some("object"),
-                    "Math" | "JSON" | "Reflect" | "Atomics" | "Intl" | "Temporal" => Some("object"),
-                    n if is_global_this_builtin_function_name(n) => Some("function"),
-                    _ => None,
-                }
             } else if let Expr::NativeModuleRef(module) = object.as_ref() {
                 // #1343: `typeof <nativeModule>.<member>` (e.g.
                 // `typeof crypto.randomBytes`, `typeof process.cwd`).
@@ -1235,6 +1230,9 @@ pub(crate) fn bind_lowered_value_to_local(
     if matches!(value, Expr::LocalGet(source_id) if *source_id != id) {
         super::helpers::emit_string_addref_if_heap_string(ctx, v);
     }
+    if crate::array_record_stack::write_local(ctx, id, v, value) {
+        return Ok(());
+    }
     // Closure captures first (write through the runtime), then
     // locals, then module globals.
     if let Some(&capture_idx) = ctx.closure_captures.get(&id) {
@@ -1266,10 +1264,13 @@ pub(crate) fn bind_lowered_value_to_local(
                     "js_closure_get_capture_bits",
                     &[(I64, &closure_ptr), (I32, &idx_str)],
                 );
+                let box_ptr = blk.and(I64, &box_ptr, crate::nanbox::POINTER_MASK_I64);
                 let v_bits = blk.bitcast_double_to_i64(v);
                 blk.call_void(setter, &[(I64, &box_ptr), (I64, &v_bits)]);
-                // Gen-GC Phase C2: barrier — box is the parent.
-                emit_write_barrier(ctx, &box_ptr, &v_bits);
+                // Only the trusted setter omits its own precise barrier.
+                if ctx.trusted_box_captures {
+                    emit_write_barrier(ctx, &box_ptr, &v_bits);
+                }
             }
         } else {
             let closure_ptr = super::current_closure_ptr_value(ctx, "captured local set")?;
@@ -1278,8 +1279,7 @@ pub(crate) fn bind_lowered_value_to_local(
                 "js_closure_set_capture_bits",
                 &[(I64, &closure_ptr), (I32, &idx_str), (I64, &v_bits)],
             );
-            // Gen-GC Phase C2: barrier — closure is the parent.
-            emit_write_barrier(ctx, &closure_ptr, &v_bits);
+            // The runtime capture setter owns the precise slot barrier.
         }
     } else if ctx.boxed_vars.contains(&id) && !ctx.module_globals.contains_key(&id) {
         // Box path — only for non-global locals. Module globals
@@ -1294,10 +1294,7 @@ pub(crate) fn bind_lowered_value_to_local(
             let blk = ctx.block();
             let box_ptr = blk.load(I64, &slot);
             blk.call_void("js_box_set_bits", &[(I64, &box_ptr), (I64, &v_bits)]);
-            // Gen-GC Phase C2: barrier — box is the parent (mirror the
-            // captured-box path above; an old box can else miss a young
-            // object/string/array value).
-            emit_write_barrier(ctx, &box_ptr, &v_bits);
+            // js_box_set_bits owns the precise cell barrier.
         }
     } else if crate::expr::store_canonical_local_from_double(ctx, id, v, Some(value)) {
         // Repsel Phase 1: canonical-i32 local — the NaN-safe helper

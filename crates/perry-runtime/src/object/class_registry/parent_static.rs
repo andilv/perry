@@ -1,7 +1,6 @@
 use super::*;
 use crate::{object::object_ops::throw_object_type_error, JSValue};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 /// Register a class with its parent class ID in the global registry
 pub(crate) fn register_class(class_id: u32, parent_class_id: u32) {
@@ -707,6 +706,36 @@ pub unsafe extern "C" fn js_register_class_static_method_entry(
     crate::object::class_value::note_intrinsic_registration(class_id as u32, name);
 }
 
+/// A class definition evaluated an instance computed member's key: a class
+/// expression's evaluation (`owner`, its class object) keeps the name;
+/// a declaration's (`owner` undefined) is kept on the class holder.
+fn name_computed_instance_member(
+    owner: f64,
+    class_id: u32,
+    definition_order: i64,
+    name: super::declarations::MemberName,
+    property_key: f64,
+) {
+    if is_class_object_value(owner) {
+        // SAFETY: a live per-evaluation class object of this template.
+        unsafe {
+            super::declarations::name_evaluation_computed_member(
+                owner,
+                class_id,
+                definition_order as u32,
+                name,
+            )
+        };
+    } else {
+        super::declarations::name_computed_member_evaluated(
+            class_id,
+            definition_order as u32,
+            name,
+            property_key,
+        );
+    }
+}
+
 fn property_key_string(key: f64) -> Option<String> {
     let property_key = unsafe { crate::object::js_to_property_key(key) };
     if unsafe { crate::symbol::js_is_symbol(property_key) } != 0 {
@@ -740,6 +769,7 @@ pub unsafe extern "C" fn js_register_class_computed_method(
     has_rest: i64,
     definition_order: i64,
     entry: i64,
+    owner: f64,
 ) {
     if class_id == 0 || func_ptr == 0 {
         return;
@@ -768,65 +798,25 @@ pub unsafe extern "C" fn js_register_class_computed_method(
                 (func_ptr as usize, param_count as u32, has_rest != 0),
             );
         });
-        // A computed key that evaluates to a WELL-KNOWN symbol — e.g. the
-        // minified `[(gm = new WeakMap, Symbol.asyncIterator)]() {…}` comma
-        // form, whose key expression the lowering can't see through
-        // statically — must land in the same synthetic vtable slot the
-        // static `[Symbol.asyncIterator]` lowering uses. Every consumer
-        // (GetIterator(async), the #5128 symbol-read binder,
-        // `js_to_primitive`, the using-block desugar) resolves these by the
-        // synthetic NAME on the class; `CLASS_SYMBOL_METHODS` above is not
-        // consulted for instance dispatch. Without the alias,
+        // A computed key that evaluates to a WELL-KNOWN symbol names the
+        // member's synthetic slot (`member_name_of_symbol`); without it,
         // `for await (… of instance)` threw `TypeError: value is not
-        // iterable` for the comma-keyed form.
+        // iterable` for the minified comma-keyed form.
         if is_static == 0 {
-            let alias = [
-                ("iterator", "@@iterator"),
-                ("asyncIterator", "@@asyncIterator"),
-                ("toPrimitive", "@@toPrimitive"),
-                ("dispose", "__perry_dispose__"),
-                ("asyncDispose", "__perry_async_dispose__"),
-            ]
-            .iter()
-            .find_map(|(wk, method_name)| {
-                let s = crate::symbol::well_known_symbol(wk);
-                if s.is_null() {
-                    return None;
-                }
-                let f = f64::from_bits(crate::value::JSValue::pointer(s as *const u8).bits());
-                if sym_key == crate::symbol::sym_key_from_f64(f) {
-                    Some(*method_name)
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                (sym_key == crate::symbol::inspect_custom_symbol_ptr())
-                    .then_some("__perry_inspect_custom__")
-            });
-            if let Some(method_name) = alias {
-                let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
-                if registry.is_none() {
-                    *registry = Some(crate::fast_hash::new_ptr_hash_map());
-                }
-                let vtable = registry.as_mut().unwrap().entry(class_id).or_default();
-                vtable.methods.insert(
-                    method_name.to_string(),
-                    VTableMethodEntry {
-                        func_ptr: func_ptr as usize,
-                        param_count: param_count as u32,
-                        has_synthetic_arguments: false,
-                        has_rest: has_rest != 0,
-                        entry: 0,
-                    },
-                );
-            }
+            // The member's declaration carries its body; this evaluation
+            // names it (the alias, or no string name at all).
+            name_computed_instance_member(
+                owner,
+                class_id,
+                definition_order,
+                super::declarations::member_name_of_symbol(sym_key),
+                property_key,
+            );
         }
         let proto = super::state::class_decl_prototype_object(class_id);
         if is_static == 0 && !proto.is_null() {
             super::state::install_class_decl_prototype_symbol_member(proto, class_id, sym_key);
         }
-        VTABLE_GEN.fetch_add(1, Ordering::Release);
         return;
     }
     let name = match property_key_string(property_key) {
@@ -880,30 +870,17 @@ pub unsafe extern "C" fn js_register_class_computed_method(
         }
         crate::object::class_value::note_intrinsic_registration(class_id, &name);
     } else {
-        let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
-        if registry.is_none() {
-            *registry = Some(crate::fast_hash::new_ptr_hash_map());
-        }
-        let vtable = registry.as_mut().unwrap().entry(class_id).or_default();
-        vtable.methods.insert(
-            name.clone(),
-            VTableMethodEntry {
-                func_ptr: func_ptr as usize,
-                param_count: param_count as u32,
-                // Computed class methods don't carry synthetic-`arguments`
-                // metadata through this registration path (only `has_rest`),
-                // so they never receive a synthesized arguments object.
-                has_synthetic_arguments: false,
-                has_rest: has_rest != 0,
-                entry: 0,
-            },
+        // The member's declaration carries its body; this evaluation names
+        // it, which also installs it when the decl prototype is waiting for
+        // it (`declarations.rs`).
+        name_computed_instance_member(
+            owner,
+            class_id,
+            definition_order,
+            super::declarations::MemberName::Str(name),
+            property_key,
         );
-        // Backfill when reflection already materialized `C.prototype`.
-        drop(registry);
-        let proto = class_decl_prototype_object(class_id);
-        super::state::install_class_decl_prototype_method_field(proto, class_id, &name);
     }
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
 }
 
 #[no_mangle]
@@ -914,6 +891,7 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
     setter_ptr: i64,
     is_static: i64,
     definition_order: i64,
+    owner: f64,
 ) {
     if class_id == 0 || (getter_ptr == 0 && setter_ptr == 0) {
         return;
@@ -949,11 +927,20 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
                 entry.1 = setter_ptr as usize;
             }
         });
+        if is_static == 0 {
+            // The declared accessor half has no string name on this class.
+            name_computed_instance_member(
+                owner,
+                class_id,
+                definition_order,
+                super::declarations::MemberName::NotAString,
+                property_key,
+            );
+        }
         let proto = super::state::class_decl_prototype_object(class_id);
         if is_static == 0 && !proto.is_null() {
             super::state::install_class_decl_prototype_symbol_member(proto, class_id, sym_key);
         }
-        VTABLE_GEN.fetch_add(1, Ordering::Release);
         return;
     }
     if let Some(name) = property_key_string(property_key) {
@@ -967,19 +954,14 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
             throw_object_type_error(b"Classes may not have a static property named 'prototype'");
         }
         if is_static == 0 {
-            let newly_declared = class_own_accessor_ptrs(class_id, &name).is_none();
-            let mut registry = CLASS_VTABLE_REGISTRY.write().unwrap();
-            if registry.is_none() {
-                *registry = Some(crate::fast_hash::new_ptr_hash_map());
-            }
-            let vtable = registry.as_mut().unwrap().entry(class_id).or_default();
-            vtable.declare_accessor_half(&name, getter_ptr as usize, false);
-            vtable.declare_accessor_half(&name, setter_ptr as usize, true);
-            drop(registry);
-            super::decl_accessors::note_instance_accessor_registered(
+            // As for a computed method: the evaluation names the declared
+            // accessor half.
+            name_computed_instance_member(
+                owner,
                 class_id,
-                &name,
-                newly_declared,
+                definition_order,
+                super::declarations::MemberName::Str(name),
+                property_key,
             );
         } else {
             {
@@ -1004,7 +986,6 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
             crate::object::class_value::note_intrinsic_registration(class_id, &name);
         }
     }
-    VTABLE_GEN.fetch_add(1, Ordering::Release);
 }
 
 /// Look up a static method by name in `CLASS_STATIC_METHODS`, walking the
@@ -1091,7 +1072,7 @@ pub(crate) fn lookup_static_method_owner(
 /// Spec `Function.prototype.length` for a class method named `name` — the
 /// count of formal parameters, excluding a trailing rest param and the
 /// synthesized `arguments` slot (neither contributes to `.length`). Walks the
-/// instance vtable chain, then the static-method table. Used to stamp the
+/// materialized declaration function, then the static-method table. Used to stamp the
 /// bound-method closure's length so `C.prototype.m.length` is correct
 /// (Test262 .../class/{gen,async}-method/...-trailing-comma + length tests).
 /// Note: does not subtract for default-valued params (the registry doesn't
@@ -1118,32 +1099,15 @@ pub(crate) fn class_method_bind_length(class_id: u32, name: &str) -> Option<u32>
             }
         }
     }
-    if let Ok(guard) = CLASS_VTABLE_REGISTRY.read() {
-        if let Some(reg) = guard.as_ref() {
-            let mut cid = class_id;
-            let mut depth = 0usize;
-            while cid != 0 && depth < 32 {
-                if let Some(vt) = reg.get(&cid) {
-                    if let Some(e) = vt.methods.get(name) {
-                        let mut len = e.param_count;
-                        if e.has_rest {
-                            len = len.saturating_sub(1);
-                        }
-                        if e.has_synthetic_arguments {
-                            len = len.saturating_sub(1);
-                        }
-                        return Some(len);
-                    }
-                }
-                match get_parent_class_id(cid) {
-                    Some(p) if p != 0 && p != cid => {
-                        cid = p;
-                        depth += 1;
-                    }
-                    _ => break,
-                }
-            }
-        }
+    // This is function materialization, including a computed ClassBody
+    // member while its evaluation prototype is being filled. Consume the
+    // declaration's function value rather than building a canonical holder,
+    // which would evaluate the superclass's prototype a second time.
+    let declaration = crate::object::class_prototype_method_value_for_name(class_id, name);
+    if let Some((_, params, synthetic, rest)) =
+        unsafe { crate::object::native_module::class_method_value_target(declaration.to_bits()) }
+    {
+        return Some(params.saturating_sub(u32::from(synthetic) + u32::from(rest)));
     }
     // Static methods: prefer the default-aware spec length recorded by codegen
     // (params before the first default/rest), walking the parent chain; fall
@@ -1647,64 +1611,93 @@ pub unsafe extern "C" fn js_class_static_method_call(
 // dense parent table it reads; it is re-exported through `object::mod` unchanged.
 pub(crate) use crate::object::class_meta_registry::get_parent_class_id;
 
-/// Look up a method by name in the class vtable, walking the parent chain.
-/// Returns `Some((func_ptr, param_count, has_synthetic_arguments, has_rest))`
-/// if found, `None` otherwise.
-/// Used by `js_assimilate_thenable` (refs #586) and other runtime callers
-/// that need to probe a class for a method without invoking it.
-///
-/// A declared method removed from its class's materialized prototype object
-/// (`delete C.prototype.m`) is not provided by that class: the prototype
-/// object's own keys are the truth, the vtable entry only names the body.
-/// The walk then continues to the parent, as the JS prototype chain does.
-pub fn lookup_class_method_in_chain(class_id: u32, name: &str) -> Option<(usize, u32, bool, bool)> {
-    let mut cur = class_id;
-    for _ in 0..32 {
-        let found = {
-            let registry = CLASS_VTABLE_REGISTRY.read().unwrap();
-            let reg = registry.as_ref()?;
-            reg.get(&cur)
-                .and_then(|vt| vt.methods.get(name))
-                .map(|entry| {
-                    (
-                        entry.func_ptr,
-                        entry.param_count,
-                        entry.has_synthetic_arguments,
-                        entry.has_rest,
-                    )
-                })
-        };
-        if let Some(entry) = found {
-            // Checked with the registry lock released: the deletedness probe
-            // reads the class tables again.
-            if !super::class_proto_key_deleted(cur, name) {
-                return Some(entry);
-            }
+/// The data method value on the class identity's real prototype chain.
+/// Materialization is a no-move window: legacy callers can hold raw
+/// receiver/argument pointers while asking this question.
+pub(crate) fn class_method_slot_value(class_id: u32, name: &str) -> Option<u64> {
+    let _no_move = crate::gc::GcSuppressScope::new();
+    let selected = decl_prototype_identity_id(class_id);
+    let word = crate::object::class_holder_word_selected(selected);
+    let existing = crate::JSValue::from_bits(word);
+    let start = if !existing.is_pointer() {
+        let v = crate::JSValue::from_bits(class_decl_prototype_value_selected(selected).to_bits());
+        if !v.is_pointer() {
+            return None;
         }
-        match instance_chain_parent_class_id(cur) {
-            Some(pid) => cur = pid,
-            None => return None,
+        v.as_pointer::<ObjectHeader>() as *const ObjectHeader
+    } else {
+        existing.as_pointer::<ObjectHeader>() as *const ObjectHeader
+    };
+    let key = crate::object::native_call_method::class_holder::MethodKey::bytes(name.as_bytes());
+    match unsafe { crate::object::native_call_method::class_holder::chain_method(start, &key) } {
+        crate::object::native_call_method::class_holder::ChainMethod::Data { value, .. } => {
+            Some(value)
         }
+        _ => None,
     }
-    None
 }
 
-/// The next class on an INSTANCE chain after `cid`: the declared parent,
-/// unless a user operation (`Object.setPrototypeOf(C.prototype, X)`,
-/// `C.prototype.__proto__ = X`) replaced the `[[Prototype]]` of `cid`'s
-/// prototype object. That prototype's recorded link is then the chain, and a
-/// walk over declared class members must stop at `cid`: the parent's methods,
-/// getters and setters are off the chain (the generic read continues on the
-/// recorded link). The static side (`C.__proto__`) is a different object and
-/// keeps the declared parent.
-///
-/// The relink check runs only when a declared parent exists, so a walk that
-/// answers from the receiver's own class, or reaches a root class, pays
-/// nothing for it.
-#[inline]
-pub(crate) fn instance_chain_parent_class_id(cid: u32) -> Option<u32> {
-    match get_parent_class_id(cid) {
-        Some(pid) if pid != 0 && !super::class_decl_prototype_relinked(cid) => Some(pid),
+/// Raw-body callers read the prototype's function object, never class
+/// dispatch metadata. Private methods materialize their lexical owner's
+/// function object in the existing method-value store, separate from properties.
+pub(crate) fn class_method_slot_target(
+    class_id: u32,
+    name: &str,
+) -> Option<(usize, u32, bool, bool)> {
+    let _no_move = crate::gc::GcSuppressScope::new();
+    let value = if crate::object::native_call_method::class_holder::name_is_not_a_prototype_method(
+        name.as_bytes(),
+    ) {
+        let owner = class_method_slot_owner(class_id, name)?;
+        crate::object::native_module::class_non_property_method_value(owner, name)
+            .or_else(|| class_method_slot_value(class_id, name))?
+    } else {
+        class_method_slot_value(class_id, name)?
+    };
+    unsafe { crate::object::native_module::class_method_value_target(value) }
+}
+
+/// The holder's owner identity, when a data property exists on the chain.
+pub(crate) fn class_method_slot_owner(class_id: u32, name: &str) -> Option<u32> {
+    let _no_move = crate::gc::GcSuppressScope::new();
+    let selected = decl_prototype_identity_id(class_id);
+    let word = crate::object::class_holder_word_selected(selected);
+    let existing = crate::JSValue::from_bits(word);
+    let start = if !existing.is_pointer() {
+        let v = crate::JSValue::from_bits(class_decl_prototype_value_selected(selected).to_bits());
+        if !v.is_pointer() {
+            return None;
+        }
+        v.as_pointer::<ObjectHeader>() as *const ObjectHeader
+    } else {
+        existing.as_pointer::<ObjectHeader>() as *const ObjectHeader
+    };
+    if crate::object::native_call_method::class_holder::name_is_not_a_prototype_method(
+        name.as_bytes(),
+    ) {
+        let mut hop = start;
+        for _ in 0..128 {
+            if !unsafe {
+                crate::object::native_call_method::class_holder::shape_answers(hop as usize)
+            } {
+                break;
+            }
+            let cid = unsafe { (*hop).class_id };
+            if crate::object::class_has_own_method(cid, name) {
+                return Some(cid);
+            }
+            match unsafe { crate::object::native_call_method::class_holder::next_holder(hop) } {
+                Ok(Some(next)) if next != hop => hop = next,
+                _ => break,
+            }
+        }
+        return None;
+    }
+    let key = crate::object::native_call_method::class_holder::MethodKey::bytes(name.as_bytes());
+    match unsafe { crate::object::native_call_method::class_holder::chain_method(start, &key) } {
+        crate::object::native_call_method::class_holder::ChainMethod::Data { holder, .. } => {
+            Some(unsafe { (*holder).class_id })
+        }
         _ => None,
     }
 }
@@ -1719,31 +1712,6 @@ pub fn is_registered_class_prototype_object(ptr: usize) -> bool {
         return false;
     }
     crate::object::class_registry::class_prototype_object_addr_index_contains(ptr)
-}
-
-/// Walk the prototype chain of `class_id` and return the id of the class that
-/// actually OWNS the method `name` (the prototype where it is defined). Used to
-/// make method-as-value identity stable: a class method is a single shared
-/// function object, so every read of it — `c.m`, `C.prototype.m`, `c2.m` —
-/// must resolve to the canonical value keyed by the OWNING class, not the
-/// (possibly derived) class of the receiver. Returns `None` when no class in
-/// the chain declares the method.
-pub fn method_owner_class_id(class_id: u32, name: &str) -> Option<u32> {
-    let registry = CLASS_VTABLE_REGISTRY.read().unwrap();
-    let reg = registry.as_ref()?;
-    let mut cur = class_id;
-    for _ in 0..32 {
-        if let Some(vt) = reg.get(&cur) {
-            if vt.methods.contains_key(name) {
-                return Some(cur);
-            }
-        }
-        match instance_chain_parent_class_id(cur) {
-            Some(pid) => cur = pid,
-            None => return None,
-        }
-    }
-    None
 }
 
 #[cfg(test)]

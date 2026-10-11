@@ -233,6 +233,37 @@ module globals, pending async work, caches, registries, and other side tables;
 helpers keep temporary values in `RuntimeHandleScope`/`RuntimeHandle` and must
 re-read a handle after a call that can collect.
 
+Root owners supply the representation. Generated globals and native
+statepoint homes keep JSValue words at rest; raw managed locals are boxed when
+stored and unboxed after a root reload. Runtime scanners and handles distinguish
+JSValues from pointer fields whose owners guarantee a GC header. Both feed one
+precise marker: decode the declared value representation, admit the address,
+then read the header's color and enqueue an unmarked object. Admission is O(1):
+the arena region descriptor says whether the address is in this heap's region,
+in a live region of another thread's heap (a Worker's, or a zero-copy
+transferred cell: the root is dropped without reading its header), or outside
+every arena region, where the header decides: an ARENA
+header there is a producer bug, any other header is a malloc or process-lifetime
+cell of this heap. Admission reads no malloc state and no collection census:
+local allocations born later and local old-generation roots remain eligible.
+Root providers emit only their own agent's roots (Worker records carry their
+creating agent). Under `PERRY_GC_VERIFY_MARK` (and in unit tests) a root that is
+neither this heap's object nor provably another heap's fails loudly: a
+malformed header, an ARENA header outside this heap, or an unmarked header
+outside the arena that is not one of this heap's malloc allocations. The same
+verification rejects an untagged word naming one of this heap's objects in a
+JSValue root, at global-root registration and at every scan. A numeric word that resembles an address remains a number;
+native handle payloads are excluded by their value-encoding band. Closure
+capture cells and temporary roots obey the same producer contract.
+
+Legacy shadow-frame homes on WASI and ARM64 Windows can still mix raw pointers
+and JSValues. Their source kind retains the mixed decoder and validity probe;
+these are the documented untyped platform fallback. Structural header checks
+in verification builds and the existing evacuation verifier check precise
+roots without changing their release marking contract. Reached-block
+accounting belongs to tracing the admitted object, rather than validating
+every root that aliases it.
+
 The conservative native-stack scan is not part of the production default:
 `Auto` resolves to `SkipDisabled`. `PERRY_CONSERVATIVE_STACK_SCAN=full` is an
 explicit diagnostic/sensitivity arm. A full scan pins ambiguous roots and

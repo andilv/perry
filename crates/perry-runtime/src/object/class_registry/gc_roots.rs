@@ -2,10 +2,6 @@ use super::*;
 
 #[derive(Clone)]
 enum ClassSideTableRootSlot {
-    PrototypeMethodValue {
-        class_id: u32,
-        name: String,
-    },
     PrototypeObject {
         class_id: u32,
     },
@@ -67,13 +63,6 @@ pub fn scan_class_side_table_roots(mark: &mut dyn FnMut(f64)) {
 }
 
 pub fn scan_class_side_table_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    CLASS_PROTOTYPE_METHOD_VALUES.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        for value_bits in cache.values_mut() {
-            visitor.visit_nanbox_u64_slot(value_bits);
-        }
-    });
-
     CLASS_PROTOTYPE_OBJECTS.with(|table| {
         if let Ok(mut guard) = table.write() {
             if let Some(map) = guard.as_mut() {
@@ -180,16 +169,6 @@ fn scan_class_symbol_member_keys_mut(visitor: &mut crate::gc::RuntimeRootVisitor
 fn class_side_table_root_snapshot() -> Vec<ClassSideTableRootSlot> {
     let mut slots = Vec::new();
 
-    CLASS_PROTOTYPE_METHOD_VALUES.with(|cache| {
-        let cache = cache.borrow();
-        for ((class_id, name), _) in cache.iter() {
-            slots.push(ClassSideTableRootSlot::PrototypeMethodValue {
-                class_id: *class_id,
-                name: name.clone(),
-            });
-        }
-    });
-
     CLASS_PROTOTYPE_OBJECTS.with(|table| {
         if let Ok(guard) = table.read() {
             if let Some(map) = guard.as_ref() {
@@ -283,13 +262,6 @@ fn scan_class_side_table_root_slot(
     slot: &ClassSideTableRootSlot,
 ) {
     match slot {
-        ClassSideTableRootSlot::PrototypeMethodValue { class_id, name } => {
-            CLASS_PROTOTYPE_METHOD_VALUES.with(|cache| {
-                if let Some(value_bits) = cache.borrow_mut().get_mut(&(*class_id, name.clone())) {
-                    visitor.visit_nanbox_u64_slot(value_bits);
-                }
-            });
-        }
         ClassSideTableRootSlot::PrototypeObject { class_id } => {
             CLASS_PROTOTYPE_OBJECTS.with(|table| {
                 if let Ok(mut guard) = table.write() {
@@ -509,13 +481,6 @@ fn visit_metadata_nanbox_key(
 #[cfg(test)]
 pub(crate) fn test_clear_class_side_table_roots() {
     super::state::CLASS_DECLARED_STATIC_GLOBAL_SLOTS.with(|m| m.borrow_mut().clear());
-    CLASS_PROTOTYPE_METHOD_VALUES.with(|cache| cache.borrow_mut().clear());
-
-    CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED.store(false, std::sync::atomic::Ordering::Release);
-    CLASS_PROTOTYPE_FAST_GUARDS_INVALIDATED_BY_METHOD
-        .write()
-        .unwrap()
-        .clear();
     FUNCTION_CLASS_IDS.with(|table| {
         if let Ok(mut guard) = table.write() {
             *guard = None;
@@ -530,7 +495,7 @@ pub(crate) fn test_clear_class_side_table_roots() {
     crate::object::class_value::test_clear_class_decl_prototype_links();
     // Test-only map reset has the same invalidation contract as production
     // registry stores: a still-live accessor site must decline its old link.
-    super::class_lookup_surface_gen_bump();
+    crate::object::shapes::clear_class_identity_words();
     CLASS_PARENT_CLOSURES.with(|table| {
         if let Ok(mut guard) = table.write() {
             *guard = None;
@@ -580,18 +545,26 @@ pub(crate) fn test_seed_class_prototype_method_value_root(
     name: &str,
     value_bits: u64,
 ) {
-    class_prototype_method_value_cache_root_store(class_id, name.to_string(), value_bits);
+    if super::declarations::class_method_decl(class_id, name).is_none() {
+        super::declarations::test_declare_member_quiet(
+            class_id,
+            name.as_bytes(),
+            super::declarations::test_method_member(1, 0, false, false, 0),
+        );
+    }
+    crate::object::class_value::class_value_ptr(class_id);
+    super::state::class_declaration_value_store(
+        class_id,
+        ClassDeclarationValueKind::Method,
+        name,
+        value_bits,
+    );
 }
 
 #[cfg(test)]
 pub(crate) fn test_class_prototype_method_value_root_bits(class_id: u32, name: &str) -> u64 {
-    CLASS_PROTOTYPE_METHOD_VALUES.with(|cache| {
-        cache
-            .borrow()
-            .get(&(class_id, name.to_string()))
-            .copied()
-            .unwrap_or(0)
-    })
+    super::state::class_declaration_value(class_id, ClassDeclarationValueKind::Method, name)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -616,7 +589,10 @@ pub(crate) fn test_seed_class_decl_prototype_object_root(class_id: u32, addr: us
     // objects before replacement, independent of production's prototype mark.
     let proto = addr as *mut ObjectHeader;
     let displaced = crate::object::class_value::class_decl_prototype_link_store(class_id, proto);
-    super::class_lookup_surface_gen_bump();
+    crate::object::shapes::write_identity_word(
+        crate::object::shapes::PROTO_ID_CLASS | u64::from(class_id),
+        crate::value::POINTER_TAG | proto as u64,
+    );
     if !displaced.is_null() && displaced != proto {
         super::state::retire_displaced_decl_prototype(displaced);
     }
@@ -643,7 +619,7 @@ pub(crate) fn test_seed_function_class_id_key(func_bits: u64, class_id: u32) {
     FUNCTION_CLASS_IDS.with(|table| {
         let mut guard = table.write().unwrap();
         if guard.is_none() {
-            *guard = Some(HashMap::new());
+            *guard = Some(std::collections::HashMap::new());
         }
         guard.as_mut().unwrap().insert(func_bits, class_id);
     });

@@ -17,15 +17,17 @@ crate::perry_thread_local! {
 /// collecting action here, so no handle is needed for it.
 pub(super) fn new(data: impl FnOnce() -> *const RegExpData) -> *mut RegExpHeader {
     let shape = BIRTH_SHAPE.with(Cell::get);
-    let mut receiver = crate::object::object_alloc_plain_born(2, shape);
-    if unsafe { crate::object::shapes::object_shape_stamp(receiver) } != shape {
-        receiver = prepare_shape(receiver);
-    }
+    let (mut receiver, born_on_memo) = crate::object::object_alloc_plain_born(2, shape);
+    let rep = born_on_memo.unwrap_or_else(|| {
+        if unsafe { crate::object::shapes::object_shape_stamp(receiver) } != shape {
+            receiver = prepare_shape(receiver);
+        }
+        crate::object::shapes::shape_rep_by_id(unsafe {
+            crate::object::shapes::object_shape_stamp(receiver)
+        })
+    });
     let data = js_nanbox_pointer(data() as i64).to_bits();
     unsafe {
-        let rep = crate::object::shapes::shape_rep_by_id(
-            crate::object::shapes::object_shape_stamp(receiver),
-        );
         let plain = crate::object::field_rep::slot_rep(rep, 0) == crate::object::field_rep::REP_ANY
             && crate::object::field_rep::slot_rep(rep, 1) == crate::object::field_rep::REP_ANY;
         if plain && !crate::gc::newborn_parent_needs_barrier(receiver as usize) {
@@ -93,6 +95,16 @@ fn prepare_shape(receiver: *mut RegExpHeader) -> *mut RegExpHeader {
             |_| false,
         ));
         let shape = crate::object::shapes::object_shape_stamp(r);
+        // `BIRTH_SHAPE` holds this id for the agent's life and re-stamps it
+        // with no receiver in between, so the record is an external carrier,
+        // as every agent-lifetime intrinsic birth memo's is (the base
+        // Function shapes, `closure::shape::mint`): a full trace that finds
+        // no live RegExp must not retire it and hand the next birth a new
+        // ShapeId (#12313). Its keys and prototype words stay repaired by the
+        // shape table's scanner while no receiver carries it.
+        crate::object::shapes::note_external_shape_carrier(
+            crate::object::shapes::shape_descriptor_by_id(shape),
+        );
         BIRTH_SHAPE.with(|memo| memo.set(shape));
         // The canonical keys above prove both namespaces and positions.
         // Prime the existing generic read sites from those birth facts so the

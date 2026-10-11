@@ -8,26 +8,7 @@
 use super::*;
 
 #[no_mangle]
-pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
-    // #10507: `x instanceof F` for an ordinary compiled function `F`: one
-    // shape compare when `x`'s ShapeId names `F.prototype`, else, for an
-    // object of no compiled class, OrdinaryHasInstance's prototype walk.
-    {
-        use crate::object::class_registry::OrdinaryInstanceof;
-        match crate::object::class_registry::ordinary_compiled_function_has_instance(
-            value, type_ref,
-        ) {
-            Some(OrdinaryInstanceof::Instance) => return f64::from_bits(crate::value::TAG_TRUE),
-            Some(OrdinaryInstanceof::PrototypeWalk) => {
-                return f64::from_bits(if ordinary_has_instance_prototype_walk(value, type_ref) {
-                    crate::value::TAG_TRUE
-                } else {
-                    crate::value::TAG_FALSE
-                });
-            }
-            None => {}
-        }
-    }
+pub extern "C" fn js_instanceof_dynamic(value: f64, mut type_ref: f64) -> f64 {
     // Proxy ids are registry handles, not closure headers. Resolve their
     // observable @@hasInstance/prototype reads before any constructor probe
     // or unwrapping of the left operand (#10364).
@@ -83,6 +64,15 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         }
         return f64::from_bits(TAG_FALSE);
     }
+    let admit_closure = |rhs: f64| {
+        let value = crate::JSValue::from_bits(rhs.to_bits());
+        if !value.is_pointer() {
+            return None;
+        }
+        let closure = value.as_pointer::<crate::closure::ClosureHeader>();
+        crate::closure::closure_info(closure).map(|info| (closure, info))
+    };
+    let mut rhs_closure = admit_closure(type_ref);
     // Spec step (InstanceofOperator): an OWN user-defined `@@hasInstance`
     // overrides even native constructor brand checks. The native generic hook
     // lives on Function.prototype, so the own-property gate distinguishes an
@@ -91,44 +81,79 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
         let hi_sym = crate::symbol::well_known_symbol("hasInstance");
         if !hi_sym.is_null() {
             let hi_f64 = f64::from_bits(crate::value::JSValue::pointer(hi_sym as *const u8).bits());
-            if unsafe { crate::symbol::js_object_has_own_symbol(type_ref, hi_f64) } {
-                let cb = unsafe { crate::symbol::js_object_get_symbol_property(type_ref, hi_f64) };
+            // A validated function already identifies its own-property holder.
+            // Symbols and symbol accessors both occupy that bag's key list;
+            // querying the generic owner/accessor/data towers repeats this
+            // admission. Class immediates and other representations retain
+            // their ordinary symbol query.
+            let owns_hook = if let Some((closure, _)) = rhs_closure {
+                let bag = unsafe { (*closure).props };
+                !bag.is_null()
+                    && unsafe { super::shaped_symbols::position(bag, hi_sym as usize).is_some() }
+            } else {
+                unsafe { crate::symbol::js_object_has_own_symbol(type_ref, hi_f64) }
+            };
+            if owns_hook {
+                // An own @@hasInstance getter can collect even when it returns
+                // undefined and ordinary dispatch continues. Refresh both
+                // operands before the callback or any later prototype check.
+                let scope = crate::gc::RuntimeHandleScope::new();
+                let lhs_h = scope.root_nanbox_f64(value);
+                let rhs_h = scope.root_nanbox_f64(type_ref);
+                let cb = unsafe {
+                    crate::symbol::js_object_get_symbol_property(rhs_h.get_nanbox_f64(), hi_f64)
+                };
+                value = lhs_h.get_nanbox_f64();
+                type_ref = rhs_h.get_nanbox_f64();
+                rhs_closure = admit_closure(type_ref);
                 if let HasInstanceOutcome::Result(result) = dispatch_own_has_instance(cb, value) {
                     return result;
                 }
             }
         }
     }
-    // OrdinaryHasInstance step 2: a bound function (with no own
-    // `@@hasInstance`, answered above) is `instanceof` exactly as its target.
-    if let Some(target) = crate::object::class_registry::bound_function_target_value(type_ref) {
-        return js_instanceof_dynamic(value, target);
-    }
-    // OrdinaryHasInstance step 3 (#11261): a primitive is never an instance.
-    // Only once the RHS is known callable — a non-callable RHS must still
-    // reach the `TypeError` below (InstanceofOperator step 4 precedes
-    // OrdinaryHasInstance). A class reference or class object RHS still
-    // forwards to `js_instanceof`, which applies the same rule only after the
-    // class's own static `@@hasInstance` hook (lifted per class id) has had
-    // its turn.
-    if instanceof_lhs_is_primitive(value)
-        && value_is_callable(type_ref)
-        && class_ref_id(type_ref).is_none()
-        && !is_class_object_value(type_ref)
-    {
-        return f64::from_bits(TAG_FALSE);
-    }
-    // Native http(s).Agent handles have no heap prototype chain. After any own
-    // override above has had first refusal, retain their native brand check.
-    if let Some((module, method)) = unsafe { bound_native_callable_module_and_method(type_ref) } {
-        if matches!(module.as_str(), "http" | "https") && method == "Agent" {
-            let matched = small_native_handle_id(value)
-                .zip(crate::object::http_agent_handle_probe())
-                .is_some_and(|(handle, probe)| unsafe { probe(handle) });
-            if matched || ordinary_has_instance_prototype_walk(value, type_ref) {
-                return f64::from_bits(crate::value::TAG_TRUE);
+    // A primitive is an ordinary miss; a terminal ordinary receiver has a
+    // complete prototype chain. Test those facts before classifying the
+    // constructor: its actual prototype decides the terminal receiver's
+    // OrdinaryHasInstance without any native-body or native-brand dispatch.
+    // Bound functions still delegate to their target, and non-callable RHS
+    // values retain the general path's TypeError. Own hooks ran above.
+    let primitive = instanceof_lhs_is_primitive(value);
+    let terminal = terminal_prototype_id(value);
+    if primitive || terminal.is_some() {
+        if let Some((closure, info)) = rhs_closure {
+            // Classes retain their lifted @@hasInstance and evaluation-identity
+            // dispatch below. A non-class function needs no class admission.
+            if !crate::closure::shape::is_class_info(info) {
+                if info.code == crate::closure::BOUND_FUNCTION_FUNC_PTR {
+                    let target = crate::closure::js_closure_get_capture_f64(closure, 0);
+                    return js_instanceof_dynamic(value, target);
+                }
+                if primitive {
+                    return f64::from_bits(TAG_FALSE);
+                }
+                // The existing function shape can also prove an own data
+                // prototype. Reading its live slot is Leaf, so both shape
+                // proofs can complete without opening any handle scopes.
+                if let Some(Some(prototype)) =
+                    unsafe { crate::closure::shape::closure_own_prototype_by_shape(closure) }
+                {
+                    if let Some(matches) =
+                        terminal.and_then(|id| terminal_prototype_matches_id(id, prototype))
+                    {
+                        return f64::from_bits(if matches {
+                            crate::value::TAG_TRUE
+                        } else {
+                            TAG_FALSE
+                        });
+                    }
+                }
+                return f64::from_bits(if ordinary_has_instance_prototype_walk(value, type_ref) {
+                    crate::value::TAG_TRUE
+                } else {
+                    TAG_FALSE
+                });
             }
-            return f64::from_bits(TAG_FALSE);
         }
     }
     let bits = type_ref.to_bits();
@@ -177,28 +202,97 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
             TAG_FALSE
         });
     }
-    // A builtin constructor held in a VARIABLE — `const RS = ReadableStream; body
-    // instanceof RS` — arrives here as the ClosureHeader-backed function installed
-    // on `globalThis`, so none of the class-id paths above match and the prototype
-    // walk below returns false. Codegen only special-cases the *static identifier*
-    // form (`body instanceof ReadableStream`), where it hands the builtin class id
-    // straight to `js_instanceof`, which brand-checks these natively-backed values
-    // via the stream / fetch kind probes (their instances are handles, not heap
-    // objects with a real prototype chain).
-    //
-    // Minified bundles almost always alias constructors into locals, so the
-    // variable form is the common one in the wild: `x instanceof <alias>` for
-    // ReadableStream / Response / Headers silently returned `false` while Node
-    // returns `true`. That made a large esbuild-bundled CLI app mis-detect its
-    // `fetch()` body, throw "The first argument must be a Readable, a
-    // ReadableStream, or an async iterable", and abort its background
-    // tar-stream downloads entirely.
-    //
-    // Recover the builtin's name from the constructor closure (recorded by
-    // `set_bound_native_closure_name` when globalThis is populated) and reuse the
-    // static path's class id, so both spellings agree.
-    if let Some(class_id) = builtin_ctor_class_id_from_value(type_ref) {
-        return js_instanceof(value, class_id);
+    // Class values take their existing exits above. An intrinsic's body
+    // identity also proves it is callable and not a bind wrapper, so dispatch
+    // it before the remaining callable/bound/native-export probes. Its own
+    // @@hasInstance already had first refusal; the shared native dispatch owns
+    // the primitive and prototype checks.
+    if let Some(name) = identify_global_builtin_constructor(type_ref) {
+        match name {
+            "Crypto" => {
+                return if is_native_module_namespace_value(value, "crypto.webcrypto") {
+                    f64::from_bits(crate::value::TAG_TRUE)
+                } else {
+                    f64::from_bits(TAG_FALSE)
+                };
+            }
+            "SubtleCrypto" => {
+                return if is_native_module_namespace_value(value, "crypto.subtle") {
+                    f64::from_bits(crate::value::TAG_TRUE)
+                } else {
+                    f64::from_bits(TAG_FALSE)
+                };
+            }
+            "CryptoKey" => {
+                let addr = value_addr(value);
+                return if addr != 0 && crate::buffer::crypto_key_meta(addr).is_some() {
+                    f64::from_bits(crate::value::TAG_TRUE)
+                } else {
+                    f64::from_bits(TAG_FALSE)
+                };
+            }
+            _ => {}
+        }
+        let class_id = global_builtin_constructor_class_id(name);
+        if class_id != 0 {
+            // Own hooks and proxy unwrapping have already completed. Once this
+            // actual constructor is proved callable, primitives are a miss;
+            // native dispatch need not repeat the static class-hook prefix.
+            if instanceof_lhs_is_primitive(value) {
+                return f64::from_bits(TAG_FALSE);
+            }
+            return super::static_dispatch::native_with_constructor(
+                value,
+                class_id,
+                Some(type_ref),
+            );
+        }
+    }
+    // Intrinsics and class values have completed their own dispatch. Only
+    // remaining function values need the compiled-function ancestry probe;
+    // ordinary native constructor checks no longer pay its failed validation.
+    // #10507: `x instanceof F` for an ordinary compiled function `F`: one
+    // shape compare when `x`'s ShapeId names `F.prototype`, else, for an
+    // object of no compiled class, OrdinaryHasInstance's prototype walk.
+    {
+        use crate::object::class_registry::OrdinaryInstanceof;
+        match crate::object::class_registry::ordinary_compiled_function_has_instance(
+            value, type_ref,
+        ) {
+            Some(OrdinaryInstanceof::Instance) => return f64::from_bits(crate::value::TAG_TRUE),
+            Some(OrdinaryInstanceof::PrototypeWalk) => {
+                return f64::from_bits(if ordinary_has_instance_prototype_walk(value, type_ref) {
+                    crate::value::TAG_TRUE
+                } else {
+                    crate::value::TAG_FALSE
+                });
+            }
+            None => {}
+        }
+    }
+    // OrdinaryHasInstance step 2: a bound function (with no own
+    // `@@hasInstance`, answered above) is `instanceof` exactly as its target.
+    if let Some(target) = crate::object::class_registry::bound_function_target_value(type_ref) {
+        return js_instanceof_dynamic(value, target);
+    }
+    // Class and intrinsic RHS values have already taken their own exits.
+    // A remaining callable still answers false for a primitive; a non-callable
+    // RHS must reach TypeError even when the left operand is primitive.
+    if instanceof_lhs_is_primitive(value) && value_is_callable(type_ref) {
+        return f64::from_bits(TAG_FALSE);
+    }
+    // Native http(s).Agent handles have no heap prototype chain. After any own
+    // override above has had first refusal, retain their native brand check.
+    if let Some((module, method)) = unsafe { bound_native_callable_module_and_method(type_ref) } {
+        if matches!(module.as_str(), "http" | "https") && method == "Agent" {
+            let matched = small_native_handle_id(value)
+                .zip(crate::object::http_agent_handle_probe())
+                .is_some_and(|(handle, probe)| unsafe { probe(handle) });
+            if matched || ordinary_has_instance_prototype_walk(value, type_ref) {
+                return f64::from_bits(crate::value::TAG_TRUE);
+            }
+            return f64::from_bits(TAG_FALSE);
+        }
     }
     // #6558: `e instanceof WebAssembly.CompileError` (and LinkError /
     // RuntimeError). These constructors live on the WebAssembly NAMESPACE —
@@ -417,51 +511,6 @@ pub extern "C" fn js_instanceof_dynamic(value: f64, type_ref: f64) -> f64 {
     }
     if is_buffer_constructor_value(type_ref) {
         return js_instanceof(value, crate::buffer::NODE_BUFFER_CLASS_ID);
-    }
-    if let Some(name) = identify_global_builtin_constructor(type_ref) {
-        match name {
-            "Crypto" => {
-                return if is_native_module_namespace_value(value, "crypto.webcrypto") {
-                    f64::from_bits(crate::value::TAG_TRUE)
-                } else {
-                    f64::from_bits(TAG_FALSE)
-                };
-            }
-            "SubtleCrypto" => {
-                return if is_native_module_namespace_value(value, "crypto.subtle") {
-                    f64::from_bits(crate::value::TAG_TRUE)
-                } else {
-                    f64::from_bits(TAG_FALSE)
-                };
-            }
-            "CryptoKey" => {
-                let addr = value_addr(value);
-                return if addr != 0 && crate::buffer::crypto_key_meta(addr).is_some() {
-                    f64::from_bits(crate::value::TAG_TRUE)
-                } else {
-                    f64::from_bits(TAG_FALSE)
-                };
-            }
-            _ => {}
-        }
-        let class_id = global_builtin_constructor_class_id(name);
-        if class_id != 0 {
-            let r = js_instanceof(value, class_id);
-            if r.to_bits() == crate::value::TAG_TRUE {
-                return r;
-            }
-            // #5989: an object that inherits a builtin's prototype via
-            // `Fn.prototype = Object.create(Builtin.prototype)` is `instanceof
-            // Builtin` per the spec even though it carries no builtin class id —
-            // react-server-dom's flight Chunk inherits `Promise.prototype` this
-            // way, so `chunk instanceof Promise` must be true. Walk the real
-            // [[Prototype]] chain against `Builtin.prototype` before answering
-            // false.
-            if ordinary_has_instance_prototype_walk(value, type_ref) {
-                return f64::from_bits(crate::value::TAG_TRUE);
-            }
-            return f64::from_bits(TAG_FALSE);
-        }
     }
     if crate::node_submodules::is_diagnostics_channel_constructor_value(type_ref) {
         return if crate::node_submodules::diagnostics_channel_is_channel_instance_value(value) {

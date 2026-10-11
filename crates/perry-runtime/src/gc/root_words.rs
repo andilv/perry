@@ -1,64 +1,15 @@
-//! The single decoder shared by the collector's *mark* and *rewrite* paths
-//! for words that may hold a heap reference (#6910).
+//! Root decoding is selected by the source owner, then shared by marking and
+//! relocation. Generated global/statepoint slots hold JSValue words at rest;
+//! runtime pointer fields supply a GcPointer. Only legacy shadow frames (including
+//! WASI) and ambiguous heap words retain the conservative mixed-word decoder.
+//! A numeric JSValue whose bits happen to equal a heap address is never a root.
 //!
-//! # The invariant
-//!
-//! **Anything the rewrite path will relocate, the mark path must mark.**
-//!
-//! A GC root slot or heap word can carry a heap reference in two forms:
-//!
-//! - **NaN-boxed** — `POINTER_TAG` / `STRING_TAG` / `BIGINT_TAG` in the top
-//!   16 bits, user address in the low 48. This is what all shipped codegen
-//!   stores in a shadow-stack slot ("tagged at rest").
-//! - **Bare** — the untagged user address written straight into the word.
-//!   Module-variable globals have always done this, runtime side tables that
-//!   hold `*mut T` do it, and the representation-selection RFC's unboxed
-//!   pointer reps (§5.6 `Ptr<Shape>`, `Str`, closure envs) are designed to.
-//!
-//! Before #6910 the two forms were decoded by four hand-copied predicates
-//! that did not agree:
-//!
-//! | surface | accepted |
-//! |---|---|
-//! | `try_mark_value` (fed by shadow-stack root marking) | NaN-boxed only |
-//! | `try_rewrite_value` (mutable-root + heap-slot rewrite) | NaN-boxed **and bare** |
-//! | `CopyingPointerSet::decode_bits` (copying minor) | NaN-boxed **and bare** |
-//! | `heap_word_candidate_addr` (incremental mark barrier) | NaN-boxed **and bare** |
-//!
-//! So a bare address in a shadow-stack slot was accepted by the rewrite,
-//! copying and barrier paths but **invisible to mark-sweep root marking**.
-//! If such a slot were the only reference to an object, the mark phase would
-//! skip it, the sweep would free it, and the slot would be left pointing at
-//! reclaimed memory — a use-after-free, not merely a missed rewrite (an
-//! unmarked object is never evacuated, so it never gets a forwarding address
-//! for the rewrite pass to follow).
-//!
-//! The failure would also have been invisible to the test suite: the unit
-//! tests default to `ConservativeStackScanMode::Full`
-//! (`gc::roots::conservative_stack_scan_mode`), whose native-stack scan
-//! accepts bare addresses and would have rescued the object, while
-//! production resolves `Auto -> SkipDisabled` and has no such safety net.
-//! Green tests, prod-only UAF. `gc::tests::root_words` therefore pins the
-//! invariant with the conservative scan explicitly `Disabled`.
-//!
-//! # Using this module
-//!
-//! Decode through [`decode_root_word`] and act on the result; do not re-type
-//! the tag comparisons or the address-range literals at a call site. Adding a
-//! representation here teaches the mark path, the rewrite path and the
-//! incremental barrier at once, which is the property that keeps them from
-//! drifting apart again.
-//!
-//! Two collector surfaces deliberately do **not** route through here, and
-//! both are safe because they are *supersets* of this decoder rather than
-//! subsets:
-//!
-//! - `try_mark_value_or_raw` — the conservative native-stack scan, which
-//!   additionally resolves *interior* pointers via `enclosing_object`.
-//! - `CopyingPointerSet::decode_bits` — the copying minor collector, which
-//!   additionally requires 8-byte alignment and a live classification, and
-//!   whose mark and rewrite are the same operation (`visit_value_bits`), so
-//!   it cannot disagree with itself.
+//! Precise roots keep their producer-declared encoding. Before touching a
+//! header, admission asks the arena region descriptor who owns the address
+//! (one descriptor read). Outside every arena region the object's own header
+//! is the authority: an ARENA header there is not this heap's object, and any
+//! other header is a malloc or process-lifetime cell of this heap. Admission
+//! never infers a word's type, consults a census snapshot or walks a registry.
 
 use super::*;
 
@@ -143,15 +94,8 @@ pub(super) fn decode_root_word(bits: u64) -> Option<RootWord> {
     })
 }
 
-/// Mark the object referenced by a mutable-root slot word — shadow-stack,
-/// native stack-map, and registered module-global slots alike.
-///
-/// All slot kinds are rewritten by `rewrite_mutable_root_slots` through
-/// `try_rewrite_value`, so all must be marked through the same decoder
-/// (#6910). Marking is address-identical for the forms once decoded —
-/// `try_mark_raw_root_addr` performs the same validation and mark that
-/// `try_mark_value` does after unwrapping a NaN box — so a single call
-/// covers them.
+/// Legacy untyped shadow-frame marking. These frames have no type descriptor
+/// and may contain bare pointers as well as JSValues, so retain validation.
 #[inline]
 pub(super) fn mark_mutable_root_bits(bits: u64, valid_ptrs: &ValidPointerSet) {
     if super::full_trace::handle_trace_active()
@@ -163,4 +107,237 @@ pub(super) fn mark_mutable_root_bits(bits: u64, valid_ptrs: &ValidPointerSet) {
         return;
     };
     try_mark_raw_root_addr(word.addr(), valid_ptrs);
+}
+
+/// Encoding supplied by the owner of a precise root. This is transient visitor
+/// data, never a registry of slot kinds. Generated mutable slots use JSValue
+/// encoding at rest; native owners with pointer fields provide GcPointer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreciseRoot {
+    JSValue(u64),
+    GcPointer(usize),
+}
+
+impl PreciseRoot {
+    #[inline]
+    fn address(self) -> Option<usize> {
+        match self {
+            Self::JSValue(bits) => decode_tagged_root_word(bits).map(RootWord::addr),
+            Self::GcPointer(addr) => (addr != 0).then_some(addr),
+        }
+    }
+
+    #[inline]
+    fn bits(self) -> u64 {
+        match self {
+            Self::JSValue(bits) => bits,
+            Self::GcPointer(addr) => POINTER_TAG | (addr as u64 & POINTER_MASK),
+        }
+    }
+}
+
+/// Verification of the precise-root contract: always on in unit tests (a test
+/// can turn it off to observe the release path), and behind
+/// `PERRY_GC_VERIFY_MARK` in instrumented builds.
+#[inline]
+pub(super) fn precise_root_verification() -> bool {
+    #[cfg(test)]
+    {
+        PRECISE_ROOT_VERIFICATION.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        super::gc_verify_mark_enabled()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static PRECISE_ROOT_VERIFICATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(true) };
+}
+
+/// The JSValue-root contract (#12271): with conservative scanning off, a
+/// global, temp, handle or statepoint root declared as a JSValue holds a tagged
+/// JSValue; a raw pointer needs a declared raw kind. An untagged word naming
+/// one of this heap's objects is a producer that stored a bare address, so
+/// the object is unrooted. Checked under verification when the slot is
+/// registered and whenever a collector reads it. Address-shaped numbers that
+/// name no object of this heap (denormal doubles) stay numbers.
+#[inline]
+pub(super) fn verify_jsvalue_root_word(bits: u64, source: &str) {
+    // Only an address-shaped word can name an object; test that before the
+    // verification switch so a numeric root word costs one range compare.
+    if (BARE_ADDR_MIN..=POINTER_MASK).contains(&bits) && precise_root_verification() {
+        verify_bare_address_root_word(bits as usize, source);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn verify_bare_address_root_word(addr: usize, source: &str) {
+    let names_object = match crate::arena::classify_region_ownership(addr) {
+        crate::arena::RegionOwnership::Current => true,
+        crate::arena::RegionOwnership::OtherHeap => false,
+        crate::arena::RegionOwnership::Outside => {
+            addr % 8 == 0
+                && super::malloc::gc_malloc_header_is_local(
+                    addr.wrapping_sub(GC_HEADER_SIZE) as *const GcHeader
+                )
+        }
+    };
+    assert!(
+        !names_object,
+        "untagged heap address {addr:#x} in a JSValue {source} root: the producer must store a tagged JSValue or declare a raw root"
+    );
+}
+
+/// A root that is neither this heap's object nor provably another live heap's
+/// is a producer bug: a mis-typed, stale or foreign word. Verification aborts
+/// before any header write; release leaves the header untouched.
+#[cold]
+#[inline(never)]
+fn invalid_precise_root(addr: usize, why: &str) -> Option<*mut GcHeader> {
+    if precise_root_verification() {
+        #[cfg(target_os = "linux")]
+        let region = crate::arena::region_classify(addr).map(|r| {
+            let this_thread = r.thread == crate::tls_hot::thread_identity();
+            (r.kind, r.space, this_thread, r.base, r.end)
+        });
+        #[cfg(not(target_os = "linux"))]
+        let region: Option<()> = None;
+        panic!(
+            "invalid precise root header: {addr:#x} ({why}); region (kind, space, this thread, base, end): {region:?}"
+        );
+    }
+    None
+}
+
+/// Admit a decoded precise root before any header write: the header this
+/// collector may mark, pin or relocate, or `None`.
+///
+/// O(1). The arena region descriptor answers first. A live region of another
+/// thread is that thread's heap (a Worker's, or a zero-copy transferred cell),
+/// so its root is dropped silently and its header is never read. Outside every arena region the header decides: an ARENA
+/// header there is a producer bug; any other header is a malloc or
+/// process-lifetime cell of this heap. Verification also checks the header's
+/// structure, and that an unmarked header outside the arena is one of this
+/// agent's malloc allocations.
+#[inline]
+pub(super) fn admit_precise_root_addr(addr: usize) -> Option<*mut GcHeader> {
+    let outside = match crate::arena::classify_region_ownership(addr) {
+        crate::arena::RegionOwnership::Current => false,
+        crate::arena::RegionOwnership::OtherHeap => return None,
+        crate::arena::RegionOwnership::Outside => true,
+    };
+    unsafe {
+        let header = header_from_user_ptr(addr as *const u8);
+        let flags = (*header).gc_flags;
+        if outside && flags & GC_FLAG_ARENA != 0 {
+            return invalid_precise_root(addr, "arena header outside this heap's regions");
+        }
+        if precise_root_verification() {
+            if !(gc_type_info((*header).obj_type).is_some()
+                && (*header).size as usize >= GC_HEADER_SIZE)
+            {
+                return invalid_precise_root(addr, "malformed header");
+            }
+            // A marked header needs no write. An unmarked one outside the
+            // arena must be this heap's own malloc allocation.
+            if outside
+                && flags & GC_FLAG_MARKED == 0
+                && !super::malloc::gc_malloc_header_is_local(header)
+            {
+                return invalid_precise_root(addr, "not this heap's allocation");
+            }
+        }
+        Some(header)
+    }
+}
+
+/// Mark a root whose producer supplied its representation. After admission
+/// the object's own header is authoritative.
+///
+/// Invalid typed roots are producer bugs; admission reports them under
+/// verification. The evacuation verifier checks that root slots do not retain
+/// moved addresses.
+#[inline]
+pub(crate) fn mark_precise_root(root: PreciseRoot, valid_ptrs: &ValidPointerSet) -> bool {
+    mark_precise_root_in_scope(root, valid_ptrs, None)
+}
+
+/// Root writes share the marker, with the incremental cycle's scope: a minor
+/// shades nursery objects only and a forwarding alias needs no new shading.
+#[inline]
+pub(super) fn mark_precise_root_in_scope(
+    root: PreciseRoot,
+    valid_ptrs: &ValidPointerSet,
+    write_scope: Option<bool>,
+) -> bool {
+    let Some(addr) = root.address() else {
+        if let PreciseRoot::JSValue(bits) = root {
+            verify_jsvalue_root_word(bits, "scanned");
+        }
+        return false;
+    };
+    // A tagged handle is a root of its provider's JSValue edges, not a GC
+    // allocation. Decode the source first so numeric bits cannot observe ids.
+    if crate::value::addr_class::is_handle_band(addr) {
+        if super::full_trace::handle_trace_active() {
+            super::full_trace::observe_handle(root.bits(), valid_ptrs);
+        }
+        return false;
+    }
+    // A minor shades only this heap's nursery. That region test is itself an
+    // ownership proof, so a root write outside it costs no further lookup.
+    if write_scope == Some(true) && !crate::arena::pointer_in_nursery(addr) {
+        return false;
+    }
+    let Some(header) = admit_precise_root_addr(addr) else {
+        return false;
+    };
+    unsafe { mark_admitted_root_header(header, write_scope.is_some()) }
+}
+
+/// Shade an admitted header. A root write never re-shades a forwarding alias.
+#[inline]
+pub(super) unsafe fn mark_admitted_root_header(header: *mut GcHeader, root_write: bool) -> bool {
+    let flags = (*header).gc_flags;
+    if root_write && flags & GC_FLAG_FORWARDED != 0 {
+        return false;
+    }
+    if flags & GC_FLAG_MARKED != 0 || super::pin::pinned_counts_as_marked(flags) {
+        return false;
+    }
+    (*header).gc_flags = flags | GC_FLAG_MARKED;
+    push_mark_seed(header);
+    true
+}
+
+/// Decode a JSValue root, never accepting a numeric bit pattern as an address.
+#[inline]
+pub(super) fn decode_nanboxed_root_word(bits: u64) -> Option<RootWord> {
+    let word = decode_tagged_root_word(bits)?;
+    (!crate::value::addr_class::is_handle_band(word.addr())).then_some(word)
+}
+
+/// Decode the pointer-bearing tags, including native handle payloads. Marking
+/// dispatches handles; relocation leaves them alone. Both reject numeric bits.
+#[inline]
+fn decode_tagged_root_word(bits: u64) -> Option<RootWord> {
+    match bits & TAG_MASK {
+        POINTER_TAG | STRING_TAG | BIGINT_TAG => {
+            let payload = bits & POINTER_MASK;
+            #[cfg(not(target_pointer_width = "64"))]
+            if payload > usize::MAX as u64 {
+                return None;
+            }
+            let addr = payload as usize;
+            (addr != 0).then_some(RootWord::Nanboxed {
+                addr,
+                tag: bits & TAG_MASK,
+            })
+        }
+        _ => None,
+    }
 }

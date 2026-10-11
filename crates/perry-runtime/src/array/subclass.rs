@@ -31,7 +31,7 @@ pub(crate) use loop_guard::{js_packed_arraylike_loop_guard, js_packed_ecs_u32_lo
 // allocation cannot inherit a proof sibling from reused `ObjectMeta` storage.
 // The payload rides evacuation with its owner, with no side-table re-key.
 //
-//     bit 0       prototype-semantic divergence
+//     bit 0       native fallback after ordinary undefined
 //     bit 1       payload valid
 //     bit 2       compact nonnegative-int entity proof (mode 2)
 //     bit 3       user-origin prototype signal
@@ -1682,7 +1682,7 @@ pub fn array_subclass_has_iterator_override(value: f64) -> bool {
     }
     let raw = value.to_bits() & 0x0000_FFFF_FFFF_FFFF;
     let class_id = crate::object::js_object_get_class_id(raw as *const ObjectHeader);
-    class_id != 0 && crate::object::method_owner_class_id(class_id, "@@iterator").is_some()
+    class_id != 0 && crate::object::class_method_slot_owner(class_id, "@@iterator").is_some()
 }
 
 // ---------------------------------------------------------------------------

@@ -41,6 +41,7 @@ struct LoweredFnArtifacts {
     ic_globals: Vec<String>,
     typed_parse_rodata: Vec<String>,
     ic_end: u32,
+    pending_helpers: Vec<crate::function::LlFunction>,
     pending_declares: Vec<(String, LlvmType, Vec<LlvmType>)>,
     buffer_alias_used: u32,
     native_rep_records: Vec<crate::native_value::NativeRepRecord>,
@@ -53,6 +54,7 @@ fn take_lowered_fn_artifacts(ctx: &mut FnCtx<'_>) -> LoweredFnArtifacts {
         ic_globals: std::mem::take(&mut ctx.ic_globals),
         typed_parse_rodata: std::mem::take(&mut ctx.typed_parse_rodata),
         ic_end: ctx.ic_site_counter,
+        pending_helpers: std::mem::take(&mut ctx.pending_helpers),
         pending_declares: std::mem::take(&mut ctx.pending_declares),
         buffer_alias_used: ctx.buffer_data_slots.len() as u32,
         native_rep_records: std::mem::take(&mut ctx.native_rep_records),
@@ -68,6 +70,9 @@ fn publish_lowered_fn_artifacts(llmod: &mut LlModule, artifacts: LoweredFnArtifa
     llmod
         .native_rep_records
         .extend(artifacts.native_rep_records);
+    for helper in artifacts.pending_helpers {
+        llmod.add_outlined_helper(helper);
+    }
     for (name, ret, params) in artifacts.pending_declares {
         llmod.declare_function(&name, ret, &params);
     }
@@ -428,7 +433,12 @@ pub(super) fn compile_method(
         }
         (this_slot, map)
     };
-    super::arguments::box_rooted_parameter_slots(lf, &method.params, &method_boxed_vars, &locals);
+    let entry_param_cells = super::arguments::box_rooted_parameter_slots(
+        lf,
+        &method.params,
+        &method_boxed_vars,
+        &locals,
+    );
 
     let mut local_types: HashMap<u32, perry_hir::types::Type> = module_global_types
         .iter()
@@ -621,6 +631,9 @@ pub(super) fn compile_method(
         trusted_box_captures: false,
         versioned_loop_deopt_context: None,
         trusted_box_capture_ptrs: HashMap::new(),
+        ready_cell_roots: crate::stmt::binding_cell::ReadyCellRoots::with_entry_cells(
+            entry_param_cells,
+        ),
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
@@ -649,6 +662,9 @@ pub(super) fn compile_method(
         interfaces: &cross_module.interfaces,
         try_depth: 0,
         pending_declares: Vec::new(),
+        pending_helpers: Vec::new(),
+        array_record_length_local: None,
+        array_stack_records: Default::default(),
         integer_locals: &index_clone_integer_locals,
         int_valued_i64_locals: native_facts.int_valued_i64_locals(),
         not_bigint_locals: native_facts.not_bigint_locals(),
@@ -675,6 +691,7 @@ pub(super) fn compile_method(
         region_loop_facts: Vec::new(),
         element_shape_loop_facts: Vec::new(),
         i32_counter_slots: index_i32_param_slots,
+        record_packed_admissions: std::collections::HashMap::new(),
         numeric_accumulator_f64_slots: HashMap::new(),
         transition_cache_base_slot: None,
         receiver_descriptors: Default::default(),
@@ -1271,14 +1288,16 @@ pub(super) fn compile_method(
                         None => undef_lit.clone(),
                     };
                     let nt_save = crate::rooting::new_target_save_for_super(&mut ctx);
+                    let construct_site = crate::expr::new_dynamic::construct_site(&mut ctx);
                     let parent_result = ctx.block().call(
                         DOUBLE,
-                        "js_fetch_or_value_super",
+                        "js_class_value_super_construct_site",
                         &[
                             (DOUBLE, &parent_val),
                             (DOUBLE, &this_box),
                             (crate::types::PTR, &args_ptr),
                             (I64, &args_len),
+                            (crate::types::PTR, &construct_site),
                         ],
                     );
                     if let Some(save) = nt_save.as_ref() {
@@ -1667,6 +1686,7 @@ mod tests {
                     "@issue_9890_rodata = private constant i64 9890".to_string()
                 ],
                 ic_end: 11,
+                pending_helpers: vec![],
                 pending_declares: vec![("js_issue_9890".to_string(), DOUBLE, vec![I64])],
                 buffer_alias_used: 2,
                 native_rep_records: Vec::new(),

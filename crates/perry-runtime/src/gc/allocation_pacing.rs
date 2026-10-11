@@ -24,6 +24,7 @@ struct Debt {
     burst_at_full_start: usize,
     mature_at_full_start: usize,
     published: usize,
+    /// Old, external and registered malloc bytes after the last full.
     live_after_full: usize,
     backoff: u32,
     seen_arena: usize,
@@ -77,7 +78,12 @@ pub(super) fn due(old_pressure: usize, burst_boundary: bool) -> bool {
         let large_band = (8 * MIB).max(debt.live_after_full / 2);
         let scale = 1usize << debt.backoff;
         let burst_scale = 1usize << debt.burst_backoff;
-        let owed = debt.published >= band.saturating_mul(scale)
+        let owed = (debt.published >= band.saturating_mul(scale)
+            // Total allocation includes nursery garbage. A full pays mature
+            // growth; a stable old heap must leave this debt to minors.
+            && old_pressure.saturating_add(super::malloc::malloc_resident_bytes())
+                >= debt.live_after_full
+                .saturating_add(large_band.saturating_mul(scale)))
             || (burst_boundary
                 && debt.allocated >= large_band.saturating_mul(burst_scale)
                 // Nursery churn alone is paid cheaply by minors. Shared
@@ -119,16 +125,16 @@ pub(super) fn finish_full(live: usize, freed: usize) {
         // Cheap nursery garbage must not make a full look productive while
         // the mature live set remains unchanged. Allocate-black births can
         // mask reclaimed old bytes; conservatively credit the net reduction.
-        let productive = mature_reclaimed >= 4 * MIB && mature_reclaimed >= live / 4;
+        let productive = mature_reclaimed >= 4 * MIB && mature_reclaimed >= mature_live / 4;
         let boundary = previous.boundary_full;
-        let next_backoff = |previous: u32| {
+        let next_backoff = |shift: u32| {
             if productive { 0 }
-            else if live <= account.0.get().live_after_full.saturating_add(4 * MIB) {
-                (previous + 1).min(3)
-            } else { previous }
+            else if mature_live <= previous.live_after_full.saturating_add(4 * MIB) {
+                (shift + 1).min(3)
+            } else { shift }
         };
         account.0.set(Debt {
-            live_after_full: live,
+            live_after_full: mature_live,
             backoff: next_backoff(previous.backoff),
             burst: previous.burst.saturating_sub(previous.burst_at_full_start),
             burst_backoff: if boundary { next_backoff(previous.burst_backoff) }
@@ -184,7 +190,6 @@ pub(super) struct CollectorStepGuard(bool);
 
 impl CollectorStepGuard {
     pub(super) fn enter() -> Self {
-        crate::arena::sync_inline_arena_state();
         sample_arena();
         Self(COLLECTOR_STEP.with(|active| active.replace(true)))
     }
@@ -192,6 +197,7 @@ impl CollectorStepGuard {
 
 impl Drop for CollectorStepGuard {
     fn drop(&mut self) {
+        // Sample while the guard is active: collector bumps are not debt.
         sample_arena();
         COLLECTOR_STEP.with(|active| active.set(self.0));
     }
@@ -199,17 +205,19 @@ impl Drop for CollectorStepGuard {
 
 #[cfg(test)]
 pub(super) fn test_debt() -> (usize, usize) {
-    crate::arena::sync_inline_arena_state();
     sample_arena();
     ACCOUNT.with(|account| (account.0.get().allocated, account.0.get().large))
 }
 
 pub(super) fn checkpoint() {
-    crate::arena::sync_inline_arena_state();
     sample_arena();
 }
 
 fn sample_arena() {
+    // Runtime helpers and generated code share the Eden offset. Every debt
+    // sample must first materialize that offset, including policy questions
+    // between checkpoints and the sample before a collector guard drops.
+    crate::arena::sync_inline_arena_state();
     let (bytes, large) = crate::arena::allocation_totals();
     let (new_bytes, new_large) = ACCOUNT.with(|account| {
         let mut debt = account.0.get();
@@ -241,5 +249,41 @@ impl BurstBoundaryGuard {
 impl Drop for BurstBoundaryGuard {
     fn drop(&mut self) {
         BURST_BOUNDARY.with(|boundary| boundary.set(self.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_runtime_bumps_do_not_charge_collector_bytes_to_mutator() {
+        std::thread::spawn(|| {
+            let _triggers =
+                super::super::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+            crate::arena::js_inline_arena_state();
+            let before = test_debt();
+            for _ in 0..16 {
+                crate::arena::arena_alloc_gc(32, 8, super::super::GC_TYPE_STRING);
+            }
+            let mutator = test_debt();
+            assert_eq!(mutator.0 - before.0, 16 * 40);
+            assert_eq!(mutator.1, before.1);
+            {
+                let _step = CollectorStepGuard::enter();
+                for _ in 0..64 {
+                    crate::arena::arena_alloc_gc(32, 8, super::super::GC_TYPE_STRING);
+                }
+            }
+            assert_eq!(
+                test_debt(),
+                mutator,
+                "collector bumps are not allocation pressure"
+            );
+            crate::arena::arena_alloc_gc(32, 8, super::super::GC_TYPE_STRING);
+            assert_eq!(test_debt().0, mutator.0 + 40);
+        })
+        .join()
+        .unwrap();
     }
 }

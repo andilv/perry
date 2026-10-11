@@ -1,5 +1,20 @@
 use super::*;
 
+// These isolated cache fixtures use boxed headers rather than class
+// materialization. Publish the same identity edge a real holder would have.
+pub(super) unsafe fn publish(cache: *mut PicCache, recv: *const ObjectHeader, walk: &Walk) {
+    let direct = if walk.depth == 1 {
+        walk.holder
+    } else {
+        walk.hops[0].0
+    };
+    let pid =
+        crate::object::shapes::shape_proto_id(crate::object::shapes::object_shape_stamp(recv))
+            .unwrap();
+    crate::object::shapes::write_identity_word(pid, crate::value::POINTER_TAG | direct as u64);
+    super::publish(cache, recv, walk);
+}
+
 pub(super) fn pinned_shape(generation: u64) -> u32 {
     crate::object::shapes::shape_descriptor_ensure_with_generation(
         std::ptr::null(),
@@ -229,7 +244,9 @@ fn multi_absent_shares_chain_and_checks_every_shape() {
     assert_ne!(unsafe { site(&cache).unwrap().next } & ABSENT_CHURN, 0);
     assert_eq!(e.slot & !MULTI_ABSENT, 96);
     assert_eq!(unsafe { e.hops() }.len(), 8);
-    assert_eq!(std::mem::size_of::<Entry>(), 48);
+    // The runtime shares this record at arbitrary chain depth. Its usize
+    // depth adds eight bytes to the old u8-depth record on 64-bit targets.
+    assert_eq!(std::mem::size_of::<Entry>(), 56);
     // Fake hops are not registered shapes. Exercise the same pinned
     // shape comparisons the real admitted walk proves.
     for r in &receivers {
@@ -423,16 +440,21 @@ fn multi_absent_reproves_shared_class_link_after_generation_change() {
     let e = unsafe { &(*record).primary_class };
     assert!(e.multi_absent());
     assert_eq!(e.slot & !MULTI_ABSENT, 24);
-    crate::object::class_registry::class_lookup_surface_gen_bump();
+    crate::object::shapes::write_identity_word(
+        crate::object::shapes::PROTO_ID_CLASS | u64::from(unsafe { (*receivers[0]).class_id }),
+        0,
+    );
     for r in &receivers {
         let token = (PIC_ID_TOKEN_BIT | u64::from(unsafe { object_shape_stamp(*r) })) as i64;
         assert_eq!(unsafe { leaf_answer(&cache, *r, token) }, None);
     }
+    assert_eq!(unsafe { try_shared_hit(record, receivers[5]) }, None);
+    crate::object::test_seed_class_decl_prototype_object_root(CID, a as usize);
     assert_eq!(
         unsafe { try_shared_hit(record, receivers[5]) },
         Some(crate::value::TAG_UNDEFINED)
     );
-    // A same-identity generation re-proof covers the whole set.
+    // Restoring the identity's live word validates the whole receiver set.
     for r in &receivers {
         let token = (PIC_ID_TOKEN_BIT | u64::from(unsafe { object_shape_stamp(*r) })) as i64;
         assert_eq!(
@@ -580,7 +602,8 @@ fn deep_entry_compares_every_hop() {
     }
     let _lock = crate::gc::global_side_table_test_lock();
     let base = crate::object::shapes::SHAPE_ID_BASE;
-    let recv = shaped(base + 1);
+    let recv_shape = receiver_shape(0x0C3C_9012, 20_999);
+    let recv = shaped(recv_shape);
     let chain: Vec<Box<ObjectHeader>> = (0..CLASS_READ_MAX_DEPTH as u32 - 1)
         .map(|i| shaped(pinned_shape(20_000 + u64::from(i))))
         .collect();
@@ -592,7 +615,7 @@ fn deep_entry_compares_every_hop() {
     // allocation, and this test drives only the published words.
     cache[HOLDER_STATE] = STATE_REGISTERED;
     unsafe { publish(&mut cache, &*recv, &w) };
-    let token = (PIC_ID_TOKEN_BIT | u64::from(base + 1)) as i64;
+    let token = (PIC_ID_TOKEN_BIT | u64::from(recv_shape)) as i64;
     let s = unsafe { site(&cache) }.expect("published site");
     let e = s.class_entries().find(|e| e.token == token).expect("entry");
     assert_eq!(
@@ -603,7 +626,7 @@ fn deep_entry_compares_every_hop() {
     // Fake headers carry admitted shape descriptors; the comparison
     // checks below exercise every shape the real walk records.
     let mut e = *e;
-    e.generation = crate::object::class_lookup_surface_generation();
+
     assert_eq!(
         unsafe { pinned_answer(&e) },
         Some(crate::value::TAG_UNDEFINED)
@@ -713,11 +736,15 @@ fn bare_class_link_replacement_with_same_holder_shape_declines() {
         depth: 1,
         absent: true,
         pinned_hops: true,
+        forward_absent: false,
+        exact_chain: false,
         slot: 0,
         holder: a as usize,
         holder_shape: proto_shape,
         hops: std::ptr::null_mut(),
-        generation: 0,
+        identity_key: crate::object::shapes::shape_proto_id(recv_shape)
+            .and_then(crate::object::shapes::identity_word_slot)
+            .map_or(0, |word| word as u64),
     };
     assert_eq!(
         unsafe { answer(&mut entry, recv) },

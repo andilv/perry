@@ -1,11 +1,10 @@
 //! Non-overlapping StringIndexOf positions, before replacement callbacks.
 //! KMP retains only failure offsets; both strings remain in original storage.
-use super::perex_match_search::subject;
 use super::perex_memory::{Buffer, MemoryBudget};
+use super::perex_output::Offsets;
 use super::perex_owner::HeapSubject;
-use super::perex_replace_storage::{List, Units};
+use super::perex_replace_storage::Units;
 use super::perex_runtime::{self as host, EngineError};
-use crate::gc::RuntimeHandle;
 use perex::binding::BoundSubject;
 use perex::Budget;
 
@@ -21,32 +20,114 @@ impl Read for Units<'_, '_> {
     }
 }
 
+/// Non-overlapping positions of `pattern` in `source` (all of them, or the
+/// first), for a replacement that collects them before it builds.
 pub(super) fn positions(
-    input: &RuntimeHandle<'_>,
-    needle: &RuntimeHandle<'_>,
+    source: &BoundSubject<HeapSubject<'_>>,
+    pattern: &BoundSubject<HeapSubject<'_>>,
     all: bool,
-    output: &mut List<'_>,
+    output: &mut Offsets,
     budget: &mut Budget,
     memory: &MemoryBudget,
 ) -> Result<(), EngineError> {
-    each(input, needle, budget, memory, |index, budget| {
-        output.push(index as f64, budget)?;
+    if ascii_positions(source, pattern, all, output, budget)? {
+        return Ok(());
+    }
+    each_bound(source, pattern, budget, memory, |index, _| {
+        output.push(index)?;
         Ok(!all)
     })
 }
 
-/// Visit non-overlapping positions without retaining a position list. The
-/// consumer may allocate/collect and returns true to stop immediately.
-pub(super) fn each(
-    input: &RuntimeHandle<'_>,
-    needle: &RuntimeHandle<'_>,
+/// How many bytes of an ASCII subject one step of `ascii_positions` reads
+/// between polls.
+const ASCII_STEP: usize = 64 * 1024;
+
+/// `positions` when both strings are ASCII: KMP over the bytes in place, the
+/// same automaton `each_readers` runs over UTF-16 units, with no per-unit
+/// cursor. Returns false, having done nothing, for any other pair.
+fn ascii_positions(
+    source: &BoundSubject<HeapSubject<'_>>,
+    pattern: &BoundSubject<HeapSubject<'_>>,
+    all: bool,
+    output: &mut Offsets,
     budget: &mut Budget,
-    memory: &MemoryBudget,
-    visit: impl FnMut(usize, &mut Budget) -> Result<bool, EngineError>,
-) -> Result<(), EngineError> {
-    let source = subject(*input)?;
-    let pattern = subject(*needle)?;
-    each_bound(&source, &pattern, budget, memory, visit)
+) -> Result<bool, EngineError> {
+    let Some(needle) = pattern
+        .with_view(|p| p.ascii_bytes().map(<[u8]>::to_vec))
+        .map_err(EngineError::Subject)?
+    else {
+        return Ok(false);
+    };
+    let Some(n) = source
+        .with_view(|s| s.ascii_bytes().map(<[u8]>::len))
+        .map_err(EngineError::Subject)?
+    else {
+        return Ok(false);
+    };
+    let m = needle.len();
+    if m == 0 {
+        for i in 0..=n {
+            host::charge(budget, 1)?;
+            output.push(i)?;
+            if !all {
+                break;
+            }
+        }
+        return Ok(true);
+    }
+    if m > n {
+        return Ok(true);
+    }
+    let mut failure = Vec::new();
+    failure
+        .try_reserve_exact(m)
+        .map_err(|_| super::perex_memory::StorageError::Allocation)?;
+    failure.resize(m, 0usize);
+    let mut j = 0;
+    for i in 1..m {
+        while j > 0 && needle[i] != needle[j] {
+            j = failure[j - 1];
+        }
+        if needle[i] == needle[j] {
+            j += 1;
+        }
+        failure[i] = j;
+    }
+    let (mut q, mut i) = (0, 0);
+    while i < n {
+        let end = (i + ASCII_STEP).min(n);
+        host::charge(budget, end - i)?;
+        let stop = source
+            .with_view(|s| {
+                let hay = s.ascii_bytes().ok_or(EngineError::InvalidSpan)?;
+                for (k, &unit) in hay[i..end].iter().enumerate() {
+                    while q > 0 && unit != needle[q] {
+                        q = failure[q - 1];
+                    }
+                    if unit == needle[q] {
+                        q += 1;
+                    }
+                    if q == m {
+                        output.push(i + k + 1 - m)?;
+                        if !all {
+                            return Ok(true);
+                        }
+                        q = 0;
+                    }
+                }
+                Ok::<bool, EngineError>(false)
+            })
+            .map_err(EngineError::Subject)??;
+        if stop {
+            break;
+        }
+        i = end;
+        if i < n {
+            host::poll()?;
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn each_bound(
