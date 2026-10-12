@@ -176,6 +176,17 @@ pub(super) unsafe fn visit_gc_layout_slot_descriptors_inline<F>(
                 .with_layout(HeapChildSlotReadKind::Prefix),
         );
     }
+    if (*header).obj_type == GC_TYPE_OBJECT {
+        if let Some(slot) = crate::object::shapes::evaluation_holder_slot(
+            child_slots.object_shape,
+            full_trace_active(),
+        ) {
+            visit(
+                GcMutableSlotDescriptor::Slot(GcMutableSlot::runtime_root(slot))
+                    .with_layout(HeapChildSlotReadKind::Prefix),
+            );
+        }
+    }
     if let Some(slot) = child_slots.take_meta_child_slot() {
         let descriptor = if matches!((*header).obj_type, GC_TYPE_OBJECT | GC_TYPE_CLOSURE) {
             pointer_slot(slot.cast())
@@ -351,9 +362,6 @@ unsafe fn visit_gc_rewrite_slot_descriptors_with<const INLINE_LAYOUT: bool>(
             // here, or the rewrite pass would hand the same slot to the
             // visitor twice and double-count in verification statistics.
             layout_descriptors!();
-            crate::object::visit_overflow_field_slots_mut(user_ptr as usize, |slot| {
-                visit(fixed_slot(slot));
-            });
         }
         GcRewriteDescriptorKind::RegExp => {
             layout_descriptors!();

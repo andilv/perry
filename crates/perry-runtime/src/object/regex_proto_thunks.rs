@@ -567,31 +567,31 @@ fn install_regex_symbol_methods(proto: *mut crate::object::ObjectHeader) {
         (
             "match",
             "[Symbol.match]",
-            crate::fn_info!(crate::regex::perex_match_search::match_thunk, 1; with_declared(1)),
+            crate::fn_info!(crate::regex::perex_match_search::match_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::codegen_abi::FN_PERMANENT_IMAGE)),
             1,
         ),
         (
             "search",
             "[Symbol.search]",
-            crate::fn_info!(crate::regex::perex_match_search::search_thunk, 1; with_declared(1)),
+            crate::fn_info!(crate::regex::perex_match_search::search_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::codegen_abi::FN_PERMANENT_IMAGE)),
             1,
         ),
         (
             "matchAll",
             "[Symbol.matchAll]",
-            crate::fn_info!(crate::regex::match_all::regexp_thunk, 1; with_declared(1)),
+            crate::fn_info!(crate::regex::match_all::regexp_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN | crate::codegen_abi::FN_PERMANENT_IMAGE)),
             1,
         ),
         (
             "split",
             "[Symbol.split]",
-            crate::fn_info!(crate::regex::perex_split::regexp_thunk, 2; with_declared(2)),
+            crate::fn_info!(crate::regex::perex_split::regexp_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN | crate::codegen_abi::FN_PERMANENT_IMAGE)),
             2,
         ),
         (
             "replace",
             "[Symbol.replace]",
-            crate::fn_info!(crate::regex::perex_replace::regexp_thunk, 2; with_declared(2)),
+            crate::fn_info!(crate::regex::perex_replace::regexp_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN | crate::codegen_abi::FN_PERMANENT_IMAGE)),
             2,
         ),
     ] {

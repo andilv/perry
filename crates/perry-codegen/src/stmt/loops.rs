@@ -3307,7 +3307,11 @@ fn emit_packed_range_receiver_forwarding_repair(ctx: &mut FnCtx<'_>, array_id: u
         let handle = blk.and(I64, &bits, crate::nanbox::POINTER_MASK_I64);
         let tag = blk.lshr(I64, &bits, "48");
         let is_pointer = blk.icmp_eq(I64, &tag, crate::nanbox::POINTER_TAG_TOP16_I64);
-        let above_band = blk.icmp_ugt(I64, &handle, "1048575");
+        let above_band = blk.icmp_ugt(
+            I64,
+            &handle,
+            crate::expr::receiver_range::HANDLE_BAND_TOP_LITERAL,
+        );
         let below_limit = blk.icmp_ult(I64, &handle, "140737488355328");
         let ok = blk.and(I1, &is_pointer, &above_band);
         let ok = blk.and(I1, &ok, &below_limit);
@@ -7119,6 +7123,16 @@ fn lower_for_in_region(
 ) -> Result<()> {
     let saved_ptr_shape_context = ctx.repsel_context_allows_ptr_shape;
     let saved_ptr_shape_denial = ctx.repsel_ptr_shape_context_denial;
+    let prepared_counter = region
+        .and_then(|t| super::region_loop::element_entry_slot(ctx, t))
+        .and_then(|valid_slot| {
+            let prepared = i32_counter::prepare(ctx, init, condition, update, body, true)?;
+            let range_ok = ctx.block().load(I1, &prepared.1.flag_slot);
+            let receiver_ok = ctx.block().load(I1, &valid_slot);
+            let pass = ctx.block().and(I1, &range_ok, &receiver_ok);
+            ctx.block().store(I1, &pass, &valid_slot);
+            Some(prepared)
+        });
     let lowered = (|| -> Result<()> {
         // With no region there is no F/G extent: ordinary loop lowering can
         // consume its pre-existing straight-line receiver facts as before.
@@ -7134,7 +7148,9 @@ fn lower_for_in_region(
         let lowered = super::region_loop::lower_loop(ctx, region, &mut |ctx| {
             // The split copy: the region is registered while it lowers.
             if region.is_some_and(|t| super::region_loop::is_registered(ctx, t)) {
-                if i32_counter::lower(ctx, init, condition, update, body)? {
+                if let Some((id, guard)) = &prepared_counter {
+                    i32_counter::lower_proven(ctx, *id, guard, init, condition, update, body)
+                } else if i32_counter::lower(ctx, init, condition, update, body)? {
                     Ok(())
                 } else {
                     lower_for_after_init(ctx, init, condition, update, body, "for")

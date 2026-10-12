@@ -66,6 +66,7 @@ pub use prototype::js_reflect_set_prototype_of;
 pub(crate) use json::{
     js_proxy_checked_target, js_proxy_checked_target_for_is_array, js_proxy_own_keys_for_json,
 };
+pub(crate) use reflect::js_reflect_get_with_explicit_receiver;
 pub use reflect::{
     js_reflect_delete, js_reflect_get, js_reflect_get_own_property_descriptor, js_reflect_has,
     js_reflect_set,
@@ -149,17 +150,17 @@ const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// `value::addr_class` (`PROXY_ID_BAND_START`).
 const PROXY_TAG_BASE: u64 = crate::value::addr_class::PROXY_ID_BAND_START as u64;
 
-/// Number of ids the revocable-Proxy band can encode: `HANDLE_BAND_MAX -
+/// Number of ids the revocable-Proxy band can encode: `PROXY_ID_BAND_END -
 /// PROXY_ID_BAND_START`, i.e. **65,536**, of which id 0 is reserved so a
 /// handle is never the bare band base.
 ///
 /// This is a hard ceiling, not a soft one. `encode_proxy_id` maps id `n` to
 /// `PROXY_TAG_BASE + n`, so the first id at or above this length encodes to
-/// `HANDLE_BAND_MAX` — a payload that `addr_class::is_proxy_id_band` rejects
-/// and `addr_class::is_above_handle_band` **accepts as a dereferenceable heap
-/// address**. Minting one is therefore a memory-safety bug rather than a lost
-/// proxy: the 65,536th `new Proxy(...)` in a thread used to hand back a value
-/// that the very next property read dereferenced, SIGSEGV (#8213).
+/// `PROXY_ID_BAND_END` — a payload that `addr_class::is_proxy_id_band` rejects
+/// and that names a Web Streams id. Before the stream band joined the handle
+/// band that payload was a **dereferenceable heap address**: the 65,536th
+/// `new Proxy(...)` in a thread used to hand back a value that the very next
+/// property read dereferenced, SIGSEGV (#8213). Minting one stays refused.
 ///
 /// Every other handle band already refuses to allocate past its end
 /// (`common/handle.rs`, `fetch/mod.rs` both panic). The Proxy band was the
@@ -168,7 +169,7 @@ const PROXY_TAG_BASE: u64 = crate::value::addr_class::PROXY_ID_BAND_START as u64
 /// long-running program reaches by simply staying up (#8213 measured ~4
 /// proxies per HTTP request on a warm Next.js App Route, i.e. this ceiling
 /// lands after roughly 16k requests).
-const PROXY_ID_BAND_LEN: u64 = (crate::value::addr_class::HANDLE_BAND_MAX
+const PROXY_ID_BAND_LEN: u64 = (crate::value::addr_class::PROXY_ID_BAND_END
     - crate::value::addr_class::PROXY_ID_BAND_START) as u64;
 
 #[cfg(test)]
@@ -234,7 +235,7 @@ fn decode_proxy_id(raw: i64) -> Option<u64> {
     // every addr-class consumer read the same payload as a heap address
     // (#8213). `reserve_proxy_id` makes such an id unmintable; this keeps the
     // two classifications from drifting apart again.
-    if raw >= crate::value::addr_class::HANDLE_BAND_MAX as u64 {
+    if raw >= crate::value::addr_class::PROXY_ID_BAND_END as u64 {
         return None;
     }
     let id = raw - PROXY_TAG_BASE;
@@ -846,9 +847,7 @@ pub(crate) fn reflect_value_is_object(value: f64) -> bool {
         // threw `TypeError: Reflect.get called on non-object`. Next's app-route
         // runtime wraps the request in a Proxy whose `get` trap forwards through
         // `Reflect.get(target, …)`, so every authenticated route 500'd.
-        if crate::value::addr_class::is_handle_band(lower48 as usize)
-            || crate::value::addr_class::is_stream_id_band(lower48 as usize)
-        {
+        if crate::value::addr_class::is_handle_band(lower48 as usize) {
             return lower48 != 0;
         }
         // The wasm32 heap is entirely below 4 GiB. Its handle-band guard
@@ -1390,6 +1389,96 @@ fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescriptor> {
         return None;
     }
 
+    // Ordinary prototype holders answer from their shape's key index. A
+    // missing key is an indexed absence, not a byte scan of every builtin
+    // key followed by a virtual/global property lookup.
+    let addr = extract_pointer(target.to_bits()) as usize;
+    let indexed_owner = unsafe {
+        match crate::value::addr_class::try_read_gc_header(addr) {
+            Some(header) if header.obj_type == crate::gc::GC_TYPE_OBJECT => {
+                let meta = (*(addr as *const crate::ObjectHeader)).meta;
+                (!meta.is_null()
+                    && (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE != 0)
+                    .then_some(addr)
+            }
+            Some(header) if header.obj_type == crate::gc::GC_TYPE_ARRAY => {
+                crate::object::shape_store::named_bag(addr as *const crate::ObjectHeader, key.to_bits())
+                    .map(|bag| bag as usize)
+            }
+            _ => None,
+        }
+    };
+    if let Some(indexed_owner) = indexed_owner {
+        if let Some(shape) = unsafe {
+            crate::object::shapes::object_shape_descriptor(
+                indexed_owner as *const crate::ObjectHeader,
+            )
+        } {
+            if shape.object_kind.is_ordinary_layout() {
+                let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+                if let Some(bytes) = unsafe {
+                    crate::string::js_string_key_bytes(
+                        crate::JSValue::from_bits(key.to_bits()),
+                        &mut scratch,
+                    )
+                } {
+                    let keys = shape.keys as usize as *const crate::ArrayHeader;
+                    use crate::object::shapes::KeysIndexVerdict;
+                    let verdict = if keys.is_null() {
+                        // Keyless dictionary shapes do not answer own absence;
+                        // the descriptor path below reads their receiver keys.
+                        KeysIndexVerdict::Unindexed
+                    } else {
+                        unsafe {
+                            let hash = crate::object::key_bytes_hash(bytes.as_ptr(), bytes.len());
+                            let verdict = crate::object::shapes::shape_slot_lookup_verdict(
+                                keys,
+                                bytes,
+                                hash,
+                                shape.logical_key_count,
+                                true,
+                            );
+                            // A shortened mutable key list retires its old
+                            // index. Rebuild before claiming absence.
+                            if matches!(verdict, KeysIndexVerdict::Unindexed) {
+                                crate::object::shapes::shape_slot_lookup_verdict(
+                                    keys,
+                                    bytes,
+                                    hash,
+                                    shape.logical_key_count,
+                                    true,
+                                )
+                            } else {
+                                verdict
+                            }
+                        }
+                    };
+                    match verdict {
+                        KeysIndexVerdict::Absent => return None,
+                        KeysIndexVerdict::Unindexed => {}
+                        KeysIndexVerdict::Found(slot) => {
+                            let entry = unsafe { crate::object::key_attrs::keys_entry(keys, slot) };
+                            if crate::object::key_attrs::entry_is_private(entry) {
+                                return None;
+                            }
+                            if entry & crate::object::key_attrs::ENTRY_ACCESSOR != 0 {
+                                let name = std::str::from_utf8(bytes).ok()?;
+                                let acc =
+                                    crate::object::get_accessor_descriptor(indexed_owner, name)?;
+                                return Some(OwnSetDescriptor::Accessor {
+                                    setter_bits: acc.set,
+                                });
+                            }
+                            return Some(OwnSetDescriptor::Data {
+                                writable: entry & crate::object::key_attrs::ENTRY_NON_WRITABLE == 0,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
         // `undefined` is a valid value for an existing own property. Using a
         // value read as the existence probe made the first overwrite of the
@@ -1833,9 +1922,6 @@ fn create_or_update_receiver_property(receiver: f64, key: f64, value: f64) -> bo
                 return false;
             }
         }
-    } else if crate::closure::is_closure_ptr(extract_pointer(receiver.to_bits()) as usize) {
-        target_set(receiver, key, value);
-        return true;
     } else if crate::object::obj_value_no_extend(receiver) {
         return false;
     }
@@ -2211,8 +2297,8 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
         // property.
         let current_addr = extract_pointer(current.to_bits()) as usize;
         if current_addr != 0
+            && key_equals(key, b"__proto__")
             && current_addr == crate::array::object_prototype_addr()
-            && key_to_rust_string(key).as_deref() == Some("__proto__")
         {
             legacy_dunder_proto_set(receiver, value);
             return true;
@@ -2253,39 +2339,9 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                     }
                     throw_type_error("Restricted function property assignment");
                 }
-                // Every function's [[Prototype]] is %Function.prototype% — a
-                // descriptor installed there via `Object.defineProperty(
-                // Function.prototype, k, {...})` must intercept a plain
-                // `boundFn.k = v` write (invoke an accessor's setter, throw
-                // for a getter-only accessor, or block a non-writable data
-                // property) instead of silently shadowing it with a new own
-                // data property on the receiver.
-                if crate::closure::closure_set_via_function_prototype_descriptor(
-                    cur_ptr, &name, value, receiver,
-                ) {
-                    return true;
-                }
-                // `Object.preventExtensions(fn)` / `Object.seal(fn)` set
-                // NO_EXTEND / SEALED in the closure's GcHeader (functions are
-                // GcHeader-backed closures). A [[Set]] that would ADD a new own
-                // property must fail (OrdinaryDefineOwnProperty returns false,
-                // silent in non-strict, TypeError in strict); an existing own
-                // key can still be updated. (test262
-                // Object/preventExtensions/15.2.3.10-3-{3,13}.)
-                if !crate::closure::closure_has_own_dynamic_prop(cur_ptr, &name) {
-                    let non_extensible = unsafe {
-                        let gc = (cur_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE)
-                            as *const crate::gc::GcHeader;
-                        (*gc)._reserved
-                            & (crate::gc::OBJ_FLAG_NO_EXTEND | crate::gc::OBJ_FLAG_SEALED)
-                            != 0
-                    };
-                    if non_extensible {
-                        return false;
-                    }
-                }
             }
-            return create_or_update_receiver_property(receiver, key, value);
+            // Functions continue through the same descriptor walk: a
+            // handled readonly write is a failure, not a successful store.
         }
         let Some(proto) = prototype_of_for_set(current) else {
             return create_or_update_receiver_property(receiver, key, value);
@@ -2686,15 +2742,15 @@ mod tests {
             );
         }
 
-        // The first refused id, and why refusing it is a memory-safety fix
-        // rather than a tidiness one.
+        // The first refused id, and why refusing it matters: it would name
+        // another subsystem's handle (the Web Streams band follows the proxy
+        // band), so a proxy minted there would be dispatched as a stream.
         assert_eq!(reserve_proxy_id(PROXY_ID_BAND_LEN as usize), None);
         let out_of_band = encode_proxy_id(PROXY_ID_BAND_LEN) as usize;
         assert!(!addr_class::is_proxy_id_band(out_of_band));
         assert!(
-            addr_class::is_above_handle_band(out_of_band),
-            "an out-of-band proxy id is classified as a heap address to be \
-             dereferenced — that is the SIGSEGV this guard prevents"
+            addr_class::is_stream_id_band(out_of_band),
+            "an out-of-band proxy id lands in the Web Streams band"
         );
     }
 
@@ -2717,12 +2773,12 @@ mod tests {
             "below band"
         );
         assert_eq!(
-            decode_proxy_id((addr_class::HANDLE_BAND_MAX - 1) as i64),
+            decode_proxy_id((addr_class::PROXY_ID_BAND_END - 1) as i64),
             Some(PROXY_ID_BAND_LEN - 1),
             "the last in-band payload still decodes"
         );
         assert_eq!(
-            decode_proxy_id(addr_class::HANDLE_BAND_MAX as i64),
+            decode_proxy_id(addr_class::PROXY_ID_BAND_END as i64),
             None,
             "the first payload past the band is not a proxy id"
         );

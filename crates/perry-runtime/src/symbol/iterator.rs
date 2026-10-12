@@ -250,11 +250,7 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
     } else if !is_proxy
         && crate::array::js_array_is_array(value()).to_bits() == crate::value::TAG_TRUE
     {
-        if let Some(iter) = unsafe { crate::array::array_intrinsic_values_iterator(value()) } {
-            return iter;
-        }
-        return get_iterator_from_method(value())
-            .unwrap_or_else(|| throw_value_not_iterable(value()));
+        return unsafe { crate::array::array_shape_iterator(value()) };
     }
     // Arguments objects iterate like arrays (spec:
     // `arguments[Symbol.iterator] === Array.prototype.values`). They are plain
@@ -633,7 +629,7 @@ mod not_iterable_message_tests {
 }
 
 // Ordinary GetMethod/Call shared by array and other protocol records.
-fn get_iterator_from_method(val_f64: f64) -> Option<f64> {
+pub(crate) fn get_iterator_from_method(val_f64: f64) -> Option<f64> {
     let this_scope = crate::gc::RuntimeHandleScope::new();
     let val_h = this_scope.root_nanbox_f64(val_f64);
     let iter_wk = well_known_symbol("iterator");

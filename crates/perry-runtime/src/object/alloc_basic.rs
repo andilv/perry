@@ -142,26 +142,33 @@ pub(crate) fn object_alloc_created(
 /// An intrinsic's empty object, born with its internal brand and class
 /// prototype in one shape. Only scalar facts cross allocation; no literal
 /// keys cache, intermediate prototype shape or brand transition is needed.
-pub(crate) fn object_alloc_branded(class_id: u32, brand: u64) -> *mut ObjectHeader {
+pub(crate) fn object_alloc_branded(
+    class_id: u32,
+    brand: u64,
+    site: &shapes::BrandedBirthSite,
+) -> *mut ObjectHeader {
+    let shape = site.resolve(class_id, brand);
+    let width = super::INLINE_SLOT_FLOOR;
+    let size = std::mem::size_of::<ObjectHeader>() + width * 8;
+    let fast = crate::arena::arena_alloc_gc_no_collect(size, 8, crate::gc::GC_TYPE_OBJECT)
+        as *mut ObjectHeader;
+    if !fast.is_null() {
+        unsafe {
+            init_unpublished(fast, class_id, width, shape);
+            shapes::store_kind::check_store_facts(fast);
+        }
+        return fast;
+    }
     let object = object_alloc_unpublished(class_id, 0);
     let scope = crate::gc::RuntimeHandleScope::new();
     let owner = scope.root_raw_mut_ptr(object);
-    let shape = shapes::publish_shape_result(shapes::shape_descriptor_intern_with_rep(
-        std::ptr::null(),
-        0,
-        0,
-        0,
-        shapes::ShapeObjectKind::Ordinary,
-        0,
-        // Intrinsic classes retain their exact CLASS identity. The vtable
-        // classifier used by class_proto_id treats reserved native ids as
-        // anonymous literals, which would publish DEFAULT instead.
-        shapes::PROTO_ID_CLASS | u64::from(class_id),
-        0,
-        super::field_rep::REP_ANY,
-        &[brand],
-        None,
-    ));
+    // The uncarried memo can retire during allocation. Resolve the same facts
+    // through the sole interner with the unpublished receiver rooted.
+    let shape = if shapes::branded_birth_matches(shape, class_id, brand) {
+        shape
+    } else {
+        site.resolve(class_id, brand)
+    };
     let object = owner.get_raw_mut_ptr::<ObjectHeader>();
     unsafe {
         if crate::arena::pointer_in_nursery(object as usize) {
@@ -399,11 +406,19 @@ pub(crate) fn object_alloc_filled_birth(
     // if the allocation moved it. Only scalar identities cross the call.
     // SAFETY: the caller holds the live prototype through its root.
     let proto_id = unsafe { crate::object::shapes::stable_linked_proto_id(0, proto_bits) }?;
+    // The recorded layout is the authority for the newborn's ordinary kind.
+    // Literal-shaped births are marked ordinary; replaying them on an
+    // unmarked cell would invalidate the same final shape on every use.
+    let kind = crate::object::shapes::shape_object_kind_by_id(shape_id)?;
+    if !kind.is_ordinary_layout() {
+        return None;
+    }
     let obj = object_alloc_unpublished(0, count);
     unsafe {
-        // This allocator creates an unmarked class-less object. Recheck the
-        // record AFTER allocation: the collector may have pruned the memo.
-        let kind = crate::object::shapes::ShapeObjectKind::OrdinaryUnmarked;
+        if kind == crate::object::shapes::ShapeObjectKind::Ordinary {
+            crate::object::shapes::store_kind::premark_plain_ordinary(obj);
+        }
+        // Recheck AFTER allocation: the collector may have pruned the memo.
         debug_assert_eq!(
             crate::object::shapes::store_kind::receiver_ordinary_kind(obj),
             kind
@@ -445,7 +460,7 @@ pub(crate) fn object_alloc_unpublished(class_id: u32, field_count: u32) -> *mut 
 
 /// Initialize storage before a birth shape is published. No collection point.
 #[inline(always)]
-unsafe fn init_unpublished(
+pub(super) unsafe fn init_unpublished(
     ptr: *mut ObjectHeader,
     class_id: u32,
     initialized_slots: usize,
@@ -523,4 +538,52 @@ pub extern "C" fn js_object_alloc_fast_with_parent(
     }
 
     ptr
+}
+
+#[cfg(test)]
+mod filled_birth_tests {
+    use super::*;
+
+    #[test]
+    fn replay_uses_recorded_kind_and_validates_prototype_and_width() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let proto = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
+        let other_proto = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
+        let keys = b"first\0second\0third\0";
+        let original = scope.root_raw_mut_ptr(crate::object::js_object_alloc_with_shape(
+            0x0ffe_47,
+            3,
+            keys.as_ptr(),
+            keys.len() as u32,
+        ));
+        let proto_bits = || {
+            proto.with_mut_ptr::<ObjectHeader, _>(|obj| {
+                crate::value::js_nanbox_pointer(obj as i64).to_bits()
+            })
+        };
+        original.with_mut_ptr::<ObjectHeader, _>(|obj| {
+            crate::object::prototype_chain::object_link_created_prototype(
+                obj as usize,
+                proto_bits(),
+            );
+        });
+        let id = original.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
+            crate::object::shapes::object_shape_stamp(obj)
+        });
+        let replay = object_alloc_filled_birth(id, proto_bits(), 3)
+            .expect("a literal's marked ordinary birth shape must replay");
+        let replay = scope.root_raw_mut_ptr(replay);
+        replay.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
+            assert_eq!(crate::object::shapes::object_shape_stamp(obj), id);
+            assert_eq!(
+                crate::object::shapes::store_kind::receiver_ordinary_kind(obj),
+                crate::object::shapes::ShapeObjectKind::Ordinary,
+            );
+        });
+        assert!(object_alloc_filled_birth(id, proto_bits(), 2).is_none());
+        let other_bits = other_proto.with_mut_ptr::<ObjectHeader, _>(|obj| {
+            crate::value::js_nanbox_pointer(obj as i64).to_bits()
+        });
+        assert!(object_alloc_filled_birth(id, other_bits, 3).is_none());
+    }
 }

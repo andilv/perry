@@ -19,7 +19,7 @@
 //! |---|---|
 //! | the box minus `POINTER_TAG << 48 \| 1 MiB` is below `2^47 - 1 MiB` | a heap pointer above the runtime-id band and below `is_valid_obj_ptr`'s 2^47 ceiling (#7396) |
 //! | `([h-8] as i32) & 0x0407_80FF == GC_TYPE_ARRAY` | ONE header word: an ordinary array, not a growth stub, no element descriptors, not frozen / sealed / non-extensible (DESIGN arrayread §3) |
-//! | `index <u capacity`, then the slot is not `TAG_HOLE` | the slot holds an own data property. `[length, capacity)` holds holes (`array_truncate_length`), so this is also `index < length`: the store cannot add an element, change `length`, or reach a prototype setter, which is why the prototype facts are not tested here |
+//! | `index <u capacity`, then an own slot or a hole below length on a pristine prototype chain | an overwrite needs no prototype lookup; a hole fill additionally proves that no inherited indexed property can intercept it |
 //!
 //! A forwarded stub fails the word; the cold arm follows one edge (no binding
 //! to heal for `this.vals[i]`) and requires the destination's word. The
@@ -59,26 +59,7 @@ use super::{
 /// The conversion never feeds `fptosi` an out-of-range or NaN input, which
 /// would be poison.
 pub(super) fn emit_canonical_element_index_i32(ctx: &mut FnCtx<'_>, idx_double: &str) -> String {
-    let blk = ctx.block();
-    let raw_ge_zero = blk.fcmp("oge", idx_double, "0.0");
-    let raw_le_i32_max = blk.fcmp("ole", idx_double, "2147483647.0");
-    let raw_in_range = blk.and(I1, &raw_ge_zero, &raw_le_i32_max);
-    // `fptosi` is poison for NaN/out-of-range input: convert the
-    // range-sanitized value.
-    let safe_raw = blk.select(I1, &raw_in_range, DOUBLE, idx_double, "0.0");
-    let raw_i32 = blk.fptosi(DOUBLE, &safe_raw, I32);
-    let raw_round_trip = blk.sitofp(I32, &raw_i32, DOUBLE);
-    let raw_is_integral = blk.fcmp("oeq", &raw_round_trip, idx_double);
-    let raw_is_canonical = blk.and(I1, &raw_in_range, &raw_is_integral);
-    let bits = blk.bitcast_double_to_i64(idx_double);
-    let top16 = blk.lshr(I64, &bits, "48");
-    let is_boxed_i32 = blk.icmp_eq(I64, &top16, crate::nanbox::INT32_TAG_TOP16_I64);
-    let boxed_i32 = blk.trunc(I64, &bits, I32);
-    let boxed_nonnegative = blk.icmp_sge(I32, &boxed_i32, "0");
-    let boxed_is_canonical = blk.and(I1, &is_boxed_i32, &boxed_nonnegative);
-    let canonical = blk.or(I1, &raw_is_canonical, &boxed_is_canonical);
-    let idx_i32 = blk.select(I1, &is_boxed_i32, I32, &boxed_i32, &raw_i32);
-    blk.select(I1, &canonical, I32, &idx_i32, "-1")
+    super::index_key::normalize(ctx, idx_double, None)
 }
 
 /// The raw-f64 element-kind bits in `_reserved`: `GC_ARRAY_RAW_F64_LAYOUT`
@@ -276,7 +257,11 @@ pub(super) fn emit_guarded_inbounds_array_store_keyed(
     let live_deref_label = ctx.block_label(live_deref_idx);
     let (arr_handle, deref_end) = {
         let blk = ctx.block();
-        let arr_handle = blk.add(I64, &band_offset, "1048576");
+        let arr_handle = blk.add(
+            I64,
+            &band_offset,
+            crate::expr::receiver_range::HANDLE_FLOOR_LITERAL,
+        );
         let word = emit_array_guard_word(blk, &arr_handle);
         let masked = blk.and(I32, &word, ARRAY_STORE_GUARD_MASK_I32);
         let word_ok = blk.icmp_eq(I32, &masked, ARRAY_STORE_GUARD_EXPECT_I32);
@@ -316,7 +301,11 @@ pub(super) fn emit_guarded_inbounds_array_store_keyed(
         // band: never read the destination header speculatively.
         let target_top = blk.lshr(I64, &target, "48");
         let target_top_clear = blk.icmp_eq(I64, &target_top, "0");
-        let target_above_band = blk.icmp_ugt(I64, &target, "1048575");
+        let target_above_band = blk.icmp_ugt(
+            I64,
+            &target,
+            crate::expr::receiver_range::HANDLE_BAND_TOP_LITERAL,
+        );
         let target_ok = blk.and(I1, &target_top_clear, &target_above_band);
         blk.cond_br(&target_ok, &follow_check_label, &slow_label);
         target
@@ -360,8 +349,8 @@ pub(super) fn emit_guarded_inbounds_array_store_keyed(
 
     // The slot must hold a value: an own data property, so the store is a
     // plain overwrite that never consults the prototype chain. A hole (or a
-    // slot past `length`) is an add, which may reach an inherited setter and
-    // may change `length`: the slow arm.
+    // slot past `length`) is an add: admit only holes below length whose
+    // default prototype chain is proven free of indexed properties.
     ctx.current_block = probe_idx;
     let element_addr = {
         let blk = ctx.block();
@@ -372,7 +361,21 @@ pub(super) fn emit_guarded_inbounds_array_store_keyed(
         let element_ptr = blk.inttoptr(I64, &element_addr);
         let old = blk.load(I64, &element_ptr);
         let is_hole = blk.icmp_eq(I64, &old, crate::nanbox::TAG_HOLE_I64);
-        blk.cond_br(&is_hole, &slow_label, &fast_label);
+        let hole_idx = ctx.new_block(&format!("{}.hole", block_prefix));
+        let hole_label = ctx.block_label(hole_idx);
+        ctx.block().cond_br(&is_hole, &hole_label, &fast_label);
+        ctx.current_block = hole_idx;
+        // Adding an element below length needs no length update, but unlike
+        // an own-slot overwrite it must prove the prototype cannot intercept.
+        let blk = ctx.block();
+        let arr_ptr = blk.inttoptr(I64, &live_handle);
+        let length = blk.load(I32, &arr_ptr);
+        let within_length = blk.icmp_ult(I32, idx_i32, &length);
+        let reserved = emit_array_reserved(blk, &live_handle);
+        let default_chain =
+            super::array_proto_guard::emit_array_default_prototype_chain(blk, &reserved);
+        let can_fill = blk.and(I1, &within_length, &default_chain);
+        blk.cond_br(&can_fill, &fast_label, &slow_label);
         element_addr
     };
 

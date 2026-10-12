@@ -351,3 +351,144 @@ fn region_consumes_keyed_absent_and_inherited_entries() {
         "non-numeric data refuses before operators"
     );
 }
+
+#[test]
+fn keyed_runtime_string_identity_reuses_the_published_atom_proof() {
+    if !super::super::super::run_with_fresh_worker_gate(
+        "keyed_runtime_string_identity_reuses_the_published_atom_proof",
+    ) {
+        return;
+    }
+    let _lock = crate::gc::global_side_table_test_lock();
+    let scope = RuntimeHandleScope::new();
+    let name = b"runtimeAliasAnswer";
+    let key = scope.root_nanbox_f64(atom(name));
+    let alias = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    let alias = scope.root_nanbox_f64(f64::from_bits(crate::value::STRING_TAG | alias as u64));
+    assert_ne!(alias.get_nanbox_u64(), key.get_nanbox_u64());
+    let proto = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 4));
+    put(&proto, key.get_nanbox_f64(), 17.0);
+    let o = inheriting(&scope, &proto);
+    let mut slot = std::ptr::null_mut();
+    assert_eq!(read(&mut slot, &o, key.get_nanbox_f64()), 17.0);
+    assert_eq!(hit(slot, &o, alias.get_nanbox_f64()), None, "identity miss");
+    assert_eq!(read(&mut slot, &o, alias.get_nanbox_f64()), 17.0);
+    put(&proto, key.get_nanbox_f64(), 18.0);
+    assert_eq!(read(&mut slot, &o, alias.get_nanbox_f64()), 18.0);
+    put(&o, key.get_nanbox_f64(), 21.0);
+    assert_eq!(read(&mut slot, &o, alias.get_nanbox_f64()), 21.0);
+    o.with_mut_ptr(|p| {
+        crate::object::js_object_delete_field(
+            p,
+            (key.get_nanbox_u64() & crate::value::POINTER_MASK) as *const crate::StringHeader,
+        )
+    });
+    assert_eq!(read(&mut slot, &o, alias.get_nanbox_f64()), 18.0);
+    proto.with_mut_ptr(|p| {
+        crate::object::js_object_delete_field(
+            p,
+            (key.get_nanbox_u64() & crate::value::POINTER_MASK) as *const crate::StringHeader,
+        )
+    });
+    assert_eq!(
+        read(&mut slot, &o, alias.get_nanbox_f64()).to_bits(),
+        crate::value::TAG_UNDEFINED,
+        "negative control: canonical identity must not preserve a deleted lane"
+    );
+}
+
+#[test]
+fn keyed_position_uses_public_namespace_and_most_derived_slot() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let _no_move = crate::gc::GcSuppressScope::new();
+    unsafe {
+        let key = atom(b"shadowed");
+        let keys = crate::array::js_array_alloc_key_list(4, false);
+        let keys = crate::array::js_array_push(keys, crate::JSValue::from_bits(key.to_bits()));
+        let keys = crate::array::js_array_push(keys, crate::JSValue::from_bits(key.to_bits()));
+        let keys = crate::object::key_attrs::ensure_owned_attrs(keys, 2);
+        let k = KeyRef::Name {
+            word: key.to_bits(),
+            bytes: b"shadowed",
+        };
+        assert_eq!(k.position(keys, 2), Some(1), "derived declaration wins");
+        let attrs = crate::object::key_attrs::keys_attrs(keys);
+        crate::object::key_attrs::attrs_set_owned(
+            keys,
+            attrs,
+            1,
+            crate::object::key_attrs::PRIVATE_FIELD_ENTRY,
+        );
+        assert_eq!(
+            k.position(keys, 2),
+            Some(0),
+            "private spelling is not a property"
+        );
+        crate::object::key_attrs::attrs_set_owned(
+            keys,
+            attrs,
+            0,
+            crate::object::key_attrs::PRIVATE_FIELD_ENTRY,
+        );
+        assert_eq!(
+            k.position(keys, 2),
+            None,
+            "negative control hides both entries"
+        );
+    }
+}
+
+#[test]
+fn rematerialized_names_reuse_the_traced_site_key_after_movement() {
+    if !super::super::super::run_with_fresh_worker_gate(
+        "rematerialized_names_reuse_the_traced_site_key_after_movement",
+    ) {
+        return;
+    }
+    let _copying = crate::gc::CopyingNurseryTestGuard::new(0);
+    crate::gc::register_runtime_handle_root_scanner_for_tests();
+    crate::gc::gc_register_mutable_root_scanner(super::super::scan_read_holder_roots_mut);
+    crate::gc::gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+    let scope = RuntimeHandleScope::new();
+    let object = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 4));
+    let bytes = b"retained-dynamic-key";
+    let make = || {
+        crate::value::js_nanbox_string(crate::string::js_string_from_bytes(
+            bytes.as_ptr(),
+            bytes.len() as u32,
+        ) as i64)
+    };
+    let mut slot = std::ptr::null_mut();
+    {
+        let initial_scope = RuntimeHandleScope::new();
+        let key = initial_scope.root_nanbox_f64(make());
+        put(&object, key.get_nanbox_f64(), 17.0);
+        assert_eq!(read(&mut slot, &object, key.get_nanbox_f64()), 17.0);
+    }
+    assert!(!slot.is_null(), "the site must publish a real proof");
+    let before = unsafe { (*slot).entries[0].identity_key };
+    crate::gc::gc_collect_minor();
+    let retained = unsafe { (*slot).entries[0].identity_key };
+    assert_ne!(before, retained, "the site's rooted key must actually move");
+    for i in 0..40 {
+        crate::string::discard_weak_interns();
+        let fresh = make();
+        assert_ne!(fresh.to_bits(), retained);
+        assert_eq!(read(&mut slot, &object, fresh), 17.0);
+        assert_eq!(
+            unsafe { (*slot).evictions },
+            0,
+            "equal names must not consume ways"
+        );
+        if i % 8 == 7 {
+            crate::gc::gc_collect_minor();
+        }
+    }
+    let key = make();
+    put(&object, key, 18.0);
+    assert_eq!(
+        read(&mut slot, &object, make()),
+        18.0,
+        "values still come from the live receiver"
+    );
+}

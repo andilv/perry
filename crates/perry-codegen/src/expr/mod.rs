@@ -148,13 +148,12 @@ pub(crate) use channel::{
 };
 pub(crate) use collection_receiver::unbox_collection_receiver;
 pub(crate) use helpers::{
-    array_or_sso_index_get, array_store_needs_layout_note, array_store_needs_write_barrier,
-    buffer_alias_metadata_suffix, class_field_store_needs_string_addref,
-    emit_all_pointer_array_declaration, emit_string_addref_if_heap_string,
-    expr_has_numeric_pointer_free_array_layout, expr_produces_fresh_heap_allocation,
-    expr_produces_non_pointer_bits_by_construction, is_global_this_builtin_name,
-    lower_expr_with_expected_type, lower_js_args_array, store_needs_string_addref,
-    unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
+    array_store_needs_layout_note, array_store_needs_write_barrier, buffer_alias_metadata_suffix,
+    class_field_store_needs_string_addref, emit_all_pointer_array_declaration,
+    emit_string_addref_if_heap_string, expr_has_numeric_pointer_free_array_layout,
+    expr_produces_fresh_heap_allocation, expr_produces_non_pointer_bits_by_construction,
+    is_global_this_builtin_name, lower_expr_with_expected_type, lower_js_args_array,
+    store_needs_string_addref, unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
     can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
@@ -406,6 +405,8 @@ pub(crate) struct FnCtx<'a> {
     /// class. Class-keyed lowering must therefore ignore `local_types` for
     /// these ids and use runtime dispatch (#6906).
     pub reassigned_locals: std::collections::HashSet<u32>,
+    /// Compiler-only complete writer values for index-producing local aliases.
+    pub index_alias_writers: std::collections::HashMap<u32, Vec<Expr>>,
     /// Immutable locals whose initializer is a string literal. These values
     /// can be resolved to the module's interned string global at a use site;
     /// unlike a runtime dynamic-key cache, this does not retain a movable
@@ -769,6 +770,8 @@ pub(crate) struct FnCtx<'a> {
     /// raw helpers. Public and dynamically dispatched closure bodies keep the
     /// defensive runtime registry validation.
     pub trusted_box_captures: bool,
+    /// Only the transformed synchronous resume body owns direct mutable state captures.
+    pub fixed_generator_state: bool,
     /// Stack context supplied only to a compiler-private versioned-loop
     /// callback clone. Its cold arms record the exact resume index and poison
     /// the caller's private counter before executing observable fallback code.
@@ -793,13 +796,10 @@ pub(crate) struct FnCtx<'a> {
     /// native constructor lowering read `const init = {...}; new Request(url,
     /// init)` with the same field extractor used for inline object literals.
     pub option_object_locals: std::collections::HashMap<u32, Vec<(String, Expr)>>,
-    /// LocalIds of immutable locals provably initialized from an object
-    /// literal (`const o = { … }`, including method-bearing literals that
-    /// lower to an object-building IIFE). #5271: a builtin-named method on
-    /// such a receiver (`o.trim()`, joi's `internals.trim(v, s)`) is the
-    /// object's OWN method, never `String.prototype.<m>` — so the static
-    /// String-method fast path must NOT claim it even when the call's arity
-    /// happens to match the String builtin.
+    /// Immutable locals initialized directly by an ordinary object allocation
+    /// (literal, spread, or a completely proven literal constructor). This
+    /// structural provenance excludes factory return
+    /// overrides and array-growth forwarding; it is not an erased type claim.
     pub object_literal_locals: std::collections::HashSet<u32>,
 
     // ── Cross-module import plumbing (Phase F) ──────────────────────
@@ -3106,6 +3106,7 @@ impl<'a> FnCtx<'a> {
 // Issue #1098 phase 2: lower_expr arm-bodies extracted into
 // per-chunk sibling modules. The dispatch in `lower_expr` below routes each
 // variant to its module's `lower(ctx, expr)` helper.
+mod array_append;
 mod array_methods;
 pub(crate) mod array_pop;
 mod array_push;
@@ -3123,6 +3124,7 @@ pub(crate) mod class_field_push;
 pub(crate) mod class_first_evaluation;
 mod closure;
 mod compare;
+pub(crate) use compare::ordinary_object_allocation;
 pub(crate) mod region_guard;
 pub(crate) mod region_read_run;
 pub(crate) use compare::lower_string_literal_strict_eq;
@@ -3137,6 +3139,7 @@ mod fs_await;
 #[cfg(test)]
 mod hit_path_tests;
 mod index_get;
+mod index_key;
 #[cfg(test)]
 mod index_get_claim_tests;
 pub(crate) mod masked_window;
@@ -3182,6 +3185,7 @@ pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
 pub(crate) mod class_field_inline_guard;
 pub(crate) mod element_shape_guard;
 pub(crate) mod element_shape_reads;
+mod generator_control_slots;
 pub(crate) mod ic_fast_split;
 mod js_runtime;
 mod literals_vars;
@@ -3199,6 +3203,7 @@ pub(crate) mod os_uri_dates;
 pub(crate) mod private_field_site;
 pub(crate) mod property_get;
 pub(crate) mod property_set;
+mod named_accessor;
 pub(crate) mod proxy_reflect;
 pub(crate) mod put_value_store_ic;
 pub(crate) mod receiver_range;
@@ -3557,14 +3562,19 @@ pub(crate) fn try_lower_proven_boolean_to_number(
 }
 
 pub(crate) fn is_compiler_private_async_i32_control_local(ctx: &FnCtx<'_>, id: u32) -> bool {
-    ctx.boxed_vars.contains(&id) && ctx.compiler_private_async_i32_control_locals.contains(&id)
+    (ctx.boxed_vars.contains(&id) || generator_control_slots::is_fixed(ctx, id))
+        && ctx.compiler_private_async_i32_control_locals.contains(&id)
 }
 
 pub(crate) fn is_compiler_private_async_i1_control_local(ctx: &FnCtx<'_>, id: u32) -> bool {
-    ctx.boxed_vars.contains(&id) && ctx.compiler_private_async_i1_control_locals.contains(&id)
+    (ctx.boxed_vars.contains(&id) || generator_control_slots::is_fixed(ctx, id))
+        && ctx.compiler_private_async_i1_control_locals.contains(&id)
 }
 
 pub(crate) fn load_boxed_local_pointer(ctx: &mut FnCtx<'_>, id: u32) -> Result<Option<String>> {
+    if generator_control_slots::is_fixed(ctx, id) {
+        return generator_control_slots::address(ctx, id).map(Some);
+    }
     // A scoped binding's cell is its slot inside the scope object.
     if let Some((slot, base)) = crate::scope_env::access::load_base(ctx, id)? {
         return Ok(Some(crate::scope_env::access::cell_addr(ctx, slot, &base)));
@@ -3697,7 +3707,7 @@ fn lower_async_i32_control_const_compare(
     let Some(ptr) = load_boxed_local_pointer(ctx, id)? else {
         return Ok(None);
     };
-    let value = load_async_i32_control_cell(ctx, &ptr);
+    let value = generator_control_slots::load_i32(ctx, id, &ptr);
     let constant_s = constant.to_string();
     let (lhs, rhs) = if local_on_left {
         (value.as_str(), constant_s.as_str())
@@ -4323,7 +4333,7 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
             let Some(ptr) = load_boxed_local_pointer(ctx, *id)? else {
                 return Ok(None);
             };
-            let value = load_async_i32_control_cell(ctx, &ptr);
+            let value = generator_control_slots::load_i32(ctx, *id, &ptr);
             let lowered = LoweredValue::i32(value);
             ctx.record_lowered_value(
                 "LocalGet",
@@ -4343,7 +4353,7 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
             let Some(ptr) = load_boxed_local_pointer(ctx, *id)? else {
                 return Ok(None);
             };
-            let value = load_async_i1_control_cell(ctx, &ptr);
+            let value = generator_control_slots::load_i1(ctx, *id, &ptr);
             let lowered = LoweredValue::i1(value);
             ctx.record_lowered_value(
                 "LocalGet",
@@ -4430,7 +4440,7 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
                 return Ok(None);
             };
             let value_i32 = lower_i32_control_store_value(ctx, value)?;
-            store_async_i32_control_cell(ctx, &ptr, &value_i32);
+            generator_control_slots::store_i32(ctx, *id, &ptr, &value_i32)?;
             record_native_arena_owner_assignment(ctx, *id, value.as_ref());
             record_int_facts_for_local_set(ctx, *id, value);
             let lowered = LoweredValue::i32(value_i32);
@@ -4455,7 +4465,7 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
                 return Ok(None);
             };
             let value_i1 = lower_i1_control_store_value(ctx, value)?;
-            store_async_i1_control_cell(ctx, &ptr, &value_i1);
+            generator_control_slots::store_i1(ctx, *id, &ptr, &value_i1)?;
             record_native_arena_owner_assignment(ctx, *id, value.as_ref());
             let lowered = LoweredValue::i1(value_i1);
             ctx.record_lowered_value(

@@ -45,7 +45,7 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                 // undefined/null tag or null pointer — return undefined
                 return JSValue::undefined();
             }
-            // Issue #340: small-handle receivers (raw < 0x100000) come
+            // Issue #340: small-handle receivers (raw < HANDLE_BAND_MAX) come
             // from native modules (axios, fastify, ...) that
             // store objects in registries and expose integer ids. The
             // handle property dispatcher (registered by stdlib via
@@ -149,7 +149,12 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
             let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
             if let Ok(name_str) = std::str::from_utf8(key_bytes) {
                 if crate::closure::closure_is_key_deleted(obj as usize, name_str) {
-                    return JSValue::undefined();
+                    // Deleting an own shadow revokes that slot, not the
+                    // inherited property. Use the same closure Get as value
+                    // reads so MethodSite observes the actual prototype.
+                    return JSValue::from_bits(
+                        crate::closure::closure_get_dynamic_prop(obj as usize, name_str).to_bits(),
+                    );
                 }
                 // ECMAScript "poison pill": reading `caller` / `arguments` off a
                 // strict-mode function throws a TypeError (the %ThrowTypeError%
@@ -251,9 +256,10 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                     return JSValue::number(length.unwrap_or(0) as f64);
                 }
                 if name_str == "name" {
-                    let func_ptr = (*(obj as *const crate::closure::ClosureHeader)).code() as usize;
-                    let fname =
-                        crate::builtins::function_name_for_ptr(func_ptr).unwrap_or_default();
+                    let fname = crate::builtins::function_name_for_closure(
+                        obj as *const crate::closure::ClosureHeader,
+                    )
+                    .unwrap_or_default();
                     let s = crate::string::js_string_from_bytes(fname.as_ptr(), fname.len() as u32);
                     return JSValue::from_bits(crate::js_nanbox_string(s as i64).to_bits());
                 }
@@ -715,10 +721,10 @@ pub(super) fn get_field_by_name_object_tail_with_kind(
                     // `[Function: <name>]` formatter uses); anonymous functions
                     // read back `""`, matching Node, not `undefined`.
                     if name_str == "name" {
-                        let func_ptr =
-                            (*(obj as *const crate::closure::ClosureHeader)).code() as usize;
-                        let fname =
-                            crate::builtins::function_name_for_ptr(func_ptr).unwrap_or_default();
+                        let fname = crate::builtins::function_name_for_closure(
+                            obj as *const crate::closure::ClosureHeader,
+                        )
+                        .unwrap_or_default();
                         let s =
                             crate::string::js_string_from_bytes(fname.as_ptr(), fname.len() as u32);
                         return JSValue::from_bits(crate::js_nanbox_string(s as i64).to_bits());

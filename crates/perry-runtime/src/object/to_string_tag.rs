@@ -4,11 +4,9 @@
 use super::*;
 
 pub(crate) fn web_stream_to_string_tag(value: f64) -> Option<&'static str> {
-    if !value.is_finite() || value <= 0.0 || value.fract() != 0.0 {
-        return None;
-    }
+    let id = stream_handle_id(value)?;
     let kind_probe = stream_handle_kind_probe()?;
-    match unsafe { kind_probe(value as usize) } {
+    match unsafe { kind_probe(id) } {
         1 => Some("ReadableStream"),
         2 => Some("WritableStream"),
         5 => Some("TransformStream"),
@@ -384,7 +382,7 @@ pub unsafe extern "C" fn js_object_to_string(value: f64) -> f64 {
     // Heap-allocated pointers: discriminate Array / Error from generic
     // Object via the GC header type byte.
     //
-    // A handle-band value (`< 0x100000`: Web Fetch `Headers`/`Request`/
+    // A handle-band value (`< 0x200000`: Web Fetch `Headers`/`Request`/
     // `Response`/`Blob` ids, net/http small handles, …) is a registry id, NOT a
     // heap pointer. It reaches here when the SDK coerces such a handle to a
     // string — e.g. an implicit `ToString(headers)` while assembling a request —

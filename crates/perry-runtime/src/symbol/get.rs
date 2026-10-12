@@ -139,6 +139,7 @@ impl OwnSymbolSlot {
     }
 }
 
+mod generator;
 mod own;
 pub(crate) use own::own_symbol_slot;
 
@@ -573,11 +574,9 @@ unsafe fn symbol_prototype_word(owner: usize) -> Option<u64> {
 }
 
 unsafe fn web_stream_symbol_property(obj_f64: f64, sym_f64: f64) -> Option<f64> {
-    if !obj_f64.is_finite() || obj_f64 <= 0.0 || obj_f64.fract() != 0.0 {
-        return None;
-    }
+    let id = crate::object::stream_handle_id(obj_f64)?;
     let kind_probe = crate::object::stream_handle_kind_probe()?;
-    let kind = kind_probe(obj_f64 as usize);
+    let kind = kind_probe(id);
     if kind == 0 {
         return None;
     }
@@ -821,7 +820,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
         if sym_key != 0 && (!crate::symbol::is_well_known_symbol(sym_key) || !is_proto_ref_receiver)
         {
             let is_proto_ref = is_proto_ref_receiver;
-            if let Some((func_ptr, param_count, has_rest)) =
+            if let Some((func_ptr, param_count, has_rest, _entry)) =
                 crate::object::lookup_class_symbol_method_in_chain(class_id, sym_key, !is_proto_ref)
             {
                 return crate::object::build_symbol_bound_method_closure(
@@ -888,9 +887,9 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
         }
         return f64::from_bits(TAG_UNDEFINED);
     }
-    // #1545: Web Stream handles are normal finite numbers, not heap objects.
-    // Resolve their well-known symbol surface before pointer-oriented fallback
-    // paths reinterpret the raw f64 bits as an address. ReadableStream is
+    // #1545: Web Stream handles are registry ids, not heap objects. Resolve
+    // their well-known symbol surface before pointer-oriented fallback paths
+    // treat the payload as an address. ReadableStream is
     // async-iterable only; none of the Web Stream handles expose
     // `Symbol.iterator`.
     if let Some(v) = web_stream_symbol_property(obj_f64, sym_f64) {
@@ -1081,6 +1080,15 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
                     // absent entry can then mean the configurable property was
                     // deleted, rather than being silently resurrected here.
                     if crate::object::class_has_symbol_member_in_chain(class_id, sym_key, false) {
+                        if let Some(value) = generator::explicit_generator_method(
+                            class_id,
+                            sym_key,
+                            obj_f64,
+                            sym_f64,
+                            receiver_f64,
+                        ) {
+                            return value;
+                        }
                         let _ = crate::object::class_decl_prototype_value(class_id);
                         if let Some(v) = declared_prototype_chain_symbol(
                             obj_f64,
@@ -1155,7 +1163,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
                     if !crate::symbol::is_well_known_symbol(sym_key)
                         || !well_known_symbol_has_instance_method_slot(sym_key)
                     {
-                        if let Some((func_ptr, param_count, has_rest)) =
+                        if let Some((func_ptr, param_count, has_rest, _entry)) =
                             crate::object::lookup_class_symbol_method_in_chain(
                                 class_id, sym_key, false,
                             )

@@ -556,11 +556,11 @@ pub(crate) fn rebind_explicit_this(target: f64, this_arg: f64) -> f64 {
     }
     let bits = target.to_bits();
     let ptr = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
-    // Reject the `[0, 0x100000)` native-handle band BEFORE probing the pointer:
+    // Reject the native-handle band BEFORE probing the pointer:
     // Fetch/http/axios/fastify ids (`0x40000+`) are NaN-boxed with POINTER_TAG
     // but are not heap pointers — `closure_is_arrow` (and the downstream
     // `clone_closure_rebind_this`) would dereference one and SIGSEGV (#4740).
-    if ptr < 0x100000 {
+    if crate::value::addr_class::is_handle_band(ptr) {
         return target;
     }
     // Arrows capture lexical `this`; an explicit receiver must not override it.
@@ -589,8 +589,7 @@ unsafe fn bound_target_declared_name(target_value: f64) -> String {
     if target_jv.is_pointer() {
         let target_closure = target_jv.as_pointer::<ClosureHeader>();
         if !target_closure.is_null() && is_closure_ptr(target_closure as usize) {
-            return crate::builtins::function_name_for_ptr((*target_closure).code() as usize)
-                .unwrap_or_default();
+            return crate::builtins::function_name_for_closure(target_closure).unwrap_or_default();
         }
         return String::new();
     }
@@ -738,9 +737,10 @@ pub unsafe extern "C" fn js_function_bind(
             // The same birth-shape metadata proof used by the observable
             // path below, before any roots, receiver probes or allocations.
             // Object receivers also need no boxing for ordinary bodies.
-            if info.as_ref().is_some_and(|info| {
-                info.flags & crate::codegen_abi::FN_COMPILED_BODY != 0
-            }) && (*closure).shape_id == crate::closure::shape::birth_shape_for_body(info)
+            if info
+                .as_ref()
+                .is_some_and(|info| info.flags & crate::codegen_abi::FN_COMPILED_BODY != 0)
+                && (*closure).shape_id == crate::closure::shape::birth_shape_for_body(info)
             {
                 let receiver = if args_len == 0 || args_ptr.is_null() {
                     crate::value::TAG_UNDEFINED
@@ -760,7 +760,8 @@ pub unsafe extern "C" fn js_function_bind(
                 // The fixed birth shares the nursery bump and collecting
                 // installer, and roots only when that bump refuses.
                 let bound = crate::closure::alloc::closure_alloc_bound_function(
-                    target_value.to_bits(), receiver,
+                    target_value.to_bits(),
+                    receiver,
                 );
                 crate::gc::runtime_write_barrier_root_raw_ptr(bound);
                 return f64::from_bits(JSValue::pointer(bound as *mut u8).bits());

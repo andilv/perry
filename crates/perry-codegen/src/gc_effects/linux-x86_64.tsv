@@ -46,6 +46,9 @@ js_argon2_verify	Reenters
 js_argon2_verify_sync	Reenters
 js_arguments_bundle_get_slow	Reenters
 js_arguments_bundle_index_get	Reenters
+js_arguments_call_spread	Reenters
+js_arguments_forward_apply	Reenters
+js_arguments_length_value	Reenters
 js_arguments_object_alloc	Reenters
 js_arguments_object_alloc_mapped	Reenters
 js_arguments_object_map_index	Reenters
@@ -53,6 +56,7 @@ js_array_alloc	Reenters
 js_array_alloc_literal	Reenters
 js_array_alloc_with_length	Reenters
 js_array_alloc_with_length_longlived	Reenters
+js_array_append_set	Reenters
 js_array_at	Reenters
 js_array_buffer_new	Reenters
 js_array_buffer_new_value	Reenters
@@ -324,6 +328,7 @@ js_aux_has_active	Reenters
 js_await_any_promise	Leaf
 js_await_js_promise	Reenters
 js_await_loop_tick_timers	Reenters
+js_back_hot_text	Leaf
 js_bcrypt_compare	Reenters
 js_bcrypt_compare_sync	Reenters
 js_bcrypt_gen_salt	Reenters
@@ -643,9 +648,12 @@ js_clear_immediate_value	Reenters
 js_clear_interval_value	Reenters
 js_clear_timeout_value	Reenters
 js_closure_alloc	Reenters
+js_closure_alloc_empty	Reenters
+js_closure_alloc_fixed	Reenters
 js_closure_alloc_init	Reenters
 js_closure_alloc_init_boxed	Reenters
 js_closure_alloc_singleton	Reenters
+js_closure_alloc_small	Reenters
 js_closure_alloc_with_captures_singleton	Reenters
 js_closure_call0	Reenters
 js_closure_call1	Reenters
@@ -1372,6 +1380,9 @@ js_gc_write_barriers_emitted	Leaf
 js_ge	Reenters
 js_generator_attach_closure_prototype	Reenters
 js_generator_attach_prototype	Reenters
+js_generator_create	Reenters
+js_generator_set_slot	Leaf
+js_generator_result	Reenters
 js_get_async_iterator	Reenters
 js_get_cjs_main_module	Reenters
 js_get_current_step_closure	Reenters
@@ -2146,6 +2157,8 @@ js_object_literal_infer_computed_function_name	Reenters
 js_object_literal_set_computed	Reenters
 js_object_literal_set_prototype	Reenters
 js_object_literal_spread	Reenters
+js_object_spread_fresh	Reenters
+js_object_spread_fresh_leading	Reenters
 js_object_literal_to_property_key	Reenters
 js_object_live_slot_count	Leaf
 js_object_lookup_getter	Reenters
@@ -3178,6 +3191,7 @@ js_string_end_index_to_i32	Reenters
 js_string_ends_with	Leaf
 js_string_ends_with_at	Leaf
 js_string_equals	Leaf
+js_string_equals_value	Reenters
 js_string_error	Leaf
 js_string_fixed	Reenters
 js_string_fontcolor	Reenters

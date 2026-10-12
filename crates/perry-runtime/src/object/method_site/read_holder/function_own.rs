@@ -63,6 +63,7 @@ pub(super) unsafe fn answer(c: &PicCache, recv: *const ObjectHeader, token: i64)
 #[inline(never)]
 unsafe fn scan_answer(c: &PicCache, recv: *const ObjectHeader, token: i64) -> Option<u64> {
     entry_answer(holder_words(c), recv, token)
+        .or_else(|| super::exotic_read::function_answer(c, recv))
         .or_else(|| class_read::function_bag_answer(c, recv, token))
 }
 
@@ -243,9 +244,7 @@ pub(super) unsafe fn prime(
     }
     let slot = if slot < shape.live_inline_slot_count {
         slot
-    } else if (slot as usize) < crate::object::spill::SPILL_MAX_FIELD_INDEX
-        && crate::object::spill::object_spill_enabled()
-    {
+    } else if (slot as usize) < crate::object::spill::SPILL_MAX_FIELD_INDEX {
         slot | HOLDER_SLOT_SPILL
     } else {
         return None;
@@ -418,6 +417,8 @@ mod tests {
                 Some(crate::value::TAG_UNDEFINED)
             );
             assert_eq!(prime_alias(b, key, &mut slot), Some(11.0));
+            assert_eq!(cache[HOLDER_KIND] as u64 & HOLDER_ACCESSOR, 0);
+            let primes = super::super::PRIMES_HOLDER.load(Ordering::Relaxed);
             for _ in 0..8 {
                 let token = (u64::from(object_shape_stamp(a)) | PIC_ID_TOKEN_BIT) as i64;
                 assert_eq!(class_read::leaf_answer(&cache, a, token), None);
@@ -427,7 +428,31 @@ mod tests {
                     "a saved own undefined slot must forward without priming again"
                 );
                 assert_eq!(try_alias_cached_accessor(b, key, &mut slot), Some(11.0));
+                assert_eq!(
+                    crate::object::field_get_set::js_object_get_field_ic_slow(
+                        a as i64,
+                        key,
+                        &mut slot,
+                        std::ptr::null(),
+                    )
+                    .to_bits(),
+                    crate::value::TAG_UNDEFINED,
+                );
+                assert_eq!(
+                    crate::object::field_get_set::js_object_get_field_ic_slow(
+                        b as i64,
+                        key,
+                        &mut slot,
+                        std::ptr::null(),
+                    ),
+                    11.0,
+                );
             }
+            assert_eq!(
+                super::super::PRIMES_HOLDER.load(Ordering::Relaxed),
+                primes,
+                "the shared read entry must consume non-accessor alias proofs without re-priming"
+            );
         }
     }
 

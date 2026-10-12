@@ -438,15 +438,13 @@ fn pic_cache_layout_matches_runtime() {
              fills on the first prime (#9708), got:\n{def}\n\nIR:\n{ir}"
         );
     }
-    // The full cache is the runtime's to dereference: the site hands the slot's
-    // ADDRESS to the miss front and the slow entry, which test it for null
-    // (`read_confirm::tests::the_front_answers_a_way_and_declines_a_null_cache`,
-    // `ic_slow::tests::an_unresolved_cache_slot_is_never_dereferenced`). A
-    // site that loaded the slot itself would have to prove it non-null first.
+    // Allocation remains lazy. Only the token-miss accessor candidate reads
+    // the slot, and its null guard dominates the holder-kind dereference.
     assert!(
-        !ir.contains("load ptr, ptr @perry_ic_"),
-        "the site must not dereference the full-cache slot:\n{ir}"
+        ir.matches("load ptr, ptr @perry_ic_").count() == 1,
+        "only the accessor candidate may inspect the lazy slot:\n{ir}"
     );
+    verify_accessor_arm(&tower_blocks(&ir)).unwrap_or_else(|e| panic!("{e}\n{ir}"));
     let front = ir
         .lines()
         .find(|l| l.contains(" = call double @js_object_get_field_ic_front("))
@@ -615,9 +613,9 @@ fn generic_property_get_tries_ways_before_calling_the_miss_handler() {
         .collect();
     assert!(
         preds.contains(&front_label)
-            && preds
-                .iter()
-                .all(|p| *p == front_label || p.starts_with("pget.recv_")),
+            && preds.iter().all(|p| *p == front_label
+                || p.starts_with("pget.recv_")
+                || p.starts_with("pic.acc.kind.")),
         "the slow call is reached from the front's decline or a receiver \
          failure only: {preds:?}"
     );
@@ -796,11 +794,13 @@ fn cached_slot_bound_comes_from_the_shape_descriptor_match() {
 /// the first matching way (at most one way holds a given token —
 /// `pic_prime_get` evicts a duplicate before writing one, and an empty way's 0
 /// cannot match), so there is no reduction left at all. Pin that the site
-/// expands none: no `pic.ways` block and no `select` anywhere in the tower.
+/// expands none: no `pic.ways` block and no integer-slot `select` in the tower.
+/// Accessor storage validation stays in the shared runtime consumer.
 #[test]
 fn way_slot_reduction_is_not_expanded_per_site() {
     let ir = emit(false, None);
     let blocks = tower_blocks(&ir);
+    verify_accessor_arm(&blocks).unwrap();
     for (label, body) in &blocks {
         assert!(
             !label.starts_with("pic.way"),
@@ -808,7 +808,7 @@ fn way_slot_reduction_is_not_expanded_per_site() {
         );
         if label.starts_with("pic.") || label.starts_with("pget.") {
             assert!(
-                !body.iter().any(|l| l.contains(" = select ")),
+                !body.iter().any(|l| { l.contains(" = select ") }),
                 "no way reduction may be expanded per site, found a select in \
                  {label}: {body:?}"
             );
@@ -1153,16 +1153,16 @@ fn generic_property_get_slot_load_is_reached_only_through_every_guard() {
     }
 
     for (needle, what) in [
-        // The fused receiver test: `bits - (POINTER_TAG | 0x10_0000)`
-        // compared unsigned below `2^48 - 0x10_0000` — the tag test and the
+        // The fused receiver test: `bits - (POINTER_TAG | 0x20_0000)`
+        // compared unsigned below `2^48 - 0x20_0000` — the tag test and the
         // small-handle test in one compare.
         (
             crate::expr::receiver_range::RECEIVER_BIAS_LITERAL,
-            "the fused receiver test's bias (POINTER_TAG | 0x10_0000)",
+            "the fused receiver test's bias (POINTER_TAG | 0x20_0000)",
         ),
         (
             crate::expr::receiver_range::RECEIVER_SPAN_LITERAL,
-            "the fused receiver test's span (2^48 - 0x10_0000)",
+            "the fused receiver test's span (2^48 - 0x20_0000)",
         ),
         ("@perry_ic_", "the per-site cached shape-token compare"),
     ] {
@@ -1335,8 +1335,8 @@ fn generic_non_length_read_keeps_the_whole_tower() {
     // The receiver test is the one test that decides whether the receiver
     // may be dereferenced at all, and for every key but `.length` it is the
     // fused range compare (`receiver_range`): POINTER tag AND a payload above
-    // the native-handle band, spelled `bits - (POINTER_TAG | 0x10_0000) <u
-    // 2^48 - 0x10_0000`. Its false edge must be the NON-POINTER exit — a
+    // the native-handle band, spelled `bits - (POINTER_TAG | 0x20_0000) <u
+    // 2^48 - 0x20_0000`. Its false edge must be the NON-POINTER exit — a
     // distinct block with a distinct callee, which is what stops SimplifyCFG
     // folding this guard into the next one.
     let branch = ir
@@ -1367,7 +1367,7 @@ fn generic_non_length_read_keeps_the_whole_tower() {
                 ", {}",
                 crate::expr::receiver_range::RECEIVER_BIAS_LITERAL
             )),
-        "the biased value must be `bits - (POINTER_TAG | 0x10_0000)`:\n{ir}"
+        "the biased value must be `bits - (POINTER_TAG | 0x20_0000)`:\n{ir}"
     );
     // A small native handle fails the fused test too. It must still reach the
     // OBJECT exit (its registry dispatch lives in the slow entry), split off in
@@ -1592,10 +1592,10 @@ fn compact_get_mru_is_atomic_and_full_cache_remains_lazy() {
         "the compact word must not be tested against zero:\n{ir}"
     );
     assert!(
-        !ir.contains("load ptr, ptr @perry_ic_"),
-        "the full cache stays lazy: the site never dereferences its slot (the \
-         front and the slow entry null-test it): {ir}"
+        ir.matches("load ptr, ptr @perry_ic_").count() == 1,
+        "the full cache stays lazy, with one bounded accessor candidate: {ir}"
     );
+    verify_accessor_arm(&tower_blocks(&ir)).unwrap_or_else(|e| panic!("{e}\n{ir}"));
 }
 
 /// T1: per untyped `obj.prop` the emitted tower is a bounded handful of blocks
@@ -1718,13 +1718,7 @@ fn the_generic_tower_is_one_leaf_call_two_exits_and_a_bounded_number_of_blocks()
         // the front: the shared guard program declines to the front, and the direct
         // getter call (`verify_accessor_arm` pins the chain).
         "pic.acc.empty",
-        "pic.acc.cache",
-        "pic.acc.recv",
         "pic.acc.kind",
-        "pic.acc.holder",
-        "pic.acc.lane",
-        "pic.acc.inline",
-        "pic.acc.call",
     ];
     // Labels carry a numeric suffix (`pic.token.6`); strip it for comparison.
     let mut normalized: Vec<String> = blocks
@@ -1913,3 +1907,6 @@ fn guarded_length_reads_admit_byte_views_and_use_a_pooled_cold_key() {
 
 #[path = "global_read_tests.rs"]
 mod global_read;
+
+#[path = "computed_admission_tests.rs"]
+mod computed_admission;

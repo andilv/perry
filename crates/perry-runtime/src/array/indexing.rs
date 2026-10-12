@@ -8,6 +8,8 @@ use std::sync::atomic::Ordering;
 mod keyed;
 #[path = "indexing_proto_chain.rs"]
 mod proto_chain;
+#[path = "indexing_read_cold.rs"]
+mod read_cold;
 pub(crate) use keyed::js_array_set_index_or_string_with_strictness;
 pub use keyed::{
     js_array_get_index_or_string, js_array_set_index_or_string,
@@ -709,15 +711,12 @@ pub(super) unsafe fn array_get_resolved(arr: *const ArrayHeader, index: u32, fla
     // checked element read once any descriptor existed process-wide, which
     // taxed every internal keys_array walk (`in`, defineProperty, Object.keys).
     if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
-        let key = index.to_string();
-        if let Some(acc) = crate::object::get_accessor_descriptor(arr as usize, &key) {
-            if acc.get != 0 {
-                let receiver = crate::value::js_nanbox_pointer(arr as i64);
-                return f64::from_bits(
-                    unsafe { crate::object::invoke_accessor_getter(acc.get, receiver) }.bits(),
-                );
-            }
-            return f64::from_bits(crate::value::TAG_UNDEFINED);
+        if let Some(value) = proto_chain::array_index_accessor_get(
+            arr,
+            index,
+            crate::value::js_nanbox_pointer(arr as i64),
+        ) {
+            return value;
         }
     }
     // JS spec: out-of-bounds array access returns `undefined`, not NaN.
@@ -1612,8 +1611,9 @@ unsafe fn js_array_set_f64_extend_resolved(
     // it (ECMA-262 OrdinaryGet → prototype chain). Cheap no-op otherwise.
     note_array_index_write(arr as usize);
     let is_frozen = flags & crate::gc::OBJ_FLAG_FROZEN != 0;
-    let blocks_extension =
-        flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0;
+    let blocks_extension = flags
+        & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND)
+        != 0;
     let scope = crate::gc::RuntimeHandleScope::new();
     let arr_handle = scope.root_raw_mut_ptr(arr);
     let value_handle = scope.root_nanbox_f64(value);
@@ -1662,7 +1662,9 @@ unsafe fn js_array_set_f64_extend_resolved(
 
         // If index is within bounds, just set it
         if index < length {
-            if is_frozen {
+            // One integrity guard leaves ordinary writes on the same branch.
+            // Filling a hole is property creation even inside length.
+            if blocks_extension && (is_frozen || !array_has_own_index(arr, index)) {
                 return arr;
             }
             if index >= (*arr).capacity {
@@ -1697,7 +1699,7 @@ unsafe fn js_array_set_f64_extend_resolved(
             return arr;
         }
 
-        if is_frozen || blocks_extension {
+        if blocks_extension {
             return arr;
         }
 

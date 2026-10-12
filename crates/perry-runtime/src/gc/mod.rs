@@ -223,6 +223,8 @@ mod cycle;
 /// `malloc_trim` maintenance, split out of `cycle.rs` for the 2000-line cap.
 mod cycle_malloc_trim;
 use cycle::*;
+#[cfg(target_vendor = "apple")]
+pub(crate) use cycle_malloc_trim::purge_allocator_on_region_growth;
 #[cfg(test)]
 pub(crate) use cycle_malloc_trim::{
     reset_test_malloc_trim_call_count, test_malloc_trim_call_count,
@@ -455,7 +457,6 @@ fn gc_collect_minor_with_trigger_inner(
     crate::arena::discard_previously_idle_eden_pages();
     crate::arena::old_pages_begin_gc_cycle();
     let previous_pause_us = gc_last_pause_us();
-    let current_rss_bytes = crate::process::get_rss_bytes();
     // Not budgeted, so the low-pause veto does not apply and the policy is
     // always allowed to run here (#7611 deleted the env veto that used to sit
     // in this slot). The variable stays rather than being folded away: it is
@@ -506,6 +507,9 @@ fn gc_collect_minor_with_trigger_inner(
         };
     }
     clear_mark_seeds();
+    // Only the non-copying evacuation policy consumes RSS. A successful
+    // copied minor has already returned, so it owes no process-memory query.
+    let current_rss_bytes = crate::process::get_rss_bytes();
     // Old-page defrag belongs to the non-copying fallback below. Snapshotting
     // and sorting all old-page metadata before trying the copying fast path
     // charged every ordinary minor an O(old pages) cost even though that path
@@ -1007,6 +1011,8 @@ pub fn gc_init() {
     if GC_INIT_DONE.with(|c| c.replace(true)) {
         return;
     }
+    // Publish this agent's intrinsic function layouts before any JS birth.
+    let _ = crate::state::state();
     crate::perf_hooks::init_time_origin();
     #[cfg(not(perry_gc_instruments))]
     instruments::refuse_instrument_knobs_without_instruments();
@@ -1117,7 +1123,6 @@ pub fn gc_init() {
     reg_scanner!(crate::perf_hooks::scan_perf_entries_roots_mut);
     reg_scanner!(crate::perf_histogram::scan_histogram_roots_mut);
     reg_scanner!(crate::v8::scan_v8_promise_hook_roots_mut);
-    reg_scanner!(crate::typed_feedback::scan_typed_feedback_roots_mut);
     reg_scanner!(transition_cache_mutable_root_scanner);
     reg_scanner!(crate::object::scan_object_cache_roots_mut);
     reg_scanner!(crate::object::scan_arguments_object_roots_mut);
@@ -1185,7 +1190,6 @@ pub fn gc_init() {
     #[cfg(feature = "mod-dgram")]
     reg_scanner!(crate::dgram_reactor::scan_roots_mut);
     reg_scanner!(json_parse_mutable_root_scanner);
-    reg_scanner!(intern_table_mutable_root_scanner);
     reg_scanner!(crate::string::scan_utf16_index_roots_mut);
     // #7564: the per-thread `{ value, done }` / `{ done, value }` keys arrays
     // shared by every iterator result the runtime builds. Nothing else in the
@@ -1207,7 +1211,6 @@ pub fn gc_init() {
     reg_scanner!(crate::buffer::pool::scan_pool_roots_mut);
     reg_scanner!(crate::string::trim_cache::scan_trim_cache_roots_mut);
     reg_scanner!(crate::builtins::scan_console_log_singleton_roots_mut);
-    reg_scanner!(crate::builtins::scan_structured_clone_memo_roots_mut);
     // #8282/#8294: process EventEmitter listener closures live as raw
     // `*const ClosureHeader` in a TLS map. The scanner existed but was never
     // called, so the table stayed invisible to the collector.

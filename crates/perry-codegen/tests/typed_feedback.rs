@@ -165,6 +165,7 @@ fn param(id: u32, name: &str, ty: Type) -> Param {
 
 fn field(name: &str, ty: Type) -> ClassField {
     ClassField {
+        origin: perry_hir::ClassFieldOrigin::Definition,
         name: name.to_string(),
         key_expr: None,
         ty,
@@ -633,7 +634,7 @@ fn a_default_build_emits_no_typed_feedback_recording_calls() {
     // to `js_typed_feedback_native_call_method_by_id`).
     assert!(
         ir.contains("call double @js_typed_feedback_native_call_method")
-            || ir.contains("call double @js_method_site_miss("),
+            || ir.contains("call double @js_method_site_miss"),
         "dispatching feedback wrappers must still be emitted in a default build \
          (method call):\n{ir}"
     );

@@ -565,7 +565,34 @@ fn lower_dynamic_compare_bits(
     ctx.block().phi(I64, &incoming)
 }
 
-fn lower_strict_eq_inline_any(ctx: &mut FnCtx<'_>, l: &str, r: &str) -> String {
+/// A structural allocation proof, never an erased object annotation. Ordinary
+/// objects do not change their user address when their property storage grows.
+pub(crate) fn ordinary_object_allocation(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
+    match expr {
+        Expr::Object(_) | Expr::ObjectSpread { .. } => true,
+        Expr::New { class_name, .. } => ctx
+            .classes
+            .get(class_name)
+            .is_some_and(|class| class.is_literal_shape()),
+        _ => false,
+    }
+}
+
+fn ordinary_object_identity(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
+    match expr {
+        Expr::LocalGet(id) => {
+            ctx.object_literal_locals.contains(id) && !ctx.reassigned_locals.contains(id)
+        }
+        _ => ordinary_object_allocation(ctx, expr),
+    }
+}
+
+fn lower_strict_eq_inline_any(
+    ctx: &mut FnCtx<'_>,
+    l: &str,
+    r: &str,
+    ordinary_identity: bool,
+) -> String {
     let l_bits = ctx.block().bitcast_double_to_i64(l);
     let r_bits = ctx.block().bitcast_double_to_i64(r);
 
@@ -622,6 +649,20 @@ fn lower_strict_eq_inline_any(ctx: &mut FnCtx<'_>, l: &str, r: &str) -> String {
     ctx.current_block = tag_idx;
     let l_tag = ctx.block().lshr(I64, &l_bits, "48");
     let r_tag = ctx.block().lshr(I64, &r_bits, "48");
+    // At least one operand is a compiler-proven ordinary object allocation.
+    // It cannot be an array-growth forwarding stub. A distinct pointer cannot
+    // alias it, including an array alias, Symbol or native registry handle.
+    // Both operands were rooted across evaluation, so moving GC has already
+    // rewritten them. Do not read an unproven operand's GC header.
+    if ordinary_identity {
+        let l_pointer = ctx.block().icmp_eq(I64, &l_tag, "32765");
+        let r_pointer = ctx.block().icmp_eq(I64, &r_tag, "32765");
+        let pointers = ctx.block().and(I1, &l_pointer, &r_pointer);
+        let rest_idx = ctx.new_block("anyeq.nonobject");
+        let rest_label = ctx.block_label(rest_idx);
+        ctx.block().cond_br(&pointers, &false_l, &rest_label);
+        ctx.current_block = rest_idx;
+    }
     let l_sso = ctx
         .block()
         .icmp_eq(I64, &l_tag, crate::nanbox::SHORT_STRING_TAG_TOP16_I64);
@@ -804,34 +845,30 @@ fn lower_relational_against_number(
     l: &str,
     r: &str,
     dynamic_is_left: bool,
+    proven_expr: &Expr,
     fallback_fn: &str,
 ) -> String {
     let dynamic = if dynamic_is_left { l } else { r };
     let bits = ctx.block().bitcast_double_to_i64(dynamic);
     let top16 = ctx.block().lshr(I64, &bits, "48");
-    let below_tag_band =
-        ctx.block()
-            .icmp_ult(I64, &top16, crate::nanbox::SHORT_STRING_TAG_TOP16_I64);
-    let above_tag_band = ctx
-        .block()
-        .icmp_ugt(I64, &top16, crate::nanbox::STRING_TAG_TOP16_I64);
-    let is_plain_number = ctx.block().or(I1, &below_tag_band, &above_tag_band);
+    // Use the same raw-Number admission as the fully dynamic comparison.
+    // Negative IEEE values and canonical NaNs precede the positive tag band.
+    let is_plain_number = emit_is_unboxed_number(ctx, &bits);
     let is_i32 = ctx
         .block()
         .icmp_eq(I64, &top16, crate::nanbox::INT32_TAG_TOP16_I64);
-    let is_undefined = ctx
+    // undefined/null/false/true are four consecutive immediate values.
+    // A range decides admission without separately classifying each value.
+    debug_assert_eq!(crate::nanbox::TAG_UNDEFINED + 3, crate::nanbox::TAG_TRUE);
+    let singleton_offset = ctx
         .block()
-        .icmp_eq(I64, &bits, crate::nanbox::TAG_UNDEFINED_I64);
-    let is_null = ctx.block().icmp_eq(I64, &bits, crate::nanbox::TAG_NULL_I64);
-    let is_false = ctx
-        .block()
-        .icmp_eq(I64, &bits, crate::nanbox::TAG_FALSE_I64);
+        .sub(I64, &bits, crate::nanbox::TAG_UNDEFINED_I64);
+    let is_singleton = ctx.block().icmp_ult(I64, &singleton_offset, "4");
+    let zero_offset = ctx.block().sub(I64, &bits, crate::nanbox::TAG_NULL_I64);
+    let is_zero = ctx.block().icmp_ult(I64, &zero_offset, "2");
     let is_true = ctx.block().icmp_eq(I64, &bits, crate::nanbox::TAG_TRUE_I64);
-    let is_zero = ctx.block().or(I1, &is_null, &is_false);
     let primitive = ctx.block().or(I1, &is_plain_number, &is_i32);
-    let primitive = ctx.block().or(I1, &primitive, &is_undefined);
-    let primitive = ctx.block().or(I1, &primitive, &is_zero);
-    let primitive = ctx.block().or(I1, &primitive, &is_true);
+    let primitive = ctx.block().or(I1, &primitive, &is_singleton);
 
     let fast_idx = ctx.new_block("relnum.fast");
     let slow_idx = ctx.new_block("relnum.slow");
@@ -853,7 +890,11 @@ fn lower_relational_against_number(
         .select(I1, &is_true, DOUBLE, "1.0", &dynamic_number);
     // `undefined` deliberately retains its tagged NaN. Ordered fcmp then
     // returns false for all four relational operators, exactly as ToNumber.
-    let proven_number = normalize_int32_immediate(ctx, if dynamic_is_left { r } else { l });
+    let proven_number = if crate::type_analysis::expr_produces_canonical_raw_f64(ctx, proven_expr) {
+        (if dynamic_is_left { r } else { l }).to_string()
+    } else {
+        normalize_int32_immediate(ctx, if dynamic_is_left { r } else { l })
+    };
     let (left_number, right_number) = if dynamic_is_left {
         (&dynamic_number, &proven_number)
     } else {
@@ -1026,11 +1067,10 @@ fn lower_short_heap_string_eq(
 ///
 /// The remaining representation arms are exactly what each caller emitted
 /// before, so this is behaviour-preserving. That matters most for
-/// `legacy_unified`, whose fallback keeps the
-/// `js_get_string_pointer_unified` composition — including its number-coercing
-/// behaviour for operands whose `string` annotation lies. Note that
-/// composition *materializes* an SSO operand onto the heap, so routing SSO x
-/// SSO around it removes two allocations per comparison as well as the calls.
+/// `legacy_unified`, whose shared boxed helper retains the unified pointer
+/// composition for non-string operands, including its number coercion when
+/// a string annotation lies. Actual strings compare borrowed bytes without
+/// materializing inline operands into weakly interned heap headers.
 ///
 /// Returns an `i32` that is 1 iff the operands are `===`.
 fn lower_string_strict_eq_inline(
@@ -1099,14 +1139,8 @@ fn lower_string_strict_eq_inline(
 
     ctx.current_block = boxed_idx;
     let boxed_res = if legacy_unified {
-        let lu = ctx
-            .block()
-            .call(I64, "js_get_string_pointer_unified", &[(DOUBLE, l)]);
-        let ru = ctx
-            .block()
-            .call(I64, "js_get_string_pointer_unified", &[(DOUBLE, r)]);
         ctx.block()
-            .call(I32, "js_string_equals", &[(I64, &lu), (I64, &ru)])
+            .call(I32, "js_string_equals_value", &[(DOUBLE, l), (DOUBLE, r)])
     } else {
         ctx.block()
             .call(I32, "js_jsvalue_equals", &[(DOUBLE, l), (DOUBLE, r)])
@@ -1137,16 +1171,16 @@ fn lower_string_strict_eq_inline(
 /// decided inline and everything else deferred to the shared classifier.
 ///
 /// The classifier answers `Number` only on its final fallthrough, after every
-/// NaN-box tag has been excluded and two raw-bit exceptions have been checked:
-/// an untagged typed-array pointer (`top16 == 0 && bits >= 0x10000`, #654) and
-/// a Web Streams handle id, which is a positive whole number inside
-/// `[STREAM_ID_BAND_START, STREAM_ID_BAND_END)` (#1545/#1650). A value is
-/// therefore a Number by construction when its top 16 bits are outside the
-/// tag range `0x7FF9..=0x7FFF` (that covers every negative double as well),
-/// it is not that raw-pointer shape, and it lies outside the stream id band.
-/// INT32-tagged values (which may be class references) and everything inside
-/// the two exception windows keep the complete classifier, so the two routes
-/// can never disagree. The inline arm is the ECS `_validID` entity-id check.
+/// NaN-box tag has been excluded and one raw-bit exception has been checked:
+/// an untagged typed-array pointer (`top16 == 0 && bits >= 0x10000`, #654). A
+/// value is therefore a Number by construction when its top 16 bits are
+/// outside the tag range `0x7FF9..=0x7FFF` (that covers every negative double
+/// as well) and it is not that raw-pointer shape. INT32-tagged values (which
+/// may be class references) and the raw-pointer window keep the complete
+/// classifier, so the two routes can never disagree. No double VALUE is ever
+/// special: Web Streams handles are `POINTER_TAG` registry ids, so 1048576 is
+/// a Number like any other. The inline arm is the ECS `_validID` entity-id
+/// check.
 fn lower_typeof_number_inline(ctx: &mut FnCtx<'_>, value: &str, negate: bool) -> String {
     let fast_idx = ctx.new_block("typeof.num.fast");
     let slow_idx = ctx.new_block("typeof.num.slow");
@@ -1165,16 +1199,7 @@ fn lower_typeof_number_inline(ctx: &mut FnCtx<'_>, value: &str, negate: bool) ->
         let top_nonzero = blk.icmp_ne(I64, &top16, "0");
         let below_pointer_floor = blk.icmp_ult(I64, &bits, "65536");
         let not_raw_pointer = blk.or(I1, &top_nonzero, &below_pointer_floor);
-        // Not inside the stream handle id band (a positive whole number
-        // there is the one Number-looking value the classifier may call an
-        // object). Ordered compares are false for NaN, which is a Number.
-        let below_band = blk.fcmp("olt", value, "1048576.0");
-        let above_band = blk.fcmp("oge", value, "2097152.0");
-        let outside_band = blk.or(I1, &below_band, &above_band);
-        let is_nan = blk.fcmp("uno", value, value);
-        let nan_or_outside_band = blk.or(I1, &outside_band, &is_nan);
-        let mut definitely_number = blk.and(I1, &untagged, &not_raw_pointer);
-        definitely_number = blk.and(I1, &definitely_number, &nan_or_outside_band);
+        let definitely_number = blk.and(I1, &untagged, &not_raw_pointer);
         blk.cond_br(&definitely_number, &fast_label, &slow_label);
     }
     ctx.current_block = fast_idx;
@@ -1616,7 +1641,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let result_bits = if matches!(op, CompareOp::LooseEq | CompareOp::LooseNe) {
                         lower_dynamic_compare_bits(ctx, &l, &r, "oeq", "js_loose_eq", true)
                     } else {
-                        lower_strict_eq_inline_any(ctx, &l, &r)
+                        let ordinary_identity = ordinary_object_identity(ctx, left)
+                            || ordinary_object_identity(ctx, right);
+                        lower_strict_eq_inline_any(ctx, &l, &r, ordinary_identity)
                     };
                     let blk = ctx.block();
                     let result = blk.bitcast_i64_to_double(&result_bits);
@@ -1859,6 +1886,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             &l,
                             &r,
                             !left_numeric,
+                            if left_numeric { left } else { right },
                             fname,
                         ));
                     }
@@ -1929,3 +1957,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         _ => unreachable!("expr/mod.rs dispatched a variant not handled by this submodule"),
     }
 }
+
+#[cfg(test)]
+#[path = "scopebox_identity_tests.rs"]
+mod scopebox_identity_tests;

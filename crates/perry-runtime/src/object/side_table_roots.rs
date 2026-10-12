@@ -191,7 +191,10 @@ fn transition_entry_is_dead(
         // dead target is now possible and must be reaped here — this is
         // the half that makes weakening it safe.
         || is_dead_owner(entry.next_keys)
-        || shapes::shape_descriptor_by_id(entry.prev_shape_id).is_none()
+        || ((entry.prev_shape_id != 0 || spread::source_shape(entry).is_none())
+            && shapes::shape_descriptor_by_id(entry.prev_shape_id).is_none())
+        || spread::source_shape(entry)
+            .is_some_and(|id| shapes::shape_descriptor_by_id(id).is_none())
         || (entry.target_shape_id != 0
             && shapes::shape_descriptor_by_id(entry.target_shape_id).is_none())
 }
@@ -299,6 +302,9 @@ pub fn scan_shape_cache_roots(mark: &mut dyn FnMut(f64)) {
 /// reclaimable arenas, so both cache copies must be marked and
 /// rewritten. The trie witnesses are weak and cannot substitute for this.
 pub fn scan_shape_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    if visitor.young_scope() {
+        return; // I3: static shapes only hold stationary old key lists.
+    }
     let st = crate::state::state();
     {
         let entries = unsafe { &mut *st.object_hot.shape_inline_cache.get() };

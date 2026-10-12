@@ -186,6 +186,7 @@ unsafe fn converge_key_add(obj: *mut ObjectHeader, id: u32, slot: u32, value_bit
         d.summary,
         field_rep::with_slot_rep(d.rep, slot, other),
         d.brands(),
+        d.integrity_flags,
     ) else {
         return id;
     };
@@ -248,11 +249,13 @@ pub(crate) fn migrate_on_miss_value(bits: u64) {
     }
 }
 
-/// A completed ordinary ConstFn shape can serve the allocation's field
+/// The expected id is the completed class layout, never a keyless allocation's
+/// birth id. Exact identity is the hot contract; a completed ConstFn shape can
+/// additionally serve that layout's field
 /// offsets and numeric lanes. The two records supply every fact; no mapping
 /// from allocation id to final id is maintained. Writes still check the live
 /// slot's rep before skipping the checked store funnel.
-pub(crate) fn final_shape_matches_birth(actual: u32, expected: u32) -> bool {
+pub(crate) fn completed_shape_matches_layout(actual: u32, expected: u32) -> bool {
     if actual == expected {
         return true;
     }
@@ -263,7 +266,7 @@ pub(crate) fn final_shape_matches_birth(actual: u32, expected: u32) -> bool {
         return false;
     };
     if a.proto_id != b.proto_id {
-        return linked_shape_matches_birth(&a, &b);
+        return linked_shape_matches_layout(&a, &b);
     }
     let base_rep = a.constfn_infos().iter().fold(a.rep, |rep, i| {
         field_rep::with_slot_rep(rep, i.slot as u32, REP_ANY)
@@ -286,12 +289,12 @@ pub(crate) fn final_shape_matches_birth(actual: u32, expected: u32) -> bool {
 }
 
 /// An instance of a per-evaluation class (`ClassExprFresh`) carries its
-/// class's birth shape `b` re-linked to its evaluation's prototype: the same
+/// class's completed layout `b` re-linked to its evaluation's prototype: the same
 /// keys, slots, lanes and attributes at a `MIXED` identity of the same class
 /// (`object_link_class_evaluation_prototype`). A class field guard reads and
 /// writes an OWN data slot, which no prototype can shadow, so `a` serves the
 /// guard exactly as `b` does. Any other fact that differs refuses.
-fn linked_shape_matches_birth(
+fn linked_shape_matches_layout(
     a: &super::shapes::ShapeDescriptor,
     b: &super::shapes::ShapeDescriptor,
 ) -> bool {
@@ -345,23 +348,33 @@ pub(crate) fn key_add_rep(pred_rep: u64, slot: u32, value_bits: Option<u64>, inl
 /// under Any before it stamps the body-specific shape.
 #[inline]
 pub(crate) fn cached_key_add_admits(target: u32, slot: u32, value_bits: Option<u64>) -> bool {
+    cached_key_add_slot_bits(
+        target,
+        slot,
+        value_bits.unwrap_or(crate::value::TAG_UNDEFINED),
+    )
+    .is_some()
+}
+
+/// The same T2 admission, retaining the canonical slot bits for an exact
+/// cached publication. No callback or collection may separate it from use.
+#[inline]
+pub(crate) fn cached_key_add_slot_bits(target: u32, slot: u32, value_bits: u64) -> Option<u64> {
     let rep = shape_rep(target);
     if rep == REP_ANY {
-        return true;
+        return Some(value_bits);
     }
     if field_rep::has_deprecated(rep) {
-        return false;
+        return None;
     }
     match slot_rep(rep, slot) {
-        REP_ANY => true,
-        field_rep::REP_F64 => {
-            value_bits.is_some_and(|bits| field_rep::f64_slot_bits(bits).is_some())
-        }
+        REP_ANY => Some(value_bits),
+        field_rep::REP_F64 => field_rep::f64_slot_bits(value_bits),
         // The cached transition stamps its target before widening and
         // writing the new slot. A SPECIAL target must take the ordered slow
         // path until the cache hit prewrites under an Any predecessor.
-        field_rep::REP_SPECIAL => false,
-        _ => false,
+        field_rep::REP_SPECIAL => None,
+        _ => None,
     }
 }
 
@@ -531,6 +544,7 @@ unsafe fn publish_key_add_rep(
             infos.as_slice(),
             &d.brands().to_vec(),
             None,
+            d.integrity_flags,
         ),
     ));
     if target != id {
@@ -587,6 +601,7 @@ pub(crate) unsafe fn private_field_lanes_target(
             &[],
             &d.brands().to_vec(),
             None,
+            d.integrity_flags,
         ),
     ));
     (target != 0 && target != id).then_some((id, target, bits))
@@ -789,6 +804,7 @@ pub(crate) fn normalized_shape(mut id: u32) -> u32 {
             // A re-intern of a live record's facts under another rep names
             // no static id.
             None,
+            d.integrity_flags,
         ));
         debug_assert_ne!(next, id, "normalizing {id:#x} found itself");
         if next == id {

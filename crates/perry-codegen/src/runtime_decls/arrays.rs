@@ -47,6 +47,11 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
         &[PTR, I32, PTR, I32],
     );
     module.declare_function("js_array_push_f64", I64, &[I64, DOUBLE]);
+    module.declare_function(
+        "js_array_append_set",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32, DOUBLE],
+    );
     module.declare_function("js_array_push_u31_with_length", I64, &[I64, I32, PTR]);
     module.declare_function("js_array_push_f64_spec", I64, &[I64, DOUBLE]);
     // #11021: the ArrayPush slow arms' push. Returns the new head with `*own = 0`,
@@ -74,6 +79,11 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // element carries, or 0.
     module.declare_function("js_array_ensure_element_shape_ordinary", I32, &[I64]);
     module.declare_function("js_array_get_index_or_string", DOUBLE, &[I64, DOUBLE]);
+    module.declare_function(
+        "perry_array_read_cold_shared",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, I64],
+    );
     module.declare_function("js_array_numeric_get_f64_unboxed", DOUBLE, &[I64, I32]);
     module.declare_function("js_array_set_f64", VOID, &[I64, I32, DOUBLE]);
     module.declare_function("js_array_numeric_set_f64_unboxed", I32, &[I64, I32, DOUBLE]);
@@ -349,6 +359,7 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // Array whose iteration is unobservable (read it by index), 1 otherwise.
     module.declare_function("js_array_destructure_needs_iterator", I32, &[DOUBLE]);
     module.declare_function("js_array_record_stack_dispatch", DOUBLE, &[PTR, I32]);
+    module.declare_function("js_array_record_stack_enter", I32, &[PTR, PTR, I32]);
     module.declare_function("js_array_record_literal", DOUBLE, &[PTR, I32]);
     module.declare_function("js_array_record_enter", I32, &[DOUBLE, PTR, PTR]);
     module.declare_function("js_array_record_enter_counted", I32, &[DOUBLE, PTR, PTR]);

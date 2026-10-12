@@ -323,8 +323,7 @@ fn lower_array_index_set_via_runtime_key(
             // side has done this since #7286 (`aidx.canonical`). A rejected key
             // becomes index -1, which the guarded in-bounds store declines
             // onto the same helper arm, so the helper is emitted once.
-            let guard_idx_i32 =
-                super::index_set_guarded::emit_canonical_element_index_i32(ctx, &idx_double);
+            let guard_idx_i32 = super::index_key::normalize(ctx, &idx_double, Some(index));
             super::index_set_guarded::emit_guarded_inbounds_array_store(
                 ctx,
                 &arr_box,
@@ -516,6 +515,11 @@ pub(crate) fn lower(
             index,
             value,
         } => {
+            if let Some(result) =
+                super::array_append::try_lower(ctx, object, index, value, assignment_strict)?
+            {
+                return Ok(result);
+            }
             // Step 4b / #10741: a planned-bare element store inside a loop
             // region (a dense raw-f64 array, the index and value proven).
             if let Some(result) = crate::stmt::region_loop::try_lower_bare_index_set(ctx, expr)? {

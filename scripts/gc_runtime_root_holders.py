@@ -147,7 +147,7 @@ Named, because an unstated limit is how a gate gets trusted past its subject.
 
 * **`RuntimeState`-owned tables.** `crates/perry-runtime/src/state.rs` absorbed
   roughly a dozen former `thread_local!`s (`descriptors`, `object_hot` and its
-  `overflow_fields` / `shape_cache_overflow` / `transition_cache`,
+  `shape_cache_overflow` / `transition_cache`,
   `field_lookup`, `shapes`, and `exotic_expando`). They are struct FIELDS,
   reached through `state()`, so no declaration-site scan sees them. All are
   covered today: in particular, `exotic_expando` is visited by
@@ -183,6 +183,7 @@ Named, because an unstated limit is how a gate gets trusted past its subject.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -1075,7 +1076,9 @@ VERDICTS = {
     "covered_elsewhere",  # a registered scanner in ANOTHER file visits it
     "not_a_gc_pointer",  # id, counter, epoch, code address, .rodata, Rust-owned
     "test_only",  # #[cfg(test)] storage
+    "weak_pinned_old",  # weak metadata with a checked old, stationary birth contract
     "non_moving_snapshot",  # deliberately untraced within a pinned collector window
+    "weak_heap_change_cache",  # cleared before free/move; never a strong root
     "open_gap",  # a real unrooted GC pointer, with an issue
     "unverified",  # enumerated, verdict not established — a dated TODO
 }
@@ -1177,8 +1180,25 @@ def inventory_problems(inventory: list[dict], root: Path | None = None) -> list[
                 f"{label}: covered_elsewhere must name the `scanner` that covers it, or "
                 f"the claim cannot be checked or maintained"
             )
+        if verdict == "weak_pinned_old":
+            from gc_keylist_invariant import keylist_contract_problems
+            problems.extend(keylist_contract_problems(entry, root))
         if verdict == "non_moving_snapshot":
             problems.extend(snapshot_contract_problems(entry, root))
+        if verdict == "weak_heap_change_cache":
+            # Retained weak holders stay visible in --list. This is a reviewed
+            # lifetime contract, not scanner coverage or a frontier debt pin.
+            sources = entry.get("sources", {})
+            required = {
+                entry.get("file"),
+                "crates/perry-runtime/src/gc/heap_generation.rs",
+            }
+            if not root or not required.issubset(sources):
+                problems.append(f"{label}: weak cache must pin its accesses and heap-change funnel")
+            elif any(not (root / rel).is_file() or
+                     hashlib.sha256((root / rel).read_text().encode()).hexdigest() != digest
+                     for rel, digest in sources.items()):
+                problems.append(f"{label}: weak cache source changed; re-audit before refreshing pins")
         if verdict == "open_gap" and not (entry.get("issue") or "").strip():
             problems.append(f"{label}: open_gap must cite an `issue`")
         if verdict in {"open_gap", "unverified"}:
@@ -1996,6 +2016,8 @@ def self_test() -> int:
         )
     failures.extend(inventory_problems(inventory, REPO_ROOT))
     failures.extend(snapshot_contract_self_test())
+    from gc_keylist_invariant import keylist_contract_self_test
+    failures.extend(keylist_contract_self_test(REPO_ROOT))
     # …and the structural checker must itself be able to fail.
     long_why = "x" * 30
     for bad, expect in (
@@ -2003,6 +2025,7 @@ def self_test() -> int:
         ({"file": "f", "name": "N", "verdict": "not_a_gc_pointer", "why": "short"}, "why"),
         ({"file": "f", "name": "N", "verdict": "covered_elsewhere", "why": long_why}, "scanner"),
         ({"file": "f", "name": "N", "verdict": "open_gap", "why": long_why}, "issue"),
+        ({"file": "f", "name": "N", "verdict": "weak_heap_change_cache", "why": long_why}, "weak cache must pin"),
     ):
         if not any(expect in problem for problem in inventory_problems([bad])):
             failures.append(

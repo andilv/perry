@@ -32,20 +32,27 @@ mod receiver_root_tests {
     fn stream_receiver_root_survives_a_precise_full_collection() {
         // Exercise the actual root scanner, rather than only checking tag bits.
         std::thread::spawn(|| unsafe {
+            // Stream tests share process-global registries. Serialize the real
+            // collection with scanner fixtures that install fake roots there.
+            let _serial = crate::streams::tests::serial_guard();
             perry_runtime::gc::gc_init();
             crate::common::dispatch::install_streams();
             let stream = crate::streams::alloc_readable_from_bytes(vec![1, 2, 3]);
-            let reader = crate::streams::js_readable_stream_get_reader(stream as f64);
+            let reader =
+                crate::streams::js_readable_stream_get_reader(crate::streams::stream_value(stream));
             let scope = perry_runtime::gc::RuntimeHandleScope::new();
-            let receiver = scope.root_nanbox_f64(super::receiver_root_value(reader as i64));
+            let receiver = scope.root_nanbox_f64(super::receiver_root_value(
+                crate::streams::stream_id(reader) as i64,
+            ));
 
             assert_eq!(perry_runtime::gc::js_gc_memory_pressure(2), 2);
-            assert_eq!(receiver.get_nanbox_f64(), reader);
+            assert_eq!(receiver.get_nanbox_f64().to_bits(), reader.to_bits());
             assert!(crate::streams::js_stream_handle_is_registered(
-                reader as usize
+                crate::streams::stream_id(reader)
             ));
             assert_eq!(
-                crate::streams::js_readable_stream_locked(stream as f64).to_bits(),
+                crate::streams::js_readable_stream_locked(crate::streams::stream_value(stream))
+                    .to_bits(),
                 perry_runtime::value::JSValue::bool(true).bits()
             );
             crate::streams::js_reader_release_lock(reader);
@@ -283,7 +290,11 @@ unsafe fn arm_streams(handle: i64, method_name: &str, args: &[f64]) -> Option<f6
     // subsystem's handle. Routes method calls on receivers whose static stream
     // type the codegen lost (`src.pipeThrough(ts).getReader()`, `ts.readable
     // .getReader()`, `const r = rs.getReader(); r.read()`, …).
-    if let Some(v) = crate::streams::dispatch_stream_method(handle as f64, method_name, &args) {
+    if let Some(v) = crate::streams::dispatch_stream_method(
+        crate::streams::stream_value(handle as usize),
+        method_name,
+        &args,
+    ) {
         return Some(v);
     }
     None
@@ -291,14 +302,10 @@ unsafe fn arm_streams(handle: i64, method_name: &str, args: &[f64]) -> Option<f6
 
 #[cfg(feature = "bundled-nodemailer")]
 unsafe fn arm_nodemailer(handle: i64, method_name: &str, args: &[f64]) -> Option<f64> {
-    // turnloop P6: `nodemailer.createTransport(...)` returns a bare handle
-    // NUMBER, so `transporter.sendMail(...)` / `.verify()` are lowered as
-    // generic calls on an untyped receiver and land here. No arm claimed them,
-    // so the whole surface answered `TypeError: (number).sendMail is not a
-    // function` — on the base commit too, in every call shape. This is the
-    // bundled-surface half of the fix; `perry-ext-nodemailer` registers a
-    // dispatch EXTENSION for the well-known-flip half, because its handles live
-    // in perry-ffi's registry rather than this one.
+    // `createTransport` returns a POINTER_TAG-boxed handle, so generic calls
+    // on its untyped receiver land here. Keep this bundled arm separate from
+    // `perry-ext-nodemailer`'s extension because their handles live in
+    // different registries.
     if let Some(value) = crate::nodemailer::dispatch_transporter_method(handle, method_name, &args)
     {
         return Some(value);

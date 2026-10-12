@@ -113,7 +113,7 @@ fn bindings_captured_by_the_same_closures_share_one_group() {
 }
 
 #[test]
-fn different_capturing_closure_sets_get_different_groups() {
+fn different_capturing_closure_sets_share_the_scope_activation() {
     // x: f and g; y: g only; z: f only.
     let body = vec![
         let_num(1, 0.0),
@@ -126,7 +126,7 @@ fn different_capturing_closure_sets_get_different_groups() {
     group_scope_boxes(&mut module);
     let mut groups = preallocs(&module.functions[0].body);
     groups.sort();
-    assert_eq!(groups, vec![vec![1], vec![2], vec![3]]);
+    assert_eq!(groups, vec![vec![1, 2, 3]]);
 }
 
 #[test]
@@ -319,6 +319,36 @@ fn a_scope_group_costs_one_root_not_one_per_binding() {
     );
 }
 
+#[test]
+fn a_reassigned_scoped_array_keeps_only_a_guarded_read_claim() {
+    let mut read = mutating_closure(100, &[1]);
+    if let Expr::Closure { body, .. } = &mut read {
+        *body = vec![
+            Stmt::Expr(Expr::IndexGet {
+                object: Box::new(Expr::LocalGet(1)),
+                index: Box::new(Expr::Integer(0)),
+            }),
+            Stmt::Expr(Expr::LocalSet(1, Box::new(Expr::Array(vec![])))),
+        ];
+    }
+    let mut module = module_with(vec![
+        Stmt::Let {
+            id: 1,
+            name: "items".into(),
+            ty: Type::Array(Box::new(Type::Any)),
+            mutable: true,
+            init: Some(Expr::Array(vec![])),
+        },
+        Stmt::Expr(read),
+    ]);
+    group_scope_boxes(&mut module);
+    let ir = compile_ir(&module);
+    assert!(
+        ir.contains("arr.guard.deref"),
+        "scoped read must be guarded: {ir}"
+    );
+}
+
 /// The closure side of the same model: the capturing closure holds ONE
 /// capture slot for the group.
 #[test]
@@ -330,7 +360,7 @@ fn a_closure_captures_a_group_through_one_slot() {
         crate::testing::root_slots::function_slice(&ir, "perry_fn_scope_env_probe_ts__probe1");
     let births: Vec<_> = fn_ir
         .lines()
-        .filter(|line| line.contains("@js_closure_alloc_init_boxed"))
+        .filter(|line| line.contains("@js_closure_alloc_small"))
         .collect();
     assert_eq!(
         births.len(),
@@ -338,7 +368,9 @@ fn a_closure_captures_a_group_through_one_slot() {
         "one bulk capture birth for the group:\n{fn_ir}"
     );
     assert!(
-        births[0].contains("i32 1, ptr"),
+        fn_ir
+            .lines()
+            .any(|line| line.contains("or i64") && line.trim_end().ends_with(", 1")),
         "the closure's capture count must be 1:\n{fn_ir}"
     );
     assert!(

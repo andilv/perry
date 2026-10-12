@@ -131,6 +131,15 @@ unsafe fn read_site_front(
     // A never-primed site (no cache) can still hold a spill entry in its
     // compact word; what else can serve it (the inherited-read cache) is
     // asked on the slow edge.
+    if shape_id < crate::object::shapes::SHAPE_ID_BASE {
+        return if inherited && !cache.is_null() {
+            crate::object::method_site::read_holder::exotic_read::array_answer(&*cache, obj)
+                .map(f64::from_bits)
+                .unwrap_or_else(hole)
+        } else {
+            hole()
+        };
+    }
     let state = if cache.is_null() {
         0
     } else {
@@ -370,7 +379,8 @@ mod tests {
                     assert_eq!(
                         super::js_object_get_own_field_ic_front(
                             dir, biased, key_bits, &mut slot, &packed,
-                        ).to_bits(),
+                        )
+                        .to_bits(),
                         crate::value::TAG_UNDEFINED,
                         "stored undefined is a positive own-slot hit, including spill"
                     );
@@ -383,14 +393,16 @@ mod tests {
                     assert_eq!(
                         super::js_object_get_field_ic_front(
                             dir, biased, key_bits, &mut slot, &packed,
-                        ).to_bits(),
+                        )
+                        .to_bits(),
                         crate::value::TAG_UNDEFINED,
                         "negative control: a property read serves cached absence"
                     );
                     assert_eq!(
                         super::js_object_get_own_field_ic_front(
                             dir, biased, key_bits, &mut slot, &packed,
-                        ).to_bits(),
+                        )
+                        .to_bits(),
                         crate::value::TAG_HOLE,
                         "a binding read requires presence"
                     );

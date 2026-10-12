@@ -114,28 +114,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 );
             }
         }
-        // Direct-call-only synthetic `arguments` clone: producer analysis
-        // proved that this exact `.length` form is the binding's sole use, and
-        // the caller placed the already boxed actual-argument count in its
-        // trailing slot. The public method retains normal Arguments semantics.
-        if property == "length"
-            && matches!(
-                object.as_ref(),
-                Expr::LocalGet(id)
-                    if matches!(
-                        ctx.local_type_hint(id),
-                        Some(perry_hir::types::Type::Named(name))
-                            if name == crate::codegen::arguments::SYNTHETIC_ARGUMENTS_LENGTH_TYPE
-                    )
-            )
+        if let Some(value) =
+            crate::codegen::arguments::lower_arguments_length(ctx, object, property)?
         {
-            return lower_expr(ctx, object);
-        }
-        // #10509: an elided `arguments` binding's length was read once.
-        if let (true, Expr::LocalGet(id)) = (property == "length", object.as_ref()) {
-            if let Some(len) = crate::codegen::arguments::lower_elided_arguments_length(ctx, *id) {
-                return Ok(len);
-            }
+            return Ok(value);
         }
         buffer_alias::invalidate_buffer_alias_for_read(ctx, object, property);
     }
@@ -460,6 +442,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(ctx.block().load(DOUBLE, &slot));
                 }
             }
+            if is_array_expr(ctx, object) {
+                let recv_box = lower_expr(ctx, object)?;
+                let bits = ctx.block().bitcast_double_to_i64(&recv_box);
+                let handle = ctx.block().and(I64, &bits, POINTER_MASK_I64);
+                return Ok(composed_ics::emit_record_length(
+                    ctx, &recv_box, &bits, &handle,
+                ));
+            }
             if let Some(length) = super::string_length::try_lower(ctx, object)? {
                 return Ok(length);
             }
@@ -536,9 +526,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                                                       // already gate on `> HANDLE_BAND_TOP`; mirror that here so any
                                                                       // handle-band receiver routes to the `js_value_length_f64` slow
                                                                       // path, which classifies it by registry without dereferencing the
-                                                                      // raw id. `HANDLE_BAND_TOP` = 0xFFFFF (addr_class::HANDLE_BAND_MAX
+                                                                      // raw id. `HANDLE_BAND_TOP` = 0x1FFFFF (addr_class::HANDLE_BAND_MAX
                                                                       // - 1).
-            let above_band = blk.icmp_ugt(I64, &recv_handle, "1048575"); // 0xFFFFF
+            let above_band = blk.icmp_ugt(
+                I64,
+                &recv_handle,
+                crate::expr::receiver_range::HANDLE_BAND_TOP_LITERAL,
+            );
             let handle_ok = blk.and(I1, &tag_ok, &above_band);
             // SSO receivers fail this guard → route to slow path
             // `js_value_length_f64` which has an SSO branch (reads
@@ -1105,29 +1099,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
                 }
             }
-            // GlobalGet receivers (`console.X`, `Math.PI`, `JSON.parse`,
-            // `process.env`, …) used as expression VALUES (not in a
-            // call) — there's no real value to materialize for most
-            // shapes; the call dispatch in lower_call handles the same
-            // receivers correctly when they're invoked. The HIR uses
-            // `Expr::GlobalGet(0)` as a sentinel for ALL builtin
-            // globals (see lower.rs:5037), so the original receiver
-            // name is no longer recoverable here — codegen has to
-            // route by the property string alone.
-            //
-            // Special-case `console.log` (the canonical pattern from
-            // #236): return a runtime-allocated singleton closure that
-            // thunks into `js_console_log_dynamic` so
-            // `.then(console.log)` actually prints. Caveat: this also
-            // catches the rare `let f = Math.log; f(x)` shape and
-            // dispatches through console.log's thunk — but that
-            // pattern previously lowered to the `0.0` sentinel
-            // (silently broken either way) so this is not a regression
-            // for the only realistic alternative caller. The full fix
-            // would side-channel the original global name through
-            // lowering; deferred until a second-callable-builtin
-            // arrives. Other unrecognized property shapes fall through
-            // to the `undefined` sentinel (a spec-correct property miss).
+            // GlobalGet names the global object. Builtin property values
+            // retain their own receiver and take ordinary property lowering.
             if matches!(object.as_ref(), Expr::GlobalGet(_)) {
                 return lower_globalget_property(ctx, property);
             }
@@ -1506,6 +1479,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     && !property.starts_with('#')
                 {
                     if ctx.methods.contains_key(&getter_key) {
+                        if let Some((function, keys)) =
+                            super::named_accessor::candidate(ctx, object, property, false)
+                        {
+                            return super::named_accessor::get(
+                                ctx, object, property, &function, &keys,
+                            );
+                        }
                         // The enclosing class is not an exact runtime receiver
                         // proof: `this` may be a subclass overriding this getter.
                         // Even exact instances can gain an own property or have

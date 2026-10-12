@@ -25,6 +25,7 @@ fn param(id: u32, name: &str) -> Param {
 
 fn field(name: &str) -> ClassField {
     ClassField {
+        origin: perry_hir::ClassFieldOrigin::Definition,
         name: name.to_string(),
         key_expr: None,
         ty: Type::Number,
@@ -161,6 +162,87 @@ fn synthesized_and_user_ctor_prologues_agree() {
         synthesized_fields,
         sorted(ctor_prologue_param_assigned_fields(&user))
     );
+}
+
+#[test]
+fn literal_birth_fills_do_not_repeat_definitions_in_the_shared_constructor() {
+    let mut literal = class(
+        vec![field("v"), field("w")],
+        Some(func(
+            vec![param(1, "v"), param(2, "w")],
+            vec![
+                synthesized_this_assign("v", 1),
+                synthesized_this_assign("w", 2),
+            ],
+        )),
+    );
+    literal.id = 12327;
+    literal.name = "__AnonShape_keyorder".into();
+    literal.constructor.as_mut().unwrap().is_strict = true;
+    assert!(
+        literal.is_literal_shape(),
+        "the fixture must exercise literal birth"
+    );
+    let compile = |class: Class| {
+        let mut module = Module::new("literal_birth_definitions.ts");
+        module.classes.push(class);
+        module.init_kind = ModuleInitKind::Eager;
+        String::from_utf8(
+            crate::compile_module(
+                &module,
+                crate::CompileOptions {
+                    emit_ir_only: true,
+                    output_type: "executable".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(!compile(literal.clone()).contains("call double @js_class_field_add("));
+    // The same stores in a declared class cannot stand in for its earlier
+    // DefineField operations: the fields exist in declaration order first.
+    literal.name = "Declared".into();
+    assert!(compile(literal).contains("call double @js_class_field_add("));
+}
+
+#[test]
+fn completed_numeric_layout_preserves_key_creation_without_generalizing_defaults() {
+    let mut c = class(
+        vec![field("v"), field("w")],
+        Some(func(
+            vec![param(1, "v"), param(2, "w")],
+            // Definition order must stay v,w even though stores run w,v.
+            vec![user_this_assign("w", 2), user_this_assign("v", 1)],
+        )),
+    );
+    // Class id zero denotes an imported stub, which has no local proof.
+    c.id = 1;
+    assert!(!c.is_imported_stub());
+    let mut module = Module::new("completed_numeric_layout.ts");
+    module.classes.push(c);
+    module.init_kind = ModuleInitKind::Eager;
+    let ir = String::from_utf8(
+        crate::compile_module(
+            &module,
+            crate::CompileOptions {
+                emit_ir_only: true,
+                output_type: "executable".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let definitions: Vec<_> = ir
+        .lines()
+        .filter(|line| line.contains("call double @js_class_field_add("))
+        .collect();
+    assert_eq!(definitions.len(), 2, "both membership events must run");
+    for definition in definitions {
+        assert!(definition.contains(", double 0.0)"), "{definition}");
+    }
 }
 
 /// The prologue is the MAXIMAL LEADING run: a statement that is not a plain
@@ -590,6 +672,7 @@ fn single_class_predicate_still_refuses_heritage() {
 
 fn captures_this_arrow_field() -> ClassField {
     ClassField {
+        origin: perry_hir::ClassFieldOrigin::Definition,
         name: "createEntity".to_string(),
         key_expr: None,
         ty: Type::Any,
@@ -622,6 +705,7 @@ fn captures_this_field_ir() -> String {
     let mut registry = class(
         vec![
             ClassField {
+                origin: perry_hir::ClassFieldOrigin::Definition,
                 name: "value".to_string(),
                 key_expr: None,
                 ty: Type::Number,
@@ -657,21 +741,18 @@ fn captures_this_field_ir() -> String {
         .expect("LLVM IR is UTF-8")
 }
 
-/// #8693: a captures-`this` arrow field on a fresh ordinary class instance
-/// must populate the field already present in the allocation's class-key
-/// shape. Full `DefineOwnProperty` marks the receiver dynamically shaped, so
-/// every exact-shape method guard inside the arrow would miss forever (the
-/// perform-ecs `createEntity = (...) => this.addComponentsToEntity(...)` case).
+/// Arrow fields use the same DefineField path as ordinary initializers, after
+/// patching their lexical this capture. The key is created at this store.
 #[test]
-fn captures_this_arrow_field_preserves_the_predeclared_class_shape() {
+fn captures_this_arrow_field_uses_define_field() {
     let ir = captures_this_field_ir();
     assert!(
-        ir.contains("call void @js_object_set_field_by_name("),
-        "the arrow field must fill its existing own slot:\n{ir}"
+        ir.contains("call double @js_class_field_add("),
+        "the arrow field must create its key at initialization:\n{ir}"
     );
     assert!(
-        !ir.contains("call double @js_class_field_add("),
-        "the ordinary arrow field must not dynamically reshape its receiver:\n{ir}"
+        ir.contains("call void @js_closure_set_capture_bits("),
+        "the arrow must retain its lexical this capture:\n{ir}"
     );
 }
 

@@ -196,27 +196,6 @@ fn is_valid_weak_target(value: f64) -> bool {
         return true;
     }
 
-    // #1545: a Web Stream handle (ReadableStream/WritableStream/...) does
-    // NOT travel as a POINTER_TAG value — it is a raw, un-NaN-boxed finite
-    // f64 holding the stream id in the `[0x100000, 0x200000)` band. It still
-    // denotes a real stream object, which CanBeHeldWeakly (ES2023): React's
-    // SSR `renderToReadableStream` path keys an internal WeakMap by the
-    // stream. Without this it threw "Invalid value used as weak map key" and
-    // 500'd the Next.js dynamic-SSR routes. The stdlib `stream_handle_probe`
-    // confirms a *live registered* stream, so a genuine plain number that
-    // merely happens to land in this band (and is not a stream) still
-    // throws, matching Node.
-    if value.is_finite() && value > 0.0 && value.fract() == 0.0 {
-        let id = value as usize;
-        if crate::value::addr_class::is_stream_id_band(id) {
-            if let Some(probe) = crate::object::stream_handle_probe() {
-                if unsafe { probe(id) } {
-                    return true;
-                }
-            }
-        }
-    }
-
     false
 }
 
@@ -1341,13 +1320,22 @@ fn remove_finalization_record_from_registry(registry: f64, record: f64) {
 pub const CLASS_ID_WEAKMAP: u32 = 0xFFFF_0027;
 pub const CLASS_ID_WEAKSET: u32 = 0xFFFF_0028;
 
-fn weak_collection_new(class: u32) -> *mut ObjectHeader {
-    crate::object::object_alloc_branded(class, u64::from(class))
+fn weak_collection_new(
+    class: u32,
+    site: &crate::object::shapes::BrandedBirthSite,
+) -> *mut ObjectHeader {
+    crate::object::object_alloc_branded(class, u64::from(class), site)
+}
+crate::perry_thread_local! {
+    static WEAKMAP_BIRTH_SITE: crate::object::shapes::BrandedBirthSite =
+        const { crate::object::shapes::BrandedBirthSite::new() };
+    static WEAKSET_BIRTH_SITE: crate::object::shapes::BrandedBirthSite =
+        const { crate::object::shapes::BrandedBirthSite::new() };
 }
 
 #[no_mangle]
 pub extern "C" fn js_weakmap_new() -> *mut ObjectHeader {
-    weak_collection_new(CLASS_ID_WEAKMAP)
+    WEAKMAP_BIRTH_SITE.with(|site| weak_collection_new(CLASS_ID_WEAKMAP, site))
 }
 
 include!("weakref/subclass.rs");
@@ -1465,7 +1453,7 @@ fn throw_invalid_weakset_value() -> ! {
 
 #[no_mangle]
 pub extern "C" fn js_weakset_new() -> *mut ObjectHeader {
-    weak_collection_new(CLASS_ID_WEAKSET)
+    WEAKSET_BIRTH_SITE.with(|site| weak_collection_new(CLASS_ID_WEAKSET, site))
 }
 
 /// `WeakSet ( [ iterable ] )`'s iterable-consumption loop. `set` is the
@@ -1617,11 +1605,9 @@ mod tests {
             "symbol-keyed WeakMap entry must round-trip"
         );
 
-        // #5437: a plain number is NOT weak-holdable, even one that lands in the
-        // Web Stream id band `[0x100000, 0x200000)`. Only a LIVE registered
-        // stream (confirmed by the stdlib `stream_handle_probe`, which is unset
-        // in a runtime-only test) is accepted — so a genuine numeric key still
-        // throws, matching Node. Guards against blanket-accepting the band.
+        // #5437: a plain number is NOT weak-holdable, even one whose value lies
+        // in the Web Stream id band `[0x100000, 0x200000)`: streams are
+        // `POINTER_TAG` handles, and a number is always a Number.
         assert!(
             !is_valid_weak_target(5.0),
             "plain number must not be weak-holdable"

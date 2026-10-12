@@ -27,23 +27,6 @@ fn remember_class_keys(class_id: u32, field_count: u32, keys: crate::object::Obj
         .insert(class_id, (keys.arr() as usize, field_count, keys.count()));
 }
 
-/// GC root scanner: rewrite each remembered keys-array address across a move.
-/// WEAK — the address is visited as metadata, never marked, so remembering a
-/// class's keys array does not keep it alive.
-pub fn scan_class_keys_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    let st = crate::state::state();
-    let mut map = st.object_hot.class_keys_by_id.borrow_mut();
-    for entry in map.values_mut() {
-        if entry.0 == 0 {
-            continue;
-        }
-        let mut addr = entry.0;
-        if visitor.visit_metadata_usize_slot(&mut addr) {
-            entry.0 = addr;
-        }
-    }
-}
-
 /// Post-trace death prune. A dropped entry costs one rebuild of the class's
 /// keys array — `registered_class_keys_array` already answers `None` for a
 /// zeroed address and every caller re-derives — which is what makes
@@ -81,8 +64,8 @@ pub(crate) fn prune_dead_class_keys_entries(is_dead_owner: &dyn Fn(usize) -> boo
 }
 
 /// This agent's memoized keys array for `class_id`. The address is current
-/// only until the next allocation: a caller that allocates before its last
-/// use must root it or read this again after the allocation.
+/// stable for the list lifetime (I3). A caller that allocates before its last
+/// use still roots it so a full trace retains the weakly held list.
 pub(crate) fn registered_class_keys_array(
     class_id: u32,
 ) -> Option<(crate::object::ObjectKeys, u32)> {
@@ -132,6 +115,21 @@ pub(crate) unsafe fn object_alloc_null_proto_with_key_attrs(
     entries: &[(&str, f64)],
     attrs: &[u8],
 ) -> *mut ObjectHeader {
+    object_alloc_null_proto_with_key_attrs_and_inline(entries, attrs, entries.len() as u32)
+}
+
+/// The same canonical birth with a bounded inline prefix. Remaining fixed
+/// positions use the existing traced spill store; no key-add or per-key
+/// attribute transitions are needed to establish them.
+///
+/// # Safety
+/// Same suppression and distinct-key requirements as the full-inline birth.
+pub(crate) unsafe fn object_alloc_null_proto_with_key_attrs_and_inline(
+    entries: &[(&str, f64)],
+    attrs: &[u8],
+    inline: u32,
+) -> *mut ObjectHeader {
+    debug_assert!(inline <= entries.len() as u32);
     debug_assert!(attrs.is_empty() || attrs.len() == entries.len());
     debug_assert!(crate::gc::gc_is_suppressed());
     let count = entries.len() as u32;
@@ -140,7 +138,7 @@ pub(crate) unsafe fn object_alloc_null_proto_with_key_attrs(
     }
     // Under suppression the unpublished bag cannot move or be traced before
     // its final keys and live bound are stamped. Publish no empty predecessor.
-    let obj = super::alloc_basic::object_alloc_unpublished(0, count);
+    let obj = super::alloc_basic::object_alloc_unpublished(0, inline);
     let with_attrs = attrs.iter().any(|&entry| entry != 0);
     let gc = (obj as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
     (*gc)._reserved |= crate::gc::OBJ_FLAG_NULL_PROTO;
@@ -177,7 +175,7 @@ pub(crate) unsafe fn object_alloc_null_proto_with_key_attrs(
         }
         canonical_keys::canonicalize(&proof, list, count)
     };
-    set_object_keys_with_live(obj, canonical.view(), count);
+    set_object_keys_with_live(obj, canonical.view(), inline);
     // The shape's keys are an external child edge. A previously traced
     // newborn bag can acquire this edge while incremental marking is active.
     crate::gc::runtime_shade_external_edge(
@@ -197,7 +195,11 @@ pub(crate) unsafe fn object_alloc_null_proto_with_key_attrs(
         }
     }
     for (i, (_, value)) in entries.iter().enumerate() {
-        store_object_field_slot(obj, i, value.to_bits());
+        if i < inline as usize {
+            store_object_field_slot(obj, i, value.to_bits());
+        } else {
+            super::spill::overflow_set(obj as usize, i, value.to_bits());
+        }
     }
     obj
 }
@@ -548,7 +550,7 @@ pub extern "C" fn js_build_class_keys_array(
         return cached.arr();
     }
     if field_count == 0 || packed_keys_len == 0 || packed_keys.is_null() {
-        let arr = crate::array::js_array_alloc_with_length_longlived(0);
+        let arr = crate::array::js_array_alloc_canonical_keys(0, true, false);
         let (_, keys) = shape_cache_insert(
             shape_id,
             crate::object::canonical_keys::LiveObject::none(),

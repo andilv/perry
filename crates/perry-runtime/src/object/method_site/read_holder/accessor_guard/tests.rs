@@ -65,9 +65,9 @@ fn shared_runtime_guards_reject_changed_facts_and_workers() {
 }
 
 #[test]
-fn inline_getter_word_proves_the_lane_is_not_spill() {
+fn callable_getter_word_is_retained_for_both_storage_locations() {
     if !crate::object::method_site::run_with_fresh_worker_gate(
-        "inline_getter_word_proves_the_lane_is_not_spill",
+        "callable_getter_word_is_retained_for_both_storage_locations",
     ) {
         return;
     }
@@ -94,11 +94,124 @@ fn inline_getter_word_proves_the_lane_is_not_spill() {
         let mut cache = [0; crate::object::PIC_CACHE_WORDS];
         cache[HOLDER_STATE] = STATE_REGISTERED; // stack cache never enters the root list
         unsafe { publish(&mut cache, &recv, &w, true) };
-        let expected = if slot & HOLDER_SLOT_SPILL != 0 {
-            0
-        } else {
-            getter
+        assert_eq!(cache[HOLDER_HOP_SHAPES] as usize, getter);
+    }
+}
+
+#[test]
+fn spill_accessor_uses_the_same_pair_and_shape_guards() {
+    if !crate::object::method_site::run_with_fresh_worker_gate(
+        "spill_accessor_uses_the_same_pair_and_shape_guards",
+    ) {
+        return;
+    }
+    let _lock = crate::gc::global_side_table_test_lock();
+    let _no_move = crate::gc::GcSuppressScope::new();
+    unsafe {
+        let holder = crate::object::js_object_alloc(0, 1);
+        for i in 0..24 {
+            let name = format!("spill_guard_padding_{i}");
+            let key = crate::string::canonical_key(name.as_bytes());
+            crate::object::js_object_set_field_by_name(holder, key, 1.0);
+        }
+        let install = |raw_get| {
+            crate::object::set_builtin_accessor_pair(
+                holder as usize,
+                "value".to_owned(),
+                crate::object::accessor_pair::Accessor {
+                    raw_get,
+                    ..Default::default()
+                },
+                crate::object::PropertyAttrs::new(true, false, true),
+            )
         };
-        assert_eq!(cache[HOLDER_HOP_SHAPES] as usize, expected);
+        install(8);
+        let recv = crate::object::js_object_create(crate::value::js_nanbox_pointer(holder as i64));
+        let recv = (recv.to_bits() & crate::value::POINTER_MASK) as *const ObjectHeader;
+        let acc = accessor_walk(recv, b"value").expect("spill accessor proof");
+        assert_ne!(acc.slot & HOLDER_SLOT_SPILL, 0, "exercise spill storage");
+        let mut hops = NO_HOPS;
+        hops[0].0 = acc.pair;
+        let w = Walk {
+            holder: acc.holder,
+            holder_shape: acc.shape,
+            slot: Some(acc.slot),
+            hops,
+            depth: 1,
+            getter: acc.getter,
+        };
+        let mut cache = [0; crate::object::PIC_CACHE_WORDS];
+        cache[HOLDER_STATE] = STATE_REGISTERED;
+        publish(&mut cache, recv, &w, true);
+        let token = (u64::from(object_shape_stamp(recv)) | PIC_ID_TOKEN_BIT) as i64;
+        assert_eq!(
+            validated_accessor::<true>(holder_words(&cache), token),
+            Some((8, acc.pair))
+        );
+        // A descriptor replacement can retain the slot and shape. The rooted
+        // pair comparison must reject that stale getter independently.
+        install(16);
+        assert!(validated_accessor::<true>(holder_words(&cache), token).is_none());
+        let changed = accessor_walk(recv, b"value").unwrap();
+        assert_ne!(changed.pair, acc.pair, "negative control changes the lane");
+        assert_eq!(changed.getter, 16);
+    }
+}
+
+#[test]
+fn emitted_spill_contract_rejects_missing_storage_bounds_and_replaced_pair() {
+    if !crate::object::method_site::run_with_fresh_worker_gate(
+        "emitted_spill_contract_rejects_missing_storage_bounds_and_replaced_pair",
+    ) {
+        return;
+    }
+    let _lock = crate::gc::global_side_table_test_lock();
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    unsafe {
+        let holder = crate::object::object_alloc_plain(0);
+        let pair = crate::object::accessor_pair::pair_new(Default::default());
+        let recv = ObjectHeader {
+            class_id: 0,
+            parent_class_id: crate::object::shapes::SHAPE_ID_BASE + 1,
+            meta: std::ptr::null_mut(),
+        };
+        let token = (u64::from(recv.parent_class_id) | PIC_ID_TOKEN_BIT) as i64;
+        let mut words = HolderEntry([0; HOLDER_STATE - HOLDER_RECV]);
+        words[HOLDER_RECV] = token;
+        words[HOLDER_OBJ] = holder as i64;
+        words[HOLDER_SHAPE] = i64::from(crate::object::shapes::object_shape_stamp(holder));
+        words[HOLDER_KIND] = (HOLDER_ACCESSOR | u64::from(HOLDER_SLOT_SPILL | 13)) as i64;
+        words[HOLDER_HOPS] = pair as i64;
+        words[HOLDER_HOP_SHAPES] = 8;
+        assert!(
+            validated_accessor::<true>(&words, token).is_none(),
+            "no spill buffer"
+        );
+        crate::object::spill::spill_set(
+            holder as usize,
+            13,
+            crate::value::POINTER_TAG | pair as u64,
+        );
+        words[HOLDER_SHAPE] = i64::from(crate::object::shapes::object_shape_stamp(holder));
+        assert_eq!(
+            validated_accessor::<true>(&words, token),
+            Some((8, pair as usize))
+        );
+        words[HOLDER_KIND] = (HOLDER_ACCESSOR | u64::from(HOLDER_SLOT_SPILL | 4095)) as i64;
+        assert!(
+            validated_accessor::<true>(&words, token).is_none(),
+            "slot outside the live buffer"
+        );
+        words[HOLDER_KIND] = (HOLDER_ACCESSOR | u64::from(HOLDER_SLOT_SPILL | 13)) as i64;
+        let replacement = crate::object::accessor_pair::pair_new(Default::default());
+        crate::object::spill::spill_set(
+            holder as usize,
+            13,
+            crate::value::POINTER_TAG | replacement as u64,
+        );
+        assert!(
+            validated_accessor::<true>(&words, token).is_none(),
+            "same shape, replaced lane pair"
+        );
     }
 }

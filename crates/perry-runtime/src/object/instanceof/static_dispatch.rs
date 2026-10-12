@@ -491,8 +491,8 @@ fn native_instanceof(
     }
 
     // #1545: Web Streams `instanceof ReadableStream` / `instanceof
-    // WritableStream`. Stream handles are numeric `id as f64`, so consult the
-    // stdlib kind-probe (1 = readable, 2 = writable) rather than the class
+    // WritableStream`. Stream handles are `POINTER_TAG` registry ids, so consult
+    // the stdlib kind-probe (1 = readable, 2 = writable) rather than the class
     // chain. Covers `ts.readable instanceof ReadableStream`,
     // `rs.pipeThrough(ts) instanceof ReadableStream`, etc.
     // kind probe values: 1 = readable, 2 = writable, 5 = transform
@@ -504,9 +504,9 @@ fn native_instanceof(
         || class_id == CLASS_ID_WRITABLE_STREAM
         || class_id == CLASS_ID_TRANSFORM_STREAM
     {
-        if value.is_finite() && value > 0.0 && value.fract() == 0.0 {
+        if let Some(id) = crate::object::stream_handle_id(value) {
             if let Some(probe) = crate::object::stream_handle_kind_probe() {
-                let kind = unsafe { probe(value as usize) };
+                let kind = unsafe { probe(id) };
                 let want = match class_id {
                     CLASS_ID_READABLE_STREAM => 1,
                     CLASS_ID_WRITABLE_STREAM => 2,
@@ -672,6 +672,21 @@ fn native_instanceof(
             // non-pointer-tagged and already falls through below. #6587 review.
             if unsafe { crate::symbol::js_is_symbol(value) != 0 } {
                 return false_val;
+            }
+            // Callable values (in particular closures) are objects whose
+            // `Object` membership depends on their live `[[Prototype]]`
+            // chain. Do not assume they still inherit through
+            // `Function.prototype`: user code can relink that object to null.
+            if value_is_callable(value) {
+                let matches = if let Some(constructor) = constructor {
+                    ordinary_has_instance_prototype_walk_rooted(rooted_value, constructor)
+                } else {
+                    let scope = crate::gc::RuntimeHandleScope::new();
+                    let object = scope
+                        .root_nanbox_f64(js_get_global_this_builtin_value(b"Object".as_ptr(), 6));
+                    ordinary_has_instance_prototype_walk_rooted(rooted_value, &object)
+                };
+                return if matches { true_val } else { false_val };
             }
             // A relinked class prototype (or a replaced instance prototype)
             // can end the chain before `Object.prototype`.

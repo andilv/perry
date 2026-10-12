@@ -114,6 +114,18 @@ pub(crate) const FIRST_DYNAMIC_PROTOTYPE_SERIAL: u64 = 64;
 static PROTOTYPE_SERIAL_NEXT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(FIRST_DYNAMIC_PROTOTYPE_SERIAL);
 
+/// Give a shared evaluation holder an identity without declaring it a
+/// prototype or invalidating prototype-chain caches. The existing identity
+/// word directory uses this same serial namespace.
+pub(crate) unsafe fn ensure_object_identity_serial(obj: *mut crate::object::ObjectHeader) -> u64 {
+    let meta = crate::object::object_meta_ensure(obj);
+    // GC_STORE_AUDIT(POINTER_FREE): a scalar identity, never a heap reference.
+    if (*meta).proto_serial == 0 {
+        (*meta).proto_serial = PROTOTYPE_SERIAL_NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    (*meta).proto_serial
+}
+
 /// Mark the freshly created intrinsic prototype `obj` and give it the
 /// reserved `serial` (below [`FIRST_DYNAMIC_PROTOTYPE_SERIAL`]). Every shape
 /// minted for a receiver inheriting from it — a base Function shape minted
@@ -200,18 +212,24 @@ pub(crate) unsafe fn mark_exotic_read_receiver(obj: usize) {
 /// `obj` is a live heap address, or 0.
 #[inline]
 pub(crate) unsafe fn object_is_exotic_read_receiver(obj: usize) -> bool {
+    if let Some(header) = crate::value::addr_class::try_read_gc_header(obj) {
+        if header.obj_type == crate::gc::GC_TYPE_OBJECT
+            && header._reserved & crate::gc::OBJ_FLAG_ARGUMENTS != 0
+        {
+            return true;
+        }
+    }
     meta_flag_is_set(obj, crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER)
 }
 
 /// Get (allocating if needed) the meta record that carries this module's two
 /// classification flags.
 ///
-/// The flags live in `ObjectMeta::flags`, NOT in `GcHeader::_reserved`. The
-/// header word has no free bits, and the two that looked free are owned by
-/// `gc/layout.rs`, which CLEARS them on layout-state transitions that have
-/// nothing to do with either fact — a flag placed there is silently ERASED and
-/// its reader then answers `false` for an object the writer marked. The
-/// complete map is on `gc::OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC`.
+/// These dynamically installed flags live in `ObjectMeta::flags`. Arguments
+/// instead have an allocation-owned brand in the OBJECT namespace of the GC
+/// header; the complete, kind-specific map is on
+/// `gc::OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC`. Array and closure layout bits must
+/// never be interpreted as these object facts.
 ///
 /// A receiver that does not yet carry `flag` first moves onto a PRIVATE shape
 /// lineage (`transition_object_shape_semantics`: a counter-unique semantic

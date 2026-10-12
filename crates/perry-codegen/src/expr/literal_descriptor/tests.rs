@@ -50,6 +50,7 @@ fn fixture(records: usize, fields: usize) -> Module {
         heritage_lexically_shadowed: false,
         fields: (0..fields)
             .map(|i| ClassField {
+                origin: perry_hir::ClassFieldOrigin::Definition,
                 name: format!("k{i}"),
                 ty: Type::Number,
                 key_expr: None,
@@ -357,11 +358,11 @@ fn born_wide_constfn_final_preserves_reserved_capacity() {
     let text = String::from_utf8(crate::compile_module(&module, options).unwrap()).unwrap();
     let calls: Vec<_> = text
         .lines()
-        .filter(|line| line.contains("call i64 @js_object_finalize_constfn_static("))
+        .filter(|line| line.contains("call i64 @js_object_alloc_constfn_static("))
         .collect();
     assert_eq!(calls.len(), 1, "finalization must be emitted");
     assert!(
-        calls[0].contains(", i32 2, i32 3, i32 0, i64 "),
+        calls[0].contains(", i32 2, i32 3, i32 ") && calls[0].contains(", i64 "),
         "finalization must preserve live width: {}",
         calls[0]
     );

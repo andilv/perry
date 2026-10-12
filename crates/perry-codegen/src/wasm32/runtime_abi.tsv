@@ -42,6 +42,9 @@ js_argon2_verify	ptr	ptr,ptr
 js_argon2_verify_sync	i32s	ptr,ptr
 js_arguments_bundle_get_slow	f64	f64,f64,f64,ptr,i32s
 js_arguments_bundle_index_get	f64	f64,f64
+js_arguments_call_spread	f64	f64,ptr,f64,i64,f64,f64
+js_arguments_forward_apply	f64	f64,f64,f64,f64
+js_arguments_length_value	f64	f64
 js_arguments_object_alloc	ptr	f64,f64,i32s
 js_arguments_object_alloc_mapped	ptr	f64,f64,i32u
 js_arguments_object_map_index	void	ptr,i32u,ptr
@@ -49,6 +52,7 @@ js_array_alloc	ptr	i32u
 js_array_alloc_literal	ptr	i32u
 js_array_alloc_with_length	ptr	i32u
 js_array_alloc_with_length_longlived	ptr	i32u
+js_array_append_set	f64	f64,f64,f64,i32s,f64
 js_array_at	f64	ptr,f64
 js_array_buffer_new	ptr	i32s
 js_array_buffer_new_value	ptr	f64
@@ -158,6 +162,7 @@ js_array_record_literal	f64	ptr,i32u
 js_array_record_literal_needs_iterator	i32s	ptr
 js_array_record_needs_iterator	i32s	f64
 js_array_record_stack_dispatch	f64	ptr,i32u
+js_array_record_stack_enter	i32s	ptr,ptr,i32u
 js_array_reduce	f64	ptr,ptr,i32s,f64
 js_array_reduce_right	f64	ptr,ptr,i32s,f64
 js_array_refresh_local_head	f64	f64
@@ -177,6 +182,7 @@ js_array_set_length_strict	void	ptr,f64
 js_array_set_string_key	ptr	ptr,ptr,f64
 js_array_shift_f64	f64	ptr
 js_array_slice	ptr	ptr,i32s,i32s
+js_array_slice_method	f64	f64,f64,f64,usize
 js_array_slice_values	ptr	ptr,f64,f64
 js_array_some	f64	ptr,ptr
 js_array_some_captureless	f64	ptr,ptr
@@ -648,9 +654,12 @@ js_clear_immediate_value	void	f64
 js_clear_interval_value	void	f64
 js_clear_timeout_value	void	f64
 js_closure_alloc	ptr	ptr,i32u
+js_closure_alloc_empty	ptr	ptr,i32u
+js_closure_alloc_fixed	ptr	ptr,i64u,ptr
 js_closure_alloc_init	ptr	ptr,i32u,ptr
 js_closure_alloc_init_boxed	ptr	ptr,i32u,ptr
 js_closure_alloc_singleton	ptr	ptr
+js_closure_alloc_small	ptr	ptr,i64u,i64u,i64u,i64u
 js_closure_alloc_with_captures_singleton	ptr	ptr,i32u,ptr
 js_closure_call0	f64	ptr,i64
 js_closure_call1	f64	ptr,i64,f64
@@ -1497,6 +1506,9 @@ js_gc_write_barriers_emitted	void	i32u
 js_ge	i64	i64,i64
 js_generator_attach_closure_prototype	f64	f64,ptr
 js_generator_attach_prototype	f64	f64,i32s
+js_generator_create	f64	f64,ptr
+js_generator_result	f64	f64,i32s
+js_generator_set_slot	void	ptr,i32u,i64,i32s
 js_get_async_iterator	f64	f64
 js_get_cjs_main_module	f64	
 js_get_current_step_closure	ptr	
@@ -1899,6 +1911,10 @@ js_method_site_call_value	f64	f64,f64,ptr,usize
 js_method_site_call_value_apply	f64	f64,f64,i64
 js_method_site_lookup	f64	ptr,f64,i64,usize,ptr
 js_method_site_miss	f64	ptr,i64,f64,i64,ptr,usize
+js_method_site_miss0	f64	ptr,i64,f64,i64
+js_method_site_miss1	f64	ptr,i64,f64,i64,f64
+js_method_site_miss2	f64	ptr,i64,f64,i64,f64,f64
+js_method_site_miss3	f64	ptr,i64,f64,i64,f64,f64,f64
 js_method_site_prepare	f64	ptr,f64,i64,usize
 js_method_site_stats	f64	i32s
 js_microtasks_pending	i32s	
@@ -2518,6 +2534,7 @@ js_object_alloc_class_dynamic_parent	ptr	i32u,i32u,ptr,i32u
 js_object_alloc_class_inline_keys	ptr	i32u,i32u,i32u,ptr
 js_object_alloc_class_inline_keys_stamped	ptr	i32u,i32u,i32u,ptr,i32u,i64
 js_object_alloc_class_with_keys	ptr	i32u,i32u,i32u,ptr,i32u
+js_object_alloc_constfn_static	i64	i32u,ptr,i32u,i32u,i32u,i32u,i64,ptr,i32u,ptr
 js_object_alloc_fast	ptr	i32u,i32u
 js_object_alloc_fast_with_parent	ptr	i32u,i32u,i32u
 js_object_alloc_null_proto	ptr	i32u,i32u
@@ -2596,6 +2613,8 @@ js_object_literal_infer_computed_function_name	f64	f64,f64
 js_object_literal_set_computed	f64	f64,f64,f64
 js_object_literal_set_prototype	f64	f64,f64
 js_object_literal_spread	f64	f64,f64
+js_object_spread_fresh	f64	f64,f64
+js_object_spread_fresh_leading	f64	f64,f64
 js_object_literal_to_property_key	f64	f64
 js_object_live_slot_count	i32u	ptr
 js_object_lookup_getter	f64	f64,f64
@@ -3198,7 +3217,7 @@ js_regexp_exec_get_groups	i64
 js_regexp_exec_get_index	f64	
 js_regexp_get_flags	ptr	ptr
 js_regexp_get_source	ptr	ptr
-js_regexp_literal	ptr	ptr,ptr,i64
+js_regexp_literal	ptr	i64
 js_regexp_new	ptr	ptr,ptr
 js_regexp_test	i32s	ptr,ptr
 js_regexp_to_string	ptr	ptr
@@ -3598,6 +3617,7 @@ js_string_end_index_to_i32	i32s	f64,i32s
 js_string_ends_with	i32s	ptr,ptr
 js_string_ends_with_at	i32s	ptr,ptr,i32s
 js_string_equals	i32s	ptr,ptr
+js_string_equals_value	i32s	f64,f64
 js_string_error	void	ptr
 js_string_fixed	ptr	ptr
 js_string_fontcolor	ptr	ptr,ptr

@@ -176,6 +176,7 @@ fn cell_class() -> Class {
         extends_expr: None,
         heritage_lexically_shadowed: false,
         fields: vec![ClassField {
+            origin: perry_hir::ClassFieldOrigin::Definition,
             name: "v".to_string(),
             key_expr: None,
             ty: Type::Number,
@@ -442,6 +443,37 @@ fn gc_leaf_attribute_constructs_on_invoke() {
         invoke.contains("#0") && printed.contains("attributes #0 = { \"gc-leaf-function\" }"),
         "invoke lost its gc-leaf-function call-site attribute:\n{printed}"
     );
+}
+
+/// Split units construct calls from lines rather than LLVM's text parser.
+/// Array admission must retain purity and the leaf contract on that path.
+#[test]
+fn pure_array_key_call_attributes_survive_native_construction() {
+    let ctx = Context::create();
+    let module = crate::inprocess::parse_ir_text(
+        &ctx,
+        "declare i32 @perry_array_index_normalize_i32(double)\n",
+        "pure_key_skeleton",
+    )
+    .expect("skeleton parses");
+    let function = r#"define i32 @read_key(double %key) {
+entry:
+  %index = call i32 @perry_array_index_normalize_i32(double %key) nounwind willreturn memory(none) "gc-leaf-function"
+  ret i32 %index
+}
+"#;
+    predeclare_function_from_text(&ctx, &module, function).expect("predeclare");
+    add_function_from_text(&ctx, &module, function).unwrap_or_else(|e| panic!("{e:#}"));
+    module.verify().expect("native module verifies");
+    let printed = module.print_to_string().to_string();
+    for effect in [
+        "nounwind",
+        "willreturn",
+        "memory(none)",
+        "\"gc-leaf-function\"",
+    ] {
+        assert!(printed.contains(effect), "missing {effect}: {printed}");
+    }
 }
 
 /// #9050: Apple arm64's hot-TLS reader is value-returning inline asm, not the

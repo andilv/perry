@@ -51,7 +51,7 @@ pub(crate) unsafe fn fetch_subclass_handle_id(obj: usize) -> Option<i64> {
     // (`GC_HEADER_SIZE + 0x1000`) plus `is_valid_obj_ptr` is a magnitude test
     // only — `is_valid_obj_ptr`'s `HEAP_MIN` is 0x1000 — so every Web Fetch
     // handle id sailed through it: they live in `[0x40000, 0xE0000)`, well
-    // above the floor and well below `HANDLE_BAND_MAX` (0x100000). `new
+    // above the floor and well below `HANDLE_BAND_MAX` (2 MiB). `new
     // Response(...)` yields id 0x40000 exactly, and `r instanceof Request`
     // reaches here, so the very first fetch handle a program allocates
     // dereferenced 0x3fff8 and took a SIGSEGV. `is_plausible_heap_addr` is the
@@ -157,7 +157,7 @@ pub(crate) unsafe fn temporal_subclass_cell(obj: usize) -> Option<f64> {
     // check but are NOT heap pointers.  On Linux (HEAP_MIN = 0x1000) the old
     // `is_valid_obj_ptr` guard passed them too, causing a SIGSEGV when the
     // GC header was read at (proxy_id − 8).  `is_plausible_heap_addr` rejects
-    // the entire handle band [0, 0x100000) unconditionally.
+    // the entire handle band [0, HANDLE_BAND_MAX) unconditionally.
     if !crate::value::addr_class::is_plausible_heap_addr(obj) {
         return None;
     }
@@ -226,7 +226,7 @@ mod get_field_by_name;
 #[cfg(test)]
 mod get_field_by_name_probe_tests;
 mod get_field_by_name_tail;
-mod has_property;
+pub(crate) mod has_property;
 mod has_property_ic;
 mod ic_miss;
 #[cfg(test)]
@@ -331,8 +331,9 @@ pub(crate) use ic_miss::{
     private_lexical_brand_stack_savepoint, private_member_access_hints_restore,
     private_member_access_hints_savepoint, private_member_call_by_name, private_member_get_by_name,
     private_member_set_by_name, scan_private_lexical_brand_roots_mut, set_method_value_name,
-    stamp_private_evaluation_brand, take_private_method_call_hint, take_private_method_owner_hint,
-    IntrinsicPrivateReadSite, PrivateHintBrandScope,
+    stamp_private_birth_evaluation_brand, stamp_private_evaluation_brand,
+    take_private_method_call_hint, take_private_method_owner_hint, IntrinsicPrivateReadSite,
+    PrivateHintBrandScope,
 };
 pub use ic_miss::{
     js_class_field_add, js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,

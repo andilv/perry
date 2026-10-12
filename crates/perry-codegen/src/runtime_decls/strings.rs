@@ -213,8 +213,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     //     (see crates/perry-runtime/src/closure.rs); the call site cap in
     //     lower_call.rs matches.
     module.declare_function("js_closure_alloc", I64, &[PTR, I32]);
+    module.declare_function("js_closure_alloc_empty", I64, &[PTR, I32]);
+    module.declare_function("js_closure_alloc_fixed", I64, &[PTR, I64, PTR]);
     module.declare_function("js_closure_alloc_init", I64, &[PTR, I32, PTR]);
     module.declare_function("js_closure_alloc_init_boxed", I64, &[PTR, I32, PTR]);
+    module.declare_function("js_closure_alloc_small", I64, &[PTR, I64, I64, I64, I64]);
     // Singleton-cached variant for non-capturing closures and FuncRef
     // wrappers — the same body info returns the same cached ClosureHeader,
     // skipping per-evaluation closure allocation on the hot loop. See
@@ -710,7 +713,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     module.declare_function("js_dyn_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_dyn_index_get_site", DOUBLE, &[PTR, DOUBLE, DOUBLE]);
-    module.declare_function("js_region_holder_read", I32, &[PTR, DOUBLE, PTR, I32, PTR, I32]);
+    module.declare_function(
+        "js_region_holder_read",
+        I32,
+        &[PTR, DOUBLE, PTR, I32, PTR, I32],
+    );
     // #8655: guarded packed-array / dense Array-subclass read before the
     // fully generic dynamic dispatcher. Used by unknown-receiver loop reads,
     // and (#T2) the single out-of-line exit of the emitted dynamic `obj[i]`
@@ -766,6 +773,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_string_replace_string", I64, &[I64, I64, I64]);
     module.declare_function("js_string_replace_all_string", I64, &[I64, I64, I64]);
     module.declare_function("js_string_equals", I32, &[I64, I64]);
+    module.declare_function("js_string_equals_value", I32, &[DOUBLE, DOUBLE]);
     module.declare_function("js_string_compare", I32, &[I64, I64]);
     // Repsel Phase 3a (canonical-Str locals): boxed-operand variants for the
     // non-proven-heap compare arms. `js_jsvalue_equals` content-compares
@@ -1104,6 +1112,17 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_bool_box_alloc", I64, &[I32]);
     module.declare_function("js_bool_box_get", I32, &[I64]);
     module.declare_function("js_bool_box_set", VOID, &[I64, I32]);
+    module.declare_function(
+        "js_arguments_call_spread",
+        DOUBLE,
+        &[DOUBLE, PTR, DOUBLE, I64, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_arguments_forward_apply",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function("js_arguments_length_value", DOUBLE, &[DOUBLE]);
     module.declare_function("js_arguments_object_alloc", I64, &[DOUBLE, DOUBLE, I32]);
     module.declare_function(
         "js_arguments_object_alloc_mapped",
@@ -1203,6 +1222,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         "js_object_finalize_constfn_static",
         I64,
         &[I64, I32, PTR, I32, I32, I32, I32, I64, PTR, I32],
+    );
+    module.declare_function(
+        "js_object_alloc_constfn_static",
+        I64,
+        &[I32, PTR, I32, I32, I32, I32, I64, PTR, I32, PTR],
     );
     module.declare_function("js_shape_seed_plain", I32, &[I32, PTR, I32, I32, I32, I64]);
     module.declare_function("js_shape_register_static_seed", VOID, &[PTR]);
@@ -1381,7 +1405,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // how #9859's five segment-view externs were caught, after twelve passing
     // unit tests. `runtime_decls::tests` asserts the name AND the arity: a
     // wrong arity parses and miscompiles.
-    module.declare_function("js_regexp_literal", I64, &[I64, I64, I64]);
+    module.declare_function("js_regexp_literal", I64, &[I64]);
     // Full ECMAScript RegExp constructor: NaN-boxed pattern + flags in, handles
     // RegExp/undefined/object patterns and ToString-coerced flags.
     module.declare_function("js_regexp_construct", I64, &[DOUBLE, DOUBLE]);
@@ -1600,8 +1624,16 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // invokes the constructor with IMPLICIT_THIS bound to the new
     // instance. Returns the NaN-boxed new instance pointer.
     module.declare_function("js_new_function_construct", DOUBLE, &[DOUBLE, PTR, I64]);
-    module.declare_function("js_new_function_construct_site", DOUBLE, &[DOUBLE, PTR, I64, PTR]);
-    module.declare_function("js_class_value_super_construct_site", DOUBLE, &[DOUBLE, DOUBLE, PTR, I64, PTR]);
+    module.declare_function(
+        "js_new_function_construct_site",
+        DOUBLE,
+        &[DOUBLE, PTR, I64, PTR],
+    );
+    module.declare_function(
+        "js_class_value_super_construct_site",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, PTR, I64, PTR],
+    );
     module.declare_function("js_function_ctor_from_strings", DOUBLE, &[PTR, I64]);
     // `new <callee>(...spread)` — codegen folds every argument (regular +
     // spread-expanded) into one JS array and hands it here; the runtime

@@ -437,7 +437,7 @@ pub(crate) enum GcLargeObjectPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GcMoveHookKind {
     None,
-    ObjectOverflowFields,
+    ObjectModuleWrapper,
     ClosureDynamicProps,
     MapForeachStack,
     SetSideTables,
@@ -572,7 +572,7 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcExternalBytePolicy::InlinePayload,
         GcLargeObjectPolicy::OldArenaWhenOverThreshold,
         false,
-        GcMoveHookKind::ObjectOverflowFields,
+        GcMoveHookKind::ObjectModuleWrapper,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
@@ -1171,8 +1171,7 @@ pub(crate) fn run_gc_rewrite_hook(obj_type: u8, user_ptr: usize) {
 pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user: usize) {
     match gc_type_info(obj_type).map_or(GcMoveHookKind::None, |info| info.move_hook_kind) {
         GcMoveHookKind::None => {}
-        GcMoveHookKind::ObjectOverflowFields => {
-            crate::object::overflow_fields_owner_moved(old_user, new_user);
+        GcMoveHookKind::ObjectModuleWrapper => {
             // The residual `Object.setPrototypeOf` registry is rekeyed by the
             // relocation funnel for every owner kind (`gc/layout/transfer.rs`),
             // which runs before this hook on every move.
@@ -1204,8 +1203,7 @@ pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user
 
 pub(crate) fn gc_type_clear_dead_payload_side_tables(obj_type: u8, user_ptr: usize) {
     match gc_type_info(obj_type).map_or(GcMoveHookKind::None, |info| info.move_hook_kind) {
-        GcMoveHookKind::ObjectOverflowFields => {
-            crate::object::clear_overflow_for_ptr(user_ptr);
+        GcMoveHookKind::ObjectModuleWrapper => {
             crate::object::clear_module_wrapper_for_dead_ptr(user_ptr);
             // The old per-object KEYS_INDEX prune is gone (#6759 C1): key
             // indexes are shape records keyed on keys_array identity now,
@@ -1376,6 +1374,13 @@ pub const GC_FLAG_PINNED: u8 = 0x04;
 /// Without the bit the clone fires on every property added to every
 /// fresh object literal — a 20-property row object allocates 19
 /// throwaway keys_array clones per row.
+/// In old generation this also pins MOVEMENT (I3), including old-page defrag
+/// and idle compaction. It does not pin liveness: full GC still sweeps a dead
+/// backing. Canonical key lists are born old with this bit; owned key lists
+/// remain movable. Key strings and the attributes child retain normal tracing.
+/// This bit belongs only to private key/attribute array storage: its words
+/// never name foreign proxy, Fetch or pool handles. The collector may use that
+/// source-word proof; the referenced children's descriptors remain authoritative.
 pub const GC_FLAG_SHAPE_SHARED: u8 = 0x08;
 /// Set on strings that live in the intern table. Prevents in-place
 /// mutation and allows `js_object_set_field_by_name` to skip the
@@ -1628,6 +1633,12 @@ pub(crate) const GC_ARRAY_NAMED_PROPS: u16 = 0x100;
 /// MUST match `PLAIN_ORDINARY_OBJ_FLAG` in
 /// `perry-codegen/src/expr/proxy_reflect.rs`, which emits it as a literal.
 pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
+/// This OBJECT allocation has an Arguments private tail. Its class id stays
+/// zero: the identity does not invent a constructor or private class fields.
+/// Bit 12 is free on OBJECT, whose layout is entirely a ShapeId fact. Array
+/// and closure layout bits are interpreted only after their own kind guard;
+/// object layout transitions never write these bits, and copying preserves it.
+pub(crate) const OBJ_FLAG_ARGUMENTS: u16 = 0x1000;
 /// # `GcHeader::_reserved` bit map by GC kind
 ///
 /// Read this before spending a bit. It is the only place both namespaces are
@@ -1647,7 +1658,7 @@ pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
 /// | 9 | `OBJ_FLAG_PLAIN_ORDINARY` | `GC_ARRAY_ARGUMENTS_OBJECT` | |
 /// | 10 | `OBJ_FLAG_STABLE_TOMBSTONES` | `OBJ_FLAG_ARRAY_DESCRIPTORS` | |
 /// | 11 | `OBJ_FLAG_HAS_DESCRIPTORS` | element shape (#7480) | |
-/// | 12 | available | `GC_ARRAY_RAW_F64_HOLES` | |
+/// | 12 | `OBJ_FLAG_ARGUMENTS` | `GC_ARRAY_RAW_F64_HOLES` | |
 /// | 13 | available | `GC_LAYOUT_ALL_POINTERS` | closure/array layout only |
 /// | 14..15 | available | `GC_LAYOUT_STATE_MASK` | closure/array layout only |
 ///
@@ -1656,7 +1667,7 @@ pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
 /// preserves a pre-existing permanent pin.
 /// These types have no dynamic layout-slot state; no header or cell grows.
 ///
-/// Object layout is a ShapeId fact. Bits 7 and 12..15 have no object
+/// Object layout is a ShapeId fact. Bits 7 and 13..15 have no object
 /// layout meaning; array and closure layout metadata still uses its listed
 /// bits. Any new header use must be checked against every GC kind.
 pub const OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC: () = ();

@@ -257,20 +257,20 @@ pub fn scan_closure_dynamic_props_roots_mut(visitor: &mut crate::gc::RuntimeRoot
 /// Is `ptr` a live function object (`GC_TYPE_CLOSURE` cell)? Safe for an
 /// ARBITRARY word: it proves ownership before trusting any header byte.
 ///
-/// Two terms, cheapest and most selective first:
+/// The address must first be proven to belong to readable GC storage:
+/// arena-page membership for arena cells, or an exact tracked-allocation hit
+/// for malloc-backed cells. Only then may the payload shape word be read.
+///
+/// Two terms, cheapest and most selective after ownership:
 ///
 /// 1. the word at +4 is an exotic-band ShapeId. Every closure is born with one
 ///    (`closure::shape`), and shape rule 3 keeps every non-object kind's +4
 ///    below the ShapeId range, while an `ObjectHeader`'s +4 is an ordinary- or
 ///    dictionary-band id — so arrays, strings, Maps, plain objects and class
 ///    instances all fail here with one load, the job the old "CLOS" magic did;
-/// 2. ownership, then the authoritative kind byte: arena page membership
-///    (`classify_heap_generation`, the page-class table — the same proof the
-///    pre-shape predicate used) or, for a cell in no arena, an exact
-///    malloc-registry hit (`try_read_tracked_gc_header`); then the GcHeader
-///    type byte says CLOSURE and the cell is not an evacuated stub. The
-///    general tracked resolver's range search measured 17% of a `fn.length`
-///    read, which is why the arena case does not take it.
+/// 2. the authoritative kind byte says CLOSURE and the cell is not an
+///    evacuated stub. The general tracked resolver's range search measured
+///    17% of a `fn.length` read, which is why the arena case does not take it.
 pub fn is_closure_ptr(ptr: usize) -> bool {
     // Reject the native / Web-Fetch small-handle band (see `value::addr_class`)
     // and anything outside the platform heap range BEFORE the +4 load: fetch
@@ -284,18 +284,27 @@ pub fn is_closure_ptr(ptr: usize) -> bool {
     if !ptr.is_multiple_of(std::mem::align_of::<ClosureHeader>()) {
         return false;
     }
+    let in_arena = !matches!(
+        crate::arena::classify_heap_generation(ptr),
+        crate::arena::HeapGeneration::Unknown
+    );
+    let tracked_header = if in_arena {
+        None
+    } else {
+        // SAFETY: the tracked-header reader checks for an exact allocation
+        // before returning a header pointer.
+        unsafe { crate::value::addr_class::try_read_tracked_gc_header(ptr) }
+    };
+    if !in_arena && tracked_header.is_none() {
+        return false;
+    }
+
+    // Ownership above is the proof that this payload byte is readable.
     let shape = unsafe { *((ptr as *const u8).add(super::CLOSURE_SHAPE_OFFSET) as *const u32) };
     if !crate::object::shapes::is_exotic_shape_id(shape) {
         return false;
     }
-    let (obj_type, gc_flags) = if matches!(
-        crate::arena::classify_heap_generation(ptr),
-        crate::arena::HeapGeneration::Unknown
-    ) {
-        let Some(header) = (unsafe { crate::value::addr_class::try_read_tracked_gc_header(ptr) })
-        else {
-            return false;
-        };
+    let (obj_type, gc_flags) = if let Some(header) = tracked_header {
         let header = unsafe { header.as_ref() };
         (header.obj_type, header.gc_flags)
     } else {
@@ -428,8 +437,9 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
     // Resolve its birth value before any inherited property lookup; once a
     // bag key exists, its value (including undefined) already won above.
     if prop == "name" && crate::object::has_own_helpers::closure_own_key_present(ptr, prop) {
-        let code = unsafe { (*(ptr as *const ClosureHeader)).code() } as usize;
-        let name = crate::builtins::function_name_for_ptr(code).unwrap_or_default();
+        let name =
+            unsafe { crate::builtins::function_name_for_closure(ptr as *const ClosureHeader) }
+                .unwrap_or_default();
         let name = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         return crate::value::js_nanbox_string(name as i64);
     }
@@ -854,11 +864,11 @@ mod tests_1802 {
     }
 
     /// #4740: `is_closure_ptr` must NOT dereference an address in the
-    /// `[0x10000, 0x100000)` native-handle band. Web Fetch response handles
+    /// `[0x10000, HANDLE_BAND_MAX)` native-handle band. Web Fetch response handles
     /// (`0x40000+`), node:http / axios / fastify ids live there and are not
     /// real pointers — probing `*(ptr + 12)` for `CLOSURE_MAGIC` on one reads
     /// a tiny unmapped address (the reported `0x4000c`) and SIGSEGVs on the
-    /// IC-miss property-lookup path. With the floor at `0x100000` the probe is
+    /// IC-miss property-lookup path. With the floor at `HANDLE_BAND_MAX` the probe is
     /// skipped and these return `false` without touching memory. Complements
     /// the #4739 own-field-probe integration repro with a direct unit assertion
     /// on the predicate's floor.
@@ -873,6 +883,45 @@ mod tests_1802 {
                  without dereferencing the handle as a pointer",
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_heap_range_word_is_rejected_before_shape_read() {
+        use std::ptr;
+
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let mapping = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                page,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED, "mmap failed");
+        struct Mapping(*mut libc::c_void, usize);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                unsafe { libc::munmap(self.0, self.1) };
+            }
+        }
+        let _mapping = Mapping(mapping, page);
+        // Payload begins immediately after the GC header, so the old
+        // payload-minus-header probe and the +4 shape read both hit PROT_NONE.
+        let ptr = mapping as usize + crate::gc::GC_HEADER_SIZE;
+        assert!(crate::value::addr_class::is_above_handle_band(ptr));
+        assert!(ptr.is_multiple_of(std::mem::align_of::<ClosureHeader>()));
+        assert!(crate::value::addr_class::is_valid_obj_ptr(mapping.cast()));
+        assert_eq!(
+            crate::arena::classify_heap_generation(ptr),
+            crate::arena::HeapGeneration::Unknown
+        );
+        assert!(unsafe { crate::value::addr_class::try_read_tracked_gc_header(ptr) }.is_none());
+
+        assert!(!is_closure_ptr(ptr));
     }
 
     /// A managed cell's GC kind must outrank a +4 word that merely looks like

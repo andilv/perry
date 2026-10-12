@@ -487,6 +487,26 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
             {
                 return super::private_field_site::lower_set(ctx, site, property, value);
             }
+            if let Some((function, keys)) =
+                super::named_accessor::candidate(ctx, object, property, true)
+            {
+                return with_class_store_operands(ctx, object, value, |ctx, receiver, rhs| {
+                    crate::rooting::with_rooted_group(ctx, 1, |ctx, group| {
+                        let saved =
+                            group.adopt_emitted(ctx, crate::rooting::Repr::Boxed, &rhs, true);
+                        super::named_accessor::emit(
+                            ctx,
+                            &receiver,
+                            property,
+                            &function,
+                            &keys,
+                            Some(&rhs),
+                            assignment_strict,
+                        )?;
+                        Ok(group.reread_emitted(ctx, saved))
+                    })
+                });
+            }
             // Step 4b: a planned-bare store inside a region's F-body.
             if let Some(v) =
                 crate::stmt::region_loop::try_lower_bare_put(ctx, expr, object, property, value)?
@@ -867,6 +887,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -
                             },
                         );
                     }
+                }
+                // Reservation slots do not establish a key layout. Serve both
+                // first stores and overwrites from the same static-key IC,
+                // whose guard observes the receiver's actual current shape.
+                if crate::expr::class_field_inline_guard::class_instances_have_constructor_reservations(
+                    ctx, &class_name,
+                ) {
+                    return lower_put_value_property_set_by_name(
+                        ctx, object, property, value, assignment_strict,
+                    );
                 }
                 // #9459: SLOPPY code stops here. Every class-field arm below
                 // terminates in `js_class_field_set_ic` /

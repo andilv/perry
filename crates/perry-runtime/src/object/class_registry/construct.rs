@@ -94,9 +94,9 @@ unsafe fn construct_function_impl(
     }
     // #10507: an ordinary compiled function is none of the exotic callees
     // below — a fact of its body, read once from its info.
-    if let Some(closure) = compiled_function::ordinary_compiled_function(func_value) {
+    if let Some(closure) = compiled_function::ordinary_compiled_function_at_site(func_value, site) {
         if let Some(result) = compiled_function::construct_ordinary_compiled_function(
-            func_value, closure, args_ptr, args_len,
+            func_value, closure, args_ptr, args_len, site,
         ) {
             return result;
         }
@@ -1259,19 +1259,7 @@ unsafe fn construct_registered_class_ref_entry(
     args_len: usize,
     entry: Option<(usize, u32, u32)>,
 ) -> f64 {
-    let inst = if let Some((keys_array, field_count)) = registered_class_keys_array(instance_cid) {
-        crate::object::alloc::alloc_class_instance_with_keys(
-            instance_cid,
-            0,
-            field_count,
-            keys_array,
-        )
-    } else {
-        js_object_alloc(
-            instance_cid,
-            crate::object::learned_inline_field_count(instance_cid),
-        )
-    };
+    let inst = allocate_class_instance(instance_cid).0;
     // #2768: a registered-class constructor reached through this path — static
     // `new ClassName()`, a first-class ClassRef `new`, or `Reflect.construct`
     // with a distinct newTarget — must observe `new.target` inside its body.
@@ -1654,16 +1642,7 @@ pub(crate) fn is_callable_function_value(value: f64) -> bool {
         return false;
     }
     let ptr = jv.as_pointer() as *const crate::closure::ClosureHeader;
-    if ptr.is_null() {
-        return false;
-    }
-    if !(ptr as usize).is_multiple_of(std::mem::align_of::<crate::closure::ClosureHeader>()) {
-        return false;
-    }
-    if !is_valid_obj_ptr(ptr as *const u8) {
-        return false;
-    }
-    unsafe { crate::closure::closure_kind_probe(ptr as usize) }
+    crate::closure::is_closure_ptr(ptr as usize)
 }
 
 pub(super) fn is_arrow_function_value(value: f64) -> bool {
@@ -1673,16 +1652,93 @@ pub(super) fn is_arrow_function_value(value: f64) -> bool {
         return false;
     }
     let ptr = jv.as_pointer() as *const crate::closure::ClosureHeader;
-    if !(ptr as usize).is_multiple_of(std::mem::align_of::<crate::closure::ClosureHeader>()) {
+    if !is_callable_function_value(value) {
         return false;
-    }
-    if ptr.is_null() || !is_valid_obj_ptr(ptr as *const u8) {
-        return false;
-    }
-    unsafe {
-        if !crate::closure::closure_kind_probe(ptr as usize) {
-            return false;
-        }
     }
     crate::closure::closure_is_arrow(ptr)
+}
+
+#[cfg(test)]
+mod callable_probe_tests {
+    use super::*;
+    use crate::closure::{ClosureHeader, JsFunctionInfo};
+
+    extern "C" fn test_body(_closure: *const ClosureHeader, _this: crate::closure::JsThis) -> f64 {
+        0.0
+    }
+
+    static ORDINARY_INFO: JsFunctionInfo =
+        JsFunctionInfo::of(test_body as crate::codegen_abi::JsBody0<ClosureHeader>);
+    static ARROW_INFO: JsFunctionInfo =
+        JsFunctionInfo::of(test_body as crate::codegen_abi::JsBody0<ClosureHeader>)
+            .with_flags(crate::closure::FN_ARROW);
+
+    fn pointer_value(ptr: usize) -> f64 {
+        f64::from_bits(crate::value::POINTER_TAG | ptr as u64)
+    }
+
+    #[test]
+    fn callable_probes_reject_unowned_words_and_preserve_live_closure_kinds() {
+        let _global = crate::gc::global_side_table_test_lock();
+        let _threshold = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+
+        for handle in [0x40000usize, 0xF0000, 0x100000] {
+            let value = pointer_value(handle);
+            assert!(!is_callable_function_value(value));
+            assert!(!is_arrow_function_value(value));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::ptr;
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+            let mapping = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    page,
+                    libc::PROT_NONE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(mapping, libc::MAP_FAILED, "mmap failed");
+            struct Mapping(*mut libc::c_void, usize);
+            impl Drop for Mapping {
+                fn drop(&mut self) {
+                    unsafe { libc::munmap(self.0, self.1) };
+                }
+            }
+            let _mapping = Mapping(mapping, page);
+            let ptr = mapping as usize + crate::gc::GC_HEADER_SIZE;
+            assert!(crate::value::addr_class::is_above_handle_band(ptr));
+            assert!(ptr.is_multiple_of(std::mem::align_of::<ClosureHeader>()));
+            assert!(crate::value::addr_class::is_valid_obj_ptr(ptr as *const u8));
+            assert_eq!(
+                crate::arena::classify_heap_generation(ptr),
+                crate::arena::HeapGeneration::Unknown
+            );
+            assert!(
+                unsafe { crate::value::addr_class::try_read_tracked_gc_header(ptr) }.is_none()
+            );
+            let value = pointer_value(ptr);
+            assert!(!is_callable_function_value(value));
+            assert!(!is_arrow_function_value(value));
+        }
+
+        let ordinary = crate::closure::js_closure_alloc(&ORDINARY_INFO, 0);
+        let ordinary_value = pointer_value(ordinary as usize);
+        assert!(is_callable_function_value(ordinary_value));
+        assert!(!is_arrow_function_value(ordinary_value));
+
+        let arrow = crate::closure::js_closure_alloc(&ARROW_INFO, 0);
+        let arrow_value = pointer_value(arrow as usize);
+        assert!(is_callable_function_value(arrow_value));
+        assert!(is_arrow_function_value(arrow_value));
+
+        let object = crate::object::js_object_alloc(0, 0);
+        let object_value = pointer_value(object as usize);
+        assert!(!is_callable_function_value(object_value));
+        assert!(!is_arrow_function_value(object_value));
+    }
 }

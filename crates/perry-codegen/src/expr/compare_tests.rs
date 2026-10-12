@@ -800,9 +800,8 @@ fn local_typeof_number_literal_is_decided_inline_for_plain_doubles() {
         "the tag-range test must be the single unsigned range compare:\n{ir}"
     );
     assert!(
-        (ir.contains("fcmp olt double") && ir.contains("1048576.0"))
-            || ir.contains("0x4130000000000000"),
-        "the stream id band must be excluded inline:\n{ir}"
+        !ir.contains("1048576.0") && !ir.contains("0x4130000000000000"),
+        "no double value may be carved out of the inline Number test:\n{ir}"
     );
     assert!(
         !ir.contains("call i64 @js_value_typeof(") && !ir.contains("call i32 @js_string_equals("),
@@ -921,4 +920,18 @@ fn integer_literal_equality_has_one_numeric_compare() {
             "strict comparison remains noncoercing: {ir}"
         );
     }
+}
+
+#[test]
+fn number_relation_uses_shared_signed_guard_and_contiguous_singleton_range() {
+    let ir = cmp_ir(
+        "number_relation_guard",
+        CompareOp::Lt,
+        Expr::LocalGet(X),
+        Expr::Number(128.0),
+    );
+    assert_eq!(ir.matches("icmp slt i64").count(), 1, "{ir}");
+    assert!(!ir.contains("icmp ugt i64"), "{ir}");
+    assert!(ir.contains("icmp ult i64") && ir.contains(", 4"), "{ir}");
+    assert!(ir.contains("call double @js_rel_lt("), "{ir}");
 }

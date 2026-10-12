@@ -81,9 +81,10 @@ pub(crate) use entry_answer::{entry_answer, primary_entry_answer};
 use function_own::HOLDER_FUNCTION_BAG;
 pub(crate) use function_own::{prime_alias, try_alias_cached_accessor};
 pub(crate) mod class_read;
+pub(crate) mod exotic_read;
 pub(crate) mod keyed;
-pub(crate) mod shared;
 mod runtime_chain;
+pub(crate) mod shared;
 pub(crate) use runtime_chain::read_runtime_chain;
 #[cfg(any(test, feature = "regex-engine"))]
 pub(crate) mod probe;
@@ -117,9 +118,8 @@ pub const HOLDER_HOPS: usize = HOLDER_KIND + 1;
 /// calls for the getter the primed pair names, `double get(double this, i64
 /// pair)`: a compiled class getter, or the closure-getter entry
 /// (`accessor_pair::holder_closure_getter_entry`), which reads the closure
-/// from the pair at each hit; 0 for a setter-only pair and for a lane in the
-/// holder's spill storage, which the emitted arm cannot load (the slow call
-/// derives the getter from the pair). A code address, never a GC pointer:
+/// from the pair at each hit; 0 for a setter-only pair or a deep chain
+/// that needs the collecting validator. A code address, never a GC pointer:
 /// the root scan never visits this word.
 /// The accessor's pair itself (its raw address) is in [`HOLDER_HOPS`], a
 /// strong root rewritten on move like the hop words it replaces.
@@ -409,7 +409,6 @@ unsafe fn holder_slot_word(addr: usize, s: u32, inline: u32) -> Option<u32> {
         return Some(s);
     }
     if s as usize >= crate::object::spill::SPILL_MAX_FIELD_INDEX
-        || !crate::object::spill::object_spill_enabled()
         || crate::object::spill::spill_get(addr, s as usize).is_none()
     {
         return None;
@@ -959,49 +958,14 @@ unsafe fn function_walk(closure: usize, name: &[u8]) -> Option<Walk> {
     {
         return None;
     }
-    let c = closure as *const crate::closure::ClosureHeader;
-    if !crate::closure::shape::closure_on_base_shape(c)
-        || shape_proto_id((*c).shape_id)? != crate::closure::shape::INTRINSIC_SERIAL_FUNCTION
-    {
+    if !exotic_read::function_inherits(closure, name) {
         return None;
     }
     let fp = crate::array::function_prototype_addr_if_resolved();
     if fp == 0 || !hop_admitted(fp) {
         return None;
     }
-    let fp_obj = fp as *const ObjectHeader;
-    let shape = object_shape_descriptor(fp_obj)?;
-    let fp_shape = object_shape_stamp(fp_obj);
-    if !shape.object_kind.is_ordinary_layout() || fp_shape == 0 {
-        return None;
-    }
-    let keys = shape.keys as usize as *const crate::array::ArrayHeader;
-    if !keys.is_null() {
-        if let Some(s) =
-            crate::object::keys_find_slot_by_bytes_resolved(keys, shape.logical_key_count, name)
-        {
-            if crate::object::key_attrs::key_is_accessor_at(keys, s) {
-                return None;
-            }
-            return Some(Walk {
-                holder: fp,
-                holder_shape: fp_shape,
-                slot: Some(holder_slot_word(fp, s, shape.live_inline_slot_count)?),
-                hops: NO_HOPS,
-                getter: 0,
-                depth: 1,
-            });
-        }
-    }
-    // Absent on `%Function.prototype%`: the rest of the chain, one hop deeper.
-    let mut inner = walk(fp_obj, name, false)?;
-    if inner.depth >= HOLDER_MAX_DEPTH {
-        return None;
-    }
-    inner.depth += 1;
-    inner.hops.copy_within(0..HOLDER_MAX_DEPTH - 2, 1);
-    inner.hops[0] = (fp, fp_shape);
-    Some(inner)
+    exotic_read::on_prototype(fp as *const ObjectHeader, name)
 }
 
 /// [`prime_read_holder`] for a function receiver (`f.k`, #10497): the site's
@@ -1031,7 +995,9 @@ pub(crate) unsafe fn prime_function_read(
     }
     let token = (u64::from(stamp) | PIC_ID_TOKEN_BIT) as i64;
     if !existing.is_null() {
-        if let Some(bits) = entry_answer(&*existing, token) {
+        if let Some(bits) = primary_entry_answer(&*existing, token, closure as *const ObjectHeader)
+            .or_else(|| exotic_read::function_answer(&*existing, closure as *const ObjectHeader))
+        {
             return Some(f64::from_bits(bits));
         }
     }
@@ -1080,7 +1046,10 @@ pub(crate) unsafe fn prime_function_read(
         if !confirmed {
             refuse();
         } else if !cache.is_null() {
-            publish(cache, closure, &w, false);
+            let token = exotic_read::function_token(closure as usize).unwrap_or_else(|| {
+                (u64::from(object_shape_stamp(closure)) | PIC_ID_TOKEN_BIT) as i64
+            });
+            publish_token(cache, closure, &w, false, token);
         }
         Some(value)
     })
@@ -1210,8 +1179,18 @@ pub(crate) unsafe fn prime_read_holder(
 }
 
 unsafe fn publish(cache: *mut PicCache, recv: *const ObjectHeader, w: &Walk, accessor: bool) {
-    let c = &mut *cache;
     let token = (u64::from(object_shape_stamp(recv)) | PIC_ID_TOKEN_BIT) as i64;
+    publish_token(cache, recv, w, accessor, token);
+}
+
+unsafe fn publish_token(
+    cache: *mut PicCache,
+    recv: *const ObjectHeader,
+    w: &Walk,
+    accessor: bool,
+    token: i64,
+) {
+    let c = &mut *cache;
     // A default-prototype optional field is often absent from many receiver
     // shapes at ONE read site (TypeScript AST's `.name` is the canonical
     // case). Keep the already-confirmed receiver shapes in this site's spare
@@ -1237,6 +1216,8 @@ unsafe fn publish(cache: *mut PicCache, recv: *const ObjectHeader, w: &Walk, acc
         }
     };
     if !accessor
+        && token as u64 == (PIC_ID_TOKEN_BIT | u64::from(token as u32))
+        && c[HOLDER_RECV] as u64 == (PIC_ID_TOKEN_BIT | u64::from(c[HOLDER_RECV] as u32))
         && w.depth == 1
         && same_answer
         && c[HOLDER_RECV] != 0
@@ -1312,12 +1293,9 @@ unsafe fn publish(cache: *mut PicCache, recv: *const ObjectHeader, w: &Walk, acc
             probe::getter_code(*words.add(crate::object::accessor_pair::PAIR_GET)) as i64;
     }
     c[HOLDER_HOP_SHAPES] = if accessor {
-        // The emitted arm loads inline lanes only (see `HOLDER_HOP_SHAPES`).
-        if w.slot.is_some_and(|s| s & HOLDER_SLOT_SPILL != 0) {
-            0
-        } else {
-            w.getter as i64
-        }
+        // The slot word distinguishes inline and spill storage. Both retain
+        // the immutable pair's getter; replacing its lane invalidates it.
+        w.getter as i64
     } else {
         (u64::from(w.hops[0].1) | u64::from(w.hops[1].1) << 32) as i64
     };

@@ -814,54 +814,7 @@ pub(super) unsafe fn dispatch_primitive(
         }
     }
 
-    // Check for raw handle integer: Perry may bit-cast an i64 handle directly to f64,
-    // producing a subnormal float (bits == handle_id, no NaN-box tag). Untagged values
-    // in the handle band are raw handle IDs from Perry's integer-typed handle parameters.
     let raw_bits = object.to_bits();
-    // Classify the full word before narrowing: on wasm32 a boxed socket
-    // otherwise looks like a bare id here and bypasses tagged-handle dispatch.
-    if (1..crate::value::addr_class::HANDLE_BAND_MAX as u64).contains(&raw_bits) {
-        if let Some(dispatch) = handle_method_dispatch() {
-            let args = refreshed_args();
-            return Some(dispatch(
-                raw_bits as i64,
-                method_name.as_ptr(),
-                method_name.len(),
-                args.as_ptr(),
-                args.len(),
-            ));
-        }
-        // No handle dispatcher registered: return JS `undefined`, NOT the
-        // signaling-NaN bit pattern 0x7FF8_..._0001 (a JS *number*) that a prior
-        // copy of this line used. See the JS-handle fallback above for why the
-        // sNaN surfaced as a spurious "Iterator result is not an object".
-        return Some(f64::from_bits(crate::value::TAG_UNDEFINED));
-    }
-
-    // #1545: Web Streams handles are returned as `id as f64` (a normal float),
-    // so their `to_bits()` is large and the raw-handle check above misses them.
-    // When the receiver is a finite whole number and the stdlib probe confirms
-    // it's a live stream handle, route the call through the same handle
-    // dispatcher (which carries the stream method arms). Gating on the probe
-    // means a genuine numeric receiver calling an unknown method still falls
-    // through to the `(number).x is not a function` TypeError below.
-    if object.is_finite() && object > 0.0 && object.fract() == 0.0 {
-        let id = object as usize;
-        if let Some(probe) = stream_handle_probe() {
-            if probe(id) {
-                if let Some(dispatch) = handle_method_dispatch() {
-                    let args = refreshed_args();
-                    return Some(dispatch(
-                        id as i64,
-                        method_name.as_ptr(),
-                        method_name.len(),
-                        args.as_ptr(),
-                        args.len(),
-                    ));
-                }
-            }
-        }
-    }
 
     // Issue #654: typed-array method dispatch. The codegen for
     // `new Float64Array(...)` (and the other typed-array constructors)

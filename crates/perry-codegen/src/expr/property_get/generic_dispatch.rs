@@ -248,7 +248,11 @@ fn emit_plain_array_length_arm(
             let target = blk.load(I64, &stub_ptr);
             let top = blk.lshr(I64, &target, "48");
             let top_clear = blk.icmp_eq(I64, &top, "0");
-            let above_band = blk.icmp_ugt(I64, &target, "1048575"); // 0x100000
+            let above_band = blk.icmp_ugt(
+                I64,
+                &target,
+                crate::expr::receiver_range::HANDLE_BAND_TOP_LITERAL,
+            );
             let heap_candidate = blk.and(I1, &top_clear, &above_band);
             blk.cond_br(&heap_candidate, &target_label, other_label);
             target
@@ -402,6 +406,25 @@ fn lower_property_site(
     // Every environment-reference read retains the shape diamond and spill
     // front, including optional typeof reads. A required binding uses positive
     // own-slot proofs; an optional read may also accept inherited/absent answers.
+    // A continuation can repeat this ladder at every split protocol read.
+    // Call the complete existing operation once, including its collecting
+    // accessor/miss routes, rather than emitting another split at each site.
+    if ctx.fixed_generator_state && global_reference.is_none() {
+        let cache_name = overridden_cache_name(ctx, object, property)
+            .unwrap_or_else(|| allocate_property_cache(ctx));
+        let cache_slot_ref = format!("@{}", cache_name);
+        let key_handle = emit_key_handle(ctx, &key_handle_global);
+        return Ok(ctx.block().call(
+            DOUBLE,
+            "js_object_get_field_ic",
+            &[
+                (I64, &obj_bits),
+                (I64, &key_handle),
+                (I64, &feedback_site_id),
+                (PTR, &cache_slot_ref),
+            ],
+        ));
+    }
     if crate::codegen::full_outline_ic_enabled() && global_reference.is_none() {
         // Per-site monomorphic IC cache, allocated identically to the inline path
         // (below) so the helper's `js_object_get_field_ic_miss` cache-priming is
@@ -435,7 +458,11 @@ fn lower_property_site(
                 let blk = ctx.block();
                 let tag = blk.lshr(I64, &obj_bits, "48");
                 let is_pointer = blk.icmp_eq(I64, &tag, "32765"); // 0x7FFD
-                let above_band = blk.icmp_ugt(I64, &entry_handle, "1048575"); // 0x100000
+                let above_band = blk.icmp_ugt(
+                    I64,
+                    &entry_handle,
+                    crate::expr::receiver_range::HANDLE_BAND_TOP_LITERAL,
+                );
                 let candidate = blk.and(I1, &is_pointer, &above_band);
                 blk.cond_br(&candidate, &header_label, &call_label);
                 ctx.current_block = header_idx;
@@ -461,10 +488,56 @@ fn lower_property_site(
         // `.length`: what reaches this call there is mostly a string or
         // another non-Array receiver no MRU word can serve, so the leaf call
         // would be a pure extra call in front of the helper (+0.65 %
-        // instructions on a string-`.length` loop, measured). It keeps the
-        // single call.
+        // instructions on a string-`.length` loop, measured). Flat strings
+        // read their header; other receivers retain a single helper call.
         let val = if property == "length" {
-            ctx.block().call(DOUBLE, "js_object_get_field_ic", &ic_args)
+            // Primitive/string reads cannot use an object slot cache. Retain
+            // the existing IC for object pointers and INT32 class references.
+            let object_idx = ctx.new_block("pget.outline_length_object");
+            let primitive_idx = ctx.new_block("pget.outline_length_primitive");
+            let string_idx = ctx.new_block("pget.outline_length_string");
+            let other_idx = ctx.new_block("pget.outline_length_other");
+            let done_idx = ctx.new_block("pget.outline_length_done");
+            let object_label = ctx.block_label(object_idx);
+            let primitive_label = ctx.block_label(primitive_idx);
+            let string_label = ctx.block_label(string_idx);
+            let other_label = ctx.block_label(other_idx);
+            let done_label = ctx.block_label(done_idx);
+            let tag = ctx.block().lshr(I64, &obj_bits, "48");
+            let object_tags = ctx.block().sub(I64, &tag, "32765");
+            let object_tag = ctx.block().icmp_ult(I64, &object_tags, "2");
+            ctx.block()
+                .cond_br(&object_tag, &object_label, &primitive_label);
+            ctx.current_block = object_idx;
+            let object_value = ctx.block().call(DOUBLE, "js_object_get_field_ic", &ic_args);
+            let object_end = ctx.block().label.clone();
+            ctx.block().br(&done_label);
+            ctx.current_block = primitive_idx;
+            let is_string = ctx.block().icmp_eq(I64, &tag, "32767"); // 0x7FFF
+            ctx.block().cond_br(&is_string, &string_label, &other_label);
+            ctx.current_block = string_idx;
+            // Same guarded leading UTF-16 word as the inline tower below.
+            let string_len = ctx.block().safe_load_i32_from_ptr(&entry_handle);
+            let string_value = ctx.block().uitofp(I32, &string_len, DOUBLE);
+            let string_end = ctx.block().label.clone();
+            ctx.block().br(&done_label);
+            ctx.current_block = other_idx;
+            let primitive_value = ctx.block().call(
+                DOUBLE,
+                "js_value_length_property_f64",
+                &[(DOUBLE, &obj_box)],
+            );
+            let primitive_end = ctx.block().label.clone();
+            ctx.block().br(&done_label);
+            ctx.current_block = done_idx;
+            ctx.block().phi(
+                DOUBLE,
+                &[
+                    (&object_value, &object_end),
+                    (&string_value, &string_end),
+                    (&primitive_value, &primitive_end),
+                ],
+            )
         } else {
             crate::expr::ic_fast_split::emit_hole_declining_split(
                 ctx,
@@ -716,16 +789,24 @@ fn lower_property_site(
     }
     // The non-pointer exit: SSO / INT32 class ref / nullish throw / everything
     // else, in that order, behind one call that needs no cache.
-    let nonptr_key_handle = emit_key_handle(ctx, &key_handle_global);
-    let val_nonptr = ctx.block().call(
-        DOUBLE,
-        "js_object_get_field_ic_nonptr",
-        &[
-            (I64, &obj_bits),
-            (I64, &nonptr_key_handle),
-            (I64, &feedback_site_id),
-        ],
-    );
+    let val_nonptr = if inline_string_length {
+        ctx.block().call(
+            DOUBLE,
+            "js_value_length_property_f64",
+            &[(DOUBLE, &obj_box)],
+        )
+    } else {
+        let nonptr_key_handle = emit_key_handle(ctx, &key_handle_global);
+        ctx.block().call(
+            DOUBLE,
+            "js_object_get_field_ic_nonptr",
+            &[
+                (I64, &obj_bits),
+                (I64, &nonptr_key_handle),
+                (I64, &feedback_site_id),
+            ],
+        )
+    };
     let nonptr_end_label = ctx.block().label.clone();
     ctx.block().br(&merge_label);
 
@@ -772,7 +853,7 @@ fn lower_property_site(
 
     // Issue #72: validate the receiver is actually a GC_TYPE_OBJECT
     // before reading its ShapeId. The receiver
-    // guard (`obj_handle > 0x100000`) keeps non-pointer NaN-boxes out,
+    // guard (`obj_handle >= HANDLE_BAND_MAX`) keeps non-pointer NaN-boxes out,
     // but real heap pointers to Arrays/Strings/Buffers all clear that
     // threshold. A chained `obj.rowsRaw.length` (whose static type
     // analysis can't prove `obj.rowsRaw` is an Array — the outer
@@ -796,14 +877,18 @@ fn lower_property_site(
     // `req.params`, etc.).
     //
     // Threshold matches `js_native_call_method`'s small-handle
-    // detection (raw_ptr < 0x100000).
+    // detection (raw_ptr < HANDLE_BAND_MAX).
     //
     // Under the fused receiver test (every key but `.length`) this fact is
     // already proven on every edge into `pget.recv_ok`, so no second branch
     // is emitted for it.
-    let is_real_ptr = fused_recv
-        .is_none()
-        .then(|| ctx.block().icmp_ugt(I64, &entry_handle, "1048575")); // 0x100000
+    let is_real_ptr = fused_recv.is_none().then(|| {
+        ctx.block().icmp_ugt(
+            I64,
+            &entry_handle,
+            crate::expr::receiver_range::HANDLE_BAND_TOP_LITERAL,
+        )
+    }); // HANDLE_BAND_MAX
 
     // #7883: the guard chain BRANCHES OUT to the slow exit on the first
     // failing predicate instead of AND-ing eight of them into one flat `hit`.
@@ -982,11 +1067,9 @@ fn lower_property_site(
             let handle = recv_handle(ctx, fused_recv.as_ref(), &entry_handle);
             emit_plain_array_length_arm(ctx, &handle, &token_miss_label, &merge_label, true)
         });
-    // #10498: a site whose reads inherit a compiled class getter answers them
-    // inline, ahead of the front (`accessor_arm`). 64-bit targets only, as the
-    // method site: the entry's words address 8-byte slots behind the header.
-    // Only for a name some compiled class of the program declares as a getter:
-    // no other site can ever take an entry.
+    // Only the existing holder's accessor-kind bit selects the collecting
+    // exit. Empty-MRU data reads retain their leaf front; all authentication
+    // belongs to the shared runtime consumer, including computed names.
     let accessor_entry = match fused_recv.as_ref() {
         Some(f)
             if array_length_arm.is_none()
@@ -1005,22 +1088,15 @@ fn lower_property_site(
             .unwrap_or_else(|| token_miss_label.clone());
         ctx.block().cond_br(&token_eq, &hit_label, &miss);
     }
-    let accessor_header_bytes =
-        crate::target_layout::object_header_size_bytes(ctx.target_triple) as i64;
-    let accessor_arm = accessor_entry.map(|(entry_idx, biased)| {
+    if let Some((entry_idx, _)) = accessor_entry {
         super::accessor_arm::emit_class_accessor_arm(
             ctx,
             entry_idx,
-            &packed_word,
-            PACKED_GET_EMPTY,
             &cache_slot_ref,
-            &biased,
-            &obj_box,
-            accessor_header_bytes,
+            &call_label,
             &token_miss_label,
-            &merge_label,
-        )
-    });
+        );
+    }
 
     // `js_object_get_field_ic_miss` primes only slots below the descriptor's
     // exact `live_inline_slot_count`. ShapeIds are never reused, so an exact
@@ -1245,9 +1321,6 @@ fn lower_property_site(
     ];
     if let Some((answered, front_end_label)) = front_arm.as_ref() {
         incoming.push((answered, front_end_label));
-    }
-    if let Some((value, accessor_end_label)) = accessor_arm.as_ref() {
-        incoming.push((value, accessor_end_label));
     }
     if let Some((sso_val, sso_end_label)) = sso_arm.as_ref() {
         incoming.push((sso_val, sso_end_label));

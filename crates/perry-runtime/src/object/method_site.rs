@@ -91,6 +91,7 @@
 use crate::object::ObjectHeader;
 
 mod builtin_receiver;
+pub(crate) use builtin_receiver::shape_proof as builtin_shape_proof;
 pub(crate) mod chain_memo;
 mod function_receiver;
 mod holder_prime;
@@ -389,6 +390,13 @@ unsafe fn method_site_miss_object(
     else {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     };
+    // Generators retain Get + Call when workers disable the primary heap's memo.
+    let receiver = miss_receiver(recv);
+    if matches!(receiver, MissReceiver::Ordinary) && super::fixed_generator_state(recv).is_some() {
+        if let Some(result) = builtin_receiver::call_miss(slot, recv, method_id, args_ptr, argc) {
+            return result;
+        }
+    }
     if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
         refuse(11);
         return crate::typed_feedback::js_typed_feedback_native_call_method(
@@ -401,8 +409,6 @@ unsafe fn method_site_miss_object(
         );
     }
     let name = std::slice::from_raw_parts(name_ref.ptr, name_ref.len);
-    // One read of the receiver's header classifies it for both steps below.
-    let receiver = miss_receiver(recv);
     if let MissReceiver::Payload = receiver {
         if let Some(result) =
             crate::native_payload::try_payload_method_fast_dispatch(recv, name, args_ptr, argc)
@@ -1042,7 +1048,7 @@ pub unsafe extern "C-unwind" fn js_method_site_call_value(
     // The value a getter or a trap returned is called as is: a nullish one
     // is not callable (the generic value call would answer `undefined`).
     let fb = func.to_bits();
-    if fb == crate::value::TAG_UNDEFINED || fb == crate::value::TAG_NULL {
+    if fb == 0 || fb == crate::value::TAG_UNDEFINED || fb == crate::value::TAG_NULL {
         crate::closure::throw_not_callable();
     }
     let fptr = (fb & crate::value::POINTER_MASK) as usize;
@@ -1589,9 +1595,6 @@ fn address_is_prime_stable(addr: usize) -> bool {
 /// The value of spill-located key `index` as the emitted hit will read it:
 /// through `ObjectMeta::spill`, a dense buffer the runtime never shifts.
 unsafe fn spill_bits(obj: *const ObjectHeader, index: u32) -> Option<u64> {
-    if !super::spill::object_spill_enabled() {
-        return None;
-    }
     let meta = (*obj).meta;
     if meta.is_null() || (*meta).spill == 0 {
         return None;
@@ -1974,7 +1977,7 @@ mod constfn_tests {
                 assert_eq!(d.special_constfn_mask != 0, admitted);
                 if admitted {
                     assert_ne!(base, id, "ordinary allocation must finalize after stores");
-                    assert!(super::super::field_rep_store::final_shape_matches_birth(
+                    assert!(super::super::field_rep_store::completed_shape_matches_layout(
                         id, base
                     ));
                     assert_eq!(primed_slot(finalized), METHOD_SITE_CONSTFN);

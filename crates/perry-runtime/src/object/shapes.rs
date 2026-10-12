@@ -34,10 +34,18 @@
 use crate::array::ArrayHeader;
 use std::cell::RefCell;
 
+#[path = "shapes_spread.rs"]
+mod shapes_spread;
+
 #[path = "shapes_own_data.rs"]
 mod shapes_own_data;
 pub(crate) use shapes_own_data::own_data_shape;
 
+#[path = "shapes_branded_birth.rs"]
+mod shapes_branded_birth;
+#[path = "static_constfn_birth.rs"]
+mod static_constfn_birth;
+pub(crate) use shapes_branded_birth::{branded_birth_matches, BrandedBirthSite};
 #[path = "shapes_birth_width.rs"]
 mod shapes_birth_width;
 #[path = "shapes_last_key_rollback.rs"]
@@ -56,14 +64,20 @@ pub(crate) use shapes_linked_birth::{
 #[cfg(all(test, feature = "regex-engine"))]
 #[path = "regex_direct_admission_tests.rs"]
 mod regex_direct_admission_tests;
+#[path = "shapes_evaluation_brand.rs"]
+mod shapes_evaluation_brand;
 #[path = "shapes_slot_list.rs"]
 mod shapes_slot_list;
 #[path = "shapes_store.rs"]
 mod shapes_store;
+pub(crate) use shapes_evaluation_brand::{
+    evaluation_holder_slot, object_evaluation_brand, stamp_evaluation_holder,
+    EVALUATION_HOLDER_BRAND,
+};
 #[path = "shapes_worker_seed.rs"]
 mod shapes_worker_seed;
 #[cfg(test)]
-pub(crate) use shapes_prototype::clear_class_identity_words;
+pub(crate) use shapes_prototype::{clear_class_identity_words, scan_shape_prototype_words_mut};
 pub(crate) use shapes_prototype::{
     identity_prototype_word, identity_word_slot, note_full_trace_begin, proto_id_carries_word,
     prune_dead_shape_prototypes, shape_prototype_word, write_identity_word,
@@ -159,6 +173,7 @@ pub(crate) struct ShapeDescriptor {
     /// mint a process-unique nonzero generation so two semantically different
     /// layouts can never compare equal merely because their keys/counts do.
     pub(crate) semantic_generation: u64,
+    pub(crate) integrity_flags: u16,
     /// The receiver's [[Prototype]] identity ([`object_proto_id`]): part of
     /// the shape's identity, so one ShapeId names one prototype.
     pub(crate) proto_id: u64,
@@ -284,10 +299,109 @@ impl ShapeDescriptor {
 pub(crate) struct ShapeRecordRef(std::ptr::NonNull<ShapeRecord>);
 
 impl ShapeRecordRef {
+    /// Seed-only derivation from checked permanent-image body metadata.
+    pub(crate) unsafe fn derive_constfn_birth_admission(self) {
+        (*self.0.as_ptr()).derive_constfn_birth_admission();
+    }
+
+    /// Test a brand in this already-proved live record, without another probe.
+    #[inline]
+    pub(crate) fn has_brand(self, brand: u64) -> bool {
+        unsafe { (*self.0.as_ptr()).brands().binary_search(&brand).is_ok() }
+    }
+
     #[inline(always)]
     pub(crate) fn prototype_word(self) -> u64 {
         // SAFETY: this handle borrows a live slab record of this agent.
         unsafe { (*self.0.as_ptr()).prototype_word() }
+    }
+
+    /// Last declaration wins, including a later noncanonical spelling of
+    /// an earlier atom. Unlike a read-site slot hint this is a full lookup.
+    pub(crate) unsafe fn own_store_slot(
+        self,
+        key: *const crate::StringHeader,
+    ) -> Option<Option<usize>> {
+        let r = &*self.0.as_ptr();
+        if r.logical_key_count == 0 {
+            // A dictionary's own keys belong to the receiver, not this record.
+            // Its generation namespace distinguishes it from an empty shape.
+            let tag = super::dictionary::DICTIONARY_GENERATION_TAG;
+            if r.semantic_generation & ((1u64 << 63) | tag) == tag {
+                return None;
+            }
+            return Some(None);
+        }
+        // The complete key index answers a binding after a descriptor or
+        // prototype generation changes too. A read site's positional guess
+        // cannot make that claim; its POSBOUND is deliberately narrower.
+        if r.keys == 0 || r.hole_count != 0 {
+            return None;
+        }
+        // The final declaration cannot be shadowed by a later one. This
+        // positional proof needs neither a site hint nor an indexed lookup.
+        let last = r.logical_key_count as usize - 1;
+        let (words, len) =
+            super::keys_array_dense_slots_resolved(r.keys as usize as *const ArrayHeader);
+        if last < len
+            && (*words.add(last)).to_bits() == crate::JSValue::string_ptr(key as *mut _).bits()
+        {
+            return Some(Some(last));
+        }
+        // Use the same small-list representation as the existing by-name
+        // resolver. Reverse order preserves the most-derived declaration,
+        // including a noncanonical spelling after an earlier atom.
+        if r.logical_key_count < super::KEYS_INDEX_THRESHOLD {
+            if words.is_null() || len < r.logical_key_count as usize {
+                return None;
+            }
+            return Some(
+                (0..r.logical_key_count as usize)
+                    .rev()
+                    .find(|&i| stored_key_matches(key, (*words.add(i)).to_bits())),
+            );
+        }
+        let bytes = crate::string::header_str_checked(key)?.as_bytes();
+        let hash = super::key_bytes_hash(bytes.as_ptr(), bytes.len());
+        match shape_slot_lookup_verdict(
+            r.keys as usize as *const ArrayHeader,
+            bytes,
+            hash,
+            r.logical_key_count,
+            true,
+        ) {
+            KeysIndexVerdict::Found(slot) => Some(Some(slot as usize)),
+            KeysIndexVerdict::Absent => Some(None),
+            KeysIndexVerdict::Unindexed => None,
+        }
+    }
+
+    /// A shape-owned inherited [[Set]] fact, valid under the same mutation
+    /// counter used by the existing key-add transition machinery.
+    pub(crate) fn store_chain_blocks(self, key: &[u8], validity: u64) -> Option<bool> {
+        unsafe { (*self.0.as_ptr()).store_chain_facts() }.and_then(|facts| {
+            facts
+                .borrow()
+                .iter()
+                .find(|fact| fact.key.as_ref() == key)
+                .filter(|fact| fact.validity == validity)
+                .map(|fact| fact.blocked)
+        })
+    }
+
+    pub(crate) fn note_store_chain(self, key: &[u8], validity: u64, blocked: bool) {
+        let facts = unsafe { (*self.0.as_ptr()).ensure_store_chain_facts() };
+        let mut facts = facts.borrow_mut();
+        if let Some(fact) = facts.iter_mut().find(|fact| fact.key.as_ref() == key) {
+            fact.validity = validity;
+            fact.blocked = blocked;
+        } else {
+            facts.push(shapes_store::StoreChainFact {
+                key: key.into(),
+                validity,
+                blocked,
+            });
+        }
     }
 
     #[inline]
@@ -487,14 +601,23 @@ impl ShapeRecordRef {
         let bound = bound.min(len);
         let heap_bits = crate::JSValue::string_ptr(key as *mut crate::StringHeader).bits();
         // The site's slot guess, confirmed by the receiver's own key.
-        if hint < bound && (*slots.add(hint)).to_bits() == heap_bits {
-            return Some(hint);
+        if hint < bound {
+            let bits = (*slots.add(hint)).to_bits();
+            if bits == heap_bits {
+                return Some(hint);
+            }
+            if stored_key_matches(key, bits) {
+                super::canonical_keys::adopt_image_key(r.keys as *mut ArrayHeader, hint, key);
+                return Some(hint);
+            }
         }
         // Identity over the whole list before any byte is compared.
         if let Some(i) = (0..bound).find(|&i| (*slots.add(i)).to_bits() == heap_bits) {
             return Some(i);
         }
-        (0..bound).find(|&i| stored_key_matches(key, (*slots.add(i)).to_bits()))
+        let slot = (0..bound).find(|&i| stored_key_matches(key, (*slots.add(i)).to_bits()))?;
+        super::canonical_keys::adopt_image_key(r.keys as *mut ArrayHeader, slot, key);
+        Some(slot)
     }
 
     /// The SPILL position at which this shape stores `key` as an own DATA
@@ -607,7 +730,17 @@ impl ShapeRecordRef {
             {
                 None
             }
-            Some(i) => Some(Some(i as u32)),
+            Some(i) => {
+                // A content-confirmed data key has the same owner as the
+                // positional read path. Retain its image spelling here too:
+                // literal-tail overwrites then use the ordinary identity
+                // proof instead of repeating this content lookup.
+                if (*slots.add(i)).to_bits() != key_bits && key_bits >> 48 == 0x7FFF {
+                    let key = crate::JSValue::from_bits(key_bits).as_string_ptr();
+                    super::canonical_keys::adopt_image_key(r.keys as *mut ArrayHeader, i, key);
+                }
+                Some(Some(i as u32))
+            }
         }
     }
 }
@@ -935,6 +1068,7 @@ impl PartialEq for ShapeDescriptor {
             && self.logical_key_count == other.logical_key_count
             && self.live_inline_slot_count == other.live_inline_slot_count
             && self.semantic_generation == other.semantic_generation
+            && self.integrity_flags == other.integrity_flags
             && self.proto_id == other.proto_id
             && self.object_kind == other.object_kind
             && self.hole_count == other.hole_count
@@ -1246,7 +1380,7 @@ pub(crate) struct ShapeTable {
 
 impl ShapeTable {
     pub(crate) fn new() -> Self {
-        ShapeTable {
+        let table = ShapeTable {
             slab: std::cell::UnsafeCell::new(ShapeSlab::new_agent()),
             inner: RefCell::new(ShapeTableInner {
                 indices: crate::fast_hash::new_ptr_hash_map(),
@@ -1254,7 +1388,60 @@ impl ShapeTable {
                 families: crate::fast_hash::new_ptr_hash_map(),
                 young_keys: crate::gc::young_log::YoungLog::new(),
             }),
+        };
+        table.seed_function_shapes();
+        table
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn seed_function_shapes(&self) {
+        let mut inner = self.inner.borrow_mut();
+        // Seed fixed function layouts once per agent. These keyless intrinsic
+        // records have no GC edges; the external-carrier flag retains them
+        // through full pruning. The ordinary intern sees the same records.
+        for (id, kind, proto, summary) in crate::closure::shape::intrinsic_shapes() {
+            self.seed_function_shape(&mut inner, id, kind, proto, summary);
         }
+    }
+
+    // Keep one installer for all nine records: constant iteration facts must
+    // not clone record construction and hashing into the startup function.
+    #[inline(never)]
+    fn seed_function_shape(
+        &self,
+        inner: &mut ShapeTableInner,
+        id: u32,
+        kind: ShapeObjectKind,
+        proto: u64,
+        summary: u8,
+    ) {
+        let rep = super::field_rep::REP_ANY;
+        let mut record = ShapeRecord::new(0, 0, 0, 0, kind, 0)
+            .with_proto_id(proto)
+            .with_summary(summary)
+            .with_special_facts(rep, &[], &[]);
+        record.set(RECORD_FLAG_EXTERNAL_CARRIER, true);
+        // SAFETY: no reference into the slab is held while seeding.
+        unsafe { self.slab_mut().insert(id, record) };
+        let facts = shapes_store::integrity_facts_key(
+            shapes_store::facts_key_proto_with_special(
+                0,
+                0,
+                0,
+                0,
+                kind,
+                0,
+                proto,
+                summary,
+                rep,
+                &[],
+                &[],
+            ),
+            0,
+        );
+        inner.facts_append_fresh(facts, id);
+        inner.family_append_fresh(0, id);
     }
 
     /// Shared view of the slab. Sound under the single-threaded agent
@@ -1379,9 +1566,15 @@ static DICTIONARY_SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 3] = [
 
 /// The exotic band's own monotonic counters ([`EXOTIC_SHAPE_ID_BASE`]).
 static EXOTIC_SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 3] = [
-    std::sync::atomic::AtomicU32::new(EXOTIC_SHAPE_ID_BASE),
-    std::sync::atomic::AtomicU32::new(EXOTIC_SHAPE_ID_BASE),
-    std::sync::atomic::AtomicU32::new(EXOTIC_SHAPE_ID_BASE),
+    std::sync::atomic::AtomicU32::new(
+        EXOTIC_SHAPE_ID_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
+    ),
+    std::sync::atomic::AtomicU32::new(
+        crate::codegen_abi::FUNCTION_SHAPE_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
+    ),
+    std::sync::atomic::AtomicU32::new(
+        EXOTIC_SHAPE_ID_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
+    ),
 ];
 
 /// # The identity kind: a ShapeId says what kind of prototype identity it names
@@ -1489,15 +1682,6 @@ pub(crate) fn is_dictionary_shape_id(v: u32) -> bool {
 #[inline]
 pub(crate) fn is_exotic_shape_id(v: u32) -> bool {
     (EXOTIC_SHAPE_ID_BASE..SHAPE_ID_END).contains(&v)
-}
-
-/// #6804: classify a WIDENED shape token (`object_shape()`'s usize). Ids
-/// stored as usize carry no high bits, so the full-width range test never
-/// misclassifies a real heap address whose LOW 32 bits merely fall in the
-/// id range (`is_shape_id(v as u32)` would).
-#[inline]
-pub(crate) fn is_shape_id_token(v: usize) -> bool {
-    v >= SHAPE_ID_BASE as usize && v < SHAPE_ID_END as usize
 }
 
 /// Lifts a ShapeId into the per-site PIC token space. MUST match the literal
@@ -1779,6 +1963,7 @@ pub(crate) fn shape_descriptor_ensure_with_rep(
         rep,
         receiver.brands.as_slice(),
         requested,
+        receiver.integrity_flags,
     )
 }
 
@@ -1797,23 +1982,27 @@ pub(crate) fn shape_descriptor_find_with_rep(
     summary: u8,
     rep: u64,
     brands: &[u64],
+    integrity_flags: u16,
 ) -> Option<u32> {
     if !super::field_rep::is_valid(rep) {
         return None;
     }
     let keys_id = keys as usize as u64;
-    let facts = shapes_store::facts_key_proto_with_special(
-        keys_id,
-        logical_key_count,
-        live_inline_slot_count,
-        semantic_generation,
-        object_kind,
-        hole_count,
-        proto_id,
-        summary,
-        rep,
-        &[],
-        brands,
+    let facts = shapes_store::integrity_facts_key(
+        shapes_store::facts_key_proto_with_special(
+            keys_id,
+            logical_key_count,
+            live_inline_slot_count,
+            semantic_generation,
+            object_kind,
+            hole_count,
+            proto_id,
+            summary,
+            rep,
+            &[],
+            brands,
+        ),
+        integrity_flags,
     );
     let table = &crate::state::state().shapes;
     let inner = table.inner.borrow();
@@ -1824,6 +2013,7 @@ pub(crate) fn shape_descriptor_find_with_rep(
             // SAFETY: live slab record, read immediately.
             let record = unsafe { *record };
             record.has(RECORD_FLAG_FACTS_INDEXED)
+                && record.integrity_flags() == integrity_flags
                 && record.facts_match_proto_with_special(
                     keys_id,
                     logical_key_count,
@@ -1871,6 +2061,7 @@ pub(crate) fn shape_descriptor_kind_twin(source: u32, object_kind: ShapeObjectKi
         &d.brands().to_vec(),
         // A twin re-kinds an existing record: never a static-id request.
         None,
+        d.integrity_flags,
     )
     .ok()
 }
@@ -1897,6 +2088,7 @@ pub(crate) fn shape_descriptor_intern_with_rep(
     rep: u64,
     brands: &[u64],
     requested: Option<u32>,
+    integrity_flags: u16,
 ) -> Result<u32, ShapeDescriptorError> {
     if !super::field_rep::is_valid(rep) {
         return Err(ShapeDescriptorError::InvalidFacts);
@@ -1914,6 +2106,7 @@ pub(crate) fn shape_descriptor_intern_with_rep(
         &[],
         brands,
         requested,
+        integrity_flags,
     )
 }
 
@@ -1934,6 +2127,7 @@ pub(crate) fn shape_descriptor_intern_with_special(
     infos: &[shapes_store::ConstFnSlotInfo],
     brands: &[u64],
     requested: Option<u32>,
+    integrity_flags: u16,
 ) -> Result<u32, ShapeDescriptorError> {
     shape_descriptor_intern_with_special_mode(
         keys,
@@ -1949,6 +2143,7 @@ pub(crate) fn shape_descriptor_intern_with_special(
         brands,
         requested,
         false,
+        integrity_flags,
     )
 }
 
@@ -1971,6 +2166,7 @@ fn shape_descriptor_intern_with_special_mode(
     brands: &[u64],
     requested: Option<u32>,
     static_constfn: bool,
+    integrity_flags: u16,
 ) -> Result<u32, ShapeDescriptorError> {
     let Some(mask) = shapes_store::constfn_mask(infos) else {
         return Err(ShapeDescriptorError::InvalidFacts);
@@ -2017,18 +2213,21 @@ fn shape_descriptor_intern_with_special_mode(
     } else {
         (0, "", 0)
     };
-    let facts = shapes_store::facts_key_proto_with_special(
-        keys_id,
-        logical_key_count,
-        live_inline_slot_count,
-        semantic_generation,
-        object_kind,
-        hole_count,
-        proto_id,
-        summary,
-        rep,
-        infos,
-        brands,
+    let facts = shapes_store::integrity_facts_key(
+        shapes_store::facts_key_proto_with_special(
+            keys_id,
+            logical_key_count,
+            live_inline_slot_count,
+            semantic_generation,
+            object_kind,
+            hole_count,
+            proto_id,
+            summary,
+            rep,
+            infos,
+            brands,
+        ),
+        integrity_flags,
     );
     let table = &crate::state::state().shapes;
     let inner = table.inner.borrow();
@@ -2042,6 +2241,7 @@ fn shape_descriptor_intern_with_special_mode(
             let record = unsafe { *record };
             // The bucket is a 64-bit fold: validate the facts on every hit.
             if record.has(RECORD_FLAG_FACTS_INDEXED)
+                && record.integrity_flags() == integrity_flags
                 && record.facts_match_proto_with_special(
                     keys_id,
                     logical_key_count,
@@ -2079,6 +2279,7 @@ fn shape_descriptor_intern_with_special_mode(
         requested,
         #[cfg(feature = "shape-mint-diag")]
         (census_on, census_list_hash, census_file, census_line),
+        integrity_flags,
     )
 }
 
@@ -2103,6 +2304,7 @@ fn shape_descriptor_mint_fresh(
     brands: &[u64],
     requested: Option<u32>,
     #[cfg(feature = "shape-mint-diag")] census: (bool, u64, &'static str, u32),
+    integrity_flags: u16,
 ) -> Result<u32, ShapeDescriptorError> {
     #[cfg(feature = "shape-mint-diag")]
     let (census_on, census_list_hash, census_file, census_line) = census;
@@ -2115,9 +2317,12 @@ fn shape_descriptor_mint_fresh(
     // it yet.
     let adopted = requested.filter(|&id| {
         is_static_shape_id(id)
-            && brands
-                .iter()
-                .all(|&b| b & crate::object::field_get_set::PRIVATE_FRESH_EVALUATION_BRAND == 0)
+            && integrity_flags == 0
+            && brands.iter().all(|&b| {
+                b & (crate::object::field_get_set::PRIVATE_FRESH_EVALUATION_BRAND
+                    | EVALUATION_HOLDER_BRAND)
+                    == 0
+            })
             && !object_kind.is_exotic()
             && (semantic_generation == 0
                 // A declared holder's stable identity is its compiled class
@@ -2184,6 +2389,9 @@ fn shape_descriptor_mint_fresh(
     .with_summary(summary)
     .with_special_facts(rep, infos, brands);
     let mut record = record;
+    if integrity_flags != 0 {
+        record.set_integrity_flags(integrity_flags);
+    }
     if adopted.is_some() {
         record.set(RECORD_FLAG_EXTERNAL_CARRIER, true);
     }
@@ -2258,6 +2466,7 @@ pub(crate) unsafe fn shape_descriptor_ensure_for_object(
 /// What a mint for `obj` takes from the receiver rather than from its keys
 /// (see [`shape_descriptor_ensure_with_holes`]).
 pub(crate) struct ReceiverFacts {
+    pub(crate) integrity_flags: u16,
     pub(crate) extra_summary: u8,
     /// The receiver's private brands (#11791), sorted. A brand is only ever
     /// added, so every shape minted for a receiver carries the brands of the
@@ -2266,26 +2475,63 @@ pub(crate) struct ReceiverFacts {
 }
 
 /// A receiver's private brands, sorted, copied out of its shape record
-/// (#11791). Almost every receiver has none, and then the list is `None`: no
-/// allocation, and nothing to free after the mint.
-pub(crate) struct BrandList(Option<Box<[u64]>>);
+/// (#11791). Almost every receiver has none, and then the list is empty: no
+/// allocation, and nothing to free after the mint. A single brand (including
+/// the ordinary class birth evaluation) is copied inline, so subsequent key
+/// transitions do not introduce a native allocation just to carry that fact.
+pub(crate) enum BrandList {
+    Empty,
+    One(u64),
+    Many(Box<[u64]>),
+}
 
 impl BrandList {
-    pub(crate) const NONE: BrandList = BrandList(None);
+    pub(crate) const NONE: BrandList = BrandList::Empty;
 
     /// A copy of `brands`, which may borrow a record a mint can retire.
     #[inline]
     pub(crate) fn copy_of(brands: &[u64]) -> BrandList {
-        if brands.is_empty() {
-            BrandList::NONE
-        } else {
-            BrandList(Some(brands.into()))
+        match brands {
+            [] => BrandList::Empty,
+            [brand] => BrandList::One(*brand),
+            _ => BrandList::Many(brands.into()),
         }
     }
 
     #[inline]
     pub(crate) fn as_slice(&self) -> &[u64] {
-        self.0.as_deref().unwrap_or(&[])
+        match self {
+            BrandList::Empty => &[],
+            BrandList::One(brand) => std::slice::from_ref(brand),
+            BrandList::Many(brands) => brands,
+        }
+    }
+
+    /// A static class-env birth can replace an ancestor's lexical evaluation
+    /// with its own. Installed private-element brands remain monotonic.
+    fn replace_evaluation_holder(&mut self, brand: u64) -> bool {
+        if self.as_slice().binary_search(&brand).is_ok() {
+            return false;
+        }
+        if self.as_slice().len() <= 1
+            && self
+                .as_slice()
+                .iter()
+                .all(|&old| shapes_evaluation_brand::is_evaluation_holder_brand(old))
+        {
+            *self = BrandList::One(brand);
+            return true;
+        }
+        let mut brands: Vec<u64> = self
+            .as_slice()
+            .iter()
+            .copied()
+            .filter(|&old| !shapes_evaluation_brand::is_evaluation_holder_brand(old))
+            .collect();
+        let at = brands.partition_point(|&old| old < brand);
+        brands.insert(at, brand);
+        *self = BrandList::Many(brands.into_boxed_slice());
+        true
     }
 
     /// Add `brand`, keeping the list sorted. `false` when it is already there.
@@ -2293,9 +2539,13 @@ impl BrandList {
         let Err(at) = self.as_slice().binary_search(&brand) else {
             return false;
         };
+        if matches!(self, BrandList::Empty) {
+            *self = BrandList::One(brand);
+            return true;
+        }
         let mut brands = self.as_slice().to_vec();
         brands.insert(at, brand);
-        self.0 = Some(brands.into_boxed_slice());
+        *self = BrandList::Many(brands.into_boxed_slice());
         true
     }
 }
@@ -2303,6 +2553,7 @@ impl BrandList {
 impl ReceiverFacts {
     /// A shape minted for no receiver: an intrinsic, a birth, a seed.
     pub(crate) const NONE: ReceiverFacts = ReceiverFacts {
+        integrity_flags: 0,
         extra_summary: 0,
         brands: BrandList::NONE,
     };
@@ -2311,6 +2562,7 @@ impl ReceiverFacts {
     pub(crate) const fn summary(extra_summary: u8) -> ReceiverFacts {
         ReceiverFacts {
             extra_summary,
+            integrity_flags: 0,
             brands: BrandList::NONE,
         }
     }
@@ -2320,6 +2572,7 @@ impl ReceiverFacts {
     pub(crate) fn of_descriptor(d: &ShapeDescriptor, extra_summary: u8) -> ReceiverFacts {
         ReceiverFacts {
             extra_summary,
+            integrity_flags: d.integrity_flags,
             brands: BrandList::copy_of(d.brands()),
         }
     }
@@ -2334,6 +2587,11 @@ impl ReceiverFacts {
 pub(crate) unsafe fn receiver_facts(obj: *const crate::object::ObjectHeader) -> ReceiverFacts {
     ReceiverFacts {
         extra_summary: receiver_extra_summary(obj),
+        integrity_flags: if obj.is_null() {
+            0
+        } else {
+            (*crate::object::gc_header_for(obj))._reserved & INTEGRITY_FLAGS
+        },
         brands: if obj.is_null() {
             BrandList::NONE
         } else {
@@ -2374,6 +2632,11 @@ pub(crate) unsafe fn receiver_facts_of_current(
     );
     ReceiverFacts {
         extra_summary: receiver_extra_summary(obj),
+        integrity_flags: if obj.is_null() {
+            0
+        } else {
+            (*crate::object::gc_header_for(obj))._reserved & INTEGRITY_FLAGS
+        },
         brands: BrandList::copy_of(current.brands()),
     }
 }
@@ -2854,6 +3117,7 @@ pub(crate) fn final_shape_ensure_constfn(
         &[],
         requested,
         true,
+        0,
     )
 }
 
@@ -2939,7 +3203,9 @@ pub extern "C" fn js_shape_ordinary_inline_slot_for_key(shape_id: u32, key_bits:
 /// shadowed field's most-derived position wins). The list is bounded by the
 /// shape's own key count, never its backing's length (#10969).
 /// Allocation-free; never calls user code.
-fn region_key_location(descriptor: &ShapeDescriptor, key_bits: u64) -> Option<(bool, usize)> {
+#[inline(never)]
+#[optimize(size)]
+fn region_key_location(keys: u64, count: u32, inline: u32, key_bits: u64) -> Option<(bool, usize)> {
     let mut wanted_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     let mut stored_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     unsafe {
@@ -2948,12 +3214,12 @@ fn region_key_location(descriptor: &ShapeDescriptor, key_bits: u64) -> Option<(b
             &mut wanted_buf,
         )?;
         let (slots, len) =
-            super::keys_array_dense_slots_resolved(descriptor.keys as usize as *const ArrayHeader);
+            super::keys_array_dense_slots_resolved(keys as usize as *const ArrayHeader);
         if slots.is_null() {
             return None;
         }
-        let hi = len.min(descriptor.logical_key_count as usize);
-        let lo = hi.min(descriptor.live_inline_slot_count as usize);
+        let hi = len.min(count as usize);
+        let lo = hi.min(inline as usize);
         let mut matches = |i: usize| {
             let stored = crate::JSValue::from_bits((*slots.add(i)).to_bits());
             stored.bits() == key_bits
@@ -3172,6 +3438,8 @@ enum RegionRefusal {
     Rep,
 }
 
+#[inline(never)]
+#[optimize(size)]
 fn region_loop_pack(
     shape_id: u32,
     n: u32,
@@ -3184,19 +3452,18 @@ fn region_loop_pack(
     if !is_site_matchable_shape_id(shape_id) || n == 0 || n > REGION_GUARD_MAX_KEYS {
         return Err(Band);
     }
-    match shape_record_by_id(shape_id) {
-        Some(record) if record.summary() == 0 => {}
-        Some(_) => return Err(Summary),
-        None => return Err(Band),
+    let record = shape_record_by_id(shape_id).ok_or(Band)?;
+    if record.summary() != 0 {
+        return Err(Summary);
     }
-    let Some(descriptor) = shape_descriptor_by_id(shape_id) else {
-        return Err(Band);
-    };
-    let unmarked_numeric_read = descriptor.object_kind == ShapeObjectKind::OrdinaryUnmarked
+    // Borrow the same record throughout priming; no descriptor clone or
+    // second slab probe, and no allocation/callback in this operation.
+    let descriptor = unsafe { &*record.0.as_ptr() };
+    let unmarked_numeric_read = descriptor.object_kind() == ShapeObjectKind::OrdinaryUnmarked
         && stored_mask == 0
         && boxed_mask == 0
         && r_mask == (1 << n) - 1;
-    if (descriptor.object_kind != ShapeObjectKind::Ordinary && !unmarked_numeric_read)
+    if (descriptor.object_kind() != ShapeObjectKind::Ordinary && !unmarked_numeric_read)
         || descriptor.proto_id == PROTO_ID_PER_OBJECT
         || descriptor.semantic_generation != 0
         || descriptor.hole_count != 0
@@ -3207,12 +3474,18 @@ fn region_loop_pack(
     let mut at = [(false, 0usize); REGION_GUARD_MAX_KEYS as usize];
     let mut any_spill = false;
     for (i, &key) in keys.iter().enumerate().take(n as usize) {
-        let (spilled, position) = region_key_location(&descriptor, key).ok_or(Absent)?;
+        let (spilled, position) = region_key_location(
+            descriptor.keys,
+            descriptor.logical_key_count,
+            descriptor.live_inline_slot_count,
+            key,
+        )
+        .ok_or(Absent)?;
         if spilled {
             if stored_mask & (1 << i) != 0 {
                 return Err(SpillStored);
             }
-            if !super::object_spill_enabled() || position >= super::SPILL_MAX_FIELD_INDEX {
+            if position >= super::SPILL_MAX_FIELD_INDEX {
                 return Err(SpillUnservable);
             }
             any_spill = true;
@@ -4302,6 +4575,7 @@ pub(crate) unsafe fn learn_object_constfn_lanes(
         &infos,
         &brands,
         None,
+        current.integrity_flags,
     ) else {
         return false;
     };
@@ -4388,6 +4662,7 @@ pub(crate) unsafe fn transition_object_shape_semantics_keeping_constfn(
         &infos,
         receiver.brands.as_slice(),
         None,
+        current.integrity_flags,
     ) else {
         return transition_object_shape_semantics(obj);
     };
@@ -4919,7 +5194,9 @@ pub(crate) unsafe fn object_proto_id_for(
     // A namespace's vtable/override registry can answer before its physical
     // own slots. Project that read classification into the shape, as for
     // process.env and arguments below; an own-slot region cannot admit it.
-    if (*obj).class_id == crate::object::NATIVE_MODULE_CLASS_ID {
+    if (*obj).class_id == crate::object::NATIVE_MODULE_CLASS_ID
+        || (*super::gc_header_for(obj))._reserved & crate::gc::OBJ_FLAG_ARGUMENTS != 0
+    {
         return PROTO_ID_PER_OBJECT;
     }
     let meta = (*obj).meta;
@@ -5067,8 +5344,9 @@ pub(crate) unsafe fn transition_object_shape_to_class(
 /// carries the brand (PrivateMethodOrAccessorAdd's "twice" error is the
 /// caller's) or is not a shaped object; nothing changes then.
 ///
-/// A class brands its instance after the heritage's constructor returned, so
-/// this is a transition, never a birth fact. Every later transition reads the
+/// Installed private elements brand a receiver after heritage construction;
+/// lexical evaluation ownership is recorded on the linked birth shape.
+/// Every later transition reads the
 /// receiver's brands back off its shape (`receiver_facts`), so the brand is
 /// carried by every shape the receiver moves to.
 ///
@@ -5087,7 +5365,12 @@ pub(crate) unsafe fn transition_object_shape_add_brand(
         object_shape_descriptor(obj).expect("shape synchronization must publish a descriptor")
     });
     let mut receiver = receiver_facts_of_current(obj, &current);
-    if !receiver.brands.insert(brand) {
+    let changed = if shapes_evaluation_brand::is_evaluation_holder_brand(brand) {
+        receiver.brands.replace_evaluation_holder(brand)
+    } else {
+        receiver.brands.insert(brand)
+    };
+    if !changed {
         return false;
     }
     crate::array::clear_array_subclass_named_prefix_token(obj);
@@ -5137,9 +5420,15 @@ fn debug_assert_brands_carried(previous: u32, next: u32) {
             return;
         };
         debug_assert!(
-            before
-                .iter()
-                .all(|brand| after.binary_search(brand).is_ok()),
+            before.iter().all(|brand| {
+                if shapes_evaluation_brand::is_evaluation_holder_brand(*brand) {
+                    after
+                        .iter()
+                        .any(|&new| shapes_evaluation_brand::is_evaluation_holder_brand(new))
+                } else {
+                    after.binary_search(brand).is_ok()
+                }
+            }),
             "shape {next:#x} dropped a private brand of {previous:#x}: {before:?} -> {after:?}"
         );
     }
@@ -5721,14 +6010,19 @@ fn scan_shape_table_keys_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     inner.young_keys.extend(carrier_notes);
     let rewrite_phase = visitor.is_metadata_rewrite_phase();
     // #9754: a minor-scoped pass visits only the young-logged keys addresses;
-    // the full walk below rebuilds the log from what it finds.
+    // the full walk below retains and updates the writer-maintained log.
     if visitor.young_scope() {
         scan_shape_table_young(visitor, table, &mut inner, rewrite_phase);
         return;
     }
-    // The full walk rebuilds the log from the tables at the end. Before that,
-    // settle what the log named, so an address that left the heap takes its
-    // entries with it here too. The rebuild below discards `relogged`.
+    // Writers already name every minor candidate. Keep that log through a
+    // full walk instead of sorting and classifying all old, stationary
+    // families again just to rediscover that they need no minor work.
+    #[cfg(any(debug_assertions, test))]
+    inner
+        .young_keys
+        .debug_assert_logged(SHAPE_YOUNG_LOG_NAME, &relevant_shape_keys(table, &inner));
+    // Settle released addresses before visiting the authoritative families.
     let drained = inner.young_keys.take_sorted();
     let mut relogged = Vec::new();
     for keys in drained {
@@ -5806,6 +6100,9 @@ fn scan_shape_table_keys_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     }
     for (old, new) in moved_families {
         move_shape_family(table, &mut inner, old, new);
+        if new != 0 {
+            relogged.push(new);
+        }
     }
 
     if rewrite_phase && !inner.indices.is_empty() {
@@ -5821,6 +6118,7 @@ fn scan_shape_table_keys_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
         for (old, new) in moved {
             if let Some(shape) = inner.indices.remove(&old) {
                 inner.indices.insert(new, shape);
+                relogged.push(new as u64);
             }
         }
         // Drop indices entries whose keys-array address was recycled: the
@@ -5841,11 +6139,24 @@ fn scan_shape_table_keys_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
         }
     }
 
-    // A full walk is authoritative: rebuild the young log from the tables.
-    let kept = relevant_shape_keys(table, &inner);
+    // Rekeys above contribute their destination, while surviving mutable
+    // lists retain their existing writer note. Drop promoted or retired
+    // candidates using the same predicate as the minor walk.
+    relogged.extend(inner.young_keys.take_sorted());
+    relogged.sort_unstable();
+    relogged.dedup();
+    let mut kept = Vec::with_capacity(relogged.len());
+    for keys in relogged {
+        if inner.families.contains_key(&keys) || inner.indices.contains_key(&(keys as usize)) {
+            relog_or_retire_shape_keys(table, &mut inner, &mut kept, keys);
+        }
+    }
     let kept_len = kept.len() as u64;
-    let _ = inner.young_keys.take_sorted();
     inner.young_keys.extend(kept);
+    #[cfg(any(debug_assertions, test))]
+    inner
+        .young_keys
+        .debug_assert_logged(SHAPE_YOUNG_LOG_NAME, &relevant_shape_keys(table, &inner));
     crate::gc::young_log::note_walk(
         SHAPE_YOUNG_LOG_NAME,
         crate::gc::young_log::YoungLogWalk {
@@ -6204,9 +6515,15 @@ pub(crate) fn shape_table_census() -> Vec<crate::gc::census::SideTableRow> {
     // and how many distinct prototype identities it names: what the
     // prototype-in-shape rule costs in shapes.
     let mut by_kind = [0usize; 6];
+    let mut extensions = (0, 0, 0, 0);
     let mut distinct = std::collections::HashSet::new();
     slab.for_each(|_, record| {
         // SAFETY: live slab record, read immediately under agent ownership.
+        let owned = unsafe { (*record).extension_census() };
+        extensions.0 += owned.0;
+        extensions.1 += owned.1;
+        extensions.2 += owned.2;
+        extensions.3 += owned.3;
         let proto_id = unsafe { (*record).proto_id };
         distinct.insert(proto_id);
         let kind = match proto_id {
@@ -6233,6 +6550,19 @@ pub(crate) fn shape_table_census() -> Vec<crate::gc::census::SideTableRow> {
         rows.push((name, count, 0));
     }
     rows.push(("shapes.proto.distinct_identities", distinct.len(), 0));
+    rows.push((
+        "shapes.extensions(native owned)",
+        extensions.0,
+        extensions.1,
+    ));
+    // A subset of extension bytes, so this informational row adds no bytes
+    // to the census total a second time.
+    rows.push(("shapes.store_chain(facts)", extensions.2, 0));
+    rows.push((
+        "shapes.store_chain(bytes included in extensions)",
+        extensions.3,
+        0,
+    ));
     rows
 }
 
@@ -6301,3 +6631,7 @@ pub(crate) fn shape_table_liveness_census(
         ("shapes.families.largest", largest, 0),
     ]
 }
+
+#[path = "shapes_integrity.rs"]
+mod integrity;
+pub(crate) use integrity::{transition_object_integrity, INTEGRITY_FLAGS};

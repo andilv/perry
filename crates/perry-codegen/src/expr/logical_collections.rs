@@ -132,10 +132,11 @@ pub(crate) fn emit_private_site_guard(
     let blk = ctx.block();
     let word = blk.load_atomic_monotonic(I64, site, 8);
     let bits = blk.bitcast_double_to_i64(obj);
-    // `bits - (POINTER_TAG + 0x100000) < 2^48 - 0x100000`: POINTER-tagged and
-    // above the small-handle band, in one compare.
-    let biased = blk.sub(I64, &bits, "9222527611925692416");
-    let in_range = blk.icmp_ult(I64, &biased, "281474975662080");
+    // POINTER-tagged and above the handle band, in one compare: the shared
+    // receiver test of every read and write route (`receiver_range`).
+    let recv = crate::expr::receiver_range::emit_fused_receiver_test(blk, &bits);
+    let biased = recv.biased;
+    let in_range = recv.is_object_pointer;
     let inert = emit_private_template_inert(blk, class_id);
     let ready = blk.and(crate::types::I1, &in_range, &inert);
     let ready = if static_id.is_some() {
@@ -148,8 +149,9 @@ pub(crate) fn emit_private_site_guard(
 
     ctx.current_block = probe_idx;
     let blk = ctx.block();
-    let shape_addr = blk.add(I64, &biased, "1048580"); // payload + 4
-    let shape_ptr = blk.inttoptr(I64, &shape_addr);
+    // The ShapeId word (payload + 4), addressed from the biased value by the
+    // module that biased it, so the two never disagree about the handle floor.
+    let shape_ptr = crate::expr::receiver_range::emit_field_ptr(blk, &biased, 4);
     let shape = blk.load(crate::types::I32, &shape_ptr);
     let shape = blk.zext(crate::types::I32, &shape, I64);
     // A site word is never 0 once primed, and no ShapeId is 0, so an
@@ -1343,11 +1345,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // first enforces ECMA-262 13.10.1 step 5: a non-Object right operand
         // (`"x" in 5`, `... in null`, `... in Symbol()`, …) throws a TypeError.
         Expr::In { property, object } => {
-            // A literal key gets a presence inline cache (`in_presence_ic`).
-            // The cache records a ShapeId and nothing else, so the key it
-            // stands for has to be fixed at the site: a dynamic key keeps the
-            // bare call. `full_outline_ic_enabled` is the size mode that asks
-            // every IC to stay out of the emitted function.
+            // Fixed keys retain the inline own-hit arm. Dynamic keys share
+            // the existing keyed entry through the one runtime operation.
             let constant_key = matches!(&**property, Expr::String(_))
                 && !crate::codegen::full_outline_ic_enabled();
             rooting::with_operands_rooted(ctx, &[property, object], |ctx, vals| {
@@ -1356,10 +1355,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         ctx, &vals[1], &vals[0],
                     ));
                 }
+                let site = ctx.ic_site_counter;
+                ctx.ic_site_counter += 1;
+                let name = super::inline_cache_global_name(ctx, site);
+                ctx.ic_globals.push(name.clone());
+                let slot_ref = format!("@{name}");
                 Ok(ctx.block().call(
                     DOUBLE,
-                    "js_in_operator",
-                    &[(DOUBLE, &vals[1]), (DOUBLE, &vals[0])],
+                    "js_in_operator_presence_ic",
+                    &[
+                        (DOUBLE, &vals[1]),
+                        (DOUBLE, &vals[0]),
+                        (crate::types::PTR, &slot_ref),
+                    ],
                 ))
             })
         }
@@ -1554,93 +1562,58 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         }
 
         // -------- ObjectSpread literal --------
-        // `{ ...a, key: val, ...b }`. The HIR carries an ordered
-        // Vec<(Option<String>, Expr)>. Static props use the same
-        // js_object_set_field_by_name path as `Expr::Object`. For
-        // spread sources we'd need a runtime helper to copy fields
-        // — for now we just allocate the object and set the static
-        // props, ignoring spreads. Wrong for `...src` but unblocks
-        // compilation.
         Expr::ObjectSpread { parts } => {
-            // `{ ...a, x: 1, ...b, y: 2 }` — allocate an empty object,
-            // then process `parts` in source order: static keys call
-            // `js_object_set_field_by_name`, spreads call the runtime
-            // `js_object_copy_own_fields(dst, src)` which walks the
-            // source's `keys_array` and copies each field via the same
-            // setter (so later parts override earlier ones, matching JS
-            // semantics).
-            let static_count = parts.iter().filter(|(k, _)| k.is_some()).count() as u32;
-            let class_id = "0".to_string();
-            let count_str = static_count.to_string();
-            let obj_handle = ctx.block().call(
-                I64,
-                "js_object_alloc",
-                &[(I32, &class_id), (I32, &count_str)],
-            );
-            // #7154: the half-built object is a raw SSA register while every
-            // part is lowered, and a part's initializer allocates (zod's
-            // `classic/schemas.ts` builds a 269-key spread whose values are
-            // `$ZodAny()` etc. — full JS calls). An evacuating minor inside one
-            // of those relocates the object, and every later
-            // `js_object_set_field_by_name` then writes into abandoned
-            // from-space memory, so the fields silently vanish from the copy
-            // the caller receives. This is the same rooting contract
-            // `Expr::Object` has used since #6951; `ObjectSpread` never got it.
-            //
-            // A spread part forces protection on its own, independently of
-            // whether the spread *expression* collects. `js_object_copy_own_fields`
-            // reads every own key of the source, so a source carrying an accessor
-            // runs arbitrary user code inside the helper — `{ ...a }` over a plain
-            // `LocalGet` answers `false` to `any_may_trigger_gc` and is still a
-            // collection point.
-            //
-            // A plain `js_object_set_field_by_name` on an inert value is NOT one,
-            // which is why the rest of the predicate stays byte-identical to
-            // `Expr::Object`'s: an allocation inside a runtime helper can never
-            // *initiate* a moving collection. `gc_check_trigger`'s minor arm
-            // defers to the loop safepoint under `PERRY_GC_MOVING_LOOP_POLLS=1`
-            // (`gc/policy.rs`, `GC_SAFEPOINT_PENDING`) and is conservative-scanned
-            // or budgeted-non-moving otherwise, so the register stays valid.
-            let protect_handle = parts.iter().any(|(k, _)| k.is_none())
-                || rooting::any_operand_may_collect(ctx, parts.iter().map(|(_, v)| v));
+            // A leading spread births its result directly. Otherwise the
+            // source-ordered prefix is built before the spread expression is
+            // evaluated. The fresh accumulator cannot escape during building.
+            let initial = if parts.first().is_some_and(|(key, _)| key.is_none()) {
+                double_literal(f64::from_bits(TAG_UNDEFINED))
+            } else {
+                let count = parts
+                    .iter()
+                    .filter(|(key, _)| key.is_some())
+                    .count()
+                    .to_string();
+                let handle = ctx
+                    .block()
+                    .call(I64, "js_object_alloc_plain", &[(I32, &count)]);
+                nanbox_pointer_inline(ctx.block(), &handle)
+            };
             rooting::with_rooted_accumulator(
                 ctx,
-                Repr::Ptr,
-                &obj_handle,
-                protect_handle,
+                Repr::Boxed,
+                &initial,
+                true,
                 |ctx, acc| {
-                    for (key_opt, value_expr) in parts {
-                        if let Some(key) = key_opt {
-                            // Static key:value pair.
-                            let v = lower_expr(ctx, value_expr)?;
+                    for (index, (key, value_expr)) in parts.iter().enumerate() {
+                        let value = lower_expr(ctx, value_expr)?;
+                        if let Some(key) = key {
                             let key_idx = ctx.strings.intern(key);
-                            let key_handle_global =
-                                format!("@{}", ctx.strings.entry(key_idx).handle_global);
-                            let key_raw = {
-                                let blk = ctx.block();
-                                let key_box = blk.load(DOUBLE, &key_handle_global);
-                                let key_bits = blk.bitcast_double_to_i64(&key_box);
-                                blk.and(I64, &key_bits, POINTER_MASK_I64)
-                            };
-                            acc.call_void(
+                            let global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+                            let key_box = ctx.block().load(DOUBLE, &global);
+                            acc.call(
                                 ctx,
-                                "js_object_set_field_by_name",
-                                &[Arg::Plain(I64, &key_raw), Arg::Plain(DOUBLE, &v)],
+                                DOUBLE,
+                                "js_object_literal_define",
+                                &[Arg::Plain(DOUBLE, &key_box), Arg::Plain(DOUBLE, &value)],
                             );
                         } else {
-                            // `...expr` spread — copy all own fields from the
-                            // source object into the accumulator.
-                            let src_box = lower_expr(ctx, value_expr)?;
-                            acc.call_void(
+                            // The helper returns the current (possibly new or
+                            // evacuated) accumulator; publish it in the root.
+                            acc.advance(
                                 ctx,
-                                "js_object_copy_own_fields",
-                                &[Arg::Plain(DOUBLE, &src_box)],
+                                if index == 0 {
+                                    "js_object_spread_fresh_leading"
+                                } else {
+                                    "js_object_spread_fresh"
+                                },
+                                &[Arg::Plain(DOUBLE, &value)],
                             );
                         }
                     }
                     Ok(())
                 },
-                |ctx, obj_handle| Ok(nanbox_pointer_inline(ctx.block(), obj_handle)),
+                |_ctx, value| Ok(value.to_string()),
             )
         }
 

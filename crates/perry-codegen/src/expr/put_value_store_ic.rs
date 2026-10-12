@@ -58,7 +58,7 @@
 //!   native-module receiver is `OrdinaryUnmarked`; a proof-carrying one is
 //!   `OrdinaryNumericProof`; both are other ShapeIds.
 //! * **Not a Proxy**: a Proxy is a POINTER-tagged id in the handle band, below
-//!   `0x100000`, so the small-handle test refuses it before any load.
+//!   `0x200000`, so the small-handle test refuses it before any load.
 //!
 //! # Nothing is re-read per object
 //!
@@ -279,11 +279,11 @@ pub(crate) fn emit_static_store_ic(
     let add_label = ctx.block_label(add_idx);
 
     // Receiver: POINTER tag AND payload above the handle band, as ONE unsigned
-    // range compare. `t = bits - (POINTER_TAG | 0x100000)` is below
-    // `2^48 - 0x100000` exactly when the top sixteen bits are 0x7FFD and the
-    // payload is >= 0x100000 (a smaller payload, or any other tag, wraps above
+    // range compare. `t = bits - (POINTER_TAG | 0x200000)` is below
+    // `2^48 - 0x200000` exactly when the top sixteen bits are 0x7FFD and the
+    // payload is >= 0x200000 (a smaller payload, or any other tag, wraps above
     // the bound). Native registry ids and the Proxy id band live below
-    // 0x100000, so neither is ever dereferenced. The handle is `t + 0x100000`.
+    // 0x200000, so neither is ever dereferenced. The handle is `t + 0x200000`.
     // The one shared form every read and write route takes
     // (`crate::expr::receiver_range`).
     let recv = crate::expr::receiver_range::emit_fused_receiver_test(ctx.block(), &obj_bits);
@@ -301,11 +301,8 @@ pub(crate) fn emit_static_store_ic(
     let sid = ctx.block().load(I32, &sid_ptr);
     let stamp = ctx.block().trunc(I64, &word, I32);
     let shape_eq = ctx.block().icmp_eq(I32, &sid, &stamp);
-    // #10498: a store to a key the receiver inherits as a compiled class
-    // setter calls it inline (`setter_arm`), ahead of the key-add memo and the
-    // ways. 64-bit targets only: the entry is a record of 8-byte words.
-    // Only for a name some compiled class of the program declares as a setter:
-    // no other site can ever take an entry.
+    // Setter candidates reuse the one collecting store exit. The shared
+    // runtime consumer validates holder, installation and storage facts.
     let setter_entry = (setter_arm_target(ctx.target_triple)
         && ctx.program_may_declare_setter(property))
     .then(|| ctx.new_block(&format!("{STORE_IC_STEM}.acc")));
@@ -313,23 +310,16 @@ pub(crate) fn emit_static_store_ic(
         .map(|idx| ctx.block_label(idx))
         .unwrap_or_else(|| add_label.clone());
     ctx.block().cond_br(&shape_eq, &kind_label, &shape_miss);
-    let setter_end = setter_entry.map(|entry_idx| {
-        let header_bytes = crate::target_layout::object_header_size_bytes(ctx.target_triple) as i64;
+    if let Some(entry_idx) = setter_entry {
         setter_arm::emit_setter_arm(
             ctx,
             entry_idx,
             &word,
             PACKED_SET_EMPTY,
-            &cache_slot_ref,
-            &sid,
-            obj_box,
-            value_double,
-            value_bits,
-            header_bytes,
+            &miss_label,
             &add_label,
-            &merge_label,
-        )
-    });
+        );
+    }
     let mut word_incoming: Vec<(String, String)> = vec![(word, tok_label.clone())];
 
     // A word miss: the key-add memo's primary pre-shape next, BEFORE the
@@ -568,14 +558,11 @@ pub(crate) fn emit_static_store_ic(
     ctx.block().br(&merge_label);
 
     ctx.current_block = merge_idx;
-    let mut incoming: Vec<(&str, &str)> = vec![
+    let incoming: Vec<(&str, &str)> = vec![
         (value_double, &hit_end_label),
         (value_double, &add_end_label),
         (&miss_value, &miss_end_label),
     ];
-    if let Some(setter_end) = setter_end.as_ref() {
-        incoming.push((value_double, setter_end));
-    }
     ctx.block().phi(DOUBLE, &incoming)
 }
 

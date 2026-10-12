@@ -42,6 +42,10 @@ fn a_constfn_exec_lane_must_name_the_builtin_body() {
                 to_any: std::sync::atomic::AtomicU32::new(0),
                 rollback_parent: std::sync::atomic::AtomicU32::new(0),
                 created_birth_shape: std::sync::atomic::AtomicU32::new(0),
+                store_chain: None,
+                integrity_targets: [0; 3],
+                integrity_flags: 0,
+                constfn_birth_admitted: false,
             };
             holder.record = 0;
             holder.extras = &extras as *const super::shapes_store::ShapeExtras as u64;

@@ -33,7 +33,7 @@ pub const AGENT_PTR_SHAPE_DIR: usize = 0;
 /// miss front (`js_object_get_field_ic_front`) takes the receiver in exactly
 /// that form: the front adds the floor back inside its load displacements,
 /// and the site passes the value its test already holds.
-pub const RECEIVER_HANDLE_FLOOR: usize = 0x10_0000;
+pub const RECEIVER_HANDLE_FLOOR: usize = 0x20_0000;
 /// Slot 2: this agent's stack limit (#10812) — not a pointer to anything, the
 /// lowest frame address a compiled prologue accepts before it throws
 /// `RangeError: Maximum call stack size exceeded`. Null means unchecked.
@@ -51,6 +51,15 @@ pub const CLOSURE_SHAPE_OFFSET: usize = 4;
 pub const CLOSURE_INFO_OFFSET: usize = 8;
 pub const CLOSURE_PROPS_OFFSET: usize = 16;
 pub const CLOSURE_HEADER_SIZE: usize = 24;
+
+/// Reserved intrinsic function ShapeIds, seeded in each agent's authoritative
+/// shape table. No body/shape cache is needed when a closure is born.
+pub const FUNCTION_SHAPE_BASE: u32 = 0xB810_0000;
+/// Per-object dictionary prototype identity uses the plain kind band.
+pub const FUNCTION_DICTIONARY_SHAPE: u32 = 0xB800_0004;
+pub const FUNCTION_SHAPE_COUNT: u32 = 9;
+pub const FUNCTION_SHAPE: u32 = FUNCTION_SHAPE_BASE;
+pub const ASYNC_FUNCTION_SHAPE: u32 = FUNCTION_SHAPE_BASE + 1;
 
 /// `object::ObjectHeader::parent_class_id`: the object's ShapeId word (LP64
 /// and ILP32 alike; `CLOSURE_SHAPE_OFFSET` is the same word of a closure).
@@ -364,6 +373,13 @@ pub const FN_REST_NATIVE_ARGS: u32 = 1 << 16;
 /// proved, avoiding a second walk. This does not waive its descriptor,
 /// prototype, frozen or extensibility checks, or change generic callers.
 pub const FN_RESOLVES_ARRAY_THIS: u32 = 1 << 17;
+/// Synthetic-arguments bodies that materialize an Arguments object accept
+/// one born directly from the dispatcher's argument list instead of an Array.
+pub const FN_ARGUMENTS_OBJECT: u32 = 1 << 18;
+/// The directly born object's `callee` is restricted.
+pub const FN_ARGUMENTS_RESTRICTED: u32 = 1 << 19;
+/// The directly born object needs slots for mapped parameter aliases.
+pub const FN_ARGUMENTS_MAPPED: u32 = 1 << 20;
 /// Any rest kind.
 pub const FN_REST_MASK: u32 =
     FN_REST_USER | FN_REST_SYNTHETIC_ARGUMENTS | FN_REST_USER_AND_ARGUMENTS | FN_REST_NATIVE_ARGS;
@@ -417,6 +433,9 @@ pub const FN_HAS_SOURCE: u32 = 1 << 14;
 /// The retained source describes an ordinary non-strict function. Methods,
 /// arrows and strict ordinary functions leave this clear.
 pub const FN_NON_STRICT_ORDINARY: u32 = 1 << 15;
+/// Compiled name bytes follow the info (and any retained-source tail) as
+/// an i32 relative displacement and a u32 byte length. No GC edge or birth work.
+pub const FN_HAS_NAME: u32 = 1 << 21;
 
 /// Byte offsets of the fields codegen emits and emitted code reads.
 pub const JS_FUNCTION_INFO_CODE_OFFSET: usize = 0;
@@ -655,13 +674,12 @@ pub const PIC_HOLDER_OBJ_WORD: usize = 13;
 pub const PIC_HOLDER_SHAPE_WORD: usize = 14;
 pub const PIC_HOLDER_KIND_WORD: usize = 15;
 /// A class-accessor entry (#10498): its kind word carries
-/// [`PIC_HOLDER_ACCESSOR_BIT`] over the holder's inline slot (low 32 bits);
+/// [`PIC_HOLDER_ACCESSOR_BIT`] over the holder's slot word (low 32 bits);
 /// [`PIC_HOLDER_PAIR_WORD`] holds the raw address of the accessor pair that
 /// slot held when the site primed (a strong root the collector rewrites), and
 /// [`PIC_HOLDER_GETTER_WORD`] the code the hit calls for the getter that pair
 /// names, as `double get(double this, i64 pair)` (0 when only the collecting
-/// slow call answers the entry: a setter-only pair, or a lane in the holder's
-/// spill storage, see [`PIC_HOLDER_SLOT_SPILL_BIT`]):
+/// slow call answers the entry: a setter-only pair or a deep chain):
 /// a compiled class getter, which declares `this` only (the pair is
 /// over-applied), or the runtime's closure-getter entry, which calls the
 /// function object in the pair's getter element through the closure ABI. A
@@ -672,8 +690,8 @@ pub const PIC_HOLDER_PAIR_WORD: usize = 16;
 pub const PIC_HOLDER_GETTER_WORD: usize = 19;
 /// A holder slot word (the low 32 bits of an entry's kind) with this bit set
 /// names a position in the holder's SPILL storage, not an inline slot. The
-/// emitted accessor arm loads inline lanes only: a spill lane's accessor entry
-/// keeps getter word 0, and the collecting slow call answers it.
+/// emitted accessor arm uses the same receiver/holder/pair proof for either
+/// storage location; spill positions are live while the holder ShapeId matches.
 pub const PIC_HOLDER_SLOT_SPILL_BIT: i64 = 1 << 31;
 
 /// `proxy::put_value::setter_site` (#10498): the word of a static-key store
