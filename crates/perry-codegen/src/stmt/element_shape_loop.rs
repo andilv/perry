@@ -61,7 +61,7 @@
 //! | `arr[i] = x` (different class / non-object / hole) | `gc::layout_note_slot` → `note_element_store` | yes |
 //! | `arr.push` / `pop` / `shift` / `splice` / `arr.length = n` | length change ⇒ `verified_len` mismatch on next query | yes |
 //! | `delete arr[i]` | `TAG_HOLE` store through the same funnel | yes |
-//! | `Object.defineProperty(arr, i, …)` | `OBJ_FLAG_ARRAY_DESCRIPTORS` ⇒ `array_admits_element_proof` | yes |
+//! | `Object.defineProperty(arr, i, …)` | element descriptor in the array's named layout ⇒ `array_admits_element_proof` | yes |
 //! | prototype surgery on the element class | `invalidate_all_element_shapes` | yes |
 //! | a GC moving the array | `layout_transfer` → `transfer_element_shape` | needs an allocation |
 //!
@@ -1359,6 +1359,12 @@ fn match_class_identity(
     // native base (`extends Array`) is exactly the #7573/#7603 hazard. Decline.
     if class.extends_name.is_some() {
         return None;
+    }
+    // The class arm compares each element against the class's static ShapeId.
+    // Elements of a class that leaves it never carry it; the shape arm asks
+    // the runtime for the shape they do carry (#12483).
+    if !crate::expr::class_field_inline_guard::class_instances_keep_birth_shape(ctx, class_name) {
+        return Some(ElementShapeIdentity::Shape);
     }
     let expected_class_id = *ctx.class_ids.get(class_name)?;
     let keys_global_name = ctx.class_keys_globals.get(class_name)?.clone();

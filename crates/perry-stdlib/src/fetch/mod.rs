@@ -66,6 +66,8 @@ pub use bun_server_bridge::*;
 // the two bound-method caches and `RequestRecord::signal`. Same
 // child-module/`use super::*` contract as `headers`.
 mod gc;
+mod native_properties;
+pub(crate) use native_properties::{native_property_bag, set_native_property_bag};
 mod lifecycle;
 
 // Web Fetch `Request` constructors (`js_request_new` /
@@ -332,6 +334,7 @@ fn with_stream(id: usize, f: impl FnOnce(&mut StreamState)) {
 }
 
 struct FetchResponse {
+    pub(super) props: u64,
     status: u16,
     status_text: String,
     headers: HeadersStore,
@@ -481,40 +484,16 @@ fn drain_body_stream(stream_id: usize) -> (Vec<u8>, Option<f64>) {
     (bytes, crate::streams::readable_stream_error(stream_id))
 }
 
-/// Extract the registry id from a Web Fetch handle f64 value.
-///
-/// Web Fetch handles (Request / Response / Headers / Blob) are returned by
-/// constructors as NaN-boxed POINTER_TAG values via `js_nanbox_pointer`, so
-/// they look like pointers to the runtime's dispatchers (`js_object_get_field_by_name`,
-/// `js_native_call_method`) and route through `HANDLE_PROPERTY/METHOD_DISPATCH`
-/// for untyped property access — fixing the hono `request.url` blocker (#421).
-///
-/// This helper is tolerant during the cross-subsystem migration: it accepts both
-/// the canonical NaN-boxed form (top16 ≥ 0x7FF8) AND the legacy raw-float form
-/// (`1.0` = id 1, denormal bits, etc.). Other handle subsystems (streams / ws /
-/// net / DB) still use the legacy form until Phase 2 of the unification migrates
-/// them to NaN-boxed too.
+/// Strict decode of a Web Fetch HANDLE_TAG value; numbers and heap addresses
+/// are never registry ids.
 #[inline]
 pub(crate) fn handle_id(value: f64) -> usize {
-    let bits = value.to_bits();
-    let top16 = bits >> 48;
-    if top16 >= 0x7FF8 {
-        // NaN-boxed (POINTER_TAG / STRING_TAG / etc.): extract lower 48 bits.
-        (bits & 0x0000_FFFF_FFFF_FFFF) as usize
-    } else if top16 == 0 && bits != 0 {
-        // Raw integer bits as f64 (denormal-encoded handle id): use bits directly.
-        bits as usize
-    } else {
-        // Legacy float form (1.0 → 1): float-to-int truncation.
-        value as usize
-    }
+    perry_runtime::value::js_nanbox_get_handle(value) as usize
 }
 
-/// NaN-box a Web Fetch handle id (registry index) into a POINTER_TAG f64
-/// for return across the FFI boundary. Pairs with `handle_id` on accessor entry.
 #[inline]
 pub(crate) fn handle_to_f64(id: usize) -> f64 {
-    perry_runtime::value::js_nanbox_pointer(id as i64)
+    perry_runtime::value::js_nanbox_handle(id as i64)
 }
 
 pub(crate) use crate::common::string_from_header;
@@ -1062,6 +1041,7 @@ mod headers_store;
 use headers_store::{HeadersRecord, HeadersStore};
 #[derive(Clone)]
 struct RequestRecord {
+    pub(super) props: u64,
     url: String,
     method: String,
     /// Raw body bytes, stored verbatim so a binary (Buffer/Uint8Array) body
@@ -1099,6 +1079,7 @@ pub(crate) static BLOB_REGISTRY: std::sync::LazyLock<Mutex<HashMap<usize, BlobDa
 
 #[derive(Clone)]
 pub(crate) struct BlobData {
+    pub(super) props: u64,
     pub(crate) body: Vec<u8>,
     pub(crate) content_type: String,
     // Issue #1211: when the handle was created via `new File(parts, name, opts)`
@@ -1110,6 +1091,7 @@ pub(crate) struct BlobData {
 impl BlobData {
     pub(crate) fn blob(body: Vec<u8>, content_type: String) -> Self {
         BlobData {
+            props: 0,
             body,
             content_type,
             file_name: None,
@@ -1118,7 +1100,8 @@ impl BlobData {
     }
 }
 
-pub(crate) fn alloc_blob(data: BlobData) -> usize {
+pub(crate) fn alloc_blob(mut data: BlobData) -> usize {
+    data.props = 0;
     let id = alloc_fetch_handle_id();
     BLOB_REGISTRY.lock().unwrap().insert(id, data);
     id
@@ -1471,6 +1454,7 @@ pub extern "C" fn js_request_clone(handle: f64) -> f64 {
                 return Err(());
             }
             Ok(RequestRecord {
+                props: 0,
                 url: req.url.clone(),
                 method: req.method.clone(),
                 body: req.body.clone(),

@@ -110,23 +110,26 @@ fn stream_max_listeners(stream: f64) -> f64 {
 /// the `EventEmitter` export exists nothing can have reassigned it, so a
 /// stream-only program reads the default without minting it.
 fn default_max_listeners() -> f64 {
+    let number = number_of(emitter_constructor_property("defaultMaxListeners"));
+    if number.is_nan() {
+        DEFAULT_MAX_LISTENERS
+    } else {
+        number
+    }
+}
+/// Mutable constructor properties live in the constructor's existing property
+/// bag. No process flag can stand in for that observable source of truth.
+fn emitter_constructor_property(name: &str) -> f64 {
     let Some(ctor) =
         crate::object::native_module::minted_native_callable_export("events\0EventEmitter")
     else {
-        return DEFAULT_MAX_LISTENERS;
+        return undefined_value();
     };
     let jsval = JSValue::from_bits(ctor.to_bits());
     if jsval.is_pointer() {
-        let value = crate::closure::closure_get_dynamic_prop(
-            jsval.as_pointer::<u8>() as usize,
-            "defaultMaxListeners",
-        );
-        let number = number_of(value);
-        if !number.is_nan() {
-            return number;
-        }
+        return crate::closure::closure_get_dynamic_prop(jsval.as_pointer::<u8>() as usize, name);
     }
-    DEFAULT_MAX_LISTENERS
+    undefined_value()
 }
 
 pub(super) extern "C" fn ns_on2(
@@ -191,16 +194,6 @@ pub(super) extern "C" fn ns_off2(
     cb: f64,
 ) -> f64 {
     ns_remove_listener2(closure, this, event, cb)
-}
-
-pub(super) extern "C" fn ns_remove_all_listeners1(
-    closure: *const ClosureHeader,
-    this: crate::closure::JsThis,
-    event: f64,
-) -> f64 {
-    let stream = super::this_value(closure, this);
-    remove_all_stream_listeners_for_event(stream, event);
-    stream
 }
 
 #[no_mangle]
@@ -273,7 +266,10 @@ pub extern "C" fn js_node_stream_method_remove_all_listeners(
     if let Some(result) = crate::fs::utf8_stream_remove_all_value(stream, event) {
         return result;
     }
-    remove_all_stream_listeners_for_event(stream, event);
+    // The native 1-arg dispatch cannot observe `arguments.length`, so an
+    // `undefined` here is node's omitted type and keeps removing every event.
+    let all = is_undefined(event);
+    remove_all_stream_listeners(stream, event, all);
     stream
 }
 
@@ -569,13 +565,9 @@ fn own_data_slot(
         return None;
     }
     let addr = jsval.as_pointer::<u8>() as usize;
-    if !crate::value::addr_class::is_plausible_heap_addr(addr)
-        || crate::arena::classify_heap_generation(addr) == crate::arena::HeapGeneration::Unknown
-    {
-        return None;
-    }
+
     unsafe {
-        let header = crate::value::addr_class::try_read_gc_header_known_plausible(addr)?;
+        let header = crate::value::addr_class::try_read_tracked_gc_header(addr)?.as_ref();
         if header.obj_type != crate::gc::GC_TYPE_OBJECT
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
@@ -596,7 +588,7 @@ fn own_data_slot(
         {
             return None;
         }
-        if crate::object::dictionary::is_dictionary(obj) {
+        if crate::object::overflow::has_overflow(obj) {
             return None;
         }
         let shape = crate::object::shapes::object_shape_descriptor(obj)?;
@@ -612,6 +604,7 @@ fn own_data_slot(
         else {
             return Some(None);
         };
+        let slot = crate::object::key_attrs::key_storage_slot(keys, slot);
         Some(Some((obj, slot, shape.live_inline_slot_count)))
     }
 }
@@ -622,16 +615,14 @@ fn is_object_value(value: f64) -> bool {
         return false;
     }
     let addr = jsval.as_pointer::<u8>() as usize;
-    // An arena cell carries its GC header; anything else (a headerless
-    // buffer, a handle) takes the classifying probe.
-    if crate::value::addr_class::is_plausible_heap_addr(addr)
-        && crate::arena::classify_heap_generation(addr) != crate::arena::HeapGeneration::Unknown
-    {
-        // SAFETY: plausible and arena-owned, so the header is readable.
-        return unsafe { crate::value::addr_class::try_read_gc_header_known_plausible(addr) }
-            .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_OBJECT);
+    unsafe {
+        crate::value::addr_class::try_read_tracked_gc_header_of_type(
+            addr,
+            crate::gc::GC_TYPE_OBJECT,
+        )
     }
-    super::object_ptr_from_value(value).is_some()
+    .is_some()
+        || super::object_ptr_from_value(value).is_some()
 }
 
 fn is_array_value(value: f64) -> bool {
@@ -711,6 +702,15 @@ fn events_of(target: f64) -> Option<f64> {
 /// `_maxListeners`. Run by `super()` of a class extending EventEmitter and by
 /// `EventEmitter.call(this)`.
 pub(crate) fn init_event_emitter_state(target: f64) {
+    init_event_emitter_state_with_presence(target, None);
+}
+/// The constructor's scalar presence proof replaces this same ordinary Get;
+/// getters refuse that proof and keep the original shared initialization body.
+#[inline(never)]
+pub(crate) fn init_event_emitter_state_with_presence(
+    target: f64,
+    birth: Option<super::constructors::birth_memo::Input>,
+) {
     if !is_object_value(target) {
         return;
     }
@@ -736,43 +736,49 @@ pub(crate) fn init_event_emitter_state(target: f64) {
         is_undefined(events.get_nanbox_f64()) || {
             let proto = crate::object::js_object_get_prototype_of(target.get_nanbox_f64());
             is_object_value(proto)
-                && get_named(proto, crate::runtime_state_key!(EVENTS_KEY)).to_bits()
+                && super::constructors::birth_memo::read_field(
+                    proto,
+                    crate::runtime_state_key!(EVENTS_KEY),
+                    birth,
+                )
+                .to_bits()
                     == events.get_nanbox_f64().to_bits()
         }
     };
     if reset {
         reset_events(target.get_nanbox_f64());
     }
-    let max = state_get(
-        target.get_nanbox_f64(),
-        crate::runtime_state_key!(MAX_LISTENERS_KEY),
-    );
-    let max = if crate::value::js_is_truthy(max) != 0 {
-        max
-    } else {
-        undefined_value()
-    };
-    state_set(
-        target.get_nanbox_f64(),
-        crate::runtime_state_key!(MAX_LISTENERS_KEY),
-        max,
-    );
+    let assign_max = birth.map(|p| p.own_max()).unwrap_or_else(|| {
+        crate::value::js_is_truthy(state_get(
+            target.get_nanbox_f64(),
+            crate::runtime_state_key!(MAX_LISTENERS_KEY),
+        )) == 0
+    });
+    if assign_max {
+        state_set(
+            target.get_nanbox_f64(),
+            crate::runtime_state_key!(MAX_LISTENERS_KEY),
+            undefined_value(),
+        );
+    }
 }
 
 /// The data properties node's `EventEmitter.prototype` carries ahead of its
 /// methods: `_events: undefined`, `_eventsCount: 0`, `_maxListeners: undefined`.
 pub(crate) fn install_event_emitter_prototype_state(proto: f64) {
-    set_named(
-        proto,
-        crate::runtime_state_key!(EVENTS_KEY),
-        undefined_value(),
-    );
-    set_named(proto, crate::runtime_state_key!(EVENTS_COUNT_KEY), 0.0);
-    set_named(
-        proto,
-        crate::runtime_state_key!(MAX_LISTENERS_KEY),
-        undefined_value(),
-    );
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let proto = scope.root_nanbox_f64(proto);
+    for (index, value) in [undefined_value(), 0.0, undefined_value()]
+        .into_iter()
+        .enumerate()
+    {
+        crate::object::js_object_set_field(
+            crate::value::js_nanbox_get_pointer(proto.get_nanbox_f64())
+                as *mut crate::object::ObjectHeader,
+            index as u32 + 1,
+            crate::JSValue::from_bits(value.to_bits()),
+        );
+    }
 }
 
 /// Call `target[name](...args)` with `this = target`, as node's emitter does
@@ -896,14 +902,16 @@ fn once_wrap(target: f64, event: f64, listener: f64) -> f64 {
     let wrapper = scope.root_nanbox_f64(super::box_pointer(wrapper as *const u8));
     // `.listener` is observable through rawListeners(), so retain an ordinary
     // function property, born at its fixed slot instead of added afterward.
-    unsafe {
-        let installed = crate::closure::props::bag_born_with_attrs(
-            super::raw_ptr_from_value(wrapper.get_nanbox_f64()),
-            &[("listener", listener.get_nanbox_f64())],
-            &[],
-        );
-        debug_assert!(installed, "a fresh once wrapper has no property bag");
-    }
+    // It must go through the public birth entry point, which re-stamps the
+    // closure's ShapeId for its new bag: `props::bag_born_with_attrs` alone
+    // leaves the wrapper on its bag-less base shape, and a property read whose
+    // call site already saw that base shape (any plain listener in the same
+    // list) then answers "no such property" for the wrapper too.
+    let installed = crate::closure::closure_define_first_props(
+        super::raw_ptr_from_value(wrapper.get_nanbox_f64()),
+        &[("listener", listener.get_nanbox_f64())],
+    );
+    debug_assert!(installed, "a fresh once wrapper has no property bag");
     wrapper.get_nanbox_f64()
 }
 
@@ -1078,18 +1086,7 @@ fn warn_listener_limit(target: f64, event: f64, list: f64, len: f64, max: f64) {
     );
     let type_name = value_text(event.get_nanbox_f64());
     // node: `inspect(target, { depth: -1 })`, e.g. `[EventEmitter]`.
-    let options = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(
-        crate::object::js_object_alloc(0, 1) as i64,
-    ));
-    set_named(
-        options.get_nanbox_f64(),
-        crate::runtime_state_key!(b"depth"),
-        -1.0,
-    );
-    let shown = value_text(crate::builtins::js_util_inspect(
-        target.get_nanbox_f64(),
-        options.get_nanbox_f64(),
-    ));
+    let shown = emitter_inspect_label(target.get_nanbox_f64());
     let text = format!(
         "Possible EventEmitter memory leak detected. {} {type_name} listeners added to {shown}. MaxListeners is {}. Use emitter.setMaxListeners() to increase limit",
         len as u64,
@@ -1129,13 +1126,61 @@ fn warn_listener_limit(target: f64, event: f64, list: f64, len: f64, max: f64) {
     );
     // node: `process.emitWarning(w)` with the Error itself, which the
     // 'warning' listeners receive as is.
-    crate::process::schedule_warning(
-        warning.get_nanbox_f64(),
-        "MaxListenersExceededWarning",
-        "",
-        &text,
-        "",
+    emit_process_warning(warning.get_nanbox_f64(), &text, &scope);
+}
+
+/// node's `inspect(target, { depth: -1 })`, which is the constructor name in
+/// brackets and nothing else. Perry's `util.inspect` has no negative-depth
+/// mode (`builtins/console.rs`'s `decode_dir_depth_option` clamps any negative
+/// `depth` to 0, so it renders the object instead), so the value node's
+/// `getConstructorName` would find is read here directly.
+fn emitter_inspect_label(target: f64) -> String {
+    let constructor = get_key(target, name_key(b"constructor"));
+    if !is_callable_value(constructor) {
+        return "[Object]".to_string();
+    }
+    let name = value_text(get_key(constructor, name_key(b"name")));
+    if name.is_empty() {
+        "[Object]".to_string()
+    } else {
+        format!("[{name}]")
+    }
+}
+
+/// node's `_addListener` warns through the JS-visible `process.emitWarning(w)`,
+/// so a program that replaces that property intercepts the leak warning (and
+/// the builtin one does the reporting itself). An override that is not callable
+/// falls back to the runtime's own warning queue rather than dereferencing it.
+fn emit_process_warning(warning: f64, text: &str, scope: &crate::gc::RuntimeHandleScope) {
+    let process = scope.root_nanbox_f64(crate::object::js_create_native_module_namespace(
+        b"process".as_ptr(),
+        7,
+    ));
+    let name = scope.root_string_ptr(crate::string::js_string_from_bytes(
+        b"emitWarning".as_ptr(),
+        11,
+    ));
+    let callback = crate::object::js_object_get_field_by_name_f64(
+        crate::value::js_nanbox_get_pointer(process.get_nanbox_f64())
+            as *const crate::object::ObjectHeader,
+        name.get_raw_const_ptr::<crate::string::StringHeader>(),
     );
+    let callback = scope.root_nanbox_f64(callback);
+    if !is_callable_value(callback.get_nanbox_f64()) {
+        crate::process::schedule_warning(warning, "MaxListenersExceededWarning", "", text, "");
+        return;
+    }
+    let warning = scope.root_nanbox_f64(warning);
+    // SAFETY: the property resolved to a callable value; node calls it with the
+    // process object as `this`.
+    unsafe {
+        crate::closure::native_call_value_this(
+            callback.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(process.get_nanbox_f64()),
+            [warning.get_nanbox_f64()].as_ptr(),
+            1,
+        );
+    }
 }
 
 /// `String(value)` as Rust text (a symbol renders as `Symbol(desc)`).
@@ -1292,8 +1337,11 @@ pub(super) fn remove_stream_listener_for_event(stream: f64, event: f64, cb: f64)
     true
 }
 
-/// node's `removeAllListeners([type])`; `undefined` stands for "no argument".
-fn remove_all_stream_listeners_for_event(stream: f64, event: f64) {
+/// node's `removeAllListeners([type])`: `all` is `arguments.length === 0`, the
+/// only case that drains every event. With a `type` the name is used as given —
+/// coerced by the `_events` lookup like node's `events[type]` — so an explicit
+/// `undefined` removes the `"undefined"` key, not the whole emitter.
+pub(super) fn remove_all_stream_listeners(stream: f64, event: f64, all: bool) {
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(stream);
     let event = scope.root_nanbox_f64(event);
@@ -1301,7 +1349,6 @@ fn remove_all_stream_listeners_for_event(stream: f64, event: f64) {
         return;
     };
     let events = scope.root_nanbox_f64(events);
-    let all = is_undefined(event.get_nanbox_f64());
     if is_undefined(get_event_named(
         events.get_nanbox_f64(),
         crate::runtime_state_key!(b"removeListener"),
@@ -1383,7 +1430,7 @@ fn remove_all_via_method(target: f64, event: f64) {
     )
     .is_none()
     {
-        remove_all_stream_listeners_for_event(target, event);
+        remove_all_stream_listeners(target, event, false);
     }
 }
 
@@ -1555,16 +1602,47 @@ fn bool_value(value: bool) -> f64 {
     })
 }
 
+#[path = "node_stream_event_emitter_capture.rs"]
+mod capture_default;
+#[cfg(test)]
+pub(crate) use capture_default::emitter_capture_default;
+
 /// node's `EventEmitter.init(opts)` capture step: a truthy
 /// `opts.captureRejections` must be a boolean, and turns capture on.
 pub(crate) fn init_event_emitter_capture(target: f64, options: f64) {
-    if !is_object_value(options) || !is_object_value(target) {
+    if !is_object_value(target) {
         return;
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let target = scope.root_nanbox_f64(target);
-    let value = get_named(options, crate::runtime_state_key!(b"captureRejections"));
+    let options = scope.root_nanbox_f64(options);
+    init_capture_rooted(&target, &options, None);
+}
+pub(crate) fn init_newborn_emitter_capture(
+    target: &crate::gc::RuntimeHandle<'_>,
+    options: &crate::gc::RuntimeHandle<'_>,
+    birth: Option<(f64, f64)>,
+) {
+    init_capture_rooted(target, options, birth);
+}
+#[inline(never)]
+fn init_capture_rooted(
+    target: &crate::gc::RuntimeHandle<'_>,
+    options: &crate::gc::RuntimeHandle<'_>,
+    birth: Option<(f64, f64)>,
+) {
+    let known_absent = birth.is_some();
+    let options = options.get_nanbox_f64();
+    let value = if is_object_value(options) {
+        get_named(options, crate::runtime_state_key!(b"captureRejections"))
+    } else {
+        undefined_value()
+    };
     if crate::value::js_is_truthy(value) == 0 {
+        let enabled = capture_default::emitter_capture_default_with_birth(birth);
+        if enabled || (!known_absent && capture_rejections_enabled(target.get_nanbox_f64())) {
+            set_capture_rejections(target.get_nanbox_f64(), enabled);
+        }
         return;
     }
     if value.to_bits() != super::TAG_TRUE {

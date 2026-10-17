@@ -25,6 +25,16 @@ const FAST_BLOCK: &str = "ctor_prologue.fast";
 /// `ctor_prologue.fast` block — the arm is a straight line, so counting to its
 /// terminator is exact.
 fn fast_arm_double_stores(ir: &str) -> usize {
+    if ir.contains("phi i1 [ true, %alloc.fast.") {
+        let start = ir
+            .find("\nalloc.fast.")
+            .expect("complete birth must be live");
+        let body = &ir[start..];
+        let end = body.find("\n  br ").unwrap();
+        assert!(!body[..end].contains("call "), "{body}");
+        // The two-field fixture writes both final values in one vector.
+        return body[..end].matches("insertelement <2 x i64>").count();
+    }
     let Some(start) = ir.find(FAST_BLOCK) else {
         return 0;
     };
@@ -55,6 +65,71 @@ fn a_prologue_only_ctor_stores_its_fields_at_the_new_site() {
     );
 }
 
+#[test]
+fn a_boolean_only_shape_uses_the_allocation_contract_without_gc_mask_profitability() {
+    let mut module = loop_new_module("__AnonShape_boolean", Type::Boolean, Expr::Bool(true));
+    for field in &mut module.classes[0].fields {
+        field.ty = Type::Boolean;
+    }
+    for param in &mut module.classes[0].constructor.as_mut().unwrap().params {
+        param.ty = Type::Boolean;
+    }
+    module.classes[0].constructor.as_mut().unwrap().is_strict = true;
+    let Stmt::For { body, .. } = &mut module.init[0] else {
+        panic!("fixture must retain its loop");
+    };
+    let Stmt::Let {
+        init: Some(Expr::New { args, .. }),
+        ..
+    } = &mut body[0]
+    else {
+        panic!("fixture must retain its birth");
+    };
+    args[0] = Expr::Bool(false);
+    assert!(module.classes[0].is_literal_shape());
+    let ir = emit(&module);
+    assert!(
+        ir.contains(FAST_BLOCK),
+        "boolean-only shape lost its direct stores:\n{ir}"
+    );
+    assert_eq!(fast_arm_double_stores(&ir), 2, "{ir}");
+    assert!(
+        !ir.lines()
+            .any(|line| line.contains("call ") && line.contains("@js_ctor_return_override")),
+        "a complete field-store constructor cannot override its instance:\n{ir}"
+    );
+    let mut dynamic = module.clone();
+    let Stmt::For { body, .. } = &mut dynamic.init[0] else {
+        unreachable!()
+    };
+    let Stmt::Let {
+        init: Some(Expr::New { args, .. }),
+        ..
+    } = &mut body[0]
+    else {
+        unreachable!()
+    };
+    args[0] = Expr::LocalGet(7);
+    let dynamic_ir = emit(&dynamic);
+    assert!(
+        dynamic_ir
+            .lines()
+            .any(|line| line.contains("call ") && line.contains("@js_ctor_return_override")),
+        "the ordinary constructor witness must retain its return check"
+    );
+    assert!(
+        !dynamic_ir.contains(FAST_BLOCK),
+        "dynamic boxed arguments exceed the replacement budget:\n{dynamic_ir}"
+    );
+    assert!(
+        dynamic_ir.contains("@perry_birth_class"),
+        "shared initializer must remain live"
+    );
+    module.classes[0].constructor.as_mut().unwrap().is_strict = false;
+    assert!(!module.classes[0].is_literal_shape());
+    assert!(!emit(&module).contains(FAST_BLOCK));
+}
+
 /// `class Link { a: number; b: Link | null }` has a non-empty pointer mask.
 /// Its birth ShapeId carries the rep, so the new site can store both fields
 /// directly and skip the constructor call.
@@ -75,7 +150,8 @@ fn a_pointer_bearing_shape_stores_at_the_new_site_without_header_layout() {
         "the mixed-layout fast arm must store both the raw-f64 and pointer fields:\n{ir}"
     );
     assert!(
-        !ir.contains("and i16 ") || !ir.contains(", 4096"),
+        !ir.lines()
+            .any(|line| line.contains("and i16 ") && line.trim_end().ends_with(", 4096")),
         "the mixed-layout arm still tests the retired object INTACT bit:\n{ir}"
     );
 }
@@ -115,25 +191,48 @@ fn a_finite_numeric_param_offset_is_stored_at_the_new_site() {
 /// gate.
 #[test]
 fn an_outlined_pointer_bearing_shape_keeps_its_write_barrier() {
-    let ir = emit(&outlined_new_module(
+    // A widened capacity cannot stamp the canonical birth descriptor. Its
+    // runtime allocation may be old, and its constructor retains barriers.
+    let mut module = outlined_new_module(
         "Link",
         Type::Union(vec![Type::Named("Link".to_string()), Type::Null]),
         Expr::Null,
-    ));
-    assert!(
-        ir.contains(FAST_BLOCK),
-        "a stamped outlined allocation did not get a constructor-free arm:\n{ir}"
     );
-    assert_eq!(fast_arm_double_stores(&ir), 2, "{ir}");
+    module.classes[0].alloc_width_hint = 4096;
+    let ir = emit(&module);
+    assert!(ir.contains("call i64 @js_object_alloc_class_inline_keys_stamped("));
+    assert!(ir.contains("call void @js_write_barrier_slot"));
+    assert!(ir.contains("@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT"));
+}
+
+/// Five boxed slots exceed the compact image budget. Their complete prologue
+/// is still NoCollect and unpublished on both emitted Eden allocation arms.
+#[test]
+fn a_fresh_wide_prologue_needs_no_store_barrier() {
+    let mut module = loop_new_module("Wide", Type::Any, Expr::Null);
+    let class = &mut module.classes[0];
+    for i in 2..5 {
+        let mut field = class.fields[1].clone();
+        field.name = format!("f{i}");
+        class.fields.push(field);
+        let mut store = class.constructor.as_ref().unwrap().body[1].clone();
+        let Stmt::Expr(Expr::PropertySet { property, .. }) = &mut store else {
+            unreachable!()
+        };
+        *property = format!("f{i}");
+        class.constructor.as_mut().unwrap().body.push(store);
+    }
+    let ir = emit(&module);
+    let label = ir
+        .find("\nctor_prologue.fast.")
+        .expect("fresh complete prologue must execute");
+    let fast = &ir[label..];
+    let fast = &fast[..fast.find("\nctor_prologue.slow.").unwrap()];
+    assert_eq!(fast.matches("store double").count(), 5, "{fast}");
     assert!(
-        ir.contains("and i8")
-            && ir.contains(", 32")
-            && ir.contains("@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT"),
-        "the outlined mixed-layout arm must retain every required pointer barrier:\n{ir}"
+        !fast.contains("call ") && !fast.contains("barrier"),
+        "{fast}"
     );
-    assert!(
-        ir.contains("ctor_prologue.barrier.maybe")
-            && ir.contains("call void @js_write_barrier_slot"),
-        "the direct pointer store must reach the ordinary write-barrier call:\n{ir}"
-    );
+    // The slow constructor still handles observations and ordinary stores.
+    assert!(ir.contains("call void @js_write_barrier_slot"));
 }

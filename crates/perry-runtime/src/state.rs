@@ -37,10 +37,6 @@ pub(crate) struct RuntimeState {
     /// Property-lookup inline caches: the direct-mapped field cache
     /// (previously a `thread_local!` in `object::field_get_set`).
     pub(crate) field_lookup: crate::object::FieldLookupCaches,
-    /// User-defined properties attached to non-`ObjectHeader` cells such as
-    /// Date, RegExp, Promise, Map, and Set (previously two `thread_local!`s in
-    /// `object::exotic_expando`).
-    pub(crate) exotic_expando: crate::object::exotic_expando::ExoticExpandoTables,
     /// #6759 Phase C1: first-class Shape records keyed on keys_array
     /// identity (see `object::shapes` and docs/shape-tree-plan.md).
     pub(crate) shapes: crate::object::ShapeTable,
@@ -51,7 +47,6 @@ impl RuntimeState {
         Box::new(RuntimeState {
             object_hot: crate::object::ObjectHotTables::new(),
             field_lookup: crate::object::FieldLookupCaches::new(),
-            exotic_expando: crate::object::exotic_expando::ExoticExpandoTables::new(),
             shapes: crate::object::ShapeTable::new(),
         })
     }
@@ -118,5 +113,12 @@ fn init_state() -> &'static RuntimeState {
     // choice — only other TLS destructors can still reach it.
     let _ = STATE_OWNER.try_with(|o| *o.borrow_mut() = Some(StateOwner(raw)));
     STATE_PTR.with(|c| c.set(raw));
+    // Rust test threads are agents too. Mirror executable startup before a
+    // fixture reaches a runtime producer; no producer registers on demand.
+    #[cfg(test)]
+    {
+        crate::object::layout_desc::seed_static_atoms();
+        crate::object::layout_desc::register_static_layouts();
+    }
     unsafe { &*raw }
 }

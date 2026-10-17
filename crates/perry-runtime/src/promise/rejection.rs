@@ -76,6 +76,15 @@ pub(super) fn checkpoint_work_pending() -> bool {
     })
 }
 
+/// Rejections recorded as currently unhandled and still awaiting a checkpoint
+/// report. Test and diagnostic observability for that set: a consumer that
+/// reads a promise's settled state directly (instead of attaching a reaction)
+/// has to mark it handled (`js_promise_mark_internally_handled`), and this is
+/// how the streams regression test for #9202 checks it did.
+pub fn unhandled_rejection_count() -> usize {
+    REJECTIONS.with(|tracker| tracker.borrow().unhandled.len())
+}
+
 /// Mark a promise as internally handled (Node's `markPromiseAsHandled`): a
 /// later rejection of it is never reported as unhandled. Used by the WHATWG
 /// stream implementation for the internal `closed` / `closeRequest` promises it
@@ -378,18 +387,14 @@ fn emit_rejection_handled(promise: *mut Promise) {
 /// `timer::with_timer_uncaught_trap`, which does the same for timer callbacks
 /// fired from the same drain.
 fn with_listener_uncaught_trap<F: FnOnce()>(f: F) {
-    let trap_buf = crate::exception::js_try_push();
-    // The jmp_buf is armed inside a C trampoline frame (#9305). The
-    // uncaught path below runs only after `js_try_end` pops this trap, so
-    // a throw out of the `uncaughtException` listener targets the OUTER
-    // trap — same as the raw shape, which also popped before emitting.
-    if crate::exception::arm_trap_and_run(trap_buf, f).is_some() {
-        crate::exception::js_try_end();
+    // The body runs under the trap shim (`exception::trap`). The
+    // uncaught path below runs after the trap returned, so a throw out of
+    // the `uncaughtException` listener targets the OUTER handler.
+    if crate::exception::trap(f).is_some() {
         return;
     }
     let exc = crate::exception::js_get_exception();
     crate::exception::js_clear_exception();
-    crate::exception::js_try_end();
     if !crate::os::emit_process_event("uncaughtException", &[exc]) {
         crate::exception::exit_on_uncaught(exc);
     }

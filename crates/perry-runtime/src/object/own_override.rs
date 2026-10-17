@@ -33,7 +33,7 @@
 //! `GcHeader::_reserved` has **no free bits** (`gc/types.rs`'s bit map says so
 //! outright, and bits 12/13 are actively ERASED by `set_layout_state` —
 //! #8690 and #10842 both lost a flag there). Arrays already carry
-//! `GC_ARRAY_NAMED_PROPS`, but Map/Set/Date/RegExp keep their own named
+//! `GC_ARRAY_KEY_ATTRS`, but Map/Set/Date/RegExp keep their own named
 //! properties in a per-thread side table, so there is no per-cell bit to read
 //! and their `ObjectMeta` is usually null — asking there would mean
 //! MATERIALISING a record to read an almost-always-clear flag.
@@ -45,7 +45,7 @@
 //!
 //! The flag is **set-only and over-approximating**, both deliberately. Set-only
 //! because clearing it on delete would reopen the hole for
-//! delete-then-shadow, exactly as `GC_ARRAY_NAMED_PROPS` is monotonic. Over-
+//! delete-then-shadow, exactly as `GC_ARRAY_KEY_ATTRS` is monotonic. Over-
 //! approximating because it is armed at the TOP of the exotic-store gauntlet,
 //! before that gauntlet's per-kind branches (buffer table, stream table, the
 //! meta/expando paths): there is no single install funnel, and a missed
@@ -73,9 +73,25 @@ use std::sync::atomic::Ordering;
 ///
 /// A `u32` rather than a bool so the emitted load matches the barrier gate's
 /// alignment and width; only zero / non-zero is meaningful.
+///
+/// #11915: also armed when a builtin prototype is modified
+/// ([`note_builtin_proto_modified`]); the predicate then answers "may own"
+/// for a receiver whose prototype is not pristine, which is how the guards
+/// this flag gates prove `Pristine` without a test of their own.
 #[no_mangle]
 pub static PERRY_OWN_NAMED_PROP_INSTALLED: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
+
+/// Arm [`PERRY_OWN_NAMED_PROP_INSTALLED`] because a builtin prototype was
+/// modified (#11915, `builtin_proto`): from now on the emitted guard asks
+/// [`js_receiver_may_own_named_method`], which answers from
+/// `builtin_proto::receiver_pristine`.
+#[inline]
+pub(crate) fn note_builtin_proto_modified() {
+    if PERRY_OWN_NAMED_PROP_INSTALLED.load(Ordering::Relaxed) == 0 {
+        PERRY_OWN_NAMED_PROP_INSTALLED.store(1, Ordering::Relaxed);
+    }
+}
 
 /// Has any non-`ObjectHeader` cell ever taken a named property at all,
 /// including the runtime's own builtin definitions? Set-only, like
@@ -122,6 +138,13 @@ crate::perry_thread_local! {
 ///
 /// Thread-local rather than save-and-restore of the global flag, so an arm by
 /// another thread in the same window is never undone. Nests.
+/// Is this thread inside [`as_builtin_definition`]? The builtin-prototype
+/// fact (`builtin_proto::note_write`) does not count the runtime's own
+/// definitions as modifications.
+pub(crate) fn in_builtin_definition() -> bool {
+    BUILTIN_INTRINSIC_INSTALL.with(|flag| flag.get())
+}
+
 pub(crate) fn as_builtin_definition<R>(install: impl FnOnce() -> R) -> R {
     let outer = BUILTIN_INTRINSIC_INSTALL.with(|flag| flag.replace(true));
     // Restored on unwind too: a leaked `true` would stop user installs from
@@ -186,14 +209,19 @@ pub(crate) fn note_exotic_named_prop_install(owner: usize) {
 /// `1` is only slower.
 ///
 /// # Safety
-/// `name_ptr`/`name_len` must describe a live UTF-8 method name; `recv` is any
-/// NaN-boxed value.
+/// `recv` is any NaN-boxed value; `key` is a live NaN-boxed interned string
+/// from the codegen string pool.
 #[no_mangle]
-pub unsafe extern "C" fn js_receiver_may_own_named_method(
-    recv: f64,
-    name_ptr: *const u8,
-    name_len: usize,
-) -> i32 {
+pub unsafe extern "C" fn js_receiver_may_own_named_method(recv: f64, key: f64) -> i32 {
+    // #11915: a receiver whose builtin prototype was modified (or an array
+    // with its own `[[Prototype]]`) does not read the builtin either. The
+    // emitted guard's gate (`PERRY_OWN_NAMED_PROP_INSTALLED`) is armed by
+    // every such modification, so this answer is how a proven Map, Set or
+    // Date site — and every receiver kind the gate guards — proves
+    // `Pristine` with no test of its own.
+    if !super::builtin_proto::receiver_pristine(recv) {
+        return 1;
+    }
     let jsval = crate::JSValue::from_bits(recv.to_bits());
     if !jsval.is_pointer() {
         // A primitive's methods come from its wrapper prototype; it has no own
@@ -205,77 +233,27 @@ pub unsafe extern "C" fn js_receiver_may_own_named_method(
         return 0;
     }
 
-    // An ARRAY records the fact on the cell, so it is answered exactly without
-    // consulting the global arm at all: `GC_ARRAY_NAMED_PROPS` is set when an
-    // array takes a named property and is monotonic for the same reason this
-    // module's flag is.
     if let Some(header) = crate::value::addr_class::try_read_gc_header(addr) {
-        if matches!(
-            header.obj_type,
-            crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY
-        ) {
-            if header._reserved & crate::gc::GC_ARRAY_NAMED_PROPS != 0 {
-                return 1;
-            }
-            // The bit is NOT a proof of absence, which this module's own rule
-            // ("never answer 0 for anything it cannot prove") forbids relying
-            // on. An array has a THIRD place for an own named property: the
-            // descriptor side table that `get_accessor_descriptor` reads and
-            // `array_own_key_present` consults BEFORE the bit-flagged named
-            // props. `a.push = () => 1` lands there — measured: neither
-            // `array_named_property_set` nor `expando_store` runs, yet
-            // `hasOwn` is true, `typeof` is "function" and `Object.keys`
-            // shows it. Reflection was right and this tier was reading the
-            // wrong table.
-            //
-            // So when any descriptor exists anywhere, ask the authoritative
-            // predicate instead of answering 0. When none does — the
-            // overwhelmingly common case — the bit stands and this stays one
-            // load and a test.
-            // Nor is the descriptor side table the answer: with
-            // `accessors_in_use` clear the row still ran the builtin, so the
-            // property `a.push = () => 1` installs is in neither the
-            // bit-flagged named props, the exotic expando, nor the accessor
-            // descriptors — yet `hasOwn`/`typeof`/`Object.keys` all see it.
-            //
-            // MEASURED COST OF ASKING ANYWAY: +4,745 instructions per
-            // guarded array builtin call (`a.push(i)` hot, 90.5 -> 4886.7 per
-            // iteration; `a.indexOf` 701.0 -> 5442.6; an element-read control
-            // flat at 16.05). The two deltas agree within 55 instructions on
-            // calls whose own work differs by 610, so it is a fixed per-call
-            // cost: the key-string allocation plus a full `hasOwn`. The exotic
-            // kinds pay +38.000 for the same guard, because their flag lets
-            // them answer 0.
-            //
-            // The cheap absence proof arrays were said to lack EXISTS, and
-            // this tier simply was not wired to it.
-            // `array_has_named_properties_resolved` covers all three storages
-            // an array named property can live in — the inline reserve, the
-            // pairs array, and the fallback table behind
-            // `FULL_ARRAY_NAMED_PROPS_EVER` — and both spellings of an
-            // own-method install go through `array_named_property_set`, which
-            // writes one of them. That is profiled, not assumed: `a.push = fn`
-            // on an `any` receiver and on a proven array local both show
-            // `array::named_props::array_named_property_set` in the install
-            // profile. (The earlier note here, that neither that function nor
-            // the expando store runs, was measured on a path that no longer
-            // carries this spelling and is wrong.)
-            //
-            // The descriptor table is still not covered by it, so a receiver
-            // with ANY descriptor keeps asking the authoritative predicate —
-            // the module's rule is unchanged, only the set of receivers that
-            // can be proven absent has grown. With no descriptors,
-            // `fallback_possible` is false, so the predicate is flag tests and
-            // a reserve read: no hash lookup, no allocation, no call.
-            if header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
-                && header.obj_type == crate::gc::GC_TYPE_ARRAY
-                && !crate::array::array_has_named_properties_resolved(
-                    addr as *const crate::array::ArrayHeader,
-                )
+        if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+            // Every own named property of an array (data or accessor, string
+            // or symbol key) lives in its named layout object (§6a), so the
+            // array owns `key` exactly when that object does.
+            let live = crate::array::clean_arr_ptr(addr as *const crate::array::ArrayHeader);
+            if live.is_null()
+                || crate::array::array_object_flags_resolved(live)
+                    & crate::gc::GC_ARRAY_CUSTOM_PROTO
+                    != 0
             {
+                return authoritative_has_own(recv, key);
+            }
+            let named = crate::array::array_property_bag_resolved(live);
+            if named.is_null() {
                 return 0;
             }
-            return authoritative_has_own(recv, name_ptr, name_len);
+            return authoritative_has_own(crate::value::js_nanbox_pointer(named as i64), key);
+        }
+        if header.obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
+            return authoritative_has_own(recv, key);
         }
     } else {
         // No readable GC header. Cannot prove absence — decline.
@@ -289,24 +267,20 @@ pub unsafe extern "C" fn js_receiver_may_own_named_method(
         return 0;
     }
 
-    authoritative_has_own(recv, name_ptr, name_len)
+    authoritative_has_own(recv, key)
 }
 
 /// `Object.hasOwn`'s own predicate — the one reflection uses, which answers
 /// correctly for every cell kind and needs no readable ShapeId.
 ///
 /// # Safety
-/// `recv` is any NaN-boxed value; `name_ptr`/`name_len` name this call's
-/// method.
-unsafe fn authoritative_has_own(recv: f64, name_ptr: *const u8, name_len: usize) -> i32 {
-    if name_ptr.is_null() || name_len == 0 {
+/// `recv` is any NaN-boxed value; `key` is a live NaN-boxed interned string.
+unsafe fn authoritative_has_own(recv: f64, key: f64) -> i32 {
+    if !crate::JSValue::from_bits(key.to_bits()).is_string() {
         return 1;
     }
-    let key = method_key(name_ptr, name_len);
-    if key.is_null() {
-        return 1;
-    }
-    authoritative_has_own_key(recv, key)
+    let has_own = crate::object::object_ops::has_own::js_object_has_own(recv, key);
+    i32::from(has_own.to_bits() == crate::value::TAG_TRUE)
 }
 
 /// This call's method name as a property key: the thread's canonical interned
@@ -328,15 +302,7 @@ unsafe fn method_key(name_ptr: *const u8, name_len: usize) -> *mut crate::String
 /// # Safety
 /// `recv` is any NaN-boxed value; `key` is a live, non-null string header.
 unsafe fn authoritative_has_own_key(recv: f64, key: *mut crate::StringHeader) -> i32 {
-    let key_value = f64::from_bits(crate::JSValue::string_ptr(key).bits());
-    // The authoritative predicate — the one behind `Object.hasOwn` — which
-    // already answers correctly for every cell kind (the `hasOwn` rows of
-    // `test_parity_own_override_beats_builtin.ts` pass on unfixed main; only
-    // the CALL disagreed). Asking it, rather than re-deriving own-ness from a
-    // shape descriptor, is the point: it does not need a readable ShapeId, and
-    // a Map/Set/Array cell's `+4` word is `capacity`, not one.
-    let has_own = crate::object::object_ops::has_own::js_object_has_own(recv, key_value);
-    i32::from(has_own.to_bits() == crate::value::TAG_TRUE)
+    authoritative_has_own(recv, f64::from_bits(crate::JSValue::string_ptr(key).bits()))
 }
 
 /// The receiver's own USER method of this name, if it has one.
@@ -496,9 +462,8 @@ unsafe fn invoke_own_user_method(own: f64, recv: f64, args: &[f64]) -> f64 {
 /// Does the array behind `arr` OWN a property named `push`? Returns the LIVE
 /// head when it does. Non-allocating, and never runs user code.
 ///
-/// `OBJ_FLAG_ARRAY_DESCRIPTORS` clear is the absence proof, answered from the
-/// header the caller's admission mask already read (#11021). Every path that
-/// gives an array an own named property arms it: `array_named_property_set`
+/// A null named layout (`ArrayHeader.named`) is the absence proof (#11021).
+/// Every path that gives an array an own named property writes that layout: `array_named_property_set`
 /// on both of its storages (the pairs reserve and the full-array fallback
 /// table — `named_props::mark_array_descriptors`), and every
 /// `Object.defineProperty` route (`array_object_ops`). It is monotone, and
@@ -529,15 +494,12 @@ unsafe fn array_owning_push(
     let live = if header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0 {
         crate::array::clean_arr_ptr_mut(arr)
     } else {
-        if header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0 {
+        if (*arr).named.is_null() {
             return None;
         }
         arr
     };
-    if live.is_null()
-        || crate::array::array_object_flags_resolved(live) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS
-            == 0
-    {
+    if live.is_null() || (*live).named.is_null() {
         return None;
     }
     let owns = crate::object::get_accessor_descriptor(live as usize, "push").is_some()
@@ -550,9 +512,8 @@ unsafe fn array_owning_push(
 ///
 /// # Why the inline tier needs no test of its own
 ///
-/// Every inline push tier admits a receiver through a mask over
-/// `GcHeader::_reserved` that already includes `OBJ_FLAG_ARRAY_DESCRIPTORS`,
-/// and every own-named-property install arms that bit (see
+/// Every inline push tier admits a receiver only with a null named layout
+/// (`ArrayHeader.named`), where every own named property lives (see
 /// [`array_owning_push`]). So an array that owns `push` can never take the
 /// inline store: it fails admission and lands in a slow arm, and every slow arm
 /// calls THIS. The hot path pays nothing — the absence proof rides the
@@ -587,9 +548,17 @@ pub unsafe extern "C" fn js_array_push_f64_spec_or_own(
     if !own_out.is_null() {
         *own_out = 0;
     }
+    // #11915: a modified `%Array.prototype%` (or `%Object.prototype%`) may
+    // hold a replacement `push`; the real `Get` decides, through the shared
+    // generic path. One load while pristine.
+    if !crate::object::builtin_proto::pristine(crate::object::builtin_proto::BuiltinProto::Array) {
+        if let Some(bits) = push_patched_proto(arr, value, own_out) {
+            return bits;
+        }
+    }
     // The common case, in the one header probe `js_array_push_f64_spec` makes
-    // anyway: a plain live array has `OBJ_FLAG_ARRAY_DESCRIPTORS` clear, so it
-    // owns no named property at all. Asking `array_owning_push` first cost the
+    // anyway: a plain live array has no named layout, so it owns no named
+    // property at all. Asking `array_owning_push` first cost the
     // local tail — whose EVERY push is this call — a second probe: +46
     // instructions per push on a captured receiver, measured.
     //
@@ -601,6 +570,29 @@ pub unsafe extern "C" fn js_array_push_f64_spec_or_own(
         return head as u64;
     }
     push_or_own_declined(arr, value, own_out)
+}
+
+/// [`js_array_push_f64_spec_or_own`] under a modified builtin prototype: the
+/// method actually selected, through `builtin_proto::redirect_call`. `None`
+/// when it is still the builtin, so the caller's plain push runs.
+#[cold]
+#[inline(never)]
+unsafe fn push_patched_proto(
+    arr: *mut crate::array::ArrayHeader,
+    value: f64,
+    own_out: *mut u32,
+) -> Option<u64> {
+    let live = crate::array::clean_arr_ptr_mut(arr);
+    if live.is_null() {
+        return None;
+    }
+    let recv = crate::value::js_nanbox_pointer(live as i64);
+    let args = [value];
+    let result = crate::object::builtin_proto::redirect_call(recv, b"push", args.as_ptr(), 1)?;
+    if !own_out.is_null() {
+        *own_out = 1;
+    }
+    Some(result.to_bits())
 }
 
 /// [`js_array_push_f64_spec_or_own`] for every receiver the plain push
@@ -647,6 +639,35 @@ pub(crate) unsafe fn array_owning_push_for_test(
     arr: *mut crate::array::ArrayHeader,
 ) -> Option<*mut crate::array::ArrayHeader> {
     array_owning_push(arr)
+}
+
+#[cfg(test)]
+mod interned_key_abi_tests {
+    use super::*;
+
+    #[test]
+    fn own_override_predicate_uses_the_passed_interned_key() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        let _gc = crate::gc::GcSuppressScope::new();
+        unsafe {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let object = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 0));
+            let present = crate::string::canonical_key(b"present");
+            let absent = crate::string::canonical_key(b"absent");
+            let present_value = f64::from_bits(crate::JSValue::string_ptr(present).bits());
+            let absent_value = f64::from_bits(crate::JSValue::string_ptr(absent).bits());
+
+            object
+                .with_mut_ptr(|obj| crate::object::js_object_set_field_by_name(obj, present, 17.0));
+            PERRY_OWN_NAMED_PROP_INSTALLED.store(1, Ordering::Relaxed);
+            let recv = object.with_mut_ptr(|obj: *mut crate::object::ObjectHeader| {
+                crate::value::js_nanbox_pointer(obj as i64)
+            });
+
+            assert_eq!(js_receiver_may_own_named_method(recv, present_value), 1);
+            assert_eq!(js_receiver_may_own_named_method(recv, absent_value), 0);
+        }
+    }
 }
 
 // Called from generated code only, so release/LTO builds may otherwise strip

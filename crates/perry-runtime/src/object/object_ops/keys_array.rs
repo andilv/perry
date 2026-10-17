@@ -86,6 +86,19 @@ unsafe fn ensure_key_in_keys_array_inner(
     if obj.is_null() || (obj as usize) < 0x10000 || key.is_null() {
         return;
     }
+    // A property list (or the overflow) retains the spelling even when transition-cache
+    // admission declines it (symbols, tombstones, long keys or private lists).
+    // Apply the ordinary string ownership rule before publishing that edge.
+    crate::string::js_string_addref(key.cast_mut());
+    if crate::object::overflow::has_overflow(obj) {
+        let keys = crate::object::object_keys(obj);
+        if crate::object::keys_find_property_slot_by_key_ptr(keys.arr(), keys.count(), key)
+            .is_none()
+        {
+            crate::object::overflow::insert(obj, key, crate::value::TAG_UNDEFINED, entry);
+        }
+        return;
+    }
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj_handle = scope.root_raw_mut_ptr(obj);
     let key_handle = scope.root_string_ptr(key);
@@ -144,7 +157,7 @@ unsafe fn ensure_key_in_keys_array_inner(
                 });
                 if let Some((next_keys, slot_idx, target_shape_id)) = probe {
                     let live = crate::object::object_live_slot_count(obj);
-                    let alloc_limit = std::cmp::max(live, crate::object::INLINE_SLOT_FLOOR as u32);
+                    let alloc_limit = crate::object::object_inline_capacity(obj);
                     if !next_keys.is_null()
                         && (writes_value || slot_idx < alloc_limit)
                         && cached_target_fits(target_shape_id, alloc_limit)
@@ -196,7 +209,9 @@ unsafe fn ensure_key_in_keys_array_inner(
             refresh_define_property_roots!();
             publish_definition_keys(obj, new_keys, 0, numeric);
             refresh_define_property_roots!();
-            if crate::object::object_live_slot_count(obj) == 0 {
+            if crate::object::object_live_slot_count(obj) == 0
+                && crate::object::object_inline_capacity(obj) != 0
+            {
                 set_object_live_slot_count(obj, 1);
             }
             if let Some(handle) = interned.as_ref() {
@@ -312,7 +327,7 @@ unsafe fn ensure_key_in_keys_array_inner(
         });
         if let Some((next_keys, slot_idx, target_shape_id)) = probe {
             let live = crate::object::object_live_slot_count(obj);
-            let alloc_limit = std::cmp::max(live, crate::object::INLINE_SLOT_FLOOR as u32);
+            let alloc_limit = crate::object::object_inline_capacity(obj);
             // An overflow target stays on the private path below for a
             // KEYS-ONLY install (an accessor claiming its slot): it writes no
             // value, so the overflow entry such an edge implies would never be
@@ -414,7 +429,7 @@ unsafe fn ensure_key_in_keys_array_inner(
     let new_index = key_count as u32;
     // #8113: one bound probe, reused.
     let live_slots = crate::object::object_live_slot_count(obj);
-    let inline_capacity = std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32);
+    let inline_capacity = crate::object::object_inline_capacity(obj);
     if new_index < inline_capacity && new_index >= live_slots {
         set_object_live_slot_count(obj, new_index + 1);
     }
@@ -486,8 +501,7 @@ unsafe fn publish_definition_keys(
         let rep = crate::object::field_rep_store::shape_rep(
             crate::object::shapes::object_shape_stamp(obj),
         );
-        let live = crate::object::object_live_slot_count(obj);
-        let inline = slot < live.max(crate::object::INLINE_SLOT_FLOOR as u32);
+        let inline = slot < crate::object::object_inline_capacity(obj);
         crate::object::field_rep_store::publish_key_add_edge(obj, keys, rep, slot, numeric, inline);
     } else {
         let live = crate::object::object_live_slot_count(obj);
@@ -633,7 +647,7 @@ mod tests {
             // keys array is privately owned. This was the false assumption in
             // the old clone condition.
             set_object_live_slot_count(first, 1);
-            let sibling_shape = (*sibling).parent_class_id;
+            let sibling_shape = (*sibling).shape_word();
             let key = crate::string::js_string_from_bytes(b"ALIAS_KEYS".as_ptr(), 10);
             ensure_key_in_keys_array(first, key);
 
@@ -643,7 +657,7 @@ mod tests {
                 crate::object::object_keys(first).arr(),
                 crate::object::object_keys(sibling).arr()
             );
-            assert_ne!((*first).parent_class_id, sibling_shape);
+            assert_ne!((*first).shape_word(), sibling_shape);
             let sibling_descriptor = crate::object::shapes::shape_descriptor_by_id(sibling_shape)
                 .expect("sibling descriptor must remain installed");
             assert_eq!(
@@ -652,7 +666,7 @@ mod tests {
             );
             assert_eq!(sibling_descriptor.logical_key_count, 0);
             let first_descriptor =
-                crate::object::shapes::shape_descriptor_by_id((*first).parent_class_id)
+                crate::object::shapes::shape_descriptor_by_id((*first).shape_word())
                     .expect("defineProperty growth must install an exact descriptor");
             assert_eq!(
                 first_descriptor.keys,
@@ -843,6 +857,16 @@ unsafe fn own_key_via_index(
         return Some(true);
     }
     let keys = crate::object::object_keys(obj);
+    if crate::object::overflow::is_table(keys.arr()) {
+        // Object model step 4: an object's overflow is its complete, hashed
+        // key index (§3.4), so its answer is authoritative either way.
+        let found = if properties_only {
+            super::super::keys_find_property_slot_by_key_ptr(keys.arr(), keys.count(), key)
+        } else {
+            super::super::keys_find_slot_by_key_ptr(keys.arr(), keys.count(), key)
+        };
+        return Some(found.is_some());
+    }
     match crate::value::addr_class::try_read_gc_header(keys.arr() as usize) {
         Some(h) if h.obj_type == crate::gc::GC_TYPE_ARRAY => {}
         _ => return None,
@@ -945,7 +969,10 @@ unsafe fn own_key_lookup(
     }
     // Validate keys_array GC header
     let keys_gc = (keys as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    if (*keys_gc).obj_type != crate::gc::GC_TYPE_ARRAY {
+    if !matches!(
+        (*keys_gc).obj_type,
+        crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_OVERFLOW
+    ) {
         return false;
     }
     let key_count = keys_view.count();

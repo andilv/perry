@@ -439,10 +439,20 @@ impl Writer<'_> {
             }
             return SerializedValue::BigInt(crate::bigint::BigIntHeader::all_limbs(ptr).to_vec());
         }
+        if tag == crate::value::HANDLE_TAG {
+            return SerializedValue::Unsupported("native handle");
+        }
         if tag == POINTER_TAG {
             return self.pointer(bits);
         }
-        // Numbers, and short strings stored inside the NaN box.
+        // Numeric transfer ingress preserves the NaN-box representation contract.
+        // Short strings and other tagged values retain their representation.
+        let value = crate::value::JSValue::from_bits(bits);
+        let bits = if value.is_number() {
+            crate::value::JSValue::number(f64::from_bits(bits)).bits()
+        } else {
+            bits
+        };
         SerializedValue::Inline(bits)
     }
 
@@ -537,9 +547,6 @@ impl Writer<'_> {
     // retain the descriptor walk.
     #[optimize(size)]
     unsafe fn data_array_layout(&self, arr: *const crate::array::ArrayHeader) -> bool {
-        if crate::array::array_has_plain_shape_resolved(arr) {
-            return true;
-        }
         let holder = crate::array::array_property_bag(arr);
         if holder.is_null() {
             return !crate::array::array_has_named_properties_resolved(arr);
@@ -801,7 +808,8 @@ impl Writer<'_> {
             for i in 0..keys_view.count() {
                 let slots = crate::array::array_elements_ptr(keys) as *const u64;
                 let key_bits = *slots.add(i as usize);
-                if key_bits == TAG_HOLE {
+                if key_bits == TAG_HOLE || crate::object::key_view::position_is_hole(obj, keys_view, i)
+                {
                     continue;
                 }
                 let entry = crate::object::key_attrs::keys_entry(keys, i);
@@ -823,7 +831,7 @@ impl Writer<'_> {
                 let field_bits = if crate::object::key_attrs::key_is_accessor_at(keys, i) {
                     TAG_UNDEFINED
                 } else {
-                    crate::object::js_object_get_field(obj, i).bits()
+                    crate::object::js_object_get_key_field(obj, i).bits()
                 };
                 names.push(name);
                 fields.push(self.value(field_bits));
@@ -1007,7 +1015,8 @@ impl Writer<'_> {
                 && d.summary
                     & (crate::object::key_attrs::SUMMARY_ACCESSOR
                         | crate::object::key_attrs::SUMMARY_NON_ENUMERABLE
-                        | crate::object::key_attrs::SUMMARY_PRIVATE)
+                        | crate::object::key_attrs::SUMMARY_PRIVATE
+                        | crate::object::key_attrs::SUMMARY_HOLES)
                     == 0
         });
         if eligible {
@@ -1023,12 +1032,14 @@ impl Writer<'_> {
                 let positions = names
                     .iter()
                     .map(|name| {
-                        crate::object::keys_find_property_slot_by_bytes(
+                        let position = crate::object::keys_find_property_slot_by_bytes(
                             keys.arr(),
                             keys.count(),
                             name,
                         )
-                        .expect("shape key is own")
+                        .expect("shape key is own");
+                        // The value's storage slot under this layout.
+                        keys.storage_slot(position)
                     })
                     .collect();
                 let shape = self.data.shapes.len() as u32;
@@ -1108,22 +1119,29 @@ impl Writer<'_> {
         // together so the reader's positional pairs stay aligned.
         let fields_ptr = (obj as *const u8).add(std::mem::size_of::<crate::object::ObjectHeader>())
             as *const u64;
+        // An optional key whose slot holds the hole is absent: skip it the
+        // same way, key and slot together.
+        let absent = |i: usize| -> bool {
+            i < key_count
+                && (key_bits(i) == TAG_HOLE
+                    || crate::object::key_view::position_is_hole(obj, keys_view, i as u32))
+        };
         let mut fields = Vec::with_capacity(field_count);
         for i in 0..field_count {
-            if i < key_count && key_bits(i) == TAG_HOLE {
+            if absent(i) {
                 continue;
             }
             let bits = if crate::object::key_attrs::key_is_accessor_at(keys_arr, i as u32) {
                 TAG_UNDEFINED
             } else {
-                *fields_ptr.add(i)
+                *fields_ptr.add(keys_view.storage_slot(i as u32) as usize)
             };
             fields.push(self.value(bits));
         }
         let keys = (!keys_view.is_null()).then(|| {
             let mut short = [0; crate::value::SHORT_STRING_MAX_LEN];
             (0..key_count)
-                .filter(|&i| key_bits(i) != TAG_HOLE)
+                .filter(|&i| !absent(i))
                 .map(|i| {
                     crate::string::js_string_key_bytes(JSValue::from_bits(key_bits(i)), &mut short)
                         .map_or_else(Vec::new, <[u8]>::to_vec)

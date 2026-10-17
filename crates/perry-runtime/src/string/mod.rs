@@ -182,7 +182,7 @@ pub(crate) use char_ops::{
 };
 pub use compare::{
     js_string_compare, js_string_ends_with, js_string_ends_with_at, js_string_equals,
-    js_string_is_well_formed, js_string_locale_compare, js_string_locale_compare_opts,
+    js_string_is_well_formed, js_string_locale_compare, js_string_locale_compare_resolved,
     js_string_normalize, js_string_search_value_to_string, js_string_starts_with,
     js_string_starts_with_at, js_string_to_well_formed,
 };
@@ -245,10 +245,14 @@ pub use html::{
     js_string_strike, js_string_sub, js_string_sup,
 };
 pub(crate) use intern::discard_weak_interns;
+pub(crate) use intern::existing_property_atom;
 pub use intern::js_string_intern;
 pub use intern::js_string_pool_atom;
+pub(crate) use intern::IMAGE_ATOM_FLAGS;
 pub(crate) use intern::INTERN_MAX_BYTE_LEN;
-pub(crate) use intern::{atom_for_key, atom_lookup};
+pub(crate) use intern::{
+    atom_colour, atom_for_key, atom_lookup, seed_static_atom, set_atom_colour,
+};
 #[cfg(test)]
 pub(crate) use intern::{is_atom_for_test, test_evict_interned};
 #[cfg(test)]
@@ -259,8 +263,7 @@ pub use iter_object::{
     dispatch_string_iterator_method, string_values_iter, STRING_ITERATOR_CLASS_ID,
 };
 pub use locale::{
-    js_string_to_locale_lower_case, js_string_to_locale_upper_case,
-    js_string_validate_collator_args,
+    js_string_resolve_collator_args, js_string_to_locale_lower_case, js_string_to_locale_upper_case,
 };
 pub use pad::{
     js_string_alloc_space, js_string_pad_end, js_string_pad_fill, js_string_pad_start,
@@ -293,7 +296,18 @@ pub(crate) use format::{
 
 /// Reserved-header spelling for immutable executable strings. Heap strings
 /// use these bits only for survival age and never acquire this marker.
-const STRING_IMAGE_MARKER: u16 = 0x494d;
+pub(crate) const STRING_IMAGE_MARKER: u16 = 0x494d;
+
+/// `GcHeader::size` of an executable string image with `byte_len` payload
+/// bytes: GC header, string header, the NUL-terminated payload padded to 8,
+/// then the 8-byte atom hash. Codegen (`string_pool/image.rs`) emits exactly
+/// this layout; runtime images (`object/runtime_layouts.rs`) build it and the
+/// image classifier (`value/addr_class/image.rs`) validates against it.
+pub(crate) const fn image_string_gc_size(byte_len: u32) -> usize {
+    let payload_end =
+        crate::gc::GC_HEADER_SIZE + std::mem::size_of::<StringHeader>() + byte_len as usize + 1;
+    (payload_end + 7) / 8 * 8 + 8
+}
 
 /// A string image owns its address for the life of the executable. This is
 /// separate from the intern bit, which also controls speculative own reads.
@@ -465,25 +479,16 @@ pub fn perry_string_ref_from_dispatch_id(
         });
     }
 
-    let addr = id as usize;
-    let hdr = addr as *const StringHeader;
-    if !is_valid_string_ptr(hdr) || (addr & 0x7) != 0 {
-        return None;
-    }
-    if matches!(
-        crate::arena::classify_heap_space(addr),
-        crate::arena::HeapSpace::Unknown
-    ) {
-        return None;
-    }
+    let hdr = id as usize as *const StringHeader;
     unsafe {
+        let header = crate::value::addr_class::try_read_string_header(hdr)?;
         Some(PerryStringRef {
-            ptr: (hdr as *const u8).add(std::mem::size_of::<StringHeader>()),
-            len: (*hdr).byte_len as usize,
+            ptr: string_data(hdr),
+            len: header.byte_len as usize,
             heap: hdr,
             static_id: 0,
             hash: 0,
-            is_wtf8: (*hdr).flags & STRING_FLAG_HAS_LONE_SURROGATES != 0,
+            is_wtf8: header.flags & STRING_FLAG_HAS_LONE_SURROGATES != 0,
         })
     }
 }
@@ -743,6 +748,32 @@ pub(crate) fn string_storage_alloc(capacity: u32) -> (*mut StringHeader, *mut u8
     (ptr, data)
 }
 
+/// [`string_storage_alloc`] for a child of a producer's fresh container, born
+/// where [`crate::gc::ProducerChildBirth`] says. `Old` takes the old-generation
+/// birth a large string takes: old pages, `GC_FLAG_TENURED`, and the live
+/// allocate-black color.
+#[inline]
+pub(crate) fn string_storage_alloc_for(
+    birth: crate::gc::ProducerChildBirth,
+    capacity: u32,
+) -> (*mut StringHeader, *mut u8) {
+    match birth {
+        crate::gc::ProducerChildBirth::Young => string_storage_alloc(capacity),
+        crate::gc::ProducerChildBirth::Old => {
+            let payload_size = std::mem::size_of::<StringHeader>() + capacity as usize;
+            let raw = crate::arena::arena_alloc_gc_old_born_tenured(
+                payload_size,
+                8,
+                crate::gc::GC_TYPE_STRING,
+            );
+            let ptr = raw as *mut StringHeader;
+            let data = string_data(ptr).cast_mut();
+            zero_alignment_padding_tail(raw, payload_size);
+            (ptr, data)
+        }
+    }
+}
+
 /// JSON results at or above this size use individually tracked storage.
 pub(crate) const JSON_MALLOC_OUTPUT_THRESHOLD: u32 = 512 * 1024;
 
@@ -930,7 +961,10 @@ pub(crate) unsafe fn init_string_header(
     (*ptr).refcount = refcount;
     // `flags` is the producer's proof for THIS payload. Byte copies preserve
     // it only on code-unit boundaries; concat/append intersect their inputs.
-    (*ptr).flags = flags;
+    (*ptr).flags = flags
+        & (STRING_FLAG_HAS_LONE_SURROGATES
+            | STRING_FLAG_JSON_ESCAPE_FREE
+            | STRING_FLAG_WTF8_VALIDATED);
 }
 
 #[inline]
@@ -1354,3 +1388,8 @@ pub(crate) fn intern_table_census() -> (usize, usize) {
 }
 
 pub(crate) use iter_object::dispatch_string_iterator_step;
+
+pub(crate) use intern::{
+    is_program_atom, is_property_atom, property_atom, property_atom_from_value, property_atom_hash,
+    property_atom_is_program_named, prune_property_atoms, scan_property_atoms,
+};

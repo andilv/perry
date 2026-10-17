@@ -38,9 +38,9 @@
 //!   seen at once. The body info, not the closure, is compared: a factory
 //!   that returns fresh closures per object shares one body, and the call
 //!   passes the LOADED closure, so each object's captures are its own.
-//! * An inherited entry holds the direct holder as a strong root. The
-//!   receiver's shape pins that holder, and the holder's shape pins the
-//!   inline slot. A structural change invalidates one of those word compares;
+//! * An inherited entry holds the direct holder as a plain, unrooted word
+//!   (see GC below). The receiver's shape pins that holder, and the holder's
+//!   shape pins the inline slot. A structural change invalidates one of those word compares;
 //!   a value overwrite is seen by loading the slot on every hit.
 //!
 //! Canonical Array/Map/Set and shape-described function receivers use the same
@@ -68,17 +68,22 @@
 //!   argument-list body ABI; bit 58 names an owned chain proof. A new kind extends the emitted `msite.other` dispatch and
 //!   [`publish`], nothing else;
 //! * an entry that holds a heap reference stores it in [`MethodEntry::closure`]
-//!   and is registered by [`publish`], so [`scan_method_site_roots_mut`] marks
-//!   and rewrites it;
+//!   (or in its owned chain proof), and [`publish`] admits it only if every
+//!   object it names is stable ([`memo_referents_stable`]);
 //! * an inherited entry records the direct holder's word in
 //!   [`MethodEntry::gen`]; deeper entries own the consumed holder shapes;
 //! * primes resolve the pre-call receiver shape, with collection suppressed.
 //!
 //! # GC
 //!
-//! [`MethodEntry::closure`] is a STRONG root for the inherited holder: marked,
-//! and rewritten when it moves (`scan_method_site_roots_mut`). Every site that ever primed an
-//! inherited entry is registered once for the scan.
+//! No entry word is a root, and no site is registered anywhere. An inherited
+//! entry's holder (and a chain proof's hops and holder) is a STABLE object —
+//! old and never-move (`gc::never_move`) — so its address cannot change while
+//! it lives; [`publish`] refuses an entry naming anything else, and the site
+//! primes again after the next minor promotes it. Liveness comes from the
+//! receiver: the emitted hit compares the receiver's word first, and that
+//! ShapeId pins its [[Prototype]], so a matching receiver keeps the holder
+//! alive (the full argument is "Weak entries" in `read_holder.rs`).
 //!
 //! # Agents
 //!
@@ -91,7 +96,11 @@
 use crate::object::ObjectHeader;
 
 mod builtin_receiver;
-pub(crate) use builtin_receiver::shape_proof as builtin_shape_proof;
+mod proto_constant;
+pub use proto_constant::{
+    js_proto_constant_contract_check, js_proto_holder_contract_check,
+    js_proto_shadow_contract_check,
+};
 pub(crate) mod chain_memo;
 mod function_receiver;
 mod holder_prime;
@@ -134,7 +143,7 @@ pub struct MethodEntry {
     /// entry whose generic invocation route consumes the current closure.
     /// A value entry validates closure kind and a non-null info, not body identity.
     pub info: u64,
-    /// Inherited entry: the direct holder's address (a STRONG GC root).
+    /// Inherited entry: the direct holder's address (stable, unrooted).
     pub closure: usize,
     /// Inherited entry: the holder's full `(class_id | ShapeId)` word.
     pub gen: u64,
@@ -162,8 +171,9 @@ pub struct MethodSite {
     pub entries: [MethodEntry; METHOD_SITE_WAYS],
     /// The entry the next prime replaces when every entry is taken.
     next: u64,
-    /// Registered with the root scan.
-    registered: u64,
+    /// [`young_retry_stamp`] of the last publication refused for a young
+    /// referent; priming waits for the next minor.
+    young_retry: u64,
 }
 
 // The emitted site runs on 64-bit targets only (`method_site_enabled`).
@@ -201,10 +211,10 @@ const _: () = {
 /// The emitted `@perry_ic_N = private global ptr null` for a method site.
 pub type MethodSiteSlot = *mut MethodSite;
 
-/// Every site that holds (or held) an inherited entry, for the primary agent's
-/// root scan until a worker starts. The sites are process-lifetime
-/// allocations, but their holders belong to the primary heap.
-static METHOD_SITES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// Serializes [`publish`] with [`note_worker_agent`]: every in-flight write
+/// finishes before a worker can run emitted code, and later publishes see the
+/// gate. Holds no data.
+static PUBLISH_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Sticky process-wide gate: a worker cannot read a primary-heap holder from
 /// a process-global method or read site. Emitted method sites read this byte
@@ -245,14 +255,11 @@ pub fn note_worker_agent() {
     // Publish the gate under the same lock as `publish`: every in-flight
     // write finishes before a worker can run emitted code, and all later
     // publishes decline. No site word is written at worker startup.
-    let _sites = METHOD_SITES
+    let _sites = PUBLISH_GATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let first = WORKER_AGENTS_EXIST.swap(1, Ordering::SeqCst) == 0;
+    WORKER_AGENTS_EXIST.store(1, Ordering::SeqCst);
     drop(_sites);
-    if first {
-        super::proto_validity::bump_proto_validity();
-    }
 }
 
 /// Why a miss did not prime (diagnostic; `PERRY_METHOD_SITE_STATS` prints it),
@@ -271,9 +278,105 @@ fn refuse(reason: usize) {
 }
 
 per_test_global! {
+    static UNSTABLE_REFERENTS: AtomicU64 = AtomicU64::new(0);
+    /// Of the refused referents: young objects (admitted after a minor),
+    /// and anything that is not a `GC_TYPE_OBJECT` (never admitted).
+    static UNSTABLE_YOUNG: AtomicU64 = AtomicU64::new(0);
+    static UNSTABLE_NOT_OBJECT: AtomicU64 = AtomicU64::new(0);
+}
+
+/// The publication rule of every per-site memo (I1, `gc::never_move`): an
+/// entry may store an object's address only if that object is stable — old
+/// and never-move — so the word needs no root, no registry and no rewrite.
+/// Asking marks each referent never-move, so a young one is promoted by the
+/// next minor and the site's next miss publishes. Every referent is asked
+/// even after one is refused. `0` names nothing and is always admitted.
+///
+/// Each admitted referent is also flagged memo-named
+/// (`gc::never_move::note_memo_named`): if a class relink later displaces it
+/// from its class identity, the retirement pins it (premise 4 of "Weak
+/// entries" in `read_holder.rs`).
+///
+/// # Safety
+/// Each address is 0 or a live heap object the caller just walked to.
+pub(crate) unsafe fn memo_referents_stable(addrs: impl IntoIterator<Item = usize>) -> bool {
+    let addrs: Vec<usize> = addrs.into_iter().filter(|&a| a != 0).collect();
+    let mut stable = true;
+    for &addr in &addrs {
+        if !crate::gc::never_move::stable_memo_referent(addr) {
+            stable = false;
+            let object = crate::value::addr_class::try_read_gc_header(addr)
+                .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT);
+            if object {
+                UNSTABLE_YOUNG.fetch_add(1, Ordering::Relaxed);
+            } else {
+                UNSTABLE_NOT_OBJECT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    if stable {
+        for &addr in &addrs {
+            crate::gc::never_move::note_memo_named(addr);
+        }
+    }
+    if !stable {
+        UNSTABLE_REFERENTS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// Publications refused because a referent was not yet stable.
+pub fn memo_unstable_referent_refusals() -> u64 {
+    UNSTABLE_REFERENTS.load(Ordering::Relaxed)
+}
+
+/// A site's young-referent retry word: after a publication is refused for a
+/// young referent, the site skips priming (the generic path answers) until
+/// the next copying minor, which is what promotes the referent. A word of the
+/// site's own memory, valid for one minor; 0 means "prime freely".
+#[inline]
+pub(crate) fn young_retry_stamp() -> u32 {
+    (crate::gc::copying_minor_cycles() as u32).wrapping_add(1)
+}
+
+/// Does a stamp written by [`young_retry_stamp`] still hold?
+#[inline]
+pub(crate) fn young_retry_pending(stamp: u32) -> bool {
+    #[cfg(test)]
+    if young_retry_sabotage::active() {
+        return false;
+    }
+    stamp != 0 && stamp == young_retry_stamp()
+}
+
+/// Test-only: ignore every site's retry stamp.
+#[cfg(test)]
+pub(crate) mod young_retry_sabotage {
+    use std::cell::Cell;
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn active() -> bool {
+        ON.with(Cell::get)
+    }
+    pub(crate) struct Guard;
+    impl Guard {
+        pub(crate) fn new() -> Self {
+            ON.with(|c| c.set(true));
+            Guard
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ON.with(|c| c.set(false));
+        }
+    }
+}
+
+per_test_global! {
     static PRIMES_OWN: AtomicU64 = AtomicU64::new(0);
     static PRIMES_INHERITED: AtomicU64 = AtomicU64::new(0);
-    static HOLDER_REWRITES: AtomicU64 = AtomicU64::new(0);
     static MISSES: AtomicU64 = AtomicU64::new(0);
     static PRIMES_FUNCTION: AtomicU64 = AtomicU64::new(0);
     static PRIMES_CONSTFN: AtomicU64 = AtomicU64::new(0);
@@ -348,20 +451,15 @@ pub(crate) fn stats_report_enabled() -> bool {
                         refused.push_str(&format!(" refused.{}={n}", refusal_name(i)));
                     }
                 }
-                let (hd, ha, hr) = read_holder::read_holder_stats();
-                let (ap, ah) = read_holder::read_accessor_stats();
-                let (cp, ch, cr) = read_holder::class_read_stats();
                 eprintln!(
-                    "[method-site] primes_own={a} primes_inherited={b} primes_builtin={} primes_function={} primes_constfn={} chain_memo_records={} holder_rewrites={} misses={c} read_holder_primes={hd} read_absent_primes={ha} read_accessor_primes={ap} read_accessor_hits={ah} read_accessor_class_primes={} class_read_primes={cp} class_read_hits={ch} class_read_root_rewrites={cr} read_holder_rewrites={} read_accessor_rewrites={} read_accessor_same_shape_relinks={} read_holder_refused={hr}{refused}",
+                    "[method-site] primes_own={a} primes_inherited={b} primes_builtin={} primes_function={} primes_constfn={} chain_memo_records={} misses={c} unstable_referent_refusals={} unstable_young={} unstable_not_object={}{refused}",
                     PRIMES_BUILTIN.load(Ordering::Relaxed),
                     method_site_function_primes(),
                     PRIMES_CONSTFN.load(Ordering::Relaxed),
                     chain_memo::chain_memo_records(),
-                    HOLDER_REWRITES.load(Ordering::Relaxed),
-                    read_holder::read_accessor_class_primes(),
-                    read_holder::read_holder_rewrites(),
-                    read_holder::read_accessor_rewrites(),
-                    read_holder::read_accessor_same_shape_relinks()
+                    memo_unstable_referent_refusals(),
+                    UNSTABLE_YOUNG.load(Ordering::Relaxed),
+                    UNSTABLE_NOT_OBJECT.load(Ordering::Relaxed),
                 );
             }
             unsafe { libc::atexit(report) };
@@ -424,8 +522,11 @@ unsafe fn method_site_miss_object(
     // Ordinary objects and described function shapes can prime. Every
     // other receiver keeps generic dispatch.
     let megamorphic = site_is_megamorphic(slot);
-    if megamorphic || !prime_candidate(receiver, name) {
-        refuse(if megamorphic { 18 } else { 1 });
+    let waiting = young_retry_waiting(slot);
+    if megamorphic || waiting || !prime_candidate(receiver, name) {
+        if !waiting {
+            refuse(if megamorphic { 18 } else { 1 });
+        }
         return crate::typed_feedback::js_typed_feedback_native_call_method(
             site_id,
             recv,
@@ -521,18 +622,14 @@ unsafe fn prepare(slot: *mut MethodSiteSlot, recv: f64, method_id: i64, argc: us
     let direct = f64::from_bits(METHOD_SITE_BY_NAME_DIRECT);
     let bits = recv.to_bits();
     let nullish = bits == crate::value::TAG_UNDEFINED || bits == crate::value::TAG_NULL;
-    let is_pointer = bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG;
+    // A native id (Web Fetch) is an object receiver with no header, and a
+    // Proxy's header names no own storage: both take the full walk below.
+    let is_pointer = bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG
+        || bits & crate::value::TAG_MASK == crate::value::HANDLE_TAG;
     let addr = (bits & crate::value::POINTER_MASK) as usize;
     // One header read classifies a heap receiver; only an ordinary object
     // or a function object needs more than the accessor facts below.
-    let header = if is_pointer
-        && !crate::value::addr_class::is_proxy_id_band(addr)
-        && crate::value::addr_class::is_above_handle_band(addr)
-    {
-        crate::value::addr_class::try_read_gc_header(addr)
-    } else {
-        None
-    };
+    let header = crate::value::addr_class::pointer_value_header(bits);
     // A pre-growth alias the program still holds (an array's forwarding
     // stub) is answered from the live head: growth carried the descriptor
     // bit to its header and re-keyed the array's own properties to it.
@@ -559,7 +656,7 @@ unsafe fn prepare(slot: *mut MethodSiteSlot, recv: f64, method_id: i64, argc: us
         }
     });
     let cell = matches!(kind, Some(t) if t != crate::gc::GC_TYPE_OBJECT
-        && t != crate::gc::GC_TYPE_CLOSURE && t != u8::MAX);
+        && t != crate::gc::GC_TYPE_CLOSURE && t != crate::gc::GC_TYPE_PROXY && t != u8::MAX);
     let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     let Some(name_ref) = crate::string::perry_string_ref_from_dispatch_id(method_id, &mut scratch)
     else {
@@ -579,13 +676,13 @@ unsafe fn prepare(slot: *mut MethodSiteSlot, recv: f64, method_id: i64, argc: us
         // ordinary method, before its arguments can change the slot.
         Some(crate::gc::GC_TYPE_CLOSURE) => prepare_function(slot, recv, name, argc),
         _ if cell => {
-            // An array that never had an own descriptor installed says so in
-            // its header (`OBJ_FLAG_ARRAY_DESCRIPTORS`, armed on the live
-            // head by every install, carried by growth and monotone for the
-            // allocation; a pre-growth alias was resolved to that head above).
+            // An array owns properties beyond its elements only in its named
+            // layout (`ArrayHeader.named`, carried by growth; a pre-growth
+            // alias was resolved to the live head above).
             let own = if kind == Some(crate::gc::GC_TYPE_ARRAY)
-                && header.is_some_and(|h| h._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0)
-            {
+                && !crate::array::array_has_named_properties_resolved(
+                    addr as *const crate::array::ArrayHeader,
+                ) {
                 None
             } else {
                 own_getter_value(addr, recv, name)
@@ -985,6 +1082,14 @@ fn addr_of(v: f64) -> usize {
 
 /// Does the ordinary object `obj`'s shape list `name` as an own DATA key?
 unsafe fn own_data_key(obj: *const ObjectHeader, name: &[u8]) -> bool {
+    // An object with an overflow lists every own key, and its attributes,
+    // there (object model step 4).
+    let table = super::overflow::table(obj);
+    if !table.is_null() {
+        return super::overflow::find_bytes(table, name).is_some_and(|i| {
+            super::overflow::entry_attrs(table.cast(), i) & super::key_attrs::ENTRY_ACCESSOR == 0
+        });
+    }
     let Some(shape) = super::shapes::object_shape_descriptor(obj) else {
         return false;
     };
@@ -1123,7 +1228,8 @@ unsafe fn lookup_is_observable(recv: f64, name: &[u8]) -> bool {
         let b = cur.to_bits();
         if is_pointer(b) {
             let addr = (b & crate::value::POINTER_MASK) as usize;
-            if crate::value::addr_class::is_proxy_id_band(addr) {
+            // A Proxy's [[Get]] is a trap: always observable.
+            if crate::value::addr_class::is_proxy_cell(addr) {
                 return true;
             }
             // Every cell kind answers: an ordinary object from its shape's
@@ -1152,6 +1258,12 @@ unsafe fn lookup_is_observable(recv: f64, name: &[u8]) -> bool {
     false
 }
 
+/// [`spec_get`] for the builtin-prototype generic path
+/// (`builtin_proto::redirect_call`).
+pub(crate) unsafe fn spec_get_value(recv: f64, name: &[u8]) -> f64 {
+    spec_get(recv, name)
+}
+
 /// The spec [[Get]] of `name` on `recv`: runs a getter (with `recv` as
 /// `this`), a Proxy trap, or throws for a nullish receiver.
 unsafe fn spec_get(recv: f64, name: &[u8]) -> f64 {
@@ -1169,15 +1281,61 @@ unsafe fn spec_get(recv: f64, name: &[u8]) -> f64 {
     let recv_h = scope.root_nanbox_f64(recv);
     // The canonical interned key: no allocation per read.
     let key = crate::string::canonical_key(name);
+    let recv_value = recv_h.get_nanbox_f64();
     let value = crate::object::js_object_get_field_by_name_f64(
-        recv_h.get_nanbox_f64().to_bits() as usize as *const ObjectHeader,
+        recv_value.to_bits() as usize as *const ObjectHeader,
         key,
     );
     if value.to_bits() == METHOD_SITE_BY_NAME || value.to_bits() == METHOD_SITE_BY_NAME_DIRECT {
-        f64::from_bits(crate::value::TAG_UNDEFINED)
-    } else {
-        value
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
+    if value.to_bits() == crate::value::TAG_UNDEFINED {
+        if let Some(inherited) = function_receiver_inherited_get(recv_value, key) {
+            return inherited;
+        }
+    }
+    value
+}
+
+/// The generic field get is not a faithful `[[Get]]` for a FUNCTION receiver:
+/// `%Function.prototype%`'s method surface (`call`/`apply`/`bind`/`toString`/
+/// `valueOf`/…) is answered by dedicated dispatch, so the closure arms of
+/// `js_object_get_field_by_name_f64` report every one of those names absent.
+/// [`spec_get`]'s caller (`builtin_proto::redirect_call`) reads that absence
+/// as "not callable" and throws, where `#11915`'s predecessor fell through to
+/// the by-name dispatcher — so a program that replaces
+/// `Function.prototype.toString` made `fn.toString()` throw
+/// `TypeError: value is not a function` (`globals/function-tostring-override`,
+/// #9202).
+///
+/// Resolve the name off the receiver's REAL `[[Prototype]]`, the same `Get`
+/// `closure::reify_function_method_value` already performs for
+/// `call`/`apply`/`bind`: a replaced slot is the value the call runs, a
+/// deleted one stays absent, and a detached function
+/// (`Object.setPrototypeOf(fn, null)`) still finds nothing. `None` for any
+/// receiver that is not a function, so no other family's path changes.
+unsafe fn function_receiver_inherited_get(
+    recv: f64,
+    key: *const crate::string::StringHeader,
+) -> Option<f64> {
+    let jsval = crate::value::JSValue::from_bits(recv.to_bits());
+    if !jsval.is_pointer() {
+        return None;
+    }
+    if !crate::closure::is_closure_ptr(jsval.as_pointer::<u8>() as usize) {
+        return None;
+    }
+    // `js_object_get_prototype_of` answers `null` for a detached function, and
+    // the closure's recorded static prototype otherwise.
+    let proto = crate::object::js_object_get_prototype_of(recv);
+    if proto.to_bits() == crate::value::TAG_NULL {
+        return None;
+    }
+    Some(crate::proxy::js_reflect_get(
+        proto,
+        crate::value::js_nanbox_string(key as i64),
+        recv,
+    ))
 }
 
 /// What one read of a miss receiver's header says.
@@ -1259,14 +1417,14 @@ fn prime_candidate(receiver: MissReceiver, _name: &[u8]) -> bool {
 unsafe fn site_of(slot: *mut MethodSiteSlot) -> *mut MethodSite {
     crate::object::pic_slot_resolve_init(slot, |fresh| {
         // GC_STORE_AUDIT(INIT): a fresh site record in the IC arena; its only
-        // heap references (inherited closures) are written by `publish` and
-        // scanned as strong roots.
+        // heap references (inherited holders) are stable words `publish`
+        // admits.
         std::ptr::write(
             fresh,
             MethodSite {
                 entries: [EMPTY_ENTRY; METHOD_SITE_WAYS],
                 next: 0,
-                registered: 0,
+                young_retry: 0,
             },
         );
     })
@@ -1276,6 +1434,13 @@ unsafe fn site_of(slot: *mut MethodSiteSlot) -> *mut MethodSite {
 /// pairs than ways, and re-priming on every miss would cost more than the
 /// dispatcher alone.
 const METHOD_SITE_MAX_EVICTIONS: u64 = 16;
+
+/// Is `slot`'s site waiting for a minor to promote a refused referent?
+#[inline]
+unsafe fn young_retry_waiting(slot: *mut MethodSiteSlot) -> bool {
+    let site = crate::object::pic_slot_peek(slot);
+    !site.is_null() && young_retry_pending((*site).young_retry as u32)
+}
 
 /// Has `slot`'s site given up priming ([`METHOD_SITE_MAX_EVICTIONS`])?
 #[inline]
@@ -1288,12 +1453,28 @@ unsafe fn site_is_megamorphic(slot: *mut MethodSiteSlot) -> bool {
 /// receiver word, else into an empty one, else over the next in turn. The
 /// word is written LAST, so a half-written entry never matches.
 unsafe fn publish(slot: *mut MethodSiteSlot, mut entry: MethodEntry) -> bool {
-    let Ok(mut sites) = METHOD_SITES.lock() else {
+    let Ok(_gate) = PUBLISH_GATE.lock() else {
         return false;
     };
     if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
         return false;
     }
+    // I1: every object the entry names must be stable.
+    let stable = if entry.slot & METHOD_SITE_CHAIN != 0 {
+        memo_referents_stable(holder_prime::chain_referents(&entry))
+    } else if entry.slot & METHOD_SITE_INHERITED != 0 {
+        memo_referents_stable([entry.closure])
+    } else {
+        true
+    };
+    if !stable {
+        let site = site_of(slot);
+        if !site.is_null() {
+            (*site).young_retry = u64::from(young_retry_stamp());
+        }
+        return false;
+    }
+
     let site = site_of(slot);
     if site.is_null() {
         return false;
@@ -1326,10 +1507,6 @@ unsafe fn publish(slot: *mut MethodSiteSlot, mut entry: MethodEntry) -> bool {
         });
     if !inherited && holder_prime::unify_own_body(&site.entries[idx], &mut entry) {
         return true;
-    }
-    if entry.closure != 0 && site.registered == 0 {
-        site.registered = 1;
-        sites.push(site as *mut MethodSite as usize);
     }
     let e = &mut site.entries[idx];
     holder_prime::drop_chain(e);
@@ -1382,8 +1559,7 @@ unsafe fn prime(slot: *mut MethodSiteSlot, recv: f64, name: &[u8], argc: usize) 
             None => {
                 let dict = crate::value::addr_class::try_read_gc_header(addr)
                     .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
-                    && !crate::closure::is_closure_ptr(addr)
-                    && super::dictionary::is_dictionary(addr as *const ObjectHeader);
+                    && super::overflow::has_overflow(addr as *const ObjectHeader);
                 refuse(if dict { 2 } else { 1 });
                 return;
             }
@@ -1407,13 +1583,12 @@ unsafe fn prime(slot: *mut MethodSiteSlot, recv: f64, name: &[u8], argc: usize) 
             refuse(4);
             return;
         }
+        let s = super::key_attrs::key_storage_slot(keys, s);
         // Where the value lives follows the by-name read's rule: below
         // `max(live slots, INLINE_SLOT_FLOOR)` it is inline, above it in the
         // spill buffer. The gap between the shape's live inline count and
         // the floor is refused rather than guessed.
-        let spill_from = shape
-            .live_inline_slot_count
-            .max(super::INLINE_SLOT_FLOOR as u32);
+        let spill_from = super::object_inline_capacity(addr as *const ObjectHeader);
         let (value, slot_word) = if s < shape.live_inline_slot_count {
             (field_bits(addr, s), s as u64)
         } else if s < spill_from {
@@ -1518,8 +1693,8 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
         return None;
     }
     let header = crate::value::addr_class::try_read_gc_header(addr)?;
+    // An OBJECT header is not a closure (closures carry GC_TYPE_CLOSURE).
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
-        || crate::closure::is_closure_ptr(addr)
         || !address_is_prime_stable(addr)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
@@ -1527,8 +1702,16 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
         return None;
     }
     let obj = addr as *const ObjectHeader;
-    if !super::object_is_regular(obj)
-        || super::dictionary::is_dictionary(obj)
+    // `object_is_regular` without its second header read: the record names
+    // the kind, and its summary says whether the layout can have holes, whose
+    // optional keys are own or absent per object (`key_view`): no site
+    // learns from such a receiver.
+    let Some(record) = super::shapes::shape_record_by_id((*obj).shape_word()) else {
+        return None;
+    };
+    if !record.object_kind().is_ordinary_layout()
+        || super::key_view::summary_may_have_holes(record.summary())
+        || super::overflow::has_overflow(obj)
         || (*obj).class_id == super::native_module::NATIVE_MODULE_CLASS_ID
         || super::class_registry::is_class_object_ptr(obj.cast())
         || crate::array::object_prototype_addr_matches(addr)
@@ -1560,8 +1743,8 @@ unsafe fn class_object_receiver(addr: usize) -> Option<*const ObjectHeader> {
         return None;
     }
     let header = crate::value::addr_class::try_read_gc_header(addr)?;
+    // An OBJECT header is not a closure (closures carry GC_TYPE_CLOSURE).
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
-        || crate::closure::is_closure_ptr(addr)
         || !address_is_prime_stable(addr)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
@@ -1572,7 +1755,7 @@ unsafe fn class_object_receiver(addr: usize) -> Option<*const ObjectHeader> {
     // A class object is not `object_is_regular` (its kind is `Class`), but
     // its own keys live in inline slots exactly as an ordinary object's do.
     let obj = addr as *const ObjectHeader;
-    if super::dictionary::is_dictionary(obj)
+    if super::overflow::has_overflow(obj)
         || !super::shapes::is_shape_id(super::shapes::object_shape_stamp(obj))
     {
         return None;
@@ -1812,32 +1995,6 @@ unsafe fn next_prototype(obj: *const ObjectHeader) -> *const ObjectHeader {
     super::class_prototype_object(class_id)
 }
 
-/// Root scan: before workers exist, every inherited entry's holder is marked
-/// and rewritten. After the sticky gate, no emitted or runtime path reads an
-/// entry; returning here lets otherwise-dead holders collect. A primary
-/// inline hit begun before the gate cannot safepoint between its entry read
-/// and method call, so no primary GC can observe an in-flight holder read.
-pub(crate) fn scan_method_site_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    if crate::agent::current_agent() != crate::agent::PRIMARY_AGENT
-        || WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0
-    {
-        return;
-    }
-    if let Ok(sites) = METHOD_SITES.lock() {
-        for &site in sites.iter() {
-            for e in unsafe { (*(site as *mut MethodSite)).entries.iter_mut() } {
-                if e.slot & METHOD_SITE_CHAIN != 0 {
-                    unsafe { holder_prime::scan_chain(e, visitor) };
-                } else if e.closure != 0 {
-                    if visitor.visit_tagged_usize_slot(&mut e.closure, crate::value::POINTER_TAG) {
-                        HOLDER_REWRITES.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(all(test, feature = "regex-engine"))]
 #[path = "method_site/regex_split_tests.rs"]
 mod regex_split_tests;
@@ -1977,9 +2134,9 @@ mod constfn_tests {
                 assert_eq!(d.special_constfn_mask != 0, admitted);
                 if admitted {
                     assert_ne!(base, id, "ordinary allocation must finalize after stores");
-                    assert!(super::super::field_rep_store::completed_shape_matches_layout(
-                        id, base
-                    ));
+                    assert!(
+                        super::super::field_rep_store::completed_shape_matches_layout(id, base)
+                    );
                     assert_eq!(primed_slot(finalized), METHOD_SITE_CONSTFN);
                     assert_eq!(
                         crate::closure::js_closure_get_capture_bits(c, 0),

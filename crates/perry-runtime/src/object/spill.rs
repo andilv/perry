@@ -77,10 +77,8 @@ unsafe fn spill_store_slot(spill: *mut crate::array::ArrayHeader, index: usize, 
     old_bits
 }
 
-/// Only genuine shaped objects carry a meta record at the ObjectHeader offset.
-/// Every other GC type (RegExp, errors, maps, ...) has unrelated bytes there —
-/// those owners use their own expando bags. Classification uses the
-/// canonical GcHeader kind, mirroring `gc_object_meta_slot`.
+/// Spill storage belongs to an ordinary object holder, including the bags
+/// that carry exotic properties. Check the kind before reading ObjectHeader.
 #[inline]
 pub(crate) unsafe fn spill_capable_owner(obj_ptr: usize) -> bool {
     if obj_ptr == 0 {
@@ -200,6 +198,7 @@ pub(crate) fn spill_store_would_be_in_capacity(obj_ptr: usize, field_index: usiz
 pub(crate) fn spill_set(obj_ptr: usize, field_index: usize, vbits: u64) {
     unsafe {
         let obj = obj_ptr as *mut ObjectHeader;
+        super::builtin_proto::note_value_store(obj, field_index, true, "spill store");
         // Hot path: meta and buffer already exist with capacity — the
         // in-range barriered store cannot allocate or move anything, so no
         // handle scope is needed. This is every write after the first to a
@@ -258,10 +257,7 @@ pub(crate) fn reserve_object_spill(obj_ptr: usize, field_count: u32) {
 
     unsafe {
         let obj = obj_ptr as *mut ObjectHeader;
-        let inline_capacity = std::cmp::max(
-            crate::object::object_live_slot_count(obj),
-            crate::object::INLINE_SLOT_FLOOR as u32,
-        );
+        let inline_capacity = crate::object::object_inline_capacity(obj);
         if field_count <= inline_capacity {
             return;
         }
@@ -419,6 +415,11 @@ pub(crate) const SPILL_MAX_FIELD_INDEX: usize = 16_000_000;
 
 #[inline]
 pub(crate) fn overflow_get(obj_ptr: usize, field_index: usize) -> Option<u64> {
+    if let Some(bits) =
+        unsafe { super::overflow::get(obj_ptr as *const ObjectHeader, field_index as u32) }
+    {
+        return Some(bits);
+    }
     if unsafe { !spill_capable_owner(obj_ptr) } {
         return None;
     }
@@ -532,6 +533,11 @@ pub(crate) fn learned_inline_field_count(class_id: u32) -> u32 {
 /// own property bags before reaching shaped-object field storage.
 #[inline]
 pub(crate) fn overflow_set(obj_ptr: usize, field_index: usize, vbits: u64) {
+    if unsafe {
+        super::overflow::store_index(obj_ptr as *mut ObjectHeader, field_index as u32, vbits)
+    } {
+        return;
+    }
     assert!(
         unsafe { spill_capable_owner(obj_ptr) },
         "spill owner must be a shaped object"

@@ -116,10 +116,15 @@ pub(super) fn emit_array_store_kind_value(
     {
         let blk = ctx.block();
         let bits = blk.bitcast_double_to_i64(val_double);
-        let top16 = blk.lshr(I64, &bits, "48");
-        // NaN-boxed iff the top 16 bits are in 0x7FF9..=0x7FFF.
-        let tag_offset = blk.sub(I64, &top16, "32761"); // 0x7FF9
-        let is_boxed = blk.icmp_ult(I64, &tag_offset, "7");
+        // NaN-boxed iff the sign-cleared word reaches the tag band: the
+        // positive tags 0x7FF9..=0x7FFF and HANDLE_TAG's mirror 0xFFF9.
+        // Numeric ingress canonicalizes every other NaN payload.
+        let magnitude = blk.and(I64, &bits, "9223372036854775807");
+        let is_boxed = blk.icmp_uge(
+            I64,
+            &magnitude,
+            &crate::nanbox::i64_literal(crate::nanbox::SHORT_STRING_TAG),
+        );
         blk.cond_br(&is_boxed, &cold_label, &canon_label);
     }
     ctx.current_block = canon_idx;
@@ -265,6 +270,8 @@ pub(super) fn emit_guarded_inbounds_array_store_keyed(
         let word = emit_array_guard_word(blk, &arr_handle);
         let masked = blk.and(I32, &word, ARRAY_STORE_GUARD_MASK_I32);
         let word_ok = blk.icmp_eq(I32, &masked, ARRAY_STORE_GUARD_EXPECT_I32);
+        let word_ok =
+            super::index_get::guarded_array::emit_and_no_named_layout(blk, &word_ok, &arr_handle);
         blk.cond_br(&word_ok, &live_deref_label, &follow_label);
         (arr_handle, blk.label.clone())
     };
@@ -316,6 +323,11 @@ pub(super) fn emit_guarded_inbounds_array_store_keyed(
         let word = emit_array_guard_word(blk, &forwarding_target);
         let masked = blk.and(I32, &word, ARRAY_STORE_GUARD_MASK_I32);
         let word_ok = blk.icmp_eq(I32, &masked, ARRAY_STORE_GUARD_EXPECT_I32);
+        let word_ok = super::index_get::guarded_array::emit_and_no_named_layout(
+            blk,
+            &word_ok,
+            &forwarding_target,
+        );
         blk.cond_br(&word_ok, &live_deref_label, &slow_label);
     }
 
@@ -564,13 +576,22 @@ mod tests {
     }
 
     fn store_ir(value: Expr, ty: Type) -> String {
+        let unknown_receiver = matches!(ty, Type::Any);
         let mut module = perry_hir::Module::new("terminated_guarded_store");
         module.init = vec![Stmt::Let {
             id: 1,
             name: "items".into(),
             ty,
             mutable: true,
-            init: Some(Expr::Array(vec![])),
+            // A module binding initialised with an array literal is proven an
+            // array for every reader (collectors::definite_init), which takes
+            // the array arm; the unknown-receiver arm needs a binding that is
+            // not.
+            init: Some(if unknown_receiver {
+                Expr::Undefined
+            } else {
+                Expr::Array(vec![])
+            }),
         }];
         module.classes.push(abrupt_derived_class());
         module.functions.push(perry_hir::Function {

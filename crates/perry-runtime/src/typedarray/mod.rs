@@ -16,6 +16,8 @@ pub use format::format_typed_array;
 
 mod access;
 mod construct;
+#[cfg(perry_gc_instruments)]
+mod element_contract;
 /// #8100: the element READ helpers against a receiver the static typed-array
 /// hint no longer describes — the shape codegen emits for a reassigned local.
 #[cfg(test)]
@@ -712,7 +714,7 @@ pub(crate) fn jsvalue_to_f64(v: f64) -> f64 {
     // STRING_TAG=0x7FFF). Negative doubles (top16≥0x8000) and the canonical
     // NaN (top16 0x7FF8) return as-is. An inline SSO string must reach the
     // string arm below, not be stored as its raw NaN bits (#11519).
-    if !(0x7FF9..0x8000).contains(&top16) {
+    if crate::value::JSValue::from_bits(bits).is_number() {
         return v;
     }
     // ECMA-262 IntegerIndexedElementSet on a non-bigint view performs

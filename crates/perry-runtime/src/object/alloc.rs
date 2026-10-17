@@ -10,6 +10,7 @@ pub use super::alloc_basic::{
     js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent, js_object_alloc_plain,
     js_object_alloc_with_parent, js_object_coerce,
 };
+pub(crate) use super::alloc_basic::{object_alloc_recorded_birth, object_fill_recorded_birth};
 use super::*;
 
 // Storage: `ObjectHotTables::class_keys_by_id` (this agent's class_id ->
@@ -550,7 +551,10 @@ pub extern "C" fn js_build_class_keys_array(
         return cached.arr();
     }
     if field_count == 0 || packed_keys_len == 0 || packed_keys.is_null() {
-        let arr = crate::array::js_array_alloc_canonical_keys(0, true, false);
+        let arr = unsafe {
+            canonical_keys::empty_backing(&canonical_keys::SharedLayout::shape_cache_entry())
+                .as_ptr()
+        };
         let (_, keys) = shape_cache_insert(
             shape_id,
             crate::object::canonical_keys::LiveObject::none(),
@@ -1154,8 +1158,7 @@ pub unsafe extern "C" fn js_object_copy_own_fields(dst_i64: i64, src_f64: f64) {
         return;
     }
     let key_count = src_keys.count() as usize;
-    let src_field_count = crate::object::object_live_slot_count(src) as usize;
-    let alloc_limit = std::cmp::max(src_field_count, crate::object::INLINE_SLOT_FLOOR);
+    let alloc_limit = crate::object::object_inline_capacity(src) as usize;
     let header_size = std::mem::size_of::<ObjectHeader>();
     let src_fields = (src as *const u8).add(header_size) as *const u64;
 
@@ -1191,6 +1194,7 @@ pub unsafe extern "C" fn js_object_copy_own_fields(dst_i64: i64, src_f64: f64) {
         if key_ptr.is_null() {
             continue;
         }
+        let i = src_keys.storage_slot(i as u32) as usize;
         let field_f64 = if i < alloc_limit {
             let field_bits = *src_fields.add(i);
             f64::from_bits(field_bits)

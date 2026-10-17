@@ -70,6 +70,9 @@ fn ir_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: false,
         non_entry_module_prefixes: Vec::new(),
@@ -172,6 +175,19 @@ fn empty_module(name: &str) -> Module {
 
 fn ir(module: &Module) -> String {
     String::from_utf8(compile_module(module, ir_opts()).expect("codegen should succeed"))
+        .expect("LLVM IR should be UTF-8")
+}
+
+/// [`ir`] with the static prototype shapes a whole-program compile assigns:
+/// a class-dispatch case is compiled only for a class whose prototype chain
+/// those shapes name.
+fn ir_static(module: &Module) -> String {
+    let mut opts = ir_opts();
+    let births = crate::module_birth_shapes(module, opts.clone()).expect("birth shapes");
+    opts.static_shape_ids = crate::assign_static_shape_ids(births.iter().map(|b| &b.shape))
+        .into_iter()
+        .collect();
+    String::from_utf8(compile_module(module, opts).expect("codegen should succeed"))
         .expect("LLVM IR should be UTF-8")
 }
 
@@ -420,7 +436,7 @@ fn tower_arm_classes(ir: &str) -> Vec<String> {
 
 #[test]
 fn dispatch_tower_arms_are_emitted_in_class_id_order() {
-    let arms = tower_arm_classes(&ir(&dispatch_tower_module()));
+    let arms = tower_arm_classes(&ir_static(&dispatch_tower_module()));
     // Liveness: the tower was actually emitted, with one arm per class. Without
     // this the test would pass on a fixture that stopped producing a tower at
     // all (e.g. if the receiver ever became statically typed).

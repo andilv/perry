@@ -537,6 +537,26 @@ pub extern "C" fn js_number_coerce(value: f64) -> f64 {
         // BigInt → number conversion
         let ptr = jsval.as_bigint_ptr();
         crate::bigint::js_bigint_to_f64(ptr)
+    } else if jsval.is_handle() {
+        // HANDLE_TAG carries a native registry id, not a heap pointer. It is
+        // still a JavaScript object and follows ToPrimitive/ToNumber, but
+        // must never enter the pointer-only object-header paths below.
+        match unsafe { crate::value::to_string_primitive::to_primitive_number(value) } {
+            crate::value::to_string_primitive::OrdinaryToPrimitiveOutcome::Primitive(p) => {
+                js_number_coerce(p)
+            }
+            crate::value::to_string_primitive::OrdinaryToPrimitiveOutcome::DefaultString => {
+                let str_ptr = crate::value::js_jsvalue_to_string(value);
+                if str_ptr.is_null() {
+                    f64::NAN
+                } else {
+                    js_number_coerce(crate::value::js_nanbox_string(str_ptr as i64))
+                }
+            }
+            crate::value::to_string_primitive::OrdinaryToPrimitiveOutcome::TypeError => {
+                crate::value::to_string_primitive::throw_cannot_convert_to_primitive()
+            }
+        }
     } else if jsval.is_pointer() {
         // ECMA-262 ToNumber(Symbol) is a TypeError (§7.1.4). Symbols are
         // NaN-boxed with POINTER_TAG, so they would otherwise fall through to
@@ -691,8 +711,8 @@ pub extern "C" fn js_string_coerce(value: f64) -> *mut StringHeader {
             let str_ptr = crate::bigint::js_bigint_to_string(ptr);
             return str_ptr as *mut StringHeader;
         }
-    } else if jsval.is_pointer() {
-        // Pointer type — could be array or object.
+    } else if jsval.is_reference() {
+        // An object reference (heap object or native handle, #12540).
         // Delegate to js_jsvalue_to_string which handles arrays via join(",") and objects.
         return crate::value::js_jsvalue_to_string(value);
     } else if jsval.is_int32() {
@@ -721,7 +741,7 @@ pub extern "C" fn js_string_coerce(value: f64) -> *mut StringHeader {
 #[no_mangle]
 pub extern "C" fn js_template_string_coerce(value: f64) -> *mut StringHeader {
     let jsval = JSValue::from_bits(value.to_bits());
-    if jsval.is_pointer() || (jsval.is_int32() && crate::object::class_ref_id(value).is_some()) {
+    if jsval.is_reference() || (jsval.is_int32() && crate::object::class_ref_id(value).is_some()) {
         return crate::value::to_string::js_jsvalue_to_string_impl(value, true);
     }
     js_string_coerce(value)

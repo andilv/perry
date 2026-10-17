@@ -3,6 +3,7 @@ use crate::common::feature_hooks::{HandleArm, Hook, PropertySetArm};
 
 // Slots for the optional-feature arms of the three hubs in this file; see
 // `method_dispatch.rs` for the scheme.
+static SET_EXTERNAL_NET: Hook<PropertySetArm> = Hook::empty();
 static SET_HTTP_SERVER_STATUS: Hook<PropertySetArm> = Hook::empty();
 static SET_HTTP_AGENT: Hook<PropertySetArm> = Hook::empty();
 static SET_HTTP_SERVER_SOCKET: Hook<PropertySetArm> = Hook::empty();
@@ -41,9 +42,7 @@ pub unsafe extern "C" fn js_handle_property_set_dispatch(
     let _ = handle;
     let _ = value;
 
-    if crate::common::net_method_values::dispatch_property_set(handle, property_name, value) {
-        return;
-    }
+    try_set_arm!(SET_EXTERNAL_NET, handle, property_name, value);
 
     try_set_arm!(SET_HTTP_SERVER_STATUS, handle, property_name, value);
     try_set_arm!(SET_HTTP_AGENT, handle, property_name, value);
@@ -98,6 +97,9 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
         );
         fn js_register_handle_own_property_names_dispatch(f: unsafe extern "C" fn(i64) -> f64);
         fn js_register_handle_prototype_dispatch(f: unsafe extern "C" fn(i64) -> f64);
+        fn js_register_native_property_bag_dispatch(
+            f: unsafe extern "C" fn(i64, u32, u64, *mut u64) -> bool,
+        );
         fn js_register_worker_threads_namespace_getters(
             worker_data: extern "C" fn() -> f64,
             is_main_thread: extern "C" fn() -> f64,
@@ -117,6 +119,7 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
     js_register_handle_property_set_dispatch(js_handle_property_set_dispatch);
     js_register_handle_own_property_names_dispatch(js_handle_own_property_names_dispatch);
     js_register_handle_prototype_dispatch(js_handle_prototype_dispatch);
+    js_register_native_property_bag_dispatch(native_property_bag_dispatch);
     crate::string_decoder::string_decoder_prototype_value();
     // Dynamic `new <bound async_hooks ctor>()` -> real handle. Next.js does
     // `globalThis.AsyncLocalStorage = AsyncLocalStorage` then
@@ -161,7 +164,6 @@ pub unsafe extern "C" fn js_stdlib_init_dispatch() {
     perry_runtime::js_set_native_async_local_storage_subclass_init(
         crate::async_local_storage::js_async_local_storage_subclass_init,
     );
-    super::super::net_socket_bridge::register_net_socket_handle_probe();
     js_register_worker_threads_namespace_getters(
         crate::worker_threads::js_worker_threads_get_worker_data,
         crate::worker_threads::js_worker_threads_is_main_thread,
@@ -290,7 +292,6 @@ pub(super) unsafe fn install_http_client_registrations() {
     {
         extern "C" {
             fn js_register_http_agent_handle_probe(f: unsafe extern "C" fn(i64) -> bool);
-            fn js_ext_http_agent_is_handle(handle: i64) -> i32;
         }
         unsafe extern "C" fn http_agent_probe(handle: i64) -> bool {
             js_ext_http_agent_is_handle(handle) != 0
@@ -344,11 +345,9 @@ pub(super) unsafe fn install_zlib_registrations() {
 
 #[cfg(feature = "external-zlib-pump")]
 pub(super) unsafe fn install_external_zlib_registrations() {
-    // Optimized builds route `node:zlib` to perry-ext-zlib and compile the
-    // bundled codec module out. Captured exports (`const gzip = zlib.gzip`) and
-    // `util.promisify(zlib.gzip)` still enter the runtime's by-name dispatcher,
-    // so install the external archive's mirror when it is the active backend.
-    #[cfg(all(feature = "external-zlib-pump", not(feature = "compression-gzip")))]
+    // `node:zlib` routed to perry-ext-zlib: captured exports
+    // (`const gzip = zlib.gzip`) and `util.promisify(zlib.gzip)` still enter
+    // the runtime's by-name dispatcher, so install the wrapper's mirror.
     {
         extern "C" {
             fn js_ext_zlib_native_dispatch(
@@ -360,6 +359,16 @@ pub(super) unsafe fn install_external_zlib_registrations() {
         }
         perry_runtime::js_set_native_zlib_dispatch(js_ext_zlib_native_dispatch);
     }
+}
+
+#[cfg(all(
+    feature = "external-net-pump",
+    not(target_os = "ios"),
+    not(target_os = "android")
+))]
+pub(super) unsafe fn install_external_net_registrations() {
+    SET_EXTERNAL_NET.set(crate::common::net_method_values::dispatch_property_set);
+    super::super::net_socket_bridge::register_net_socket_handle_probe();
 }
 
 #[cfg(feature = "database-sqlite")]
@@ -377,16 +386,6 @@ pub(super) unsafe fn install_http_server_registrations() {
     // the feature guarantees the crate is linked.
     #[cfg(feature = "external-http-server-pump")]
     {
-        extern "C" {
-            fn js_ext_http_native_dispatch(
-                module_ptr: *const u8,
-                module_len: usize,
-                method_ptr: *const u8,
-                method_len: usize,
-                args_ptr: *const f64,
-                args_len: usize,
-            ) -> f64;
-        }
         perry_runtime::js_set_native_http_dispatch(js_ext_http_native_dispatch);
     }
     SET_HTTP_SERVER_STATUS.set(set_http_server_status);
@@ -442,16 +441,6 @@ unsafe fn set_http_server_status(handle: i64, property_name: &str, value: f64) -
         property_name,
         "statusCode" | "statusMessage" | "sendDate" | "strictContentLength"
     ) {
-        extern "C" {
-            fn js_ext_http_server_response_is_handle(handle: i64) -> i32;
-            fn js_ext_http_server_response_dispatch_property_set(
-                handle: i64,
-                property_ptr: *const u8,
-                property_len: usize,
-                value: f64,
-            ) -> i32;
-        }
-
         if unsafe { js_ext_http_server_response_is_handle(handle) } != 0 {
             unsafe {
                 js_ext_http_server_response_dispatch_property_set(
@@ -483,15 +472,6 @@ unsafe fn set_http_agent(handle: i64, property_name: &str, value: f64) -> bool {
             | "createConnection"
             | "createSocket"
     ) {
-        extern "C" {
-            fn js_ext_http_agent_is_handle(handle: i64) -> i32;
-            fn js_ext_http_agent_dispatch_property_set(
-                handle: i64,
-                property_ptr: *const u8,
-                property_len: usize,
-                value: f64,
-            ) -> i32;
-        }
         if unsafe { js_ext_http_agent_is_handle(handle) } != 0 {
             unsafe {
                 js_ext_http_agent_dispatch_property_set(
@@ -512,16 +492,6 @@ unsafe fn set_http_server_socket(handle: i64, property_name: &str, value: f64) -
     // #4904: `req.connection = v` / `req.socket = v` on an IncomingMessage —
     // Node's `connection` accessor writes `this.socket`.
     if matches!(property_name, "socket" | "connection") {
-        extern "C" {
-            fn js_ext_http_incoming_message_is_handle(handle: i64) -> i32;
-            fn js_ext_http_incoming_message_dispatch_property_set(
-                handle: i64,
-                property_ptr: *const u8,
-                property_len: usize,
-                value: f64,
-            ) -> i32;
-        }
-
         if unsafe { js_ext_http_incoming_message_is_handle(handle) } != 0 {
             unsafe {
                 js_ext_http_incoming_message_dispatch_property_set(
@@ -554,3 +524,46 @@ unsafe fn prototype_crypto(handle: i64) -> Option<f64> {
     }
     None
 }
+
+/// Bridge to bag slots on the existing native records. GC allocation remains
+/// in the runtime, outside every native-registry borrow.
+unsafe extern "C" fn native_property_bag_dispatch(
+    handle: i64,
+    operation: u32,
+    bits: u64,
+    out: *mut u64,
+) -> bool {
+    if out.is_null() || operation > 1 {
+        return false;
+    }
+    if let Some(previous) = crate::common::handle::native_property_bag(handle) {
+        *out = previous;
+        return operation == 0 || crate::common::handle::set_native_property_bag(handle, bits);
+    }
+    if let Some(previous) = perry_ffi::native_handle_props(handle) {
+        *out = previous;
+        if operation == 0 {
+            return true;
+        }
+        if bits != 0 {
+            perry_runtime::arena::thread_exit::register_thread_exit_range_hook(
+                crate::common::handle::release_handle_payloads_in_freed_ranges,
+            );
+        }
+        return perry_ffi::set_native_handle_props(handle, bits);
+    }
+    #[cfg(feature = "web-fetch")]
+    if let Some(previous) = crate::fetch::native_property_bag(handle as usize) {
+        *out = previous;
+        return operation == 0 || crate::fetch::set_native_property_bag(handle as usize, bits);
+    }
+    #[cfg(feature = "bundled-streams")]
+    if let Some(previous) = crate::streams::native_property_bag(handle as usize) {
+        *out = previous;
+        return operation == 0 || crate::streams::set_native_property_bag(handle as usize, bits);
+    }
+    false
+}
+
+#[allow(unused_imports)]
+use crate::common::wrapper_imports::*;

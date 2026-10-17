@@ -17,6 +17,8 @@ use super::*;
 ///   our number ABI)
 pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function("js_array_alloc", I64, &[I32]);
+    module.declare_function("perry_array_attach_layout", DOUBLE, &[DOUBLE, PTR]);
+    module.declare_function("perry_array_element_kind", I32, &[I64]);
     // Tagged-template `.raw` side-table helpers (per ECMA-262 §13.2.8.3
     // TaggedTemplate Evaluation step 5: `template[Symbol.raw]` returns
     // an array of raw strings).
@@ -37,6 +39,9 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // #5391: build an array literal from a stack buffer of N values in one call
     // (outlines the inline alloc + per-element store/note/barrier). (values_ptr, n).
     module.declare_function("js_array_from_values", I64, &[PTR, I32]);
+    // Fill a fresh `js_array_alloc(n)` array with n staged values in one
+    // non-allocating call: (array, values_ptr, n) -> array.
+    module.declare_function("js_array_fill_values", I64, &[I64, PTR, I32]);
     // #8583 follow-up: materialize a large, fully-constant nested array literal
     // from a static rodata descriptor blob in ONE call — (descriptor_ptr,
     // blob_len). Returns the nanboxed JS value (a fresh, mutable array).
@@ -173,6 +178,9 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     module.declare_function_with_ret_attrs("js_shadow_frame_enter", PTR, &[I32], "nonnull");
     module.declare_function("js_shadow_frame_push", I64, &[I32]);
     module.declare_function("js_shadow_frame_pop", VOID, &[I64]);
+    // A landing pad of a function with a shadow frame makes that frame the
+    // top frame again (`LlFunction` emits it after `js_eh_pad_enter`).
+    module.declare_function("js_shadow_frame_restore_to", VOID, &[I64]);
     module.declare_function("js_shadow_slot_set", VOID, &[I32, I64]);
     module.declare_function("js_shadow_slot_bind", VOID, &[I32, PTR]);
     module.declare_function("js_gc_write_barriers_emitted", VOID, &[I32]);
@@ -237,6 +245,8 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // - js_array_join(arr, sep) -> *mut StringHeader (i64)
     // - js_array_join_value(arr, sep_value) -> *mut StringHeader (i64)
     module.declare_function("js_array_pop_f64", DOUBLE, &[I64]);
+    // #11915: `arr.pop()` from compiled code, under the builtin-prototype proof.
+    module.declare_function("js_array_pop_f64_site", DOUBLE, &[I64]);
     module.declare_function("js_array_join", I64, &[I64, I64]);
     module.declare_function("js_array_join_value", I64, &[I64, DOUBLE]);
     module.declare_function("js_array_forEach", VOID, &[I64, I64]);
@@ -359,12 +369,13 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     // Array whose iteration is unobservable (read it by index), 1 otherwise.
     module.declare_function("js_array_destructure_needs_iterator", I32, &[DOUBLE]);
     module.declare_function("js_array_record_stack_dispatch", DOUBLE, &[PTR, I32]);
-    module.declare_function("js_array_record_stack_enter", I32, &[PTR, PTR, I32]);
+    module.declare_function("perry_array_iteration_init", crate::types::VOID, &[I32]);
+    module.declare_function("js_array_record_stack_enter", I32, &[PTR, I32, I32]);
     module.declare_function("js_array_record_literal", DOUBLE, &[PTR, I32]);
-    module.declare_function("js_array_record_enter", I32, &[DOUBLE, PTR, PTR]);
-    module.declare_function("js_array_record_enter_counted", I32, &[DOUBLE, PTR, PTR]);
+    module.declare_function("js_array_record_enter", I32, &[DOUBLE, PTR, I32]);
+    module.declare_function("js_array_record_enter_counted", I32, &[DOUBLE, PTR, I32]);
     module.declare_function("js_array_record_needs_iterator", I32, &[DOUBLE]);
-    module.declare_function("js_array_record_literal_needs_iterator", I32, &[PTR]);
+    module.declare_function("js_array_record_literal_needs_iterator", I32, &[I32]);
     module.declare_function("js_array_record_close_absent", I32, &[]);
     module.declare_function(
         "js_array_record_finish",

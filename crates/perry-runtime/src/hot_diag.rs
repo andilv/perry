@@ -425,8 +425,14 @@ impl RegexDiag {
         let secs = self.started.map_or(0.0, |t| t.elapsed().as_secs_f64());
         let _ = writeln!(out, "[regex-cache] perex_compiles={} validations={} identity_hits={} content_hits={} hash_bytes={}",
             self.perex_compiles, self.perex_validations, self.program_identity_hits, self.program_content_hits, self.program_hash_bytes);
-        let _ = writeln!(out, "[regex-perex] canonical_execs={} searches={} scratch_allocs={} scratch_grows={}",
-            self.perex_canonical_execs, self.perex_searches, self.perex_scratch_allocs, self.perex_scratch_grows);
+        let _ = writeln!(
+            out,
+            "[regex-perex] canonical_execs={} searches={} scratch_allocs={} scratch_grows={}",
+            self.perex_canonical_execs,
+            self.perex_searches,
+            self.perex_scratch_allocs,
+            self.perex_scratch_grows
+        );
         let _ = writeln!(
             out,
             "[regex-proofs] exec hit={} miss={} refresh={} method hit={} miss={} split hit={} miss={} \
@@ -1190,12 +1196,11 @@ const RECV_ROUTE_NAMES: [&str; 35] = [
     // Step 4 (link-time shape ids), emitted: a region guard's static
     // supplier matched (`Route::RloopStatic`).
     "rloop_static",
-    // Runtime-counted: a class-field read whose inline guard missed, answered
-    // from the receiver's shape (the site's word or holder fact)...
-    "rt_class_miss_shape",
-    // ...or by the generic read ladder behind it, where it used to take the
-    // site-less by-name walk.
-    "rt_class_miss_ladder",
+    // Retired (#12483): a class-field read is a shape-site read with no miss
+    // helper of its own. The two indices stay reserved so the emitted route
+    // numbers `receiver_range::Route` mirrors keep their values.
+    "retired_class_miss_shape",
+    "retired_class_miss_ladder",
     // Runtime-counted: a by-name overwrite of a live inline slot on an object
     // whose ShapeId carries an `F64` lane, which keeps that ShapeId (it used
     // to declare the object's layout unknown).
@@ -1209,11 +1214,6 @@ const RECV_ROUTE_NAMES: [&str; 35] = [
     "rloop_f_rep",
 ];
 
-/// The runtime-counted routes: see [`RECV_ROUTE_NAMES`].
-pub(crate) const RT_ROUTE_MEGA_SPILL: u32 = 9;
-pub(crate) const RT_ROUTE_SPILL_MISS: u32 = 10;
-pub(crate) const RT_ROUTE_CLASS_MISS_SHAPE: u32 = 29;
-pub(crate) const RT_ROUTE_CLASS_MISS_LADDER: u32 = 30;
 pub(crate) const RT_ROUTE_OVERWRITE_KEPT_TYPED: u32 = 31;
 pub(crate) const RT_ROUTE_RLOOP_PRIME_OK: u32 = 19;
 pub(crate) const RT_ROUTE_RLOOP_REFUSE_BAND: u32 = 20;

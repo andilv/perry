@@ -1,150 +1,130 @@
 //! Exception handling runtime for Perry.
 //!
-//! Two transports behind one handler stack (#7302):
+//! One transport on native targets (#7302, ehfree slices 2b and 1): every
+//! handler is a landing pad that the personality finds, and nothing is
+//! recorded when a handler is entered.
 //!
-//! * **Generated `try`/`catch`** (`js_eh_try_push`, `HandlerKind::Unwind`):
-//!   `js_throw` raises through the system unwinder
-//!   (`_Unwind_RaiseException`; `RaiseException` on Windows) and the
-//!   frame's `landingpad`/`catchpad` receives control — see `crate::eh`.
-//! * **Rust-side boundary traps** (`js_try_push` + the C trampoline,
-//!   `HandlerKind::Setjmp`): runtime helpers that drive user JS from a
-//!   Rust-owned context (`js_call_catching`, promise combinators, iterator
-//!   trampolines) catch via `longjmp` — Rust cannot catch a foreign
-//!   exception, and this is sound because an open Rust handler is always
-//!   innermost when it is the throw target (handler-stack order mirrors
-//!   stack order), so a raise never crosses one, and the frames a longjmp
-//!   discards are never resumed.
+//! * **Generated `try`/`catch`**: the frame's `landingpad` receives control
+//!   (see `crate::eh`). Entering and leaving the protected region costs
+//!   nothing: there is no handler stack and no savepoint.
+//! * **Runtime traps** ([`trap`], behind [`catch_js_throw`],
+//!   [`js_call_catching`], the drains and [`js_trap_call`]): runtime helpers
+//!   that drive user JS from a Rust-owned context run it through the
+//!   checked-in shim `ffi/perry_trap.ll`, an `invoke` of the body under a
+//!   catch-all pad with Perry's personality — the same shape as a generated
+//!   `try`.
+//!
+//! Every pad (generated or shim) first calls [`js_eh_pad_enter`] with its own
+//! stack pointer, which pops the managed-stack entries of the frames the throw
+//! abandoned (`marks`: each entry carries the address of the frame that owns
+//! it). `js_throw` stores the value and raises (the single-phase walker, then
+//! `_Unwind_RaiseException`, or `RaiseException` on Windows). When no handler
+//! exists the raise returns `_URC_END_OF_STACK` without unwinding (Windows:
+//! the unhandled-exception filter runs with the stack intact), and the
+//! uncaught path runs on the intact stack.
+//!
+//! WASI keeps setjmp transport (design §1.3): a generated `try` and a runtime
+//! trap push a jump buffer ([`js_try_push`]) that records the frame's mark;
+//! `js_throw` restores with the same mark rule and `longjmp`s.
 
-// Platform-specific jmp_buf size (in i32 units)
-// macOS ARM64: _JBLEN = 48 (48 * 4 = 192 bytes)
-// macOS x86_64: _JBLEN = 37 (37 * 4 = 148 bytes, but aligned to 156)
-// Linux x86_64: __jmp_buf is 8 * i64 = 64 bytes
-// Windows MSVC x86_64: _JBLEN = 16 doubles = 256 bytes
-// We use a conservative size that works for all
-const JMP_BUF_SIZE: usize = 64; // 64 * i32 = 256 bytes, enough for any platform
+#[cfg(target_os = "wasi")]
+mod wasi_handlers {
+    // Platform-specific jmp_buf size (in i32 units); conservative.
+    pub(super) const JMP_BUF_SIZE: usize = 64; // 64 * i32 = 256 bytes
 
-// jmp_buf must be properly aligned
-#[repr(C, align(16))]
-#[derive(Copy, Clone)]
-struct JmpBuf {
-    data: [i32; JMP_BUF_SIZE],
-}
+    #[repr(C, align(16))]
+    #[derive(Copy, Clone)]
+    pub(super) struct JmpBuf {
+        pub(super) data: [i32; JMP_BUF_SIZE],
+    }
 
-impl JmpBuf {
-    fn as_mut_ptr(&mut self) -> *mut i32 {
-        self.data.as_mut_ptr()
+    impl JmpBuf {
+        pub(super) fn as_mut_ptr(&mut self) -> *mut i32 {
+            self.data.as_mut_ptr()
+        }
+    }
+
+    // SAFETY: plain `i32`s, and a slot is armed by `setjmp` before it is ever
+    // jumped through.
+    unsafe impl crate::zeroed_cache::ZeroEmpty for JmpBuf {}
+
+    // Jump buffers live in fixed-size heap slabs per thread, so published
+    // jmp_buf addresses stay stable as the depth grows.
+    pub(super) const JUMP_BUFFER_SLAB_SIZE: usize = 256;
+
+    /// What a WASI handler restores besides the mark rule: the stacks that
+    /// compiled code pushes in its own frame. A landing pad closes those with
+    /// actions; a setjmp handler has no pad, so it records their depths.
+    #[derive(Clone, Copy)]
+    pub(super) struct WasiHandler {
+        pub(super) mark: usize,
+        pub(super) handles: usize,
+        pub(super) shadow: crate::gc::FrameRootSavepoint,
+        pub(super) temp_roots: usize,
+        pub(super) derived_super: usize,
     }
 }
+#[cfg(target_os = "wasi")]
+use wasi_handlers::*;
 
-// SAFETY: plain `i32`s, and a slot is armed by
-// `setjmp` before it is ever jumped through.
-unsafe impl crate::zeroed_cache::ZeroEmpty for JmpBuf {}
-
-#[cfg(any(test, not(perry_native_stack_maps)))]
-pub(crate) use savepoints::catch_subsystem_used;
+pub(crate) mod marks;
+pub(crate) use marks::CatchStack;
+pub use marks::{caller_frame_mark, frame_mark};
 mod native_call;
-pub(crate) use native_call::{catch_native_callback, NativeCatch};
-mod savepoints;
-use savepoints::CatchSavepoint;
-pub(crate) use savepoints::{catch_subsystem, note_catch_subsystem_used, CatchStack};
+pub(crate) use native_call::catch_native_callback;
 
+#[cfg(target_os = "wasi")]
 extern "C" {
-    #[cfg_attr(target_os = "wasi", link_name = "perry_wasi_longjmp")]
+    #[link_name = "perry_wasi_longjmp"]
     fn longjmp(env: *mut i32, val: i32) -> !;
 }
 
-// Jump buffers live in fixed-size heap slabs per thread. Each slab keeps
-// published jmp_buf addresses stable as try depth grows, while avoiding
-// ld64's 64KB inline initialized-TLS limit on arm64_32.
-const JUMP_BUFFER_SLAB_SIZE: usize = 256;
-
-/// How a handler-stack entry catches (#7302).
-///
-/// `Setjmp`: the handler frame armed a `jmp_buf` (generated setjmp-based
-/// `try` while the old lowering exists, plus the Rust-side
-/// `js_call_catching` boundary trap, which keeps setjmp forever — Rust
-/// cannot catch a foreign unwind). `js_throw` reaches these via `longjmp`.
-///
-/// `Unwind`: an invoke/landingpad `try` in generated code (pushed by
-/// `js_eh_try_push`). `js_throw` reaches these via
-/// `_Unwind_RaiseException`; the unwinder finds the landing pad of the
-/// innermost `try`-containing generated frame, which is exactly this entry
-/// (handler-stack order mirrors stack order, and an entry above it would
-/// have been popped or would itself be the throw target).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum HandlerKind {
-    Setjmp,
-    Unwind,
-    NativeInactive,
-}
-
 struct ExceptionState {
-    // Group captured fields per depth, but keep jump buffers separately aligned.
-    // Putting their 16-byte alignment and a one-byte kind into every record
-    // adds 15 KiB of padding per thread in the default 64-bit configuration.
-    // The Vec may move its Box handles, but each Box allocation is stable after
-    // a jmp_buf pointer has been returned to generated code or the C trampoline.
+    #[cfg(target_os = "wasi")]
     jump_buffer_slabs: Vec<Box<[JmpBuf]>>,
-    handler_kinds: Vec<HandlerKind>,
-    savepoints: Vec<std::mem::MaybeUninit<CatchSavepoint>>,
-    try_depth: usize,
+    #[cfg(target_os = "wasi")]
+    handlers: Vec<WasiHandler>,
     current_exception: f64,
     has_exception: bool,
     in_finally: bool,
+    /// Set by [`hand_to_worker_base`] while its raise is in flight; the
+    /// worker base trap clears it when it lands.
+    #[cfg(not(target_os = "wasi"))]
+    to_worker_base: bool,
+    /// Debug builds: [`js_eh_pad_enter`] is running. A throw from inside it
+    /// would land on half-restored stacks.
+    #[cfg(debug_assertions)]
+    in_pad_enter: bool,
 }
 
 impl ExceptionState {
     fn new() -> Self {
-        let mut jump_buffer_slabs = Vec::new();
-        jump_buffer_slabs.push(crate::zeroed_cache::new_zeroed_cache(JUMP_BUFFER_SLAB_SIZE));
         Self {
-            // Build the zeroed slab directly on the heap, without a large TLS
-            // initializer or native-stack temporary (arm64_32). Each new slab
-            // is allocated the same way when a thread reaches another chunk.
-            jump_buffer_slabs,
-            handler_kinds: vec![HandlerKind::Setjmp; JUMP_BUFFER_SLAB_SIZE],
-            // Snapshots have no escaping addresses. Allocate only the nesting
-            // depth reached by this thread; each push initializes its slot
-            // before publishing try_depth, which bounds the root scanner.
-            savepoints: Vec::new(),
-            try_depth: 0,
+            #[cfg(target_os = "wasi")]
+            jump_buffer_slabs: vec![crate::zeroed_cache::new_zeroed_cache(JUMP_BUFFER_SLAB_SIZE)],
+            #[cfg(target_os = "wasi")]
+            handlers: Vec::new(),
             current_exception: 0.0,
             has_exception: false,
             in_finally: false,
+            #[cfg(not(target_os = "wasi"))]
+            to_worker_base: false,
+            #[cfg(debug_assertions)]
+            in_pad_enter: false,
         }
     }
 
-    /// Make storage for `depth` available before publishing a handler there.
-    /// Appending slabs can move the Vec of Box handles, but never the separate
-    /// heap allocations whose addresses have escaped to setjmp trampolines.
-    fn ensure_depth_storage(&mut self, depth: usize) {
+    /// The jump buffer of handler `depth`, growing the slabs as needed.
+    /// Appending a slab can move the Vec of Box handles, never the separate
+    /// heap allocations whose addresses have escaped to setjmp frames.
+    #[cfg(target_os = "wasi")]
+    fn jump_buffer_ptr(&mut self, depth: usize) -> *mut i32 {
         let slab_index = depth / JUMP_BUFFER_SLAB_SIZE;
         while self.jump_buffer_slabs.len() <= slab_index {
             self.jump_buffer_slabs
                 .push(crate::zeroed_cache::new_zeroed_cache(JUMP_BUFFER_SLAB_SIZE));
         }
-        let required = (slab_index + 1) * JUMP_BUFFER_SLAB_SIZE;
-        if self.handler_kinds.len() < required {
-            self.handler_kinds.resize(required, HandlerKind::Setjmp);
-        }
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "gnu",
-        target_pointer_width = "64"
-    ))]
-    fn jump_buffer(&self, depth: usize) -> &JmpBuf {
-        &self.jump_buffer_slabs[depth / JUMP_BUFFER_SLAB_SIZE][depth % JUMP_BUFFER_SLAB_SIZE]
-    }
-
-    fn jump_buffer_mut(&mut self, depth: usize) -> &mut JmpBuf {
-        &mut self.jump_buffer_slabs[depth / JUMP_BUFFER_SLAB_SIZE][depth % JUMP_BUFFER_SLAB_SIZE]
-    }
-
-    fn jump_buffer_ptr(&mut self, depth: usize) -> *mut i32 {
-        self.jump_buffer_mut(depth).as_mut_ptr()
+        self.jump_buffer_slabs[slab_index][depth % JUMP_BUFFER_SLAB_SIZE].as_mut_ptr()
     }
 }
 
@@ -158,205 +138,251 @@ fn with_exception_state<R>(f: impl FnOnce(*mut ExceptionState) -> R) -> R {
     EXCEPTION_STATE.with(|c| f(c.get()))
 }
 
-/// Push a new try block and return a pointer to its jmp_buf.
+// ---------------------------------------------------------------------------
+// The landing pad's restore.
+// ---------------------------------------------------------------------------
+
+/// The first call of every landing pad, generated or the trap shim's:
+/// `js_eh_pad_enter(llvm.stacksave(), handle_height)`. Pops, on every managed
+/// stack, the entries pushed by frames the throw abandoned — those whose mark
+/// lies below `sp`, the catching frame's stack pointer — and truncates the
+/// runtime-handle stack to `handle_height`, the value the catching frame read
+/// with [`js_eh_handle_height`] when it entered its handler scope (see
+/// `marks`). Idempotent; runs no JS and allocates nothing.
 ///
-/// The buffer must be armed through the C trampoline
-/// (`arm_trap_and_run` / `perry_sjlj_try`), NEVER by a raw `setjmp` call
-/// from Rust: rustc cannot express `returns_twice`, so a Rust frame
-/// containing a live `setjmp` is miscompiled under LLVM's one-return
-/// assumption (#9305 — stack-slot coloring across the call). Generated
-/// code does not use this entry point at all (its `try` transport is
-/// invoke/landingpad, `js_eh_try_push`, since #7302).
+/// A pad entered means the throw was caught, so the `throw_not_callable`
+/// circuit breaker (#2780) resets here: valid JS that throws and catches a
+/// non-callable many times must not trip the abort meant for runaway
+/// *uncaught* throw loops.
 #[no_mangle]
-pub extern "C" fn js_try_push() -> *mut i32 {
-    try_push_with_kind(HandlerKind::Setjmp)
+pub extern "C" fn js_eh_pad_enter(sp: *const u8, handle_height: u64) {
+    #[cfg(debug_assertions)]
+    with_exception_state(|s| unsafe { (*s).in_pad_enter = true });
+    crate::closure::reset_throw_not_callable_counter();
+    #[cfg(test)]
+    if crate::native_payload::callback_sabotage("pad_enter") {
+        #[cfg(debug_assertions)]
+        with_exception_state(|s| unsafe { (*s).in_pad_enter = false });
+        return;
+    }
+    marks::unwind_managed_stacks(sp as usize, handle_height as usize);
+    #[cfg(debug_assertions)]
+    with_exception_state(|s| unsafe { (*s).in_pad_enter = false });
 }
 
-/// Push a handler for an invoke/landingpad `try` (#7302). Same savepoint
-/// recording as `js_try_push`, but no jmp_buf is armed — `js_throw` reaches
-/// this handler via `_Unwind_RaiseException` and the frame's landing pad.
+/// The runtime-handle stack's height, read where a generated handler scope is
+/// entered and in the trap shim before its `invoke`; the scope's pads pass it
+/// back to [`js_eh_pad_enter`] (see `marks`). `u64` on
+/// every target so the generated declaration has one shape.
 #[no_mangle]
-pub extern "C" fn js_eh_try_push() {
-    // First `try` of the process: prove the unwinder can step runtime
-    // frames (a runtime built without forced unwind tables would strand
-    // every cross-helper throw). Windows needs no check — MSVC x64 unwind
-    // tables are mandatory for all functions.
-    #[cfg(not(windows))]
-    crate::eh::verify_unwind_tables_once();
-    try_push_with_kind(HandlerKind::Unwind);
+pub extern "C" fn js_eh_handle_height() -> u64 {
+    crate::gc::runtime_handle_stack_len() as u64
 }
 
-fn try_push_with_kind(kind: HandlerKind) -> *mut i32 {
+// ---------------------------------------------------------------------------
+// WASI handlers (setjmp transport).
+// ---------------------------------------------------------------------------
+
+/// Push a WASI handler and return its jmp_buf. `mark` is the handler frame's
+/// stack pointer (`llvm.stacksave` in a generated `try`, [`frame_mark`] in a
+/// runtime trap); a throw restores every managed stack to it, as a landing
+/// pad at that frame would.
+///
+/// The buffer is armed by the C trampoline (`perry_sjlj_try`, via [`trap`]) or
+/// by generated WASI code, NEVER by a raw `setjmp` call from Rust: rustc
+/// cannot express `returns_twice` (#9305).
+#[cfg(target_os = "wasi")]
+#[no_mangle]
+pub extern "C" fn js_try_push(mark: *const u8) -> *mut i32 {
     with_exception_state(|s| unsafe {
-        let depth = (*s).try_depth;
-        (*s).ensure_depth_storage(depth);
-        let savepoint = CatchSavepoint::capture();
-        // Native vector growth cannot trigger a JS GC. No snapshot address
-        // escapes, and the scanner visits only the published active prefix.
-        if depth == (*s).savepoints.len() {
-            (*s).savepoints.push(std::mem::MaybeUninit::new(savepoint));
-        } else {
-            (&mut (*s).savepoints)
-                .get_unchecked_mut(depth)
-                .write(savepoint);
-        }
-        (&mut (*s).handler_kinds)[depth] = kind;
-        (*s).try_depth = depth + 1;
+        let depth = (*s).handlers.len();
+        (*s).handlers.push(WasiHandler {
+            mark: mark as usize,
+            handles: crate::gc::runtime_handle_stack_len(),
+            shadow: crate::gc::frame_root_savepoint(),
+            temp_roots: crate::gc::temp_root_len(),
+            derived_super: crate::object::derived_super_binding_len(),
+        });
         (*s).jump_buffer_ptr(depth)
     })
 }
 
-/// End a try block (just decrements depth, does NOT clear exception)
-/// The exception is cleared explicitly by js_clear_exception() in catch blocks
+/// End a WASI `try` (pop its handler). Does NOT clear the exception.
+#[cfg(target_os = "wasi")]
 #[no_mangle]
 pub extern "C" fn js_try_end() {
     with_exception_state(|s| unsafe {
-        (*s).try_depth = (*s).try_depth.saturating_sub(1);
+        (*s).handlers.pop();
     });
 }
 
-/// Current `try` nesting depth on this thread. Async-context scopes
-/// (`AsyncLocalStorage#run` etc.) record this at entry so the unwind path
-/// can tell which scopes a throw is about to longjmp past (#788).
-pub(crate) fn current_try_depth() -> usize {
-    with_exception_state(|s| unsafe { (*s).try_depth })
-}
-
-/// A generated iterator-cleanup pad may precede a Rust-side trap without
-/// pushing an exception savepoint on every loop iteration. The existing C
-/// trampoline publishes its CFA in reserved tail bytes of its own buffer.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_env = "gnu",
-    target_pointer_width = "64"
-))]
-pub(crate) fn current_setjmp_stack_limit() -> Option<usize> {
-    with_exception_state(|s| unsafe {
-        if (*s).try_depth == 0 {
-            return None;
-        }
-        let depth = (*s).try_depth - 1;
-        if (&(*s).handler_kinds)[depth] != HandlerKind::Setjmp {
-            return None;
-        }
-        // GC_STORE_AUDIT(STACK): C trampoline CFA, not a managed heap pointer.
-        let buf = (*s).jump_buffer(depth).data.as_ptr() as *const usize;
-        Some(buf.add(31).read())
-    })
-}
-
 // ---------------------------------------------------------------------------
-// setjmp trampoline (#9305): no Rust frame is ever a longjmp target.
+// Runtime traps (ehfree 2b): a landing-pad shim on native, setjmp on WASI.
 // ---------------------------------------------------------------------------
 
+/// The body a runtime trap runs. `C-unwind`: a JS throw unwinds out of it
+/// into the shim's landing pad, and a plain `"C"` boundary would plant
+/// `panic_cannot_unwind` there under panic=unwind (see [`js_throw`]).
+pub type TrapBody = unsafe extern "C-unwind" fn(*mut core::ffi::c_void);
+
+// Declared `extern "C"` (nounwind) on purpose: the shim never unwinds out —
+// its pad catches every Perry throw. A `"C-unwind"` foreign declaration would
+// give each call an unwind edge; rustc then plants a terminate pad on it in
+// the panic=abort runtime, and that function's LSDA (rust_eh_personality,
+// listing only the shim call) makes every OTHER call site in it a terminate
+// site, so a throw passing through such a frame failed phase 1 with
+// `_URC_FATAL_PHASE1_ERROR` (gap test_gap_7911, run_combinator).
+#[cfg(not(target_os = "wasi"))]
 extern "C" {
-    /// C-side setjmp trampoline (`src/ffi/perry_sjlj.c`, compiled by
-    /// build.rs). Arms `env` via the platform `setjmp` inside its own C
-    /// frame and invokes `body(ctx)` under it. Returns 0 when `body`
-    /// returns normally, or the `longjmp` value (always 1 — `js_throw`)
+    /// The landing-pad shim (`src/ffi/perry_trap.ll`, compiled by build.rs):
+    /// `invoke body(ctx)` under a catch-all pad with Perry's personality,
+    /// whose first call is [`js_eh_pad_enter`]. Returns 0 when `body`
+    /// returned and 1 when a JS throw landed in the pad. Nothing is ever
+    /// returned into twice, so Rust callers need no setjmp discipline (#9305).
+    fn perry_trap_call(body: TrapBody, ctx: *mut core::ffi::c_void) -> core::ffi::c_int;
+    /// The same shim for the worker base trap ([`run_worker_body`]); its pad
+    /// returns 2. The personality accepts only this frame while
+    /// [`hand_to_worker_base`] carries an exception to the base.
+    fn perry_trap_call_base(body: TrapBody, ctx: *mut core::ffi::c_void) -> core::ffi::c_int;
+}
+
+#[cfg(target_os = "wasi")]
+extern "C" {
+    /// WASI setjmp trampoline (`src/ffi/perry_sjlj.c`): arms `env` in its own
+    /// C frame and runs `body(ctx)`; returns 0, or the `longjmp` value (1)
     /// when a JS throw lands.
-    ///
-    /// WHY C: rustc has no `returns_twice`, so a Rust frame containing a
-    /// live `setjmp` is compiled under a one-return assumption — LLVM may
-    /// assign (color) a stack slot that is live only into the longjmp
-    /// return path to an unrelated temporary on the normal path. #9305
-    /// was exactly that: `run_microtasks`' spilled TLS-base temporary was
-    /// overwritten by the task-record copy loop, and the longjmp path
-    /// reloaded NULL. Routing every arm through this trampoline makes the
-    /// hazard unrepresentable: Rust code only ever sees a single-return
-    /// call, and the one twice-returning frame is compiled by a C
-    /// compiler that knows setjmp's contract.
     fn perry_sjlj_try(
         env: *mut core::ffi::c_void,
-        body: unsafe extern "C" fn(*mut core::ffi::c_void),
+        body: TrapBody,
         ctx: *mut core::ffi::c_void,
     ) -> core::ffi::c_int;
 }
 
-/// Arm the jmp_buf `env` (from [`js_try_push`]) and run `f` under it.
+/// Function start of the worker base shim, for the personality's handoff
+/// check (`crate::eh`, `crate::eh_windows`).
+#[cfg(not(target_os = "wasi"))]
+pub(crate) fn worker_base_shim_addr() -> usize {
+    perry_trap_call_base as *const () as usize
+}
+
+/// True while [`hand_to_worker_base`] carries an exception to the worker's
+/// base trap: the personality then refuses every handler but that one.
+#[cfg(not(target_os = "wasi"))]
+pub(crate) fn worker_base_handoff_pending() -> bool {
+    with_exception_state(|s| unsafe { (*s).to_worker_base })
+}
+
+/// Run `body(ctx)` under a runtime trap. `true`: `body` returned. `false`: a
+/// JS throw landed; the value is in the TLS exception slot, and every managed
+/// stack is back where it was when the trap was entered.
 ///
-/// `Some(r)`: `f` completed normally. `None`: a `js_throw` longjmp landed
-/// while `f` (or JS it called into) was running. The thrown value is left
-/// in the TLS exception slot (`js_get_exception`), and the `try` frame is
-/// still pushed — the caller owns `js_try_end`, exactly as with the raw
-/// `setjmp` idiom this replaces.
+/// Shadow-stack targets (and the runtime's own tests) also keep the shadow
+/// frame depth here: compiled frames push shadow frames, and a shadow frame
+/// is restored by the frame that holds its handle — for a trap, this frame.
+#[inline]
+unsafe fn trap_raw<const BASE: bool>(body: TrapBody, ctx: *mut core::ffi::c_void) -> bool {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        #[cfg(any(test, not(perry_native_stack_maps)))]
+        let shadow = crate::gc::frame_root_savepoint();
+        let rc = if BASE {
+            perry_trap_call_base(body, ctx)
+        } else {
+            perry_trap_call(body, ctx)
+        };
+        #[cfg(any(test, not(perry_native_stack_maps)))]
+        if rc != 0 {
+            crate::gc::frame_root_restore(shadow);
+        }
+        rc == 0
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        let env = js_try_push(frame_mark() as *const u8);
+        let returned = perry_sjlj_try(env.cast(), body, ctx) == 0;
+        js_try_end();
+        returned
+    }
+}
+
+/// Run `f` under a runtime trap.
 ///
-/// SAFETY CONTRACT for callers (same as the raw idiom, spelled out):
+/// `Some(r)`: `f` completed normally. `None`: a JS throw landed while `f` (or
+/// JS it called into) was running. The thrown value is left in the TLS
+/// exception slot (`js_get_exception`), not yet cleared.
 ///
-/// * After a `None` return the jmp_buf points at a trampoline invocation
-///   that has already returned. Until the caller either re-arms (calls
-///   this again with the same `env`) or pops the frame (`js_try_end`),
-///   nothing that can reach `js_throw` may run — a throw in that window
-///   would longjmp into a dead frame. Handlers that can throw (they run
-///   user JS: uncaught-exception listeners, promise rejection with hooks
-///   active) must run *inside* a re-armed `f`, loop-style — see
-///   `run_microtasks` / `with_timer_uncaught_trap`.
-/// * A landing abandons the Rust frames between the throw point and the
-///   trampoline without running destructors; `js_throw`'s savepoint
-///   restores cover the runtime's own state (the runtime is panic=abort).
-pub fn arm_trap_and_run<R, F: FnOnce() -> R>(env: *mut i32, f: F) -> Option<R> {
+/// A landing abandons the frames between the throw point and the shim
+/// without running their cleanups (the runtime is panic=abort); the shim's
+/// pad restores the runtime's own state ([`js_eh_pad_enter`]).
+pub fn trap<R>(f: impl FnOnce() -> R) -> Option<R> {
+    trap_with::<false, R, _>(f)
+}
+
+fn trap_with<const BASE: bool, R, F: FnOnce() -> R>(f: F) -> Option<R> {
     struct Ctx<F, R> {
         f: Option<F>,
         ret: Option<R>,
     }
-    unsafe extern "C" fn invoke<F: FnOnce() -> R, R>(raw: *mut core::ffi::c_void) {
+    unsafe extern "C-unwind" fn invoke<F: FnOnce() -> R, R>(raw: *mut core::ffi::c_void) {
         // SAFETY: `raw` is the `&mut Ctx` passed below, alive for the whole
-        // `perry_sjlj_try` call; the trampoline invokes us at most once.
+        // shim call; the shim invokes us exactly once.
         let ctx = unsafe { &mut *(raw as *mut Ctx<F, R>) };
-        let f = ctx.f.take().expect("sjlj trampoline invoked body twice");
+        let f = ctx.f.take().expect("trap shim invoked body twice");
         ctx.ret = Some(f());
     }
-    let mut ctx: Ctx<_, R> = Ctx {
+    let mut ctx: Ctx<F, R> = Ctx {
         f: Some(f),
         ret: None,
     };
-    // SAFETY: `env` points at a live 256-byte, 16-aligned JmpBuf slab owned
-    // by this thread's exception state; the trampoline's frame stays alive
-    // while `f` runs, so a longjmp from `js_throw` targets a live frame.
-    let rc = unsafe {
-        perry_sjlj_try(
-            env as *mut core::ffi::c_void,
+    // SAFETY: the shim's frame stays alive while `f` runs; `ctx` outlives it.
+    let returned = unsafe {
+        trap_raw::<BASE>(
             invoke::<F, R>,
-            &mut ctx as *mut Ctx<_, R> as *mut core::ffi::c_void,
+            &mut ctx as *mut Ctx<F, R> as *mut core::ffi::c_void,
         )
     };
-    if rc == 0 {
-        // `ret` empty with rc == 0 would mean the trampoline returned 0
-        // without running the body to completion — a broken trampoline.
+    if returned {
         Some(
             ctx.ret
                 .take()
-                .expect("sjlj trampoline returned 0 without a body result"),
+                .expect("trap shim returned without a body result"),
         )
     } else {
         None
     }
 }
 
-/// Push a `try` frame, run `f` under it, pop it. `Ok(value)` on a normal
-/// return; `Err(exception_bits)` — with the TLS exception slot cleared — if
-/// `f` threw. The everything-in-one-call shape for handlers that are pure
-/// Rust (read the exception, return it): between the landing and the pop
-/// nothing that can throw runs, so the momentarily-stale jmp_buf is never
-/// a live target.
+/// C entry for runtime traps in other crates (perry-ext-http; they declare it
+/// plain `extern "C"`, see `perry_trap_call`): run `body(ctx)` under a trap.
+/// Returns 0 when `body` returned and 1 when a JS throw landed; the thrown
+/// value is then in the exception slot (`js_get_exception`), not yet cleared.
+///
+/// # Safety
+/// `body` must be safe to call with `ctx`.
+#[no_mangle]
+pub unsafe extern "C" fn js_trap_call(body: TrapBody, ctx: *mut core::ffi::c_void) -> i32 {
+    i32::from(!trap_raw::<false>(body, ctx))
+}
+
+/// Take and clear the pending exception after a trap landed.
+#[inline]
+fn take_exception() -> f64 {
+    let err = js_get_exception();
+    js_clear_exception();
+    err
+}
+
+/// Run `f` under a trap. `Ok(value)` on a normal return; `Err(exception_bits)`
+/// — with the TLS exception slot cleared — if `f` threw.
 pub fn catch_js_throw<R>(f: impl FnOnce() -> R) -> Result<R, f64> {
-    let env = js_try_push();
-    let outcome = arm_trap_and_run(env, f);
-    js_try_end();
-    match outcome {
+    match trap(f) {
         Some(r) => Ok(r),
-        None => {
-            let err = js_get_exception();
-            js_clear_exception();
-            Err(err)
-        }
+        None => Err(take_exception()),
     }
 }
 
 /// The fixed generator boundary calls one known two-argument compiled body.
-/// Keep the same full exception savepoint and C-owned jump target, but pass
-/// the rooted invocation directly instead of transporting FnOnce/Option
+/// Pass the rooted invocation directly instead of transporting FnOnce/Option
 /// through another Rust callback frame on every yield.
 #[inline(never)]
 pub(crate) unsafe fn catch_generator_resume(
@@ -370,7 +396,7 @@ pub(crate) unsafe fn catch_generator_resume(
         op: f64,
         result: f64,
     }
-    unsafe extern "C" fn invoke(raw: *mut core::ffi::c_void) {
+    unsafe extern "C-unwind" fn invoke(raw: *mut core::ffi::c_void) {
         let ctx = &mut *raw.cast::<Invocation<'_, '_>>();
         // next's argument is already published in the rooted fixed frame.
         // Read it there after any barrier work, directly into the body ABI.
@@ -408,43 +434,34 @@ pub(crate) unsafe fn catch_generator_resume(
         op,
         result: 0.0,
     };
-    let env = js_try_push();
-    let rc = perry_sjlj_try(env.cast(), invoke, (&raw mut ctx).cast());
-    js_try_end();
-    if rc == 0 {
+    if trap_raw::<false>(invoke, (&raw mut ctx).cast()) {
         Ok(ctx.result)
     } else {
-        let err = js_get_exception();
-        js_clear_exception();
-        Err(err)
+        Err(take_exception())
     }
 }
 
 crate::perry_thread_local! {
-    /// Try depth of this thread's worker base trap, while a worker body runs
-    /// under [`run_worker_body`].
-    static WORKER_BASE_DEPTH: std::cell::Cell<Option<usize>> =
-        const { std::cell::Cell::new(None) };
+    /// True while this thread's body runs under [`run_worker_body`]'s base
+    /// trap.
+    static IN_WORKER_BASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Run a worker thread's whole body under one base `try`. Everything the
+/// Run a worker thread's whole body under one base trap. Everything the
 /// worker leaves unhandled lands here: a throw no `try` catches, an uncaught
 /// exception no `uncaughtException` listener takes (from a timer or a
 /// listener), and an unhandled rejection. `Err(value)` is that exception. The
 /// caller ends the worker; the process keeps running, as in Node.
 pub fn run_worker_body<R>(f: impl FnOnce() -> R) -> Result<R, f64> {
-    let env = js_try_push();
-    let outer = WORKER_BASE_DEPTH.with(|d| d.replace(Some(current_try_depth() - 1)));
-    let outcome = arm_trap_and_run(env, f);
-    WORKER_BASE_DEPTH.with(|d| d.set(outer));
-    js_try_end();
+    let outer = IN_WORKER_BASE.with(|d| d.replace(true));
+    let outcome = trap_with::<true, R, _>(f);
+    IN_WORKER_BASE.with(|d| d.set(outer));
+    // A handoff ends here, at the base pad.
+    #[cfg(not(target_os = "wasi"))]
+    with_exception_state(|s| unsafe { (*s).to_worker_base = false });
     match outcome {
         Some(r) => Ok(r),
-        None => {
-            let err = js_get_exception();
-            js_clear_exception();
-            Err(err)
-        }
+        None => Err(take_exception()),
     }
 }
 
@@ -452,36 +469,34 @@ pub fn run_worker_body<R>(f: impl FnOnce() -> R) -> Result<R, f64> {
 /// (see [`run_worker_body`]); this does not return. On any other thread it
 /// returns and the caller ends the process.
 pub(crate) fn hand_to_worker_base(value: f64) {
-    let Some(depth) = WORKER_BASE_DEPTH.with(std::cell::Cell::get) else {
+    if !IN_WORKER_BASE.with(std::cell::Cell::get) {
         return;
-    };
+    }
     #[cfg(not(target_os = "wasi"))]
     {
-        // Like `js_throw`, but straight to the base trap: the traps between
+        // Like `js_throw`, but straight to the base trap: the handlers between
         // here and there belong to drains (microtasks, timers, rejection
-        // listeners) that would report the exception again or swallow it.
-        let jb_ptr: *mut i32 = with_exception_state(|s| unsafe {
+        // listeners) that would report the exception again or swallow it, or
+        // to JS `try`s that must not see it. The flag makes the personality
+        // refuse every pad but the base shim's (`perry_trap_call_base`), whose
+        // pad restores the managed stacks like any other.
+        with_exception_state(|s| unsafe {
             crate::gc::runtime_store_root_nanbox_f64_raw_slot(
                 &raw mut (*s).current_exception,
                 value,
             );
             (*s).has_exception = true;
             (*s).in_finally = false;
-            (*s).try_depth = depth + 1;
-            crate::async_context::unwind_context_guards(depth);
-            (&(*s).savepoints)[depth].assume_init_read().restore();
-            (*s).jump_buffer_ptr(depth)
+            (*s).to_worker_base = true;
         });
-        // See `js_throw`: force the non-unwinding POSIX-style longjmp.
-        #[cfg(windows)]
-        unsafe {
-            // GC_STORE_AUDIT(STACK): native jmp_buf control word is not GC-managed storage.
-            (jb_ptr as *mut u64).write(0);
-        }
-        unsafe { longjmp(jb_ptr, 1) }
+        // The single-phase transport applies the personality's handoff rule
+        // (only the base shim's pad), so it carries this throw too; it falls
+        // back to the system unwinder exactly as `js_throw` does.
+        crate::eh::try_fast_transport();
+        let reason = crate::eh::raise_perry_exception();
+        eprintln!("perry: FATAL: worker base handoff found no base trap (reason={reason})");
+        std::process::abort();
     }
-    #[cfg(target_os = "wasi")]
-    let _ = depth;
 }
 
 /// End this thread's JS for an uncaught exception: a worker's base trap
@@ -492,21 +507,35 @@ pub(crate) fn exit_on_uncaught(value: f64) -> ! {
     crate::process::exit_after_current_thread_collection_teardown(1)
 }
 
-/// Invoke `f` — which may call into user JS and `js_throw` — inside a `try`
-/// trap, catching any JS exception. Returns `Ok(value)` on a normal return,
-/// or `Err(exception_bits)` if `f` threw. The armed jmp_buf lives in the C
-/// trampoline's frame (see `arm_trap_and_run`), which stays alive while `f`
-/// runs, so the `longjmp` target is valid, and the throw unwinds only up to
-/// there — NOT past the Rust caller's frame.
+/// Invoke `f` — which may call into user JS and `js_throw` — inside a trap,
+/// catching any JS exception. Returns `Ok(value)` on a normal return, or
+/// `Err(exception_bits)` if `f` threw. The catch is the trap shim's landing
+/// pad (see [`trap`]), whose frame stays alive while `f` runs, so the throw
+/// unwinds only up to there — NOT past the Rust caller's frame.
 ///
 /// Runtime helpers that drive user JS from a Rust-owned microtask/timer
 /// context (e.g. a Web Streams `pull` callback) use this so a throwing
-/// callback errors the relevant object per spec instead of `longjmp`-ing past
+/// callback errors the relevant object per spec instead of unwinding past
 /// their frames — skipping cleanup and corrupting state. Mirrors
 /// `combinators::combinator_catch_js`.
 pub fn js_call_catching(f: impl FnOnce() -> f64) -> Result<f64, f64> {
     catch_js_throw(f)
 }
+
+/// The uncaught path, on an intact stack: Node's `exit` listeners run first
+/// (with code 1, BEFORE the report, #9403 — verified against node 26.5.1
+/// with the two streams separated), then the report, then exit with the
+/// status the listeners may have rewritten via `process.exitCode`.
+fn exit_uncaught(value: f64) -> ! {
+    let status = crate::process::run_process_exit_sequence(Some(1));
+    print_uncaught(value);
+    emit_uncaught_backtrace();
+    std::process::exit(status);
+}
+
+/// `_URC_END_OF_STACK`: phase 1 walked every frame and none had a handler.
+#[cfg(all(not(target_os = "wasi"), not(windows)))]
+const URC_END_OF_STACK: i32 = 5;
 
 /// Throw an exception with the given value
 ///
@@ -518,165 +547,84 @@ pub fn js_call_catching(f: impl FnOnce() -> f64) -> Result<f64, f64> {
 /// `panic_cannot_unwind` before the landing pad can run.
 #[no_mangle]
 pub extern "C-unwind" fn js_throw(value: f64) -> ! {
-    // Pull the transport decision out under the TLS borrow, then act after
-    // dropping it (neither longjmp nor a raise returns here, so leaving the
-    // TLS access "open" would leave the cell permanently borrowed on this
-    // thread; in practice UnsafeCell tolerates it but the shorter scope
-    // keeps things tidy).
-    // #9403: an uncaught throw is a process exit, so Node's `exit` listeners
-    // run — with code 1, and BEFORE the uncaught-exception report is printed.
-    // The listeners are JS, so they must not run under the open
-    // `with_exception_state` access below; the closure records that this throw
-    // is fatal and the work happens after it has been dropped.
-    let mut fatal = false;
-    let jb_ptr: *mut i32 = with_exception_state(|s| unsafe {
+    // The throws premise of the generated GC-effects table: a collection never
+    // unwinds. Throw path only (see `forbid_throw_in_collection`).
+    crate::gc::allocation_pacing::forbid_throw_in_collection();
+    with_exception_state(|s| unsafe {
+        #[cfg(debug_assertions)]
+        if (*s).in_pad_enter {
+            eprintln!("perry: FATAL: js_throw while a landing pad restores the managed stacks");
+            std::process::abort();
+        }
         crate::gc::runtime_store_root_nanbox_f64_raw_slot(&raw mut (*s).current_exception, value);
         (*s).has_exception = true;
-
         if (*s).in_finally {
             eprintln!("Cannot throw during finally block");
             std::process::abort();
         }
-
-        if (*s).try_depth == 0 {
-            fatal = true;
-            return std::ptr::null_mut();
-        }
-
-        // Issue #2780: this throw is going to be CAUGHT by an open `try`
-        // (try_depth > 0), so it is not a runaway uncaught loop. Reset the
-        // `throw_not_callable` circuit-breaker counter so that valid JS which
-        // throws-and-catches a non-callable many times (e.g. a route-handler
-        // / retry loop doing `try { (undefined as any)() } catch {}` 200k
-        // times) completes instead of tripping the abort at 100k. The
-        // breaker is meant to catch genuinely *uncaught* runaway throw loops;
-        // those still hit the `try_depth == 0` path above and abort there /
-        // the async-step guards in `promise/microtasks.rs` still cover
-        // unbounded async re-entry.
-        crate::closure::reset_throw_not_callable_counter();
-
-        let depth = (*s).try_depth - 1;
-        if (&(*s).handler_kinds)[depth] == HandlerKind::NativeInactive {
-            // A callback arms its own trampoline. Outside it, jumping to a
-            // previous trampoline would cross native frames into dead storage.
-            eprintln!("perry: JavaScript throw outside native callback trap");
-            std::process::abort();
-        }
-        // Apply the deferred context restores of async-context scopes
-        // (`AsyncLocalStorage#run`/`#exit`, `runInAsyncScope`) whose normal
-        // restore code this longjmp skips (#788). Pure thread-local state
-        // swaps — no JS runs and nothing allocates.
-        crate::async_context::unwind_context_guards(depth);
-        // Restore every subsystem before transporting the exception. The
-        // registration generates capture and restore together, including the
-        // feature-gated entries; the test replay uses this exact path too.
-        // depth names a published handler, whose push initialized this slot.
-        (&(*s).savepoints)[depth].assume_init_read().restore();
-        // The savepoint restores above are transport-independent: the unwind
-        // path skips Rust cleanups exactly like longjmp does (the runtime is
-        // built panic=abort; see crate::eh), so restoring at throw time is
-        // correct for both.
-        match (&(*s).handler_kinds)[depth] {
-            HandlerKind::Setjmp => (*s).jump_buffer_ptr(depth),
-            HandlerKind::Unwind => std::ptr::null_mut(),
-            HandlerKind::NativeInactive => unreachable!(),
-        }
     });
-    // WASI handlers (generated and Rust callback boundaries) use libsetjmp
-    // over standardized wasm EH. Savepoints were restored above, exactly as
-    // for native longjmp; the only twice-returning frames are LLVM IR or C.
+    // WASI handlers (generated and runtime traps) use libsetjmp over
+    // standardized wasm EH. Restore to the handler frame's mark, exactly as a
+    // landing pad at that frame would, then jump.
     #[cfg(target_os = "wasi")]
     {
-        if !fatal {
-            assert!(!jb_ptr.is_null(), "WASI handler must use SjLj");
-            unsafe { longjmp(jb_ptr, 1) }
-        }
-        let status = crate::process::run_process_exit_sequence(Some(1));
-        print_uncaught(value);
-        emit_uncaught_backtrace();
-        std::process::exit(status);
+        let jb = with_exception_state(|s| unsafe {
+            let depth = (*s).handlers.len().checked_sub(1)?;
+            Some(((*s).handlers[depth], (*s).jump_buffer_ptr(depth)))
+        });
+        let Some((handler, jb)) = jb else {
+            exit_uncaught(value)
+        };
+        crate::closure::reset_throw_not_callable_counter();
+        marks::unwind_managed_stacks(handler.mark, handler.handles);
+        crate::gc::frame_root_restore(handler.shadow);
+        crate::gc::temp_roots_truncate_to(handler.temp_roots);
+        crate::object::derived_super_binding_truncate(handler.derived_super);
+        unsafe { longjmp(jb, 1) }
     }
     #[cfg(not(target_os = "wasi"))]
     {
-        // Zero-cost iterator cleanup may be inside the pending Rust trap (or
-        // ahead of an uncaught exit). The personality respects that trap's
-        // CFA boundary, so a nested catch_js_throw still owns close failures.
-        #[cfg(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu",
-            target_pointer_width = "64"
-        ))]
-        if (fatal || !jb_ptr.is_null()) && crate::eh::native_cleanup_before_trap() {
-            let reason = crate::eh::raise_perry_exception();
-            // _URC_END_OF_STACK: no native cleanup before the trap/exit.
-            if reason != 5 {
-                eprintln!("perry: FATAL: cleanup unwind failed (reason={reason})");
-                std::process::abort();
-            }
-        }
-        if fatal {
-            // No open `try`: this throw ends the process. Run the `exit`
-            // listeners first (Node emits `exit` before writing its
-            // uncaught-exception report — verified against node 26.5.1 with the
-            // two streams separated), then report and leave with the status the
-            // listeners may have rewritten via `process.exitCode`.
-            let status = crate::process::run_process_exit_sequence(Some(1));
-            print_uncaught(value);
-            emit_uncaught_backtrace();
-            std::process::exit(status);
-        }
-        if !jb_ptr.is_null() {
-            // Windows MSVC: `longjmp` inspects `_JUMP_BUFFER.Frame` (the first
-            // 8 bytes of the jmp_buf) and, when it is nonzero, performs a REAL
-            // stack unwind via `RtlUnwindEx` instead of a register restore. Our
-            // one-arg `setjmp` extern leaves that slot holding whatever was in
-            // RDX at the call (the CRT `_setjmp` stores its second parameter),
-            // so the unwind target is garbage — measured 0xC0000028
-            // (STATUS_BAD_STACK) in a release binary, and GS-cookie aborts via
-            // `_report_gsfailure` under the panic=unwind test harness (#7356).
-            // Zero the slot to force the non-unwinding POSIX-style `longjmp`;
-            // that is exactly the semantics the savepoint restores above
-            // assume (skipped cleanups are replayed manually).
-            #[cfg(windows)]
-            unsafe {
-                // GC_STORE_AUDIT(STACK): native jmp_buf control word is not GC-managed storage.
-                (jb_ptr as *mut u64).write(0);
-            }
-            unsafe { longjmp(jb_ptr, 1) }
-        }
-        // Invoke/landingpad handler: raise. The unwinder transfers control to
-        // the innermost try-containing generated frame's landing pad — the
-        // handler this entry describes. Returning here means the walk failed
-        // DESPITE an armed handler: lost unwind tables between the throw point
-        // and the handler frame (e.g. a runtime rebuilt without
-        // -C force-unwind-tables). That is a build/configuration defect, not a
-        // JS error — fail loudly instead of masking it as an uncaught throw.
-        // Owned single-phase transport: walks to the handler using cached
-        // CFI and installs its register context directly. Never returns on
-        // success. Declines (undecodable frame, disabled, or verification
-        // mode) fall through to the system unwinder below — same semantics,
-        // slower.
-        //
-        // Not on Windows: `eh_walker` is Itanium-unwind machinery and the module
-        // is `#[cfg(not(windows))]`; `crate::eh` there is `eh_windows.rs`, whose
-        // `raise_perry_exception` below is the whole transport. These two calls
-        // landing unguarded is what broke the Windows build of this crate (#7354).
+        // First throw of the process: prove the unwinder can step runtime
+        // frames. A runtime built without forced unwind tables would end
+        // every cross-helper throw's search early, and that must not read as
+        // an uncaught exception. Windows needs no check — MSVC x64 unwind
+        // tables are mandatory for all functions.
         #[cfg(not(windows))]
-        {
-            crate::eh_walker::predict_before_raise();
-            crate::eh_walker::try_fast_transport(crate::eh::exception_object_addr());
-        }
+        crate::eh::verify_unwind_tables_once();
+        #[cfg(windows)]
+        crate::eh::install_uncaught_filter_once();
+        // Single-phase transport (every native target): walk to the handler
+        // frame and install its register context directly. Never returns on
+        // success. Declines (no handler, undecodable frame, disabled, or
+        // verification mode) fall through to the two-phase raise below.
+        crate::eh::try_fast_transport();
         let reason = crate::eh::raise_perry_exception();
+        // Itanium: phase 1 found no pad anywhere, and the raise returned
+        // without unwinding. The stack is intact, so exit listeners and the
+        // backtrace behave as before. (Windows reaches its uncaught path in
+        // the unhandled-exception filter, before RaiseException returns.)
+        #[cfg(not(windows))]
+        if reason == URC_END_OF_STACK {
+            crate::eh::diagnose_end_of_stack();
+            exit_uncaught(value)
+        }
         eprintln!(
-            "perry: FATAL: exception transport failed (reason={reason}): a try \
-             handler is armed but the unwinder found no landing pad. The runtime \
-             or an intermediate object was built without unwind tables."
+            "perry: FATAL: exception transport failed (reason={reason}). The runtime or an \
+             intermediate object was built without unwind tables, or an unwinder returned \
+             a throw it had accepted."
         );
         print_uncaught(value);
         emit_uncaught_backtrace();
         std::process::abort();
     }
+}
+
+/// The Windows uncaught path: the unhandled-exception filter
+/// (`crate::eh_windows`) calls this for a Perry throw no frame accepted,
+/// with the stack still intact.
+#[cfg(windows)]
+pub(crate) fn exit_uncaught_pending() -> ! {
+    exit_uncaught(js_get_exception())
 }
 
 /// Get the current exception value
@@ -706,16 +654,14 @@ pub extern "C" fn js_clear_exception() {
     });
 }
 
-/// A `catch` clause's entry, whole: end the `try` (pop its handler), take the
-/// pending exception and clear it, in that order. One call where every catch
-/// entry emitted three (perry-codegen `stmt/try_stmt.rs`); each part is the
-/// exported helper itself.
+/// A `catch` clause's entry: take the pending exception and clear it. On
+/// WASI it first ends the `try` (pops its setjmp handler); a landing pad has
+/// nothing to pop.
 #[no_mangle]
 pub extern "C" fn js_catch_enter() -> f64 {
+    #[cfg(target_os = "wasi")]
     js_try_end();
-    let exception = js_get_exception();
-    js_clear_exception();
-    exception
+    take_exception()
 }
 
 /// Mark entering a finally block
@@ -945,9 +891,6 @@ pub fn scan_exception_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>)
         if (*s).has_exception {
             visitor.visit_nanbox_f64_raw_slot(&raw mut (*s).current_exception);
         }
-        // #10564 review finding: every open `try`'s captured implicit-`this`/
-        // `new.target` snapshot is a second root for whatever it holds.
-        savepoints::scan_pending_trap_roots_mut(&mut (*s).savepoints, (*s).try_depth, visitor);
     });
 }
 
@@ -960,24 +903,6 @@ pub(crate) fn test_set_exception(value: f64) {
 }
 
 #[cfg(test)]
-pub(crate) fn test_try_depth() -> usize {
-    with_exception_state(|s| unsafe { (*s).try_depth })
-}
-
-/// Replay the production savepoint restoration without transporting an
-/// exception. Legacy subsystem tests use this; each registration additionally
-/// has a nested real-throw test in `savepoints::restore_tests`.
-#[cfg(test)]
-pub(crate) fn test_unwind_innermost_shadow_restore() {
-    with_exception_state(|s| unsafe {
-        assert!((*s).try_depth > 0, "no open try to unwind");
-        (&(*s).savepoints)[(*s).try_depth - 1]
-            .assume_init_read()
-            .restore();
-    });
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::gc::{
@@ -985,310 +910,210 @@ mod tests {
         RuntimeHandleScope,
     };
 
-    /// #11507: the jump-buffer slab is zero-allocated rather than filled.
+    /// A trap restores the shadow stack it was entered with: the frames
+    /// pushed by the abandoned callees are dropped before any later GC scans
+    /// roots (#1830). All assertions are relative to the entry state, so
+    /// this is robust under `--test-threads=1` (shared TLS).
     #[test]
-    fn fresh_thread_jump_buffers_start_zeroed() {
-        std::thread::spawn(|| {
-            with_exception_state(|state| {
-                let state = unsafe { &*state };
-                assert_eq!(state.jump_buffer_slabs.len(), 1);
-                assert_eq!(state.jump_buffer_slabs[0].len(), JUMP_BUFFER_SLAB_SIZE);
-                for buf in state.jump_buffer_slabs[0].iter() {
-                    assert!(buf.data.iter().all(|&word| word == 0));
-                }
-            });
-        })
-        .join()
-        .unwrap();
-    }
-
-    #[test]
-    fn growing_savepoints_preserve_jump_buffers_and_active_roots() {
-        std::thread::spawn(|| {
-            with_exception_state(|state| unsafe {
-                assert!((*state).savepoints.is_empty());
-            });
-            let previous = crate::object::js_new_target_get();
-            let pushes = 5 * JUMP_BUFFER_SLAB_SIZE + 17;
-            let earlier_depth = JUMP_BUFFER_SLAB_SIZE / 2;
-            let mut buffers = Vec::new();
-            for depth in 0..earlier_depth {
-                crate::object::js_new_target_set((depth + 1) as f64);
-                buffers.push(js_try_push());
-                with_exception_state(|state| unsafe {
-                    assert!((*state).savepoints.len() >= (*state).try_depth);
-                });
-            }
-            let landed = arm_trap_and_run(buffers[earlier_depth - 1], || -> () {
-                // The trampoline above is armed in the first slab. Grow past
-                // five slabs before throwing back into that saved context.
-                for depth in earlier_depth..pushes {
-                    crate::object::js_new_target_set((depth + 1) as f64);
-                    buffers.push(js_try_push());
-                    with_exception_state(|state| unsafe {
-                        assert!((*state).savepoints.len() >= (*state).try_depth);
-                    });
-                }
-
-                with_exception_state(|state| unsafe {
-                    assert_eq!((*state).jump_buffer_slabs.len(), 6);
-                    assert_eq!((*state).handler_kinds.len(), 6 * JUMP_BUFFER_SLAB_SIZE);
-                    for depth in [
-                        0,
-                        JUMP_BUFFER_SLAB_SIZE - 1,
-                        JUMP_BUFFER_SLAB_SIZE,
-                        2 * JUMP_BUFFER_SLAB_SIZE,
-                        4 * JUMP_BUFFER_SLAB_SIZE,
-                        5 * JUMP_BUFFER_SLAB_SIZE,
-                        pushes - 1,
-                    ] {
-                        assert_eq!(
-                            (*state).jump_buffer_ptr(depth),
-                            buffers[depth],
-                            "jump buffer address at depth {depth} must remain stable after slab growth"
-                        );
-                    }
-                });
-
-                let mut roots = Vec::new();
-                let mut mark = |value: f64| roots.push(value);
-                let mut visitor = crate::gc::RuntimeRootVisitor::for_copy(&mut mark);
-                scan_exception_roots_mut(&mut visitor);
-                assert_eq!(
-                    roots,
-                    (1..=pushes).map(|n| n as f64).collect::<Vec<_>>()
-                );
-
-                while current_try_depth() > earlier_depth {
-                    js_try_end();
-                }
-                let mut roots = Vec::new();
-                let mut mark = |value: f64| roots.push(value);
-                let mut visitor = crate::gc::RuntimeRootVisitor::for_copy(&mut mark);
-                scan_exception_roots_mut(&mut visitor);
-                assert_eq!(
-                    roots,
-                    (1..=earlier_depth)
-                        .map(|n| n as f64)
-                        .collect::<Vec<_>>()
-                );
-
-                crate::object::js_new_target_set(-1.0);
-                js_throw(99.0)
-            });
-            assert!(landed.is_none());
-            assert_eq!(
-                crate::object::js_new_target_get(),
-                earlier_depth as f64
-            );
-            js_clear_exception();
-            while current_try_depth() > 0 {
-                js_try_end();
-            }
-            // Storage retains initialized but inactive snapshots after pop.
-            // They must neither retain nor rewrite roots at depth zero.
-            with_exception_state(|state| unsafe {
-                assert_eq!((*state).savepoints.len(), pushes);
-                assert_eq!((*state).try_depth, 0);
-                assert_eq!((*state).jump_buffer_slabs.len(), 6);
-            });
-            let mut roots = Vec::new();
-            let mut mark = |value: f64| roots.push(value);
-            let mut visitor = crate::gc::RuntimeRootVisitor::for_copy(&mut mark);
-            scan_exception_roots_mut(&mut visitor);
-            assert!(roots.is_empty(), "inactive snapshots must not be scanned");
-            crate::object::js_new_target_set(previous);
-        })
-        .join()
-        .unwrap();
-    }
-
-    // Issue #1830: js_try_push must capture a shadow-stack savepoint, and the
-    // unwind path (js_throw, here replayed without the longjmp) must restore
-    // it so the orphaned frames of the functions being unwound past are
-    // dropped before any later GC scans roots. All assertions are relative to
-    // the entry state so this is robust under `--test-threads=1` (shared TLS).
-    #[test]
-    fn js_throw_path_restores_shadow_stack_across_unwound_frames() {
+    fn a_trap_landing_restores_shadow_stack_across_unwound_frames() {
         let base_depth = shadow_stack_depth();
-        let base_try = test_try_depth();
-
-        // Establish run()'s frame.
         let run_frame = js_shadow_frame_push(1);
         js_shadow_slot_set(0, 0x7FFD_0000_0000_0001);
         let depth_at_try = shadow_stack_depth();
-
-        // try { ... } — js_try_push records the savepoint at this depth.
-        let _jb = js_try_push();
-        assert_eq!(test_try_depth(), base_try + 1);
-
-        // Callees push frames and the innermost throws (their pops skipped).
-        let _f1 = js_shadow_frame_push(1);
-        js_shadow_slot_set(0, 0x7FFD_0000_0000_00A1);
-        let _f2 = js_shadow_frame_push(2);
-        js_shadow_slot_set(0, 0x7FFD_0000_0000_00B1);
-        assert_eq!(shadow_stack_depth(), depth_at_try + 2);
-
-        // Replay js_throw's shadow restore (the longjmp itself can't return in
-        // a unit test), then the catch path's js_try_end().
-        test_unwind_innermost_shadow_restore();
-        js_try_end();
-
-        assert_eq!(test_try_depth(), base_try);
+        let r: Result<(), f64> = catch_js_throw(|| {
+            let _f1 = js_shadow_frame_push(1);
+            js_shadow_slot_set(0, 0x7FFD_0000_0000_00A1);
+            let _f2 = js_shadow_frame_push(2);
+            js_shadow_slot_set(0, 0x7FFD_0000_0000_00B1);
+            assert_eq!(shadow_stack_depth(), depth_at_try + 2);
+            js_throw(1.0)
+        });
+        assert_eq!(r, Err(1.0));
         assert_eq!(
             shadow_stack_depth(),
             depth_at_try,
-            "unwind dropped the orphaned callee frames"
+            "the landing dropped the orphaned callee frames"
         );
-
         js_shadow_frame_pop(run_frame);
         assert_eq!(shadow_stack_depth(), base_depth);
     }
 
+    /// The pad's restore rolls the runtime handle stack back to the scopes
+    /// that are still live: the trap frame's own scope keeps its handle, the
+    /// abandoned frames' handles are gone.
     #[test]
-    fn js_throw_path_restores_runtime_handles_across_unwound_frames() {
-        let base_try = test_try_depth();
+    fn a_pad_restores_runtime_handles_across_unwound_frames() {
+        #[inline(never)]
+        fn abandoned() -> ! {
+            let scope = RuntimeHandleScope::new();
+            let _orphaned = scope.root_nanbox_f64(f64::from_bits(0x7FFD_0000_0000_00A1));
+            std::mem::forget(scope);
+            js_throw(3.0)
+        }
         let base_handles = RuntimeHandleScope::active_len_for_tests();
-        let _jb = js_try_push();
         let scope = RuntimeHandleScope::new();
-        let _orphaned = scope.root_nanbox_f64(f64::from_bits(0x7FFD_0000_0000_00A1));
-        assert!(RuntimeHandleScope::active_len_for_tests() > base_handles);
-
-        test_unwind_innermost_shadow_restore();
-        js_try_end();
-
-        assert_eq!(test_try_depth(), base_try);
+        let _live = scope.root_nanbox_f64(f64::from_bits(0x7FFD_0000_0000_00B1));
+        let r: Result<(), f64> = catch_js_throw(|| abandoned());
+        assert_eq!(r, Err(3.0));
+        assert_eq!(RuntimeHandleScope::active_len_for_tests(), base_handles + 1);
+        drop(scope);
         assert_eq!(RuntimeHandleScope::active_len_for_tests(), base_handles);
     }
 
-    /// PR #10564 review finding, reproduced without touching the new
-    /// `new_target` savepoint directly: a bare
-    /// save/call/restore pair — no RAII guard — around a call that throws.
-    /// This is exactly the shape at the 4 named sites (fetch_globals.rs's
-    /// Temporal/Intl subclass bridges, handle_methods.rs's prototype-walk
-    /// accessor dispatch, the stdlib listener/getter dispatchers) before this
-    /// fix: the restore statement textually follows the call, so neither
-    /// `longjmp` nor a system unwind ever reaches it once the call throws.
-    ///
-    /// Deliberately uses only pre-existing public entry points
-    /// (`js_new_target_set`/`catch_js_throw`/`js_throw`) that this fix does
-    /// not change, so the same test body fails on the unfixed tree (nothing
-    /// restores the cell across the inner `js_throw`) and passes once
-    /// `new_target` joins `catch_savepoints!` — the fail-before/pass-after
-    /// proof for the mechanism every one of the 4 sites shares.
+    /// PR #10564 review finding: a bare save/call/restore pair — no RAII
+    /// guard — around a call that throws (the Temporal/Intl subclass
+    /// `super()` bridges). The restore statement textually follows the call,
+    /// so no transport ever reaches it once the call throws; the sites root the
+    /// previous value as a new.target save and the pad restores it.
     #[test]
-    fn a_bare_save_call_restore_site_is_made_exception_safe_by_the_savepoint() {
+    fn a_bare_save_call_restore_site_is_made_exception_safe_by_the_pad() {
         let base_nt = crate::object::js_new_target_get().to_bits();
-
         let outcome: Result<(), f64> = catch_js_throw(|| {
-            // The caller's open `try` around the guarded call, e.g. user code
-            // wrapping `obj.method()` in `try {}`.
             let inner: Result<(), f64> = catch_js_throw(|| {
-                // The bare save/call/restore pair itself: set, call something
-                // that throws, restore — except the restore is unreachable.
-                let _prev_nt = crate::object::js_new_target_set(22.0);
+                let scope = crate::gc::RuntimeHandleScope::new();
+                let _save = scope.root_new_target_save(crate::object::js_new_target_set(22.0));
                 js_throw(99.0)
             });
             assert_eq!(inner, Err(99.0));
             assert_eq!(
                 crate::object::js_new_target_get().to_bits(),
                 base_nt,
-                "the try open around the bare site must have restored new.target"
+                "the pad of the trap around the bare site must have restored new.target"
             );
         });
         assert_eq!(outcome, Ok(()));
         assert_eq!(crate::object::js_new_target_get().to_bits(), base_nt);
     }
 
+    /// The trap transport round-trips a throw: a real `js_throw` raises from
+    /// inside the protected body and lands in the shim's pad (setjmp
+    /// trampoline on WASI); the Rust caller observes a single-return call and
+    /// `None`, and can trap again at once.
     #[test]
-    fn try_push_pop_beyond_old_limit_does_not_panic() {
-        // Cross multiple heap slabs, relative to the entry depth so this also
-        // behaves correctly when run after other tests on the same TLS thread.
-        let base = current_try_depth();
-        let pushes = 5 * JUMP_BUFFER_SLAB_SIZE + 1;
-        for _ in 0..pushes {
-            let p = js_try_push();
-            assert!(!p.is_null(), "js_try_push returned null jmp_buf");
-        }
-        assert_eq!(current_try_depth(), base + pushes);
-        for _ in 0..pushes {
-            js_try_end();
-        }
-        assert_eq!(current_try_depth(), base);
-    }
-
-    #[test]
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "gnu",
-        target_pointer_width = "64"
-    ))]
-    fn iterator_cleanup_trap_boundary_is_the_nearest_trampoline() {
-        let env = js_try_push();
-        let landed = arm_trap_and_run(env, || {
-            let outer = current_setjmp_stack_limit().unwrap_or(0);
-            let nested = js_try_push();
-            let inner = arm_trap_and_run(nested, || current_setjmp_stack_limit().unwrap_or(0));
-            js_try_end();
-            let restored = current_setjmp_stack_limit().unwrap_or(0);
-            (outer, inner, restored)
-        });
-        js_try_end();
-        let (outer, inner, restored) = landed.expect("outer trap returned");
-        assert_ne!(outer, 0, "the trampoline must publish its boundary");
-        let inner = inner.expect("inner trap returned");
-        assert!(
-            inner < outer,
-            "the nested trap must precede an older cleanup pad"
-        );
-        assert_eq!(restored, outer);
-    }
-
-    /// #9305: the C-trampoline transport round-trips a throw. A real
-    /// `js_throw` longjmps from inside the protected body back into
-    /// `perry_sjlj_try`'s frame; the Rust caller observes a single-return
-    /// call and `None`.
-    #[test]
-    fn arm_trap_and_run_catches_a_real_throw() {
-        let base = current_try_depth();
-        let env = js_try_push();
-        // Normal completion.
-        assert_eq!(arm_trap_and_run(env, || 7), Some(7));
-        // Re-arm the SAME buffer (the run_microtasks shape) and throw.
-        let landed = arm_trap_and_run(env, || -> i32 { js_throw(42.0) });
-        assert!(landed.is_none(), "throw must land in the trampoline");
+    fn trap_catches_a_real_throw_and_traps_again() {
+        assert_eq!(trap(|| 7), Some(7));
+        let landed = trap(|| -> i32 { js_throw(42.0) });
+        assert!(landed.is_none(), "throw must land in the trap");
         assert_eq!(js_get_exception(), 42.0);
         js_clear_exception();
-        js_try_end();
-        assert_eq!(current_try_depth(), base);
+        assert_eq!(trap(|| 8), Some(8));
     }
 
-    /// #9305: `catch_js_throw` = push + arm + pop, Err with the TLS
-    /// exception cleared.
+    /// `catch_js_throw`: Err with the TLS exception cleared.
     #[test]
     fn catch_js_throw_err_clears_exception() {
-        let base = current_try_depth();
         assert_eq!(catch_js_throw(|| 3usize), Ok(3));
         let r: Result<usize, f64> = catch_js_throw(|| js_throw(7.5));
         assert_eq!(r, Err(7.5));
-        // The Err path cleared the slot; a fresh trap sees no exception.
+        assert_eq!(js_has_exception(), 0);
         assert_eq!(catch_js_throw(|| 1u8), Ok(1));
-        assert_eq!(current_try_depth(), base);
     }
 
-    /// #9305: nested arms target the innermost trap; the outer trap still
-    /// works after the inner one pops.
+    /// Nested traps land innermost first; the outer trap still works after
+    /// the inner one returned.
     #[test]
     fn nested_trampoline_arms_unwind_innermost_first() {
-        let base = current_try_depth();
         let outcome = catch_js_throw(|| {
             let inner: Result<u8, f64> = catch_js_throw(|| js_throw(1.0));
             assert_eq!(inner, Err(1.0));
             js_throw(2.0)
         });
         assert_eq!(outcome, Err(2.0));
-        assert_eq!(current_try_depth(), base);
+    }
+
+    /// A throw from deep inside a trap's body (hundreds of Rust frames, each
+    /// holding a runtime handle) lands in that trap's pad, and the pad rolls
+    /// the handle stack back to the trap's entry.
+    #[test]
+    fn a_throw_at_depth_lands_in_the_trap_pad() {
+        #[inline(never)]
+        fn descend(n: usize, scope: &RuntimeHandleScope) -> usize {
+            let _h = scope.root_nanbox_f64(f64::from_bits(0x7FFD_0000_0000_0000 | n as u64));
+            if n == 0 {
+                js_throw(13.0)
+            }
+            std::hint::black_box(descend(n - 1, scope)) + 1
+        }
+        let base_handles = RuntimeHandleScope::active_len_for_tests();
+        let r = catch_js_throw(|| {
+            let scope = RuntimeHandleScope::new();
+            descend(400, &scope)
+        });
+        assert_eq!(r, Err(13.0));
+        assert_eq!(RuntimeHandleScope::active_len_for_tests(), base_handles);
+    }
+
+    /// The C entry other crates use: 0 when the body returns, 1 with the
+    /// exception left in the slot when it throws.
+    #[test]
+    fn js_trap_call_reports_both_outcomes() {
+        unsafe extern "C-unwind" fn ok(ctx: *mut core::ffi::c_void) {
+            *ctx.cast::<i32>() = 9;
+        }
+        unsafe extern "C-unwind" fn throws(_ctx: *mut core::ffi::c_void) {
+            js_throw(6.5)
+        }
+        let mut out = 0i32;
+        assert_eq!(unsafe { js_trap_call(ok, (&raw mut out).cast()) }, 0);
+        assert_eq!(out, 9);
+        assert_eq!(unsafe { js_trap_call(throws, std::ptr::null_mut()) }, 1);
+        assert_eq!(js_get_exception(), 6.5);
+        js_clear_exception();
+    }
+
+    /// `hand_to_worker_base` passes every handler between the throw and the
+    /// worker's base trap, runtime traps included, and lands at the base.
+    #[test]
+    #[cfg(not(target_os = "wasi"))]
+    fn worker_base_handoff_skips_inner_traps() {
+        let mut inner_landed = false;
+        let r = run_worker_body(|| {
+            let inner = catch_js_throw(|| {
+                let deeper: Result<u8, f64> = catch_js_throw(|| {
+                    hand_to_worker_base(21.0);
+                    0
+                });
+                // Never reached: the handoff skips this trap's pad.
+                inner_landed = deeper.is_err();
+                0u8
+            });
+            inner_landed |= inner.is_err();
+            1u8
+        });
+        assert_eq!(r, Err(21.0));
+        assert!(!inner_landed);
+        assert!(!worker_base_handoff_pending());
+        // An ordinary throw afterwards lands in the innermost trap again.
+        assert_eq!(catch_js_throw(|| -> u8 { js_throw(2.0) }), Err(2.0));
+    }
+
+    /// The owned walker recognizes the shim as a Perry handler, so a
+    /// throw into a runtime trap takes the single-phase transport instead of
+    /// falling back (or worse, skipping the shim for an outer pad).
+    #[test]
+    #[cfg(any(
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        all(target_os = "windows", target_arch = "x86_64")
+    ))]
+    fn the_fast_walker_carries_a_throw_into_a_trap() {
+        #[cfg(target_os = "windows")]
+        use crate::eh as transport;
+        #[cfg(not(target_os = "windows"))]
+        use crate::eh_walker as transport;
+        use std::sync::atomic::Ordering::Relaxed;
+        // Warm the walker's caches and images once.
+        let _ = catch_js_throw(|| -> u8 { js_throw(0.0) });
+        let fast = transport::FAST_TRANSPORTS.load(Relaxed);
+        let falls = transport::FALLBACKS.load(Relaxed);
+        assert_eq!(catch_js_throw(|| -> u8 { js_throw(1.0) }), Err(1.0));
+        if std::env::var_os("PERRY_EH_WALKER").is_none() {
+            assert_eq!(transport::FALLBACKS.load(Relaxed), falls);
+            assert!(transport::FAST_TRANSPORTS.load(Relaxed) > fast);
+        }
     }
 
     /// #9486: the extracted uncaught report carries the `ERR_*` code and the
@@ -1301,18 +1126,10 @@ mod tests {
     /// harness can force a collection at a point of its own choosing
     /// (`gc_collect_minor`) but cannot schedule one inside
     /// `js_string_from_bytes`, and a test that cannot create the racing
-    /// collection cannot assert the race is handled. Two attempts at one were
-    /// discarded rather than shipped green-but-vacuous: the first suppressed
-    /// GC triggers so nothing moved at all, and the second moved the error but
-    /// asserted a rekey that does not happen (see below).
+    /// collection cannot assert the race is handled.
     ///
     /// What this does pin is the report itself: the code branch, the frame
     /// tail, and the `<Name> [<code>]: <message>` head.
-    ///
-    /// #9530 moved the code lookup onto the Error's address, so the existing
-    /// `ErrorSideTables` hook now keeps it attached when either the Error or its
-    /// message relocates. The forced-moving coverage lives beside that hook in
-    /// `gc::tests::error_side_tables`.
     #[test]
     fn the_uncaught_report_carries_the_error_code_and_the_frames() {
         unsafe {
@@ -1341,18 +1158,12 @@ mod tests {
 mod catch_enter_tests {
     use super::*;
 
-    /// `js_catch_enter` is the catch entry's three calls in order: the `try`
-    /// depth drops by one, the pending exception is answered, and it is
-    /// cleared.
+    /// `js_catch_enter` answers the pending exception and clears it.
     #[test]
-    fn catch_enter_ends_the_try_takes_and_clears_the_exception() {
-        let base = test_try_depth();
-        js_eh_try_push();
-        assert_eq!(test_try_depth(), base + 1);
+    fn catch_enter_takes_and_clears_the_exception() {
         test_set_exception(42.5);
         assert_eq!(js_has_exception(), 1);
         assert_eq!(js_catch_enter(), 42.5);
-        assert_eq!(test_try_depth(), base, "the catch entry ends the try");
         assert_eq!(
             js_has_exception(),
             0,

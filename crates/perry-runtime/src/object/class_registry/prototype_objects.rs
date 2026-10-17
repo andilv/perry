@@ -1,71 +1,61 @@
 use super::*;
 use crate::JSValue;
-use std::collections::HashMap;
 
-pub(crate) fn ensure_function_prototype_object(
-    func_value: f64,
-    class_id: u32,
-) -> *mut ObjectHeader {
-    if class_id == 0 {
+pub(crate) fn ensure_function_prototype_object(func_value: f64) -> *mut ObjectHeader {
+    if !is_callable_function_value(func_value) {
         return std::ptr::null_mut();
     }
-    // A `Temporal.<X>` constructor pre-populates its `prototype` (a real object
-    // with the type's accessor getters / methods) during globalThis init and
-    // stamps it on the closure's `prototype` dynamic prop — but intentionally
-    // NOT in the GC-scanned class-prototype cache (rooting an init-time arena
-    // object there dangles across the test-suite's arena-fixture swaps). So when
-    // `new Temporal.X()` / a reflective `.prototype` read lands here, return that
-    // pre-set object as-is instead of allocating a fresh empty one (which would
-    // overwrite the populated prototype). Gated on `temporal_ctor_kind` so the
-    // ordinary class-prototype flow (which relies on the cache for method
-    // registration) is unaffected.
-    if super::super::global_this::temporal_ctor_kind(func_value).is_some() {
-        let fv_bits = func_value.to_bits();
-        let fp = (fv_bits & crate::value::POINTER_MASK) as usize;
-        if fp != 0 {
-            let dyn_proto = crate::closure::closure_get_dynamic_prop(fp, "prototype");
-            let dp = JSValue::from_bits(dyn_proto.to_bits());
-            if dp.is_pointer() {
-                let pp = dp.as_pointer::<ObjectHeader>();
-                if !pp.is_null() {
-                    return pp as *mut ObjectHeader;
-                }
+    let func_ptr = (func_value.to_bits() & crate::value::POINTER_MASK) as usize;
+    if let Some(value) = crate::closure::closure_get_own_dynamic_prop(func_ptr, "prototype") {
+        let value = JSValue::from_bits(value.to_bits());
+        if value.is_pointer() {
+            let ptr = value.as_pointer::<ObjectHeader>() as usize;
+            if unsafe { crate::value::addr_class::try_read_gc_header(ptr) }
+                .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
+            {
+                return ptr as *mut ObjectHeader;
             }
         }
+        return std::ptr::null_mut();
     }
-    let existing = class_prototype_object(class_id);
-    if !existing.is_null() {
-        return existing;
-    }
-
     let scope = crate::gc::RuntimeHandleScope::new();
     let func_handle = scope.root_nanbox_f64(func_value);
-    let inline_slots = match super::super::nm_ee_ops() {
-        Some(ops) => unsafe { (ops.ee_prototype_inline_slots)(func_handle.get_nanbox_f64()) },
-        None => 0,
+    let layout = match super::super::nm_ee_ops() {
+        Some(ops) => unsafe { (ops.ee_prototype_layout)(func_handle.get_nanbox_f64()) },
+        None => std::ptr::null(),
     };
-    let proto = js_object_alloc(0, inline_slots);
+    let proto = if layout.is_null() {
+        crate::object::object_alloc_prototype_old(0, 0)
+    } else {
+        unsafe { crate::object::layout_desc::perry_alloc_layout(layout) }
+    };
     if proto.is_null() {
         return proto;
     }
     let proto_handle = scope.root_raw_mut_ptr(proto);
 
-    let constructor_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
-        b"constructor".as_ptr(),
-        "constructor".len() as u32,
-    ));
-    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
-        constructor_key.with_const_ptr::<crate::StringHeader, _>(|key| {
-            js_object_set_field_by_name(proto, key, func_handle.get_nanbox_f64())
-        })
-    });
-    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
-        set_builtin_property_attrs(
-            proto as usize,
-            "constructor".to_string(),
-            PropertyAttrs::new(true, false, true),
-        )
-    });
+    if !layout.is_null() {
+        proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            js_object_set_field(proto, 0, JSValue::from_bits(func_handle.get_nanbox_u64()))
+        });
+    } else {
+        let constructor_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+            b"constructor".as_ptr(),
+            "constructor".len() as u32,
+        ));
+        proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            constructor_key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                js_object_set_field_by_name(proto, key, func_handle.get_nanbox_f64())
+            })
+        });
+        proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
+            set_builtin_property_attrs(
+                proto as usize,
+                "constructor".to_string(),
+                PropertyAttrs::new(true, false, true),
+            )
+        });
+    }
 
     if let Some(object_proto_bits) = global_object_prototype_bits() {
         let object_proto = scope.root_nanbox_u64(object_proto_bits);
@@ -77,10 +67,6 @@ pub(crate) fn ensure_function_prototype_object(
         });
     }
 
-    proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| {
-        class_prototype_object_root_store(class_id, proto)
-    });
-
     // #5477: the bound `events.EventEmitter` / `EventEmitterAsyncResource` export's
     // synthetic prototype must carry the EventEmitter methods (`emit`/`on`/`once`/
     // …) so the `Object.setPrototypeOf(x, EventEmitter.prototype)` mixin pattern
@@ -88,8 +74,7 @@ pub(crate) fn ensure_function_prototype_object(
     // closures read their `this` argument, so a plain object that merely inherits this
     // prototype dispatches against ITSELF (listener state is keyed by the receiver
     // object, not a captured instance). Mirrors what `Stream.prototype` already
-    // does. This proto is cached (`class_prototype_object_root_store` above), so
-    // the install runs once.
+    // does. The function owns this prototype, so the install runs once.
     // Routed through the armed ops table (see `nm_namespace_hooks`): bound
     // native-callable closures only exist once `callable_exports` minted one
     // (which arms), so binaries without module imports link neither the
@@ -122,22 +107,9 @@ pub(crate) fn ensure_function_prototype_object(
     proto_handle.with_mut_ptr::<ObjectHeader, _>(|proto| proto)
 }
 
-/// Floor of the synthetic class-id range (see [`NEXT_SYNTHETIC_CLASS_ID`]).
-///
-/// RULE 2 (single-path object model): a class id must never land inside the
-/// ShapeId range `[SHAPE_ID_BASE, SHAPE_ID_END)`. The read path tells a
-/// STAMPED object from an UNSTAMPED one by range alone — the `+4` word holds
-/// `parent_class_id` until a shape is stamped over it, and
-/// `shapes::object_shape_stamp` answers with that word exactly when
-/// `shapes::is_shape_id` accepts it. This counter used to start at
-/// `0x8000_0000`, the ShapeId floor, so synthetic id *n* and ShapeId *n* were
-/// the same u32: an instance born with a synthetic PARENT id
-/// (`class X extends someFunction`, resolved through
-/// `dynamic_value_class_id` -> `function_class_id`, then written to `+4` by
-/// `js_object_alloc_class_dynamic_parent`) claimed a live, unrelated shape,
-/// whose ordered keys and live-inline-slot bound then described its layout.
-/// The band above the ShapeId range is unused: codegen ids start at 1, the
-/// builtin bands are `0x7FFF_FF00..=0x7FFF_FFFF` and `0xFFFF_0000..`.
+/// Object.create's synthetic identity range, disjoint from ShapeIds and
+/// declared/builtin class ids. Ordinary functions use their owned prototype
+/// property and never allocate an entry in the synthetic class tables.
 pub(crate) const SYNTHETIC_CLASS_ID_BASE: u32 = 0xC000_0000;
 /// Exclusive end of the synthetic range: the first reserved builtin id.
 pub(crate) const SYNTHETIC_CLASS_ID_END: u32 = 0xFFFF_0000;
@@ -170,7 +142,7 @@ per_test_global! {
 /// collides with the reserved builtin ids (`0xFFFF_0000..`), and on u32 wrap
 /// it lands back in — among others — the ShapeId range. Exhaustion is
 /// unreachable in practice (2^30 ids, one per distinct
-/// function constructor / `F.prototype = X` function, not per instance), so
+/// Object.create prototype identity), so
 /// saturating is the conservative answer: `0` means "no synthetic id", which
 /// every caller already handles as "stays parentless".
 pub(crate) fn alloc_synthetic_class_id() -> u32 {
@@ -258,188 +230,26 @@ pub extern "C" fn js_set_prototype_property(receiver: f64, value: f64, strict: i
         strict,
     );
 
-    // Synchronize from the actual own property. A sloppy rejected write or an
-    // accessor must not install the attempted RHS as a class prototype, and
-    // synchronization must not reset the property's descriptor attributes.
-    // These probes and side-table updates have no JS/GC safepoints; the receiver
-    // keeps its own prototype live throughout. Ownership is checked before any
-    // header read so proxies and other synthetic pointer values are harmless.
-    let func = receiver.get_nanbox_f64();
-    let func_value = JSValue::from_bits(func.to_bits());
-    if func_value.is_pointer() {
-        let func_ptr = func_value.as_pointer::<u8>() as usize;
-        let header = unsafe { crate::value::addr_class::try_read_tracked_gc_header(func_ptr) };
-        if header
-            .is_some_and(|header| unsafe { header.as_ref().obj_type == crate::gc::GC_TYPE_CLOSURE })
-            && get_accessor_descriptor(func_ptr, "prototype").is_none()
-        {
-            if let Some(proto) = crate::closure::closure_get_own_dynamic_prop(func_ptr, "prototype")
-            {
-                let proto = JSValue::from_bits(proto.to_bits());
-                if proto.is_pointer() {
-                    let proto_ptr = proto.as_pointer::<ObjectHeader>() as *mut ObjectHeader;
-                    let header = unsafe {
-                        crate::value::addr_class::try_read_tracked_gc_header(proto_ptr as usize)
-                    };
-                    if header.is_some_and(|header| unsafe {
-                        header.as_ref().obj_type == crate::gc::GC_TYPE_OBJECT
-                    }) {
-                        let class_id = synthetic_class_id_for_function(func);
-                        class_prototype_object_root_store(class_id, proto_ptr);
-                        crate::typed_feedback::invalidate_method_change(class_id);
-                        crate::object::prop_plan::prop_plan_epoch_bump();
-                    }
-                }
-            }
-        }
-    }
     value.get_nanbox_f64()
 }
 
-/// Legacy function-prototype registration ABI. New codegen uses
-/// `js_set_prototype_property` to preserve ordinary property semantics.
-///
-/// Returns the synthetic class_id allocated for this function (0 if
-/// validation fails). The synthetic id is folded into CLASS_REGISTRY
-/// when a class extends `func` via the #711 dynamic-parent path.
+/// Legacy ABI: store the function's prototype in its owned property bag.
+/// There is no synthetic function class identity; the unused result is zero.
 #[no_mangle]
 pub extern "C" fn js_set_function_prototype(func: f64, proto: f64) -> u32 {
-    // `F.prototype = obj` re-shapes the chain of every future instance —
-    // flush cached store plans (`object::prop_plan`).
-    crate::object::prop_plan::prop_plan_epoch_bump();
-    let func_bits = func.to_bits();
-    let func_tag = func_bits & 0xFFFF_0000_0000_0000;
-    let proto_bits = proto.to_bits();
-    let proto_tag = proto_bits & 0xFFFF_0000_0000_0000;
-    const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-    // The function must be a heap-allocated pointer. Anything else (a
-    // primitive `<not-a-function>.prototype = X`) is a no-op — preserves the
-    // pre-fix baseline where it was just a property write on a non-function.
-    if func_tag != POINTER_TAG {
-        return 0;
-    }
-    // A function may legitimately have a *primitive* (e.g. `null`) prototype:
-    // `function f() {} f.prototype = null` — it just doesn't establish an
-    // `instanceof` chain. Store it as a plain `prototype` data property so reads
-    // reflect it (test262 `GetPrototypeFromConstructor` falls back to the
-    // default when `newTarget.prototype` is not an object). Without this the
-    // write was dropped and the stale auto-created prototype object lingered.
-    if proto_tag != POINTER_TAG {
-        let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
-        if func_ptr != 0 && crate::closure::is_closure_ptr(func_ptr) {
-            crate::closure::closure_set_dynamic_prop(func_ptr, "prototype", proto);
-            set_builtin_property_attrs(
-                func_ptr,
-                "prototype".to_string(),
-                PropertyAttrs::new(true, false, false),
-            );
-        }
-        return 0;
-    }
-    // Validate an ordinary prototype source. Headerless Set/Map backings
-    // cannot participate in the class-layout machinery.
-    let proto_ptr = crate::value::js_nanbox_get_pointer(proto) as *mut ObjectHeader;
-    if proto_ptr.is_null() {
-        return 0;
-    }
-    let proto_addr = proto_ptr as usize;
-    if crate::set::is_registered_set(proto_addr) || crate::map::is_registered_map(proto_addr) {
-        return 0;
-    }
-    unsafe {
-        if !is_valid_obj_ptr(proto_ptr as *const u8) {
-            return 0;
-        }
-        let gc_header =
-            (proto_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        let obj_type = (*gc_header).obj_type;
-        // `foo.prototype = new Array(...)` — a real-array prototype can't join
-        // the class-id machinery (it has no ObjectHeader), but it must not be
-        // DROPPED: store it as the closure's `prototype` dynamic prop so reads
-        // reflect it and `js_new_function_construct` links instances to it
-        // (test262 filter/15.4.4.20-6-*, some/15.4.4.17-8-*, map/15.4.4.19-9-3).
-        // `foo.prototype = someOtherFunction` — a function/closure-valued
-        // prototype can't join the class-id machinery either (it has no
-        // ObjectHeader): store it the same way as the array case so
-        // `js_new_function_construct`'s `linked_user_proto` check links new
-        // instances to it (test262 built-ins/Function/prototype/apply/
-        // S15.3.4.3_A1_T1, call/S15.3.4.4_A1_T1 — `FACTORY.prototype =
-        // Function()` was silently dropped, so `new FACTORY` instances kept
-        // the auto-created empty prototype instead of inheriting the real
-        // function's methods).
-        if obj_type == crate::gc::GC_TYPE_ARRAY
-            || obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
-            || obj_type == crate::gc::GC_TYPE_CLOSURE
-        {
-            let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
-            if func_ptr != 0 && crate::closure::is_closure_ptr(func_ptr) {
-                crate::closure::closure_set_dynamic_prop(func_ptr, "prototype", proto);
-                set_builtin_property_attrs(
-                    func_ptr,
-                    "prototype".to_string(),
-                    PropertyAttrs::new(true, false, false),
-                );
-            }
-            return 0;
-        }
-        if obj_type != crate::gc::GC_TYPE_OBJECT {
-            return 0;
-        }
-    }
-
-    // Allocate or reuse a synthetic class id for this function value.
-    // The same `function Base() {}` ident can be assigned a prototype
-    // multiple times in pathological code; we keep the FIRST mapping
-    // and quietly ignore subsequent calls so existing parent edges
-    // don't dangle.
-    let existing = FUNCTION_CLASS_IDS.with(|table| {
-        let read = table.read().unwrap();
-        if let Some(map) = read.as_ref() {
-            if let Some(&existing) = map.get(&func_bits) {
-                return Some(existing);
-            }
-        }
-        None
-    });
-    if let Some(existing) = existing {
-        // Update the prototype object (allow re-pointing) without changing the
-        // class_id.
-        class_prototype_object_root_store(existing, proto_ptr);
-        let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
-        if func_ptr != 0 {
-            crate::closure::closure_set_dynamic_prop(func_ptr, "prototype", proto);
-            set_builtin_property_attrs(
-                func_ptr,
-                "prototype".to_string(),
-                PropertyAttrs::new(true, false, false),
-            );
-        }
-        crate::typed_feedback::invalidate_method_change(existing);
-        return existing;
-    }
-    let new_cid = alloc_synthetic_class_id();
-    FUNCTION_CLASS_IDS.with(|table| {
-        let mut write = table.write().unwrap();
-        if write.is_none() {
-            *write = Some(HashMap::new());
-        }
-        write.as_mut().unwrap().insert(func_bits, new_cid);
-    });
-    class_prototype_object_root_store(new_cid, proto_ptr);
-    let func_ptr = (func_bits & crate::value::POINTER_MASK) as usize;
-    if func_ptr != 0 {
-        crate::closure::closure_set_dynamic_prop(func_ptr, "prototype", proto);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let func = scope.root_nanbox_f64(func);
+    let proto = scope.root_nanbox_f64(proto);
+    if is_callable_function_value(func.get_nanbox_f64()) {
+        let ptr = (func.get_nanbox_u64() & crate::value::POINTER_MASK) as usize;
+        crate::closure::closure_set_dynamic_prop(ptr, "prototype", proto.get_nanbox_f64());
         set_builtin_property_attrs(
-            func_ptr,
+            ptr,
             "prototype".to_string(),
             PropertyAttrs::new(true, false, false),
         );
     }
-    // Register the synthetic id so REGISTERED_CLASS_IDS-gated paths
-    // (e.g., the #687 ClassRef-as-receiver short-circuit) recognize it.
-    unsafe { js_register_class_id(new_cid) };
-    crate::typed_feedback::invalidate_method_change(new_cid);
-    new_cid
+    0
 }
 
 /// The prototype holder an instance of class `class_id` reads through next:
@@ -1164,53 +974,23 @@ unsafe fn proto_chain_symbol_slot_inner(
     None
 }
 
-/// Lookup the synthetic class id for a function value, if one was
-/// registered via `js_set_function_prototype`.
-#[inline]
-pub(crate) fn function_class_id(value: f64) -> u32 {
-    let bits = value.to_bits();
-    FUNCTION_CLASS_IDS.with(|table| {
-        if let Ok(read) = table.read() {
-            if let Some(map) = read.as_ref() {
-                return map.get(&bits).copied().unwrap_or(0);
-            }
-        }
-        0
-    })
-}
-
-pub(crate) fn function_value_for_class_id(class_id: u32) -> Option<f64> {
-    if class_id == 0 {
-        return None;
-    }
-    FUNCTION_CLASS_IDS.with(|table| {
-        table.read().ok().and_then(|guard| {
-            guard.as_ref().and_then(|map| {
-                map.iter()
-                    .find_map(|(&bits, &cid)| (cid == class_id).then_some(f64::from_bits(bits)))
-            })
-        })
-    })
-}
-
-/// `EventEmitter.prototype` holds `constructor`, node's three instance-state
-/// defaults and fifteen methods; `EventEmitterAsyncResource.prototype` holds
-/// `constructor` and five own members. Room for those plus slack keeps every
-/// one an inline slot, so a method call's site memo can name it.
-const EVENT_EMITTER_PROTOTYPE_INLINE_SLOTS: u32 = 24;
-const EVENT_EMITTER_ASYNC_RESOURCE_PROTOTYPE_INLINE_SLOTS: u32 = 8;
-
-/// See `NmEeOps::ee_prototype_inline_slots`.
-pub(crate) unsafe fn nm_ee_prototype_inline_slots(func_value: f64) -> u32 {
+/// Static layout of a bound events constructor's canonical prototype.
+pub(crate) unsafe fn nm_ee_prototype_layout(
+    func_value: f64,
+) -> *const super::super::layout_desc::PerryLayoutDesc {
     match super::super::native_module::bound_native_callable_module_and_method(func_value) {
         Some((module, method)) if module.trim_start_matches("node:") == "events" => {
             match method.as_str() {
-                "EventEmitter" => EVENT_EMITTER_PROTOTYPE_INLINE_SLOTS,
-                "EventEmitterAsyncResource" => EVENT_EMITTER_ASYNC_RESOURCE_PROTOTYPE_INLINE_SLOTS,
-                _ => 0,
+                "EventEmitter" => {
+                    std::ptr::addr_of!(super::super::runtime_layouts::EVENT_EMITTER_PROTO)
+                }
+                "EventEmitterAsyncResource" => {
+                    std::ptr::addr_of!(super::super::runtime_layouts::EE_ASYNC_RESOURCE_PROTO)
+                }
+                _ => std::ptr::null(),
             }
         }
-        _ => 0,
+        _ => std::ptr::null(),
     }
 }
 
@@ -1261,5 +1041,70 @@ pub(crate) unsafe fn nm_ee_prototype_install(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod born_old_tests {
+    use super::*;
+
+    extern "C" fn body(
+        _: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
+    ) -> f64 {
+        0.0
+    }
+
+    unsafe fn is_born_old(proto: *mut ObjectHeader) -> bool {
+        let header =
+            (proto as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+        crate::gc::never_move::is_never_move(header)
+            && crate::gc::never_move::lives_old(proto as usize)
+    }
+
+    /// Every default prototype is stationary from birth, including one
+    /// owned by a young function. Its ordinary owner edge still determines liveness.
+    #[test]
+    fn every_default_prototype_is_born_old() {
+        let _copying = crate::gc::CopyingNurseryTestGuard::new(0);
+        let _age = crate::gc::pin_tenuring_survivals_for_test(1);
+        crate::gc::register_runtime_handle_root_scanner_for_tests();
+        crate::gc::gc_register_mutable_root_scanner(
+            crate::object::shapes::scan_shape_table_rekey_mut,
+        );
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let make = || {
+            crate::value::js_nanbox_pointer(crate::closure::js_closure_alloc(
+                crate::fn_info!(body, 0),
+                0,
+            ) as i64)
+        };
+        let young = scope.root_nanbox_f64(make());
+        let young_addr =
+            JSValue::from_bits(young.get_nanbox_f64().to_bits()).as_pointer::<u8>() as usize;
+        assert!(
+            unsafe { !crate::gc::never_move::lives_old(young_addr) },
+            "premise: the function is young"
+        );
+        let young_proto = ensure_function_prototype_object(young.get_nanbox_f64());
+        assert!(!young_proto.is_null());
+        assert!(
+            unsafe { is_born_old(young_proto) },
+            "a young function's prototype is born old and never-move"
+        );
+        let old = scope.root_nanbox_f64(make());
+        let _ = crate::gc::gc_collect_minor();
+        let old_addr =
+            JSValue::from_bits(old.get_nanbox_f64().to_bits()).as_pointer::<u8>() as usize;
+        assert!(
+            unsafe { crate::gc::never_move::lives_old(old_addr) },
+            "premise: the minor promoted the function"
+        );
+        let old_proto = ensure_function_prototype_object(old.get_nanbox_f64());
+        assert!(!old_proto.is_null());
+        assert!(
+            unsafe { is_born_old(old_proto) },
+            "an old function's prototype is born old and never-move"
+        );
     }
 }

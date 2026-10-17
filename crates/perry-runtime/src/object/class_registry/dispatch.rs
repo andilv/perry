@@ -1,5 +1,4 @@
 use super::*;
-use crate::JSValue;
 
 // ============================================================================
 // Class-method calls through the vtable's function pointers (constructors,
@@ -139,7 +138,9 @@ pub(crate) unsafe fn call_vtable_method_with_private_brand(
 fn legacy_method_receiver(this: i64) -> f64 {
     let bits = this as u64;
     if bits != 0 && bits <= crate::value::POINTER_MASK {
-        f64::from_bits(JSValue::pointer(bits as *mut u8).bits())
+        // A raw receiver may be a native id: the unknown-word constructor
+        // boxes the id band under HANDLE_TAG.
+        crate::value::js_nanbox_pointer(bits as i64)
     } else {
         f64::from_bits(bits)
     }
@@ -264,7 +265,7 @@ pub(crate) unsafe fn call_vtable_method_value(
         .or(explicit_private_brand)
         .or_else(|| crate::object::private_evaluation_brand_value(this_f64))
         .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED));
-    let derived_super_depth = crate::object::derived_super_binding_stack_savepoint();
+    let derived_super_depth = crate::object::derived_super_binding_len();
     crate::object::private_lexical_brand_push(private_brand);
     let result = call_fn_with_this_and_args(
         func_ptr,
@@ -274,7 +275,7 @@ pub(crate) unsafe fn call_vtable_method_value(
         param_count_usize,
     );
     crate::object::private_lexical_brand_pop();
-    crate::object::derived_super_binding_stack_restore(derived_super_depth);
+    crate::object::derived_super_binding_truncate(derived_super_depth);
     result
 }
 

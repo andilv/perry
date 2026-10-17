@@ -217,7 +217,7 @@ pub(crate) extern "C" fn global_this_date_thunk(
 
 fn global_this_fetch_option(init: f64, name: &[u8]) -> f64 {
     let value = crate::value::JSValue::from_bits(init.to_bits());
-    if !value.is_pointer() {
+    if !value.is_reference() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     let raw = crate::value::js_nanbox_get_pointer(init);
@@ -442,8 +442,9 @@ pub(crate) unsafe fn temporal_subclass_super(
     // constructor call.
     let this_scope = crate::gc::RuntimeHandleScope::new();
     let this_h = this_scope.root_nanbox_f64(this_box);
-    // #10490: the displaced `new.target` crosses the same call.
-    let prev_nt = this_scope.root_nanbox_f64(crate::object::js_new_target_set(parent_val));
+    // #10490: the displaced `new.target` crosses the same call. Its save
+    // also tells a landing pad what to put back if the call throws.
+    let prev_nt = this_scope.root_new_target_save(crate::object::js_new_target_set(parent_val));
     let cell = crate::closure::native_call_value_this(
         parent_val,
         crate::closure::JsThis::from_f64(this_h.get_nanbox_f64()),

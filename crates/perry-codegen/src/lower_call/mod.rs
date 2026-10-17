@@ -47,12 +47,9 @@ mod closure_analysis;
 #[cfg(test)]
 mod closure_call_arity_tests;
 mod console_promise;
-pub(crate) use console_promise::{emit_method_args_buffer, try_lower_optional_method_call};
-/// #10943: the universal method dispatcher, which finds an own or
-/// inherited user method. It is the other side of every own-override
-/// diamond, including the one `expr/folded_builtin_override.rs` emits for
-/// the builtin calls HIR folded before this module could see them.
-pub(crate) use console_promise::{emit_native_method_str_dispatch_plain, lower_split_method_call};
+pub(crate) use console_promise::{
+    emit_method_args_buffer, lower_split_method_call, try_lower_optional_method_call,
+};
 /// Rooting and evaluation-order coverage for the `console.*` arms slice 6
 /// repaired (#7649) — see the module header for why these assert on IR.
 #[cfg(test)]
@@ -81,12 +78,12 @@ pub(crate) use func_ref::{
     guarded_path_type,
 };
 mod direct_method_guard;
-pub(crate) mod holder_shape_guard;
 mod jsx;
 pub(crate) mod lookup_first;
 #[cfg(test)]
 mod method_order_tests;
 pub(crate) mod method_override;
+mod method_shape_proof;
 pub(crate) use direct_method_guard::emit_inline_direct_method_shape_guard;
 #[cfg(test)]
 mod args_sweep_tests;
@@ -99,6 +96,8 @@ mod native;
 #[cfg(test)]
 mod native_abi_tests;
 mod native_module_dispatch;
+pub(crate) use early_branches::native_receiver_module;
+pub(crate) use native_module_dispatch::native_lookup_runtime;
 #[cfg(test)]
 mod native_module_rooting_tests;
 mod native_table;
@@ -195,7 +194,8 @@ pub(crate) use new_ctor_args::{
 // super-must-be-called.
 pub(crate) use new_helpers::{
     ctor_body_calls_super, ctor_body_closure_calls_super, ctor_body_has_value_return,
-    ctor_body_uses_this, ctor_chain_can_replace_this, default_ctor_dynamic_parent_owner,
+    ctor_body_lexically_contains_arrow, ctor_body_uses_this, ctor_chain_can_replace_this,
+    default_ctor_dynamic_parent_owner,
 };
 // #6325 / #6326: the class-chain walk to a native base whose surface perry
 // stamps onto the instance, plus its init emitter. Shared by the implicit

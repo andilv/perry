@@ -35,6 +35,10 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
     let bits = value.to_bits();
     let top16 = bits >> 48;
 
+    if top16 == (crate::value::HANDLE_TAG >> 48) {
+        return 0.0;
+    }
+
     // SHORT_STRING_TAG stores a byte count; JS length counts UTF-16 units.
     if top16 == 0x7FF9 {
         return JSValue::from_bits(bits).short_string_utf16_len() as f64;
@@ -372,9 +376,8 @@ pub unsafe extern "C" fn js_dynamic_object_get_property(
     // misrouted.
     if !property_name_ptr.is_null() {
         let addr = js_nanbox_get_pointer(obj_value);
-        if addr != 0 && crate::value::addr_class::is_proxy_id_band(addr as usize) {
-            const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-            let boxed = f64::from_bits(POINTER_TAG | (addr as u64 & POINTER_MASK));
+        if addr != 0 && crate::value::addr_class::is_proxy_cell(addr as usize) {
+            let boxed = f64::from_bits(crate::value::POINTER_TAG | (addr as u64 & POINTER_MASK));
             if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
                 let name_slice = if property_name_len > 0 {
                     std::slice::from_raw_parts(property_name_ptr as *const u8, property_name_len)
@@ -470,7 +473,7 @@ pub unsafe extern "C" fn js_dynamic_object_get_property(
     }
 
     // Check if this is a handle-based object (small integer, not a real heap pointer)
-    if crate::value::addr_class::is_handle_band(ptr as usize) {
+    if JSValue::from_bits(obj_value.to_bits()).is_handle() {
         if let Some(dispatch) = crate::object::handle_property_dispatch() {
             return dispatch(ptr, property_name_ptr as *const u8, property_name_len);
         }
@@ -1011,18 +1014,15 @@ mod length_handle_band_tests {
         };
         let console_ptr = crate::value::js_nanbox_get_pointer(console_ctor) as usize;
         let length_key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
-        let mut cache = [0_i64; crate::object::PIC_CACHE_WORDS];
-        let mut cache_slot: crate::object::PicCacheSlot = &mut cache;
         assert_eq!(js_value_length_f64(console_ctor), 1.0);
         assert_eq!(
             crate::closure::closure_get_dynamic_prop(console_ptr, "length"),
             1.0
         );
         assert_eq!(
-            crate::object::js_object_get_field_ic_miss(
+            crate::object::field_get_set::get_field_miss(
                 console_ptr as *const crate::ObjectHeader,
-                length_key,
-                &mut cache_slot,
+                length_key
             ),
             1.0
         );

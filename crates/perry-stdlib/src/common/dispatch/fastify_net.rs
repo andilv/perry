@@ -23,7 +23,7 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
         (v.to_bits() & 0x0000_FFFF_FFFF_FFFF) as i64
     }
     fn nanbox_handle(h: i64) -> f64 {
-        f64::from_bits(0x7FFD_0000_0000_0000u64 | (h as u64 & 0x0000_FFFF_FFFF_FFFF))
+        perry_runtime::value::js_nanbox_handle(h)
     }
     extern "C" {
         // #5021 — route write/end/destroy through perry-ext-net's DISTINCT
@@ -35,49 +35,19 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
         // symbols have no twin and always reach ext-net's own registry.
         // Mirrors how `js_ext_net_destroy_socket` was already split out (#5010).
         // #11111 — returns Node's boolean `write()` result.
-        fn js_ext_net_socket_write(handle: i64, buf_ptr: i64) -> f64;
-        fn js_ext_net_socket_read(handle: i64, size: f64) -> f64;
         // Issue #1852 — `js_ext_net_socket_end` takes the optional final
         // chunk (NA_JSV bits) so `socket.end(data)` writes before FIN.
-        fn js_ext_net_socket_end(handle: i64, chunk_bits: i64);
-        fn js_ext_net_socket_emit(
-            handle: i64,
-            event_ptr: i64,
-            args_ptr: *const f64,
-            args_len: usize,
-        ) -> f64;
-        fn js_ext_net_destroy_socket(handle: i64);
         // #5021 (listener half): the shared `js_net_socket_*` listener names
         // have bundled-stdlib twins that bind to an EMPTY registry in a
         // both-archives link — the registration is dropped and the socket's
         // 'data' events never reach JS. Use ext-net's distinct symbols.
-        fn js_ext_net_socket_on(handle: i64, event_ptr: i64, cb_ptr: i64);
-        fn js_ext_net_socket_method_connect(handle: i64, arg1: f64, arg2: f64, arg3: f64);
-        fn js_net_socket_upgrade_tls(
-            handle: i64,
-            servername_ptr: i64,
-            verify: f64,
-        ) -> *mut perry_runtime::Promise;
         // Issue #2131 — lifecycle + EventEmitter surface beyond `on`.
         // Same FFIs the NATIVE_MODULE_TABLE typed path uses; the
         // dispatch arms below route any-typed receivers (e.g. the
         // socket arg of `server.on('connection', sock => …)` after
         // codegen loses the static class) to them.
-        fn js_net_socket_address(handle: i64) -> *mut perry_runtime::StringHeader;
-        fn js_ext_net_socket_once(handle: i64, event_ptr: i64, cb_ptr: i64) -> i64;
-        fn js_ext_net_socket_remove_listener(handle: i64, event_ptr: i64, cb_ptr: i64) -> i64;
-        fn js_ext_net_socket_remove_all_listeners(handle: i64, event_ptr: i64) -> i64;
-        fn js_ext_net_socket_listener_count(handle: i64, event_ptr: i64) -> f64;
-        fn js_ext_net_socket_get_max_listeners(handle: i64) -> f64;
-        fn js_ext_net_socket_set_max_listeners(handle: i64, n: f64) -> f64;
-        fn js_net_socket_event_names(handle: i64) -> *mut perry_runtime::StringHeader;
-        fn js_net_socket_reset_and_destroy(handle: i64) -> i64;
         // Issue #2211 — listeners()/rawListeners() return a *mut ArrayHeader
         // cast to i64; NaN-box with POINTER_TAG to surface as a real JS array.
-        fn js_ext_net_socket_listeners(handle: i64, event_ptr: i64) -> i64;
-        fn js_net_socket_raw_listeners(handle: i64, event_ptr: i64) -> i64;
-        fn js_net_socket_get_type_of_service(handle: i64) -> f64;
-        fn js_net_socket_set_type_of_service(handle: i64, value: f64) -> i64;
     }
 
     // Parse a runtime StringHeader pointer (`address` / `eventNames`
@@ -141,7 +111,7 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
             let servername_ptr = str_arg(args[0]);
             let verify = if args.len() >= 2 { args[1] } else { 1.0 };
             let promise = js_net_socket_upgrade_tls(handle, servername_ptr, verify);
-            f64::from_bits(0x7FFD_0000_0000_0000u64 | (promise as u64 & 0x0000_FFFF_FFFF_FFFF))
+            perry_runtime::value::js_nanbox_pointer(promise as i64)
         }
         // Issue #2131 — EventEmitter surface on any-typed receivers
         // (the accepted-socket arg of `server.on('connection', s => …)`
@@ -188,12 +158,12 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
         "listeners" if !args.is_empty() => {
             let event_ptr = str_arg(args[0]);
             let arr = js_ext_net_socket_listeners(handle, event_ptr);
-            f64::from_bits(0x7FFD_0000_0000_0000u64 | (arr as u64 & 0x0000_FFFF_FFFF_FFFF))
+            perry_runtime::value::js_nanbox_pointer(arr as i64)
         }
         "rawListeners" if !args.is_empty() => {
             let event_ptr = str_arg(args[0]);
             let arr = js_net_socket_raw_listeners(handle, event_ptr);
-            f64::from_bits(0x7FFD_0000_0000_0000u64 | (arr as u64 & 0x0000_FFFF_FFFF_FFFF))
+            perry_runtime::value::js_nanbox_pointer(arr as i64)
         }
         "address" => json_str_to_value(js_net_socket_address(handle)),
         "getTypeOfService" => js_net_socket_get_type_of_service(handle),
@@ -218,3 +188,6 @@ pub(crate) unsafe fn dispatch_external_net_socket(handle: i64, method: &str, arg
         _ => f64::from_bits(0x7FFC_0000_0000_0001),
     }
 }
+
+#[allow(unused_imports)]
+use crate::common::wrapper_imports::*;

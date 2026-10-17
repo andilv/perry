@@ -18,6 +18,7 @@ pub(super) struct StaticMethodEntry {
     /// object for this method is at home in that evaluation's class object.
     pub(super) home: bool,
     pub(super) generator_owner: bool,
+    pub(super) is_generator: bool,
 }
 
 /// Define `<body>__clo(callee, this, args...)`, the code of a ClassBody static
@@ -106,7 +107,7 @@ pub(super) fn emit_static_method_entry(
         }
         f.set_length(e.spec_length);
         f.set_strict();
-        if e.generator_owner {
+        if e.is_generator {
             f.set_generator();
         }
     });
@@ -153,11 +154,17 @@ pub(super) fn emit_class_method_entry(
         } else {
             None
         };
-        let depth = b.call(
-            I64,
-            "js_class_method_entry_enter_home",
-            &[(I32, &e.cid.to_string()), (I64, "%this"), (I64, "%callee")],
-        );
+        // A declaration's function object has no evaluation capture. Its
+        // instance shapes already carry the private brand, and its body reads
+        // the explicit receiver. Only a per-evaluation method needs to select
+        // the lexical home independently of that receiver.
+        let depth = e.home.then(|| {
+            b.call(
+                I64,
+                "js_class_method_entry_enter_home",
+                &[(I32, &e.cid.to_string()), (I64, "%this"), (I64, "%callee")],
+            )
+        });
         let this_box = if let Some((_, recv)) = &roots {
             b.load(DOUBLE, recv)
         } else {
@@ -177,7 +184,9 @@ pub(super) fn emit_class_method_entry(
             e.llvm_name.clone()
         };
         let r = b.call(DOUBLE, &target, &call_args);
-        b.call_void("js_class_method_entry_leave", &[(I64, &depth)]);
+        if let Some(depth) = depth {
+            b.call_void("js_class_method_entry_leave", &[(I64, &depth)]);
+        }
         b.ret(DOUBLE, &r);
     }
     let (rest, rest_kind) = match (e.has_user_rest, e.has_synth_args) {
@@ -199,7 +208,7 @@ pub(super) fn emit_class_method_entry(
         }
         f.set_length(e.spec_length);
         f.set_strict();
-        if e.generator_owner {
+        if e.is_generator {
             f.set_generator();
         }
         f.set_non_constructor();
@@ -209,11 +218,29 @@ pub(super) fn emit_class_method_entry(
 }
 
 /// Source flags of a class member, without another persistent metadata table.
-pub(super) fn source_is_fixed_generator(
+pub(super) fn source_needs_owner(
     classes: &[(u32, &perry_hir::Class)],
     cid: u32,
     id: u32,
+    fresh: bool,
 ) -> bool {
+    classes
+        .iter()
+        .find(|(c, _)| *c == cid)
+        .is_some_and(|(_, class)| {
+            class
+                .methods
+                .iter()
+                .chain(class.static_methods.iter())
+                .chain(class.computed_members.iter().map(|m| &m.function))
+                .any(|f| {
+                    f.id == id
+                        && crate::codegen::helpers::body_needs_explicit_method_owner(&f.body, fresh)
+                })
+        })
+}
+
+pub(super) fn source_is_generator(classes: &[(u32, &perry_hir::Class)], cid: u32, id: u32) -> bool {
     classes
         .iter()
         .find(|(c, _)| *c == cid)
@@ -229,6 +256,71 @@ pub(super) fn source_is_fixed_generator(
         })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(home: bool) -> String {
+        let mut module = crate::module::LlModule::new("x86_64-unknown-linux-gnu");
+        module.declare_function("method_body", DOUBLE, &[DOUBLE, DOUBLE]);
+        let mut chunker = InitChunker::new(&mut module, "init".into(), 100);
+        chunker.roll_if_full();
+        emit_class_method_entry(
+            &mut chunker,
+            &StaticMethodEntry {
+                cid: 801,
+                llvm_name: "method_body".into(),
+                param_count: 1,
+                spec_length: 1,
+                has_user_rest: false,
+                has_synth_args: false,
+                home,
+                generator_owner: false,
+                is_generator: false,
+            },
+        );
+        chunker.finish();
+        module.to_ir()
+    }
+
+    #[test]
+    fn declaration_super_home_shares_the_direct_body_but_fresh_home_needs_owner() {
+        let body = vec![perry_hir::Stmt::Let {
+            id: 1,
+            name: "home".into(),
+            ty: perry_hir::types::Type::Any,
+            mutable: false,
+            init: Some(perry_hir::Expr::ClassMethodHome {
+                class_name: "C".into(),
+                is_static: false,
+            }),
+        }];
+        assert!(crate::codegen::helpers::body_needs_method_owner(&body));
+        assert!(!crate::codegen::helpers::body_needs_explicit_method_owner(
+            &body, false
+        ));
+        assert!(crate::codegen::helpers::body_needs_explicit_method_owner(
+            &body, true
+        ));
+    }
+
+    #[test]
+    fn declaration_entries_forward_the_receiver_without_a_home_scope() {
+        let ir = entry(false);
+        assert!(ir.contains("define double @method_body__eclo"));
+        assert!(ir.contains("call double @method_body("));
+        assert!(!ir.contains("@js_class_method_entry_enter_home"));
+        assert!(!ir.contains("@js_class_method_entry_leave"));
+    }
+
+    #[test]
+    fn evaluation_entries_keep_their_lexical_home() {
+        let ir = entry(true);
+        assert!(ir.contains("call i64 @js_class_method_entry_enter_home"));
+        assert!(ir.contains("call void @js_class_method_entry_leave"));
+    }
+}
+
 /// Computed instance generators need a callable entry as named ones do.
 pub(super) fn emit_computed_generator_entries(
     chunker: &mut InitChunker<'_>,
@@ -239,7 +331,10 @@ pub(super) fn emit_computed_generator_entries(
     for &(cid, class) in classes {
         for m in class.computed_members.iter().filter(|m| {
             !m.is_static
-                && crate::codegen::helpers::body_has_fixed_generator_state(&m.function.body)
+                && crate::codegen::helpers::body_needs_explicit_method_owner(
+                    &m.function.body,
+                    fresh.contains(&cid),
+                )
         }) {
             let f = &m.function;
             let llvm_name = format!(
@@ -262,6 +357,7 @@ pub(super) fn emit_computed_generator_entries(
                     has_synth_args: f.params.iter().any(|p| p.arguments_object.is_some()),
                     home: fresh.contains(&cid),
                     generator_owner: true,
+                    is_generator: crate::codegen::helpers::body_has_fixed_generator_state(&f.body),
                 },
             );
         }

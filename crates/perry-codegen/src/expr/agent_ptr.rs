@@ -90,6 +90,12 @@ fn elf_triple(triple: &str) -> bool {
         && (triple.starts_with("x86_64") || triple.starts_with("aarch64"))
 }
 
+/// The image can address runtime TLS without a resolver call. Shared images
+/// keep the generic accessor; each executable invocation stays on one thread.
+pub(crate) fn executable_tls(triple: &str) -> bool {
+    elf_triple(triple) && OUTPUT_IS_EXECUTABLE.with(|c| c.get())
+}
+
 /// How this compile reaches the block. `PERRY_AGENT_PTR_ACCESS=call` forces
 /// the call (A/B knob).
 pub(crate) fn agent_ptr_access(ctx: &FnCtx<'_>) -> AgentPtrAccess {
@@ -153,6 +159,59 @@ pub(crate) fn emit_agent_ptr_or(ctx: &mut FnCtx<'_>, slot: usize, absent: &str) 
                 .phi(PTR, &[(&val, &fast_pred), (absent, &slow_pred)])
         }
         AgentPtrAccess::Call => ctx.block().call(PTR, agent_ptr_accessor(slot), &[]),
+    }
+}
+
+/// This agent's intrinsic prototype of builtin family `family` (object model
+/// step 3: the object whose layout word's shadow bit is `Pristine(family)`).
+/// The slot is never null (`PERRY_PRISTINE_PROTO` until the realm is sealed),
+/// so the inline forms are one load; Apple's TSD path answers the stand-in
+/// when unavailable; every other target calls the leaf accessor.
+pub(crate) fn emit_intrinsic_proto(ctx: &mut FnCtx<'_>, family: usize) -> String {
+    let slot = crate::runtime_abi::AGENT_PTR_INTRINSIC_PROTO + family;
+    debug_assert!(slot < AGENT_PTR_SLOTS);
+    let slot_off = (slot * 8).to_string();
+    match agent_ptr_access(ctx) {
+        access @ (AgentPtrAccess::ExecutableTls | AgentPtrAccess::WindowsTeb) => {
+            let at = emit_slot_addr(ctx, access, &slot_off);
+            ctx.block().load(PTR, &at)
+        }
+        AgentPtrAccess::AppleTsd => {
+            let lookup = super::hot_tls::emit_hot_tls_lookup(ctx, "intrinsic_proto");
+            let field = super::hot_tls::hot_tls_field(
+                ctx,
+                &lookup.hot,
+                &HOT_TLS_AGENT_PTRS_OFFSET.to_string(),
+            );
+            let blk = ctx.block();
+            let block_ptr = blk.load(PTR, &field);
+            let at = blk.gep(
+                crate::types::I8,
+                &block_ptr,
+                &[(crate::types::I64, &slot_off)],
+            );
+            let val = blk.load(PTR, &at);
+            let fast_pred = blk.label.clone();
+            let join_idx = ctx.new_block("intrinsic_proto.join");
+            let join_label = ctx.block_label(join_idx);
+            ctx.block().br(&join_label);
+            ctx.current_block = lookup.slow_idx;
+            let called = ctx.block().call(
+                PTR,
+                "perry_intrinsic_proto",
+                &[(crate::types::I32, &family.to_string())],
+            );
+            let slow_pred = ctx.block().label.clone();
+            ctx.block().br(&join_label);
+            ctx.current_block = join_idx;
+            ctx.block()
+                .phi(PTR, &[(&val, &fast_pred), (&called, &slow_pred)])
+        }
+        AgentPtrAccess::Call => ctx.block().call(
+            PTR,
+            "perry_intrinsic_proto",
+            &[(crate::types::I32, &family.to_string())],
+        ),
     }
 }
 

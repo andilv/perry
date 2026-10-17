@@ -81,7 +81,7 @@ pub(crate) fn get_string_content(ptr_f64: f64) -> String {
     // this arm is exactly the pre-#11519 body.
     if jsval.is_string() {
         let ptr = jsval.as_string_ptr();
-        if ptr.is_null() {
+        if unsafe { crate::value::addr_class::try_read_string_header(ptr) }.is_none() {
             return String::new();
         }
         unsafe {
@@ -109,7 +109,7 @@ fn short_string_content(jsval: crate::value::JSValue) -> String {
 }
 
 pub(crate) fn string_from_header(ptr: *mut crate::StringHeader) -> String {
-    if ptr.is_null() {
+    if unsafe { crate::value::addr_class::try_read_string_header(ptr) }.is_none() {
         return String::new();
     }
     unsafe {
@@ -315,6 +315,55 @@ mod tests {
         assert_eq!(host, "");
         assert_eq!(hostname, "");
         assert_eq!(pathname, "/Users/test/file.ts");
+    }
+
+    #[test]
+    fn test_parse_file_url_windows_drive_authority() {
+        // Matches Node 26.5.1 WHATWG URL normalization for both spellings:
+        // `new URL("file://C:\\Users\\Ralph\\config.env")` and the
+        // slash-separated equivalent serialize as `file:///C:/Users/...`.
+        for input in [
+            "file://C:\\Users\\Ralph\\config.env",
+            "file://C:/Users/Ralph/config.env",
+        ] {
+            assert_eq!(
+                super::parse::normalize_file_drive_authority(input),
+                "file:///C:/Users/Ralph/config.env",
+                "normalized {input}"
+            );
+            assert!(super::parse::is_valid_absolute_url(input), "{input}");
+            let (protocol, host, hostname, port, pathname, search, hash) = parse_url(input);
+            assert_eq!(protocol, "file:", "{input}");
+            assert_eq!(host, "", "{input}");
+            assert_eq!(hostname, "", "{input}");
+            assert_eq!(port, "", "{input}");
+            assert_eq!(pathname, "/C:/Users/Ralph/config.env", "{input}");
+            assert_eq!(search, "", "{input}");
+            assert_eq!(hash, "", "{input}");
+        }
+
+        let (_, host, _, _, pathname, search, hash) =
+            parse_url("file://C:/Users/Ralph/config.env?x=\\\\y#\\\\z");
+        assert_eq!(host, "");
+        assert_eq!(pathname, "/C:/Users/Ralph/config.env");
+        assert_eq!(search, "?x=\\\\y");
+        assert_eq!(hash, "#\\\\z");
+    }
+
+    #[test]
+    fn test_parse_file_url_windows_drive_does_not_capture_unc_hosts() {
+        let (protocol, host, hostname, _, pathname, _, _) =
+            parse_url("file://server/share/config.env");
+        assert_eq!(protocol, "file:");
+        assert_eq!(host, "server");
+        assert_eq!(hostname, "server");
+        assert_eq!(pathname, "/share/config.env");
+
+        let (_, host, hostname, _, pathname, _, _) =
+            parse_url("file://localhost/C:/share/config.env");
+        assert_eq!(host, "");
+        assert_eq!(hostname, "");
+        assert_eq!(pathname, "/C:/share/config.env");
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::block::LlBlock;
 use crate::module::LlModule;
 use crate::strings::StringPool;
-use crate::types::{DOUBLE, I8, I32, I64, PTR, VOID};
+use crate::types::{DOUBLE, I32, I64, I8, PTR, VOID};
 
 use super::ctor_arity::constructor_layout_params;
 use super::helpers::{sanitize_member, scoped_static_method_name};
@@ -14,6 +14,10 @@ use super::spec_function_length;
 
 mod class_birth_image;
 mod image;
+
+pub(super) fn image_pointer(entry: &crate::strings::StringEntry) -> String {
+    image::pointer(entry)
+}
 mod image_handles;
 use image_handles::{
     add_mutable_string_handle, emit_prepare_agent_strings, emit_runtime_boxed_image_handle,
@@ -509,6 +513,26 @@ pub(super) fn emit_string_pool(
         ops_per_chunk,
     );
 
+    if image_literals && strings.iter().next().is_some() {
+        let atoms: Vec<String> = strings
+            .iter()
+            .map(|entry| format!("ptr {}", image::pointer(entry)))
+            .collect();
+        let name = format!("perry_property_atoms_{module_prefix}");
+        let count = atoms.len();
+        chunker.module().add_raw_global(format!(
+            "@{name} = private constant [{count} x ptr] [{}]",
+            atoms.join(", ")
+        ));
+        chunker
+            .module()
+            .declare_function("js_string_register_property_atoms", VOID, &[PTR, I32]);
+        chunker.roll_if_full();
+        chunker.current_block().call_void(
+            "js_string_register_property_atoms",
+            &[(PTR, &format!("@{name}")), (I32, &count.to_string())],
+        );
+    }
     for entry in strings
         .iter()
         .filter(|_| !image_literals || runtime_boxed_images)
@@ -550,7 +574,7 @@ pub(super) fn emit_string_pool(
         llmod,
         &agent_strings_name,
         module_prefix,
-        !image_literals || runtime_boxed_images,
+        true,
         agent_strings_tls,
         &string_chunks,
     );
@@ -1127,7 +1151,11 @@ pub(super) fn emit_string_pool(
                     .any(|p| p.is_rest && p.arguments_object.is_none()),
                 has_synth_args: f.params.iter().any(|p| p.arguments_object.is_some()),
                 home: fresh_class_templates.contains(class_name),
-                generator_owner: super::helpers::body_has_fixed_generator_state(&f.body),
+                generator_owner: super::helpers::body_needs_explicit_method_owner(
+                    &f.body,
+                    fresh_class_templates.contains(class_name),
+                ),
+                is_generator: super::helpers::body_has_fixed_generator_state(&f.body),
             });
         }
         // #1787: the standalone constructor `<prefix>__<class>_constructor`
@@ -1275,16 +1303,8 @@ pub(super) fn emit_string_pool(
         };
         let bytes_global = format!("@{}", entry.bytes_global);
         let len_str = entry.byte_len.to_string();
-        // Every class prototype holds a function object of each method's own
-        // body, running this closure-convention entry: its JsFunctionInfo is the
-        // ConstFn fact the prototype's shape records for the method's slot. A
-        // per-evaluation template's evaluations each hold their own object, at
-        // home in that evaluation (`class_method_entry_enter_home`); a declared
-        // class's one object has no home and runs in its receiver's evaluation,
-        // exactly as a vtable call does.
-        // The entries are defined after every init chunk (below), so the
-        // init code module init runs stays contiguous: an entry runs only
-        // when its method value is called.
+        // Each method's callable entry is the prototype shape's ConstFn fact.
+        // Its selected function object retains the lexical class evaluation.
         let home = fresh_cids.contains(&cid);
         let entry_name = format!("{}__eclo", llvm_name);
         let entry_ref = format!("@{}", entry_name);
@@ -1296,10 +1316,16 @@ pub(super) fn emit_string_pool(
             has_user_rest: has_rest,
             has_synth_args,
             home,
-            generator_owner: method_entries::source_is_fixed_generator(
+            is_generator: method_entries::source_is_generator(
                 &local_classes,
                 cid,
                 definition_order,
+            ),
+            generator_owner: method_entries::source_needs_owner(
+                &local_classes,
+                cid,
+                definition_order,
+                home,
             ),
         });
         let bytes_i64 = blk.ptrtoint(&bytes_global, I64);
@@ -1402,10 +1428,16 @@ pub(super) fn emit_string_pool(
                 has_user_rest,
                 has_synth_args,
                 home: fresh_cids.contains(&cid),
-                generator_owner: method_entries::source_is_fixed_generator(
+                is_generator: method_entries::source_is_generator(
                     &local_classes,
                     cid,
                     definition_order,
+                ),
+                generator_owner: method_entries::source_needs_owner(
+                    &local_classes,
+                    cid,
+                    definition_order,
+                    fresh_cids.contains(&cid),
                 ),
             },
         );
@@ -1980,7 +2012,7 @@ pub(super) fn emit_string_pool(
 
 #[path = "fn_info_facts.rs"]
 mod fn_info_facts;
-use fn_info_facts::{FnInfoFactSources, record_fn_info_facts};
+use fn_info_facts::{record_fn_info_facts, FnInfoFactSources};
 
 #[cfg(test)]
 #[path = "class_name_registration_tests.rs"]
@@ -1988,4 +2020,4 @@ mod class_name_registration_tests;
 
 #[path = "method_entries.rs"]
 mod method_entries;
-use method_entries::{StaticMethodEntry, emit_class_method_entry, emit_static_method_entry};
+use method_entries::{emit_class_method_entry, emit_static_method_entry, StaticMethodEntry};

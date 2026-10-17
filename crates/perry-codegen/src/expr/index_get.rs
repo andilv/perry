@@ -28,7 +28,7 @@ use crate::native_value::{
 };
 use crate::rooting;
 use crate::type_analysis::{is_array_expr, is_numeric_expr, is_string_expr, receiver_class_name};
-use crate::types::{DOUBLE, I1, I16, I32, I64, I8};
+use crate::types::{DOUBLE, I1, I32, I64, I8};
 
 use super::{
     array_kind_fact, attach_buffer_view_pointer_state_for_expr,
@@ -47,9 +47,6 @@ pub(crate) use foreign_counter::{
     packed_f64_loop_index_parts, packed_f64_loop_offset_read,
 };
 use foreign_counter::{affine_packed_loop_read, emit_affine_index_i64, foreign_packed_loop_read};
-pub(crate) use guarded_array::{
-    emit_array_region_guard, emit_typed_f64_region_guard, ArrayRegionDense,
-};
 pub(super) mod inline_dyn_typed_array;
 
 use guarded_array::{
@@ -408,9 +405,7 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
         return Ok(None);
     };
     // A planned-bare region read lowers through the value path's hook.
-    if crate::stmt::region_loop::is_bare_index_get(ctx, expr) {
-        return Ok(None);
-    }
+
     // Masked-window fast path first: the dense range guard proved the whole
     // static index window at loop entry, so the read needs neither the static
     // layout proof below nor a per-access guard. The fact can only exist for
@@ -765,15 +760,11 @@ fn lower_bounded_array_index_get_checked(
     let is_fwd = blk.icmp_ne(I8, &fwd_bits, "0");
     let needs_slow = blk.or(I1, &not_array, &is_fwd);
     // Index accessors / custom attribute descriptors (`Object.defineProperty
-    // (arr, i, { get })`) divert element reads through the descriptor tables —
-    // the raw slot load below would bypass them (test262 sort/precise-*).
-    // GcHeader._reserved (u16 at -6) carries OBJ_FLAG_ARRAY_DESCRIPTORS=0x400.
-    let obj_flags_addr = blk.sub(I64, &arr_handle, "6");
-    let obj_flags_ptr = blk.inttoptr(I64, &obj_flags_addr);
-    let obj_flags = blk.load(I16, &obj_flags_ptr);
-    let desc_bits = blk.and(I16, &obj_flags, "1024");
-    let has_desc = blk.icmp_ne(I16, &desc_bits, "0");
-    let needs_slow = blk.or(I1, &needs_slow, &has_desc);
+    // (arr, i, { get })`) divert element reads through the array's named
+    // layout — the raw slot load below would bypass them (test262
+    // sort/precise-*). A null `ArrayHeader.named` proves there is none.
+    let has_named = crate::expr::array_proto_guard::emit_array_has_named_layout(blk, &arr_handle);
+    let needs_slow = blk.or(I1, &needs_slow, &has_named);
     ctx.block().cond_br(&needs_slow, &lazy_label, &fast_label);
 
     ctx.current_block = lazy_idx;
@@ -813,11 +804,28 @@ fn lower_bounded_array_index_get_checked(
     ))
 }
 
+/// Is `object` a confined array binding (`collectors::definite_init`)?
+fn confined_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
+    matches!(object, Expr::LocalGet(id) if ctx.confined_arrays.contains(id))
+}
+
+/// Run `f` (which emits the guarded element tier for an already-lowered
+/// receiver and key) with `FnCtx::confined_array_read` set to `confined`.
+/// Operands are lowered before this, so no nested read sees the flag.
+fn with_confined_read<'a, T>(
+    ctx: &mut FnCtx<'a>,
+    confined: bool,
+    f: impl FnOnce(&mut FnCtx<'a>) -> T,
+) -> T {
+    let previous = std::mem::replace(&mut ctx.confined_array_read, confined);
+    let result = f(ctx);
+    ctx.confined_array_read = previous;
+    result
+}
+
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     // Step 4b / array S3: a planned-bare element read inside a loop region.
-    if let Some(v) = crate::stmt::region_loop::try_lower_bare_index_get(ctx, expr)? {
-        return Ok(v);
-    }
+
     match expr {
         Expr::IndexGet { object, index } => {
             // The private record cursor starts at zero, advances only after a
@@ -855,6 +863,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 crate::codegen::arguments::try_lower_elided_arguments_index_get(ctx, object, index)?
             {
                 return Ok(v);
+            }
+            // A field declared as a typed array: the declared kind selects the
+            // inline owner-brand proof (expr/typed_element.rs).
+            if let Some(value) = super::typed_element::try_lower_read(ctx, object, index, false)? {
+                return Ok(value);
             }
             // A declared array keeps its own tier order below.
             if !is_array_expr(ctx, object) {
@@ -1379,17 +1392,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // while retaining the boxed-receiver helper for every
                     // string, symbol, object and rejected number key.
                     let repair_slot = receiver_repair_slot(ctx, object);
+                    let confined = confined_receiver(ctx, object);
                     return rooting::with_operands_rooted(ctx, &[object, index], |ctx, vals| {
-                        lower_array_index_get_via_canonical_i32_split(
-                            ctx,
-                            &vals[0],
-                            &vals[1],
-                            index,
-                            false,
-                            false,
-                            true,
-                            repair_slot.as_deref(),
-                        )
+                        with_confined_read(ctx, confined, |ctx| {
+                            lower_array_index_get_via_canonical_i32_split(
+                                ctx,
+                                &vals[0],
+                                &vals[1],
+                                index,
+                                false,
+                                false,
+                                true,
+                                repair_slot.as_deref(),
+                            )
+                        })
                     });
                 }
                 if numeric_index_needs_runtime_key(ctx, object.as_ref(), index.as_ref()) {
@@ -1400,17 +1416,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // but recover the guarded element tier for runtime-proven
                     // canonical signed-i32 keys (notably branded number IDs).
                     let repair_slot = receiver_repair_slot(ctx, object);
+                    let confined = confined_receiver(ctx, object);
                     return rooting::with_operands_rooted(ctx, &[object, index], |ctx, vals| {
-                        lower_array_index_get_via_canonical_i32_split(
-                            ctx,
-                            &vals[0],
-                            &vals[1],
-                            index,
-                            false,
-                            false,
-                            false,
-                            repair_slot.as_deref(),
-                        )
+                        with_confined_read(ctx, confined, |ctx| {
+                            lower_array_index_get_via_canonical_i32_split(
+                                ctx,
+                                &vals[0],
+                                &vals[1],
+                                index,
+                                false,
+                                false,
+                                false,
+                                repair_slot.as_deref(),
+                            )
+                        })
                     });
                 }
                 let require_numeric_layout =
@@ -1488,11 +1507,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 }
 
                 let repair_slot = receiver_repair_slot(ctx, object);
+                let confined = confined_receiver(ctx, object);
                 if !numeric_index_has_integer_array_index_proof(ctx, index) {
                     return rooting::with_operands_rooted(ctx, &[object, index], |ctx, vals| {
-                        Ok(lower_array_index_get_via_runtime_key(
-                            ctx, &vals[0], &vals[1], false,
-                        ))
+                        Ok(with_confined_read(ctx, confined, |ctx| {
+                            lower_array_index_get_via_runtime_key(ctx, &vals[0], &vals[1], false)
+                        }))
                     });
                 }
                 // #6132: a member receiver of unknown type (e.g. `n.buf[i]` where
@@ -1510,15 +1530,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &[index],
                     |ctx| lower_expr_as_i32(ctx, index),
                     |ctx, vals, idx_i32| {
-                        lower_guarded_array_index_get(
-                            ctx,
-                            &vals[0],
-                            &idx_i32,
-                            "arr",
-                            require_numeric_layout,
-                            false,
-                            repair_slot.as_deref(),
-                        )
+                        with_confined_read(ctx, confined, |ctx| {
+                            lower_guarded_array_index_get(
+                                ctx,
+                                &vals[0],
+                                &idx_i32,
+                                "arr",
+                                require_numeric_layout,
+                                false,
+                                repair_slot.as_deref(),
+                            )
+                        })
                     },
                 );
             }
@@ -1600,18 +1622,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         "object[index]",
                         TypedFeedbackContract::object_get_by_name(),
                     );
-                    let slot = keyed_slot(ctx);
-                    Ok(ctx.block().call(
-                        DOUBLE,
-                        "js_object_get_field_by_key_site",
-                        &[
-                            (crate::types::PTR, &slot),
-                            (I64, &site_id),
-                            (I64, &obj_handle),
-                            (DOUBLE, key_box),
-                            (DOUBLE, obj_box),
-                        ],
-                    ))
+                    let _ = obj_handle;
+                    // Object model step 5 (§3.7 case 3): the receiver's own
+                    // layout and its chain answer the key's atom
+                    // (`perry_probe_get_keyed`, a GC leaf); only a decline
+                    // takes the complete keyed read.
+                    Ok(symbol_ic::emit_keyed_probe(ctx, obj_box, key_box, |ctx| {
+                        symbol_ic::keyed_slow(ctx, obj_box, key_box, &site_id, false)
+                    }))
                 });
             }
             // Last-resort fallback with runtime tag checks on the index.
@@ -1716,18 +1734,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 );
                 // #10753: the by-key entry answers from shapes before it
                 // takes the by-value read (see the dynamic-string arm above).
-                let slot = keyed_slot(ctx);
-                let v_str = ctx.block().call(
-                    DOUBLE,
-                    "js_object_get_field_by_key_site",
-                    &[
-                        (crate::types::PTR, &slot),
-                        (I64, &site_id),
-                        (I64, &str_obj_handle),
-                        (DOUBLE, &idx_box),
-                        (DOUBLE, &obj_box),
-                    ],
-                );
+                let _ = str_obj_handle;
+                // The probe first (§3.7 case 3), as the dynamic-string arm.
+                let v_str = symbol_ic::emit_keyed_probe(ctx, &obj_box, &idx_box, |ctx| {
+                    symbol_ic::keyed_slow(ctx, &obj_box, &idx_box, &site_id, false)
+                });
                 let str_end_lbl = ctx.block().label.clone();
                 ctx.block().br(&merge_lbl);
                 // Numeric key → polymorphic dispatch.
@@ -1804,13 +1815,4 @@ pub(crate) fn lower_record_next(
     value_slot: &str,
 ) -> Result<(String, String)> {
     guarded_array::lower_record_next(ctx, array, index, protocol, record, index_slot, value_slot)
-}
-
-/// A keyed read owns one lazy PIC slot, just like a named read.
-pub(super) fn keyed_slot(ctx: &mut FnCtx<'_>) -> String {
-    let site = ctx.ic_site_counter;
-    ctx.ic_site_counter += 1;
-    let name = crate::expr::inline_cache_global_name(ctx, site);
-    ctx.ic_globals.push(name.clone());
-    format!("@{name}")
 }

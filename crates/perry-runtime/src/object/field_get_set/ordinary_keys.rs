@@ -12,13 +12,15 @@ pub(super) fn try_keys(obj: *const ObjectHeader) -> Option<*mut ArrayHeader> {
         let record = crate::object::shapes::object_shape_record(obj)?;
         // Dictionary, native namespace and Array-subclass shapes retain their
         // existing enumeration. Class storage retains its internal-key filter.
+        // A layout that can have holes takes the walk that asks `key_view`.
         if !matches!(
             record.object_kind(),
             crate::object::shapes::ShapeObjectKind::Ordinary
                 | crate::object::shapes::ShapeObjectKind::OrdinaryUnmarked
         ) || record.summary()
             & (crate::object::key_attrs::SUMMARY_NON_ENUMERABLE
-                | crate::object::key_attrs::SUMMARY_PRIVATE)
+                | crate::object::key_attrs::SUMMARY_PRIVATE
+                | crate::object::key_attrs::SUMMARY_HOLES)
             != 0
         {
             return None;
@@ -36,19 +38,24 @@ pub(super) fn try_keys(obj: *const ObjectHeader) -> Option<*mut ArrayHeader> {
         }
         // Some dictionary publishers retain an ordinary kind on their keyless
         // shape. The existing private-list edge still proves receiver ownership.
-        if record.keys() == 0 && !(*obj).meta.is_null() && (*(*obj).meta).dictionary_keys != 0 {
+        if super::super::overflow::has_overflow(obj) {
             return None;
         }
         let keys = crate::object::object_keys_from_shape_record(obj, record);
         let order = ecma_own_key_order(keys);
         let count = keys.count();
-        // Allocation can move the receiver and its shape's key backing. Root
-        // the receiver and acquire the current list only after that allocation.
+        // Keep the shape's immutable key prefix across result allocation, which
+        // may collect or reenter. Root its backing directly; neither the receiver
+        // nor a borrowed shape record is needed afterwards. The prefix count and
+        // class-key filter are scalar snapshots of the selected key list.
+        let filter_internal = (*obj).class_id != 0;
         let scope = crate::gc::RuntimeHandleScope::new();
-        let receiver = scope.root_raw_const_ptr(obj);
+        let backing = scope.root_raw_const_ptr(keys.arr());
         let out = crate::array::js_array_alloc(count);
-        receiver.with_const_ptr::<ObjectHeader, _>(|obj| {
-            let keys = crate::object::object_keys(obj);
+        backing.with_const_ptr::<ArrayHeader, _>(|keys| {
+            // Reacquire the rooted backing after allocation, retaining the
+            // generic grow/forward resolution of an ObjectKeys view.
+            let keys = crate::object::ObjectKeys::new(keys.cast_mut(), count);
             let (source, available) = keys.dense_slots();
             let dest = crate::array::array_elements_ptr(out) as *mut f64;
             let mut written = 0;
@@ -63,7 +70,7 @@ pub(super) fn try_keys(obj: *const ObjectHeader) -> Option<*mut ArrayHeader> {
                 if !JSValue::from_bits(value.to_bits()).is_any_string() {
                     continue;
                 }
-                if (*obj).class_id != 0
+                if filter_internal
                     && crate::string::js_string_key_bytes(
                         JSValue::from_bits(value.to_bits()),
                         &mut scratch,
@@ -79,7 +86,11 @@ pub(super) fn try_keys(obj: *const ObjectHeader) -> Option<*mut ArrayHeader> {
                 written += 1;
             }
             (*out).length = written as u32;
-            crate::array::rebuild_array_layout(out);
+            // This array is fresh and unpublished: initialize its exact slot
+            // layout using the same helper as fresh canonical key lists. A bulk
+            // mutation rebuild would revoke element-shape metadata it never had.
+            // The helper retains numeric reclassification and old-parent barriers.
+            crate::object::gc_slots::rebuild_array_layout_from_slots(out);
         });
         Some(out)
     }
@@ -147,7 +158,7 @@ mod tests {
             );
             let dict = crate::object::js_object_alloc(0, 4);
             crate::object::js_object_set_field_by_name(dict, key(b"dict_key"), 1.0);
-            assert!(crate::object::dictionary::latch_object_to_dictionary(dict));
+            assert!(crate::object::overflow::establish_order(dict));
             assert!(
                 try_keys(dict).is_none(),
                 "receiver-owned keys keep their path"

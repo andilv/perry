@@ -278,8 +278,9 @@ fn lower_captureless_some_inline(
             let reserved_addr = blk.sub(I64, &raw, "6");
             let reserved_ptr = blk.inttoptr(I64, &reserved_addr);
             let reserved = blk.load(I16, &reserved_ptr);
-            let descriptors = blk.and(I16, &reserved, "1024"); // OBJ_FLAG_ARRAY_DESCRIPTORS
-            let no_descriptors = blk.icmp_eq(I16, &descriptors, "0");
+            // Element descriptors live in the array's named layout.
+            let has_named = crate::expr::array_proto_guard::emit_array_has_named_layout(blk, &raw);
+            let no_descriptors = blk.xor(I1, &has_named, "true");
             // #10593: the process-wide byte AND this array's own custom-proto bit.
             let prototype_clean =
                 crate::expr::array_proto_guard::emit_array_default_prototype_chain(blk, &reserved);
@@ -440,7 +441,7 @@ fn lower_captureless_some_inline(
     })
 }
 
-fn captureless_some_callback(ctx: &FnCtx<'_>, callback: &Expr) -> Option<String> {
+pub(crate) fn captureless_some_callback(ctx: &FnCtx<'_>, callback: &Expr) -> Option<String> {
     let Expr::Closure {
         func_id,
         params,
@@ -820,6 +821,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             method,
             receiver,
             args,
+            source,
         } => {
             // #7615 slice 2: the receiver sat in a register across every
             // argument's lowering, and each argument across the ones after it.
@@ -829,181 +831,203 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             rooting::with_operands_rooted(ctx, &operands, |ctx, vals| {
                 let recv_box = vals[0].clone();
                 let arg_boxes: Vec<String> = vals[1..].to_vec();
-                let undef = || double_literal(f64::from_bits(TAG_UNDEFINED));
-                let nth = |i: usize| arg_boxes.get(i).cloned();
-                let blk = ctx.block();
-                let result = match method.as_str() {
-                    // Callback iterators: (recv, callback, thisArg).
-                    "forEach" | "map" | "filter" | "some" | "every" | "find" | "findIndex"
-                    | "findLast" | "findLastIndex" => {
-                        let cb = nth(0).unwrap_or_else(undef);
-                        let this_arg = nth(1).unwrap_or_else(undef);
-                        let fname = match method.as_str() {
-                            "forEach" => "js_arraylike_forEach",
-                            "map" => "js_arraylike_map",
-                            "filter" => "js_arraylike_filter",
-                            "some" => "js_arraylike_some",
-                            "every" => "js_arraylike_every",
-                            "find" => "js_arraylike_find",
-                            "findIndex" => "js_arraylike_findIndex",
-                            "findLast" => "js_arraylike_findLast",
-                            _ => "js_arraylike_findLastIndex",
-                        };
-                        blk.call(
-                            DOUBLE,
-                            fname,
-                            &[(DOUBLE, &recv_box), (DOUBLE, &cb), (DOUBLE, &this_arg)],
-                        )
+                // #11915: the method value this call stands for — the
+                // receiver's own `[[Get]]`, or a read of `%Array.prototype%`
+                // (plus `Function.prototype.call`) at the call. A binding
+                // holds the value it captured and needs no proof.
+                use crate::builtin_proto::{BuiltinProto, GenericRead};
+                const RECEIVER: &[BuiltinProto] = &[BuiltinProto::Array];
+                const BORROWED: &[BuiltinProto] = &[BuiltinProto::Array, BuiltinProto::Function];
+                let guard = match source {
+                    perry_hir::ArrayLikeSource::Receiver => Some((RECEIVER, GenericRead::Receiver)),
+                    perry_hir::ArrayLikeSource::Prototype => {
+                        Some((BORROWED, GenericRead::ArrayPrototype))
                     }
-                    // Reducers: (recv, callback, has_init, init).
-                    "reduce" | "reduceRight" => {
-                        let cb = nth(0).unwrap_or_else(undef);
-                        let (has_init, init) = match nth(1) {
-                            Some(i) => ("1".to_string(), i),
-                            None => ("0".to_string(), undef()),
-                        };
-                        let fname = if method == "reduce" {
-                            "js_arraylike_reduce"
-                        } else {
-                            "js_arraylike_reduceRight"
-                        };
-                        blk.call(
-                            DOUBLE,
-                            fname,
-                            &[
-                                (DOUBLE, &recv_box),
-                                (DOUBLE, &cb),
-                                (I32, &has_init),
-                                (DOUBLE, &init),
-                            ],
-                        )
-                    }
-                    // Search: (recv, value, fromIndex, has_from).
-                    "indexOf" | "lastIndexOf" | "includes" => {
-                        let value = nth(0).unwrap_or_else(undef);
-                        let (has_from, from) = match nth(1) {
-                            Some(f) => ("1".to_string(), f),
-                            None => ("0".to_string(), undef()),
-                        };
-                        let fname = match method.as_str() {
-                            "indexOf" => "js_arraylike_indexOf",
-                            "lastIndexOf" => "js_arraylike_lastIndexOf",
-                            _ => "js_arraylike_includes",
-                        };
-                        blk.call(
-                            DOUBLE,
-                            fname,
-                            &[
-                                (DOUBLE, &recv_box),
-                                (DOUBLE, &value),
-                                (DOUBLE, &from),
-                                (I32, &has_from),
-                            ],
-                        )
-                    }
-                    // at(index): ToIntegerOrInfinity(undefined) === 0 when omitted.
-                    "at" => {
-                        let idx = nth(0).unwrap_or_else(undef);
-                        blk.call(
-                            DOUBLE,
-                            "js_arraylike_at",
-                            &[(DOUBLE, &recv_box), (DOUBLE, &idx)],
-                        )
-                    }
-                    // join(separator?): undefined separator → comma.
-                    "join" => {
-                        let sep = nth(0).unwrap_or_else(undef);
-                        blk.call(
-                            DOUBLE,
-                            "js_arraylike_join",
-                            &[(DOUBLE, &recv_box), (DOUBLE, &sep)],
-                        )
-                    }
-                    // flat(depth?): undefined selects the default depth 1.
-                    "flat" => {
-                        let depth = nth(0).unwrap_or_else(undef);
-                        blk.call(
-                            DOUBLE,
-                            "js_arraylike_flat",
-                            &[(DOUBLE, &recv_box), (DOUBLE, &depth)],
-                        )
-                    }
-                    // slice(start?, end?): has-flags distinguish omitted from undefined.
-                    "slice" => {
-                        let (has_start, start) = match nth(0) {
-                            Some(s) => ("1".to_string(), s),
-                            None => ("0".to_string(), undef()),
-                        };
-                        let (has_end, end) = match nth(1) {
-                            Some(e) => ("1".to_string(), e),
-                            None => ("0".to_string(), undef()),
-                        };
-                        blk.call(
-                            DOUBLE,
-                            "js_arraylike_slice",
-                            &[
-                                (DOUBLE, &recv_box),
-                                (DOUBLE, &start),
-                                (I32, &has_start),
-                                (DOUBLE, &end),
-                                (I32, &has_end),
-                            ],
-                        )
-                    }
-                    // sort(comparator?): validated + run by the runtime engine.
-                    "sort" => {
-                        let cmp = nth(0).unwrap_or_else(undef);
-                        blk.call(
-                            DOUBLE,
-                            "js_arraylike_sort",
-                            &[(DOUBLE, &recv_box), (DOUBLE, &cmp)],
-                        )
-                    }
-                    // splice(...) / concat(...): variadic — pass an alloca buffer
-                    // of raw NaN-boxed doubles + count (mirrors the dense
-                    // `js_array_concat_variadic` lowering).
-                    "splice" | "concat" => {
-                        // #10463: an entry-block buffer; allocated in the
-                        // current block it grew the stack per loop iteration.
-                        let (buf_reg, count_str) = lower_js_args_array(ctx, &arg_boxes);
-                        let fname = if method == "splice" {
-                            "js_arraylike_splice"
-                        } else {
-                            "js_arraylike_concat"
-                        };
-                        ctx.block().call(
-                            DOUBLE,
-                            fname,
-                            &[(DOUBLE, &recv_box), (PTR, &buf_reg), (I32, &count_str)],
-                        )
-                    }
-                    // pop() / shift(): no args, generic over a value receiver.
-                    "pop" | "shift" => {
-                        let fname = if method == "pop" {
-                            "js_arraylike_pop"
-                        } else {
-                            "js_arraylike_shift"
-                        };
-                        blk.call(DOUBLE, fname, &[(DOUBLE, &recv_box)])
-                    }
-                    // push(...) / unshift(...): variadic — pass an alloca buffer of
-                    // raw NaN-boxed doubles + count (mirrors splice/concat above).
-                    "push" | "unshift" => {
-                        let (buf_reg, count_str) = lower_js_args_array(ctx, &arg_boxes);
-                        let fname = if method == "push" {
-                            "js_arraylike_push"
-                        } else {
-                            "js_arraylike_unshift"
-                        };
-                        ctx.block().call(
-                            DOUBLE,
-                            fname,
-                            &[(DOUBLE, &recv_box), (PTR, &buf_reg), (I32, &count_str)],
-                        )
-                    }
-                    other => bail!("unsupported generic array-like method '{other}'"),
+                    perry_hir::ArrayLikeSource::Binding => None,
                 };
-                Ok(result)
+                let direct = |ctx: &mut FnCtx<'_>| -> Result<String> {
+                    let undef = || double_literal(f64::from_bits(TAG_UNDEFINED));
+                    let nth = |i: usize| arg_boxes.get(i).cloned();
+                    let blk = ctx.block();
+                    let result = match method.as_str() {
+                        // Callback iterators: (recv, callback, thisArg).
+                        "forEach" | "map" | "filter" | "some" | "every" | "find" | "findIndex"
+                        | "findLast" | "findLastIndex" => {
+                            let cb = nth(0).unwrap_or_else(undef);
+                            let this_arg = nth(1).unwrap_or_else(undef);
+                            let fname = match method.as_str() {
+                                "forEach" => "js_arraylike_forEach",
+                                "map" => "js_arraylike_map",
+                                "filter" => "js_arraylike_filter",
+                                "some" => "js_arraylike_some",
+                                "every" => "js_arraylike_every",
+                                "find" => "js_arraylike_find",
+                                "findIndex" => "js_arraylike_findIndex",
+                                "findLast" => "js_arraylike_findLast",
+                                _ => "js_arraylike_findLastIndex",
+                            };
+                            blk.call(
+                                DOUBLE,
+                                fname,
+                                &[(DOUBLE, &recv_box), (DOUBLE, &cb), (DOUBLE, &this_arg)],
+                            )
+                        }
+                        // Reducers: (recv, callback, has_init, init).
+                        "reduce" | "reduceRight" => {
+                            let cb = nth(0).unwrap_or_else(undef);
+                            let (has_init, init) = match nth(1) {
+                                Some(i) => ("1".to_string(), i),
+                                None => ("0".to_string(), undef()),
+                            };
+                            let fname = if method == "reduce" {
+                                "js_arraylike_reduce"
+                            } else {
+                                "js_arraylike_reduceRight"
+                            };
+                            blk.call(
+                                DOUBLE,
+                                fname,
+                                &[
+                                    (DOUBLE, &recv_box),
+                                    (DOUBLE, &cb),
+                                    (I32, &has_init),
+                                    (DOUBLE, &init),
+                                ],
+                            )
+                        }
+                        // Search: (recv, value, fromIndex, has_from).
+                        "indexOf" | "lastIndexOf" | "includes" => {
+                            let value = nth(0).unwrap_or_else(undef);
+                            let (has_from, from) = match nth(1) {
+                                Some(f) => ("1".to_string(), f),
+                                None => ("0".to_string(), undef()),
+                            };
+                            let fname = match method.as_str() {
+                                "indexOf" => "js_arraylike_indexOf",
+                                "lastIndexOf" => "js_arraylike_lastIndexOf",
+                                _ => "js_arraylike_includes",
+                            };
+                            blk.call(
+                                DOUBLE,
+                                fname,
+                                &[
+                                    (DOUBLE, &recv_box),
+                                    (DOUBLE, &value),
+                                    (DOUBLE, &from),
+                                    (I32, &has_from),
+                                ],
+                            )
+                        }
+                        // at(index): ToIntegerOrInfinity(undefined) === 0 when omitted.
+                        "at" => {
+                            let idx = nth(0).unwrap_or_else(undef);
+                            blk.call(
+                                DOUBLE,
+                                "js_arraylike_at",
+                                &[(DOUBLE, &recv_box), (DOUBLE, &idx)],
+                            )
+                        }
+                        // join(separator?): undefined separator → comma.
+                        "join" => {
+                            let sep = nth(0).unwrap_or_else(undef);
+                            blk.call(
+                                DOUBLE,
+                                "js_arraylike_join",
+                                &[(DOUBLE, &recv_box), (DOUBLE, &sep)],
+                            )
+                        }
+                        // flat(depth?): undefined selects the default depth 1.
+                        "flat" => {
+                            let depth = nth(0).unwrap_or_else(undef);
+                            blk.call(
+                                DOUBLE,
+                                "js_arraylike_flat",
+                                &[(DOUBLE, &recv_box), (DOUBLE, &depth)],
+                            )
+                        }
+                        // slice(start?, end?): has-flags distinguish omitted from undefined.
+                        "slice" => {
+                            let (has_start, start) = match nth(0) {
+                                Some(s) => ("1".to_string(), s),
+                                None => ("0".to_string(), undef()),
+                            };
+                            let (has_end, end) = match nth(1) {
+                                Some(e) => ("1".to_string(), e),
+                                None => ("0".to_string(), undef()),
+                            };
+                            blk.call(
+                                DOUBLE,
+                                "js_arraylike_slice",
+                                &[
+                                    (DOUBLE, &recv_box),
+                                    (DOUBLE, &start),
+                                    (I32, &has_start),
+                                    (DOUBLE, &end),
+                                    (I32, &has_end),
+                                ],
+                            )
+                        }
+                        // sort(comparator?): validated + run by the runtime engine.
+                        "sort" => {
+                            let cmp = nth(0).unwrap_or_else(undef);
+                            blk.call(
+                                DOUBLE,
+                                "js_arraylike_sort",
+                                &[(DOUBLE, &recv_box), (DOUBLE, &cmp)],
+                            )
+                        }
+                        // splice(...) / concat(...): variadic — pass an alloca buffer
+                        // of raw NaN-boxed doubles + count (mirrors the dense
+                        // `js_array_concat_variadic` lowering).
+                        "splice" | "concat" => {
+                            // #10463: an entry-block buffer; allocated in the
+                            // current block it grew the stack per loop iteration.
+                            let (buf_reg, count_str) = lower_js_args_array(ctx, &arg_boxes);
+                            let fname = if method == "splice" {
+                                "js_arraylike_splice"
+                            } else {
+                                "js_arraylike_concat"
+                            };
+                            ctx.block().call(
+                                DOUBLE,
+                                fname,
+                                &[(DOUBLE, &recv_box), (PTR, &buf_reg), (I32, &count_str)],
+                            )
+                        }
+                        // pop() / shift(): no args, generic over a value receiver.
+                        "pop" | "shift" => {
+                            let fname = if method == "pop" {
+                                "js_arraylike_pop"
+                            } else {
+                                "js_arraylike_shift"
+                            };
+                            blk.call(DOUBLE, fname, &[(DOUBLE, &recv_box)])
+                        }
+                        // push(...) / unshift(...): variadic — pass an alloca buffer of
+                        // raw NaN-boxed doubles + count (mirrors splice/concat above).
+                        "push" | "unshift" => {
+                            let (buf_reg, count_str) = lower_js_args_array(ctx, &arg_boxes);
+                            let fname = if method == "push" {
+                                "js_arraylike_push"
+                            } else {
+                                "js_arraylike_unshift"
+                            };
+                            ctx.block().call(
+                                DOUBLE,
+                                fname,
+                                &[(DOUBLE, &recv_box), (PTR, &buf_reg), (I32, &count_str)],
+                            )
+                        }
+                        other => bail!("unsupported generic array-like method '{other}'"),
+                    };
+                    Ok(result)
+                };
+                match guard {
+                    Some((families, read)) => crate::builtin_proto::emit_guarded_direct(
+                        ctx, families, read, &recv_box, method, &arg_boxes, direct,
+                    ),
+                    None => direct(ctx),
+                }
             })
         }
 
@@ -1345,29 +1369,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // first enforces ECMA-262 13.10.1 step 5: a non-Object right operand
         // (`"x" in 5`, `... in null`, `... in Symbol()`, …) throws a TypeError.
         Expr::In { property, object } => {
-            // Fixed keys retain the inline own-hit arm. Dynamic keys share
-            // the existing keyed entry through the one runtime operation.
-            let constant_key = matches!(&**property, Expr::String(_))
-                && !crate::codegen::full_outline_ic_enabled();
+            // HasProperty through the object's own layout (the shape
+            // presence answer), then the complete operation; no site state.
             rooting::with_operands_rooted(ctx, &[property, object], |ctx, vals| {
-                if constant_key {
-                    return Ok(super::in_presence_ic::lower_in_presence_ic(
-                        ctx, &vals[1], &vals[0],
-                    ));
-                }
-                let site = ctx.ic_site_counter;
-                ctx.ic_site_counter += 1;
-                let name = super::inline_cache_global_name(ctx, site);
-                ctx.ic_globals.push(name.clone());
-                let slot_ref = format!("@{name}");
                 Ok(ctx.block().call(
                     DOUBLE,
-                    "js_in_operator_presence_ic",
-                    &[
-                        (DOUBLE, &vals[1]),
-                        (DOUBLE, &vals[0]),
-                        (crate::types::PTR, &slot_ref),
-                    ],
+                    "js_in_operator",
+                    &[(DOUBLE, &vals[1]), (DOUBLE, &vals[0])],
                 ))
             })
         }
@@ -1626,6 +1634,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // `target` is evaluated exactly once and threaded through each source.
         // Refs #590.
         Expr::ObjectAssign { target, sources } => {
+            // Object model step 1: an `Object.create(P)` family's birth.
+            if let Some(site) = crate::layout_desc::create_families::site(expr) {
+                return crate::layout_desc::create_families::lower_assign(ctx, &site, expr);
+            }
             let target_box = lower_expr(ctx, target)?;
             let acc = ctx.block().call(
                 DOUBLE,

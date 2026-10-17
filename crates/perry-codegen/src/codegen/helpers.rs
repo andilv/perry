@@ -448,6 +448,14 @@ pub fn worker_entries() -> Vec<(String, String)> {
     WORKER_ENTRIES.lock().unwrap().clone()
 }
 
+/// The contract-check build: `PERRY_CHECK_CONTRACTS=1` while compiling. The
+/// same knob builds the runtime with its contract assertions
+/// (`perry-runtime` `entry_contracts`); codegen then emits the run-time
+/// witness of each inline proof it admits (`js_typed_element_contract`).
+pub(crate) fn check_contracts() -> bool {
+    std::env::var("PERRY_CHECK_CONTRACTS").as_deref() == Ok("1")
+}
+
 /// Gen-GC write-barrier emission gate. Default ON: emit a
 /// `js_write_barrier_slot(parent_bits, slot_addr, child_bits)` call, or
 /// the compatibility wrapper, after every heap-store site. Set
@@ -534,9 +542,9 @@ pub(crate) fn module_callable_count(hir: &perry_hir::Module) -> usize {
 }
 
 /// Decide whether a module is large enough to warrant full-outlining its
-/// class-field IC diamonds (#5334 lever B). Collapsing each inline diamond's
-/// ~15-line-per-site expansion to one `call @js_class_field_set_ic(...)` keeps
-/// large functions tractable for LLVM's `-O3` pipeline. Gated on the module's
+/// property IC diamonds (#5334 lever B). Collapsing each inline diamond's
+/// per-site expansion to one outlined call keeps large functions tractable
+/// for LLVM's `-O3` pipeline. Gated on the module's
 /// total callable count (see
 /// [`module_callable_count`]) — the defining trait of the pathological
 /// minified-bundle case (tens of thousands of callables in one module);
@@ -1153,7 +1161,7 @@ fn has_numeric_version_suffix(component: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod target_os_tests {
-    use super::{TARGET_NAMES, default_target_triple, resolve_target_triple, target_os_of};
+    use super::{default_target_triple, resolve_target_triple, target_os_of, TARGET_NAMES};
 
     #[test]
     fn target_aliases_resolve_and_classify_to_the_rust_target_os() {
@@ -1830,4 +1838,25 @@ pub(crate) fn body_has_fixed_generator_state(body: &[perry_hir::Stmt]) -> bool {
             }))
         )
     })
+}
+
+/// Whether the body needs the selected method's lexical function object.
+pub(crate) fn body_needs_method_owner(body: &[perry_hir::Stmt]) -> bool {
+    body_has_fixed_generator_state(body)
+        || body.iter().any(|s| {
+            matches!(
+                s,
+                perry_hir::Stmt::Let {
+                    init: Some(perry_hir::Expr::ClassMethodHome { .. }),
+                    ..
+                }
+            )
+        })
+}
+
+/// A once-evaluated class has one lexical home: its direct body and callable
+/// entry can share that body. Only generators (which retain the callable in
+/// their resume state) and per-evaluation homes need an explicit owner ABI.
+pub(crate) fn body_needs_explicit_method_owner(body: &[perry_hir::Stmt], fresh: bool) -> bool {
+    body_has_fixed_generator_state(body) || (fresh && body_needs_method_owner(body))
 }

@@ -408,6 +408,10 @@ pub(super) fn compile_module_entry(
                 );
             }
             blk.call_void("js_gc_init", &[]);
+            blk.call_void(
+                "perry_array_iteration_init",
+                &[(I32, &crate::expr::array_program_facts().to_string())],
+            );
             // Design step 4: mint the program's static literal ids in this
             // agent before any module init or user code (the seed unit the
             // driver links registers the function; none = a no-op).
@@ -739,6 +743,10 @@ pub(super) fn compile_module_entry(
             locals: HashMap::new(),
             local_types: init_local_types,
             proven_local_types: HashMap::new(),
+            typed_locals: std::collections::HashMap::new(),
+            code_unit_locals: std::collections::HashSet::new(),
+            confined_arrays: &cross_module.definite_init.confined,
+            confined_array_read: false,
             guarded_discriminant_aliases: HashMap::new(),
             module_global_proven_types: &cross_module.module_global_proven_types,
             module_global_transfers: &cross_module.module_global_transfers,
@@ -761,10 +769,15 @@ pub(super) fn compile_module_entry(
             pending_labels: Vec::new(),
             classes,
             class_hierarchy: &cross_module.class_hierarchy,
+            wpfacts: cross_module.wpfacts.clone(),
+            program_layouts: cross_module.program_layouts.clone(),
+            wpfacts_sites: 0,
+            wpfacts_tested: Vec::new(),
+            wpfacts_this: Vec::new(),
             this_stack: Vec::new(),
             super_called_stack: Vec::new(),
             shared_super_scope_active: false,
-            lexical_this_uses_derived_binding: false,
+            lexical_this_uses_derived_binding: None,
             inline_ctor_return: Vec::new(),
             new_target_stack: Vec::new(),
             class_stack: Vec::new(),
@@ -824,6 +837,7 @@ pub(super) fn compile_module_entry(
             local_func_ref_ids: HashMap::new(),
             option_object_locals: HashMap::new(),
             object_literal_locals: HashSet::new(),
+            constructed_kind_locals: HashMap::new(),
             namespace_imports: &cross_module.namespace_imports,
             namespace_member_prefixes: &cross_module.namespace_member_prefixes,
             namespace_member_nested: &cross_module.namespace_member_nested,
@@ -848,6 +862,7 @@ pub(super) fn compile_module_entry(
             imported_class_original_names: &cross_module.imported_class_original_names,
             interfaces: &cross_module.interfaces,
             try_depth: 0,
+            derived_super_closes: Vec::new(),
             pending_declares: Vec::new(),
             pending_helpers: Vec::new(),
             array_record_length_local: None,
@@ -907,6 +922,8 @@ pub(super) fn compile_module_entry(
             spec_ta_ready: std::collections::HashSet::new(),
             spec_i32_params: std::collections::HashSet::new(),
             spec_bool_params: std::collections::HashSet::new(),
+            typed_element_locals: std::collections::HashSet::new(),
+            class_guard_window: None,
             i1_local_slots: HashMap::new(),
             index_used_locals: main_native_facts.index_used_locals(),
             strictly_i32_bounded_locals: main_native_facts.strictly_i32_bounded_locals(),
@@ -985,7 +1002,6 @@ pub(super) fn compile_module_entry(
             was_unrolled: hir.init_was_unrolled,
             ic_site_counter: ic_base,
             ic_globals: Vec::new(),
-            property_get_ic_override: None,
             typed_parse_rodata: Vec::new(),
             buffer_data_slots: HashMap::new(),
             native_arena_owner_aliases: HashMap::new(),

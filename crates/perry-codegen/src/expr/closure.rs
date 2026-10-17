@@ -131,6 +131,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // indices.
             let auto_captures = compute_auto_captures(ctx, params, body, captures);
             for cap_id in &auto_captures {
+                crate::codegen::arguments::ensure_arguments_object(ctx, *cap_id);
+            }
+            for cap_id in &auto_captures {
                 super::downgrade_buffer_alias(
                     ctx,
                     *cap_id,
@@ -259,10 +262,12 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // `capture_count` field. Used by `clone_closure_rebind_this` at
             // `Object.defineProperty(obj, k, { get(){}, set(){} })` time so
             // accessor invocation sees `this === obj` per spec.
+            // Validate before truncating to the packed header word.
+            let total_caps_word = crate::runtime_abi::checked_closure_capture_count(total_caps);
             let cap_count_val = if *captures_this {
-                (total_caps as u32) | 0x8000_0000u32
+                total_caps_word | 0x8000_0000u32
             } else {
-                total_caps as u32
+                total_caps_word
             };
             let cap_count = cap_count_val.to_string();
             // Closures with NO captures (and no `this` to patch) are

@@ -36,13 +36,11 @@ fn prepare() {
     gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
     gc_register_mutable_root_scanner(crate::object::scan_transition_cache_roots_mut);
     gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
-    gc_register_mutable_root_scanner(crate::iter_result::scan_iter_result_keys_roots_mut);
-    gc_register_mutable_root_scanner(crate::symbol::scan_symbol_side_table_roots_mut);
+    crate::gc::initialize_runtime_fixture();
     assert!(crate::object::iterator_prototype_for_class_id(
         crate::iterator_helpers::ITERATOR_HELPER_CLASS_ID
     )
     .is_some());
-    crate::iter_result::reset_shared_keys_for_test();
     COPIED.with(|count| count.set(0));
     ORDER.with(|order| order.set(0));
 }
@@ -814,7 +812,7 @@ fn array_stack_entry_refreshes_getter_factory_and_next_after_moving_collection()
         js_shadow_slot_bind(2, std::ptr::addr_of_mut!(stack.next).cast());
         js_shadow_slot_bind(3, std::ptr::addr_of_mut!(stack.value).cast());
         assert_eq!(
-            crate::array::js_array_record_stack_enter(&mut stack, std::ptr::null(), 0),
+            crate::array::js_array_record_stack_enter(&mut stack, 1, 0),
             1
         );
         assert_relocated(crate::value::js_nanbox_get_pointer(before) as usize);

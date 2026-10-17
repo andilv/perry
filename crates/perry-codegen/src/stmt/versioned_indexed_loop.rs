@@ -317,8 +317,11 @@ fn emit_array_admission(
     let not_forwarded = ctx.block().icmp_eq(I8, &forwarded, "0");
     let reserved_shifted = ctx.block().lshr(I64, &gc_header, "16");
     let reserved = ctx.block().trunc(I64, &reserved_shifted, I16);
-    let descriptors = ctx.block().and(I16, &reserved, "1024");
-    let no_descriptors = ctx.block().icmp_eq(I16, &descriptors, "0");
+    // An element descriptor lives in the array's named layout: admit a null
+    // `ArrayHeader.named` (the per-iteration guard re-tests it).
+    let has_named =
+        crate::expr::array_proto_guard::emit_array_has_named_layout(ctx.block(), &live_handle);
+    let no_descriptors = ctx.block().xor(I1, &has_named, "true");
     // #10593: the process-wide byte AND this array's own custom-proto bit.
     // The per-iteration guard re-tests the byte and compares the whole header
     // fingerprint, which includes that bit, so a mid-loop retarget exits.
@@ -374,6 +377,11 @@ pub(super) fn emit_iteration_guard(ctx: &mut FnCtx<'_>) -> bool {
     let array_invalidated = ctx
         .block()
         .load_volatile(I8, "@PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED");
+    let array_invalidated = ctx.block().and(
+        I8,
+        &array_invalidated,
+        crate::expr::array_proto_guard::INDEX_INVALIDATED_I8,
+    );
     let mut pass = ctx.block().icmp_eq(I8, &array_invalidated, "0");
     let mut live_handles = HashMap::new();
 
@@ -390,10 +398,16 @@ pub(super) fn emit_iteration_guard(ctx: &mut FnCtx<'_>) -> bool {
             .block()
             .icmp_eq(I128, &current, &array.expected_fingerprint);
         pass = ctx.block().and(I1, &pass, &unchanged);
+        // The fingerprint stops at `capacity`; a descriptor the body installs
+        // gives the array a named layout.
+        let has_named =
+            crate::expr::array_proto_guard::emit_array_has_named_layout(ctx.block(), &array_handle);
+        let no_named = ctx.block().xor(I1, &has_named, "true");
+        pass = ctx.block().and(I1, &pass, &no_named);
         live_handles.insert(array.local_id, array_handle);
     }
 
-    let holder_ok = crate::lower_call::holder_shape_guard::method_guard(
+    let holder_ok = crate::proto_constants::holder_constant(
         ctx,
         &fact.method.class_name,
         &fact.method.method_name,
@@ -568,11 +582,8 @@ pub(super) fn lower(
         .expect("matched method body has this storage")
         .clone();
     let this_box = ctx.block().load(DOUBLE, &this_slot);
-    let holder_ok = crate::lower_call::holder_shape_guard::method_guard(
-        ctx,
-        &candidate.class_name,
-        &candidate.method_name,
-    );
+    let holder_ok =
+        crate::proto_constants::holder_constant(ctx, &candidate.class_name, &candidate.method_name);
     crate::lower_call::emit_inline_direct_method_shape_guard(
         ctx,
         &this_box,

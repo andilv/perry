@@ -4,7 +4,7 @@ use super::*;
 /// Wall 10 — resolve and invoke a method that a framework attached to a native
 /// registry handle via `Object.setPrototypeOf(handle, proto)` (Express's
 /// augmented `res.send` / `req.accepts` / …). The link was recorded in the
-/// `OBJECT_PROTOTYPES` side-table keyed by the handle id (see
+/// owner property bag for the handle id (see
 /// `js_object_set_prototype_of`). Walk it via `resolve_inherited_field`; if the
 /// resolved member is a callable closure, invoke it with `this` bound to the
 /// handle value (`object`) so the method's internal `this.end(...)` /
@@ -72,9 +72,9 @@ pub(super) unsafe fn dispatch_handle(
     // Check if this is a handle-based object (small integer, not a real heap pointer)
     // Handles are used by Fastify and other native modules that store
     // objects in a registry and use integer IDs to reference them.
-    if jsval.is_pointer() {
-        let raw_ptr = jsval.as_pointer::<u8>() as usize;
-        if crate::value::addr_class::is_small_handle(raw_ptr) {
+    if jsval.is_reference() {
+        let raw_ptr = (jsval.bits() & crate::value::POINTER_MASK) as usize;
+        if jsval.is_handle() {
             // This is a handle, not a real memory pointer - dispatch to stdlib
             if let Some(dispatch) = handle_method_dispatch() {
                 let r = dispatch(
@@ -952,7 +952,10 @@ pub(super) unsafe fn dispatch_handle(
                             key_count as u32,
                             method_name.as_bytes(),
                         ) {
-                            let field_val = js_object_get_field(obj as *mut _, slot);
+                            let field_val = crate::object::field_get_set::js_object_get_key_field(
+                                obj as *const _,
+                                slot,
+                            );
                             // Always try the field as a callable —
                             // `js_native_call_value` validates
                             // CLOSURE_MAGIC internally and safely

@@ -7,6 +7,8 @@ use super::search_params::{create_url_search_params_object, parse_query_string};
 /// Simple URL parser
 /// Returns (protocol, host, hostname, port, pathname, search, hash)
 pub(crate) fn parse_url(url_str: &str) -> (String, String, String, String, String, String, String) {
+    let normalized_url = normalize_file_drive_authority(url_str);
+    let url_str = normalized_url.as_str();
     let mut protocol = String::new();
     // #854: `host`, `hostname`, `pathname` are always set by the file: /
     // non-file branches below, so the initial empty strings were dead
@@ -407,15 +409,21 @@ pub(crate) fn create_url_object(url_string: &str) -> *mut ObjectHeader {
         format!("{}//{}", protocol, host)
     };
 
-    // Allocate object with URL_FIELD_COUNT fields
-    // Using class_id 0 for now (generic object)
-    let obj = js_object_alloc(0, URL_FIELD_COUNT);
+    // Component storage and its intrinsic prototype are declared at startup.
+    let obj = unsafe {
+        let obj = crate::object::layout_desc::perry_alloc_layout(std::ptr::addr_of!(
+            crate::object::runtime_layouts::URL_COMPONENTS
+        ));
+        // GC_STORE_AUDIT(POINTER_FREE): immutable runtime family brand.
+        (*obj).class_id = crate::object::runtime_layouts::URL_CLASS_ID;
+        obj
+    };
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj_h = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(obj as i64));
 
-    // The numbered fields are internal URL state. Named properties live on
-    // URL.prototype; an expando write seeds twelve tombstone keys before its
-    // first append so it cannot overwrite these fields.
+    // The declared private slots hold URL state. Public names remain on
+    // URL.prototype; expandos append after the private slots without seeding
+    // a tombstone layout on the first write.
 
     // Set all the URL properties
     let set_string = |field, text: &str| {
@@ -469,12 +477,7 @@ pub(crate) fn create_url_object(url_string: &str) -> *mut ObjectHeader {
             ptr => crate::value::js_nanbox_pointer(ptr),
         }
     };
-    if proto.to_bits() != crate::value::TAG_UNDEFINED {
-        crate::object::prototype_chain::object_link_class_default_prototype(
-            crate::value::js_nanbox_get_pointer(obj_h.get_nanbox_f64()) as usize,
-            proto.to_bits(),
-        );
-    }
+    debug_assert_ne!(proto.to_bits(), crate::value::TAG_UNDEFINED);
     crate::value::js_nanbox_get_pointer(obj_h.get_nanbox_f64()) as *mut ObjectHeader
 }
 
@@ -567,7 +570,8 @@ pub(crate) unsafe fn rebuild_url_host(url: *mut ObjectHeader) {
 /// scheme-specific data. Used by `URL.canParse` / `URL.parse` to mirror
 /// the validation Node's WHATWG parser performs before constructing.
 pub(crate) fn is_valid_absolute_url(s: &str) -> bool {
-    let s = s.trim();
+    let normalized = normalize_file_drive_authority(s.trim());
+    let s = normalized.as_str();
     if s.is_empty() {
         return false;
     }
@@ -618,6 +622,36 @@ pub(crate) fn is_valid_absolute_url(s: &str) -> bool {
         return false;
     }
     true
+}
+
+/// WHATWG treats a Windows drive letter after `file://` as the beginning of
+/// the path, not as an authority host. Backslashes are path separators in
+/// this file-URL form, but query and fragment bytes are left untouched.
+pub(super) fn normalize_file_drive_authority(input: &str) -> String {
+    let Some(colon) = input.find(':') else {
+        return input.to_string();
+    };
+    if !input[..colon].eq_ignore_ascii_case("file") || !input[colon + 1..].starts_with("//") {
+        return input.to_string();
+    }
+
+    let authority_start = colon + 3;
+    let url_end = input[authority_start..]
+        .find(['?', '#'])
+        .map_or(input.len(), |offset| authority_start + offset);
+    let tail = &input[url_end..];
+    let authority_and_path = &input[authority_start..url_end];
+    let drive_end = authority_and_path
+        .find(['/', '\\'])
+        .unwrap_or(authority_and_path.len());
+    let authority = &authority_and_path[..drive_end];
+    let drive_bytes = authority.as_bytes();
+    if drive_bytes.len() != 2 || !drive_bytes[0].is_ascii_alphabetic() || drive_bytes[1] != b':' {
+        return input.to_string();
+    }
+
+    let rest = authority_and_path[drive_end..].replace('\\', "/");
+    format!("{}///{}{}{}", &input[..=colon], authority, rest, tail)
 }
 
 fn is_valid_url_authority(scheme: &str, authority: &str) -> bool {

@@ -36,6 +36,10 @@ pub enum LoadFlavor {
     Aligned(u32),
     Volatile,
     AtomicMonotonic(u32),
+    /// `load atomic … unordered`: a monotone runtime latch (#11915). Atomic,
+    /// so a concurrent writer is not a data race, but with no ordering, so the
+    /// backend may fold it into a compare with memory and merge repeats.
+    AtomicUnordered(u32),
     AtomicAcquire(u32),
     AtomicSeqCst(u32),
     /// `!invariant.load !0` tagged (issue #52).
@@ -64,6 +68,13 @@ pub enum LlInst {
     FNeg {
         dst: String,
         pre: &'static str,
+        a: String,
+    },
+    /// `dst = freeze <ty> a`: a poison operand becomes an arbitrary fixed
+    /// value. Lets an `fptosi` round trip test exactness without UB.
+    Freeze {
+        dst: String,
+        ty: LlvmType,
         a: String,
     },
     FCmp {
@@ -132,6 +143,8 @@ pub enum LlInst {
         /// transitive effect analysis; this flag only controls caller-side
         /// root relocation and the emitted RS4GC attribute.
         gc_leaf: bool,
+        /// Keep a cold selected-body call out of the caller.
+        no_inline: bool,
     },
     /// Opaque-pointer indirect call. The callee operand itself is a `ptr`;
     /// argument types remain explicit at the call site.
@@ -198,6 +211,9 @@ impl LlInst {
             LlInst::FNeg { dst, pre, a } => {
                 let _ = write!(out, "  {dst} = fneg {pre}double {a}");
             }
+            LlInst::Freeze { dst, ty, a } => {
+                let _ = write!(out, "  {dst} = freeze {ty} {a}");
+            }
             LlInst::FCmp {
                 dst,
                 pred,
@@ -244,6 +260,12 @@ impl LlInst {
                     let _ = write!(
                         out,
                         "  {dst} = load atomic {ty}, ptr {ptr} acquire, align {n}"
+                    );
+                }
+                LoadFlavor::AtomicUnordered(n) => {
+                    let _ = write!(
+                        out,
+                        "  {dst} = load atomic {ty}, ptr {ptr} unordered, align {n}"
                     );
                 }
                 LoadFlavor::AtomicSeqCst(n) => {
@@ -298,6 +320,7 @@ impl LlInst {
                 args,
                 cconv,
                 gc_leaf,
+                no_inline,
             } => {
                 out.push_str("  ");
                 if let Some(d) = dst {
@@ -313,6 +336,9 @@ impl LlInst {
                 }
                 push_args(out, args);
                 out.push(')');
+                if *no_inline {
+                    out.push_str(" noinline");
+                }
                 if *gc_leaf {
                     out.push_str(" \"gc-leaf-function\"");
                 }
@@ -437,6 +463,26 @@ impl LlInst {
             }
             LlInst::CallIndirect { .. } => true,
             _ => false,
+        }
+    }
+}
+
+impl LlInst {
+    /// The callee symbol of a direct call (without `@`), for the typed-body
+    /// admission count (`codegen/typed_body.rs`). Pre-rendered `Raw` calls are
+    /// read from their text.
+    pub(crate) fn direct_callee(&self) -> Option<&str> {
+        match self {
+            LlInst::Call { callee, .. } => Some(callee.as_str()),
+            LlInst::Raw(line) => {
+                let at = line.find("call ")?;
+                let rest = &line[at..];
+                let sym = rest.find('@')?;
+                let name = &rest[sym + 1..];
+                let end = name.find('(')?;
+                Some(&name[..end])
+            }
+            _ => None,
         }
     }
 }

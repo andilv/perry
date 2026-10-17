@@ -12,6 +12,7 @@ const MAX_FIELDS: usize = 32;
 unsafe fn primitive(bits: u64) -> bool {
     bits != crate::value::TAG_HOLE
         && bits & crate::value::TAG_MASK != POINTER_TAG
+        && bits & crate::value::TAG_MASK != crate::value::HANDLE_TAG
         && bits & crate::value::TAG_MASK != BIGINT_TAG
         && !is_raw_pointer(bits)
 }
@@ -102,7 +103,7 @@ unsafe fn primitive_array(arr: *const crate::ArrayHeader) -> bool {
         || (header.size as usize)
             < crate::gc::GC_HEADER_SIZE + std::mem::size_of::<crate::ArrayHeader>()
         || (*arr).length > (*arr).capacity
-        || header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+        || !(*arr).named.is_null()
         || (header.size as usize)
             < crate::gc::GC_HEADER_SIZE
                 + std::mem::size_of::<crate::ArrayHeader>()

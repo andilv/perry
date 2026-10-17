@@ -623,7 +623,7 @@ use attach::attach_rooted;
 pub(crate) use attach::{any_object, attach_external_rooted, set_own};
 pub use attach::{
     attach_stream_to_object, attach_to_object, define_own_accessor, iter_result_done_value,
-    iterator_prototype, prototype, state_get, state_get_memo, state_set, state_set_memo,
+    iterator_prototype, prototype, state_get, state_set,
 };
 
 /// A fresh instance of `class_id` linked to its family prototype `proto`,
@@ -1146,24 +1146,9 @@ impl NativeCallGuard {
     /// GC root scopes; callback argument conversion may add those scopes.
     #[inline]
     pub unsafe fn call<R>(self, f: impl FnOnce() -> R) -> (R, Result<(), CallEnd>) {
-        let cell = self.link.0 as *mut NativeHandleHeader;
-        let mut catch = crate::exception::NativeCatch::new();
-        if (*cell).flags & CALLBACK_STORAGE == 0 {
-            let value = f();
-            return (value, self.finish());
-        }
-        let extended = cell as *mut NativeCallbackCell;
-        let previous = (*extended).catch;
-        (*extended).catch = &mut catch;
+        // Each callback runs under its own trap (`catch_native_callback`),
+        // so nothing is armed for the call as a whole.
         let value = f();
-        catch.finish();
-        #[cfg(test)]
-        let previous = if callback_sabotage("catch_reentry") {
-            std::ptr::null_mut()
-        } else {
-            previous
-        };
-        (*extended).catch = previous;
         (value, self.finish())
     }
 
@@ -1226,72 +1211,19 @@ fn state_field(state: &crate::gc::RuntimeHandle<'_>, key: &[u8]) -> f64 {
     })
 }
 
-/// [`state_field`] through a per-site [`StateKeyMemo`].
-fn state_field_memo(
-    state: &crate::gc::RuntimeHandle<'_>,
-    key: &[u8],
-    memo: &'static StateKeyMemo,
-) -> f64 {
-    state.with_mut_ptr::<ObjectHeader, _>(|obj| unsafe {
-        state_key_index_memo(obj, key, memo).map_or_else(undefined, |i| state_slot_get(obj, i))
-    })
-}
-
-/// One runtime call site's emitted read words, per agent. The own-only
-/// native-state entry and ordinary own/inherited/absent reads share these
-/// words and the existing PIC holder validation/rooting mechanism.
-pub type StateKeyMemo = std::thread::LocalKey<StateKeySite>;
-
-/// The existing emitted read site, also used by native state slot accesses.
-pub use crate::object::field_get_set::runtime_read_site::RuntimeReadSite as StateKeySite;
-
-/// Declare a per-agent runtime call site: `state_key_memo!(static MEMO_DB);`.
-#[macro_export]
-macro_rules! state_key_memo {
-    ($vis:vis static $name:ident) => {
-        ::std::thread_local! {
-            $vis static $name: $crate::native_payload::StateKeySite =
-                const { $crate::native_payload::StateKeySite::new() };
-        }
-    };
-}
-
-unsafe fn state_key_index_memo(
-    obj: *const ObjectHeader,
-    name: &[u8],
-    memo: &'static StateKeyMemo,
-) -> Option<usize> {
-    memo.with(|site| {
-        if let Some(slot) = site.own_slot(obj) {
-            return Some(slot as usize);
-        }
-        let i = state_key_index(obj, name)?;
-        site.prime_own_slot(
-            crate::object::shapes::object_shape_stamp(obj),
-            i as u32,
-            crate::object::object_live_slot_count(obj),
-        );
-        Some(i)
-    })
-}
-
-/// Read a field of a live object through a memo. Never allocates, so no
+/// Read a field of a live object by its layout. Never allocates, so no
 /// handle scope is needed around it.
-unsafe fn raw_field_memo(obj: *mut ObjectHeader, key: &[u8], memo: &'static StateKeyMemo) -> f64 {
-    state_key_index_memo(obj, key, memo).map_or_else(undefined, |i| state_slot_get(obj, i))
+unsafe fn raw_field(obj: *mut ObjectHeader, key: &[u8]) -> f64 {
+    state_key_index(obj, key).map_or_else(undefined, |i| state_slot_get(obj, i))
 }
 
 /// The JS state object of `obj` if it has one (no allocation).
 pub(crate) unsafe fn raw_js_state(obj: *mut ObjectHeader) -> Option<*mut ObjectHeader> {
-    let state = raw_field_memo(obj, JS_STATE_KEY, &JS_STATE_MEMO);
+    let state = raw_field(obj, JS_STATE_KEY);
     let js = crate::value::JSValue::from_bits(state.to_bits());
     js.is_pointer()
         .then(|| js.as_pointer::<ObjectHeader>() as *mut ObjectHeader)
 }
-
-state_key_memo!(static JS_STATE_MEMO);
-state_key_memo!(static CALLBACKS_MEMO);
-state_key_memo!(static PENDING_MEMO);
 
 /// A state field past the inline slots lives in the object's overflow
 /// storage (a state grows by definition, one key at a time).
@@ -1323,12 +1255,14 @@ unsafe fn state_inline_limit(obj: *mut ObjectHeader) -> usize {
 unsafe fn state_key_index(obj: *const ObjectHeader, name: &[u8]) -> Option<usize> {
     let keys = crate::object::object_keys(obj);
     let (slots, len) = keys.dense_slots();
-    (0..(keys.count() as usize).min(len)).find(|&i| {
-        crate::string::js_string_key_matches_bytes(
-            crate::JSValue::from_bits((*slots.add(i)).to_bits()),
-            name,
-        )
-    })
+    (0..(keys.count() as usize).min(len))
+        .find(|&i| {
+            crate::string::js_string_key_matches_bytes(
+                crate::JSValue::from_bits((*slots.add(i)).to_bits()),
+                name,
+            )
+        })
+        .map(|position| keys.storage_slot(position as u32) as usize)
 }
 
 fn set_state_field(
@@ -1369,7 +1303,7 @@ pub fn callbacks(owner: f64, family: &NativePayloadFamily) -> f64 {
     if let Some(obj) = instance_of(owner, family.class_id) {
         unsafe {
             if let Some(state) = raw_js_state(obj) {
-                let existing = raw_field_memo(state, b"callbacks", &CALLBACKS_MEMO);
+                let existing = raw_field(state, b"callbacks");
                 if crate::JSValue::from_bits(existing.to_bits()).is_pointer() {
                     return existing;
                 }
@@ -1380,7 +1314,7 @@ pub fn callbacks(owner: f64, family: &NativePayloadFamily) -> f64 {
     let owner = scope.root_nanbox_f64(owner);
     let state =
         root_pointer::<ObjectHeader>(&scope, js_state(owner.get_nanbox_f64(), family, true));
-    let existing = state_field_memo(&state, b"callbacks", &CALLBACKS_MEMO);
+    let existing = state_field(&state, b"callbacks");
     if crate::JSValue::from_bits(existing.to_bits()).is_pointer() {
         return existing;
     }
@@ -1489,7 +1423,6 @@ pub unsafe fn call_from_native(
         ));
     }
     match crate::exception::catch_native_callback(
-        callback_slots::catch_from_cell(cell),
         callee.get_nanbox_f64(),
         this.get_nanbox_f64(),
         &args,
@@ -1518,9 +1451,9 @@ unsafe fn ensure_pending_slot(cell: *mut NativeHandleHeader, owner: f64, class_i
         &scope,
         js_state_for_class(owner.get_nanbox_f64(), class_id, true),
     );
-    if state.with_mut_ptr::<ObjectHeader, _>(|obj| {
-        state_key_index_memo(obj, b"pendingException", &PENDING_MEMO).is_none()
-    }) {
+    if state
+        .with_mut_ptr::<ObjectHeader, _>(|obj| state_key_index(obj, b"pendingException").is_none())
+    {
         set_state_field(&scope, &state, b"pendingException", undefined());
     }
     (*cell).flags |= PENDING_SLOT;
@@ -1580,12 +1513,7 @@ unsafe fn call_open_link(
             args.len(),
         ));
     }
-    match crate::exception::catch_native_callback(
-        callback_slots::catch_from_cell(cell),
-        callee,
-        this,
-        args,
-    ) {
+    match crate::exception::catch_native_callback(callee, this, args) {
         Ok(value) => Ok(value),
         Err(err) => {
             let _ = set_pending_exception(f64::from_bits((*cell).owner), err);
@@ -1749,9 +1677,9 @@ pub(crate) unsafe fn try_payload_method_fast_dispatch(
     // (charter step 3): the instance owning no key of this name has no own
     // descriptor for it, and the prototype's key entry says whether it is an
     // accessor.
-    if crate::object::dictionary::is_dictionary(obj)
+    if crate::object::overflow::has_overflow(obj)
         || shape_key_index(obj, name).is_some()
-        || crate::object::dictionary::is_dictionary(proto)
+        || crate::object::overflow::has_overflow(proto)
         || crate::object::key_attrs::object_key_is_accessor(proto, name)
     {
         return None;
@@ -1826,7 +1754,7 @@ pub(crate) fn js_state_for_class(value: f64, class_id: u32, create: bool) -> f64
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj = scope.root_raw_mut_ptr(obj);
-    let existing = state_field_memo(&obj, JS_STATE_KEY, &JS_STATE_MEMO);
+    let existing = state_field(&obj, JS_STATE_KEY);
     if crate::value::JSValue::from_bits(existing.to_bits()).is_pointer() || !create {
         return existing;
     }

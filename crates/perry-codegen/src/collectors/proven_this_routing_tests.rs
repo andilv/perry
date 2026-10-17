@@ -40,6 +40,9 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: is_entry,
         non_entry_module_prefixes: Vec::new(),
@@ -1119,7 +1122,8 @@ fn field_value_arguments_to_sibling_methods_keep_the_proven_this_clone() {
 }
 
 /// The single-pair shape-only arm is small enough to inline at the call site.
-/// Pin the complete safety gate: compare the live holder ShapeId, accept
+/// Pin the complete safety gate: the holder is a prototype constant (no
+/// load), accept
 /// both the boxed-pointer and
 /// internal raw-pointer ABIs, reject addresses outside the target heap range
 /// before dereference, reject own descriptors, then compare the exact
@@ -1129,8 +1133,8 @@ fn single_arm_method_shape_guard_is_inlined_with_the_runtime_contract() {
     let ir = emit_static(&guarded_site_module(), false);
     let probe = function_body(&ir, "__probe(");
     assert!(
-        probe.contains("holder.shape") && probe.contains("icmp eq i32"),
-        "the live holder P must be compared before the direct arm:\n{probe}"
+        !probe.contains("holder.") && !probe.contains("@perry_class_value_dir_cell"),
+        "a prototype constant needs no holder load before the direct arm:\n{probe}"
     );
     assert!(
         !ir.contains("PERRY_CLASS_PROTOTYPE_FAST_GUARDS"),
@@ -1477,7 +1481,7 @@ fn block_calling<'a>(
 /// stayed dead on the one workload `Ptr<Shape>` exists for.
 #[test]
 fn tower_case_routes_to_proven_this_clone() {
-    let ir = emit(&tower_site_module(), false);
+    let ir = emit_static(&tower_site_module(), false);
     // Anti-vacuity: this must really be the class-id tower, not one of the two
     // guard-dominated sites that already routed before this change.
     assert!(
@@ -1502,7 +1506,7 @@ fn tower_case_routes_to_proven_this_clone() {
 #[test]
 fn tower_case_composes_receiver_shape_and_proven_index_clones() {
     const INDEX_ID: u32 = 83;
-    let ir = emit(&indexed_tower_site_module(), false);
+    let ir = emit_static(&indexed_tower_site_module(), false);
     let caller = function_body(&ir, "__probeIndex(");
     let public = "perry_method_pshape_index_tower_ts__Row__lookup";
     let indexed = format!("{public}$idx_u31_{INDEX_ID}");
@@ -1533,7 +1537,7 @@ fn tower_case_composes_receiver_shape_and_proven_index_clones() {
 #[test]
 fn tower_route_is_guarded_by_the_class_shape_id() {
     let _shadow = crate::codegen::helpers::NativeRootsPin::shadow();
-    let ir = emit(&tower_site_module(), false);
+    let ir = emit_static(&tower_site_module(), false);
     let bs = blocks(&ir);
     let clone = pshape_definitions(&ir)
         .into_iter()
@@ -1581,14 +1585,26 @@ fn tower_route_is_guarded_by_the_class_shape_id() {
                 .any(|line| line.contains("icmp eq i32") && line.contains(&expected))
                 .then(|| (slot.to_string(), expected))
         })
+        .or_else(|| {
+            // With whole-program static shapes the class ShapeId is a
+            // constant: the guard compares the receiver's live ShapeId
+            // (header offset 4) with that literal, and no slot is involved.
+            guard_body.iter().find_map(|line| {
+                let line = line.trim();
+                let rhs = line.split("icmp eq i32 ").nth(1)?.rsplit(", ").next()?;
+                rhs.parse::<u32>().ok().map(|_| (String::new(), rhs.to_string()))
+            })
+        })
         .unwrap_or_else(|| {
             panic!(
                 "the routed call is not dominated by the hoisted ShapeId's reload and compare:\n{guard_body:#?}"
             )
         });
     assert!(
-        !ir.lines()
-            .any(|line| line.contains("call void @js_shadow_slot_bind") && line.contains(&slot)),
+        slot.is_empty()
+            || !ir
+                .lines()
+                .any(|line| line.contains("call void @js_shadow_slot_bind") && line.contains(&slot)),
         "a ShapeId scalar must not be registered as a moving GC root:\n{ir}"
     );
     assert!(
@@ -1611,18 +1627,53 @@ fn tower_route_is_guarded_by_the_class_shape_id() {
 }
 
 #[test]
-fn tower_class_shape_id_cache_is_a_native_scalar() {
+fn tower_receiver_word_is_a_native_scalar() {
     let _native = crate::codegen::helpers::NativeRootsPin::native();
-    let ir = emit(&tower_site_module(), false);
-    let global_load = ir
+    let ir = emit_static(&tower_site_module(), false);
+    // The tower selects by the receiver's class id against the prototype
+    // constants: the header word (class_id | ShapeId) is an i64 scalar.
+    let caller = ir
+        .split("\ndefine ")
+        .find(|f| f.contains("\npconst.selected"))
+        .unwrap_or_else(|| panic!("the tower site has no constant selection:\n{ir}"));
+    // The selection switches on `trunc i64 <word> to i32`.
+    let switch = caller
         .lines()
-        .find(|line| line.contains("= load i32, ptr @perry_class_shape_id_"))
-        .unwrap_or_else(|| panic!("the class ShapeId is never read:\n{ir}"));
-    let global_reg = global_load.trim().split(' ').next().expect("ssa name");
+        .find(|line| line.contains("switch i32") && line.contains("label %pconst.selected"))
+        .unwrap_or_else(|| panic!("no class-id selection switch:\n{caller}"));
+    let class_id = switch
+        .split("switch i32 ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .expect("switch operand")
+        .trim()
+        .to_string();
+    let compare = caller
+        .lines()
+        .find(|line| {
+            line.trim_start()
+                .starts_with(&format!("{class_id} = trunc i64 "))
+        })
+        .unwrap_or_else(|| panic!("no receiver-word class id:\n{caller}"));
+    let word = compare
+        .split("trunc i64 ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .expect("compare operand")
+        .trim()
+        .to_string();
     assert!(
-        ir.lines()
-            .any(|line| line.contains(&format!("store i32 {global_reg}, ptr "))),
-        "the class ShapeId must be cached as an i32 scalar:\n{ir}"
+        caller
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{word} = phi i64"))),
+        "the receiver word must be an i64 scalar:\n{caller}"
+    );
+    assert!(
+        !caller.lines().any(|line| {
+            (line.contains("store ") && line.contains(&format!(" {word},")))
+                || (line.contains("@js_shadow_slot_bind") && line.contains(&word))
+        }),
+        "a receiver word must never be stored to a slot or registered as a moving GC root:\n{caller}"
     );
 }
 
@@ -1670,4 +1721,250 @@ fn tower_route_refused_when_clone_deletes_one_field_site() {
 fn is_dynamic_method_fallback(line: &str) -> bool {
     line.contains("@js_native_call_method_by_id(")
         || line.contains("@js_native_call_method_by_id_learn(")
+}
+
+fn polymorphic_array_site_module() -> Module {
+    let mut m = guarded_site_module();
+    let mut own = bump_method();
+    own.body = vec![Stmt::Return(Some(Expr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(this_get("value")),
+        right: Box::new(Expr::Number(1.0)),
+    }))];
+    m.classes[0]
+        .methods
+        .iter_mut()
+        .find(|f| f.name == "bump")
+        .unwrap()
+        .body = own.body.clone();
+    own.return_type = Type::Number;
+    own.id = 192;
+    let mut derived = class(102, "Derived", Vec::new(), vec![own]);
+    derived.extends = Some(101);
+    derived.extends_name = Some("Counter".into());
+    let mut inherited = class(
+        103,
+        "Inherited",
+        vec![field("extra", Type::Any)],
+        Vec::new(),
+    );
+    inherited.extends = Some(101);
+    inherited.extends_name = Some("Counter".into());
+    m.classes.extend([derived, inherited]);
+    m.functions[0].params[0].ty = Type::Array(Box::new(Type::Named("Counter".into())));
+    m.functions[0].body = vec![Stmt::Expr(call(
+        Expr::IndexGet {
+            object: Box::new(Expr::LocalGet(2)),
+            index: Box::new(Expr::Integer(0)),
+        },
+        "bump",
+        Vec::new(),
+    ))];
+    m
+}
+
+#[test]
+fn class_array_dispatch_consumes_own_subclass_shape_without_a_second_tower() {
+    let ir = emit_static(&polymorphic_array_site_module(), false);
+    let caller = function_body(&ir, "__probe(");
+    assert!(caller.contains("method_direct.layout") && caller.contains("pconst.selected"));
+    assert!(!caller.contains("@PERRY_PROTO_VALIDITY") && !caller.contains("holder."));
+    assert!(!caller.contains("idispatch.") && !caller.contains("msite."));
+    let subclass = blocks(&caller)
+        .into_iter()
+        .find(|(label, _)| label.starts_with("method_direct.sub0."))
+        .expect("the subclass arm must be live");
+    assert!(subclass
+        .1
+        .iter()
+        .any(|line| line.contains("__Derived__bump$pshape(")));
+    assert!(!subclass
+        .1
+        .iter()
+        .any(|line| line.contains("__Derived__bump(")));
+    let inherited = blocks(&caller)
+        .into_iter()
+        .find(|(label, _)| label.starts_with("method_direct.sub1."))
+        .expect("the inherited arm must be live");
+    assert!(inherited
+        .1
+        .iter()
+        .any(|line| line.contains("__Counter__bump(")));
+    assert!(!inherited.1.iter().any(|line| line.contains("$pshape(")));
+    assert!(caller.contains("@js_native_call_method_by_id("));
+    assert!(!caller.contains("@js_native_call_method_by_id_learn("));
+}
+
+#[test]
+fn class_dispatch_compares_the_authoritative_packed_word() {
+    let ir = emit_static(&polymorphic_array_site_module(), false);
+    let caller = function_body(&ir, "__probe(");
+    let tests: Vec<_> = blocks(&caller)
+        .into_iter()
+        .filter(|(label, _)| label.starts_with("method_direct.layout."))
+        .collect();
+    assert_eq!(tests.len(), 3);
+    for (_, body) in tests {
+        assert!(body.iter().any(|l| l.contains("icmp eq i64")));
+        assert!(!body.iter().any(|l| l.contains("icmp eq i32")));
+    }
+    assert!(!caller.contains("@js_object_get_own_field_or_undef("));
+    let read = blocks(&caller)
+        .into_iter()
+        .find(|(label, _)| label.starts_with("method_probe.read"))
+        .expect("receiver word must be read only after admission");
+    assert_eq!(
+        read.1.iter().filter(|l| l.contains("icmp ne i32")).count(),
+        2
+    );
+    assert!(
+        read.1.iter().any(|l| l.contains("and i32") && l.ends_with("3145728")),
+        "the class tower must reject linked/null ShapeId kinds before exposing the packed word\n{:?}",
+        read.1
+    );
+    assert!(
+        read.1
+            .iter()
+            .any(|l| l.contains("icmp eq i32") && l.ends_with("0")),
+        "only kind-plain ShapeIds may reach direct class dispatch\n{:?}",
+        read.1
+    );
+    assert!(read
+        .1
+        .iter()
+        .any(|l| l.contains("select i1") && l.ends_with("i64 0")));
+}
+
+#[test]
+fn class_array_annotation_is_only_a_guard_candidate() {
+    let mut m = polymorphic_array_site_module();
+    m.functions[0].params[0].ty = Type::Array(Box::new(Type::Any));
+    let ir = emit_static(&m, false);
+    let caller = function_body(&ir, "__probe(");
+    assert!(caller.contains("idispatch.") && !caller.contains("method_direct.sub0."));
+}
+
+#[test]
+fn class_array_observable_args_keep_lookup_before_call() {
+    let mut m = polymorphic_array_site_module();
+    if let Stmt::Expr(Expr::Call { args, .. }) = &mut m.functions[0].body[0] {
+        args.push(call(Expr::LocalGet(2), "shift", Vec::new()));
+    } else {
+        panic!("fixture must contain an actual indexed call");
+    }
+    let ir = emit_static(&m, false);
+    let caller = function_body(&ir, "__probe(");
+    // The method is read before the arguments: constant selection, then
+    // the split lookup for a receiver no compiled body claims.
+    let select = caller.find("pconst.selected").expect("constant selection");
+    let lookup = caller
+        .find("@js_method_site_lookup(")
+        .expect("split lookup half");
+    let shift = caller.find("shift").expect("observable argument");
+    assert!(select < shift && lookup < shift, "{caller}");
+    assert!(!caller.contains("method_direct.sub0."));
+}
+
+#[test]
+fn class_array_object_args_do_not_reuse_receiver_proof() {
+    let mut m = polymorphic_array_site_module();
+    m.functions[0].params.push(param(3, "x", Type::Any));
+    if let Stmt::Expr(Expr::Call { args, .. }) = &mut m.functions[0].body[0] {
+        args.push(Expr::LocalGet(3));
+    } else {
+        panic!("fixture must contain an indexed call");
+    }
+    let ir = emit_static(&m, false);
+    let caller = function_body(&ir, "__probe(");
+    assert!(!caller.contains("method_direct.sub0."));
+    assert!(caller.contains("idispatch."));
+}
+
+#[test]
+fn class_array_field_coercion_before_later_read_keeps_old_dispatch() {
+    let mut m = polymorphic_array_site_module();
+    m.classes[0]
+        .methods
+        .iter_mut()
+        .find(|f| f.name == "bump")
+        .unwrap()
+        .body = vec![Stmt::Return(Some(Expr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(Expr::Binary {
+            op: BinaryOp::Mul,
+            left: Box::new(this_get("value")),
+            right: Box::new(Expr::Integer(3)),
+        }),
+        right: Box::new(this_get("value")),
+    }))];
+    let ir = emit_static(&m, false);
+    let caller = function_body(&ir, "__probe(");
+    assert!(!caller.contains("method_direct.sub0."));
+    assert!(caller.contains("idispatch."));
+}
+
+#[test]
+fn class_array_subclass_callback_keeps_its_public_body() {
+    let mut m = polymorphic_array_site_module();
+    m.functions.push(func(
+        901,
+        "tick",
+        Vec::new(),
+        Type::Void,
+        vec![Stmt::Return(None)],
+    ));
+    m.classes[1].methods[0].body.insert(
+        0,
+        Stmt::Expr(Expr::Call {
+            callee: Box::new(Expr::FuncRef(901)),
+            args: Vec::new(),
+            byte_offset: 0,
+            type_args: Vec::new(),
+        }),
+    );
+    let ir = emit_static(&m, false);
+    let caller = function_body(&ir, "__probe(");
+    let subclass = blocks(&caller)
+        .into_iter()
+        .find(|(label, _)| label.starts_with("method_direct.sub0."))
+        .expect("the existing guard must remain");
+    assert!(subclass
+        .1
+        .iter()
+        .any(|line| line.contains("__Derived__bump(")));
+    assert!(!subclass.1.iter().any(|line| line.contains("$pshape(")));
+}
+
+/// Object model step 3: the class-id tower selects its body by the
+/// receiver's class id against the classes whose method is a prototype
+/// constant; no runtime proof, epoch, own-property probe or holder-directory
+/// read remains, and release code carries no contract check.
+#[test]
+fn tower_selects_by_prototype_constant() {
+    let ir = emit_static(&tower_site_module(), false);
+    assert!(ir.contains("idispatch.case"), "{ir}");
+    assert!(ir.contains("pconst.selected") && !ir.contains("certify"));
+    assert!(!ir.contains("@PERRY_PROTO_VALIDITY"));
+    let site = ir
+        .split("\ndefine ")
+        .find(|f| f.contains("pconst.selected"))
+        .expect("the function holding the selecting site");
+    assert!(
+        !site.contains("@js_object_get_own_field_or_undef("),
+        "{site}"
+    );
+    assert!(!site.contains("holder.tower"), "{site}");
+    assert!(!site.contains("call void @js_proto_constant_contract_check("));
+}
+
+/// A census that writes the method name withdraws the constant: the tower
+/// keeps no compiled case and every receiver takes the generic site.
+#[test]
+fn a_written_method_name_is_not_a_prototype_constant() {
+    let mut census = perry_hir::ProtoCensus::default();
+    census.dynamic_write = true;
+    let ir = crate::proto_constants::with_test_census(census, || {
+        emit_static(&tower_site_module(), false)
+    });
+    assert!(!ir.contains("pconst.case"), "{ir}");
 }

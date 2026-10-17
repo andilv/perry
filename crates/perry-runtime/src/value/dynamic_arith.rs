@@ -50,8 +50,8 @@ unsafe fn describe_mix_operand(v: f64) -> String {
             s.truncate(cut);
         }
         format!("string({s:?})")
-    } else if jv.is_pointer() {
-        format!("pointer(0x{:x})", jv.as_pointer::<u8>() as usize)
+    } else if jv.is_reference() {
+        format!("reference(0x{:x})", jv.reference_payload())
     } else {
         format!("number({v}) bits=0x{:016x}", v.to_bits())
     }
@@ -110,8 +110,9 @@ unsafe fn to_numeric(value: f64) -> f64 {
         return crate::builtins::js_number_coerce(primitive);
     }
     // Non-object primitives (number/int32/string/bool/null/undefined) never
-    // become a BigInt; defer to the existing ToNumber coercion.
-    if !jsval.is_pointer() {
+    // become a BigInt; defer to the existing ToNumber coercion. A native
+    // handle is an object and takes ToPrimitive like any other (#12540).
+    if !jsval.is_reference() {
         return crate::builtins::js_number_coerce(value);
     }
     // Symbols are pointers but ToNumber(Symbol) throws — let js_number_coerce
@@ -130,7 +131,15 @@ unsafe fn to_numeric(value: f64) -> f64 {
             }
         }
         crate::value::to_string_primitive::OrdinaryToPrimitiveOutcome::DefaultString => {
-            crate::builtins::js_number_coerce(value)
+            if jsval.is_handle() {
+                // The handle already completed ToPrimitive above. Convert its
+                // default string directly so user getters aren't consulted a
+                // second time by js_number_coerce's handle arm.
+                let string = crate::value::js_jsvalue_to_string(value);
+                crate::builtins::js_number_coerce(crate::value::js_nanbox_string(string as i64))
+            } else {
+                crate::builtins::js_number_coerce(value)
+            }
         }
         crate::value::to_string_primitive::OrdinaryToPrimitiveOutcome::TypeError => {
             throw_add_type_error(b"Cannot convert object to primitive value")
@@ -170,17 +179,22 @@ unsafe fn is_symbol_value(value: f64) -> bool {
 #[inline]
 unsafe fn is_nonprimitive_object_value(value: f64) -> bool {
     let jsval = JSValue::from_bits(value.to_bits());
-    if !jsval.is_pointer() {
+    // Native handles are JavaScript objects too, even though their payload is
+    // an id rather than a dereferenceable heap pointer.
+    if jsval.is_handle() {
+        return true;
+    }
+    if !jsval.is_reference() {
         return false;
     }
-    let ptr = jsval.as_pointer::<u8>() as usize;
+    let ptr = jsval.reference_payload();
     ptr >= 0x1000 && !is_symbol_value(value)
 }
 
 unsafe fn to_primitive_default_for_add(value: f64) -> f64 {
     let jsval = JSValue::from_bits(value.to_bits());
     let is_class_ref = crate::object::class_ref_id(value).is_some();
-    if (!jsval.is_pointer() && !is_class_ref) || is_symbol_value(value) {
+    if (!jsval.is_reference() && !is_class_ref) || is_symbol_value(value) {
         return value;
     }
 
@@ -195,7 +209,7 @@ unsafe fn to_primitive_default_for_add(value: f64) -> f64 {
         return crate::value::to_string::class_ref_to_primitive(value, 0);
     }
 
-    let ptr = jsval.as_pointer::<u8>() as usize;
+    let ptr = jsval.reference_payload();
     if ptr < 0x1000 {
         return value;
     }
@@ -692,21 +706,60 @@ pub unsafe extern "C" fn js_dynamic_div(a: f64, b: f64) -> f64 {
     numify_arith_operand(a) / numify_arith_operand(b)
 }
 
+/// JS `%` on two Numbers (ECMA-262 Number::remainder).
+///
+/// When both operands are exact integers within ±2^53 and the divisor is
+/// nonzero, the remainder is computed in `i64`: every such operand converts
+/// exactly, `i64` `%` truncates toward zero like `fmod` (so a nonzero result
+/// already carries the dividend's sign), and the result is exact in `f64`.
+/// The only sign the integer path cannot carry is that of a zero result,
+/// which Number::remainder defines as the dividend's sign: `-4 % 2` and
+/// `-0 % 5` are `-0`. Everything else (a zero divisor, NaN, ±Infinity, a
+/// fractional or out-of-range operand) is `fmod`, which is the spec.
+///
+/// This is the single out-of-line slow path for numeric `%`: generated code
+/// keeps only its inline i32 check and calls here instead of emitting
+/// `frem` (a libm `fmod` call on every target).
+///
+/// Tiers, cheapest first: the exact u32 domain (a nonnegative dividend and
+/// divisor, a 32-bit divide; this is where index arithmetic lives and what
+/// `js_dynamic_mod` already did before this helper existed), then exact i53,
+/// then `fmod`.
+#[no_mangle]
+#[inline]
+pub extern "C" fn js_number_mod(a: f64, b: f64) -> f64 {
+    const EXACT_INT_LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+                                                          // u32 tier. Rejects negative zero, so every signed, fractional or
+                                                          // exceptional case falls through; cast round trips also reject infinity
+                                                          // and NaN, and a negative divisor saturates to 0 and is refused.
+    if !a.is_sign_negative() {
+        let dividend = a as u32;
+        let divisor = b as u32;
+        if divisor != 0 && dividend as f64 == a && divisor as f64 == b {
+            return (dividend % divisor) as f64;
+        }
+    }
+    // i53 tier. Ordered comparisons are false for NaN, so NaN never enters
+    // the integer path; the bound also excludes ±Infinity.
+    if a.abs() <= EXACT_INT_LIMIT && b.abs() <= EXACT_INT_LIMIT {
+        let dividend = a as i64;
+        let divisor = b as i64;
+        if divisor != 0 && dividend as f64 == a && divisor as f64 == b {
+            let remainder = dividend % divisor;
+            if remainder == 0 {
+                return if a.is_sign_negative() { -0.0 } else { 0.0 };
+            }
+            return remainder as f64;
+        }
+    }
+    a % b
+}
+
 /// Dynamic modulo: BigInt % BigInt if either operand is BigInt, else f64 % f64.
 #[no_mangle]
 pub unsafe extern "C" fn js_dynamic_mod(a: f64, b: f64) -> f64 {
     if is_plain_double(a) && is_plain_double(b) {
-        // Index arithmetic commonly stays in the exact u32 domain. Reject
-        // negative zero so every signed, fractional or exceptional case keeps
-        // fmod semantics. Cast round trips also reject infinity and NaN.
-        if !a.is_sign_negative() {
-            let dividend = a as u32;
-            let divisor = b as u32;
-            if divisor != 0 && dividend as f64 == a && divisor as f64 == b {
-                return (dividend % divisor) as f64;
-            }
-        }
-        return a % b;
+        return js_number_mod(a, b);
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let (a_handle, b_handle) = to_numeric_pair(&scope, a, b);
@@ -728,7 +781,7 @@ pub unsafe extern "C" fn js_dynamic_mod(a: f64, b: f64) -> f64 {
     // `x % Infinity` (should be `x`). Rust's `f64 % f64` *is* `fmod`, matching
     // the spec exactly on the sign of zero, `x % ±Inf`, and `±Inf % y` / `x % 0`
     // → `NaN` (test262 compound-assignment `mod-whitespace`: `-0` expected).
-    a % b
+    js_number_mod(a, b)
 }
 
 /// Dynamic negate: -BigInt if operand is BigInt, else -f64.
@@ -805,7 +858,7 @@ pub unsafe extern "C" fn js_dynamic_bitnot(a: f64) -> f64 {
 /// |v| >= 2^63, so ToInt32(1e20) came out as -1 instead of 1661992960 (#6079).
 /// The range test below is what keeps the cast inside its exact domain.
 #[inline]
-fn dyn_to_int32(v: f64) -> i32 {
+pub(crate) fn dyn_to_int32(v: f64) -> i32 {
     const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
     if v.abs() < TWO_POW_63 {
         // SAFETY: a NaN fails the comparison, and |v| < 2^63 truncates to a
@@ -1043,6 +1096,74 @@ static KEEP_NUMERIC_STEP: unsafe extern "C" fn(f64, i32) -> f64 = js_numeric_ste
 mod tests {
     use super::*;
 
+    /// Number::remainder edge cases for the shared `%` slow path: the i53
+    /// integer path must agree with `fmod` bit for bit, including the sign of
+    /// a zero result, and must hand every non-integer case to `fmod`.
+    #[test]
+    fn number_mod_matches_fmod_including_signed_zero() {
+        let two53 = 9_007_199_254_740_992.0_f64;
+        let cases: &[(f64, f64)] = &[
+            // integers beyond i32, within i53 (the LCG step that motivated this)
+            (12_345_678.0 * 48_271.0, 2_147_483_647.0),
+            (-(12_345_678.0 * 48_271.0), 2_147_483_647.0),
+            (two53, 3.0),
+            (-two53, 7.0),
+            (two53, two53),
+            (two53 - 1.0, -2.0),
+            // zero results take the DIVIDEND's sign
+            (-4.0, 2.0),
+            (4.0, -2.0),
+            (-4.0, -2.0),
+            (-0.0, 5.0),
+            (0.0, -5.0),
+            (-0.0, -5.0),
+            (-(2.0_f64.powi(40)), 2.0_f64.powi(20)),
+            // nonzero results take the dividend's sign
+            (-7.0, 3.0),
+            (7.0, -3.0),
+            (-7.0, -3.0),
+            // zero divisor and non-finite / non-integral operands: fmod
+            (5.0, 0.0),
+            (5.0, -0.0),
+            (-5.0, 0.0),
+            (0.0, 0.0),
+            (f64::NAN, 3.0),
+            (3.0, f64::NAN),
+            (f64::INFINITY, 3.0),
+            (3.0, f64::INFINITY),
+            (-3.0, f64::NEG_INFINITY),
+            (5.5, 2.0),
+            (5.0, 2.5),
+            // out of the exact-integer range: fmod
+            (two53 * 2.0, 3.0),
+            (1e300, 7.0),
+            (7.0, 1e300),
+        ];
+        for &(a, b) in cases {
+            let got = js_number_mod(a, b);
+            let want = a % b;
+            assert!(
+                (got.is_nan() && want.is_nan()) || got.to_bits() == want.to_bits(),
+                "js_number_mod({a:?}, {b:?}) = {got:?} (bits {:#x}), fmod gives {want:?} (bits {:#x})",
+                got.to_bits(),
+                want.to_bits(),
+            );
+        }
+    }
+
+    /// `js_dynamic_mod` must route plain doubles through the same slow path.
+    #[test]
+    fn dynamic_mod_plain_doubles_use_number_mod() {
+        for &(a, b) in &[
+            (103_524_123_456_789.0, 2_147_483_647.0),
+            (-4.0, 2.0),
+            (5.0, 0.0),
+        ] {
+            let got = unsafe { js_dynamic_mod(a, b) };
+            let want = js_number_mod(a, b);
+            assert!((got.is_nan() && want.is_nan()) || got.to_bits() == want.to_bits());
+        }
+    }
     fn int32(n: i32) -> f64 {
         f64::from_bits(JSValue::int32(n).bits())
     }
@@ -1060,6 +1181,22 @@ mod tests {
             assert_eq!(js_dynamic_mul(int32(42), 2.0), 84.0);
             assert_eq!(js_dynamic_div(int32(84), 2.0), 42.0);
             assert_eq!(js_dynamic_mod(int32(43), 10.0), 3.0);
+        }
+    }
+
+    #[test]
+    fn dynamic_arith_treats_native_handles_as_objects_for_to_numeric() {
+        let _global = crate::gc::global_side_table_test_lock();
+        unsafe {
+            let handle = f64::from_bits(
+                JSValue::handle(crate::value::addr_class::FETCH_HANDLE_BAND_START).bits(),
+            );
+            let coerced = crate::builtins::js_number_coerce(handle);
+            assert!(JSValue::from_bits(coerced.to_bits()).is_number());
+            assert!(coerced.is_nan());
+            let result = js_dynamic_div(1.0, handle);
+            assert!(JSValue::from_bits(result.to_bits()).is_number());
+            assert!(result.is_nan());
         }
     }
 

@@ -18,7 +18,6 @@ pub(crate) fn begin_full_trace() {
     });
     // The prototype identity words emit their carrier edge once per trace.
     crate::object::shapes::note_full_trace_begin();
-    crate::proxy::gc_begin_full_trace();
     if let Some(hook) = FETCH_TRACE.with(Cell::get) {
         FETCH_TRACE_ARMED.with(|armed| armed.set(true));
         (hook.phase)(0);
@@ -43,7 +42,6 @@ pub(crate) fn finish_full_trace() {
             (hook.phase)(1);
         }
     }
-    crate::proxy::gc_finish_full_trace();
     FULL_TRACE_ACTIVE.with(|active| {
         assert!(active.replace(false), "no full trace active");
     });
@@ -108,9 +106,7 @@ pub extern "C" fn perry_ffi_gc_register_pool_handle_trace(
 /// Fetch, or a shared-pool handle trace is running on this thread.
 #[inline]
 pub(crate) fn handle_trace_active() -> bool {
-    crate::proxy::gc_full_trace_active()
-        || FETCH_TRACE_ARMED.with(Cell::get)
-        || POOL_TRACE_ARMED.with(Cell::get)
+    FETCH_TRACE_ARMED.with(Cell::get) || POOL_TRACE_ARMED.with(Cell::get)
 }
 
 /// Shared shape storage is private key/attribute metadata, never a JS array.
@@ -138,7 +134,7 @@ pub(super) unsafe fn object_words_may_name_handles(header: *const super::GcHeade
         for i in 0..count {
             let bits = *slots.add(i);
             let proxy = bits & crate::value::TAG_MASK == crate::value::POINTER_TAG
-                && crate::value::addr_class::is_proxy_id_band(
+                && crate::value::addr_class::is_proxy_cell(
                     (bits & crate::value::POINTER_MASK) as usize,
                 );
             assert!(
@@ -156,7 +152,7 @@ pub(super) unsafe fn object_words_may_name_handles(header: *const super::GcHeade
 #[inline(always)]
 fn is_fetch_handle_word(bits: u64) -> bool {
     let id = match bits >> 48 {
-        0x7FFD => bits & crate::value::POINTER_MASK,
+        0xFFF9 | 0x7FFD => bits & crate::value::POINTER_MASK,
         0 => bits,
         _ => return false,
     };
@@ -167,7 +163,7 @@ fn is_fetch_handle_word(bits: u64) -> bool {
 #[inline(always)]
 fn is_pool_handle_word(bits: u64) -> bool {
     let id = match bits >> 48 {
-        0x7FFD => bits & crate::value::POINTER_MASK,
+        0xFFF9 | 0x7FFD => bits & crate::value::POINTER_MASK,
         0 => bits,
         _ => return false,
     };
@@ -175,9 +171,6 @@ fn is_pool_handle_word(bits: u64) -> bool {
 }
 
 pub(crate) fn observe_handle(bits: u64, valid_ptrs: &super::ValidPointerSet) -> bool {
-    if crate::proxy::gc_observe_traced_value(bits, valid_ptrs) {
-        return true;
-    }
     if is_fetch_handle_word(bits) {
         return observe_fetch_handle(bits, valid_ptrs);
     }
@@ -236,7 +229,6 @@ pub(crate) fn abort_full_trace() {
         });
     }
     let _ = FULL_TRACE_ACTIVE.try_with(|active| active.set(false));
-    crate::proxy::gc_abort_full_trace();
 }
 
 /// Query whether a mutable-root scan is the weak-owner marking phase.

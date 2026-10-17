@@ -237,7 +237,10 @@ fn test_array_mixed_bulk_producers_preserve_pointer_layout() {
     // follow to the child — is asserted below, unchanged: one slot read, child
     // marked.
     assert_eq!(test_layout_pointer_slot_count(set_arr as usize, 1), None);
-    assert_array_root_trace_reads(set_arr, 1);
+    // The iterator brand lives in the array's named layout object (§6a):
+    // one read for the element, one for the `named` edge, one for the brand
+    // slot of that object.
+    assert_array_root_trace_reads(set_arr, 3);
     unsafe {
         assert_ne!((*child_header).gc_flags & GC_FLAG_MARKED, 0);
     }
@@ -255,7 +258,9 @@ fn test_array_mixed_bulk_producers_preserve_pointer_layout() {
     let pair_box = crate::array::js_array_get_f64(entries, 0);
     let pair = (pair_box.to_bits() & POINTER_MASK) as *mut crate::array::ArrayHeader;
     assert_eq!(test_layout_pointer_slot_count(pair as usize, 2), None);
-    assert_array_root_trace_reads(entries, 3);
+    // The outer iterator's brand lives in its named layout object: the
+    // `named` edge and the brand slot add two reads.
+    assert_array_root_trace_reads(entries, 5);
     unsafe {
         assert_ne!((*child_header).gc_flags & GC_FLAG_MARKED, 0);
     }

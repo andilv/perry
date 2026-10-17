@@ -124,9 +124,41 @@ pub extern "C" fn js_object_set_field(obj: *mut ObjectHeader, field_index: u32, 
         // js_object_alloc_class_with_keys use exactly field_count slots.
         // We use a generous limit of max(field_count, 8) to avoid false positives from
         // js_object_alloc_with_shape's extra padding while still catching real overflows.
+        if crate::object::overflow::has_overflow(obj)
+            && field_index >= crate::object::object_live_slot_count(obj)
+        {
+            crate::object::overflow::store_index(obj, field_index, value.bits());
+            return;
+        }
+        if crate::object::overflow::has_overflow(obj)
+            && field_index < crate::object::object_live_slot_count(obj)
+        {
+            let old = crate::object::field_get_set::object_field_at_with_live(
+                obj,
+                field_index,
+                crate::object::object_live_slot_count(obj),
+            );
+            if old.bits() == crate::value::TAG_HOLE && value.bits() != crate::value::TAG_HOLE {
+                let shape = crate::object::shapes::object_shape_descriptor(obj).unwrap();
+                let key = crate::object::ObjectKeys::new(
+                    shape.keys as usize as *mut ArrayHeader,
+                    shape.logical_key_count,
+                )
+                .get(field_index);
+                if key.is_any_string() {
+                    let raw =
+                        crate::value::js_get_string_pointer_unified(f64::from_bits(key.bits()));
+                    crate::object::overflow::store_routed(
+                        obj,
+                        raw as *const crate::StringHeader,
+                        f64::from_bits(value.bits()),
+                    );
+                    return;
+                }
+            }
+        }
         let stored_field_count = crate::object::object_live_slot_count(obj);
-        let alloc_limit =
-            std::cmp::max(stored_field_count, crate::object::INLINE_SLOT_FLOOR as u32);
+        let alloc_limit = crate::object::object_inline_capacity(obj);
         if field_index >= alloc_limit {
             eprintln!(
                 "[PERRY WARN] js_object_set_field: OOB write field_index={} alloc_limit={} (field_count={}) obj={:p} class_id={}",
@@ -201,19 +233,7 @@ pub extern "C" fn js_object_get_class_id(obj: *const ObjectHeader) -> u32 {
     if crate::value::addr_class::is_handle_band(obj as usize) {
         return 0;
     }
-    let addr = obj as usize;
-    // Built-in headers (Set / Map) live in their own per-type
-    // registries — they're never user class instances. Reject them first.
-    //
-    // The reason given here used to be that Set/Map headers are `std::alloc`'d
-    // with no `GcHeader` at `obj - 8`. That stopped being true when
-    // `js_set_alloc` / `js_map_alloc` moved to
-    // `arena_alloc_gc(_, _, GC_TYPE_SET|GC_TYPE_MAP)` — both DO carry a header,
-    // and the GC-kind test below already rejects them on it. RegExp likewise
-    // has a dedicated kind, so it needs no payload or registry discriminator.
-    if crate::set::is_registered_set(addr) || crate::map::is_registered_map(addr) {
-        return 0;
-    }
+    // The GC-kind check below already excludes Map and Set headers.
     unsafe {
         if !is_valid_obj_ptr(obj as *const u8) {
             return 0;

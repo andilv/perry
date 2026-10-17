@@ -130,8 +130,25 @@ fn numeric_layout_oob_array_read_uses_shared_cold_body() {
         "a numeric-layout OOB read must use the shared generic fallback:\n{ir}"
     );
     assert!(
-        ir.contains("arr.guard.range") && ir.contains("8388608"),
-        "only the in-bounds arm may require the numeric element-layout proof:\n{ir}"
+        ir.contains("arr.guard.range") && !ir.contains("8388608"),
+        "the numeric read must not consult the array layout bit:\n{ir}"
+    );
+    // The proof is the loaded element's own tag, tested inside the fast arm
+    // (the consumer's copy of the predicate elsewhere does not count).
+    let mut in_fast = false;
+    let mut fast_arm = Vec::new();
+    for line in ir.lines() {
+        if !line.starts_with(char::is_whitespace) && line.ends_with(':') {
+            in_fast = line.starts_with("arr.fast.");
+        } else if in_fast {
+            fast_arm.push(line.trim());
+        }
+    }
+    assert!(
+        fast_arm
+            .iter()
+            .any(|l| l.contains("icmp ule i64") && l.contains("9221401712017801215")),
+        "the fast arm must test the loaded element:\n{ir}"
     );
 }
 
@@ -344,7 +361,7 @@ fn unknown_numeric_read_is_one_inline_hit_and_one_out_of_line_exit() {
         .expect("the property-key dispatch block exists");
     assert_eq!(
         property
-            .matches("call double @js_dyn_index_get_site(")
+            .matches("call double @perry_probe_get_keyed(")
             .count(),
         1
     );
@@ -568,36 +585,13 @@ fn dynamic_symbol_read_ir(symbol_init: Expr) -> String {
 fn proven_symbol_key_uses_the_keyed_shape_guard() {
     let ir = dynamic_symbol_read_ir(Expr::SymbolNew(None));
     assert!(
-        ir.contains("symic.hit")
-            && ir.contains("4611686018427387904")
-            && ir.contains("call double @js_object_get_field_by_key_site(")
+        ir.contains("call double @perry_probe_get_keyed(")
             && !ir.contains("@PERRY_SYMBOL_PROPERTY_IC_EPOCH"),
-        "the exact-key ShapeId Symbol guard was not emitted:\n{ir}"
+        "the Symbol read must take the keyed probe:\n{ir}"
     );
     assert!(
         !ir.contains("call i32 @js_is_symbol("),
         "compiler-owned Symbol provenance must remove the registry probe:\n{ir}"
-    );
-}
-
-#[test]
-fn proven_symbol_then_named_field_composes_identity_and_shape_caches() {
-    let ir = dynamic_symbol_access_ir(Expr::SymbolNew(None), Some("id"));
-    assert!(
-        ir.contains("symfield.identity")
-            && ir.contains("symfield.hit")
-            && ir.contains("load atomic i64, ptr @PERRY_SYMBOL_PROPERTY_IC_EPOCH acquire")
-            && ir.contains("call double @js_object_get_symbol_then_field_ic_miss(")
-            && ir.contains("4611686018427387904"),
-        "the weak Symbol identity and exact ShapeId field caches were not composed:\n{ir}"
-    );
-    assert!(
-        ir.contains("and i16") && ir.contains("2048"),
-        "the composed hit must reject descriptor-bearing metadata objects:\n{ir}"
-    );
-    assert!(
-        !ir.contains("call i32 @js_is_symbol("),
-        "compiler-owned Symbol provenance must retain its registry-free route:\n{ir}"
     );
 }
 
@@ -610,7 +604,7 @@ fn erased_symbol_annotation_does_not_bypass_runtime_validation() {
     });
     assert!(
         ir.contains("dynkey.property")
-            && ir.contains("call double @js_dyn_index_get_site(")
+            && ir.contains("call double @perry_probe_get_keyed(")
             && !ir.contains("symic.hit")
             && !ir.contains("call double @js_object_get_symbol_property_ic_miss("),
         "a TypeScript Symbol annotation without initializer provenance must not enter the exact-Symbol IC:\n{ir}"
@@ -862,7 +856,7 @@ fn claimed_array_receiver_brands_before_committing_a_canonical_key_to_the_plain_
         ],
     );
     assert!(ir.contains("aidx.canonical") && ir.contains("aidx.dynamic.guard.deref"));
-    assert!(ir.contains("67141887") && ir.contains("aidx.dynamic.fast"));
+    assert!(ir.contains("33023") && ir.contains("aidx.dynamic.fast"));
     assert!(ir.contains("call double @perry_array_read_cold_shared"));
     assert!(
         !ir.contains("aidx.claimed.brand"),

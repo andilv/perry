@@ -1,9 +1,9 @@
 use super::{
-    closure_from, coerce_trap_bool, extract_pointer, handler_trap, is_callable_function,
+    closure_from, coerce_trap_bool, entry, extract_pointer, handler_trap, is_callable_function,
     js_proxy_delete, js_proxy_get, js_proxy_has, lookup, nanbox_bool, reflect_non_object_typeerror,
     reflect_ordinary_delete_property_key, reflect_ordinary_set_with_receiver,
-    reflect_value_is_object, revoked_return, target_get_property_key, throw_type_error, PROXIES,
-    TAG_NULL, TAG_TRUE, TAG_UNDEFINED,
+    reflect_value_is_object, revoked_return, target_get_property_key, throw_type_error, TAG_NULL,
+    TAG_TRUE, TAG_UNDEFINED,
 };
 
 /// `Reflect.get(target, key, receiver)` (#2766).
@@ -135,6 +135,8 @@ fn js_reflect_get_impl(target: f64, key: f64, receiver: f64, default_undefined: 
 /// Integer-Indexed exotic targets — test262 internals/Set/*-reflect-set).
 #[no_mangle]
 pub extern "C" fn js_reflect_set(target: f64, key: f64, value: f64, receiver: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::runtime_write(target, key, value, "Reflect.set");
     // Reflect.set on a non-object target must throw TypeError (spec step 1),
     // matching Reflect.has/get/etc. Pre-fix it silently returned false.
     if !reflect_value_is_object(target) {
@@ -273,12 +275,7 @@ pub extern "C" fn js_reflect_delete(target: f64, key: f64) -> f64 {
 
 fn proxy_entry(proxy_boxed: f64) -> Option<(f64, f64, bool)> {
     let id = lookup(proxy_boxed)?;
-    PROXIES.with(|p| {
-        p.borrow()
-            .get(id as usize)
-            .and_then(|o| o.as_ref())
-            .map(|e| (e.target, e.handler, e.revoked))
-    })
+    entry(id).map(|e| (e.target, e.handler, e.revoked))
 }
 
 fn descriptor_key(name: &[u8]) -> (*const crate::StringHeader, f64) {

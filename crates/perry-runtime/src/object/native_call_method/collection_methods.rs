@@ -212,7 +212,14 @@ pub(super) unsafe fn dispatch_map_set(
                         crate::map::js_map_foreach(map, args[0], this_arg);
                         f64::from_bits(crate::value::TAG_UNDEFINED)
                     }
-                    _ => f64::from_bits(crate::value::TAG_UNDEFINED),
+                    // #11915: any other name is an ordinary method call — the
+                    // receiver's real `Get` (its chain reaches
+                    // `Object.prototype`), never a silent `undefined`.
+                    _ => crate::object::builtin_proto::call_unknown_collection_method(
+                        object,
+                        method_name.as_bytes(),
+                        args,
+                    ),
                 });
             }
             if crate::set::is_registered_set(check_ptr) {
@@ -296,7 +303,14 @@ pub(super) unsafe fn dispatch_map_set(
                         JSValue::bool(crate::set::js_set_is_disjoint_from(set, args[0]) != 0)
                             .bits(),
                     ),
-                    _ => f64::from_bits(crate::value::TAG_UNDEFINED),
+                    // #11915: any other name is an ordinary method call — the
+                    // receiver's real `Get` (its chain reaches
+                    // `Object.prototype`), never a silent `undefined`.
+                    _ => crate::object::builtin_proto::call_unknown_collection_method(
+                        object,
+                        method_name.as_bytes(),
+                        args,
+                    ),
                 });
             }
             // Buffer / Uint8Array dispatch — allocated raw, not behind a
@@ -450,7 +464,11 @@ pub(super) unsafe fn dispatch_raw_pointer(
                         for i in 0..key_count {
                             let key_val = crate::array::js_array_get(keys, i as u32);
                             if crate::string::js_string_key_matches_bytes(key_val, method_bytes) {
-                                let field_val = js_object_get_field(obj as *mut _, i as u32);
+                                let field_val =
+                                    crate::object::field_get_set::js_object_get_key_field(
+                                        obj as *mut _,
+                                        i as u32,
+                                    );
                                 if field_val.is_pointer() {
                                     return Some(crate::closure::js_native_call_value(
                                         f64::from_bits(field_val.bits()),

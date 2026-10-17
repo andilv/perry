@@ -4,6 +4,7 @@
 //! data slot, and each one must show up as a ShapeId the published word can no
 //! longer match — or as a refusal to publish at all.
 use super::*;
+use crate::proxy::put_value::record_fixture::{json, record};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -19,15 +20,6 @@ fn interned(name: &[u8]) -> *const crate::StringHeader {
 
 fn boxed_string(key: *const crate::StringHeader) -> f64 {
     f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits())
-}
-
-/// A JSON-parsed object: class-less, birth-marked ordinary, stamped with a
-/// real ShapeId, and sharing it with every other parse of the same text.
-fn parsed(src: &[u8]) -> f64 {
-    let text = crate::string::js_string_from_bytes(src.as_ptr(), src.len() as u32);
-    let value = unsafe { crate::json::js_json_parse(text) };
-    assert!(value.is_pointer(), "JSON.parse must yield an object");
-    f64::from_bits(value.bits())
 }
 
 fn object_of(value: f64) -> *mut crate::ObjectHeader {
@@ -61,8 +53,7 @@ const SRC: &[u8] = br#"{"a":1,"n":2,"b":3}"#;
 /// entry; otherwise every iteration falls through the slow miss path.
 #[test]
 fn pooled_runtime_key_names_prime_static_overwrites() {
-    let target = parsed(br#"{"name":0,"nam":0,"E":0,"X":0,"length":0,"len":0,"now":0,"later":0}"#);
-    for (index, name) in [
+    let names = [
         b"name".as_slice(),
         b"nam",
         b"E",
@@ -71,16 +62,27 @@ fn pooled_runtime_key_names_prime_static_overwrites() {
         b"len",
         b"now",
         b"later",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let runtime_key = interned(name);
-        let pooled_key =
-            crate::string::js_string_pool_atom(name.as_ptr(), name.len() as u32, fnv1a(name), 0);
-        assert_ne!(
-            pooled_key as *const _, runtime_key,
-            "fixture must use the pooled copy"
+    ];
+    // Mirror link-image startup: register program atoms before parsing data.
+    let keys: Vec<_> = names
+        .iter()
+        .map(|name| unsafe {
+            let key = crate::string::js_string_pool_atom(
+                name.as_ptr(),
+                name.len() as u32,
+                fnv1a(name),
+                0,
+            );
+            crate::string::seed_static_atom(name, fnv1a(name), key);
+            key
+        })
+        .collect();
+    let target = record(br#"{"name":0,"nam":0,"E":0,"X":0,"length":0,"len":0,"now":0,"later":0}"#);
+    for (index, (name, pooled_key)) in names.into_iter().zip(keys).enumerate() {
+        assert_eq!(
+            pooled_key as *const _,
+            interned(name),
+            "data keys must intern to the program's one atom"
         );
         let (stored, word) = store_fresh(target, pooled_key, index as f64 + 1.0);
         assert_eq!(stored, index as f64 + 1.0);
@@ -104,7 +106,7 @@ fn packed_set_empty_matches_codegen() {
 
 #[test]
 fn an_ordinary_receiver_publishes_its_shape_and_inline_slot() {
-    let target = parsed(SRC);
+    let target = record(SRC);
     let key = interned(b"n");
     let (stored, word) = store_fresh(target, key, 7.0);
     assert_eq!(stored, 7.0, "the miss performs the store");
@@ -149,7 +151,7 @@ fn per_object_facts_the_hit_retests_are_refused_at_publication() {
         ("the Array-subclass numeric proof", &numeric_proof),
     ];
     for (what, write) in writers {
-        let target = parsed(SRC);
+        let target = record(SRC);
         write(target);
         let packed = AtomicU64::new(PACKED_SET_EMPTY);
         unsafe { prime_packed_set(target, key, std::ptr::null_mut(), &packed) };
@@ -159,7 +161,7 @@ fn per_object_facts_the_hit_retests_are_refused_at_publication() {
             "a receiver carrying {what} must not publish"
         );
     }
-    let target = parsed(SRC);
+    let target = record(SRC);
     unsafe {
         (*object_of(target)).class_id = crate::object::NATIVE_MODULE_CLASS_ID;
         crate::object::shapes::store_kind::restamp_object_store_kind(object_of(target));
@@ -296,7 +298,6 @@ fn real_numeric_proof_shape_cannot_prime_packed_set_or_add() {
             receiver.get_nanbox_f64(),
             add_key,
             add_pre,
-            crate::object::chain_store::ChainSite::Packed(&mut add_ways_slot),
         );
     }
     assert_ne!(add_site.add_shapes.load(Ordering::Relaxed) as u32, add_pre);
@@ -313,7 +314,7 @@ fn real_numeric_proof_shape_cannot_prime_packed_set_or_add() {
 #[test]
 fn integrity_operations_leave_the_published_shape() {
     let key = interned(b"n");
-    let primer = parsed(SRC);
+    let primer = record(SRC);
     let (_, word) = store_fresh(primer, key, 1.0);
     assert_eq!(word as u32, stamp(primer));
     for (what, op) in [
@@ -327,7 +328,7 @@ fn integrity_operations_leave_the_published_shape() {
             crate::object::js_object_prevent_extensions,
         ),
     ] {
-        let sibling = parsed(SRC);
+        let sibling = record(SRC);
         assert_eq!(
             stamp(sibling),
             word as u32,
@@ -365,12 +366,12 @@ fn integrity_operations_leave_the_published_shape() {
 #[test]
 fn a_descriptor_on_the_key_leaves_the_published_shape() {
     let key = interned(b"n");
-    let primer = parsed(SRC);
+    let primer = record(SRC);
     let (_, word) = store_fresh(primer, key, 1.0);
 
-    let receiver = parsed(SRC);
+    let receiver = record(SRC);
     assert_eq!(stamp(receiver), word as u32);
-    let desc = parsed(br#"{"value":5,"writable":false}"#);
+    let desc = json(br#"{"value":5,"writable":false}"#);
     crate::object::js_object_define_property(receiver, boxed_string(key), desc);
     assert_ne!(
         stamp(receiver),
@@ -398,9 +399,9 @@ fn a_descriptor_on_the_key_leaves_the_published_shape() {
 #[test]
 fn delete_leaves_the_published_shape() {
     let key = interned(b"n");
-    let primer = parsed(SRC);
+    let primer = record(SRC);
     let (_, word) = store_fresh(primer, key, 1.0);
-    let receiver = parsed(SRC);
+    let receiver = record(SRC);
     assert_eq!(stamp(receiver), word as u32);
     crate::object::js_object_delete_field(object_of(receiver), key);
     assert_ne!(
@@ -410,18 +411,16 @@ fn delete_leaves_the_published_shape() {
     );
 }
 
-/// A Proxy is a POINTER-tagged id in the handle band, which the emitted
-/// small-handle test (`handle > 0xFFFFF`) refuses before any header load.
+/// A Proxy's tagged receiver word cannot match a shape, so emitted shape
+/// comparisons miss and route to the shared proxy helper.
 #[test]
-fn proxies_live_below_the_small_handle_floor() {
-    use crate::value::addr_class::{HANDLE_BAND_MAX, PROXY_ID_BAND_START};
-    // The emitted receiver test refuses every payload below HANDLE_BAND_MAX
-    // (`perry-codegen` spells it `2^48 - HANDLE_BAND_MAX` after the bias).
-    assert!(PROXY_ID_BAND_START < HANDLE_BAND_MAX);
-    let target = parsed(SRC);
-    let handler = parsed(b"{}");
+fn proxies_cannot_match_an_ordinary_receiver_shape() {
+    let target = record(SRC);
+    let handler = json(b"{}");
     let proxy = crate::proxy::js_proxy_new(target, handler);
-    assert!((proxy.to_bits() & POINTER_MASK) < HANDLE_BAND_MAX as u64);
+    let receiver = (proxy.to_bits() & POINTER_MASK) as *const u8;
+    assert!(crate::proxy::canonical_address(proxy).is_some());
+    assert_eq!(unsafe { receiver.add(4).cast::<u32>().read_unaligned() }, 0);
 }
 
 /// A forwarded cell keeps the new user address in its first eight payload
@@ -429,8 +428,8 @@ fn proxies_live_below_the_small_handle_floor() {
 /// is below the ShapeId floor on every supported target.
 #[test]
 fn a_forwarded_cell_cannot_match_a_shape_id() {
-    let target = parsed(SRC);
-    let other = parsed(SRC);
+    let target = record(SRC);
+    let other = record(SRC);
     unsafe {
         let obj = object_of(target);
         let saved = *(obj as *const u64);
@@ -451,8 +450,8 @@ fn a_forwarded_cell_cannot_match_a_shape_id() {
 #[test]
 fn a_second_shape_is_kept_in_the_ways_without_moving_the_word() {
     let key = interned(b"n");
-    let first = parsed(SRC);
-    let second = parsed(br#"{"n":2,"z":0}"#);
+    let first = record(SRC);
+    let second = record(br#"{"n":2,"z":0}"#);
     assert_ne!(stamp(first), stamp(second));
     let packed_site: &'static PackedSetSite = Box::leak(Box::new(PackedSetSite::empty()));
     let packed = &packed_site.set;
@@ -504,7 +503,7 @@ fn saturated_named_store_uses_each_receivers_own_binding() {
                 source.push_str(&format!("\"extra{i}\":0,"));
             }
             source.push_str("\"n\":1}");
-            parsed(source.as_bytes())
+            record(source.as_bytes())
         })
         .collect();
     let site: &'static PackedSetSite = Box::leak(Box::new(PackedSetSite::empty()));
@@ -545,7 +544,7 @@ fn saturated_named_store_uses_each_receivers_own_binding() {
 #[test]
 fn a_fresh_way_cache_is_born_empty_not_zero() {
     let key = interned(b"n");
-    let target = parsed(SRC);
+    let target = record(SRC);
     let packed_site: &'static PackedSetSite = Box::leak(Box::new(PackedSetSite::empty()));
     let packed = &packed_site.set;
     let mut slot: PackedSetWaysSlot = std::ptr::null_mut();
@@ -556,11 +555,11 @@ fn a_fresh_way_cache_is_born_empty_not_zero() {
     for (i, w) in ways[..PACKED_SET_WAYS].iter().enumerate().skip(1) {
         assert_eq!(*w, PACKED_SET_EMPTY, "way {i} must be born EMPTY");
     }
-    // The chain-entry word after the ways is a pointer word, not a way: it is
-    // born 0 (no entry), and no emitted compare reads it.
+    // The setter word after the ways is a pointer word, not a way: it is
+    // born 0 (no entry), and no emitted ways compare reads it.
     assert_eq!(
-        ways[PACKED_SET_CHAIN_WORD], 0,
-        "the chain word is born empty"
+        ways[PACKED_SET_SETTER_WORD], 0,
+        "the setter word is born empty"
     );
 }
 
@@ -579,7 +578,7 @@ fn packed_set_inline_ways_matches_codegen() {
 #[test]
 fn a_store_fact_change_leaves_the_published_shape() {
     let key = interned(b"n");
-    let marked = parsed(SRC);
+    let marked = record(SRC);
     let (_, word) = store_fresh(marked, key, 1.0);
     assert_eq!(word as u32, stamp(marked));
     let ways: [AtomicU64; PACKED_SET_WAYS] =
@@ -587,7 +586,7 @@ fn a_store_fact_change_leaves_the_published_shape() {
     ways[0].store(word, Ordering::Relaxed);
 
     let served = |target: f64, v: f64| unsafe { packed_ways_store(&ways, 0, target, v) };
-    let other = parsed(SRC);
+    let other = record(SRC);
     assert_eq!(stamp(other), word as u32, "premise: a shape twin");
     assert_eq!(
         served(other, 5.0),
@@ -598,7 +597,7 @@ fn a_store_fact_change_leaves_the_published_shape() {
     let restamp = |target: f64| unsafe {
         crate::object::shapes::store_kind::restamp_object_store_kind(object_of(target))
     };
-    let unmarked = parsed(SRC);
+    let unmarked = record(SRC);
     unsafe { (*header(unmarked))._reserved &= !crate::gc::OBJ_FLAG_PLAIN_ORDINARY };
     restamp(unmarked);
     assert_ne!(
@@ -612,7 +611,7 @@ fn a_store_fact_change_leaves_the_published_shape() {
         "an UNMARKED class-less receiver must not be served"
     );
 
-    let proto = parsed(SRC);
+    let proto = record(SRC);
     unsafe { (*header(proto))._reserved |= crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO };
     restamp(proto);
     assert_ne!(stamp(proto), word as u32);
@@ -622,7 +621,7 @@ fn a_store_fact_change_leaves_the_published_shape() {
         "a typed-array prototype must not be served"
     );
 
-    let proof = parsed(SRC);
+    let proof = record(SRC);
     assert!(unsafe {
         crate::object::shapes::store_kind::stamp_numeric_proof_twin(object_of(proof)).is_some()
     });
@@ -637,7 +636,7 @@ fn a_store_fact_change_leaves_the_published_shape() {
         "a receiver carrying the numeric proof must not be served"
     );
 
-    let native = parsed(SRC);
+    let native = record(SRC);
     unsafe { (*object_of(native)).class_id = crate::object::NATIVE_MODULE_CLASS_ID };
     restamp(native);
     assert_ne!(stamp(native), word as u32);
@@ -653,7 +652,7 @@ fn a_store_fact_change_leaves_the_published_shape() {
 /// publishes too — only the pointer-keyed read-plan memo is skipped for it.
 #[test]
 fn a_non_interned_key_publishes_by_content() {
-    let target = parsed(SRC);
+    let target = record(SRC);
     let key = crate::string::js_string_from_bytes(b"n".as_ptr(), 1);
     let gc =
         unsafe { crate::value::addr_class::try_read_gc_header(key as usize) }.expect("a heap key");
@@ -672,13 +671,12 @@ fn a_non_interned_key_publishes_by_content() {
 }
 
 /// A static-key store that ADDS a key to a class instance misses into this
-/// entry on every call (the emitted hit only serves existing own slots), so
-/// this is where the inherited-access chain verdict must run. Since #11241 no
-/// static-key store reaches the write-PIC miss entries at all: a verdict wired
-/// only there fires zero times while every trap test stays green. Asserts the
-/// verdict is primed on THIS site and then serves the later stores.
+/// entry on every call (the emitted hit only serves existing own slots), even
+/// at a full-outline site with no key-add memo. Its shape fact (the
+/// transition edge with its inherited-store verdict) must serve every store
+/// after the first.
 #[test]
-fn a_key_adding_static_store_is_served_by_the_chain_or_shape_verdict() {
+fn a_key_adding_static_store_is_served_by_the_shape_verdict() {
     const CID: u32 = 0x0004_2217;
     let first = interned(b"chainPackedFirst");
     let added = interned(b"chainPackedAdded");
@@ -687,20 +685,18 @@ fn a_key_adding_static_store_is_served_by_the_chain_or_shape_verdict() {
     let mut cache: PackedSetWays = packed_set_cache_empty();
     let mut cache_slot: PackedSetWaysSlot = &mut cache;
     // A full-outline site (null compact word): no key-add memo, so the
-    // chain verdict is the lane that serves the adds this test counts.
+    // shape's transition fact is what serves the adds this test counts.
     // A class with a prototype object, as a compiled class has: the verdict
-    // walks (and marks) the chain it proves clear, so a class with no
-    // prototype to walk is refused.
+    // walks (and marks) the chain it proves clear.
     let proto = crate::object::js_object_alloc(0, 4);
     crate::object::class_prototype_object_root_store(CID, proto);
-    let before = crate::object::chain_store::chain_store_hits_this_thread();
     crate::object::test_reset_transition_fast_hits();
     const STORES: u64 = 6;
     for i in 0..STORES {
         let obj = crate::object::js_object_alloc(CID, 0);
         let target = f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
-        // One key first, so the receiver the chain-verdict site sees carries a
-        // real ShapeId, as a constructor's receiver does.
+        // One key first, so the receiver the add site sees carries a real
+        // ShapeId, as a constructor's receiver does.
         js_put_value_set_packed_miss(target, first, 1.0, 0, &mut first_slot, std::ptr::null());
         js_put_value_set_packed_miss(
             target,
@@ -713,33 +709,24 @@ fn a_key_adding_static_store_is_served_by_the_chain_or_shape_verdict() {
         let read = crate::object::js_object_get_field_by_name_f64(obj, added);
         assert_eq!(read, i as f64, "the added key holds the stored value");
     }
-    assert_ne!(
-        cache[PACKED_SET_CHAIN_WORD],
-        0,
-        "the site primed a chain verdict in its own cache: {}",
-        crate::object::chain_store::chain_store_counters_for_test()
-    );
-    let served = crate::object::chain_store::chain_store_hits_this_thread() - before
-        + crate::object::test_transition_fast_hits();
+    let served = crate::object::test_transition_fast_hits();
     assert!(
         served >= STORES - 1,
-        "every store after the prime is served by its chain or shape fact: {served} of {STORES}"
+        "every store after the first is served by its shape fact: {served} of {STORES}"
     );
 }
 
-/// S6 on the store side: a dictionary-mode receiver must never publish a store
-/// site word. Its ShapeId survives appends and in-place deletes, so no
-/// `(ShapeId, slot)` is a fact of that id. The control is the same receiver
-/// before the latch, which does publish. Two independent facts refuse it: the
-/// dictionary shape publishes no key list (so the prime finds no slot), and the
-/// prime admits only a matchable ShapeId. This pins the outcome; it goes red
-/// only if BOTH are removed, which is why the band check is not the only
-/// guard here.
+/// S6 on the store side, object model step 4: a receiver with an overflow
+/// never publishes a store site word (store-site memos do not serve it until
+/// step 5). The control is the same receiver before its overflow, which does
+/// publish. The overflow sets the shadow bit in the layout word, which puts
+/// the full word outside the matchable band; the miss still performs the
+/// store, and the generic read sees it.
 #[test]
-fn a_dictionary_receiver_never_publishes_a_store_site_word() {
+fn an_overflow_receiver_never_publishes_a_store_site_word() {
     let _lock = crate::gc::global_side_table_test_lock();
     let _no_gc = crate::gc::GcSuppressScope::new();
-    let target = parsed(SRC);
+    let target = record(SRC);
     let key = interned(b"n");
     let (_, word) = store_fresh(target, key, 7.0);
     assert_eq!(
@@ -747,18 +734,37 @@ fn a_dictionary_receiver_never_publishes_a_store_site_word() {
         stamp(target),
         "control: an ordinary receiver publishes"
     );
-    assert!(unsafe { crate::object::dictionary::latch_object_to_dictionary(object_of(target)) });
+    assert!(unsafe { crate::object::overflow::establish_order(object_of(target)) });
     let id = stamp(target);
     assert!(
         !crate::object::shapes::is_site_matchable_shape_id(id),
-        "premise: the dictionary id is outside the matchable band: {id:#x}"
+        "premise: the shadowed word is outside the matchable band: {id:#x}"
     );
     let (stored, word) = store_fresh(target, key, 8.0);
     assert_eq!(stored, 8.0, "the miss still performs the store");
     assert_eq!(
         word, PACKED_SET_EMPTY,
-        "a dictionary receiver must not publish"
+        "an overflow receiver must not publish"
     );
+    let n = crate::object::js_object_get_field_by_name(object_of(target), key);
+    assert_eq!(f64::from_bits(n.bits()), 8.0);
+}
+
+/// A `JSON.parse` record is born with its exact layout and no overflow
+/// (#12618): a store through the miss entry is performed and read back by the
+/// generic Get, for an existing key and for an added one, and the record never
+/// gains an overflow from them.
+#[test]
+fn a_json_record_is_born_without_an_overflow_and_stores_read_back() {
+    let target = json(SRC);
+    assert!(!unsafe { crate::object::overflow::has_overflow(object_of(target)) });
+    for (name, value) in [(b"n".as_slice(), 7.0), (b"json_added", 9.0)] {
+        let key = interned(name);
+        let (stored, _) = store_fresh(target, key, value);
+        assert_eq!(stored, value, "the miss performs the store");
+        let read = crate::object::js_object_get_field_by_name(object_of(target), key);
+        assert_eq!(f64::from_bits(read.bits()), value);
+    }
 }
 
 /// An `Object.create(proto)` receiver is an ORDINARY object whose prototype is
@@ -769,7 +775,7 @@ fn a_dictionary_receiver_never_publishes_a_store_site_word() {
 /// walk (the acceptance matrix's ocreate column went 293 -> 1,588 instr/op).
 #[test]
 fn an_object_create_receiver_publishes_its_shape_and_inline_slot() {
-    let proto = parsed(br#"{"pa":32}"#);
+    let proto = record(br#"{"pa":32}"#);
     let target = crate::object::js_object_create(proto);
     let obj = object_of(target);
     assert_eq!(
@@ -811,7 +817,7 @@ fn an_object_create_receiver_publishes_its_shape_and_inline_slot() {
 #[test]
 fn an_f64_lane_publishes_the_store_check_flag() {
     let key_x = interned(b"p2c_f64_x");
-    let target = parsed(br#"{"p2c_a":1}"#);
+    let target = record(br#"{"p2c_a":1}"#);
     crate::object::js_object_set_field_by_name(object_of(target), key_x as *mut _, 2.5);
     assert!(
         !crate::object::field_rep_store::shape_slot_is_any(stamp(target), 1),
@@ -825,7 +831,60 @@ fn an_f64_lane_publishes_the_store_check_flag() {
     assert_eq!(
         any_word & PACKED_SET_F64_SLOT,
         0,
-        "a JSON birth lane is Any"
+        "a record's birth lane is Any"
     );
     assert_eq!(any_word >> 32, 0);
+}
+
+/// #12484: a key that lives in spill storage enters a runtime way with the
+/// spill flip, which no emitted compare can match. A warm miss must take that
+/// learned answer — a function of the receiver's ShapeId alone — before any
+/// own-key lookup or re-publication. The planted index below names a
+/// DIFFERENT spill slot than the key's, so the store landing there shows the
+/// way was served and the slot was not re-derived from the key.
+#[test]
+fn a_learned_spill_way_is_served_before_the_own_key_lookup() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let obj = crate::object::js_object_alloc(0, 0);
+    unsafe { crate::object::alloc_plain::mark_object_plain_ordinary(obj) };
+    let names = [b"pos".as_slice(), b"end", b"spillA", b"spillB"];
+    for name in names {
+        crate::object::js_object_set_field_by_name(obj, interned(name), 1.0);
+    }
+    let target = crate::value::js_nanbox_pointer(obj as i64);
+    let key = interned(b"spillA");
+    let other = interned(b"spillB");
+    let packed_site: &'static PackedSetSite = Box::leak(Box::new(PackedSetSite::empty()));
+    let packed = &packed_site.set;
+    let mut cache: PackedSetWays = packed_set_cache_empty();
+    let mut cache_slot: PackedSetWaysSlot = &mut cache;
+    assert_eq!(
+        js_put_value_set_packed_miss(target, key, 2.0, 0, &mut cache_slot, packed),
+        2.0
+    );
+    assert_eq!(
+        packed.load(Ordering::Relaxed),
+        PACKED_SET_EMPTY,
+        "a spill slot never enters the emitted word"
+    );
+    assert_eq!(
+        cache[0] as u32 ^ super::SPILL_FLIP,
+        stamp(target),
+        "the spill key's way"
+    );
+    let slot = (cache[0] & !PACKED_SET_FLAGS) >> 32;
+    assert_eq!(slot, 2, "`spillA` is the third key");
+    assert_eq!(cache[1], PACKED_SET_EMPTY);
+
+    // The learned answer, not a key lookup, decides the slot.
+    cache[0] = (3u64 << 32) | (cache[0] & 0xFFFF_FFFF);
+    assert_eq!(
+        js_put_value_set_packed_miss(target, key, 9.0, 0, &mut cache_slot, packed),
+        9.0
+    );
+    let read = |k| f64::from_bits(crate::object::js_object_get_field_by_name(obj, k).bits());
+    assert_eq!(read(other), 9.0, "the way's slot was written");
+    assert_eq!(read(key), 2.0, "the key's own slot was not re-derived");
+    assert_eq!(cache[1], PACKED_SET_EMPTY, "a way hit publishes nothing");
 }

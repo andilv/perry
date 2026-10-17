@@ -86,13 +86,15 @@ pub(crate) fn emit_typed_i32_guard_and_raw(
     let tagged_identity = blk.and(I64, &bits, &int32_identity_mask);
     let is_tagged = blk.icmp_eq(I64, &tagged_identity, crate::nanbox::INT32_TAG_I64);
 
-    // JSValue::is_number: Perry-owned tags occupy positive-qNaN top words
-    // 0x7ff9..=0x7fff.  Everything outside that interval (including negative
-    // IEEE values and canonical 0x7ff8 NaNs) remains a Number.
-    let top16 = blk.lshr(I64, &bits, "48");
-    let below_tag_band = blk.icmp_ult(I64, &top16, crate::nanbox::SHORT_STRING_TAG_TOP16_I64);
-    let above_tag_band = blk.icmp_ugt(I64, &top16, crate::nanbox::STRING_TAG_TOP16_I64);
-    let is_plain_number = blk.or(I1, &below_tag_band, &above_tag_band);
+    // Sign-closed numeric proof, shared with boxed numeric-loop admission.
+    // Numeric ingress canonicalizes payload NaNs; mirroring the tag band
+    // excludes HANDLE_TAG while preserving finite values and default NaNs.
+    let magnitude = blk.and(I64, &bits, "9223372036854775807");
+    let is_plain_number = blk.icmp_ult(
+        I64,
+        &magnitude,
+        &crate::nanbox::i64_literal(crate::nanbox::SHORT_STRING_TAG),
+    );
     let above_min = blk.fcmp("oge", value, "-2147483648.0");
     let below_max = blk.fcmp("ole", value, "2147483647.0");
     let in_range = blk.and(I1, &above_min, &below_max);
@@ -280,12 +282,15 @@ pub(crate) fn emit_typed_string_guard(blk: &mut crate::block::LlBlock, arg: &str
 pub(crate) fn emit_typed_f64_guard(blk: &mut crate::block::LlBlock, arg: &str) -> String {
     use crate::types::{I1, I64};
     let bits = blk.bitcast_double_to_i64(arg);
-    // JSValue::is_number: Perry-owned tags occupy the positive-qNaN top words
-    // 0x7ff9..=0x7fff; everything outside that band is a Number.
-    let top16 = blk.lshr(I64, &bits, "48");
-    let below_tag_band = blk.icmp_ult(I64, &top16, crate::nanbox::SHORT_STRING_TAG_TOP16_I64);
-    let above_tag_band = blk.icmp_ugt(I64, &top16, crate::nanbox::STRING_TAG_TOP16_I64);
-    let is_plain_number = blk.or(I1, &below_tag_band, &above_tag_band);
+    // The sign-closed numeric proof excludes both the positive tag band and
+    // its negative mirror (including HANDLE_TAG). Ingress canonicalization
+    // ensures numeric payload NaNs cannot reach this boxed entry.
+    let magnitude = blk.and(I64, &bits, "9223372036854775807");
+    let is_plain_number = blk.icmp_ult(
+        I64,
+        &magnitude,
+        &crate::nanbox::i64_literal(crate::nanbox::SHORT_STRING_TAG),
+    );
     // JSValue::is_int32: the INT32 tag with any payload.
     let int32_identity_mask = crate::nanbox::i64_literal(!crate::nanbox::INT32_MASK);
     let tagged_identity = blk.and(I64, &bits, &int32_identity_mask);
@@ -459,6 +464,10 @@ pub(crate) enum TypedCloneRejectionReason {
     /// Spec-ABI: the module-wide `PERRY_SPECIALIZED_ABI_MAX` budget was
     /// exhausted before this function's turn.
     SpecBudgetExceeded,
+    /// Spec-ABI: the body has more HIR nodes than `SPEC_MAX_BODY_NODES`; a
+    /// second copy of it costs more compile time and code than its
+    /// entry-bound facts can win back.
+    SpecBodyTooLarge,
     /// Spec-ABI: the callee reads dynamic `this`, so direct call sites must
     /// juggle the implicit-this slot and never take the raw-ABI route.
     SpecReadsDynamicThis,
@@ -502,6 +511,7 @@ impl TypedCloneRejectionReason {
             Self::SpecTupleUnproven => "spec_tuple_unproven",
             Self::SpecTypedCloneOverlap => "spec_typed_clone_overlap",
             Self::SpecBudgetExceeded => "spec_budget_exceeded",
+            Self::SpecBodyTooLarge => "spec_body_too_large",
             Self::SpecReadsDynamicThis => "spec_reads_dynamic_this",
         }
     }
@@ -880,7 +890,7 @@ pub(crate) fn typed_f64_receiver_method_rejection_reason(
     method: &Function,
     classes: &HashMap<String, &perry_hir::Class>,
 ) -> Option<TypedCloneRejectionReason> {
-    typed_f64_receiver_method_candidate(class, method, classes).err()
+    typed_f64_receiver_method_candidate(class, method, classes, false).err()
 }
 
 pub(crate) fn typed_f64_receiver_method_info(
@@ -888,7 +898,17 @@ pub(crate) fn typed_f64_receiver_method_info(
     method: &Function,
     classes: &HashMap<String, &perry_hir::Class>,
 ) -> Option<TypedReceiverMethodInfo> {
-    typed_f64_receiver_method_candidate(class, method, classes).ok()
+    typed_f64_receiver_method_candidate(class, method, classes, false).ok()
+}
+
+/// Accessor dispatch has already proved the receiver's own data layout and
+/// its declaration holders. Prototype accessors do not invalidate own slots.
+pub(crate) fn typed_f64_accessor_receiver_method_info(
+    class: &perry_hir::Class,
+    method: &Function,
+    classes: &HashMap<String, &perry_hir::Class>,
+) -> Option<TypedReceiverMethodInfo> {
+    typed_f64_receiver_method_candidate(class, method, classes, true).ok()
 }
 
 pub(crate) fn typed_i1_method_rejection_reason(
@@ -1312,6 +1332,7 @@ pub(crate) struct TypedReceiverChainFields<'a> {
 fn typed_receiver_chain_fields<'a>(
     classes: &HashMap<String, &'a perry_hir::Class>,
     class: &'a perry_hir::Class,
+    accessor: bool,
 ) -> Result<TypedReceiverChainFields<'a>, TypedCloneRejectionReason> {
     // Chain, self first.
     let mut chain: Vec<&perry_hir::Class> = Vec::new();
@@ -1332,7 +1353,7 @@ fn typed_receiver_chain_fields<'a>(
         {
             return Err(TypedCloneRejectionReason::ReceiverClassExtends);
         }
-        if !link.getters.is_empty() || !link.setters.is_empty() {
+        if !accessor && (!link.getters.is_empty() || !link.setters.is_empty()) {
             return Err(TypedCloneRejectionReason::ReceiverClassHasAccessor);
         }
         if !link.computed_members.is_empty() {
@@ -1385,6 +1406,7 @@ fn typed_f64_receiver_method_candidate(
     class: &perry_hir::Class,
     method: &Function,
     classes: &HashMap<String, &perry_hir::Class>,
+    accessor: bool,
 ) -> Result<TypedReceiverMethodInfo, TypedCloneRejectionReason> {
     if method.is_async || method.is_generator || method.was_plain_async {
         return Err(TypedCloneRejectionReason::AsyncOrGenerator);
@@ -1397,7 +1419,7 @@ fn typed_f64_receiver_method_candidate(
     }
     // Phase 3b widening: extends chains are admitted when every link passes
     // the receiver-shape checks; field indexes are chain-global.
-    let chain_fields = typed_receiver_chain_fields(classes, class)?;
+    let chain_fields = typed_receiver_chain_fields(classes, class, accessor)?;
 
     let mut locals = HashMap::new();
     for param in &method.params {

@@ -265,7 +265,11 @@ mod target_os_tests {
 
     #[test]
     fn lchmod_availability_uses_the_classified_target_os() {
-        for target in ["aarch64-apple-darwin", "arm64-apple-macosx15.0.0", "x86_64-unknown-freebsd"] {
+        for target in [
+            "aarch64-apple-darwin",
+            "arm64-apple-macosx15.0.0",
+            "x86_64-unknown-freebsd",
+        ] {
             assert!(fs_lchmod_callable_on_target(target), "{target}");
         }
         for target in ["aarch64-unknown-linux-android", "x86_64-pc-windows-msvc"] {
@@ -392,6 +396,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             crate::rooting::lower_scoped_binding(ctx, *id, value, body)
         }
         Expr::LocalGet(id) => {
+            crate::codegen::arguments::ensure_arguments_object(ctx, *id);
             if let Some(value) = crate::array_record_stack::read_local(ctx, *id) {
                 return Ok(value);
             }
@@ -1108,16 +1113,23 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // call returning a `double` (milliseconds since UNIX epoch as
         // produced by `js_date_now` in `perry-runtime/src/date.rs`).
         Expr::DateNow => Ok(ctx.block().call(DOUBLE, "js_date_now", &[])),
-        // #7760: one volatile `i8` load, the same shape the array index fast
-        // path uses for its own invalidation flag. Emitted once at the entry of
-        // a `for…of` over a proven array to choose between the index loop and
-        // the lazy iterator-protocol loop, so the fast arm pays a load and a
-        // predictable branch PER LOOP, never per iteration.
+        // #7760: emitted once at the entry of a `for…of` over a proven array
+        // to choose between the index loop and the lazy iterator-protocol
+        // loop. With no program write able to reach an iteration member it is
+        // the constant `false`; otherwise one read of `%Array.prototype%`'s
+        // fixed `Symbol.iterator` slot, PER LOOP, never per iteration.
         Expr::ArrayIterationPatched => {
+            let facts = super::array_iteration_facts();
+            if facts == 0 {
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_FALSE)));
+            }
             let blk = ctx.block();
-            let flag = blk.load_volatile(crate::types::I8, "@PERRY_ARRAY_ITERATION_NOT_PRISTINE");
-            let widened = blk.zext(crate::types::I8, &flag, crate::types::I32);
-            Ok(super::i32_bool_to_nanbox(blk, &widened))
+            let needs = blk.call(
+                crate::types::I32,
+                "js_array_record_literal_needs_iterator",
+                &[(crate::types::I32, &facts.to_string())],
+            );
+            Ok(super::i32_bool_to_nanbox(blk, &needs))
         }
 
         // -------- Arithmetic --------
@@ -1274,6 +1286,7 @@ pub(crate) fn bind_lowered_value_to_local(
     v: &str,
     value: &Expr,
 ) -> Result<()> {
+    crate::codegen::arguments::note_arguments_assignment(ctx, id);
     // `target = source` creates the same string-buffer alias as a
     // `let target = source` initializer. The declaration path has
     // demoted this shape since #5552, but assignment aliases were

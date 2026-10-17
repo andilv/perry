@@ -72,7 +72,7 @@ const JS_EQ_CALL: &str = "call i64 @js_eq(";
 const JS_LOOSE_EQ_CALL: &str = "call i64 @js_loose_eq(";
 
 #[test]
-fn dynamic_relations_admit_unboxed_numbers_with_one_signed_guard_per_operand() {
+fn dynamic_relations_admit_unboxed_numbers_with_one_sign_closed_guard_per_operand() {
     for (op, helper, pred) in [
         (CompareOp::Lt, "js_rel_lt", "olt"),
         (CompareOp::Le, "js_rel_le", "ole"),
@@ -85,9 +85,15 @@ fn dynamic_relations_admit_unboxed_numbers_with_one_signed_guard_per_operand() {
             Expr::LocalGet(X),
             Expr::LocalGet(Y),
         );
+        // The shared sign-closed plain-number test (#12540): a one-sided
+        // signed compare admitted HANDLE_TAG (a negative NaN) as a number.
         assert!(
-            ir.contains("icmp slt i64"),
+            ir.contains("icmp ule i64") && ir.contains(", 9221401712017801215"),
             "unboxed-number guard was not emitted:\n{ir}"
+        );
+        assert!(
+            !ir.contains("icmp slt i64"),
+            "no one-sided signed number guard:\n{ir}"
         );
         assert!(
             ir.contains(&format!("fcmp {pred} double")),
@@ -795,9 +801,13 @@ fn local_typeof_number_literal_is_decided_inline_for_plain_doubles() {
         calls, 1,
         "exactly one classifier call, on the slow arm:\n{ir}"
     );
+    // Honest pointers: the tag band is sign-closed, so the Number test is
+    // one mask of the sign bit and one unsigned compare against 0x7FF9<<48.
     assert!(
-        ir.contains("icmp ugt i64") && ir.contains(", 6\n") || ir.contains(", 6 "),
-        "the tag-range test must be the single unsigned range compare:\n{ir}"
+        ir.contains("and i64")
+            && ir.contains("icmp ult i64")
+            && ir.contains(", 9221401712017801216"),
+        "the tag-range test must be the single sign-closed unsigned range compare:\n{ir}"
     );
     assert!(
         !ir.contains("1048576.0") && !ir.contains("0x4130000000000000"),
@@ -923,14 +933,15 @@ fn integer_literal_equality_has_one_numeric_compare() {
 }
 
 #[test]
-fn number_relation_uses_shared_signed_guard_and_contiguous_singleton_range() {
+fn number_relation_uses_shared_sign_closed_guard_and_contiguous_singleton_range() {
     let ir = cmp_ir(
         "number_relation_guard",
         CompareOp::Lt,
         Expr::LocalGet(X),
         Expr::Number(128.0),
     );
-    assert_eq!(ir.matches("icmp slt i64").count(), 1, "{ir}");
+    assert_eq!(ir.matches("icmp ule i64").count(), 1, "{ir}");
+    assert!(!ir.contains("icmp slt i64"), "{ir}");
     assert!(!ir.contains("icmp ugt i64"), "{ir}");
     assert!(ir.contains("icmp ult i64") && ir.contains(", 4"), "{ir}");
     assert!(ir.contains("call double @js_rel_lt("), "{ir}");

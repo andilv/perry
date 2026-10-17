@@ -72,7 +72,7 @@ impl OwnProperty {
                 let keys = super::object_keys(obj);
                 let field = |name: &[u8]| {
                     super::keys_find_property_slot_by_bytes(keys.arr(), keys.count(), name)
-                        .map(|slot| super::js_object_get_field(obj, slot).bits())
+                        .map(|slot| super::field_get_set::js_object_get_key_field(obj, slot).bits())
                 };
                 let flags = if field(b"enumerable") == Some(crate::value::TAG_TRUE) {
                     0
@@ -111,6 +111,10 @@ pub(crate) unsafe fn ordinary_data_shape(
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
+        return None;
+    }
+    // A shadowed object's own keys are its overflow's, not the layout's.
+    if super::overflow::shadowed(object) {
         return None;
     }
     let shape = shapes::object_shape_descriptor(object)?;

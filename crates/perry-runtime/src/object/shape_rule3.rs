@@ -233,6 +233,14 @@ pub(crate) const RULE3_KINDS: &[(u8, &str, &str, Rule3Word)] = &[
         "high 32 of prototype NaN-box",
         Rule3Word::NotPointerTagged,
     ),
+    // Object model step 4: an object's overflow table hangs off its
+    // `ObjectMeta` and serves as its key view; it is never a JavaScript value.
+    (
+        gc::GC_TYPE_OVERFLOW,
+        "overflow::Table",
+        "capacity: u32 (entries, the ArrayHeader-shaped prefix)",
+        Rule3Word::NotPointerTagged,
+    ),
     (
         gc::GC_TYPE_REGEXP,
         "RegExpData",
@@ -313,8 +321,26 @@ pub(crate) const RULE3_KINDS: &[(u8, &str, &str, Rule3Word)] = &[
     ),
     (
         gc::GC_TYPE_SYMBOL,
-        "SymbolHeader (persistent)",
-        "registered: u32 — the Symbol.for flag is exactly 0 or 1",
+        "SymbolHeader",
+        "registered: u32 — Symbol.for/persistent flags are bounded by 3",
+        Rule3Word::StructurallySmall,
+    ),
+    (
+        gc::GC_TYPE_SET_STORE,
+        "SetStore",
+        "reserved zero receiver word at +0..8",
+        Rule3Word::StructurallySmall,
+    ),
+    (
+        gc::GC_TYPE_MAP_STORE,
+        "MapStore",
+        "reserved zero receiver word at +0..8",
+        Rule3Word::StructurallySmall,
+    ),
+    (
+        gc::GC_TYPE_ASYNC_SNAPSHOT,
+        "AsyncSnapshotHolder",
+        "reserved zero receiver word at +0..8",
         Rule3Word::StructurallySmall,
     ),
     (
@@ -322,6 +348,24 @@ pub(crate) const RULE3_KINDS: &[(u8, &str, &str, Rule3Word)] = &[
         "WeakStorage",
         "len: u32 <= capacity; storage::grow bounds capacity by the u32 allocation size / 28",
         Rule3Word::BoundedBelowRange,
+    ),
+    (
+        gc::GC_TYPE_PROXY,
+        "ProxyEntry",
+        "zero receiver prefix, including the tagged receiver's +4 word",
+        Rule3Word::StructurallySmall,
+    ),
+    (
+        gc::GC_TYPE_ASYNC_RESOURCE_STATE,
+        "ResourceState",
+        "zero reserved receiver word",
+        Rule3Word::StructurallySmall,
+    ),
+    (
+        gc::GC_TYPE_INTERP_FUNCTION,
+        "FunctionCell",
+        "high half of its pure Rust AST pointer",
+        Rule3Word::StructurallySmall,
     ),
 ];
 

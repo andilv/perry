@@ -1041,10 +1041,7 @@ pub extern "C" fn js_array_some_captureless(
         // SAFETY: `normalize_array_receiver` returned this live plain-array
         // head and the registry exits above excluded Buffer/TypedArray
         // receivers; nothing allocates before the flag read.
-        let exotic = crate::array::array_iteration_is_exotic_resolved(
-            arr,
-            crate::array::array_object_flags_resolved(arr),
-        );
+        let exotic = crate::array::array_iteration_is_exotic_resolved(arr);
         let scope = crate::gc::RuntimeHandleScope::new();
         let rooted = RootedIterArray::new(&scope, arr);
 
@@ -1501,8 +1498,8 @@ fn typeof_owned_string(v: f64) -> String {
 fn resolve_callback_ptr(cb_boxed: f64) -> Option<i64> {
     use crate::value::JSValue;
     let jv = JSValue::from_bits(cb_boxed.to_bits());
-    if jv.is_pointer() {
-        let ptr = jv.as_pointer::<ClosureHeader>();
+    if jv.is_reference() {
+        let ptr = (jv.bits() & crate::value::POINTER_MASK) as *const ClosureHeader;
         // #9681: a callable Proxy is a small registry id, so the hardened
         // closure validator correctly rejects it as a ClosureHeader. Return
         // that bare id anyway: DirectCallN falls back to js_closure_callN,

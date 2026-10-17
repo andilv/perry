@@ -35,6 +35,8 @@ mod liveness;
 mod liveness_tests;
 mod module_api;
 mod socket_api;
+pub(crate) use dispatch::install_client_socket_arm;
+pub(crate) use module_api::install_ext_net_connect;
 mod turnloop_server;
 #[cfg(all(test, feature = "turnloop-http-client"))]
 mod turnloop_server_tests;
@@ -340,7 +342,7 @@ fn next_tls_handle_id() -> i64 {
 }
 
 fn nanbox_handle(handle: i64) -> f64 {
-    f64::from_bits(0x7FFD_0000_0000_0000u64 | (handle as u64 & 0x0000_FFFF_FFFF_FFFF))
+    perry_runtime::value::js_nanbox_handle(handle)
 }
 
 fn raw_handle_value(handle: i64) -> f64 {

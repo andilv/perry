@@ -14,6 +14,7 @@ mod cjs_scaffolding;
 mod clamp_detect;
 mod class_accessors;
 mod closures;
+pub(crate) mod definite_init;
 mod escape_arrays;
 mod escape_check;
 mod escape_news;
@@ -47,6 +48,7 @@ mod ptr_shape_callbacks;
 mod ptr_shape_elements;
 mod ptr_shape_report;
 mod ptr_shape_returns;
+mod read_before_write;
 mod receiver_regions;
 #[cfg(test)]
 mod receiver_regions_tests;
@@ -64,6 +66,7 @@ pub(crate) mod spec_abi_sites;
 mod straight_line_stores;
 pub(crate) mod suffix_strings;
 mod this_as_value;
+pub(crate) mod typed_locals;
 mod uppercase_strings;
 
 // Public re-exports for the visible API.
@@ -78,6 +81,7 @@ pub use clamp_detect::{detect_clamp3, detect_clamp_u8, returns_i32_identity_arg,
 pub(crate) use byte_read_key::{collect_numeric_typed_locals, uint8array_get_reads_a_byte};
 pub(crate) use class_accessors::{is_class_getter, is_class_setter};
 pub(crate) use closures::{collect_closures_in_expr, collect_closures_in_stmts};
+pub(crate) use definite_init::DefiniteInit;
 pub(crate) use escape_arrays::{const_index, MAX_SCALAR_OBJECT_FIELDS};
 pub(crate) use escape_check::{check_escapes_in_stmts, find_new_candidates};
 pub(crate) use escape_news::MAX_SCALAR_ARRAY_LEN;
@@ -108,7 +112,9 @@ pub(crate) use mutation::{
     has_any_mutation,
 };
 pub(crate) use number_by_construction::collect_number_by_construction_locals;
-pub(crate) use object_create_proto::{object_create_protos, ObjectCreateProtos};
+pub(crate) use object_create_proto::{
+    object_create_bindings, object_create_protos, ObjectCreateProtos,
+};
 pub(crate) use object_literal_exports::exported_object_literal_capabilities;
 pub(crate) use param_ranges::{collect_param_int_ranges, ParamIntRanges};
 pub(crate) use pointer_locals::collect_pointer_typed_locals;
@@ -116,17 +122,18 @@ pub(crate) use proven_args::{
     method_proven_shape_args, pshape_args_method_name, ProvenShapeArgPlan,
 };
 pub(crate) use proven_this::{
+    accessor_proven_this,
     exportable_method_capabilities as exportable_proven_this_method_capabilities,
-    method_proven_this, prune_unregistered_clones, pshape_method_name, ptr_array_cache_fields,
-    ptr_array_cache_method_name, ptr_array_cached_method,
-    tower_route_profitable as pshape_tower_route_profitable,
+    inherited_accessor_proven_this, method_proven_this, prune_unregistered_clones,
+    pshape_method_name, ptr_array_cache_fields, ptr_array_cache_method_name,
+    ptr_array_cached_method, tower_route_profitable as pshape_tower_route_profitable,
 };
 pub(crate) use ptr_numarray::{NumArrayDensity, NumArrayLocal};
 pub(crate) use ptr_shape::{
     collect_numeric_by_construction_locals_in_region, region_number_flow_reads,
     region_store_value_is_number, RegionNumberAssumptions,
 };
-pub(crate) use ptr_shape::{ptr_shape_locals_enabled, PtrShapeLocal};
+pub(crate) use ptr_shape::{ptr_shape_locals_enabled, FamilyProof, PtrShapeLocal};
 pub(crate) use ptr_shape_callbacks::collect_array_callback_shapes;
 pub(crate) use ptr_shape_returns::collect_exported_return_shapes;
 pub(crate) use receiver_regions::{
@@ -134,9 +141,10 @@ pub(crate) use receiver_regions::{
     ReceiverArrayValidationKind, ReceiverDescriptorTable, RegionEnder,
 };
 pub(crate) use refs::{
-    collect_let_ids, collect_ref_ids_in_expr, collect_ref_ids_in_stmts, is_clamp_call,
+    collect_free_ref_ids_in_stmts, collect_let_ids, collect_ref_ids_in_expr,
+    collect_ref_ids_in_stmts, is_clamp_call,
 };
-pub(crate) use safepoint_sites::count_safepoint_sites;
+pub(crate) use safepoint_sites::{count_body_nodes, count_safepoint_sites};
 pub(crate) use scalar_method_dispatch::{
     collect_module_dispatch_facts, for_each_expr_in_stmts, mark_unstable_scalar_method_receivers,
     ModuleDispatchFacts,

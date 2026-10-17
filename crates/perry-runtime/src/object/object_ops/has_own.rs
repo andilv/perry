@@ -108,7 +108,7 @@ unsafe fn ordinary_own_key_present(obj_bits: u64, key_bits: u64) -> Option<bool>
     let text = crate::string::js_string_key_bytes(key, &mut sso)?;
     let (present, kind) = super::super::shapes::plain_own_key_present(
         super::super::shapes::ordinary_dir_addr(),
-        (*obj).parent_class_id,
+        (*obj).shape_word(),
         key_bits,
         text,
     )
@@ -180,7 +180,7 @@ unsafe fn shape_may_answer(obj_bits: u64, key_bits: u64) -> bool {
         && (key.is_string() || key.is_short_string())
         && (obj_bits & crate::value::POINTER_MASK) as usize >= perry_abi::RECEIVER_HANDLE_FLOOR
         && super::super::shapes::is_shape_id(
-            (*((obj_bits & crate::value::POINTER_MASK) as *const ObjectHeader)).parent_class_id,
+            (*((obj_bits & crate::value::POINTER_MASK) as *const ObjectHeader)).shape_word(),
         )
 }
 
@@ -213,13 +213,21 @@ fn object_has_own_generic(obj_value: f64, key_value: f64) -> f64 {
         // TYPED surface is prototype accessors (not own properties), but a
         // user-attached expando IS an own property (#6363) — `handle.foo = v` or
         // `Object.defineProperty(handle, …)`. Consult the expando table rather
-        // than reporting a flat false. Proxies also live in the handle band but
-        // are served by the trap branch below (which runs before any deref), so
-        // leave their sub-band alone.
-        if obj_js.is_pointer() {
-            let addr = obj_js.as_pointer::<u8>() as usize;
-            if crate::value::addr_class::is_handle_band(addr)
-                && !crate::value::addr_class::is_proxy_id_band(addr)
+        // than reporting a flat false. Proxies are heap cells, served by the
+        // trap branch below.
+        // An object with an overflow holds every own key in it: one
+        // atom-keyed probe answers (§3.4), unless indexed elements or an
+        // exotic receiver make a miss inconclusive.
+        if obj_js.is_pointer() && crate::JSValue::from_bits(key_value.to_bits()).is_any_string() {
+            if let Some(present) = crate::object::overflow::own_has_key(
+                obj_js.as_pointer::<super::super::ObjectHeader>(),
+                key_value.to_bits(),
+            ) {
+                return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
+            }
+        }
+        if obj_js.is_handle() {
+            let addr = obj_js.as_handle();
             {
                 let key_value = super::super::js_to_property_key(key_value);
                 if crate::symbol::js_is_symbol(key_value) != 0 {
@@ -346,24 +354,13 @@ fn object_has_own_generic(obj_value: f64, key_value: f64) -> f64 {
             return f64::from_bits(if present { TAG_TRUE } else { TAG_FALSE });
         }
 
-        // The receiver's managed header, read ONCE through the
-        // ownership-proving reader (an arbitrary receiver word is never read
-        // at `addr - 8` unchecked). Its type decides which of the
-        // kind-specific probes below can apply; none of them re-derives it.
-        // `None` means no allocator-owned header: a non-pointer word, or
-        // foreign / untracked memory such as a foreign-backed Buffer. The
-        // read follows every allocating coercion above, and a move never
-        // changes a header's type.
-        let header = if obj_js.is_pointer() {
-            let addr = obj_js.as_pointer::<u8>() as usize;
-            if crate::value::addr_class::is_above_handle_band(addr) {
-                crate::value::addr_class::try_read_tracked_gc_header(addr).map(|h| &*h.as_ptr())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // The receiver's managed header, read ONCE. A POINTER_TAG word names
+        // a GC-headed object (honest pointers), so the header needs no
+        // ownership proof. Its type decides which of the kind-specific probes
+        // below can apply; none of them re-derives it. `None` means a
+        // non-pointer word. The read follows every allocating coercion
+        // above, and a move never changes a header's type.
+        let header = crate::value::addr_class::pointer_value_header(obj_js.bits());
 
         match header {
             // An array is none of the kinds below (Buffer, typed array, class

@@ -74,6 +74,8 @@ pub extern "C" fn js_get_global_this_builtin_value(name_ptr: *const u8, name_len
 /// Object.create(proto) — create an empty object with an owner-traced prototype.
 #[no_mangle]
 pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::object_create(proto_value);
     let proto_value = unsafe { normalize_descriptor_operand(proto_value) };
     // #2816 prototype validation: only an object or `null` is permitted. A
     // Symbol is pointer-tagged but not an object, so reject it explicitly.
@@ -123,7 +125,7 @@ pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
         crate::object::shapes::keyless_birth_width(proto_id, producer)
     });
     let proto_id = serial.unwrap_or_else(crate::object::shapes::fresh_unique_proto_id);
-    let born = crate::object::alloc_basic::object_alloc_created(&proto, proto_id, birth);
+    let born = crate::object::alloc_basic::object_alloc_created(&proto, proto_id, birth, 0);
     crate::value::js_nanbox_pointer(born as i64)
 }
 
@@ -255,9 +257,9 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // Rule 3: a live ordinary ShapeId proves this cell's layout.
                 // Arrays, closures, handles, class and exotic identities
                 // decline without consulting their registries on this arm.
-                let id = unsafe { (*addr).parent_class_id };
+                let id = unsafe { (*addr).shape_word() };
                 if id.wrapping_sub(crate::object::shapes::SHAPE_ID_BASE)
-                    < crate::object::shapes::DICTIONARY_SHAPE_ID_BASE
+                    < crate::object::shapes::SITE_SHAPE_ID_END
                         - crate::object::shapes::SHAPE_ID_BASE
                 {
                     if let Some(proto) = unsafe { shape_link_prototype(addr, false) } {
@@ -325,9 +327,9 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
     }
     let bits = obj_value.to_bits();
     let top16 = bits >> 48;
-    if top16 == 0x7FFD {
+    if top16 == (crate::value::HANDLE_TAG >> 48) {
         let raw_addr = bits & 0x0000_FFFF_FFFF_FFFF;
-        if crate::value::addr_class::is_small_handle(raw_addr as usize) {
+        {
             // WHATWG fetch values are registry handles rather than heap
             // ObjectHeaders, but they still have the intrinsic prototype for
             // their interface.  Axios walks this chain to distinguish a
@@ -399,7 +401,22 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
         // comparing `class_id`, matching the `is_registered_map`/
         // `is_registered_set` safety bar above.
         let receiver = crate::value::js_nanbox_pointer(addr as i64);
-        if let Some(class_id) = crate::object::weak_class_id_from_receiver(receiver) {
+        let class_id = crate::object::weak_class_id_from_receiver(receiver)?;
+        // A weak brand is independent of [[Prototype]]. A subclass or a
+        // relinked intrinsic uses its own shape edge before the intrinsic.
+        if let Some(proto) = super::super::prototype_chain::object_static_prototype(addr) {
+            return Some(f64::from_bits(proto));
+        }
+        let object = addr as *const ObjectHeader;
+        if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
+            if header.obj_type == crate::gc::GC_TYPE_OBJECT {
+                let cid = unsafe { (*object).class_id };
+                if super::super::is_class_id_registered(cid) {
+                    return Some(super::class_decl_prototype_value(cid));
+                }
+            }
+        }
+        {
             let name = if class_id == crate::weakref::CLASS_ID_WEAKMAP {
                 "WeakMap"
             } else {
@@ -614,7 +631,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // cached intrinsic pointer (also a GC root) so the chain holds
                 // through copying GC.
                 // Bit 8 means "per-kind TypedArray prototype" only on a
-                // `GC_TYPE_OBJECT`; on an array it is `GC_ARRAY_NAMED_PROPS`.
+                // `GC_TYPE_OBJECT`; on an array it is `GC_ARRAY_KEY_ATTRS`.
                 if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
                     && (*gc)._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
                 {
@@ -876,7 +893,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             }
 
             // Bit 8 means "per-kind TypedArray prototype" only on a
-            // `GC_TYPE_OBJECT`; on an array it is `GC_ARRAY_NAMED_PROPS`.
+            // `GC_TYPE_OBJECT`; on an array it is `GC_ARRAY_KEY_ATTRS`.
             if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
                 && (*gc)._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
             {

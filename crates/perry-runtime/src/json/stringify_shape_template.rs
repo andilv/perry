@@ -58,6 +58,9 @@ pub(crate) struct ShapeTemplate {
 pub(crate) unsafe fn shape_template_for(obj_ptr: *const u8) -> Option<*const ShapeTemplate> {
     let obj = obj_ptr as *const crate::ObjectHeader;
     let keys_arr_view = crate::object::object_keys(obj);
+    if crate::object::overflow::is_table(keys_arr_view.arr()) {
+        return None;
+    }
     let keys_arr = keys_arr_view.arr();
     if keys_arr.is_null() {
         return None;
@@ -162,11 +165,19 @@ pub(crate) unsafe fn build_shape_prefix_template(first_elem_bits: u64) -> Option
         return None;
     }
     let keys_arr_view = crate::object::object_keys(obj);
+    // Templates read fields by key position: a layout with its own storage
+    // slots, or an ordered overflow table, keeps the general walker.
+    if crate::object::overflow::is_table(keys_arr_view.arr())
+        || crate::object::key_attrs::keys_have_slots(keys_arr_view.arr(), keys_arr_view.count())
+    {
+        return None;
+    }
     let keys_arr = keys_arr_view.arr();
     if keys_arr.is_null() {
         return None;
     }
     let shape_fields = keys_arr_view.count();
+    crate::object::key_attrs::debug_assert_positional(keys_arr, shape_fields);
     if shape_fields == 0 || shape_fields > 32 {
         return None;
     }
@@ -351,6 +362,7 @@ pub(crate) unsafe fn try_emit_shape_element(
     if keys_arr.arr() != template.keys_arr.get() || keys_arr.count() != template.shape_fields {
         return false;
     }
+    crate::object::key_attrs::debug_assert_positional(keys_arr.arr(), keys_arr.count());
 
     if template.data_record_candidate && !*data_record_global_proof {
         *data_record_global_proof =
@@ -504,7 +516,7 @@ pub(crate) unsafe fn try_emit_shape_element(
                 } else {
                     buf.push_str("null");
                 }
-            } else if vtag == POINTER_TAG || is_raw_pointer(fb) {
+            } else if crate::value::is_reference_bits(vtag) || is_raw_pointer(fb) {
                 set_to_json_key_for_template_field(cur_keys(), f);
                 stringify_value_depth(field_val, TYPE_UNKNOWN, buf, depth + 1);
                 called_out = true;
@@ -584,7 +596,7 @@ pub(crate) unsafe fn try_emit_shape_element(
             } else {
                 buf.push_str("null");
             }
-        } else if vtag == POINTER_TAG || is_raw_pointer(fb) {
+        } else if crate::value::is_reference_bits(vtag) || is_raw_pointer(fb) {
             set_to_json_key_for_template_field(cur_keys(), f);
             stringify_value_depth(field_val, TYPE_UNKNOWN, buf, depth + 1);
         } else {

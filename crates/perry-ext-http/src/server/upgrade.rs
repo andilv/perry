@@ -18,7 +18,7 @@ use crate::server::types::{js_promise_run_microtasks, POINTER_TAG, PTR_MASK};
 
 fn upgrade_head_arg(head_data: &[u8]) -> f64 {
     let head = perry_ffi::alloc_buffer(head_data);
-    f64::from_bits(POINTER_TAG | (head as u64 & PTR_MASK))
+    f64::from_bits(perry_ffi::JsValue::from_object_ptr(head as usize as *mut u8).bits())
 }
 
 /// Fire the `'upgrade'` event listeners with `(im, wsId, head)`.
@@ -114,4 +114,19 @@ pub(crate) fn attached_address(handle: i64) -> Option<(String, u16)> {
                 },
             )
         })
+}
+
+/// Copy the upgrade request while keeping the ws → HTTP dependency one-way.
+pub(crate) fn upgrade_request(value: f64) -> Option<turnloop_http::http1::Head> {
+    if value.to_bits() & !PTR_MASK != POINTER_TAG {
+        return None;
+    }
+    let handle = (value.to_bits() & PTR_MASK) as i64;
+    let request = perry_ffi::get_handle::<crate::server::request::IncomingMessage>(handle)?;
+    Some(perry_ext_ws::turnloop_link::request_head(
+        &request.method,
+        &request.url,
+        u8::from(request.http_version != "1.0"),
+        &request.raw_headers,
+    ))
 }

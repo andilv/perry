@@ -105,6 +105,9 @@ pub struct LlModule {
     /// shared with every function's register counter; emitted by
     /// [`Self::emit_fn_infos`] once every function exists.
     fn_infos: Rc<RefCell<crate::fn_info::FnInfoState>>,
+    /// The compilation's runtime call-effect table, installed on every
+    /// function this module defines. `None` outside a compilation (tests).
+    gc_effects: Option<Arc<crate::gc_call_effects::GcEffects>>,
     /// Whether this module's own thread-locals use the local-exec model
     /// ([`Self::use_local_exec_tls`]). Module state: the output kind of the
     /// compile that built this module decides it, never a process global.
@@ -169,6 +172,7 @@ impl LlModule {
             fp_flags,
             preserve_none_fns: Rc::new(RefCell::new(HashSet::new())),
             fn_infos: Rc::new(RefCell::new(crate::fn_info::FnInfoState::default())),
+            gc_effects: None,
             local_exec_tls: false,
         }
     }
@@ -268,6 +272,20 @@ impl LlModule {
         self.preserve_none_fns.borrow_mut().extend(fns);
     }
 
+    /// Install the compilation's call-effect table (`CompileOptions::
+    /// gc_effects`). Must precede every function definition so each function's
+    /// counter reads it from its first block.
+    pub(crate) fn set_gc_effects(&mut self, effects: Arc<crate::gc_call_effects::GcEffects>) {
+        self.gc_effects = Some(effects);
+    }
+
+    /// The call-effect table this module is compiled under.
+    pub(crate) fn gc_effects(&self) -> Arc<crate::gc_call_effects::GcEffects> {
+        self.gc_effects
+            .clone()
+            .unwrap_or_else(crate::gc_call_effects::GcEffects::committed_fallback)
+    }
+
     /// Append a raw metadata definition line (e.g. `!1 = distinct !{!1}`).
     /// Emitted after `!0 = !{}` in the module IR.
     pub fn add_metadata_line(&mut self, line: String) {
@@ -309,11 +327,10 @@ impl LlModule {
     /// varargs — the symbol is only ever *named* on define lines and in the
     /// unwind tables; generated code never calls it.
     pub fn declare_personality(&mut self) {
-        for name in ["perry_eh_personality", "perry_iterator_eh_personality"] {
-            if self.declared_names.insert(name.to_string()) {
-                self.declarations
-                    .push((name.to_string(), format!("declare i32 @{name}(...)")));
-            }
+        let name = "perry_eh_personality";
+        if self.declared_names.insert(name.to_string()) {
+            self.declarations
+                .push((name.to_string(), format!("declare i32 @{name}(...)")));
         }
     }
 
@@ -366,6 +383,7 @@ impl LlModule {
         // so its call sites and its own define header agree on the convention.
         func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
         func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_gc_effects(self.gc_effects());
         func.set_null_guard_global(&self.null_guard_global());
         self.functions.push(func);
         self.functions.last_mut().unwrap()
@@ -379,8 +397,24 @@ impl LlModule {
         }
         func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
         func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_gc_effects(self.gc_effects());
         func.set_null_guard_global(&self.null_guard_global());
         self.functions.push(func);
+    }
+
+    /// Replace a lowered implementation with an ABI adapter, retaining the
+    /// module-owned function-info and call-convention authorities.
+    pub(crate) fn replace_defined_function(&mut self, func: LlFunction) {
+        let i = self
+            .functions
+            .iter()
+            .position(|f| f.name == func.name)
+            .expect("defined body");
+        func.set_preserve_none_fns(Rc::clone(&self.preserve_none_fns));
+        func.set_fn_infos(Rc::clone(&self.fn_infos));
+        func.set_gc_effects(self.gc_effects());
+        func.set_null_guard_global(&self.null_guard_global());
+        self.functions[i] = func;
     }
 
     /// Record a fact about `body`, a JS body this module defines, in its
@@ -489,6 +523,90 @@ impl LlModule {
     /// to the other.
     pub(crate) fn functions_mut(&mut self) -> impl Iterator<Item = &mut LlFunction> {
         self.functions.iter_mut()
+    }
+
+    /// Remove unreachable module-local capabilities before unit splitting
+    /// promotes their linkage. Public bodies and globals are reachability roots.
+    pub(crate) fn prune_private_capabilities(&mut self, candidates: &HashSet<String>) {
+        let candidates: HashSet<_> = self
+            .functions
+            .iter()
+            .filter(|f| f.linkage == "internal" && candidates.contains(&f.name))
+            .map(|f| f.name.clone())
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        let mut live = HashSet::new();
+        for line in self.globals.iter().chain(&self.string_constants) {
+            collect_symbol_refs(line, &mut live);
+        }
+        // The IR scanner returns @-prefixed references; definitions store
+        // bare names. Only capability edges matter to this scoped pass.
+        live = live
+            .into_iter()
+            .filter_map(|name| {
+                candidates
+                    .contains(&name[1..])
+                    .then(|| name[1..].to_string())
+            })
+            .collect();
+        let mut edges = HashMap::new();
+        for f in &self.functions {
+            let mut refs = HashSet::new();
+            f.for_each_final_line::<std::convert::Infallible>(&mut |line| {
+                collect_symbol_refs(line, &mut refs);
+                Ok(())
+            })
+            .unwrap();
+            refs = refs
+                .into_iter()
+                .filter_map(|name| {
+                    candidates
+                        .contains(&name[1..])
+                        .then(|| name[1..].to_string())
+                })
+                .collect();
+            refs.remove(&f.name);
+            if candidates.contains(&f.name) {
+                edges.insert(f.name.clone(), refs);
+            } else {
+                live.extend(refs);
+            }
+        }
+        let mut pending: Vec<_> = live.iter().cloned().collect();
+        while let Some(name) = pending.pop() {
+            if let Some(refs) = edges.get(&name) {
+                for target in refs {
+                    if live.insert(target.clone()) {
+                        pending.push(target.clone());
+                    }
+                }
+            }
+        }
+        self.functions
+            .retain(|f| !candidates.contains(&f.name) || live.contains(&f.name));
+        self.defined_names
+            .retain(|name| !candidates.contains(name) || live.contains(name));
+    }
+
+    /// Drop the function defined at `idx` when it is `name` (an unreferenced
+    /// typed-body clone that was not installed). Helpers it published stay:
+    /// they are shared by name.
+    pub(crate) fn remove_defined_function(&mut self, idx: usize, name: &str) {
+        if self.functions.get(idx).is_some_and(|f| f.name == name) {
+            self.functions.remove(idx);
+            self.defined_names.remove(name);
+        }
+    }
+
+    /// Rename the function defined at `idx` (typed-body dispatch: the generic
+    /// body moves off the public symbol, which the dispatcher then defines).
+    pub(crate) fn rename_defined_function(&mut self, idx: usize, new_name: &str) {
+        if let Some(f) = self.functions.get_mut(idx) {
+            f.name = new_name.to_string();
+            self.defined_names.insert(new_name.to_string());
+        }
     }
 
     /// Number of functions defined so far. Used to recover the index of a
@@ -823,7 +941,7 @@ impl LlModule {
 
         let funcs = self.deduped_function_refs();
         let gc_leaf_callees = if crate::codegen::helpers::native_stack_roots_enabled() {
-            crate::gc_call_effects::transitive_leaf_functions(&funcs)
+            crate::gc_call_effects::transitive_leaf_functions(&self.gc_effects(), &funcs)
         } else {
             HashSet::new()
         };
@@ -960,7 +1078,7 @@ impl LlModule {
         if n <= 1 || funcs.len() <= 1 {
             let gc_leaf_callees =
                 Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
-                    crate::gc_call_effects::transitive_leaf_functions(&funcs)
+                    crate::gc_call_effects::transitive_leaf_functions(&self.gc_effects(), &funcs)
                 } else {
                     HashSet::new()
                 });
@@ -1027,7 +1145,7 @@ impl LlModule {
         let gc_leaf_callees = {
             let refs: Vec<&LlFunction> = funcs.iter().map(|f| f.borrow()).collect();
             Arc::new(if crate::codegen::helpers::native_stack_roots_enabled() {
-                crate::gc_call_effects::transitive_leaf_functions(&refs)
+                crate::gc_call_effects::transitive_leaf_functions(&self.gc_effects(), &refs)
             } else {
                 HashSet::new()
             })
@@ -1220,7 +1338,7 @@ impl LlModule {
         // associative targets (LNK1227). Give each global one owner and use
         // external declarations in other consumers. Mach-O retains the
         // replicated policy required by `-dead_strip`.
-        let global_owners: Vec<usize> = (0..all_globals.len())
+        let mut global_owners: Vec<usize> = (0..all_globals.len())
             .map(|gi| {
                 bucket_needs
                     .iter()
@@ -1228,6 +1346,26 @@ impl LlModule {
                     .unwrap_or(0)
             })
             .collect();
+        let replicate_globals = self.target_triple.contains("apple");
+        // An alias must name a DEFINITION in its own object ("Alias must
+        // point to a definition"), so with one owner per global it is owned
+        // by its aliasee's owner. Owning it by its own first reference put a
+        // layout id alias (`@perry_array_layout_*_id`, which nothing loads,
+        // so unit 0 kept it) beside a mere declaration of its descriptor,
+        // defined in the unit that attaches the layout; three Next.js
+        // bundles failed to compile that way. Other units that name the
+        // alias declare it like any global (`external_decl_for_global`).
+        // Under replication every unit emitting the alias also emits the
+        // aliasee (the reference closure above), so Mach-O needs nothing.
+        if !replicate_globals {
+            for gi in 0..all_globals.len() {
+                if let Some(aliasee) = alias_target(all_globals[gi]) {
+                    if let Some(&ai) = global_index.get(aliasee) {
+                        global_owners[gi] = global_owners[ai];
+                    }
+                }
+            }
+        }
         // #10152: otherwise-unreferenced globals are retained in unit 0, but
         // their initializers were absent from the function-rooted closure
         // above. An orphaned string dispatch descriptor can still name bytes
@@ -1248,7 +1386,6 @@ impl LlModule {
                 }
             }
         }
-        let replicate_globals = self.target_triple.contains("apple");
         // #9610: how many units end up DEFINING each global. Under the
         // replicated (Mach-O) policy that is one unit per referencing bucket;
         // the owner fallback keeps unreferenced globals at one. Only the

@@ -152,11 +152,15 @@ pub(super) fn try_object_has_own_call(
                             (&mid.prop, mid.obj.as_ref())
                         {
                             if mid_obj.sym.as_ref() == "Object" {
+                                // #11915: the `js_borrowed_*` entries run the
+                                // builtin body while `Object.prototype` and
+                                // `Function.prototype.call` are pristine, and
+                                // otherwise call the method actually there.
                                 let runtime_fn = match mid_prop.sym.as_ref() {
-                                    "hasOwnProperty" => Some("js_object_has_own"),
+                                    "hasOwnProperty" => Some("js_borrowed_object_has_own"),
                                     // #2891: Object.propertyIsEnumerable.call(obj, key)
                                     "propertyIsEnumerable" => {
-                                        Some("js_object_property_is_enumerable")
+                                        Some("js_borrowed_object_property_is_enumerable")
                                     }
                                     _ => None,
                                 };
@@ -182,8 +186,7 @@ pub(super) fn try_object_has_own_call(
     Err(args)
 }
 
-/// `Object.prototype.toString.call(x)` → `js_object_to_string(x)` and
-/// `Object.prototype.hasOwnProperty.call(obj, key)` → `js_object_has_own(obj, key)`.
+/// `Object.prototype.toString.call(x)` → `js_object_to_string(x)`.
 ///
 /// AST shape is a four-level member expression:
 ///   call.call(x)
@@ -208,18 +211,19 @@ pub(super) fn try_object_prototype_call(
                         if let (ast::MemberProp::Ident(mid_prop), ast::Expr::Member(inner)) =
                             (&mid.prop, mid.obj.as_ref())
                         {
+                            // #11915: `js_borrowed_*` = the builtin body under
+                            // the builtin-prototype proof, else the real call.
                             let runtime_fn = match (mid_prop.sym.as_ref(), args.len()) {
-                                ("toString", 1) => Some("js_object_to_string"),
-                                ("hasOwnProperty", 2) => Some("js_object_has_own"),
+                                ("toString", 1) => Some("js_borrowed_object_to_string"),
                                 // #2891: Object.prototype.propertyIsEnumerable.call(obj, key)
                                 ("propertyIsEnumerable", 2) => {
-                                    Some("js_object_property_is_enumerable")
+                                    Some("js_borrowed_object_property_is_enumerable")
                                 }
                                 // Annex B accessor helpers: .call(obj, key[, fn]).
-                                ("__defineGetter__", 3) => Some("js_object_define_getter"),
-                                ("__defineSetter__", 3) => Some("js_object_define_setter"),
-                                ("__lookupGetter__", 2) => Some("js_object_lookup_getter"),
-                                ("__lookupSetter__", 2) => Some("js_object_lookup_setter"),
+                                ("__defineGetter__", 3) => Some("js_borrowed_object_define_getter"),
+                                ("__defineSetter__", 3) => Some("js_borrowed_object_define_setter"),
+                                ("__lookupGetter__", 2) => Some("js_borrowed_object_lookup_getter"),
+                                ("__lookupSetter__", 2) => Some("js_borrowed_object_lookup_setter"),
                                 _ => None,
                             };
                             if let Some(runtime_fn) = runtime_fn {
@@ -251,4 +255,51 @@ pub(super) fn try_object_prototype_call(
         }
     }
     Err(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Module;
+    use perry_diagnostics::SourceCache;
+
+    fn lower(src: &str) -> Module {
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let mut cache = SourceCache::new();
+                let parsed = perry_parser::parse_typescript_with_cache(
+                    &src,
+                    "object_proto_hasown.ts",
+                    &mut cache,
+                )
+                .expect("parse should succeed");
+                crate::lower_module(&parsed.module, "test", "object_proto_hasown.ts")
+                    .expect("lower should succeed")
+            })
+            .expect("spawn lower thread")
+            .join()
+            .expect("lower thread panicked")
+    }
+
+    #[test]
+    fn object_prototype_hasownproperty_call_keeps_dynamic_method_lookup() {
+        let hir = format!(
+            "{:?}",
+            lower(
+                r#"
+                Object.prototype.hasOwnProperty.call({ x: 1 }, "x");
+                "#,
+            )
+        );
+
+        assert!(
+            !hir.contains("js_object_has_own"),
+            "hasOwnProperty.call must not bypass a patched prototype method: {hir}"
+        );
+        assert!(
+            hir.contains("PropertyGet"),
+            "the call should retain dynamic property lookup: {hir}"
+        );
+    }
 }

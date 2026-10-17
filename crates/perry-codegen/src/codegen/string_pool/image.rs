@@ -7,17 +7,12 @@ const IMAGE_GC_FLAGS: u8 = 0x15;
 const STRING_IMAGE_MARKER: u16 = 0x494d;
 
 pub(super) fn name(entry: &StringEntry) -> String {
-    if entry.byte_len <= 64 {
-        let spelling: String = entry.bytes.iter().map(|b| format!("{b:02x}")).collect();
-        format!(
-            "perry_image_{}_{}_{}",
-            "literal",
-            u8::from(entry.is_wtf8),
-            spelling
-        )
-    } else {
-        format!("{}_image_{}", entry.handle_global, "literal")
-    }
+    let spelling: String = entry.bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "perry_image_literal_{}_{}",
+        u8::from(entry.is_wtf8),
+        spelling
+    )
 }
 
 pub(super) fn pointer(entry: &StringEntry) -> String {
@@ -31,7 +26,7 @@ pub(super) fn pointer(entry: &StringEntry) -> String {
 pub(super) fn emit(llmod: &mut LlModule, entry: &StringEntry) -> String {
     let name = name(entry);
     let mut units = 0;
-    let mut flags = 4u32; // STRING_FLAG_WTF8_VALIDATED
+    let mut flags = 28u32; // STRING_FLAG_WTF8_VALIDATED
     let mut previous_lead = false;
     let mut at = 0;
     while at < entry.bytes.len() {
@@ -61,12 +56,23 @@ pub(super) fn emit(llmod: &mut LlModule, entry: &StringEntry) -> String {
     // These objects never enter an arena or malloc ownership list, so GC
     // cannot reclaim or rewrite them. Both mark and pin are born in data:
     // precise roots may visit these immutable leaves during a full cycle.
+    // Object model step 5 (case 2c): a coloured key's image carries its
+    // colour in flags bits 16..32 (perry-runtime `string::atom_colour`), so a
+    // record's colour masks are one flags load per key at mint.
+    flags |= crate::layout_desc::image_colour_flags(&entry.bytes);
     let n = entry.byte_len + 1;
-    let ty = format!("{{ i8, i8, i16, i32, i32, i32, i32, i32, i32, [{n} x i8] }}");
+    let ty = format!("{{ i8, i8, i16, i32, i32, i32, i32, i32, i32, [{n} x i8], i64 }}");
     let gc_flags = IMAGE_GC_FLAGS;
+    let section = if llmod.target_triple.contains("apple") {
+        "__TEXT,__perry_strings"
+    } else if llmod.target_triple.contains("windows") {
+        ".perrystr$m"
+    } else {
+        "perry_strings"
+    };
     llmod.add_raw_global(format!(
-        "@{name} = weak_odr constant {ty} {{ i8 {GC_TYPE_STRING}, i8 {gc_flags}, i16 {STRING_IMAGE_MARKER}, i32 {}, i32 {units}, i32 {}, i32 {}, i32 0, i32 {flags}, [{n} x i8] {} }}, align 8",
-        28 + n, entry.byte_len, entry.byte_len, entry.escaped_ir
+        "@{name} = weak_odr constant {ty} {{ i8 {GC_TYPE_STRING}, i8 {gc_flags}, i16 {STRING_IMAGE_MARKER}, i32 {}, i32 {units}, i32 {}, i32 {}, i32 0, i32 {flags}, [{n} x i8] {}, i64 {} }}, section \"{section}\", align 8",
+        (28 + n + 7) / 8 * 8 + 8, entry.byte_len, entry.byte_len, entry.escaped_ir, crate::nanbox::i64_literal(entry.dispatch_hash)
     ));
     pointer(entry)
 }
@@ -105,6 +111,21 @@ mod tests {
                     .count(),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn literals_have_linker_owned_bounds_on_native_targets() {
+        for (target, section) in [
+            ("x86_64-unknown-linux-gnu", "perry_strings"),
+            ("aarch64-apple-darwin", "__TEXT,__perry_strings"),
+            ("x86_64-pc-windows-msvc", ".perrystr$m"),
+        ] {
+            let mut pool = StringPool::with_prefix("bounds".into());
+            let id = pool.intern("literal");
+            let mut module = LlModule::new(target);
+            emit(&mut module, pool.entry(id));
+            assert!(module.to_ir().contains(&format!("section \"{section}\"")));
         }
     }
 

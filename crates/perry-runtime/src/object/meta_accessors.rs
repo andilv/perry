@@ -23,8 +23,10 @@ pub(crate) unsafe fn object_meta_ensure_for_cell(user_ptr: usize) -> Option<*mut
         return Some(*slot);
     }
     (*meta).prototype = 0;
-    (*meta).reserved_descriptor_words = [0; 2];
-    (*meta).reserved_descriptor_identity = [0; 2];
+    (*meta).boxed_primitive = 0;
+    (*meta).reflect_metadata = 0;
+    (*meta).key_identity = 0;
+    (*meta).owned_state = 0;
     (*meta).flags = 0;
     (*meta).spill = 0;
     (*meta).private_evaluation_brand = 0;
@@ -39,7 +41,7 @@ pub(crate) unsafe fn object_meta_ensure_for_cell(user_ptr: usize) -> Option<*mut
     (*meta).array_subclass_dense_bounds = 0;
     (*meta).expando = 0;
     (*meta).elements = 0;
-    (*meta).dictionary_keys = 0;
+    (*meta).overflow = 0;
     (*meta).arguments = 0;
     (*meta).instance_birth = 0;
     // GC_STORE_AUDIT(BARRIERED): header-slot store followed by an object-slot
@@ -72,8 +74,10 @@ pub(crate) unsafe fn object_meta_ensure(obj: *mut ObjectHeader) -> *mut ObjectMe
         return (*obj).meta;
     }
     (*meta).prototype = 0;
-    (*meta).reserved_descriptor_words = [0; 2];
-    (*meta).reserved_descriptor_identity = [0; 2];
+    (*meta).boxed_primitive = 0;
+    (*meta).reflect_metadata = 0;
+    (*meta).key_identity = 0;
+    (*meta).owned_state = 0;
     (*meta).flags = 0;
     (*meta).spill = 0;
     (*meta).private_evaluation_brand = 0;
@@ -88,7 +92,7 @@ pub(crate) unsafe fn object_meta_ensure(obj: *mut ObjectHeader) -> *mut ObjectMe
     (*meta).array_subclass_dense_bounds = 0;
     (*meta).expando = 0;
     (*meta).elements = 0;
-    (*meta).dictionary_keys = 0;
+    (*meta).overflow = 0;
     (*meta).arguments = 0;
     (*meta).instance_birth = 0;
     // GC_STORE_AUDIT(BARRIERED): meta-record edge is a header-slot store

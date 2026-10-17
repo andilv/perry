@@ -124,6 +124,8 @@ pub(crate) fn install_external_http_server() {
 ))]
 pub(crate) fn install_external_net() {
     method_dispatch::install_external_net();
+    property_dispatch::install_external_net();
+    unsafe { init::install_external_net_registrations() };
 }
 
 #[cfg(feature = "web-fetch")]
@@ -136,5 +138,5 @@ pub(crate) fn install_fetch() {
 pub(crate) const TAG_UNDEFINED_F64: f64 = f64::from_bits(0x7FFC_0000_0000_0001);
 #[cfg(feature = "external-http-client-pump")]
 pub(crate) fn nanbox_handle_value(handle: i64) -> f64 {
-    f64::from_bits(0x7FFD_0000_0000_0000 | (handle as u64 & 0x0000_FFFF_FFFF_FFFF))
+    perry_runtime::value::js_nanbox_pointer(handle as i64)
 }

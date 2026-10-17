@@ -152,10 +152,15 @@ ACCESSOR_RETURN = re.compile(
 
 # Floors: "the extraction still works" assertions, not budgets.
 # Phase A deletes 24 net/HTTP/TLS maps without adding any (main 249 -> 225).
-# Keep the parser liveness floor below that new, audited population.
-MIN_REGISTRIES = 220
+# Removing perry-ext-streams drops six currently enumerated registries (224 ->
+# 218). Preserve the four-entry parser-liveness margin by lowering the floor
+# from 220 to 214.
+# The objtables lane moves per-object facts onto their owners and deletes 23
+# owner-keyed tables, 21 of them with a removal path (218 -> 195 enumerated,
+# 143 -> 122 removing). The floors keep the four-entry margin below them.
+MIN_REGISTRIES = 191
 # Phase A removes 21 maps previously counted as shrinking (167 -> 146).
-MIN_REMOVING = 140
+MIN_REMOVING = 118
 
 MIN_WHY = 20
 

@@ -64,7 +64,7 @@ fn array_numeric_range_add_impl(receiver: f64, start: f64, end: Option<f64>, del
         None => unsafe { (*arr).length },
     };
     let flags = array_object_flags(arr);
-    if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 || array_has_element_descriptors(arr) {
         return -1;
     }
 
@@ -88,10 +88,9 @@ fn array_numeric_range_add_impl(receiver: f64, start: f64, end: Option<f64>, del
         for index in start..end {
             let slot = elements.add(index as usize);
             let bits = ptr::read(slot);
-            let tag = bits >> 48;
             // Genuine boxed double: anything outside the NaN-box tag band.
             // This is `value_bits_to_number`'s double arm, fused inline.
-            let number = if !(0x7FF9..=0x7FFF).contains(&tag) {
+            let number = if crate::value::JSValue::from_bits(bits).is_number() {
                 super::header::canonical_raw_f64(f64::from_bits(bits))
             } else if let Some(number) = value_bits_to_number(bits) {
                 // Int-tagged (minus registered class ids) via the shared
@@ -197,11 +196,9 @@ pub unsafe extern "C" fn js_array_fill_range_strided_tagged(
 
     let flags = array_object_flags(arr);
     if flags
-        & (crate::gc::OBJ_FLAG_FROZEN
-            | crate::gc::OBJ_FLAG_SEALED
-            | crate::gc::OBJ_FLAG_NO_EXTEND
-            | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+        & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND)
         != 0
+        || array_has_element_descriptors(arr)
     {
         return -1;
     }

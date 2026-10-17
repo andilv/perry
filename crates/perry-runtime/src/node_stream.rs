@@ -41,8 +41,8 @@ use event_emitter::{
     add_stream_listener_for_event, call_listener_args, emit_stream_event,
     emit_stream_event_from_array, is_callable_value, ns_event_names, ns_get_max_listeners,
     ns_listener_count, ns_listeners, ns_off2, ns_on2, ns_once2, ns_prepend_listener2,
-    ns_prepend_once_listener2, ns_raw_listeners, ns_remove_all_listeners1, ns_remove_listener2,
-    ns_set_max_listeners, remove_stream_listener_for_event, stream_listener_count_for_event,
+    ns_prepend_once_listener2, ns_raw_listeners, ns_remove_listener2, ns_set_max_listeners,
+    remove_stream_listener_for_event, stream_listener_count_for_event,
 };
 pub(crate) use event_emitter::{emit_stream_event_rooted, RootedArgs};
 
@@ -68,8 +68,8 @@ pub(crate) fn has_stream_listeners(stream: f64, event: &[u8]) -> bool {
 pub(crate) use event_emitter::validate_max_listeners;
 // node EventEmitter instance state (EventEmitter.init) and the prototype defaults.
 pub(crate) use event_emitter::{
-    init_event_emitter_capture, init_event_emitter_state, install_event_emitter_prototype_state,
-    new_events_object,
+    init_event_emitter_capture, init_event_emitter_state, init_event_emitter_state_with_presence,
+    install_event_emitter_prototype_state, new_events_object,
 };
 pub use event_emitter::{
     js_node_stream_method_event_names, js_node_stream_method_get_max_listeners,
@@ -89,7 +89,7 @@ const TAG_TRUE: u64 = 0x7FFC_0000_0000_0004;
 // `Readable/Writable/Duplex.toWeb`. Placed above the Duplex band so it
 // can't collide as method sets grow.
 const WEB_STREAM_SHAPE_ID: u32 = 0x7FFF_FF20;
-const READABLE_CHUNKS_KEY: Slot = Slot::ReadableChunks;
+const READABLE_CHUNKS_KEY: StateData = StateData::ReadableChunks;
 const READABLE_SOURCE_ITERATOR_KEY: Slot = Slot::ReadableSourceIterator;
 const READABLE_ERROR_KEY: Slot = Slot::ReadableError;
 const READABLE_SIGNAL_KEY: Slot = Slot::ReadableSignal;
@@ -108,9 +108,9 @@ const EVENT_EMITTER_ASYNC_RESOURCE_KEY: &[u8] = b"__perryEventEmitterAsyncResour
 const WRITABLE_WRITE_KEY: Slot = Slot::WritableWrite;
 const WRITABLE_FINISH_SCHEDULED_KEY: Slot = Slot::FinishScheduled;
 const WRITABLE_FINISH_EMITTED_KEY: Slot = Slot::FinishEmitted;
-const WRITABLE_CORKED_KEY: Slot = Slot::WritableCorked;
+const WRITABLE_CORKED_KEY: StateData = StateData::WritableCorked;
 const WRITABLE_BUFFERED_KEY: Slot = Slot::WritableBuffered;
-const WRITABLE_LENGTH_KEY: Slot = Slot::WritableLength;
+const WRITABLE_LENGTH_KEY: StateData = StateData::WritableLength;
 const WRITABLE_NEED_DRAIN_KEY: Slot = Slot::WritableNeedDrain;
 const WRITABLE_OBJECT_MODE_KEY: Slot = Slot::WritableObjectMode;
 const WRITABLE_DECODE_STRINGS_KEY: Slot = Slot::WritableDecodeStrings;
@@ -138,11 +138,11 @@ const WRITABLE_FLAG_KEY: Slot = Slot::WritableFlag;
 const STREAM_DISTURBED_KEY: Slot = Slot::Disturbed;
 // #1539: bytes currently buffered (for `push()`'s highWaterMark return) and
 // the effective readable highWaterMark.
-const READABLE_BUFFERED_KEY: Slot = Slot::ReadableBuffered;
-const READABLE_HWM_KEY: Slot = Slot::ReadableHwm;
+const READABLE_BUFFERED_KEY: StateData = StateData::ReadableBuffered;
+const READABLE_HWM_KEY: StateData = StateData::ReadableHwm;
 const READABLE_PENDING_KEY: Slot = Slot::ReadablePending;
 const READABLE_RESUME_SCHEDULED_KEY: Slot = Slot::ReadableResumeScheduled;
-const STREAM_PIPES_KEY: Slot = Slot::Pipes;
+const STREAM_PIPES_KEY: StateData = StateData::Pipes;
 const READABLE_BASE64_REMAINDER_KEY: Slot = Slot::ReadableBase64Remainder;
 /// #9490: the incomplete trailing UTF-8 sequence held between `push()` calls
 /// on a `setEncoding("utf8")` readable, mirroring the base64 remainder above.
@@ -402,7 +402,7 @@ extern "C" fn ns_finished_default_completion(
         || has_truthy_hidden(stream, hidden_end_emitted_key());
     let writable_done = !js_node_stream_has_writable_side(stream)
         || has_truthy_hidden(stream, hidden_finish_emitted_key());
-    let closed = has_truthy_hidden(stream, crate::runtime_state_key!(b"closed"));
+    let closed = has_truthy_hidden(stream, Slot::Closed);
     let error = readable_hidden_error(stream);
     if error.is_none() && !closed && !(readable_done && writable_done) {
         return f64::from_bits(TAG_UNDEFINED);
@@ -488,9 +488,12 @@ extern "C" fn ns_construct_callback_done(
     if closure.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
-    let stream = js_closure_get_capture_f64(closure, 0);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let stream = scope.root_nanbox_f64(js_closure_get_capture_f64(closure, 0));
     if err.to_bits() != TAG_UNDEFINED && err.to_bits() != TAG_NULL {
-        destroy_stream(stream, err);
+        destroy_stream(stream.get_nanbox_f64(), err);
+    } else if let Some(event) = get_hidden_value(stream.get_nanbox_f64(), Slot::ConstructEvent) {
+        emit_stream_event(stream.get_nanbox_f64(), event, &[]);
     }
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -693,7 +696,7 @@ fn append_readable_output_chunk(stream: f64, chunk: f64) -> f64 {
     let prev = get_hidden_value(stream, hidden_buffered_key()).unwrap_or(0.0);
     let total = prev + added;
     set_hidden_value(stream, hidden_buffered_key(), total);
-    set_hidden_value(stream, crate::runtime_state_key!(b"readableLength"), total);
+    set_hidden_value(stream, StateData::ReadableBuffered, total);
     if added > 0.0 {
         push_readable_buffered_chunk(stream, chunk);
         mark_readable_live_push(stream);
@@ -922,7 +925,7 @@ fn unshift_chunk(stream: f64, chunk: f64) -> f64 {
     let prev = get_hidden_value(stream, hidden_buffered_key()).unwrap_or(0.0);
     let total = prev + added;
     set_hidden_value(stream, hidden_buffered_key(), total);
-    set_hidden_value(stream, crate::runtime_state_key!(b"readableLength"), total);
+    set_hidden_value(stream, StateData::ReadableBuffered, total);
     if added > 0.0 {
         unshift_readable_buffered_chunk(stream, chunk);
         mark_readable_live_push(stream);
@@ -1201,26 +1204,38 @@ extern "C" fn writable_write_callback_noop(
 }
 
 fn invoke_writable_write(stream: f64, chunk: f64, enc: f64, len: f64, callback: f64) {
-    if let Some(write) = writable_hidden_write(stream) {
-        let cb = js_closure_alloc(
-            crate::fn_info!(ns_writable_write_done, 1; with_declared(1)),
-            3,
-        );
-        js_closure_set_capture_f64(cb, 0, stream);
-        js_closure_set_capture_f64(cb, 1, len);
-        js_closure_set_capture_f64(cb, 2, callback);
-        let cb_value = f64::from_bits(JSValue::pointer(cb as *const u8).bits());
-        let args = [chunk, enc, cb_value];
-        unsafe {
-            let _ = crate::closure::native_call_value_this(
-                write,
-                crate::closure::JsThis::from_f64(stream),
-                args.as_ptr(),
-                args.len(),
-            );
-        }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let stream = scope.root_nanbox_f64(stream);
+    let chunk = scope.root_nanbox_f64(chunk);
+    let enc = scope.root_nanbox_f64(enc);
+    let callback = scope.root_nanbox_f64(callback);
+    let write = crate::runtime_state_key!(b"_write").read_value(stream.get_nanbox_f64());
+    let write = scope.root_nanbox_f64(if is_callable_value(write) {
+        write
     } else {
+        writable_hidden_write(stream.get_nanbox_f64()).unwrap_or(f64::from_bits(TAG_UNDEFINED))
+    });
+    if !is_callable_value(write.get_nanbox_f64()) {
         throw_missing_stream_method("The _write() method is not implemented");
+    }
+    set_hidden_value(stream.get_nanbox_f64(), StateData::WritableWriteLen, len);
+    set_hidden_value(
+        stream.get_nanbox_f64(),
+        Slot::WritableWriteCallback,
+        callback.get_nanbox_f64(),
+    );
+    let state = scope.root_nanbox_f64(
+        crate::runtime_state_key!(b"_writableState").read_value(stream.get_nanbox_f64()),
+    );
+    let cb = crate::runtime_state_key!(b"onwrite").read_value(state.get_nanbox_f64());
+    let args = [chunk.get_nanbox_f64(), enc.get_nanbox_f64(), cb];
+    unsafe {
+        let _ = crate::closure::native_call_value_this(
+            write.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(stream.get_nanbox_f64()),
+            args.as_ptr(),
+            args.len(),
+        );
     }
 }
 
@@ -1343,8 +1358,7 @@ fn writable_default_encoding(stream: f64) -> f64 {
 
 fn writable_backpressure_return(stream: f64) -> f64 {
     let len = writable_length(stream);
-    let hwm = get_hidden_value(stream, crate::runtime_state_key!(b"writableHighWaterMark"))
-        .unwrap_or(16384.0);
+    let hwm = get_hidden_value(stream, StateData::WritableHwm).unwrap_or(16384.0);
     let ok = len < hwm || len == 0.0;
     set_writable_need_drain(stream, !ok);
     f64::from_bits(if ok { TAG_TRUE } else { TAG_FALSE })
@@ -1389,7 +1403,7 @@ fn finish_stream(stream: f64, callback: Option<f64>) {
         let _ = emit_stream_event(stream, literal_string_value(b"end"), &[]);
         end_pipe_destinations(stream);
     }
-    if writable_length(stream) > 0.0 {
+    if writable_length(stream) > 0.0 || has_truthy_hidden(stream, Slot::ConstructPending) {
         set_pending_writable_finish_callback(stream, callback);
         return;
     }
@@ -1451,7 +1465,8 @@ fn stream_value_from_handle(stream_handle: i64) -> f64 {
     if stream_handle == 0 {
         f64::from_bits(TAG_UNDEFINED)
     } else {
-        f64::from_bits(JSValue::pointer(stream_handle as *const u8).bits())
+        // A stream handle may be an id: the unknown-word constructor routes it.
+        crate::value::js_nanbox_pointer(stream_handle)
     }
 }
 
@@ -1512,7 +1527,7 @@ pub extern "C" fn js_node_stream_method_unshift(stream_handle: i64, chunk: f64) 
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_readable_hwm(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, crate::runtime_state_key!(b"readableHighWaterMark")).unwrap_or(16384.0)
+    get_hidden_value(stream, StateData::ReadableHwm).unwrap_or(16384.0)
 }
 
 /// `stream.readableLength` property getter on a typed instance.
@@ -1562,7 +1577,7 @@ pub extern "C" fn js_node_stream_method_readable_encoding(stream_handle: i64) ->
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_writable_hwm(stream_handle: i64) -> f64 {
     let stream = stream_value_from_handle(stream_handle);
-    get_hidden_value(stream, crate::runtime_state_key!(b"writableHighWaterMark")).unwrap_or(16384.0)
+    get_hidden_value(stream, StateData::WritableHwm).unwrap_or(16384.0)
 }
 
 /// `stream.writableLength` property getter on a typed instance.
@@ -1598,11 +1613,8 @@ pub extern "C" fn js_node_stream_method_readable_aborted(stream_handle: i64) -> 
 /// `stream.closed` property getter on typed stream instances.
 #[no_mangle]
 pub extern "C" fn js_node_stream_method_closed(stream_handle: i64) -> f64 {
-    get_hidden_value(
-        stream_value_from_handle(stream_handle),
-        crate::runtime_state_key!(b"closed"),
-    )
-    .unwrap_or(f64::from_bits(TAG_FALSE))
+    get_hidden_value(stream_value_from_handle(stream_handle), Slot::Closed)
+        .unwrap_or(f64::from_bits(TAG_FALSE))
 }
 
 /// `stream.errored` property getter on typed stream instances.

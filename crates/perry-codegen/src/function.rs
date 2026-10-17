@@ -7,6 +7,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::block::{FpFlags, LlBlock, RegCounter};
 use crate::types::LlvmType;
@@ -85,6 +86,10 @@ pub struct LlFunction {
     /// since #7354 — windows-msvc used to name `__C_specific_handler` here,
     /// which forced funclet EH and locked Windows out of statepoints.
     pub personality: Option<&'static str>,
+    /// Field sites the wpfacts lowering compiled without a guard
+    /// (`expr/wpfacts_access.rs`); a typed body is installed only when it
+    /// has more of them than its generic body (`codegen/typed_body.rs`).
+    pub wpfacts_sites: u32,
     blocks: Vec<LlBlock>,
     block_counter: u32,
     reg_counter: Rc<RegCounter>,
@@ -110,6 +115,11 @@ pub struct LlFunction {
     /// into (`expr/method_site.rs`), allocated once per function: each site
     /// loads it right after the call.
     method_site_code_slot: Option<String>,
+    /// The function's one buffer of staged `double` values (register, the
+    /// largest count requested). See [`LlFunction::acquire_staging_values`].
+    staging_values: Option<(String, usize)>,
+    /// Whether a site currently holds `staging_values`.
+    staging_values_held: bool,
     /// Hoisted setup instructions (loads, stores, calls) that must run
     /// AFTER the entry block's "init prelude" — `js_gc_init` and the
     /// `__perry_init_strings_*` calls — but BEFORE any user code, so
@@ -188,7 +198,7 @@ pub struct LlFunction {
     /// Thread-local globals whose current-thread address this function has
     /// already computed in its entry block, with the SSA register holding it
     /// (see [`Self::entry_tls_address`]).
-    entry_tls_addresses: Vec<(String, String)>,
+    entry_tls_addresses: Vec<(String, String, bool)>,
 }
 
 /// Render the frame-push instruction. Kept in one place so the eager
@@ -297,12 +307,15 @@ impl LlFunction {
             hot_loop_callee: false,
             alloc_hot: false,
             personality: None,
+            wpfacts_sites: 0,
             blocks: Vec::new(),
             block_counter: 0,
             reg_counter: Rc::new(RegCounter::new()),
             fp_flags,
             entry_allocas: Vec::new(),
             method_site_code_slot: None,
+            staging_values: None,
+            staging_values_held: false,
             entry_post_init_setup: Vec::new(),
             entry_init_boundary: None,
             shadow_frame_slot: None,
@@ -499,8 +512,23 @@ impl LlFunction {
         self.reg_counter.push_eh_scope(lpad_label);
     }
 
-    pub fn pop_eh_scope(&self) {
-        self.reg_counter.pop_eh_scope();
+    /// Enter an EH scope with its chaining information (`block::EhScope`).
+    pub fn push_eh_scope_entry(&self, scope: crate::block::EhScope) {
+        self.reg_counter.push_eh_scope_entry(scope);
+    }
+
+    pub fn pop_eh_scope(&self) -> Option<crate::block::EhScope> {
+        self.reg_counter.pop_eh_scope()
+    }
+
+    /// The innermost active EH scope of this function, if any.
+    pub fn innermost_eh_scope(&self) -> Option<crate::block::EhScope> {
+        self.reg_counter.innermost_eh_scope()
+    }
+
+    /// Number of active EH scopes (handlers and action scopes).
+    pub fn eh_scope_depth(&self) -> usize {
+        self.reg_counter.eh_scope_depth()
     }
 
     /// The function's one `i64` slot for a split method site's code address
@@ -513,6 +541,38 @@ impl LlFunction {
         let slot = self.alloca_entry(crate::types::I64);
         self.method_site_code_slot = Some(slot.clone());
         slot
+    }
+
+    /// The function's one entry-block buffer of at least `count` doubles, for
+    /// values staged immediately before the ONE runtime call that consumes
+    /// them. Every such site shares it, so a body with hundreds of sites holds
+    /// one buffer of the largest size, not one per site.
+    ///
+    /// `None` while another site holds it: a site acquires the buffer before
+    /// lowering its first value, so a staging site nested in one of those
+    /// values is refused and takes its unstaged path instead of overwriting
+    /// the outer site's values. Release right after the consuming call.
+    pub(crate) fn acquire_staging_values(&mut self, count: usize) -> Option<String> {
+        if self.staging_values_held {
+            return None;
+        }
+        self.staging_values_held = true;
+        Some(match &mut self.staging_values {
+            Some((reg, max)) => {
+                *max = (*max).max(count);
+                reg.clone()
+            }
+            None => {
+                let reg = format!("%r{}", self.reg_counter.next());
+                self.staging_values = Some((reg.clone(), count));
+                reg
+            }
+        })
+    }
+
+    /// Give the staging buffer back once its consuming call is emitted.
+    pub(crate) fn release_staging_values(&mut self) {
+        self.staging_values_held = false;
     }
 
     /// Allocate a fresh stack slot in the function entry block. Returns
@@ -545,7 +605,11 @@ impl LlFunction {
     ///
     /// The caller declares `llvm.threadlocal.address.p0` in the module.
     pub fn entry_tls_address(&mut self, global: &str) -> String {
-        if let Some((_, reg)) = self.entry_tls_addresses.iter().find(|(g, _)| g == global) {
+        if let Some((_, reg, _)) = self
+            .entry_tls_addresses
+            .iter()
+            .find(|(g, _, _)| g == global)
+        {
             return reg.clone();
         }
         let reg = format!("%r{}", self.reg_counter.next());
@@ -553,8 +617,31 @@ impl LlFunction {
             "  {reg} = call ptr @{TLS_ADDRESS_INTRINSIC}(ptr @{global})"
         ));
         self.entry_tls_addresses
-            .push((global.to_string(), reg.clone()));
+            .push((global.to_string(), reg.clone(), false));
         reg
+    }
+
+    /// Keep a runtime cursor's address in one register. Otherwise the x86
+    /// backend folds every field load back into a long fs: displacement,
+    /// duplicating TLS addressing at each operation. The tied empty asm emits
+    /// no instruction; it only preserves the once-per-activation address.
+    pub(crate) fn entry_materialized_tls_address(&mut self, global: &str) -> String {
+        let address = self.entry_tls_address(global);
+        let entry = self
+            .entry_tls_addresses
+            .iter_mut()
+            .find(|(g, _, _)| g == global)
+            .unwrap();
+        if entry.2 {
+            return address;
+        }
+        let held = format!("%r{}", self.reg_counter.next());
+        self.entry_allocas.push(format!(
+            "  {held} = call ptr asm \"\", \"=r,0\"(ptr {address}) \"gc-leaf-function\""
+        ));
+        entry.1 = held.clone();
+        entry.2 = true;
+        held
     }
 
     /// Allocate a fixed-size `[count x elem_ty]` array slot in the function
@@ -876,6 +963,17 @@ impl LlFunction {
         self.reg_counter.set_preserve_none_fns(fns);
     }
 
+    /// Install the compilation's call-effect table (`CompileOptions::
+    /// gc_effects`) on this function's counter.
+    pub(crate) fn set_gc_effects(&self, effects: Arc<crate::gc_call_effects::GcEffects>) {
+        self.reg_counter.set_gc_effects(effects);
+    }
+
+    /// The compilation's call-effect table this function is lowered under.
+    pub(crate) fn gc_effects(&self) -> Arc<crate::gc_call_effects::GcEffects> {
+        self.reg_counter.gc_effects()
+    }
+
     /// Install the module's `JsFunctionInfo` state (`crate::fn_info`).
     pub(crate) fn set_fn_infos(&self, infos: Rc<RefCell<crate::fn_info::FnInfoState>>) {
         self.reg_counter.set_fn_infos(infos);
@@ -924,7 +1022,7 @@ impl LlFunction {
             .map(|b| b.insts().iter().map(|i| i.text_len() + 1).sum::<usize>() + b.label.len() + 4)
             .sum();
         let allocas: usize = self.entry_allocas.iter().map(|a| a.len() + 1).sum();
-        body + allocas + self.name.len() + 64
+        body + allocas + self.name.len() + 64 + usize::from(self.staging_values.is_some()) * 48
     }
 
     /// The `define ... {` line, and the ONLY place it is rendered.
@@ -1106,6 +1204,7 @@ impl LlFunction {
                 && crate::codegen::helpers::native_stack_roots_enabled()
                 && crate::codegen::helpers::rs4gc_enabled(),
             rewrite_eh_phis: self.personality.is_some(),
+            gc_effects: self.gc_effects(),
         }
     }
 
@@ -1160,6 +1259,10 @@ impl LlFunction {
             sink(FinalItem::Label(&blk.label))?;
             let is_entry = i == 0;
             if is_entry {
+                if let Some((reg, count)) = &self.staging_values {
+                    let alloca = format!("  {reg} = alloca [{count} x double], align 8");
+                    self.text_item(&alloca, rewrite_rets, &mut seq, sink)?;
+                }
                 for alloca in &self.entry_allocas {
                     self.text_item(alloca, rewrite_rets, &mut seq, sink)?;
                 }
@@ -1229,7 +1332,39 @@ impl LlFunction {
                 self.yield_ret_prologue(seq, sink)?;
             }
         }
-        sink(FinalItem::Inst(inst))
+        sink(FinalItem::Inst(inst))?;
+        self.yield_pad_shadow_restore(inst, seq, sink)
+    }
+
+    /// Shadow-stack targets: a landing pad of a function that pushed a shadow
+    /// frame makes that frame the top frame again, right after the pad's
+    /// `js_eh_pad_enter` (which restores every managed stack whose entries
+    /// carry frame marks). The frame handle lives in this frame, like the one
+    /// every `ret` pops with; the frame may be created after the pad was
+    /// emitted (`reserve_shadow_slot`), which is why this is a final rewrite.
+    fn yield_pad_shadow_restore<E>(
+        &self,
+        inst: &crate::inst::LlInst,
+        seq: &mut u32,
+        sink: &mut dyn FnMut(FinalItem<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Some(handle_slot) = &self.shadow_frame_slot else {
+            return Ok(());
+        };
+        if !matches!(inst, crate::inst::LlInst::Call { callee, .. } if callee == "js_eh_pad_enter")
+        {
+            return Ok(());
+        }
+        let load_reg = format!("%shadow_restore_l_{}", seq);
+        *seq += 1;
+        sink(FinalItem::Text(&format!(
+            "  {} = load i64, ptr {}",
+            load_reg, handle_slot
+        )))?;
+        sink(FinalItem::Text(&format!(
+            "  call void @js_shadow_frame_restore_to(i64 {})",
+            load_reg
+        )))
     }
 
     /// Return-site rewrite, streamed: before every `ret` (except `ret ptr`),
@@ -1555,6 +1690,8 @@ pub(crate) struct TextFinish {
     annotate_leaf_calls: bool,
     retype_landing_pads: bool,
     rewrite_eh_phis: bool,
+    /// The compilation's call-effect table the audited-leaf marking reads.
+    gc_effects: Arc<crate::gc_call_effects::GcEffects>,
 }
 
 impl TextFinish {
@@ -1563,7 +1700,9 @@ impl TextFinish {
         // native-frame stack maps only after lowering is complete, when every
         // lazily-reserved scalar root and every call site is visible.
         let ir = match self.precise_roots {
-            Some(slot_count) => lower_precise_roots_to_native_stack(&ir, &self.name, slot_count),
+            Some(slot_count) => {
+                lower_precise_roots_to_native_stack(&self.gc_effects, &ir, &self.name, slot_count)
+            }
             None => ir,
         };
 

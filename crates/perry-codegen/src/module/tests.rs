@@ -1,3 +1,39 @@
+#[test]
+fn unused_private_capabilities_disappear_before_unit_promotion() {
+    use crate::module::LlModule;
+    use crate::types::VOID;
+    let mut module = LlModule::new("x86_64-unknown-linux-gnu");
+    for (name, target) in [
+        ("entry", "used"),
+        ("used", "nested"),
+        ("nested", "nested"),
+        ("dead", "dead"),
+        ("public", "public"),
+    ] {
+        let f = module.define_function(name, VOID, vec![]);
+        if name != "entry" && name != "public" {
+            f.linkage = "internal".into();
+        }
+        let block = f.create_block("entry");
+        block.call_void(target, &[]);
+        block.ret_void();
+    }
+    module.prune_private_capabilities(
+        &["used", "nested", "dead", "public"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    assert!(module.has_function("used"));
+    assert!(module.has_function("nested"));
+    assert!(module.has_function("public"));
+    assert!(!module.has_function("dead"));
+    assert!(!module
+        .render_codegen_units(2)
+        .iter()
+        .any(|u| u.contains("define double @dead") || u.contains("define void @dead")));
+}
+
 /// #10399: a `thread_local` global's cross-unit DECLARATION must keep the
 /// TLS specifier. Without it `external_decl_for_global` returned `None`
 /// and `split_units` panicked with "cannot form external declaration"; a
@@ -663,6 +699,11 @@ fn helper_attr_groups_on_verified_declarations_only() {
     m.declare_function("js_string_compare_value", I32, &[DOUBLE, DOUBLE]);
     m.declare_function("js_nanbox_string", DOUBLE, &[I64]);
     m.declare_function(
+        "js_typed_feedback_plain_array_index_get_guard",
+        I32,
+        &[I64, DOUBLE, I32, I32],
+    );
+    m.declare_function(
         "js_typed_feedback_numeric_array_index_get_guard",
         I32,
         &[I64, DOUBLE, I32, I32],
@@ -699,7 +740,12 @@ fn helper_attr_groups_on_verified_declarations_only() {
     // Repsel 4a.0: the array-index guards carry #4 (nounwind willreturn,
     // no memory attribute — the first-touch path rebuilds raw-f64 layout).
     assert!(ir.contains(
-        "declare i32 @js_typed_feedback_numeric_array_index_get_guard(i64, double, i32, i32) #4"
+        "declare i32 @js_typed_feedback_plain_array_index_get_guard(i64, double, i32, i32) #4"
+    ));
+    // The numeric guards can force-materialize a lazy JSON array (a generic
+    // property set the throws column cannot prove inert): no nounwind.
+    assert!(ir.contains(
+        "declare i32 @js_typed_feedback_numeric_array_index_get_guard(i64, double, i32, i32)\n"
     ));
     assert_eq!(
         ir.matches("attributes #4 = { nounwind willreturn }")
@@ -943,4 +989,79 @@ fn with_local_exec_tls_rewrites_every_thread_local_model() {
     );
     assert_eq!(with_local_exec_tls("@g = global i64 0"), None);
     assert_eq!(with_local_exec_tls("@thread_local = global i64 0"), None);
+}
+
+/// A layout descriptor plus its `layout_id` alias, as `layout_desc` emits
+/// them, and three functions: a big one (unit 0), one that attaches the
+/// descriptor, and — when `read_id` — one that loads the alias.
+fn layout_id_alias_fixture(read_id: bool) -> LlModule {
+    let mut m = LlModule::new("x86_64-unknown-linux-gnu");
+    m.declare_function("js_noop", VOID, &[]);
+    m.declare_function("perry_array_attach_layout", DOUBLE, &[DOUBLE, PTR]);
+    m.add_raw_global(
+        "@perry_array_layout_m_0 = global { i32, i32 } { i32 7, i32 0 }, align 8".to_string(),
+    );
+    m.add_raw_global(
+        "@perry_array_layout_m_0_id = internal alias i32, getelementptr (i8, ptr @perry_array_layout_m_0, i64 4)"
+            .to_string(),
+    );
+    let big = m.define_function("perry_fn_m__big", DOUBLE, vec![]);
+    let block = big.create_block("entry");
+    for _ in 0..200 {
+        block.call_void("js_noop", &[]);
+    }
+    block.ret(DOUBLE, "0.0");
+    let attach = m.define_function("perry_fn_m__attach", DOUBLE, vec![]);
+    let block = attach.create_block("entry");
+    let v = block.call(
+        DOUBLE,
+        "perry_array_attach_layout",
+        &[(DOUBLE, "0.0"), (PTR, "@perry_array_layout_m_0")],
+    );
+    block.ret(DOUBLE, &v);
+    if read_id {
+        let reader = m.define_function("perry_fn_m__reader", I32, vec![]);
+        let block = reader.create_block("entry");
+        let id = block.load(I32, "@perry_array_layout_m_0_id");
+        block.ret(I32, &id);
+    }
+    m
+}
+
+#[test]
+fn split_units_keep_a_layout_id_alias_with_its_descriptor() {
+    // Next.js: nothing loads an array layout's id alias, so unit 0 kept it
+    // while the attaching function's unit owned the descriptor, and LLVM
+    // rejected unit 0 with "Alias must point to a definition".
+    for (read_id, n) in [(false, 2), (true, 3)] {
+        let units = layout_id_alias_fixture(read_id).render_codegen_units(n);
+        assert_eq!(units.len(), n);
+        for (i, unit) in units.iter().enumerate() {
+            crate::testing::verify_ir(unit, &format!("alias_unit{i}"))
+                .unwrap_or_else(|e| panic!("unit {i} (read_id {read_id}): {e}\n{unit}"));
+        }
+        let owner = |sym: &str| {
+            units
+                .iter()
+                .position(|u| {
+                    u.contains(&format!("{sym} = global")) || u.contains(&format!("{sym} = alias"))
+                })
+                .unwrap_or_else(|| panic!("{sym} defined nowhere"))
+        };
+        assert_eq!(
+            owner("@perry_array_layout_m_0_id"),
+            owner("@perry_array_layout_m_0"),
+            "an alias lives in its aliasee's unit"
+        );
+        if read_id {
+            let reader = units
+                .iter()
+                .find(|u| u.contains("define i32 @perry_fn_m__reader("))
+                .unwrap();
+            assert!(
+                reader.contains("@perry_array_layout_m_0_id = external global i32"),
+                "{reader}"
+            );
+        }
+    }
 }

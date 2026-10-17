@@ -283,10 +283,21 @@ fn proven_receivers_keep_the_direct_builtin_call() {
         1,
         "a proven receiver pays exactly one own-override test:\n{ir}"
     );
+    // #11915: that other arm is the ONE shared generic path — the real `Get`
+    // (own property or replaced prototype method) and call — not a second
+    // copy of the dispatcher tower.
     assert_eq!(
-        ir.matches(DISPATCH).count(),
+        ir.matches("call double @js_builtin_proto_generic_call")
+            .count(),
         1,
-        "and reaches the dispatcher only as that test's other arm:\n{ir}"
+        "and reaches the shared generic path only as that test's other arm:\n{ir}"
+    );
+    // #11915: the own-override gate the test already reads is armed by any
+    // builtin prototype modification, and its predicate answers for a
+    // modified Date prototype — the proof costs the site nothing.
+    assert!(
+        ir.contains(OWN_FLAG) && !ir.contains("@PERRY_BUILTIN_PROTO_PATCHED"),
+        "the test's own gate proves the Date prototype unmodified:\n{ir}"
     );
 }
 
@@ -304,9 +315,10 @@ fn zero_argument_search_methods_compile_on_any_receiver_and_on_a_string() {
             ),
         ],
     );
+    // #11915: through the checked entries, with the arity in the symbol.
     assert!(
-        ir.contains("call i32 @js_string_ends_with(")
-            && ir.contains("call i32 @js_string_starts_with(")
+        ir.contains("call double @js_string_m_endsWith0(")
+            && ir.contains("call double @js_string_m_startsWith0(")
             && dispatches(&ir),
         "an omitted searchString is `undefined`, not a compile error:\n{ir}"
     );
@@ -342,6 +354,22 @@ fn unproven_date_receiver_asks_the_own_override_test_before_the_builtin() {
     assert!(
         ir.contains(OWN_FLAG) && ir.contains(OWN_TEST),
         "a Date receiver must take the own-override test before the builtin:\n{ir}"
+    );
+    let own_call = ir
+        .lines()
+        .find(|line| line.contains(OWN_TEST))
+        .expect("own-override call");
+    assert!(
+        own_call.contains(", double "),
+        "the own-override ABI passes the interned key as a NaN-boxed double:\n{own_call}"
+    );
+    assert!(
+        ir.lines().any(|line| {
+            line.contains("load double, ptr @")
+                && line.contains(".str.")
+                && line.contains(".handle")
+        }),
+        "the guard must load its key from the interned string handle global:\n{ir}"
     );
     assert_eq!(
         ir.matches(DISPATCH).count(),
@@ -404,9 +432,10 @@ fn unproven_array_receiver_asks_the_own_override_test_from_its_header() {
         vec![method_call(any_value(), "toSorted", vec![Expr::Undefined])],
     );
     assert!(
-        ir.contains(OWN_TEST) && ir.contains("load i16"),
-        "a plain array tests its own named-property header bits before the \
-         builtin, and asks the predicate only when they are set:\n{ir}"
+        ir.contains(OWN_TEST) && ir.contains(", 4227072") && ir.contains("icmp ne i64"),
+        "a plain array tests its header word and its named layout \
+         (`ArrayHeader.named`) before the builtin, and asks the predicate only \
+         when it may own one:\n{ir}"
     );
     assert!(
         !ir.contains(OWN_FLAG),

@@ -603,7 +603,10 @@ impl Serializer {
             // (#323) — and undefined is never a legal key, so this skip
             // cannot drop a real property. Serializing the slot would emit a
             // phantom `undefined` key node's structured clone doesn't have.
-            if key.to_bits() == crate::value::TAG_UNDEFINED {
+            if key.to_bits() == crate::value::TAG_UNDEFINED
+                // An optional key whose slot holds the hole is absent.
+                || crate::object::key_view::position_is_hole(obj, keys_arr_view, f)
+            {
                 continue;
             }
             // An accessor key's slot holds its accessor pair, never a value
@@ -611,10 +614,13 @@ impl Serializer {
             // it carries `undefined` for it, as the slot always read before.
             let val = if crate::object::key_attrs::key_is_accessor_at(keys_arr, f) {
                 f64::from_bits(crate::value::TAG_UNDEFINED)
-            } else if f < alloc_limit {
-                *fields_ptr.add(f as usize)
             } else {
-                f64::from_bits(crate::object::js_object_get_field(obj, f).bits())
+                let f = crate::object::key_attrs::key_storage_slot(keys_arr, f);
+                if f < alloc_limit {
+                    *fields_ptr.add(f as usize)
+                } else {
+                    f64::from_bits(crate::object::js_object_get_field(obj, f).bits())
+                }
             };
             self.write_value(key);
             self.write_value(val);

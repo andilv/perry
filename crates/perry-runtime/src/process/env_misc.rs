@@ -18,13 +18,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static PROCESS_UNCAUGHT_CAPTURE_CALLBACK_SET: AtomicBool = AtomicBool::new(false);
 
+/// `process.ref(t)` / `process.unref(t)` for a `Timeout`/`Immediate` handle.
+///
+/// #340/#341 made the JS-visible timer handle an ordinary object carrying its
+/// registry id in `ObjectMeta.native_state`; the id is no longer a
+/// POINTER_TAG-boxed small integer. This helper kept the pre-#340 decode, so
+/// `value & POINTER_MASK` yielded a raw heap address, `is_known_timer_id`
+/// always answered false, and both entry points silently did nothing —
+/// `process.unref(timeout)` left `timeout.hasRef()` true. `timer_handle_parts`
+/// is the branded accessor that migration left behind.
 fn timer_handle_id(value: f64) -> Option<i64> {
-    let js_value = JSValue::from_bits(value.to_bits());
-    if !js_value.is_pointer() {
-        return None;
-    }
-    let id = (value.to_bits() & crate::value::POINTER_MASK) as i64;
-    crate::timer::is_known_timer_id(id).then_some(id)
+    crate::timer::timer_handle_parts(value).map(|(id, _)| id)
 }
 
 #[no_mangle]
@@ -351,51 +355,13 @@ pub extern "C" fn js_process_linked_binding(_name: f64) -> f64 {
 
 #[no_mangle]
 pub extern "C" fn js_process_dlopen(module: f64, filename: f64, flags: f64) -> f64 {
-    #[cfg(feature = "node-api-host")]
-    unsafe {
-        let Some(filename) = crate::node_api_host::js_string_value(filename) else {
-            crate::fs::validate::throw_type_error_with_code(
-                "process.dlopen(module, filename) expects filename to be a string",
-                "ERR_INVALID_ARG_TYPE",
-            );
-        };
-        let flags_value = JSValue::from_bits(flags.to_bits());
-        if !flags_value.is_undefined() && !flags_value.is_null() {
-            if !flags_value.is_number() || !matches!(flags_value.as_number() as i64, 0 | 1 | 2) {
-                crate::fs::validate::throw_error_with_code(
-                    "process.dlopen only supports RTLD_LAZY or RTLD_NOW with local symbol scope",
-                    "ERR_DLOPEN_FAILED",
-                );
-            }
-        }
-        let module_value = JSValue::from_bits(module.to_bits());
-        if !crate::object::object_ops::value_is_object_like(module) {
-            crate::fs::validate::throw_type_error_with_code(
-                "process.dlopen(module, filename) expects module to be an object",
-                "ERR_INVALID_ARG_TYPE",
-            );
-        }
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let module = scope
-            .root_raw_mut_ptr(module_value.as_pointer::<crate::object::ObjectHeader>()
-                as *mut crate::object::ObjectHeader);
-        let exports = scope.root_nanbox_f64(crate::node_api_host::load_addon_or_throw(&filename));
-        let key = scope.root_string_ptr(js_string_from_bytes(b"exports".as_ptr(), 7));
-        module.with_mut_ptr(|module| {
-            key.with_const_ptr(|key| {
-                crate::object::js_object_set_field_by_name(module, key, exports.get_nanbox_f64())
-            })
-        });
-        exports.get_nanbox_f64()
+    if let Some(exports) = crate::node_api_host::hooks::dlopen(module, filename, flags) {
+        return exports;
     }
-    #[cfg(not(feature = "node-api-host"))]
-    {
-        let _ = (module, filename, flags);
-        crate::fs::validate::throw_error_with_code(
-            "this executable was compiled without an approved Node-API addon manifest",
-            "ERR_DLOPEN_FAILED",
-        )
-    }
+    crate::fs::validate::throw_error_with_code(
+        "this executable was compiled without an approved Node-API addon manifest",
+        "ERR_DLOPEN_FAILED",
+    )
 }
 
 #[no_mangle]
@@ -475,14 +441,10 @@ pub extern "C" fn js_process_cpu_usage(prior: f64) -> f64 {
         user_us = (user_us - prev_user).max(0.0);
         system_us = (system_us - prev_system).max(0.0);
     }
-    let obj = crate::object::js_object_alloc(0, 2);
-    let set_field = |name: &str, value: f64| {
-        let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        crate::object::js_object_set_field_by_name(obj, key, value);
-    };
-    set_field("user", user_us);
-    set_field("system", system_us);
-    f64::from_bits(JSValue::pointer(obj as *const u8).bits())
+    crate::object::runtime_layouts::runtime_record!(obj, RECORD_Q436_0);
+    obj.set(0, JSValue::from_bits((user_us).to_bits()));
+    obj.set(1, JSValue::from_bits((system_us).to_bits()));
+    f64::from_bits(JSValue::pointer(obj.finish() as *const u8).bits())
 }
 
 const MAX_SAFE_INTEGER_F64: f64 = 9_007_199_254_740_991.0;
@@ -734,6 +696,11 @@ pub(crate) fn schedule_warning(warning: f64, label: &str, code: &str, msg: &str,
 /// runtime parses the modern options-object overload, creates an Error-like
 /// warning object, and queues the warning job so stderr/event delivery happens
 /// after the current synchronous frame.
+///
+/// An `Error` warning is not re-built: node's `emitWarning` validates `type`
+/// and `code` and then ignores both, and the default reporter titles the
+/// warning from the error's own `name`, adds `[code]` / `detail` from the
+/// error's own fields, and emits the very same object to `warning` listeners.
 #[no_mangle]
 pub extern "C" fn js_process_emit_warning(warning: f64, type_name: f64, code: f64) {
     // #3662 — Node validates the optional `type` (when supplied as a non-object
@@ -743,14 +710,35 @@ pub extern "C" fn js_process_emit_warning(warning: f64, type_name: f64, code: f6
     // function (custom ctor) form — both are valid Node usages.
     validate_emit_warning_type(type_name);
     let warning_jv = JSValue::from_bits(warning.to_bits());
-    let warning_is_valid = warning_jv.is_any_string()
-        || crate::error::js_error_is_error(warning).to_bits() == crate::value::TAG_TRUE;
+    let warning_is_error =
+        crate::error::js_error_is_error(warning).to_bits() == crate::value::TAG_TRUE;
+    let warning_is_valid = warning_jv.is_any_string() || warning_is_error;
     if !warning_is_valid {
         let received = crate::fs::validate::describe_received(warning);
         let message = format!(
             "The \"warning\" argument must be of type string or an instance of Error. Received {received}"
         );
         crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
+    }
+
+    if warning_is_error {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        // SAFETY: the validity test above proved this is the pointer of a live
+        // error object; rooting it keeps it live across the reads below.
+        let warning_handle =
+            scope
+                .root_raw_mut_ptr(crate::value::js_nanbox_get_pointer(warning)
+                    as *mut crate::object::ObjectHeader);
+        let label = object_string_field(&warning_handle, "name")
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "Warning".to_string());
+        let raw_code = object_string_field(&warning_handle, "code").unwrap_or_default();
+        let detail = object_string_field(&warning_handle, "detail").unwrap_or_default();
+        let msg = object_string_field(&warning_handle, "message")
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| warning_value_to_string(warning));
+        schedule_warning(warning, &label, &raw_code, &msg, &detail);
+        return;
     }
 
     let msg = warning_value_to_string(warning);
@@ -1472,14 +1460,10 @@ pub extern "C" fn js_process_thread_cpu_usage(prior: f64) -> f64 {
         system_us -= prev_system;
     }
 
-    let obj = crate::object::js_object_alloc(0, 2);
-    let set_field = |name: &str, value: f64| {
-        let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        crate::object::js_object_set_field_by_name(obj, key, value);
-    };
-    set_field("user", user_us);
-    set_field("system", system_us);
-    f64::from_bits(JSValue::pointer(obj as *const u8).bits())
+    crate::object::runtime_layouts::runtime_record!(obj, RECORD_Q436_0);
+    obj.set(0, JSValue::from_bits((user_us).to_bits()));
+    obj.set(1, JSValue::from_bits((system_us).to_bits()));
+    f64::from_bits(JSValue::pointer(obj.finish() as *const u8).bits())
 }
 
 /// process.memoryUsage() -> object { rss, heapTotal, heapUsed, external, arrayBuffers }
@@ -1497,22 +1481,24 @@ pub extern "C" fn js_process_memory_usage() -> f64 {
     let memory = crate::gc::heap_stats();
 
     // Allocate object with 5 fields
-    let obj = crate::object::js_object_alloc(0, 5);
+    crate::object::runtime_layouts::runtime_record!(obj, RECORD_Q439_0);
 
     // Set fields by name to match Node.js API
-    let set_field = |name: &str, value: f64| {
-        let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        crate::object::js_object_set_field_by_name(obj, key, value);
-    };
 
-    set_field("rss", rss as f64);
-    set_field("heapTotal", heap_total as f64);
-    set_field("heapUsed", heap_used as f64);
-    set_field("external", memory.external_bytes as f64);
-    set_field("arrayBuffers", memory.array_buffer_bytes as f64);
+    obj.set(0, JSValue::from_bits((rss as f64).to_bits()));
+    obj.set(1, JSValue::from_bits((heap_total as f64).to_bits()));
+    obj.set(2, JSValue::from_bits((heap_used as f64).to_bits()));
+    obj.set(
+        3,
+        JSValue::from_bits((memory.external_bytes as f64).to_bits()),
+    );
+    obj.set(
+        4,
+        JSValue::from_bits((memory.array_buffer_bytes as f64).to_bits()),
+    );
 
     // Return as NaN-boxed pointer (convert bits to f64)
-    f64::from_bits(JSValue::pointer(obj as *const u8).bits())
+    f64::from_bits(JSValue::pointer(obj.finish() as *const u8).bits())
 }
 
 /// Render a number the way Node prints the `Received …` clause of an
@@ -1631,3 +1617,59 @@ mod env_object_tests {
         assert!(got.is_undefined());
     }
 }
+
+#[cfg(test)]
+mod process_ref_unref_tests {
+    use super::*;
+
+    /// #9202: `process.unref(t)` / `process.ref(t)` must reach the timer
+    /// registry through the SAME brand-checked decode the `Timeout.prototype`
+    /// thunks use (`crate::timer::timer_handle_parts`).
+    ///
+    /// The local `timer_handle_id` still decoded the pre-#340/#341 model — a
+    /// `POINTER_TAG`-boxed small integer whose low 48 bits ARE the id. On the
+    /// handle `setTimeout` actually returns (an ordinary `GC_TYPE_OBJECT` with
+    /// the id in `ObjectMeta.native_state`) that mask yields the handle's heap
+    /// address, `is_known_timer_id` always answered false, and both entry points
+    /// were silent no-ops: `process.unref(timeout)` left `timeout.hasRef()` true
+    /// while `process.ref(timeout)` "worked" only because doing nothing also
+    /// leaves it true.
+    #[test]
+    fn ref_and_unref_reach_the_timer_registry() {
+        let _serial = crate::gc::global_side_table_test_lock();
+        crate::gc::ensure_gc_initialized();
+        let handle =
+            crate::value::js_nanbox_pointer(crate::timer::js_set_timeout_callback(0, 50_000.0));
+        let (id, _) = crate::timer::timer_handle_parts(handle).expect("branded handle");
+        assert_eq!(
+            crate::timer::js_timer_has_ref(id),
+            1,
+            "fixture must start proven: a new timer is ref'd"
+        );
+
+        js_process_unref(handle);
+        assert_eq!(
+            crate::timer::js_timer_has_ref(id),
+            0,
+            "process.unref() must clear the registry's ref state"
+        );
+
+        js_process_ref(handle);
+        assert_eq!(
+            crate::timer::js_timer_has_ref(id),
+            1,
+            "process.ref() must set it back"
+        );
+
+        // A non-handle argument stays the documented no-op (node returns
+        // `undefined` and touches nothing).
+        assert!(js_process_unref(1.0).to_bits() == crate::value::TAG_UNDEFINED);
+        assert!(js_process_ref(std::f64::consts::PI).to_bits() == crate::value::TAG_UNDEFINED);
+
+        crate::timer::clearTimeout(id);
+    }
+}
+
+#[cfg(test)]
+#[path = "warning_tests.rs"]
+mod warning_tests;

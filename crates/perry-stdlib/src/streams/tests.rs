@@ -7,9 +7,11 @@ use super::*;
 static ALLOCATOR_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
 pub(crate) fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
-    ALLOCATOR_TEST_SERIAL
+    let guard = ALLOCATOR_TEST_SERIAL
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::test_runtime::initialize();
+    guard
 }
 
 fn alloc_closed_readable() -> usize {
@@ -32,7 +34,7 @@ fn stream_ids_live_outside_pointer_tag_small_handle_band() {
     );
     assert!(
         perry_runtime::value::addr_class::is_stream_id_band(id)
-            && !perry_runtime::value::addr_class::is_proxy_id_band(id)
+            && !perry_runtime::value::addr_class::is_proxy_cell(id)
             && !perry_runtime::value::addr_class::is_fetch_handle_band(id),
         "stream id {id:#x} must not overlap the other handle sub-bands"
     );
@@ -130,6 +132,7 @@ fn attached_reader_dies_with_terminal_stream_but_not_before() {
     READERS.lock().unwrap().insert(
         reader,
         ReaderData {
+            props: Default::default(),
             stream_handle: stream,
             locked: true,
             closed_promise: 0x2345_6780 as *mut Promise,
@@ -162,6 +165,7 @@ fn root_scanner_emits_callbacks_chunks_and_promises() {
         readable.insert(
             1,
             ReadableStreamData {
+                props: Default::default(),
                 native_source: None,
                 tee_cancel_promise: None,
                 body_consumer: None,
@@ -702,4 +706,39 @@ fn stream_chunk_uses_uint8array_placement_at_birth() {
             &input[..len]
         );
     }
+}
+
+/// #9202: `drain_readable_into_bytes` creates a reader read, polls its state
+/// directly and drops it. An errored stream rejects that read, and the drain
+/// is its only observer — the caller reports the error through its own path
+/// (fetch's `drain_body_stream`), so the rejection must count as handled.
+/// Before the fix it leaked as an "Uncaught (in promise)" for an error the
+/// program already caught, and exited 1.
+#[test]
+fn draining_an_errored_stream_leaves_no_unhandled_rejection() {
+    let _serial = serial_guard();
+    let chunk = js_string_from_bytes(b"partial".as_ptr(), 7);
+    let reason = js_string_from_bytes(b"boom".as_ptr(), 4);
+    let id = alloc_readable(0, 0, 0, 1.0);
+    {
+        let mut g = READABLE_STREAMS.lock().unwrap();
+        let s = g.get_mut(&id).unwrap();
+        s.push_chunk(JSValue::string_ptr(chunk).bits(), 1.0);
+        s.started = true;
+        s.state = ReadableState::Readable;
+        // A read delivering the last chunk flips the stream to Errored, so the
+        // NEXT read is the one that rejects.
+        s.pending_error_after_chunks = Some(JSValue::string_ptr(reason).bits());
+    }
+    let before = perry_runtime::promise::rejection::unhandled_rejection_count();
+    let bytes = unsafe { drain_readable_into_bytes(id) };
+    assert_eq!(
+        bytes, b"partial",
+        "the chunk yielded before the error is still delivered"
+    );
+    assert_eq!(
+        perry_runtime::promise::rejection::unhandled_rejection_count(),
+        before,
+        "the drain consumed the errored read; it must not stay unhandled"
+    );
 }

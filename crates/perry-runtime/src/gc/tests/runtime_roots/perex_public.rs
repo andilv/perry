@@ -17,7 +17,6 @@ pub(super) fn register_host_roots() {
     // The isolation guard removes the production registry. Restore both the
     // transient handles and the metadata families these public operations use.
     register_runtime_handle_root_scanner_for_tests();
-    gc_register_mutable_root_scanner(crate::object::scan_builtin_closure_metadata_roots_mut);
     gc_register_mutable_root_scanner(crate::array::scan_template_raw_roots_mut);
     // gc_init registers this in production. The isolation guard clears that
     // registry, so restore the intrinsic-address rewrites before callbacks
@@ -28,21 +27,14 @@ pub(super) fn register_host_roots() {
 
     gc_register_mutable_root_scanner(crate::object::shapes::scan_shape_table_rekey_mut);
     gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
-    gc_register_mutable_root_scanner(crate::object::scan_exotic_expando_roots_mut);
     gc_register_mutable_root_scanner(crate::regex::scan_last_exec_groups_root_mut);
-    gc_register_mutable_root_scanner(
-        crate::object::method_site::read_holder::scan_read_holder_roots_mut,
-    );
     gc_register_mutable_root_scanner(crate::object::scan_dispatch_binding_roots_mut);
-    // PR #10564 review finding: the new_target savepoint in exception.rs is
-    // a second root for whatever a throw displaces. gc_init registers this in
+    // The pending exception is a root. gc_init registers this in
     // production; the isolation guard clears that registry too.
     gc_register_mutable_root_scanner(crate::exception::scan_exception_roots_mut);
     gc_register_mutable_root_scanner(crate::closure::scan_singleton_closure_roots_mut);
-    gc_register_mutable_root_scanner(crate::closure::scan_closure_dynamic_props_roots_mut);
-    gc_register_mutable_root_scanner(crate::symbol::scan_symbol_side_table_roots_mut);
     gc_register_mutable_root_scanner(crate::object::scan_current_new_target_root_mut);
-    gc_register_mutable_root_scanner(crate::iter_result::scan_iter_result_keys_roots_mut);
+    crate::gc::initialize_runtime_fixture();
 }
 
 fn text<'s>(scope: &'s RuntimeHandleScope, bytes: &[u8]) -> RuntimeHandle<'s> {
@@ -434,7 +426,11 @@ fn regexp_cold_birth_keeps_the_realm_intrinsic_after_global_replacement_and_move
     let before =
         crate::value::js_nanbox_get_pointer(crate::object::builtin_prototype_value("RegExp"))
             as usize;
-    assert!(crate::arena::pointer_in_nursery(before));
+    // The intrinsic is born old and never-move (`gc::never_move`).
+    assert_eq!(
+        crate::arena::classify_heap_generation(before),
+        crate::arena::HeapGeneration::Old
+    );
     let key = crate::string::intern_ascii_literal(b"RegExp");
     crate::object::js_object_set_field_by_name(
         crate::value::js_nanbox_get_pointer(global.get_nanbox_f64()) as *mut ObjectHeader,
@@ -449,7 +445,11 @@ fn regexp_cold_birth_keeps_the_realm_intrinsic_after_global_replacement_and_move
     let after = crate::object::js_object_get_prototype_of(
         receiver.with_const_ptr::<RegExpHeader, _>(|r| js_nanbox_pointer(r as i64)),
     );
-    assert_ne!(crate::value::js_nanbox_get_pointer(after) as usize, before);
+    assert_eq!(
+        crate::value::js_nanbox_get_pointer(after) as usize,
+        before,
+        "the old intrinsic stays at its address across the moving minor"
+    );
     assert!(crate::value::JSValue::from_bits(after.to_bits()).is_pointer());
     let input = text(&scope, b"a");
     assert_eq!(test(&receiver, &input), 1);

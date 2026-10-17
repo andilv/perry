@@ -4,6 +4,10 @@
 //! Pure mechanical move — match arm bodies are verbatim copies, called from
 //! `lower_expr`'s outer dispatch.
 
+#[path = "compare_typeof_object.rs"]
+mod typeof_object;
+use typeof_object::lower_typeof_object_inline;
+
 #[path = "compare_chain.rs"]
 mod chain;
 pub(crate) use chain::try_lower as try_lower_chain;
@@ -436,15 +440,12 @@ pub(crate) fn lower_string_literal_strict_eq(
 /// Returns an i64 holding `TAG_TRUE`/`TAG_FALSE` (or `js_eq`'s own tagged
 /// boolean), i.e. the same value the bare call produced.
 /// All unboxed IEEE doubles, including NaNs. Boxed values occupy the
-/// positive signed suffix starting at SHORT_STRING_TAG; one signed compare
-/// rejects it. The ordered fcmp predicates below already make NaN unequal
-/// and unordered, so a NaN does not need the coercing helper.
+/// sign-closed tag band (the positive tags and `HANDLE_TAG`'s negative
+/// mirror), so the shared plain-number test rejects them. The ordered fcmp
+/// predicates below already make NaN unequal and unordered, so a NaN does
+/// not need the coercing helper.
 fn emit_is_unboxed_number(ctx: &mut FnCtx<'_>, bits: &str) -> String {
-    ctx.block().icmp_slt(
-        I64,
-        bits,
-        &crate::nanbox::i64_literal(crate::nanbox::SHORT_STRING_TAG),
-    )
+    crate::codegen::emit_plain_number_bits_test(ctx.block(), bits)
 }
 
 /// Dynamic-operand comparison with an inline plain-number fast path.
@@ -1191,11 +1192,16 @@ fn lower_typeof_number_inline(ctx: &mut FnCtx<'_>, value: &str, negate: bool) ->
     {
         let blk = ctx.block();
         let bits = blk.bitcast_double_to_i64(value);
-        let top16 = blk.lshr(I64, &bits, "48");
-        // Outside the tag range `0x7FF9..=0x7FFF` in one unsigned compare.
-        let tag_offset = blk.sub(I64, &top16, "32761");
-        let untagged = blk.icmp_ugt(I64, &tag_offset, "6");
+        // Outside the tag band, sign-closed so HANDLE_TAG (0xFFF9) is
+        // excluded with the positive tags 0x7FF9..=0x7FFF.
+        let magnitude = blk.and(I64, &bits, "9223372036854775807");
+        let untagged = blk.icmp_ult(
+            I64,
+            &magnitude,
+            &crate::nanbox::i64_literal(crate::nanbox::SHORT_STRING_TAG),
+        );
         // Not an untagged raw typed-array pointer.
+        let top16 = blk.lshr(I64, &bits, "48");
         let top_nonzero = blk.icmp_ne(I64, &top16, "0");
         let below_pointer_floor = blk.icmp_ult(I64, &bits, "65536");
         let not_raw_pointer = blk.or(I1, &top_nonzero, &below_pointer_floor);
@@ -1236,10 +1242,9 @@ fn lower_typeof_number_inline(ctx: &mut FnCtx<'_>, value: &str, negate: bool) ->
 /// arithmetic.rs`) decides `undefined` (including the hole sentinel), the two
 /// booleans and both string tags with exact bit tests before any registry or
 /// heap lookup, so `"undefined"`, `"boolean"` and `"string"` never need the
-/// call, and `"number"` keeps its inline definitely-a-Number arm. `"object"`,
-/// `"function"`, `"symbol"` and `"bigint"` are usually asked of heap values the
-/// classifier must inspect anyway, so they keep the direct call: an inline
-/// primitive pre-test would only add instructions to that common case.
+/// call, and `"number"` keeps its inline definitely-a-Number arm. `"object"` and
+/// `"function"` read heap callability inline; `"symbol"` and `"bigint"` use the
+/// shared classifier.
 fn lower_typeof_literal_inline(
     ctx: &mut FnCtx<'_>,
     value: &str,
@@ -1267,6 +1272,9 @@ fn lower_typeof_literal_inline(
             bit
         };
     }
+    if expected_tag == 1 || expected_tag == 5 {
+        return lower_typeof_object_inline(ctx, value, expected_tag, negate);
+    }
     if expected_tag == 3 {
         return lower_typeof_number_inline(ctx, value, negate);
     }
@@ -1282,9 +1290,6 @@ fn lower_typeof_literal_inline(
 }
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
-    if let Some(value) = crate::stmt::region_loop::try_lower_numeric_compare(ctx, expr, lower)? {
-        return Ok(value);
-    }
     match expr {
         Expr::Compare { op, left, right } => {
             // `typeof` always yields a string, so loose and strict equality

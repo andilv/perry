@@ -160,9 +160,64 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     );
     // Object introspection / mutation (Agent A's accessor-descriptor work).
     module.declare_function("js_object_has_own", DOUBLE, &[DOUBLE, DOUBLE]);
+    // #11915: `Object.prototype.<m>.call(x, …)` under the builtin-prototype
+    // proof (`perry-runtime/src/object/builtin_proto.rs`).
+    module.declare_function("js_borrowed_object_to_string", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_borrowed_object_has_own", DOUBLE, &[DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_borrowed_object_property_is_enumerable",
+        DOUBLE,
+        &[DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_borrowed_object_define_getter",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_borrowed_object_define_setter",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_borrowed_object_lookup_getter",
+        DOUBLE,
+        &[DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_borrowed_object_lookup_setter",
+        DOUBLE,
+        &[DOUBLE, DOUBLE],
+    );
+    module.declare_function("js_builtin_proto_contract_check", VOID, &[I64]);
+    module.declare_function("js_builtin_namespace_contract_check", VOID, &[I64, PTR, I64]);
+    module.declare_function("js_builtin_namespace_value", DOUBLE, &[I64]);
+    module.declare_function("js_builtin_namespace_member", DOUBLE, &[DOUBLE, PTR, I64]);
+    crate::builtin_proto::declare_entries(module);
+    module.declare_function("js_builtin_proto_generic_call0", DOUBLE, &[DOUBLE, I64]);
+    module.declare_function(
+        "js_builtin_proto_generic_call1",
+        DOUBLE,
+        &[DOUBLE, I64, DOUBLE],
+    );
+    module.declare_function(
+        "js_builtin_proto_generic_call2",
+        DOUBLE,
+        &[DOUBLE, I64, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_builtin_proto_generic_call3",
+        DOUBLE,
+        &[DOUBLE, I64, DOUBLE, DOUBLE, DOUBLE],
+    );
+    module.declare_function(
+        "js_builtin_proto_generic_call",
+        DOUBLE,
+        &[I32, DOUBLE, I64, PTR, I64],
+    );
     // #10943: the own-override guard condition; 0 takes the builtin, 1 the
     // universal dispatcher.
-    module.declare_function("js_receiver_may_own_named_method", I32, &[DOUBLE, PTR, I64]);
+    module.declare_function("js_receiver_may_own_named_method", I32, &[DOUBLE, DOUBLE]);
     // #2891: Object.prototype.propertyIsEnumerable.call(obj, key).
     module.declare_function(
         "js_object_property_is_enumerable",
@@ -354,16 +409,6 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         &[DOUBLE, DOUBLE],
     );
     module.declare_function("js_object_get_symbol_property", DOUBLE, &[DOUBLE, DOUBLE]);
-    module.declare_function(
-        "js_object_get_symbol_property_ic_miss",
-        DOUBLE,
-        &[DOUBLE, DOUBLE, PTR],
-    );
-    module.declare_function(
-        "js_object_get_symbol_then_field_ic_miss",
-        DOUBLE,
-        &[DOUBLE, DOUBLE, PTR, I64, PTR, PTR],
-    );
     module.add_external_global("PERRY_SYMBOL_PROPERTY_IC_EPOCH", I64);
     module.declare_function("js_object_create", DOUBLE, &[DOUBLE]);
     // #2816: Object.create(proto[, propertiesObject]) — validates the
@@ -401,7 +446,11 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
         &[I64, I64, DOUBLE, I32],
     );
     module.declare_function("js_string_locale_compare", DOUBLE, &[I64, I64]);
-    module.declare_function("js_string_locale_compare_opts", DOUBLE, &[I64, I64, DOUBLE]);
+    module.declare_function(
+        "js_string_locale_compare_resolved",
+        DOUBLE,
+        &[I64, I64, I32],
+    );
     module.declare_function("js_string_normalize", I64, &[I64, DOUBLE]);
     module.declare_function("js_string_pad_start", I64, &[I64, DOUBLE, I64]);
     module.declare_function("js_string_pad_end", I64, &[I64, DOUBLE, I64]);
@@ -789,28 +838,35 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_throw", VOID, &[DOUBLE]);
 
     // Exception handling: invoke/landingpad-based try/catch (#7302).
-    // js_eh_try_push() arms a handler (savepoint recording).
-    // js_try_end() pops the try depth (no return value).
+    // Entering a `try` costs nothing (ehfree slice 1): every landing pad
+    // first calls js_eh_pad_enter(llvm.stacksave(), handle height), which
+    // restores the runtime's managed stacks to the catching frame: by frame
+    // marks, and the runtime-handle stack to the height the scope read with
+    // js_eh_handle_height() when it was entered.
     // js_get_exception() returns the thrown NaN-boxed value.
     // js_clear_exception() resets the exception state.
     // js_has_exception() returns i32 (1 if exception is active, 0 otherwise).
     // js_enter_finally() / js_leave_finally() bracket finally blocks.
-    // Invoke-EH (#7302): handlers are armed by js_eh_try_push (savepoints
-    // only, no jmp_buf) and entered through landing pads. One shape on every
-    // target, windows-msvc included — the SEH/catchpad variant was removed in
-    // #7354 because funclet EH cannot coexist with rewrite-statepoints-for-gc
-    // (see `stmt/try_stmt.rs::emit_eh_dispatch`).
-    module.declare_function("js_eh_try_push", VOID, &[]);
+    // One shape on every native target, windows-msvc included — the
+    // SEH/catchpad variant was removed in #7354 because funclet EH cannot
+    // coexist with rewrite-statepoints-for-gc (see
+    // `stmt/try_stmt.rs::emit_eh_dispatch`). WASI keeps setjmp transport:
+    // js_try_push(frame sp) arms a handler, js_try_end() pops it.
+    module.declare_function("js_eh_pad_enter", VOID, &[PTR, I64]);
+    if !module.target_triple.starts_with("wasm32") {
+        // A handler scope's runtime-handle height (`stmt/try_stmt.rs`).
+        module.declare_function("js_eh_handle_height", I64, &[]);
+    }
     if module.target_triple.starts_with("wasm32") {
-        module.declare_function("js_try_push", PTR, &[]);
+        module.declare_function("js_try_push", PTR, &[PTR]);
         module.declare_function("setjmp", I32, &[PTR]);
+        module.declare_function("js_try_end", VOID, &[]);
     }
     module.declare_personality();
-    module.declare_function("js_try_end", VOID, &[]);
     module.declare_function("js_get_exception", DOUBLE, &[]);
     module.declare_function("js_clear_exception", VOID, &[]);
-    // A catch entry's `js_try_end` + `js_get_exception` + `js_clear_exception`
-    // as one call (`stmt/try_stmt.rs`).
+    // A catch entry's `js_get_exception` + `js_clear_exception` as one call
+    // (`stmt/try_stmt.rs`; on WASI it also pops the setjmp handler).
     module.declare_function("js_catch_enter", DOUBLE, &[]);
     module.declare_function("js_has_exception", I32, &[]);
     module.declare_function("js_enter_finally", VOID, &[]);

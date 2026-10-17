@@ -183,6 +183,9 @@ pub(super) unsafe fn try_object(bits: u64) -> Option<JSValue> {
         return Some(result);
     }
     let keys_view = crate::object::object_keys(obj);
+    if crate::object::overflow::is_table(keys_view.arr()) {
+        return None;
+    }
     let keys = keys_view.arr();
     if keys.is_null() {
         return emit_empty_object(obj);
@@ -231,7 +234,7 @@ unsafe fn dense_array(bits: u64) -> Option<(*const crate::ArrayHeader, usize)> {
     let header = crate::value::addr_class::try_read_tracked_gc_header(arr as usize)?.as_ref();
     if header.obj_type != crate::gc::GC_TYPE_ARRAY
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-        || header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+        || !(*arr).named.is_null()
         || (header.size as usize) < crate::gc::GC_HEADER_SIZE + ARRAY_BYTES
     {
         return None;
@@ -374,7 +377,7 @@ unsafe fn emit_repeated_output(
                 &*((arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader);
             if header.obj_type != crate::gc::GC_TYPE_ARRAY
                 || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-                || header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+                || !(*arr).named.is_null()
                 || (*arr).length != len as u32
                 || (*arr).capacity < len as u32
                 || (header.size as usize)
@@ -675,6 +678,9 @@ unsafe fn emit_cached_record_memo(
 #[inline(never)]
 unsafe fn emit_record(obj: *const crate::ObjectHeader, fields: usize) -> Option<JSValue> {
     let keys_view = crate::object::object_keys(obj);
+    if crate::object::overflow::is_table(keys_view.arr()) {
+        return None;
+    }
     let keys = keys_view.arr();
     if let Some(prefix) = key_prefix_plan(obj, keys, fields) {
         let repeat_eligible = (*prefix).receiver == obj as usize
@@ -751,6 +757,9 @@ unsafe fn emit_record(obj: *const crate::ObjectHeader, fields: usize) -> Option<
     init_string_header(result, units, bytes, bytes, 0, 0);
     let value = input.with_const_ptr(|obj: *const crate::ObjectHeader| {
         let keys_view = crate::object::object_keys(obj);
+        if crate::object::overflow::is_table(keys_view.arr()) {
+            return None;
+        }
         let keys = keys_view.arr();
         output.write(b'{');
         let mut at = 1usize;

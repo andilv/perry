@@ -53,34 +53,35 @@ pub(crate) fn proxy_set_with_receiver(
         Some(id) => id,
         None => return f64::from_bits(TAG_FALSE),
     };
-    let (target, handler, revoked) = PROXIES.with(|p| {
-        p.borrow()
-            .get(id as usize)
-            .and_then(|o| o.as_ref())
-            .map(|e| (e.target, e.handler, e.revoked))
-            .unwrap_or((
-                f64::from_bits(TAG_UNDEFINED),
-                f64::from_bits(TAG_UNDEFINED),
-                false,
-            ))
-    });
+    let (target, handler, revoked) = entry(id)
+        .map(|e| (e.target, e.handler, e.revoked))
+        .unwrap_or((
+            f64::from_bits(TAG_UNDEFINED),
+            f64::from_bits(TAG_UNDEFINED),
+            false,
+        ));
     if revoked {
         return revoked_return();
     }
-    let trap = handler_trap(handler, "set");
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target_h = scope.root_nanbox_f64(target);
+    let handler_h = scope.root_nanbox_f64(handler);
+    let key_h = scope.root_nanbox_f64(key);
+    let value_h = scope.root_nanbox_f64(value);
+    let receiver_h = scope.root_nanbox_f64(receiver);
+    let trap = handler_trap(handler_h.get_nanbox_f64(), "set");
+    let target = target_h.get_nanbox_f64();
+    let key = key_h.get_nanbox_f64();
+    let value = value_h.get_nanbox_f64();
+    let receiver = receiver_h.get_nanbox_f64();
     if is_callable(trap) {
         // #2756: the `set` trap's boolean result is observable through
         // `Reflect.set(proxy, …)` (and strict-mode assignment). Coerce and
         // return it rather than discarding it. The trap receives the spec
         // argument list `(target, key, value, receiver)` with `this` bound to
         // the handler.
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let target_h = scope.root_nanbox_f64(target);
-        let key_h = scope.root_nanbox_f64(key);
-        let value_h = scope.root_nanbox_f64(value);
-        let receiver_h = scope.root_nanbox_f64(receiver);
         let trap_result = call_trap(
-            handler,
+            handler_h.get_nanbox_f64(),
             trap,
             &[
                 target_h.get_nanbox_f64(),
@@ -106,7 +107,6 @@ pub(crate) fn proxy_set_with_receiver(
     if lookup(target).is_some() {
         return proxy_set_with_receiver(target, key, value, receiver);
     }
-    let scope = crate::gc::RuntimeHandleScope::new();
     let target_handle = scope.root_nanbox_f64(target);
     let key_handle = scope.root_nanbox_f64(key);
     let value_handle = scope.root_nanbox_f64(value);
@@ -132,11 +132,13 @@ pub extern "C" fn js_put_value_set(
     receiver: f64,
     strict: i32,
 ) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::put_value(target, key, value, receiver);
     // Short strings and heap strings name the same property. Reuse the
     // existing allocation-free atom resolver before asking the shape, as
     // the transition-only entry did, so a warm short key keeps that answer.
     let key = if crate::JSValue::from_bits(key.to_bits()).is_short_string() {
-        unsafe { crate::object::chain_store::interned_key_for_store(key) }
+        unsafe { crate::object::store_key::interned_key_for_store(key) }
             .map(|atom| crate::value::js_nanbox_string(atom as i64))
             .unwrap_or(key)
     } else {
@@ -368,7 +370,10 @@ pub extern "C" fn js_put_value_set(
         return throw_type_error(&msg);
     }
     let ok = if lookup(target).is_some() {
-        js_proxy_set(target, property_key, value).to_bits() == TAG_TRUE
+        // A proxy in the prototype chain is the [[Set]] target, but the
+        // receiver remains the original assignment receiver. `super.x = v`
+        // depends on this distinction just as ordinary inherited writes do.
+        proxy_set_with_receiver(target, property_key, value, receiver).to_bits() == TAG_TRUE
     } else {
         // #8082: `ordinary_set_with_receiver` can run user setters (and
         // allocates), so it is a collection point — the raw `receiver` and
@@ -473,6 +478,9 @@ fn getter_only_accessor_owner_name(receiver: f64, key: &str) -> Option<String> {
 mod packed_add;
 #[path = "put_value/packed_set.rs"]
 mod packed_set;
+#[cfg(test)]
+#[path = "put_value/record_fixture.rs"]
+pub(super) mod record_fixture;
 pub(crate) use packed_add::note_packed_add_carriers;
 pub(crate) use packed_add::scan_packed_add_roots_mut;
 pub use packed_add::PackedSetSite;
@@ -485,12 +493,11 @@ pub(crate) use packed_set::PackedSetWays;
 #[cfg(any(test, feature = "regex-engine"))]
 pub(crate) use packed_set::{js_put_value_set_packed_fast, store_and_prime};
 pub use packed_set::{js_put_value_set_packed_miss, PACKED_SET_EMPTY};
-pub(crate) use packed_set::{packed_set_cache_resolve, PackedSetWaysSlot, PACKED_SET_CHAIN_WORD};
 /// Words in a per-site static-key write cache (`[shape_token, slot]` × the
 /// four inline ways) and in its outlined poly tail. Both are views of the
 /// same `PicCacheSlot` family the read PIC uses; the arena hands out exactly
 /// this many words for them (#9708).
-pub const WRITE_PIC_WORDS: usize = 9;
+pub const WRITE_PIC_WORDS: usize = 8;
 
 /// A per-site write cache, as the emitted slot resolves it.
 pub type WritePicCache = [i64; WRITE_PIC_WORDS];
@@ -538,32 +545,6 @@ pub extern "C" fn js_put_value_set_ic_miss(
 ) -> f64 {
     // Charter step 5: migrate-on-miss (DESIGN §1.5 step 4).
     crate::object::field_rep_store::migrate_on_miss_value(target.to_bits());
-    // Inherited-access lane: a key-adding store on a class instance whose
-    // chain this site has already proved clear takes the transition append
-    // (`object::chain_store`). Before any scope: the try allocates nothing on
-    // a decline.
-    let chain_key = if key.is_null() {
-        None
-    } else {
-        unsafe {
-            crate::object::chain_store::interned_key_for_store(f64::from_bits(
-                crate::value::js_nanbox_string(key as i64).to_bits(),
-            ))
-        }
-    };
-    if let Some(chain_key) = chain_key {
-        if let Some(stored) = unsafe {
-            crate::object::chain_store::chain_store_try(
-                crate::object::chain_store::ChainSite::Pic(cache_slot),
-                target,
-                chain_key,
-                value,
-            )
-        } {
-            return stored;
-        }
-    }
-    let pre_shape = unsafe { crate::object::chain_store::pre_store_shape(target) };
     let scope = crate::gc::RuntimeHandleScope::new();
     let target_handle = scope.root_nanbox_f64(target);
     let key_handle = scope.root_string_ptr(key);
@@ -584,25 +565,6 @@ pub extern "C" fn js_put_value_set_ic_miss(
             strict,
         )
     });
-    unsafe {
-        // Re-resolved after the store: interning the key is one of the things
-        // the slow path does, so a key with no twin before may have one now.
-        let chain_key = if key.is_null() {
-            std::ptr::null()
-        } else {
-            crate::object::chain_store::interned_key_for_store(f64::from_bits(
-                crate::value::js_nanbox_string(key as i64).to_bits(),
-            ))
-            .unwrap_or(std::ptr::null())
-        };
-        crate::object::chain_store::chain_store_after_miss(
-            crate::object::chain_store::ChainSite::Pic(cache_slot),
-            pre_shape,
-            target_handle.get_nanbox_f64(),
-            chain_key,
-        );
-    }
-
     if cache_slot.is_null() {
         return result;
     }
@@ -699,6 +661,7 @@ pub extern "C" fn js_put_value_set_ic_miss(
             crate::object::attr_census::note_global("ic.write_prime_declined.not_plain_key");
             return result;
         }
+        let idx = crate::object::key_attrs::key_storage_slot(keys, idx);
         // #9287: a slot past the inline region primes too, carrying
         // IC_SLOT_OVERFLOW_BIT exactly like the dynamic-key IC's stub entries.
         // A way hit on such a slot is served by `dyn_ic_try_store` —
@@ -782,6 +745,8 @@ pub extern "C" fn js_put_value_set_dyn_ic(
     value: f64,
     strict: i32,
 ) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::put_value(target, key, value, target);
     // SAFETY: a non-null slot is the emitted pointer global (or a test's
     // stack slot); reading it is the same load the inline hit path performs.
     let cache = unsafe { crate::object::pic_slot_peek(cache_slot) };
@@ -931,7 +896,7 @@ fn write_stub_probe(token: u64, key_bits: u64) -> Option<u32> {
 
 #[inline(always)]
 fn write_stub_insert(token: u64, key_bits: u64, slot: u32) {
-    // Never for a dictionary shape (`shapes::DICTIONARY_SHAPE_ID_BASE`).
+    // Never for a dictionary shape (`shapes::SITE_SHAPE_ID_END`).
     if !crate::object::shapes::is_site_matchable_token(token) || key_bits == 0 {
         return;
     }
@@ -1189,6 +1154,18 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
         }
     }
 
+    // §3.3: a computed key the receiver's layout does not name is appended
+    // to its overflow; a layout key continues to the slot store below. A
+    // decline allocates nothing, so the raw operands stay current.
+    if (target_bits & !POINTER_MASK) == POINTER_TAG {
+        let obj = (target_bits & POINTER_MASK) as *mut crate::ObjectHeader;
+        if let Some(stored) =
+            unsafe { crate::object::shape_store::try_dynamic_store(obj, key, value) }
+        {
+            return stored;
+        }
+    }
+
     // A computed write site that constructs the same plain-object shape over
     // and over changes receiver shape after every append, so the per-site
     // overwrite IC above cannot hit. Reuse the runtime's global transition
@@ -1212,24 +1189,6 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
     let mut value = value;
     if (target_bits & !POINTER_MASK) == POINTER_TAG {
         let obj = (target_bits & POINTER_MASK) as *mut crate::ObjectHeader;
-        // Inherited-access lane: a class instance whose chain this site has
-        // proved clear takes the same append with the proof
-        // (`object::chain_store`). The key may be an SSO immediate — tsc's
-        // `pos` / `kind` / `flags` are — resolved to its interned pointer
-        // without allocating.
-        let chain_key = unsafe { crate::object::chain_store::interned_key_for_store(key) };
-        if let Some(key_ptr) = chain_key {
-            if let Some(stored) = unsafe {
-                crate::object::chain_store::chain_store_try(
-                    crate::object::chain_store::ChainSite::Pic(cache_slot),
-                    target,
-                    key_ptr,
-                    value,
-                )
-            } {
-                return stored;
-            }
-        }
         let kb = key.to_bits();
         if (kb & !POINTER_MASK) == crate::value::STRING_TAG {
             let key_ptr = (kb & POINTER_MASK) as *const crate::StringHeader;
@@ -1251,7 +1210,6 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
         }
     }
 
-    let pre_shape = unsafe { crate::object::chain_store::pre_store_shape(target) };
     let scope = crate::gc::RuntimeHandleScope::new();
     let target_handle = scope.root_nanbox_f64(target);
     let key_handle = scope.root_nanbox_f64(key);
@@ -1264,17 +1222,6 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
         target_handle.get_nanbox_f64(),
         strict,
     );
-    unsafe {
-        let key_ptr =
-            crate::object::chain_store::interned_key_for_store(key_handle.get_nanbox_f64())
-                .unwrap_or(std::ptr::null());
-        crate::object::chain_store::chain_store_after_miss(
-            crate::object::chain_store::ChainSite::Pic(cache_slot),
-            pre_shape,
-            target_handle.get_nanbox_f64(),
-            key_ptr,
-        );
-    }
     if cache_slot.is_null() {
         return result;
     }
@@ -1343,6 +1290,7 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
         let Some(idx) = own_idx else {
             return result;
         };
+        let idx = crate::object::key_attrs::key_storage_slot(keys, idx);
         // Generated own-slot hits write raw bits. A ConstFn target must
         // keep using the checked store funnel so an incompatible overwrite
         // invalidates its body fact before changing the slot.
@@ -1386,15 +1334,8 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
         }
         let c = &mut *crate::object::pic_slot_resolve(cache_slot);
         if c[0] as u64 != shape_token {
-            // New shape at this site: restart the way set. The chain-verdict
-            // word is not part of it: it is keyed on the receiver class, not
-            // the shape, and dropping it would orphan its entry.
-            for word in c
-                .iter_mut()
-                .take(crate::object::chain_store::CHAIN_ENTRY_WORD)
-            {
-                *word = 0;
-            }
+            // New shape at this site: restart the way set.
+            c.fill(0);
         }
         // MRU insert: shift ways down, newest first. A duplicate key way is
         // moved to the front rather than duplicated.
@@ -1421,15 +1362,19 @@ pub extern "C" fn js_put_value_set_dyn_ic_miss(
 mod tests {
     use super::*;
 
+    /// Object model step 4 (§3.3): a computed key the receiver's layout does
+    /// not name is appended to the receiver's overflow. The layout id never
+    /// changes (the shadow bit marks the overflow) and no shape transition is
+    /// learned or reused, for any receiver of the site; a user-class receiver
+    /// gets the same value semantics.
     #[test]
-    fn dynamic_ic_miss_reuses_learned_anon_shape_transition_only() {
+    fn dynamic_ic_miss_adds_an_unnamed_key_to_the_overflow_without_transitions() {
         let _lock = crate::gc::global_side_table_test_lock();
         crate::object::test_reset_transition_fast_hits();
         crate::object::shapes::test_reset_cached_transition_stamps();
 
         // Longer than the SSO limit so this exercises the heap-string arm
-        // admitted above. A unique name prevents another test's transition
-        // edge from turning the first write into a hit.
+        // admitted above. A unique name keeps other tests' keys out of it.
         let key_bytes = b"__dyn_ic_transition_fast_test_8783";
         let key_ptr =
             crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
@@ -1445,67 +1390,48 @@ mod tests {
             scope.root_raw_mut_ptr(crate::object::js_object_alloc(USER_CLASS_ID, 0));
         let mut cache: WritePicCache = [0; WRITE_PIC_WORDS];
         let mut cache_slot: WritePicCacheSlot = &mut cache;
+        let read = |obj: *mut crate::ObjectHeader| {
+            let key_ptr = (key_handle.get_nanbox_f64().to_bits() & POINTER_MASK)
+                as *const crate::StringHeader;
+            crate::object::js_object_get_field_by_name(obj, key_ptr).as_number()
+        };
 
-        let first = first_handle.get_raw_mut_ptr::<crate::ObjectHeader>();
-        let learned_predecessor = unsafe { crate::object::shapes::object_shape_stamp(first) };
-        assert_eq!(
-            js_put_value_set_dyn_ic_miss(
-                &mut cache_slot,
-                crate::value::js_nanbox_pointer(first as i64),
-                key_handle.get_nanbox_f64(),
-                11.0,
-                1,
-            ),
-            11.0
-        );
+        for (handle, value) in [(&first_handle, 11.0), (&second_handle, 29.0)] {
+            let obj = handle.get_raw_mut_ptr::<crate::ObjectHeader>();
+            let before = unsafe { crate::object::shapes::object_shape_stamp(obj) };
+            assert!(!unsafe { crate::object::overflow::has_overflow(obj) });
+            assert_eq!(
+                js_put_value_set_dyn_ic_miss(
+                    &mut cache_slot,
+                    crate::value::js_nanbox_pointer(obj as i64),
+                    key_handle.get_nanbox_f64(),
+                    value,
+                    1,
+                ),
+                value
+            );
+            let obj = handle.get_raw_mut_ptr::<crate::ObjectHeader>();
+            assert!(
+                unsafe { crate::object::overflow::has_overflow(obj) },
+                "the computed key is an overflow entry"
+            );
+            let after = unsafe { crate::object::shapes::object_shape_stamp(obj) };
+            assert_eq!(
+                crate::object::layout_desc::layout_id_of_word(after),
+                crate::object::layout_desc::layout_id_of_word(before),
+                "the layout id does not change"
+            );
+            assert_ne!(after & crate::object::overflow::SHADOW_BIT, 0);
+            assert_eq!(read(obj), value);
+        }
         assert_eq!(crate::object::test_transition_fast_hits(), 0);
-        let first = first_handle.get_raw_mut_ptr::<crate::ObjectHeader>();
-        let learned_target = unsafe { crate::object::shapes::object_shape_stamp(first) };
-        assert_ne!(learned_target, learned_predecessor);
-        let key_ptr =
-            (key_handle.get_nanbox_f64().to_bits() & POINTER_MASK) as *const crate::StringHeader;
+        assert_eq!(crate::object::shapes::test_cached_transition_stamps(), 0);
+        // The first receiver's entry is its own.
         assert_eq!(
-            crate::object::js_object_get_field_by_name(first, key_ptr).as_number(),
+            read(first_handle.get_raw_mut_ptr::<crate::ObjectHeader>()),
             11.0
         );
-        // The first lazy runtime operation can perform unrelated cached
-        // transitions while bootstrapping builtins. Isolate the sibling edge
-        // below rather than treating that process-wide activity as test state.
-        let second = second_handle.get_raw_mut_ptr::<crate::ObjectHeader>();
-        crate::object::shapes::test_watch_cached_transition_stamps(second as usize);
-        assert_eq!(
-            unsafe { crate::object::shapes::object_shape_stamp(second) },
-            learned_predecessor,
-            "the sibling must begin at the learned predecessor ShapeId"
-        );
-        assert_eq!(
-            js_put_value_set_dyn_ic_miss(
-                &mut cache_slot,
-                crate::value::js_nanbox_pointer(second as i64),
-                key_handle.get_nanbox_f64(),
-                29.0,
-                1,
-            ),
-            29.0
-        );
-        assert_eq!(crate::object::test_transition_fast_hits(), 1);
-        assert_eq!(crate::object::shapes::test_cached_transition_stamps(), 1);
-        let second = second_handle.get_raw_mut_ptr::<crate::ObjectHeader>();
-        assert_eq!(
-            unsafe { crate::object::shapes::object_shape_stamp(second) },
-            learned_target,
-            "the hit must stamp the exact learned successor ShapeId"
-        );
-        let key_ptr =
-            (key_handle.get_nanbox_f64().to_bits() & POINTER_MASK) as *const crate::StringHeader;
-        assert_eq!(
-            crate::object::js_object_get_field_by_name(second, key_ptr).as_number(),
-            29.0
-        );
 
-        // A real user class can have inherited setters and must not borrow the
-        // anonymous shape's cached edge even though both receivers begin with
-        // the same null keys-array identity.
         let user_class = user_class_handle.get_raw_mut_ptr::<crate::ObjectHeader>();
         assert_eq!(
             js_put_value_set_dyn_ic_miss(
@@ -1517,14 +1443,11 @@ mod tests {
             ),
             47.0
         );
-        assert_eq!(crate::object::test_transition_fast_hits(), 1);
-        let user_class = user_class_handle.get_raw_mut_ptr::<crate::ObjectHeader>();
-        let key_ptr =
-            (key_handle.get_nanbox_f64().to_bits() & POINTER_MASK) as *const crate::StringHeader;
         assert_eq!(
-            crate::object::js_object_get_field_by_name(user_class, key_ptr).as_number(),
+            read(user_class_handle.get_raw_mut_ptr::<crate::ObjectHeader>()),
             47.0
         );
+        assert_eq!(crate::object::test_transition_fast_hits(), 0);
     }
 }
 
@@ -1578,7 +1501,9 @@ fn object_array_numeric_write_slots(
     )?;
     if array_gc.obj_type != crate::gc::GC_TYPE_ARRAY
         || array_gc.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-        || array_gc._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+        || crate::array::array_has_element_descriptors(
+            array_addr as *const crate::array::ArrayHeader,
+        )
         || crate::array::array_index_fast_path_invalid_for(array_gc._reserved)
     {
         trace_object_array_numeric_write_rejection(
@@ -1694,10 +1619,8 @@ fn object_array_numeric_write_slots(
         if key_count > 4096 {
             return None;
         }
-        if let Some(slot) = crate::object::keys_find_slot_by_key_ptr(keys, key_count, key) {
-            return Some(slot);
-        }
-        None
+        crate::object::keys_find_slot_by_key_ptr(keys, key_count, key)
+            .map(|position| crate::object::key_attrs::key_storage_slot(keys, position))
     }
 
     let elements = unsafe {

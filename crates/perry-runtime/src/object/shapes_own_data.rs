@@ -36,7 +36,9 @@ pub(crate) unsafe fn own_data_shape(dir: *const u8, shape_id: u32) -> Option<Opt
         }
     }
     let plain_bound = if record.proto_id == PROTO_ID_PER_OBJECT
-        || record.summary() & crate::object::key_attrs::SUMMARY_PRIVATE != 0
+        || record.summary()
+            & (crate::object::key_attrs::SUMMARY_PRIVATE | crate::object::key_attrs::SUMMARY_HOLES)
+            != 0
     {
         0
     } else {
@@ -68,6 +70,7 @@ impl OwnDataShape {
         // accessors, no holes and no semantic descriptor generation.
         let keys = self.keys as usize as *const ArrayHeader;
         let count = self.logical_key_count;
+        crate::object::key_attrs::debug_assert_positional(keys, bound);
         let n = (count as usize).min((*keys).length.min((*keys).capacity) as usize);
         let words = crate::array::array_elements_ptr(keys) as *const u64;
         // Last matching key wins, including a later noncanonical spelling of an

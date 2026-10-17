@@ -205,6 +205,10 @@ pub(super) struct CopyingNurseryCollector {
     /// to-space copies or non-moving objects, which don't move again within
     /// the cycle.
     pub(super) weak_slots: Vec<*mut u64>,
+    /// Weak-storage objects the drain handed to the ephemeron fixed point.
+    /// Their scan remembers no edge, so the post-drain remembered-set pass
+    /// walks exactly these (see `run_copied_minor_attempt`).
+    pub(super) weak_storage_scanned: Vec<*mut GcHeader>,
     pub(super) ephemerons: super::ephemeron::Ephemerons,
     /// One-entry memo for [`CopyingNurseryCollector::mark_addr`]: the last
     /// address it classified successfully, and the address it returned.
@@ -272,6 +276,7 @@ impl CopyingNurseryCollector {
             survival: crate::gc::gc_diag_enabled()
                 .then(|| Box::new(super::survival_diag::SurvivalDiag::new())),
             weak_slots: Vec::new(),
+            weak_storage_scanned: Vec::new(),
             ephemerons: super::ephemeron::Ephemerons::default(),
             memo_addr: 0,
             memo_result: 0,
@@ -563,9 +568,25 @@ impl CopyingNurseryCollector {
         // re-derived from survivor influx after every cycle. The decision is
         // purely per-object (flags + age) so the copied/promoted split stays
         // deterministic regardless of root traversal order.
-        let promote = flags & GC_FLAG_TENURED != 0 || next_age >= self.tenuring_survivals;
+        // I1: a never-move object is promoted at its first survival, so the
+        // memos that ask for it are admitted after this minor.
+        let promote = flags & GC_FLAG_TENURED != 0
+            || next_age >= self.tenuring_survivals
+            || super::never_move::promotes_now((*header).obj_type, (*header)._reserved);
         let new_user = if promote {
-            crate::arena::arena_alloc_gc_old(payload, 8, (*header).obj_type)
+            // The promotion's live page accounting rides on the allocation's
+            // deferred page registration (one page lookup per run, applied
+            // by the same flush).
+            crate::arena::arena_alloc_gc_promoted(
+                payload,
+                8,
+                (*header).obj_type,
+                flags & GC_FLAG_PINNED != 0
+                    || super::never_move::header_is_never_move(
+                        (*header).obj_type,
+                        (*header)._reserved,
+                    ),
+            )
         } else {
             crate::arena::arena_alloc_gc_survivor(payload, 8, (*header).obj_type)
         };
@@ -590,13 +611,6 @@ impl CopyingNurseryCollector {
             } else {
                 GC_FLAG_HAS_SURVIVED
             };
-        if promote {
-            crate::arena::old_page_account_promoted_object(
-                new_header as usize,
-                total,
-                preserved & GC_FLAG_PINNED != 0,
-            );
-        }
 
         set_forwarding_address(header, new_user);
         (*header).gc_flags &= !GC_FLAG_MARKED;
@@ -710,6 +724,7 @@ impl CopyingNurseryCollector {
     pub(super) unsafe fn scan_object_fields(&mut self, header: *mut GcHeader) {
         if (*header).obj_type == GC_TYPE_WEAK_STORAGE {
             super::ephemeron::discover(header);
+            self.weak_storage_scanned.push(header);
             return; // Conditional tracing/repair is performed by the fixed point.
         }
         // The common case, written out (#11549): see `gc/copying_object_scan.rs`.
@@ -1089,8 +1104,15 @@ pub(super) fn run_copied_minor_attempt(
     // `should_attempt_first_cycle_promotion` for why, and for why both extra
     // preconditions here are about making the ROLLBACK's obligations provably
     // empty rather than about liveness.
+    // A young Map/Set store or context-snapshot holder owns native buffers
+    // that only the copying walk of from-space releases when it dies, and the
+    // retag leaves no from-space to walk: a speculative promotion would carry
+    // every dead holder's buffers into old-gen until the next full sweep. That
+    // is the retention `malloc_registry_empty_at_start` already rules out for
+    // malloc-owned payloads, so both preconditions read the same way.
     let speculate_first_cycle = may_speculate
         && ptrs.malloc_registry_empty_at_start
+        && !crate::arena::young_owned_stores_may_exist()
         && untraced_promotion_instrument_veto().is_none()
         && super::should_attempt_first_cycle_promotion();
     let promotion_phase_start = PhaseDiag::start(&phase_diag);
@@ -1390,12 +1412,25 @@ pub(super) fn run_copied_minor_attempt(
     // the rebuild performs is exact rather than a from-space
     // over-approximation. Headers still carry GC_FLAG_MARKED (clear_marks
     // runs later), which the per-object gate requires.
+    //
+    // The drain itself remembers every promoted parent's young and malloc
+    // children: it scans each parent once, in its old copy, after moving
+    // every child the parent names to the child's final address (an object
+    // moves at most once per cycle), and asks the same tracking question of
+    // the same decoded child. So the pass over all of `moved_headers` would
+    // only repeat it. Weak storage is the exception: its drain visit hands
+    // the object to the ephemeron fixed point and remembers nothing, so only
+    // those parents are walked here. Test and debug builds still walk every
+    // moved header and require its pages to be covered already.
     let forwarding_phase_start = PhaseDiag::start(&phase_diag);
     if !collector.skip_remembering {
         let promoted_sticky =
-            rebuild_evacuated_old_to_young_remembered_set(&collector.moved_headers);
-        promoted_sticky.restore();
+            rebuild_evacuated_old_to_young_remembered_set(&collector.weak_storage_scanned);
+        #[cfg(any(test, debug_assertions))]
+        rebuild_evacuated_old_to_young_remembered_set(&collector.moved_headers)
+            .assert_covered_by(&collector.sticky, &promoted_sticky);
         collector.sticky.extend(promoted_sticky);
+        collector.sticky.restore();
     }
     let old_young_edges = if gc_verify_evacuation_enabled() {
         let phase_start = trace_phase_start(trace);
@@ -1502,6 +1537,8 @@ pub(super) fn run_copied_minor_attempt(
     // being swept. Non-fatal; logs parent/child obj_types.
     if crate::gc::gc_verify_mark_enabled() {
         super::verify::verify_marked_heap_report_nonfatal("copying-minor");
+        #[cfg(any(test, perry_check_contracts))]
+        super::verify_honest::verify_honest_pointers("copying-minor");
         // #9261: the copied minor is the OPERATIVE cycle on every workload that
         // reaches this path, and it was the one collector with no sweep-live-
         // child probe — `verify_minor_unmarked_young_children_report` was wired

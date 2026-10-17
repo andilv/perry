@@ -257,21 +257,12 @@ fn read_lines_id(closure: *const ClosureHeader) -> usize {
 }
 
 fn build_read_lines_step(value: f64, done: bool) -> f64 {
-    let obj = crate::object::js_object_alloc(0, 2);
-    let set = |name: &[u8], v: f64| {
-        let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
-        crate::object::js_object_set_field_by_name(obj, key, v);
-    };
-    set(b"value", value);
-    set(
-        b"done",
-        f64::from_bits(if done {
-            crate::value::TAG_TRUE
-        } else {
-            crate::value::TAG_FALSE
-        }),
-    );
-    f64::from_bits(crate::value::JSValue::pointer(obj as *const u8).bits())
+    unsafe {
+        crate::iter_result::make_iter_result(
+            crate::value::JSValue::from_bits(value.to_bits()),
+            done,
+        )
+    }
 }
 
 extern "C" fn read_lines_next_impl(
@@ -1604,6 +1595,8 @@ fn fs_codec_is_filehandle(value: f64) -> bool {
 }
 
 fn build_filehandle_object(fd: i32) -> f64 {
+    // Bounded native initialization; the created closures do not execute JS.
+    let _no_move = crate::gc::GcSuppressScope::new();
     // Arm BEFORE the object exists: every FileHandle (attached or detached)
     // is minted here, so the thread codec is live from the first moment a
     // probe could ever match.
@@ -1756,9 +1749,9 @@ fn build_filehandle_object(fd: i32) -> f64 {
             0,
         ),
     );
-    FILEHANDLE_OBJECT_FDS.with(|fds| {
-        fds.borrow_mut().insert(obj as usize, fd);
-    });
+    unsafe {
+        set_filehandle_owner_fd(obj, fd);
+    }
     handle
 }
 

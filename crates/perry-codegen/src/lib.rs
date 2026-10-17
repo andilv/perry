@@ -7,6 +7,7 @@
 mod array_storage;
 pub mod block;
 pub(crate) mod boxed_vars;
+pub(crate) mod builtin_proto;
 pub mod codegen;
 pub(crate) mod collectors;
 pub(crate) mod concat_site_cache;
@@ -20,10 +21,15 @@ pub(crate) mod fn_info;
 pub mod function;
 pub mod function_order;
 pub(crate) mod gc_call_effects;
+pub use gc_call_effects::GcEffects;
 pub mod gc_map;
 #[cfg(feature = "llvm-inprocess")]
 pub mod inprocess;
 pub mod inst;
+pub(crate) mod layout_desc;
+pub mod layout_families;
+pub(crate) mod proto_constants;
+pub use layout_families::ProgramLayouts;
 pub mod linker;
 pub(crate) mod loop_purity;
 pub(crate) mod lower_array_method;
@@ -55,6 +61,7 @@ pub(crate) mod native_value;
 pub(crate) use perry_abi as runtime_abi;
 pub mod native_routing;
 pub(crate) mod nm_install;
+pub mod providers;
 pub use native_routing::{
     program_native_routing_key, set_program_native_routing, NativeProvider, NativeRouting,
 };
@@ -95,14 +102,15 @@ pub mod workers;
 pub use codegen::{
     assign_static_shape_ids, compile_module, context_free_ctor_abi, context_free_ctor_param_count,
     decode_static_seed, encode_static_seed, module_birth_shapes, namespace_member_class_key,
-    namespace_member_func_key, namespace_member_var_key, resolve_target_triple, target_os_of,
-    TARGET_NAMES,
-    short_spread_method_capabilities, take_module_static_seeds, user_function_symbol, AppMetadata,
-    BirthProto, BirthShape, ClassAccessorNames, CompileOptions, ConstFnBirth, ConstructorContracts,
-    CtorAbi, DefinedClassShape, ExportedObjectLiteralCapability, FpContractMode, ImportedClass,
-    ImportedObjectLiteral, ImportedObjectLiteralMethod, ModuleBirth, NamespaceEntry,
-    NamespaceEntryKind, ObjectLiteralMethodCandidate, ProgramClassShapeIds,
+    namespace_member_func_key, namespace_member_var_key, resolve_target_triple,
+    short_spread_method_capabilities, take_module_static_seeds, target_os_of, user_function_symbol,
+    AppMetadata, BirthProto, BirthShape, ClassAccessorNames, CompileOptions, ConstFnBirth,
+    ConstructorContracts, CtorAbi, DefinedClassShape, ElisionFacts,
+    ExportedObjectLiteralCapability, FactsClass, FactsField, FactsRecv, FpContractMode,
+    ImportedClass, ImportedObjectLiteral, ImportedObjectLiteralMethod, ModuleBirth, NamespaceEntry,
+    NamespaceEntryKind, ObjectLiteralMethodCandidate, ProgramClassShapeIds, ProgramFactsView,
     ResolvedConstructorContracts, ShortSpreadMethodCandidate, TypedMasks, STATIC_SEED_FORMAT,
+    TARGET_NAMES,
 };
 // #10399: worker entries supplied by the driver before module codegen.
 pub use codegen::{set_worker_entries, worker_entries};
@@ -119,6 +127,8 @@ pub use function_order::{
 pub use collectors::segview::{
     segview_diag_enabled, segview_lowering_enabled, segview_rewrite_module, SegViewDiag,
 };
+// Object model step 3: the program-wide prototype-write census.
+pub use proto_constants::{program_proto_census_key, set_program_proto_census};
 // #11394: whole-program set of methods written onto a builtin prototype.
 pub use lower_call::property_get::patched_proto::{
     program_patched_proto_methods, set_program_patched_proto_methods,

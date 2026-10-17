@@ -64,6 +64,9 @@ fn entry_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: true,
         non_entry_module_prefixes: Vec::new(),
@@ -328,7 +331,15 @@ fn concat_accumulator_is_rooted_and_written_back() {
                 property: "concat".to_string(),
                 byte_offset: 0,
             }),
-            args: vec![allocating()],
+            // Three arguments: `concat` with at most two goes through the
+            // checked entry `js_string_m_concat<n>` (#11915), one call that
+            // takes its operands boxed; the fused chain this test pins is
+            // the lowering for longer argument lists.
+            args: vec![
+                allocating(),
+                Expr::String("x".to_string()),
+                Expr::String("y".to_string()),
+            ],
             type_args: Vec::new(),
             byte_offset: 0,
         })],

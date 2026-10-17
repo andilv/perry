@@ -401,8 +401,16 @@ pub(crate) use handle_object::{scan_timer_prototype_roots_mut, try_timer_method_
 // an unconditional `pub(crate) use` would be an unused import in a lib build
 // and `-D warnings` would reject it.
 use handle_object::{timer_handle_id, timer_object};
+// #9202: `timer_handle_parts` is the ONE brand-checked decoder from a JS timer
+// handle to its registry id, and `process.ref`/`process.unref`
+// (`process/env_misc.rs`) need it in a lib build too — re-deriving the decode
+// there is what let a stale pre-#340/#341 copy survive in the first place.
+// Unconditional is safe: that consumer exists in every cfg, so this is never an
+// unused import. `TIMEOUT_CLASS_ID` still has no lib-build consumer and stays
+// test-gated.
+pub(crate) use handle_object::timer_handle_parts;
 #[cfg(test)]
-pub(crate) use handle_object::{timer_handle_parts, TIMEOUT_CLASS_ID};
+pub(crate) use handle_object::TIMEOUT_CLASS_ID;
 
 static WARNED_NEGATIVE_TIMER_DELAY: AtomicBool = AtomicBool::new(false);
 static WARNED_NAN_TIMER_DELAY: AtomicBool = AtomicBool::new(false);
@@ -429,20 +437,18 @@ fn leave_timer_callback_dispatch() {
 }
 
 fn timer_handle_value(id: i64) -> f64 {
-    f64::from_bits(crate::value::JSValue::pointer(id as *mut u8).bits())
+    // A timer id is a word of unknown kind: the id band boxes as HANDLE_TAG.
+    crate::value::js_nanbox_pointer(id)
 }
 
 fn with_timer_uncaught_trap<F: FnOnce()>(f: F) {
-    let trap_buf = crate::exception::js_try_push();
     let mut f = Some(f);
-    // The jmp_buf is armed inside a C trampoline frame (#9305 — a raw
-    // `setjmp` in a Rust frame is unsound). Loop shape: a throw from the
-    // timer callback lands in the trampoline, and the uncaught path then
-    // runs under the NEXT arm — so a throw out of an 'uncaughtException'
-    // listener lands here again instead of targeting a dead frame,
-    // matching the raw shape where the still-armed setjmp caught it.
+    // The body runs under the trap shim (`exception::trap`). Loop shape: a
+    // throw from the timer callback lands in the trap, and the uncaught path
+    // then runs under the NEXT `trap` — so a throw out of an
+    // 'uncaughtException' listener lands here again, under this entry.
     loop {
-        let completed = crate::exception::arm_trap_and_run(trap_buf, || {
+        let completed = crate::exception::trap(|| {
             if let Some(f) = f.take() {
                 f();
             } else {
@@ -455,7 +461,6 @@ fn with_timer_uncaught_trap<F: FnOnce()>(f: F) {
             break;
         }
     }
-    crate::exception::js_try_end();
 }
 
 fn call_timer_callback(
@@ -876,18 +881,13 @@ fn schedule_callback_timer_inner(
 
     let mut context = crate::async_context::capture_context();
     let context_roots = crate::async_context::root_snapshot(&scope, &context);
-    let (ids, callback) =
-        callback_handle.across_const::<crate::closure::ClosureHeader, _>(
-            || match trigger_async_id {
-                Some(trigger_async_id) => crate::async_hooks::init_resource_with_trigger(
-                    type_name,
-                    resource(),
-                    true,
-                    trigger_async_id,
-                ),
-                None => crate::async_hooks::init_resource(type_name, resource(), true),
-            },
-        );
+    let (ids, callback) = callback_handle.across_const::<crate::closure::ClosureHeader, _>(|| {
+        crate::async_hooks::init_scheduled_resource(type_name, resource(), trigger_async_id)
+    });
+    // The queue entry owns the timer's state; keep it reachable until queued.
+    if let Some(state) = crate::async_hooks::resource_state::get(ids.async_id) {
+        scope.root_raw_mut_ptr(state);
+    }
     crate::async_context::refresh_snapshot_from_roots(&mut context, &context_roots);
 
     // Re-read after `init_resource*`, which can move it.

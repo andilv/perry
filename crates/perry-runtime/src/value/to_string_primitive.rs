@@ -82,7 +82,7 @@ unsafe fn ordinary_to_primitive_string_inner(value: f64) -> Option<f64> {
         MethodOutcome::Absent => {
             // A boxed primitive wrapper (`new Number/String/Boolean/BigInt(x)`,
             // or a reflective `Object(x)`) stores its `[[PrimitiveData]]` in a
-            // side table (`BOXED_PRIMITIVE_PAYLOADS`), not as a regular own
+            // private metadata slot (`ObjectMeta::boxed_primitive`), not as a regular own
             // field — so `call_method_for_primitive`'s `js_object_get_field_by_name`
             // lookup for `toString` misses even though `Number.prototype.toString`
             // /etc. are real installed methods, and this arm would otherwise
@@ -337,8 +337,7 @@ pub(crate) fn is_primitive_value(value: f64) -> bool {
         || jsval.is_null()
         || jsval.is_undefined()
         || jsval.is_bigint()
-        || ((value.to_bits() & 0xFFFF_0000_0000_0000) == POINTER_TAG
-            && crate::symbol::is_registered_symbol((value.to_bits() & POINTER_MASK) as usize))
+        || unsafe { crate::symbol::js_is_symbol(value) } != 0
 }
 
 /// Result of consulting an exotic instance's OWN `toString` (#6370).
@@ -574,8 +573,13 @@ unsafe fn call_method_for_primitive(
     method_name: &[u8],
 ) -> MethodOutcome {
     let recv = value_handle.get_nanbox_f64();
+    let receiver_jsval = JSValue::from_bits(recv.to_bits());
+    let receiver_is_handle = receiver_jsval.is_handle();
     let obj_ptr = (recv.to_bits() & POINTER_MASK) as *const crate::object::ObjectHeader;
-    if obj_ptr.is_null() || (obj_ptr as usize) < 0x10000 {
+    // `js_object_get_field_by_name` accepts the small id encoded in this
+    // pointer-shaped argument and dispatches handles before any object-header
+    // dereference. Do not apply the heap-pointer floor to HANDLE_TAG values.
+    if !receiver_is_handle && (obj_ptr.is_null() || (obj_ptr as usize) < 0x10000) {
         return MethodOutcome::Absent;
     }
     let key = crate::string::canonical_key(method_name);

@@ -254,8 +254,7 @@ impl ShapeChain {
         let Some(shape) = crate::object::shapes::object_shape_descriptor(obj) else {
             return false;
         };
-        if !shape.object_kind.is_ordinary_layout() || crate::object::dictionary::is_dictionary(obj)
-        {
+        if !shape.object_kind.is_ordinary_layout() || crate::object::overflow::has_overflow(obj) {
             return false;
         }
         let meta = (*obj).meta;
@@ -292,6 +291,9 @@ impl ShapeChain {
             .all(|hop| std::ptr::read(hop.addr as *const u64) == hop.word)
     }
 
+    /// Strong-root scan for the one owner that still roots its proofs
+    /// (`proxy::put_value::packed_add`'s key-add sites; read and method
+    /// sites hold their proofs weakly, see `read_holder.rs` "Weak entries").
     pub(crate) fn scan(&mut self, visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
         for hop in unsafe { std::slice::from_raw_parts_mut(self.hops, self.len) } {
             let addr = &mut hop.addr;
@@ -301,5 +303,15 @@ impl ShapeChain {
                 visitor.visit_nanbox_u64_slot(&mut hop.word);
             }
         }
+    }
+
+    /// The objects this proof names (its heap hops); identity-word slots
+    /// are stable metadata and are not objects.
+    pub(crate) fn heap_addrs(&self) -> Vec<usize> {
+        unsafe { std::slice::from_raw_parts(self.hops, self.len) }
+            .iter()
+            .filter(|hop| hop.heap)
+            .map(|hop| hop.addr)
+            .collect()
     }
 }

@@ -36,7 +36,9 @@ impl JSValue {
     /// Create an f64 number value
     #[inline]
     pub fn number(value: f64) -> Self {
-        // Just reinterpret the bits - f64 values are stored directly
+        // Raw-byte ingress (typed arrays, DataView, Buffer, clone, FFI)
+        // canonicalizes NaN payloads, so a computed number never carries a
+        // tag pattern; boxing is the bit pattern itself.
         Self {
             bits: value.to_bits(),
         }
@@ -53,6 +55,13 @@ impl JSValue {
     /// Create a pointer value (for heap-allocated objects)
     #[inline]
     pub fn pointer(ptr: *const u8) -> Self {
+        // Honest pointers: the argument is a GC-headed object. A native
+        // registry id is boxed by `handle`; the out-of-line, unknown-word
+        // constructor `js_nanbox_pointer` routes the id band itself. Contract
+        // builds abort on an id-band payload here; release builds pay
+        // nothing at the hundreds of inlined boxing sites.
+        #[cfg(perry_check_contracts)]
+        crate::entry_contracts::assert_heap_payload(ptr as usize, "JSValue::pointer");
         debug_assert!(
             (ptr as u64) <= POINTER_MASK,
             "Pointer too large for NaN-boxing"
@@ -62,15 +71,35 @@ impl JSValue {
         }
     }
 
+    /// A native registry id, never a heap address or V8 handle.
+    #[inline]
+    pub fn handle(id: usize) -> Self {
+        debug_assert!(crate::value::addr_class::is_small_handle(id));
+        Self {
+            bits: HANDLE_TAG | id as u64,
+        }
+    }
+
+    #[inline]
+    pub fn is_handle(&self) -> bool {
+        // On the top 16 bits: a 16-bit immediate rather than a 64-bit tag.
+        self.bits >> 48 == HANDLE_TAG >> 48
+    }
+
+    #[inline]
+    pub fn as_handle(&self) -> usize {
+        debug_assert!(self.is_handle(), "Value is not a native handle");
+        (self.bits & POINTER_MASK) as usize
+    }
+
     /// Check if this is a number (not a tagged value)
     #[inline]
     pub fn is_number(&self) -> bool {
-        // Perry-owned tags occupy the positive qNaN band 0x7FF9..=0x7FFF.
-        // Keep IEEE f64 values, including canonical qNaN 0x7FF8 and negative
-        // NaN payloads, classified as numbers.
-        // The tag band occupies this whole bit interval, including payloads.
-        // Comparing the original word removes the per-check tag mask.
-        !(SHORT_STRING_TAG..0x8000_0000_0000_0000).contains(&self.bits)
+        // Perry-owned tags occupy the positive qNaN band 0x7FF9..=0x7FFF and
+        // HANDLE_TAG's mirror 0xFFF9. Numeric ingress canonicalizes every
+        // other NaN payload, so the sign-closed band is one mask and compare,
+        // the same test emitted code uses.
+        self.bits & !(1u64 << 63) < SHORT_STRING_TAG
     }
 
     /// Check if this is undefined
@@ -97,10 +126,36 @@ impl JSValue {
         (self.bits & !INT32_MASK) == INT32_TAG
     }
 
-    /// Check if this is a pointer (object or array)
+    /// A `POINTER_TAG` word: a GC-headed heap allocation whose header may be
+    /// read. This is a *representation* test. A native handle (`HANDLE_TAG`)
+    /// is a JavaScript object too but has no header, so it fails here; a site
+    /// that asks "is this an object reference?" for JavaScript semantics uses
+    /// [`is_reference`](Self::is_reference) instead (#12540).
     #[inline]
     pub fn is_pointer(&self) -> bool {
         (self.bits & !POINTER_MASK) == POINTER_TAG
+    }
+
+    /// A reference value: a GC-headed heap word (`POINTER_TAG`, which also
+    /// covers Symbol cells) or a native handle id (`HANDLE_TAG`: Headers,
+    /// Blob, Request/Response, Web Streams, sockets, ...). This is the set
+    /// `POINTER_TAG` named before honest pointers (#12529) split the handles
+    /// out, and the one test every JavaScript-semantic dispatch branches on:
+    /// ToPrimitive / ToNumber / ToString ladders, equality, inspection and
+    /// serialization. Without it a handle falls through such a ladder into its
+    /// "plain number" arm and arithmetic propagates the tag (#12540). Only
+    /// [`is_pointer`](Self::is_pointer) proves a header is readable.
+    #[inline]
+    pub fn is_reference(&self) -> bool {
+        is_reference_bits(self.bits)
+    }
+
+    /// The 48-bit payload of an [`is_reference`](Self::is_reference) value:
+    /// the heap address of a `POINTER_TAG` word or the id of a handle.
+    #[inline]
+    pub fn reference_payload(&self) -> usize {
+        debug_assert!(self.is_reference(), "Value is not a reference");
+        (self.bits & POINTER_MASK) as usize
     }
 
     /// Check if this is a heap-allocated string pointer
@@ -364,6 +419,8 @@ impl std::fmt::Debug for JSValue {
             write!(f, "{}i", self.as_int32())
         } else if self.is_pointer() {
             write!(f, "<ptr {:p}>", self.as_pointer::<u8>())
+        } else if self.is_handle() {
+            write!(f, "<handle {}>", self.as_handle())
         } else {
             write!(f, "<unknown 0x{:016x}>", self.bits)
         }
@@ -388,8 +445,15 @@ mod number_tag_interval_tests {
         for tag in 0..=u16::MAX {
             for payload in [0, 1, 0x1234_5678_9abc, 0xffff_ffff_fffe, 0xffff_ffff_ffff] {
                 let bits = (u64::from(tag) << 48) | payload;
-                let expected = !(0x7ff9..=0x7fff).contains(&tag);
-                assert_eq!(JSValue::from_bits(bits).is_number(), expected, "{bits:016x}");
+                // Sign-closed: HANDLE_TAG (0xFFF9) mirrors the positive band;
+                // the other negative mirrors are non-canonical NaNs that
+                // numeric ingress never produces.
+                let expected = !(0x7ff9..=0x7fff).contains(&(tag & 0x7fff));
+                assert_eq!(
+                    JSValue::from_bits(bits).is_number(),
+                    expected,
+                    "{bits:016x}"
+                );
             }
         }
     }

@@ -29,7 +29,7 @@ pub(crate) unsafe fn accessor_walk(
 ) -> Option<HolderAccessor> {
     if !holder_name_admitted(name)
         || crate::object::field_get_set::accessor_receiver_override_armed()
-        || crate::object::prototype_chain::resolution_stack_savepoint() != 0
+        || crate::object::prototype_chain::resolution_stack_depth() != 0
     {
         return None;
     }
@@ -46,7 +46,7 @@ pub(crate) unsafe fn accessor_walk(
         if header.obj_type != crate::gc::GC_TYPE_OBJECT
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
             || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
-            || crate::object::dictionary::is_dictionary(holder)
+            || crate::object::overflow::has_overflow(holder)
         {
             return None;
         }
@@ -86,17 +86,21 @@ pub(crate) unsafe fn accessor_walk(
                     return None;
                 }
             }
-            let slot = holder_slot_word(addr, slot, shape.live_inline_slot_count)?;
+            let slot = holder_slot_word(
+                addr,
+                shape.keys as usize as *const crate::ArrayHeader,
+                slot,
+                shape.live_inline_slot_count,
+            )?;
             let lane = holder_slot_value(addr, slot)?;
-            let getter = crate::object::accessor_pair::site_getter_word_of_value(lane)?;
+            // The lane must hold an accessor pair a site could call.
+            crate::object::accessor_pair::site_getter_word_of_value(lane)?;
             return Some(HolderAccessor {
                 hops,
                 depth,
                 holder: addr,
                 shape: object_shape_stamp(holder),
                 slot,
-                pair: (lane & crate::value::POINTER_MASK) as usize,
-                getter,
             });
         }
         if depth == HOLDER_MAX_DEPTH {

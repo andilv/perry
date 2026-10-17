@@ -118,13 +118,13 @@ impl Drop for BlockPool {
 
 // ---------------------------------------------------------------------------
 // These three stay RAW, and not because nobody got to them: they are read from
-// inside `Arena::new`, which runs as `ARENA`'s lazy initializer — and `ARENA`
+// inside `ArenaCell::initialize`, which runs on `ARENA`'s first access — and `ARENA`
 // is the FIRST provider `tls_hot::fill` resolves. Routing them through the hot
 // cache closes a cycle that ends in a stack overflow at thread start:
 //
 //     HotKey::get -> hot() -> hot_uncached -> hot_via_tls
 //       -> (temp_roots still null) fill()
-//         -> arena_hot_addr() -> ARENA.with(..) -> Arena::new
+//         -> arena_hot_addr() -> ARENA.with(..) -> ArenaCell::get
 //           -> ARENA_TOTAL_BYTES / BLOCK_POOL{,_BYTES}.with(..)
 //             -> HotKey::get -> hot() -> ... (temp_roots STILL null) ...
 //
@@ -136,8 +136,8 @@ impl Drop for BlockPool {
 //
 // The rule this is an instance of: a declaration read from the dynamic extent
 // of a `tls_hot::fill` provider cannot use `crate::perry_thread_local!`. Today
-// `ARENA` is the only provider whose initializer runs code, so this is the
-// whole set.
+// `ARENA`'s first-use setup is the provider that reads these counters and
+// the block pool, so this is the complete dependency set.
 // ---------------------------------------------------------------------------
 thread_local! {
     static BLOCK_POOL: RefCell<BlockPool> = const { RefCell::new(BlockPool {
@@ -500,8 +500,8 @@ pub(crate) struct ArenaBlock {
 }
 
 impl ArenaBlock {
-    /// The initial block of a thread's arena, built during `Arena::new` — i.e.
-    /// while the arena does not exist yet, so nothing may collect here.
+    /// The initial block, built during `ArenaCell::initialize` before the
+    /// arena has backing storage. Nothing may collect here.
     fn new(generation: HeapGeneration) -> Self {
         alloc_block_no_gc(BLOCK_SIZE, generation)
     }
@@ -612,6 +612,29 @@ pub(crate) struct Arena {
     pub(crate) large_allocated_bytes: usize,
 }
 
+/// The GC kinds whose payload owns native memory released at thread exit.
+const OWNED_HOLDER_KIND_FIRST: u8 = crate::gc::GC_TYPE_ASYNC_SNAPSHOT;
+const OWNED_HOLDER_KIND_LAST: u8 = crate::gc::GC_TYPE_ASYNC_RESOURCE_STATE;
+const _: () = {
+    let kinds = [
+        crate::gc::GC_TYPE_SET_STORE,
+        crate::gc::GC_TYPE_MAP_STORE,
+        crate::gc::GC_TYPE_ASYNC_RESOURCE_STATE,
+        crate::gc::GC_TYPE_ASYNC_SNAPSHOT,
+    ];
+    let mut i = 0;
+    while i < kinds.len() {
+        assert!(kinds[i] >= OWNED_HOLDER_KIND_FIRST && kinds[i] <= OWNED_HOLDER_KIND_LAST);
+        i += 1;
+    }
+    // No byte-cell kind sits below the holder range or inside it.
+    let mut kind = 0u8;
+    while kind <= OWNED_HOLDER_KIND_LAST {
+        assert!(!crate::gc::is_byte_family_type(kind));
+        kind += 1;
+    }
+};
+
 impl Drop for Arena {
     fn drop(&mut self) {
         // Runtime-owned payloads can now be in the last unsynchronized Eden
@@ -640,7 +663,6 @@ impl Drop for Arena {
                 .filter(|block| !block.data.is_null())
                 .map(|block| (block.data as usize, block.data as usize + block.size))
                 .collect();
-            crate::closure::release_closure_side_table_owners_in_ranges(&ranges);
             // #11471: every other process-global table keyed by, or holding,
             // an address in these blocks (see `arena::thread_exit`).
             super::thread_exit::release_freed_ranges(&ranges);
@@ -655,13 +677,29 @@ impl Drop for Arena {
                 continue;
             }
             super::walk::for_each_block_header(block, |header| unsafe {
+                // Every kind with thread-exit work (byte cells, native-owning
+                // holders) has an id at or above the first holder id, so an
+                // ordinary object, array, string or closure leaves after one
+                // compare.
+                let kind = (*header).obj_type;
+                if kind < OWNED_HOLDER_KIND_FIRST {
+                    return;
+                }
                 crate::buffer::drop_owned_backing_at_thread_exit(header);
-            });
-            super::map_allocations::walk_block_maps(block, &mut |header| unsafe {
-                if (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0 {
-                    crate::map::drop_map_store_at_thread_exit(
-                        header.cast::<u8>().add(crate::gc::GC_HEADER_SIZE).cast(),
-                    );
+                if kind > OWNED_HOLDER_KIND_LAST {
+                    return;
+                }
+                let user = header.cast::<u8>().add(crate::gc::GC_HEADER_SIZE);
+                match kind {
+                    crate::gc::GC_TYPE_SET_STORE => crate::set::finalize_owned_store(user, false),
+                    crate::gc::GC_TYPE_MAP_STORE => crate::map::finalize_owned_store(user, false),
+                    crate::gc::GC_TYPE_ASYNC_RESOURCE_STATE => {
+                        crate::async_hooks::resource_state::finalize(user.cast(), false)
+                    }
+                    crate::gc::GC_TYPE_ASYNC_SNAPSHOT => {
+                        crate::async_context::finalize_snapshot_holder(user.cast())
+                    }
+                    _ => {}
                 }
             });
             // #11463: a typed-array cache hit must not survive reuse of this
@@ -683,6 +721,68 @@ impl Drop for Arena {
     }
 }
 
+/// Const-constructed arena storage. Initial blocks are installed inside the
+/// value on its first access, so native TLS never needs an old-value drop.
+pub(crate) struct ArenaCell(UnsafeCell<Arena>);
+
+impl ArenaCell {
+    const fn new(generation: HeapGeneration, space: HeapSpace) -> Self {
+        Self(UnsafeCell::new(Arena {
+            blocks: Vec::new(),
+            current: 0,
+            generation,
+            space,
+            allocated_bytes: 0,
+            large_allocated_bytes: 0,
+        }))
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> *mut Arena {
+        let ptr = self.0.get();
+        // As with the former UnsafeCell, callers serialize access on this
+        // thread. Setup uses only raw TLS providers, never the hot cache.
+        unsafe {
+            if (*ptr).blocks.is_empty() {
+                Self::initialize(&mut *ptr);
+            }
+        }
+        ptr
+    }
+
+    #[cold]
+    fn initialize(arena: &mut Arena) {
+        if arena.space == HeapSpace::NurseryEden {
+            let initial = ArenaBlock::new(arena.generation);
+            register_block_space_with_object_starts(
+                initial.data as usize,
+                initial.size,
+                arena.generation,
+                arena.space,
+                initial.object_starts_ptr(),
+            );
+            ARENA_TOTAL_BYTES.with(|t| t.set(t.get() + initial.size));
+            arena.blocks.reserve_exact(1);
+            arena.blocks.push(initial);
+        } else {
+            // Same tombstone as the former new_lazy: walkers and allocation
+            // slow paths keep their existing block-index semantics.
+            arena.blocks.reserve_exact(1);
+            arena.blocks.push(ArenaBlock {
+                extent_kind: super::region::Kind::NurseryBlock,
+                data: std::ptr::null_mut(),
+                size: 0,
+                offset: 0,
+                object_starts: Box::new([]),
+                dead_cycles: 0,
+                old_free_holes: false,
+                pinned_summary: false,
+                idle_pages_discarded: false,
+            });
+        }
+    }
+}
+
 impl Arena {
     /// Monotonic mutator/collector allocation counters. Resetting or moving
     /// blocks never resets these; the pacer subtracts collector deltas per step.
@@ -691,26 +791,6 @@ impl Arena {
         self.allocated_bytes = self.allocated_bytes.saturating_add(bytes);
         if large {
             self.large_allocated_bytes = self.large_allocated_bytes.saturating_add(bytes);
-        }
-    }
-
-    fn new(generation: HeapGeneration, space: HeapSpace) -> Self {
-        let initial = ArenaBlock::new(generation);
-        register_block_space_with_object_starts(
-            initial.data as usize,
-            initial.size,
-            generation,
-            space,
-            initial.object_starts_ptr(),
-        );
-        ARENA_TOTAL_BYTES.with(|t| t.set(t.get() + initial.size));
-        Arena {
-            blocks: vec![initial],
-            current: 0,
-            generation,
-            space,
-            allocated_bytes: 0,
-            large_allocated_bytes: 0,
         }
     }
 
@@ -735,50 +815,44 @@ impl Arena {
         crate::gc::trigger_watermark::retire_trigger_watermark();
     }
 
-    /// Lazy variant of `new`: starts with a single tombstone block
-    /// (`data = null, size = 0`) instead of an eagerly-mapped 1 MB
-    /// block, so JS-touching threads that never allocate in this
-    /// region (spawn workers, tokio callers) don't pay the block.
-    /// The tombstone shape is exactly the one C4b-δ block release leaves
-    /// behind, so every walker/reset/alloc path already handles it:
-    /// the first `alloc` misses the tombstone, and the slow path's
-    /// `install_fresh_block` replaces the tombstone slot in place.
-    /// Only used for the non-Eden regions — Eden must stay eager
-    /// because `js_inline_arena_state` hands its current block to
-    /// codegen's inline bump allocator at thread start.
-    fn new_lazy(generation: HeapGeneration, space: HeapSpace) -> Self {
-        Arena {
-            blocks: vec![ArenaBlock {
-                extent_kind: super::region::Kind::NurseryBlock,
-                data: std::ptr::null_mut(),
-                size: 0,
-                offset: 0,
-                object_starts: Box::new([]),
-                dead_cycles: 0,
-                old_free_holes: false,
-                pinned_summary: false,
-                idle_pages_discarded: false,
-            }],
-            current: 0,
-            generation,
-            space,
-            allocated_bytes: 0,
-            large_allocated_bytes: 0,
-        }
-    }
-
     /// Bump-allocate in `blocks[idx]`, delta-maintaining the cached
     /// old-gen in-use counter (see `OLD_GEN_IN_USE_BYTES`). Every
     /// successful offset advance of an old-arena block MUST go through
     /// here — a bypassed site silently skews the OldReclaim trigger.
     #[inline]
     fn try_block_alloc(&mut self, idx: usize, size: usize, align: usize) -> Option<*mut u8> {
+        if matches!(
+            self.blocks[idx].extent_kind,
+            super::region::Kind::CollectingHolder
+        ) {
+            return None;
+        }
         let before = self.blocks[idx].offset;
         let ptr = self.blocks[idx].alloc(size, align)?;
         self.note_allocation(self.blocks[idx].offset - before, size >= 16 * 1024);
         if self.generation == HeapGeneration::Old {
             old_gen_in_use_bytes_add(self.blocks[idx].offset - before);
         }
+        Some(ptr)
+    }
+
+    pub(crate) fn try_alloc_collecting_holder(
+        &mut self,
+        size: usize,
+        align: usize,
+    ) -> Option<*mut u8> {
+        let idx = self.blocks.iter().rposition(|b| {
+            matches!(b.extent_kind, super::region::Kind::CollectingHolder)
+                && !b.data.is_null()
+                && ((b.offset + align - 1) & !(align - 1))
+                    .checked_add(size)
+                    .is_some_and(|n| n <= b.size)
+        })?;
+        let before = self.blocks[idx].offset;
+        let ptr = self.blocks[idx].alloc(size, align)?;
+        let bytes = self.blocks[idx].offset - before;
+        self.note_allocation(bytes, size >= 16 * 1024);
+        old_gen_in_use_bytes_add(bytes);
         Some(ptr)
     }
 
@@ -791,6 +865,12 @@ impl Arena {
         align: usize,
         excluded_pages: &crate::fast_hash::PtrHashSet<usize>,
     ) -> Option<*mut u8> {
+        if matches!(
+            self.blocks[idx].extent_kind,
+            super::region::Kind::CollectingHolder
+        ) {
+            return None;
+        }
         let before = self.blocks[idx].offset;
         let ptr = self.blocks[idx].alloc_excluding_pages(size, align, excluded_pages)?;
         self.note_allocation(self.blocks[idx].offset - before, size >= 16 * 1024);
@@ -982,6 +1062,26 @@ impl Arena {
         }
         self.alloc_fresh_block_excluding_pages(size, align, excluded_pages)
     }
+}
+
+/// Reserve collecting-holder backing outside an arena borrow. The class
+/// lives on the existing block, and its objects use the normal old page index.
+pub(crate) unsafe fn arena_cell_alloc_collecting_holder(
+    arena: *mut Arena,
+    size: usize,
+    align: usize,
+) -> *mut u8 {
+    if let Some(ptr) = (*arena).try_alloc_collecting_holder(size, align) {
+        return ptr;
+    }
+    let mut fresh = reserve_arena_block_for(size, HeapGeneration::Old);
+    fresh.extent_kind = super::region::Kind::CollectingHolder;
+    let previous = (*arena).current;
+    (*arena).install_reserved_block(fresh);
+    (*arena).set_current(previous);
+    (*arena)
+        .try_alloc_collecting_holder(size, align)
+        .expect("fresh collecting-holder block")
 }
 
 /// Allocate from an arena that lives behind a thread-local `UnsafeCell`,
@@ -1178,7 +1278,7 @@ thread_local! {
     /// 80-block working set the per-allocation overhead was ~250 ns
     /// just to recompute a total that almost never changes (only on
     /// fresh-block alloc and tombstone release). Maintained via deltas
-    /// at the four mutation sites (Arena::new initial block, fresh
+    /// at the four mutation sites (ArenaCell::initialize initial block, fresh
     /// alloc into a tombstone slot or the end, and release inside
     /// `arena_reset_empty_blocks`).
     pub(crate) static ARENA_TOTAL_BYTES: crate::gc::TriggerInput<usize> = const { crate::gc::TriggerInput::new(0) };
@@ -1217,8 +1317,8 @@ crate::perry_thread_local! {
 // providers further down, and a named field is one dependent load cheaper
 // than a claimed slot. Their neighbours in this block were never migrated.
 thread_local! {
-    pub(crate) static ARENA: UnsafeCell<Arena> =
-        UnsafeCell::new(Arena::new(HeapGeneration::Nursery, HeapSpace::NurseryEden));
+    pub(crate) static ARENA: ArenaCell =
+        const { ArenaCell::new(HeapGeneration::Nursery, HeapSpace::NurseryEden) };
 }
 
 crate::perry_thread_local! {
@@ -1240,16 +1340,16 @@ crate::perry_thread_local! {
     /// still traverse them so mark/trace reach cached objects; root
     /// scanners (`scan_parse_roots`, `scan_shape_cache_roots`,
     /// `scan_transition_cache_roots`) keep them marked.
-    pub(crate) static LONGLIVED_ARENA: UnsafeCell<Arena> =
-        UnsafeCell::new(Arena::new_lazy(HeapGeneration::Longlived, HeapSpace::Longlived));
+    pub(crate) static LONGLIVED_ARENA: ArenaCell =
+        const { ArenaCell::new(HeapGeneration::Longlived, HeapSpace::Longlived) };
 
     /// Copying nursery survivor semispaces. At most one is the active
     /// from-space at the start of a copying minor GC; the other is reset
     /// and used as to-space for fresh Eden survivors.
-    pub(crate) static SURVIVOR_ARENA_0: UnsafeCell<Arena> =
-        UnsafeCell::new(Arena::new_lazy(HeapGeneration::Nursery, HeapSpace::Survivor0));
-    pub(crate) static SURVIVOR_ARENA_1: UnsafeCell<Arena> =
-        UnsafeCell::new(Arena::new_lazy(HeapGeneration::Nursery, HeapSpace::Survivor1));
+    pub(crate) static SURVIVOR_ARENA_0: ArenaCell =
+        const { ArenaCell::new(HeapGeneration::Nursery, HeapSpace::Survivor0) };
+    pub(crate) static SURVIVOR_ARENA_1: ArenaCell =
+        const { ArenaCell::new(HeapGeneration::Nursery, HeapSpace::Survivor1) };
     pub(crate) static ACTIVE_SURVIVOR: Cell<usize> = const { Cell::new(0) };
 
     /// Generational-GC old-generation arena (gen-GC Phase B per
@@ -1266,29 +1366,52 @@ crate::perry_thread_local! {
     /// reset path), and never feed the inline bump allocator. Full
     /// mark-sweep can reclaim completely dead old blocks through the
     /// dedicated old-arena reset/release path.
-    pub(crate) static OLD_ARENA: UnsafeCell<Arena> =
-        UnsafeCell::new(Arena::new_lazy(HeapGeneration::Old, HeapSpace::Old));
+    pub(crate) static OLD_ARENA: ArenaCell =
+        const { ArenaCell::new(HeapGeneration::Old, HeapSpace::Old) };
 
 }
 
-thread_local! {
-    /// Inline allocator state — a cache of the current arena block's
-    /// `(data, offset, size)` tuple, exposed via a stable pointer so
-    /// codegen can emit inline bump-allocate IR without going through
-    /// any function call or `LocalKey::with` wrapper.
-    ///
-    /// `#[repr(C)]` on `InlineArenaState` keeps the field offsets stable
-    /// (data=0, offset=8, size=16). The codegen reads/writes these fields
-    /// directly via fixed GEPs, so changing the struct layout would
-    /// silently break every emitted `new ClassName()`.
-    pub(crate) static INLINE_STATE: UnsafeCell<InlineArenaState> = const { UnsafeCell::new(InlineArenaState {
+/// Native TLS storage with the same scoped access interface as the old
+/// const-initialized LocalKey. It has no destructor or lazy-init metadata.
+#[repr(transparent)]
+pub(crate) struct InlineStateCell(UnsafeCell<InlineArenaState>);
+
+impl InlineStateCell {
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&UnsafeCell<InlineArenaState>) -> R) -> R {
+        f(&self.0)
+    }
+
+    pub(crate) fn try_with<R>(
+        &self,
+        f: impl FnOnce(&UnsafeCell<InlineArenaState>) -> R,
+    ) -> Result<R, std::thread::AccessError> {
+        // Like the old const LocalKey without Drop, this storage remains
+        // available throughout thread teardown.
+        Ok(self.with(f))
+    }
+}
+
+/// Inline allocator state — a cache of the current arena block's
+/// `(data, offset, size)` tuple, exposed via a stable pointer so
+/// codegen can emit inline bump-allocate IR without going through
+/// any function call or `LocalKey::with` wrapper.
+///
+/// `#[repr(C)]` on `InlineArenaState` keeps the field offsets stable
+/// (data=0, offset=8, size=16). The codegen reads/writes these fields
+/// directly via fixed GEPs, so changing the struct layout would
+/// silently break every emitted `new ClassName()`.
+#[cfg_attr(not(windows), no_mangle)]
+#[thread_local]
+pub(crate) static PERRY_INLINE_ARENA_STATE: InlineStateCell =
+    InlineStateCell(UnsafeCell::new(InlineArenaState {
         data: std::ptr::null_mut(),
         offset: 0,
         size: 0,
         birth_flags: std::ptr::null(),
         birth_seeds: std::ptr::null_mut(),
-    }) };
-}
+    }));
+
+pub(crate) use PERRY_INLINE_ARENA_STATE as INLINE_STATE;
 
 /// Hot-cache slot claimed by `OLD_GEN_IN_USE_BYTES`. See above.
 #[cfg(test)]
@@ -1357,3 +1480,35 @@ pub(crate) fn block_pool_bytes() -> usize {
 #[cfg(test)]
 #[path = "block/reuse_window_tests.rs"]
 mod reuse_window_tests;
+
+#[cfg(test)]
+mod const_tls_tests {
+    use super::*;
+
+    #[test]
+    fn const_arena_storage_installs_the_original_initial_block_on_first_access() {
+        std::thread::spawn(|| {
+            ARENA.with(|cell| unsafe {
+                assert!((*cell.0.get()).blocks.is_empty());
+                let arena = &*cell.get();
+                assert_eq!(arena.blocks.len(), 1);
+                assert_eq!(arena.blocks.capacity(), 1);
+                assert!(!arena.blocks[0].data.is_null());
+                assert_eq!(arena.blocks[0].size, BLOCK_SIZE);
+                assert_eq!(arena.blocks[0].offset, 0);
+                let data = arena.blocks[0].data;
+                assert_eq!((&*cell.get()).blocks[0].data, data);
+            });
+            OLD_ARENA.with(|cell| unsafe {
+                assert!((*cell.0.get()).blocks.is_empty());
+                let arena = &*cell.get();
+                assert_eq!(arena.blocks.len(), 1);
+                assert_eq!(arena.blocks.capacity(), 1);
+                assert!(arena.blocks[0].data.is_null());
+                assert_eq!(arena.blocks[0].size, 0);
+            });
+        })
+        .join()
+        .expect("const-initialized arenas must still tear down cleanly");
+    }
+}

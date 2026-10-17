@@ -38,6 +38,17 @@ pub(crate) const INTRINSIC_SERIAL_ASYNC_GENERATOR_FUNCTION: u64 = 4;
 /// object is ever assigned this serial; a class constructor's real
 /// [[Prototype]] lives on the object (dictionary kind: "ask the object").
 pub(crate) const INTRINSIC_SERIAL_CLASS_CONSTRUCTOR_MARKER: u64 = 5;
+/// Runtime prototypes that runtime layout descriptors name
+/// (`runtime_layouts::*_PROTO_FAMILY`).
+pub(crate) const INTRINSIC_SERIAL_URL: u64 = 6;
+pub(crate) const INTRINSIC_SERIAL_READABLE_STATE: u64 = 7;
+pub(crate) const INTRINSIC_SERIAL_WRITABLE_STATE: u64 = 8;
+pub(crate) const INTRINSIC_SERIAL_TIMEOUT: u64 = 9;
+pub(crate) const INTRINSIC_SERIAL_IMMEDIATE: u64 = 10;
+/// `%Array.prototype%`'s named-property holder (`ArrayHeader.named`, born on
+/// `runtime_layouts::ARRAY_PROTOTYPE_NAMED`): its identity word is how an
+/// array read reaches it.
+pub(crate) const INTRINSIC_SERIAL_ARRAY_PROTOTYPE: u64 = 11;
 
 /// Which intrinsic prototype a function BODY's closures inherit from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,6 +197,12 @@ pub(crate) fn is_class_info(info: *const super::JsFunctionInfo) -> bool {
     std::ptr::eq(info, &crate::object::class_value::CLASS_CONSTRUCTOR_INFO)
 }
 
+/// Ordinary bound layout, including inline partial arguments.
+#[inline(always)]
+pub(crate) fn function_bound_shape() -> u32 {
+    base_slot(7)
+}
+
 /// The ShapeId a fresh closure of the body `info` describes is born with.
 #[inline]
 pub(crate) fn birth_shape_for_body(info: *const super::JsFunctionInfo) -> u32 {
@@ -231,6 +248,26 @@ pub(crate) unsafe fn closure_on_base_shape(closure: *const ClosureHeader) -> boo
     // so the info-pointer compare (a link-time constant, no thread-local
     // read) excludes it for free on this hot path.
     id != function_dictionary_shape() && !is_class_info((*closure).info)
+}
+
+/// Is `closure` on a described Function shape of a plain function body: its
+/// own properties are its bag plus the synthesized intrinsic ones, and its
+/// [[Prototype]] is `%Function.prototype%`? Not FunctionDictionary, a class
+/// constructor, a bound function or method (whose reads have their own
+/// dispatch), or an async or generator body (another intrinsic prototype).
+///
+/// # Safety
+/// `closure` is a proven, live closure cell.
+#[inline(always)]
+pub(crate) unsafe fn closure_on_plain_function_shape(closure: *const ClosureHeader) -> bool {
+    let info = (*closure).info;
+    if info.is_null() || (*closure).shape_id == function_dictionary_shape() || is_class_info(info) {
+        return false;
+    }
+    let code = (*info).code;
+    code != super::BOUND_FUNCTION_FUNC_PTR
+        && code != super::BOUND_METHOD_FUNC_PTR
+        && (*info).flags & (super::FN_ASYNC | super::FN_GENERATOR | super::FN_ASYNC_GENERATOR) == 0
 }
 
 /// Record that `closure` now answers something its base shape does not:
@@ -528,11 +565,13 @@ unsafe fn prototype_slot_of_shape(closure: *const ClosureHeader, id: u32) -> u32
         b"prototype",
     ) {
         None => PROTOTYPE_SLOT_ABSENT,
-        Some(index)
-            if (index as u32) < descriptor.live_inline_slot_count
-                && !crate::object::key_attrs::key_is_accessor_at(keys, index as u32) =>
-        {
-            index as u32
+        Some(index) if !crate::object::key_attrs::key_is_accessor_at(keys, index as u32) => {
+            let slot = crate::object::key_attrs::key_storage_slot(keys, index as u32);
+            if slot < descriptor.live_inline_slot_count {
+                slot
+            } else {
+                PROTOTYPE_SLOT_UNKNOWN
+            }
         }
         Some(_) => PROTOTYPE_SLOT_UNKNOWN,
     }
@@ -832,8 +871,8 @@ mod tests {
         );
         assert_eq!(
             unsafe { (*(b as *const ClosureHeader)).capture_count },
-            5,
-            "target, this, partial args, name snapshot, bound length"
+            6,
+            "target, this, argument count, name snapshot, bound length, inline argument"
         );
         // The bound call still sees target + partial args + call args.
         let r = crate::closure::js_closure_call2(

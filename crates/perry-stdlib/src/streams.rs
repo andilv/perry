@@ -338,6 +338,8 @@ unsafe fn settle_stream_action_promise(promise: *mut Promise, actions: &[*mut Pr
 
 mod byob;
 mod expando;
+mod native_properties;
+pub(crate) use native_properties::{native_property_bag, set_native_property_bag};
 mod gc;
 mod idalloc;
 mod native;
@@ -426,6 +428,7 @@ enum WritableState {
 }
 
 struct ReadableStreamData {
+    props: perry_ffi::NativePropertyBag,
     native_source: Option<native::NativeSource>,
     tee_cancel_promise: Option<*mut Promise>,
     body_consumer: Option<native::BodyConsumer>,
@@ -486,6 +489,7 @@ impl ReadableStreamData {
 
 #[allow(dead_code)]
 struct WritableStreamData {
+    props: perry_ffi::NativePropertyBag,
     state: WritableState,
     write_cb: i64,
     close_cb: i64,
@@ -512,6 +516,7 @@ struct WritableStreamData {
 }
 
 struct TransformStreamData {
+    props: perry_ffi::NativePropertyBag,
     readable_handle: usize,
     writable_handle: usize,
     transform_cb: i64,
@@ -542,6 +547,7 @@ enum NativeTransformKind {
 }
 
 struct ReaderData {
+    props: perry_ffi::NativePropertyBag,
     stream_handle: usize,
     locked: bool,
     closed_promise: *mut Promise,
@@ -552,6 +558,7 @@ struct ReaderData {
 }
 
 struct WriterData {
+    props: perry_ffi::NativePropertyBag,
     stream_handle: usize,
     locked: bool,
     closed_promise: *mut Promise,
@@ -575,7 +582,7 @@ pub(crate) const STREAM_HANDLE_ID_END: usize = perry_runtime::value::addr_class:
 /// `typeof 1048576` cannot depend on whether stream 0x100000 is live.
 #[inline]
 pub(crate) fn stream_value(id: usize) -> f64 {
-    perry_runtime::value::js_nanbox_pointer(id as i64)
+    perry_runtime::value::js_nanbox_handle(id as i64)
 }
 
 /// True for a JS object (a heap `POINTER_TAG` value), false for a stream
@@ -857,32 +864,8 @@ unsafe fn stream_object_closure(object: f64, name: &[u8]) -> i64 {
 }
 
 unsafe fn build_iter_result(value_bits: u64, done: bool) -> u64 {
-    let scope = perry_runtime::gc::RuntimeHandleScope::new();
-    let value = scope.root_nanbox_u64(value_bits);
-    let obj = scope.root_raw_mut_ptr(js_object_alloc(0, 2));
-    let keys = scope.root_raw_mut_ptr(js_array_alloc(2));
-    let k_done = scope.root_string_ptr(js_string_from_bytes(b"done".as_ptr(), 4));
-    let k_value = scope.root_string_ptr(js_string_from_bytes(b"value".as_ptr(), 5));
-    keys.set_raw_mut_ptr(js_array_push(
-        keys.get_raw_mut_ptr(),
-        JSValue::string_ptr(k_done.get_raw_mut_ptr()),
-    ));
-    keys.set_raw_mut_ptr(js_array_push(
-        keys.get_raw_mut_ptr(),
-        JSValue::string_ptr(k_value.get_raw_mut_ptr()),
-    ));
-    js_object_set_field(
-        obj.get_raw_mut_ptr(),
-        0,
-        JSValue::from_bits(if done { TAG_TRUE } else { TAG_FALSE }),
-    );
-    js_object_set_field(
-        obj.get_raw_mut_ptr(),
-        1,
-        JSValue::from_bits(value.get_nanbox_u64()),
-    );
-    js_object_set_keys(obj.get_raw_mut_ptr(), keys.get_raw_mut_ptr());
-    JSValue::object_ptr(obj.get_raw_mut_ptr() as *mut u8).bits()
+    perry_runtime::iter_result::make_sqlite_iter_result(JSValue::from_bits(value_bits), done)
+        .to_bits()
 }
 
 pub(crate) unsafe fn alloc_uint8array_from_bytes(bytes: &[u8]) -> u64 {
@@ -1020,6 +1003,7 @@ fn alloc_readable_with_strategy(
     READABLE_STREAMS.lock().unwrap().insert(
         id,
         ReadableStreamData {
+            props: Default::default(),
             native_source: None,
             tee_cancel_promise: None,
             body_consumer: None,
@@ -1080,6 +1064,7 @@ fn alloc_writable_with_strategy(
     WRITABLE_STREAMS.lock().unwrap().insert(
         id,
         WritableStreamData {
+            props: Default::default(),
             state: WritableState::Writable,
             write_cb,
             close_cb,
@@ -1584,6 +1569,7 @@ pub unsafe extern "C" fn js_readable_stream_get_reader_with_options(
             READERS.lock().unwrap().insert(
                 reader_id,
                 ReaderData {
+                    props: Default::default(),
                     stream_handle: id,
                     locked: true,
                     closed_promise: closed_p,

@@ -917,7 +917,7 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 .split_once(char::is_whitespace)
                 .unwrap_or((trailing_attr, ""));
             let (kind, value) = match attr {
-                "nounwind" | "willreturn" => (attr, 0),
+                "nounwind" | "willreturn" | "noinline" => (attr, 0),
                 "memory(none)" => ("memory", 0),
                 _ => break,
             };
@@ -1442,6 +1442,23 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 }
                 self.def(dst, out)
             }
+            I::Freeze { dst, ty, a } => {
+                let t = basic_type(self.ctx, ty)?;
+                let av = self.val(t, a)?;
+                let name = std::ffi::CString::new(dst.trim_start_matches('%'))?;
+                // SAFETY: the builder is positioned in this function's block
+                // and `av` is a value of the same context.
+                let raw = unsafe {
+                    llvm_sys::core::LLVMBuildFreeze(
+                        self.builder.as_mut_ptr(),
+                        inkwell::values::AsValueRef::as_value_ref(&av),
+                        name.as_ptr(),
+                    )
+                };
+                // SAFETY: freeze returns a first-class value of `av`'s type.
+                let out = unsafe { BasicValueEnum::new(raw) };
+                self.def(dst, out)
+            }
             // #10779: `ty` was hardcoded `"double"` here and in `inst.rs`.
             // Kept on one line: this file sits against the 2000-line gate.
             #[rustfmt::skip]
@@ -1531,6 +1548,17 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                                 llvm_sys::core::LLVMSetOrdering(
                                     i.as_value_ref(),
                                     llvm_sys::LLVMAtomicOrdering::LLVMAtomicOrderingMonotonic,
+                                )
+                            };
+                            let _ = i.set_alignment(*n);
+                        }
+                    }
+                    LF::AtomicUnordered(n) => {
+                        if let Some(i) = v.as_instruction_value() {
+                            unsafe {
+                                llvm_sys::core::LLVMSetOrdering(
+                                    i.as_value_ref(),
+                                    llvm_sys::LLVMAtomicOrdering::LLVMAtomicOrderingUnordered,
                                 )
                             };
                             let _ = i.set_alignment(*n);
@@ -1693,6 +1721,7 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 args,
                 cconv,
                 gc_leaf,
+                no_inline,
             } => {
                 let mut argv: Vec<BasicMetadataValueEnum> = Vec::with_capacity(args.len());
                 let mut argtys: Vec<inkwell::types::BasicMetadataTypeEnum> =
@@ -1730,6 +1759,13 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                     // Closed dialect: an unknown token is a construction bug,
                     // not something to normalize away silently.
                     Some(cc) => bail!("unknown calling-convention token `{cc}`"),
+                }
+                if *no_inline {
+                    let id = inkwell::attributes::Attribute::get_named_enum_kind_id("noinline");
+                    site.add_attribute(
+                        inkwell::attributes::AttributeLoc::Function,
+                        self.ctx.create_enum_attribute(id, 0),
+                    );
                 }
                 if *gc_leaf {
                     site.add_attribute(

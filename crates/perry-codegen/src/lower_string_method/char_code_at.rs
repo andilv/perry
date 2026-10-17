@@ -1,4 +1,4 @@
-//! Inline `charCodeAt` on an ASCII heap string (#7592).
+//! Inline `charCodeAt` and `charAt` on an ASCII string (#7592).
 //!
 //! Split out of `lower_string_method.rs` to stay under the repo's
 //! 2000-line-per-file lint cap. Pure code move plus the `pub(super)`
@@ -36,14 +36,14 @@ const SHORT_STRING_HIGH_BITS: &str = "551911719040"; // 0x80_8080_8080
 /// #7592 — the FNV-1a phase of `json_pipeline` spent 85% of its leaf profile
 /// in four opaque runtime calls per character over a 68 MB string:
 /// `js_string_char_code_at` (31.5%), `js_dynamic_bitxor` (31.0%),
-/// `js_string_index_to_i32` (13.1%) and `js_get_string_pointer_unified`
+/// `js_string_number_index_to_i32` (13.1%) and `js_get_string_pointer_unified`
 /// (9.0%). Only 15% was the JS loop. The individual helpers are each a
 /// handful of instructions; the cost is the FFI boundary itself, and — worse
 /// — an opaque call on the loop's critical path blocks LICM, so the
 /// loop-invariant receiver unbox and header loads could never be hoisted.
 ///
 /// The guard chain reproduces exactly what `js_string_char_code_at` +
-/// `js_string_index_to_i32` would compute, and anything it cannot prove
+/// `js_string_number_index_to_i32` would compute, and anything it cannot prove
 /// branches to those same two calls:
 /// * `STRING_TAG` receiver — a lying `string` annotation or `undefined`
 ///   take the slow arm, which still routes through
@@ -53,8 +53,8 @@ const SHORT_STRING_HIGH_BITS: &str = "551911719040"; // 0x80_8080_8080
 /// * handle ≥ 4096 — the runtime's `is_valid_string_ptr` magnitude check;
 /// * `0.0 <= index < 2^31-1` — ORDERED comparisons, so a NaN-boxed index
 ///   (a string, a bool, `undefined`, or a genuine NaN) fails both and takes
-///   the slow arm, where `js_string_index_to_i32` performs the full
-///   `ToIntegerOrInfinity` including user `valueOf`. Also makes the
+///   the slow arm, where `js_string_number_index_to_i32` saturates the
+///   already-coerced number without invoking user code. Also makes the
 ///   subsequent `fptosi` in-range, so it can never be poison;
 /// * `utf16_len == byte_len` — the runtime's own `is_ascii_string`
 ///   predicate. Equality implies every byte is one UTF-16 code unit, i.e.
@@ -78,6 +78,89 @@ pub(super) fn lower_char_code_at_inline(
     recv_box: &str,
     idx_d: &str,
 ) -> Option<String> {
+    lower_inline(ctx, object, recv_box, idx_d, None, Op::CharCodeAt)
+}
+
+/// Which character read the inline body answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Op {
+    /// The byte as a number; an out-of-range index is `NaN`.
+    CharCodeAt,
+    /// The byte's one-character string: the runtime's image string
+    /// `PERRY_ASCII_CHARS[byte]` (the agent's atom of that text, the same
+    /// pointer `js_string_char_at` returns), STRING-tagged. An out-of-range
+    /// index takes the entry, which returns `""`.
+    CharAt,
+}
+
+/// `s.charAt(i)` through its entry (#11915), inline on an ASCII receiver:
+/// the same guards and proof as [`lower_char_code_at_inline_entry`], with
+/// the byte turned into its canonical one-character string by one load from
+/// the runtime's static table. No call, allocation or thread-local access.
+pub(super) fn lower_char_at_inline_entry(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    recv_box: &str,
+    idx_d: &str,
+    entry: &str,
+    args: &[String],
+    prove_here: bool,
+) -> Option<String> {
+    lower_inline(
+        ctx,
+        object,
+        recv_box,
+        idx_d,
+        Some((entry, args, prove_here)),
+        Op::CharAt,
+    )
+}
+
+/// The STRING-tagged canonical one-character string of the ASCII `byte_i64`.
+fn ascii_char_value(ctx: &mut FnCtx<'_>, byte_i64: &str) -> String {
+    let slot = ctx.block().gep_inbounds(
+        crate::types::PTR,
+        "@PERRY_ASCII_CHARS",
+        &[(I64, byte_i64)],
+    );
+    let string = ctx.block().load(crate::types::PTR, &slot);
+    let handle = ctx.block().ptrtoint(&string, I64);
+    crate::expr::nanbox_string_inline(ctx.block(), &handle)
+}
+
+/// [`lower_char_code_at_inline`] proving `Pristine(String)` (#11915): the
+/// byte joins the index test every inline arm (heap, SSO, out-of-bounds) is
+/// dominated by, so a modified prototype reaches only the slow arm — which
+/// is the checked entry `entry(recv, args…)`, replacing the unbox, index
+/// coercion and decoder calls it had.
+pub(super) fn lower_char_code_at_inline_entry(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    recv_box: &str,
+    idx_d: &str,
+    entry: &str,
+    args: &[String],
+    prove_here: bool,
+) -> Option<String> {
+    lower_inline(
+        ctx,
+        object,
+        recv_box,
+        idx_d,
+        Some((entry, args, prove_here)),
+        Op::CharCodeAt,
+    )
+}
+
+fn lower_inline(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    recv_box: &str,
+    idx_d: &str,
+    entry: Option<(&str, &[String], bool)>,
+    op: Op,
+) -> Option<String> {
+    debug_assert!(op == Op::CharCodeAt || entry.is_some());
     use crate::nanbox::POINTER_MASK_I64;
     if !crate::expr::static_string_lowering_enabled() {
         return None;
@@ -89,7 +172,27 @@ pub(super) fn lower_char_code_at_inline(
         .block()
         .icmp_eq(I64, &tag, crate::nanbox::STRING_TAG_TOP16_I64);
     let handle = ctx.block().and(I64, &bits, POINTER_MASK_I64);
+    // #11915 / object model step 3: with `prove_here`, both inline arms also
+    // prove `Pristine(String)` — the shadow bit of the agent's
+    // `%String.prototype%` (`builtin_proto::emit_patched_test`), tested once
+    // here. A modified prototype reaches only the slow arm, the checked
+    // entry. With `prove_here == false` the caller proved it before the
+    // arguments and the slow arm is the unchecked body.
+    let prove_here = matches!(entry, Some((_, _, true)));
+    let string_pristine = if prove_here {
+        let patched = crate::builtin_proto::emit_patched_test(
+            ctx,
+            crate::builtin_proto::BuiltinProto::String,
+        );
+        Some(ctx.block().xor(I1, &patched, "true"))
+    } else {
+        None
+    };
     let handle_ok = ctx.block().icmp_uge(I64, &handle, "4096");
+    let handle_ok = match &string_pristine {
+        Some(p) => ctx.block().and(I1, &handle_ok, p),
+        None => handle_ok,
+    };
     let idx_ge0 = ctx.block().fcmp("oge", idx_d, "0.0");
     let idx_lt_max = ctx
         .block()
@@ -129,6 +232,10 @@ pub(super) fn lower_char_code_at_inline(
         .block()
         .icmp_eq(I64, &tag, crate::nanbox::SHORT_STRING_TAG_TOP16_I64);
     let sso_ok = ctx.block().and(I1, &is_sso, &idx_ok);
+    let sso_ok = match &string_pristine {
+        Some(pristine) => ctx.block().and(I1, &sso_ok, pristine),
+        None => sso_ok,
+    };
     ctx.block().cond_br(&sso_ok, &sso_label, &slow_label);
 
     // Dominated by the index range test, so `fptosi` is in range.
@@ -145,15 +252,23 @@ pub(super) fn lower_char_code_at_inline(
     ctx.block()
         .cond_br(&sso_ascii, &sso_bounds_label, &slow_label);
     ctx.current_block = sso_bounds_idx;
+    let sso_oob_label = if op == Op::CharAt {
+        &slow_label
+    } else {
+        &oob_label
+    };
     ctx.block()
-        .cond_br(&sso_in_bounds, &sso_fast_label, &oob_label);
+        .cond_br(&sso_in_bounds, &sso_fast_label, sso_oob_label);
 
     // `index < len <= 5`, so the shift is at most 32.
     ctx.current_block = sso_fast_idx;
     let sso_shift = ctx.block().shl(I64, &sso_idx_i64, "3");
     let sso_word = ctx.block().lshr(I64, &bits, &sso_shift);
     let sso_byte = ctx.block().and(I64, &sso_word, "255");
-    let sso_val = ctx.block().uitofp(I64, &sso_byte, DOUBLE);
+    let sso_val = match op {
+        Op::CharCodeAt => ctx.block().uitofp(I64, &sso_byte, DOUBLE),
+        Op::CharAt => ascii_char_value(ctx, &sso_byte),
+    };
     let sso_pred = ctx.block().label.clone();
     ctx.block().br(&merge_label);
 
@@ -188,7 +303,12 @@ pub(super) fn lower_char_code_at_inline(
     let in_bounds = ctx.block().icmp_ult(I32, &idx_i32, &utf16_len);
     ctx.block().cond_br(&is_ascii, &bounds_label, &slow_label);
     ctx.current_block = bounds_idx;
-    ctx.block().cond_br(&in_bounds, &fast_label, &oob_label);
+    let oob_target = if op == Op::CharAt {
+        &slow_label
+    } else {
+        &oob_label
+    };
+    ctx.block().cond_br(&in_bounds, &fast_label, oob_target);
 
     // Fast block: one byte load, zero calls.
     ctx.current_block = fast_idx;
@@ -200,7 +320,13 @@ pub(super) fn lower_char_code_at_inline(
         .block()
         .gep_inbounds(crate::types::I8, &data_ptr, &[(I64, &idx_i64)]);
     let byte = ctx.block().load(crate::types::I8, &char_ptr);
-    let fast_val = ctx.block().uitofp(crate::types::I8, &byte, DOUBLE);
+    let fast_val = match op {
+        Op::CharCodeAt => ctx.block().uitofp(crate::types::I8, &byte, DOUBLE),
+        Op::CharAt => {
+            let byte_i64 = ctx.block().zext(crate::types::I8, &byte, I64);
+            ascii_char_value(ctx, &byte_i64)
+        }
+    };
     let fast_pred = ctx.block().label.clone();
     ctx.block().br(&merge_label);
 
@@ -211,25 +337,34 @@ pub(super) fn lower_char_code_at_inline(
 
     // Slow block: coercing indices and Unicode keep the existing decoder.
     ctx.current_block = slow_idx;
-    let recv_handle = str_operand_handle_tag_dispatched(ctx, object, recv_box);
-    let slow_idx_i32 = ctx
-        .block()
-        .call(I32, "js_string_index_to_i32", &[(DOUBLE, idx_d)]);
-    let slow_val = ctx.block().call(
-        DOUBLE,
-        "js_string_char_code_at",
-        &[(I64, &recv_handle), (I32, &slow_idx_i32)],
-    );
+    let slow_val = if let Some((entry, args, _)) = entry {
+        let mut operands: Vec<(crate::types::LlvmType, &str)> = vec![(DOUBLE, recv_box)];
+        operands.extend(args.iter().map(|a| (DOUBLE, a.as_str())));
+        ctx.block().call(DOUBLE, entry, &operands)
+    } else {
+        let recv_handle = str_operand_handle_tag_dispatched(ctx, object, recv_box);
+        let slow_idx_i32 =
+            ctx.block()
+                .call(I32, "js_string_number_index_to_i32", &[(DOUBLE, idx_d)]);
+        ctx.block().call(
+            DOUBLE,
+            "js_string_char_code_at",
+            &[(I64, &recv_handle), (I32, &slow_idx_i32)],
+        )
+    };
     let slow_pred = ctx.block().label.clone();
     ctx.block().br(&merge_label);
 
     ctx.current_block = merge_idx;
+    let nan = crate::nanbox::double_literal(f64::NAN);
+    // `charAt` sends an out-of-range index to the entry, so its oob block is
+    // unreachable; it still branches here and needs its incoming value.
     Some(ctx.block().phi(
         DOUBLE,
         &[
             (&fast_val, &fast_pred),
             (&sso_val, &sso_pred),
-            (&crate::nanbox::double_literal(f64::NAN), &oob_pred),
+            (&nan, &oob_pred),
             (&slow_val, &slow_pred),
         ],
     ))

@@ -38,7 +38,7 @@ use perry_runtime::object::{
     js_object_alloc_with_shape, js_object_get_field_by_name_f64, js_object_set_field, ObjectHeader,
 };
 use perry_runtime::string::{js_string_from_bytes, StringHeader};
-use perry_runtime::value::{js_jsvalue_to_string, js_nanbox_pointer, JSValue};
+use perry_runtime::value::{js_jsvalue_to_string, JSValue};
 
 /// Singleton handle for the legacy stdin-backed readline interface.
 const STDIN_READLINE_HANDLE: i64 = 1;
@@ -1006,16 +1006,9 @@ const READLINE_ITER_SHAPE_ID: u32 = 0x7FFF_FF4B;
 
 /// Build a `{ value, done }` iterator-result object.
 fn iter_result(value: f64, done: bool) -> f64 {
-    let packed = b"value\0done\0";
-    let obj = js_object_alloc_with_shape(
-        READLINE_ITER_SHAPE_ID,
-        2,
-        packed.as_ptr(),
-        packed.len() as u32,
-    );
-    js_object_set_field(obj, 0, JSValue::from_bits(value.to_bits()));
-    js_object_set_field(obj, 1, JSValue::bool(done));
-    f64::from_bits(JSValue::pointer(obj as *const u8).bits())
+    unsafe {
+        perry_runtime::iter_result::make_iter_result(JSValue::from_bits(value.to_bits()), done)
+    }
 }
 
 /// A Promise already resolved with `{ value, done }`.
@@ -1626,8 +1619,11 @@ pub extern "C" fn js_readline_write(handle: i64, chunk: f64) -> f64 {
 pub extern "C" fn js_readline_get_cursor_pos(handle: i64) -> i64 {
     let (cols, rows) =
         with_interface(handle, |state| (state.cursor_cols, state.cursor_rows)).unwrap_or((0, 0));
-    let packed = b"cols\0rows\0";
-    let obj = js_object_alloc_with_shape(0x7FFF_FF49, 2, packed.as_ptr(), packed.len() as u32);
+    let obj = unsafe {
+        perry_runtime::object::runtime_layouts::perry_alloc_runtime_record(std::ptr::addr_of!(
+            perry_runtime::object::runtime_layouts::RECORD_F568_0
+        ))
+    };
     js_object_set_field(obj, 0, JSValue::number(cols as f64));
     js_object_set_field(obj, 1, JSValue::number(rows as f64));
     obj as i64
@@ -1673,7 +1669,7 @@ pub extern "C" fn js_readline_set_raw_mode(enabled: f64) -> f64 {
     // Return a pointer-tagged handle so the chain `process.stdin.setRawMode(true)`
     // could be extended later (Node returns `this`); for now any non-undefined
     // value is fine.
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 /// process.stdin.on(event, callback) — register a callback for raw-mode
@@ -1747,7 +1743,7 @@ pub extern "C" fn js_readline_stdin_remove_listener(
     callback: i64,
 ) -> f64 {
     if event_ptr.is_null() {
-        return js_nanbox_pointer(STDIN_READLINE_HANDLE);
+        return perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE);
     }
     let event = string_header_to_string(event_ptr);
     match event.as_str() {
@@ -1779,13 +1775,13 @@ pub extern "C" fn js_readline_stdin_remove_listener(
         }
         _ => {}
     }
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 #[no_mangle]
 pub extern "C" fn js_readline_stdin_pause() -> f64 {
     STDIN_PAUSED.store(true, Ordering::Release);
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 #[no_mangle]
@@ -1795,13 +1791,13 @@ pub extern "C" fn js_readline_stdin_resume() -> f64 {
         try_register_pump();
         ensure_reader_started();
     }
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 #[no_mangle]
 pub extern "C" fn js_readline_stdin_unref() -> f64 {
     STDIN_REFED.store(false, Ordering::Release);
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 #[no_mangle]
@@ -1809,7 +1805,7 @@ pub extern "C" fn js_readline_stdin_ref() -> f64 {
     if !STDIN_DESTROYED.load(Ordering::Acquire) {
         STDIN_REFED.store(true, Ordering::Release);
     }
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 #[no_mangle]
@@ -1854,7 +1850,7 @@ pub extern "C" fn js_readline_stdin_destroy() -> f64 {
     CLOSE_CALLBACK.with(|cb| *cb.borrow_mut() = None);
     CLOSE_FIRED.with(|f| *f.borrow_mut() = true);
     perry_runtime::os::mark_process_stdin_destroyed();
-    js_nanbox_pointer(STDIN_READLINE_HANDLE)
+    perry_runtime::value::js_nanbox_handle(STDIN_READLINE_HANDLE)
 }
 
 // ---------------------------------------------------------------------------

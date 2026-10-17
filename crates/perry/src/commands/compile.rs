@@ -21,6 +21,7 @@ mod build_cache;
 mod bundle_apple;
 mod bundle_ios;
 mod bundle_macos;
+mod compile_env;
 mod defines;
 pub(crate) mod sync_program;
 // `pub(crate)` so `commands::deps` can reuse `cjs_wrap::detect`'s
@@ -33,6 +34,7 @@ mod collect_modules_helpers;
 mod compressed_libs;
 mod embed;
 mod env_fold;
+mod fn_infer;
 mod geisterhand;
 mod harmonyos_shim;
 mod host_config;
@@ -50,6 +52,7 @@ mod output_path;
 mod parse_cache;
 mod post_link;
 mod precompile_capture;
+mod program_facts;
 mod reachability;
 mod size_report;
 mod solid_config;
@@ -91,11 +94,10 @@ use init_order::{classify_eager_modules, topo_sort_non_entry_modules};
 pub use library_search::find_library;
 pub(crate) use library_search::host_target_triple;
 use library_search::{
-    build_wasm_host_library, find_harmonyos_sdk, find_lld_link, find_llvm_tool,
-    find_msvc_lib_paths, find_msvc_link_exe, find_perry_windows_sdk, find_runtime_library,
-    find_stdlib_library, find_ui_library, find_wasm_host_library, find_windows_archiver,
-    windows_archiver_command, windows_default_output_extension, windows_pe_subsystem_flag,
-    windows_subsystem_needs_ui,
+    find_harmonyos_sdk, find_lld_link, find_llvm_tool, find_msvc_lib_paths, find_msvc_link_exe,
+    find_perry_windows_sdk, find_runtime_library, find_stdlib_library, find_ui_library,
+    find_wasm_host_library, find_windows_archiver, windows_archiver_command,
+    windows_default_output_extension, windows_pe_subsystem_flag, windows_subsystem_needs_ui,
 };
 use link::{build_and_run_link, write_link_cache_manifest};
 pub use lock_scan::collect_native_archives_for_lock;

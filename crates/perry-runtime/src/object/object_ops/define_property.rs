@@ -5,16 +5,9 @@ use super::*;
 /// small registry id (zlib stream, fetch Request/Response/Headers/Blob, crypto
 /// hash, …), not a heap `ObjectHeader`.
 ///
-/// Handles get their arbitrary own-property storage from the
-/// `handle_expando` side table — the same one a plain `handle.foo = v` write
-/// lands in (perry-stdlib's `js_handle_property_set_dispatch` falls back to it
-/// once every typed setter has passed). This ROUTES the descriptor there rather
-/// than merely tolerating the call: the value round-trips through `handle.key`,
-/// the `writable`/`enumerable`/`configurable` bits and any `get`/`set` pair are
-/// recorded in the ordinary descriptor side tables (keyed by the handle id), and
-/// `getOwnPropertyDescriptor` / `Object.keys` / `delete` read them back. A
-/// define that returned `true` and dropped the property would be the same silent
-/// no-op the throw replaced.
+/// The existing native payload owns an ordinary property bag. Data and
+/// accessors use its slots, and attributes use its shape. Assignment,
+/// descriptor queries, enumeration and deletion all route through that bag.
 ///
 /// The caller has already established that `hid` is in the handle band and that
 /// the receiver is not a Proxy (proxies are handle-band ids too, and are routed
@@ -33,9 +26,8 @@ unsafe fn define_property_on_handle(
     };
     use crate::object::handle_expando as hx;
 
-    // A Symbol key goes to the symbol side table (`SYMBOL_PROPERTIES`), which is
-    // keyed by the NaN-box payload — a handle id works there unchanged, and it's
-    // the table `handle[sym]` reads back from. String-coercing the symbol would
+    // A Symbol key is an ordinary symbol shape key on the owned bag.
+    // String-coercing the symbol would
     // file the value under a `"Symbol(x)"` STRING name, unreachable by the
     // symbol-keyed reader. (This is the Next.js `PATCHED_SET_HEADER` shape.)
     if crate::symbol::js_is_symbol(key_value) != 0 {
@@ -162,6 +154,8 @@ unsafe fn define_property_on_handle(
 /// Object validates and coerces the key before decoding the descriptor once.
 #[no_mangle]
 pub extern "C" fn js_object_define_property(obj: f64, key: f64, bag: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_value(obj, "Object.defineProperty");
     unsafe {
         if !definition_target_is_object(obj) {
             throw_object_type_error(b"Object.defineProperty called on non-object");
@@ -222,11 +216,7 @@ pub(crate) unsafe fn definition_target_is_object(value: f64) -> bool {
     value_is_object_like(value)
         || super::super::class_ref_id(value).is_some()
         || crate::proxy::js_proxy_is_proxy(value) != 0
-        || {
-            let value = crate::JSValue::from_bits(value.to_bits());
-            value.is_pointer()
-                && crate::value::addr_class::is_small_handle(value.as_pointer::<u8>() as usize)
-        }
+        || crate::JSValue::from_bits(value.to_bits()).is_handle()
 }
 
 /// One decoded [[DefineOwnProperty]] boundary for public entries and forwarding.
@@ -333,13 +323,11 @@ pub(crate) unsafe fn apply_property_descriptor(
         let obj_value_handle = scope.root_nanbox_u64(obj_value.to_bits());
         let key_handle = scope.root_nanbox_f64(key_value);
         let target = crate::JSValue::from_bits(obj_value.to_bits());
-        if target.is_pointer()
-            && crate::value::addr_class::is_small_handle(target.as_pointer::<u8>() as usize)
-        {
+        if target.is_handle() {
             return define_property_on_handle(
                 scope,
                 obj_value,
-                target.as_pointer::<u8>() as i64,
+                target.as_handle() as i64,
                 key_value,
                 descriptor,
             );

@@ -82,9 +82,12 @@ pub(crate) unsafe fn fetch_subclass_handle_id(obj: usize) -> Option<i64> {
     if v.is_undefined() {
         return None;
     }
-    if v.is_pointer() {
-        let id = crate::value::js_nanbox_get_pointer(f64::from_bits(v.bits()));
+    if v.is_handle() {
+        let id = v.as_handle() as i64;
         return crate::value::addr_class::is_fetch_handle_band(id as usize).then_some(id);
+    }
+    if v.is_pointer() {
+        return None;
     }
     let id = f64::from_bits(v.bits());
     if id.is_finite() && id > 0.0 && id.fract() == 0.0 {
@@ -223,11 +226,15 @@ mod exotic_named_read_tests;
 mod field_ops;
 mod for_in_stable;
 mod get_field_by_name;
+mod get_slow;
+pub use get_slow::{
+    js_object_get_field_nonptr, js_object_get_field_slow, js_object_get_field_value,
+    js_object_get_keyed_slow,
+};
 #[cfg(test)]
 mod get_field_by_name_probe_tests;
 mod get_field_by_name_tail;
 pub(crate) mod has_property;
-mod has_property_ic;
 mod ic_miss;
 #[cfg(test)]
 #[path = "field_get_set/ic_miss_array_length_tests.rs"]
@@ -275,13 +282,15 @@ pub(crate) use accessors::{
     accessor_receiver_override_armed, accessor_receiver_override_begin,
     accessor_receiver_override_end, accessor_receiver_override_take,
     array_prototype_property_value, invoke_accessor_getter, invoke_accessor_setter,
-    is_typed_array_prototype, object_accessor_at_with_live, object_field_at_with_live,
-    ordinary_object_prototype_property_value, own_data_field_by_name, own_property_get_by_bytes,
+    is_typed_array_prototype, js_object_get_key_field, object_accessor_at_with_live,
+    object_field_at_with_live, object_key_field_at_with_keys, object_property_at_with_live,
+    ordinary_object_prototype_property_value, own_data_field_by_name,
     primitive_builtin_prototype_property, primitive_object_prototype_accessor,
     primitive_tagged_prototype_property, string_index_value,
 };
 pub use accessors::{
     js_object_get_field, js_object_record_get_by_bytes, js_object_record_set_by_bytes,
+    own_property_get_by_bytes,
 };
 pub(crate) use class_object_props::{
     class_evaluation_prototype_class_id, class_object_default_to_string,
@@ -294,9 +303,9 @@ pub(crate) use crypto_key::{
     CLASS_ID_BOXED_NUMBER, CLASS_ID_BOXED_STRING, CLASS_ID_BOXED_SYMBOL,
 };
 pub(crate) use enumeration::{
-    canonical_array_index, ecma_own_key_order, instance_private_key_hidden,
-    is_internal_runtime_key, is_internal_runtime_key_bytes, keys_contain_array_index,
-    own_key_hidden_bytes, own_keys_may_hide, own_slot_hidden,
+    canonical_array_index, canonical_array_index_bytes, ecma_own_key_order,
+    instance_private_key_hidden, is_internal_runtime_key, is_internal_runtime_key_bytes,
+    keys_contain_array_index, own_key_hidden_bytes, own_keys_may_hide, own_slot_hidden,
 };
 pub use enumeration::{
     js_for_in_keys_value, js_object_entries, js_object_entries_value, js_object_keys,
@@ -318,33 +327,33 @@ pub(crate) use has_property::{
     wide_key_index_lookup, wide_key_index_note_hit, WIDE_KEY_INDEX_MIN_KEYS,
 };
 pub use has_property::{js_in_operator, js_object_has_property};
-pub use has_property_ic::js_in_operator_presence_ic;
+#[cfg(test)]
+pub(crate) use ic_miss::get_field_miss;
 #[cfg(feature = "regex-engine")]
 pub(crate) use ic_miss::intrinsic_private_add;
 #[cfg(feature = "regex-engine")]
 pub(crate) use ic_miss::intrinsic_private_set;
+#[cfg(test)]
+pub(crate) use ic_miss::private_member_access_hints_depth;
 pub(crate) use ic_miss::{
     bind_primitive_proto_method_static, cannot_be_private_member_name, class_evaluation_of,
     current_private_lexical_brand_value, define_static_private_field, is_array_method_value_name,
-    note_private_template_evaluated, private_evaluation_brand_value, private_lexical_brand_pop,
-    private_lexical_brand_push, private_lexical_brand_stack_restore,
-    private_lexical_brand_stack_savepoint, private_member_access_hints_restore,
-    private_member_access_hints_savepoint, private_member_call_by_name, private_member_get_by_name,
-    private_member_set_by_name, scan_private_lexical_brand_roots_mut, set_method_value_name,
-    stamp_private_birth_evaluation_brand, stamp_private_evaluation_brand,
-    take_private_method_call_hint, take_private_method_owner_hint, IntrinsicPrivateReadSite,
-    PrivateHintBrandScope,
+    note_private_template_evaluated, private_evaluation_brand_value,
+    private_lexical_brand_check_marks, private_lexical_brand_pop, private_lexical_brand_push,
+    private_lexical_brand_push_at, private_lexical_brand_unwind_to,
+    private_member_access_hints_check_marks, private_member_access_hints_unwind_to,
+    private_member_call_by_name, private_member_get_by_name, private_member_set_by_name,
+    scan_private_lexical_brand_roots_mut, stamp_private_birth_evaluation_brand,
+    stamp_private_evaluation_brand, take_private_method_call_hint, take_private_method_owner_hint,
+    IntrinsicPrivateReadSite, PrivateHintBrandScope,
 };
 pub use ic_miss::{
     js_class_field_add, js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
-    js_object_get_field_ic, js_object_get_field_ic_miss, js_object_get_field_ic_miss_packed,
     js_object_set_field_by_property_id, js_private_brand_add, js_private_brand_check,
     js_private_field_add, js_private_guard, js_private_guard_site, js_private_method_call,
     js_private_method_guard, PicCache, PicCacheSlot, PIC_CACHE_WORDS,
 };
-// The One Path read, for the class-field read's miss arm
-// (`typed_feedback::guards::js_class_field_get_ic`).
-pub(crate) use ic_miss::{get_field_ic_dispatch, pic_outlined_mru_hit};
+pub(crate) use ic_miss::{private_lexical_brand_depth, private_lexical_brand_truncate};
 // The read path's spill flip, shared with the static-key store IC's ways
 // (`proxy/put_value/packed_set.rs`): one encoding for both compact words.
 pub(crate) use ic_miss::PACKED_SPILL_FLIP;
@@ -354,26 +363,10 @@ pub(crate) use ic_miss::{
     primitive_proto_method_name_static, test_pending_private_access_owner,
     test_push_catch_private_hint,
 };
-/// The one slow exit of the emitted generic property-get tower. Declared here
-/// rather than inside `ic_miss.rs` only because that file sits at the
-/// 2000-line cap; the source lives next to its sibling entries.
-#[path = "field_get_set/ic_miss/ic_slow.rs"]
-mod ic_slow;
 pub(crate) use ic_slot::pic_slot_census;
 pub use ic_slot::{
     pic_arena_bytes, pic_slot_peek, pic_slot_resolve, pic_slot_resolve_init, pic_slots_resolved,
 };
-pub use ic_slow::{js_object_get_field_ic_nonptr, js_object_get_field_ic_slow};
-/// S2 of the deferred-collection RFC: the full-outline read as a GC-leaf hit
-/// plus a collecting miss continuation.
-#[path = "field_get_set/ic_miss/outline_split.rs"]
-mod outline_split;
-pub use outline_split::{js_object_get_field_ic_fast, js_object_get_field_ic_fast_miss};
-/// First-read D3: the megamorphic read confirm, a GC-leaf stub a latched
-/// generic read site calls before the slow entry.
-#[path = "field_get_set/ic_miss/read_confirm.rs"]
-mod read_confirm;
-pub use read_confirm::js_object_get_field_ic_front;
 
 #[cfg(test)]
 mod buffer_ic_miss_tests {
@@ -404,26 +397,22 @@ mod buffer_ic_miss_tests {
         unsafe {
             for len in [16usize, 24, 32] {
                 let buf = secret_buffer(len);
-                let mut cache = [0i64; crate::object::PIC_CACHE_WORDS];
-                let mut cache_slot: crate::object::PicCacheSlot = &mut cache;
-                let ty = js_object_get_field_ic_miss(
+                let ty = crate::object::field_get_set::get_field_miss(
                     buf as *const ObjectHeader,
                     key(b"type"),
-                    &mut cache_slot,
                 );
                 assert_eq!(string_value_bytes(ty), b"secret");
 
-                let size = js_object_get_field_ic_miss(
+                let size = crate::object::field_get_set::get_field_miss(
                     buf as *const ObjectHeader,
                     key(b"symmetricKeySize"),
-                    &mut cache_slot,
                 );
                 assert_eq!(size, len as f64);
 
                 let raw = dispatch_buffer_method(buf as usize, "export", std::ptr::null(), 0);
                 let raw_addr = (raw.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *const ObjectHeader;
                 let raw_len =
-                    js_object_get_field_ic_miss(raw_addr, key(b"length"), &mut cache_slot);
+                    crate::object::field_get_set::get_field_miss(raw_addr, key(b"length"));
                 assert_eq!(raw_len, len as f64);
             }
         }

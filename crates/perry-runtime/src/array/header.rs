@@ -69,47 +69,98 @@ pub(crate) unsafe fn array_object_flags_resolved(arr: *const ArrayHeader) -> u16
 }
 
 /// Whether the resolved live head has the canonical ordinary-Array shape:
-/// `%Array.prototype%` and no own non-index keys or descriptors.
+/// `%Array.prototype%` and no own property beyond its elements.
 ///
-/// This is the runtime spelling of the one-word array admission guards emitted
-/// by codegen: the array's receiver-local shape facts live in `_reserved`, and
-/// both facts that leave the canonical shape are monotone for the allocation.
-/// `OBJ_FLAG_ARRAY_DESCRIPTORS` is armed by every own named/symbol key install;
-/// `GC_ARRAY_CUSTOM_PROTO` is armed when the receiver is re-parented. Keep the
-/// test as one masked load/compare so callers do not rediscover those facts in
-/// the side tables they guard.
+/// Every own property of an array other than its plain elements (a named or
+/// symbol key, an index-key descriptor, a non-writable `length`) lives in its
+/// named layout object (`ArrayHeader.named`, object model §6a), so a null
+/// `named` is the absence proof; `GC_ARRAY_CUSTOM_PROTO` is armed when the
+/// receiver is re-parented.
 ///
 /// # Safety
 ///
 /// `arr` must satisfy [`array_object_flags_resolved`]'s contract.
 #[inline(always)]
 pub(crate) unsafe fn array_has_plain_shape_resolved(arr: *const ArrayHeader) -> bool {
-    const NON_PLAIN_SHAPE: u16 =
-        crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS | crate::gc::GC_ARRAY_CUSTOM_PROTO;
-    array_object_flags_resolved(arr) & NON_PLAIN_SHAPE == 0
+    array_object_flags_resolved(arr) & crate::gc::GC_ARRAY_CUSTOM_PROTO == 0
+        && (*arr).named.is_null()
 }
 
-/// Publish that `owner` gained an own non-index key, moving a real Array off
-/// its canonical shape. The descriptor bit is the existing array-shape fact
-/// used by generated element/method guards; no separate symbol registry fact
-/// is needed on their hit paths.
+/// Does the array own any property beyond its elements? Its named layout
+/// object (`ArrayHeader.named`, §6a) holds every one: named and symbol keys,
+/// index-key descriptors and a non-writable `length`. Resolves a growth alias.
 ///
-/// Arbitrary non-array owners are accepted and ignored. Symbol-property
-/// installation funnels call this before publishing their side-table entry.
+/// `arr` is an array head or a growth alias of one, as for
+/// [`array_object_flags`].
 #[inline]
-pub(crate) fn note_array_own_non_index_key(owner: usize) {
-    let is_array = unsafe { crate::value::addr_class::try_read_gc_header(owner) }
-        .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_ARRAY);
-    if !is_array {
-        return;
+pub(crate) fn array_has_named_layout(arr: *const ArrayHeader) -> bool {
+    let live = clean_arr_ptr(arr);
+    // SAFETY: `clean_arr_ptr` returned the live head or null.
+    !live.is_null() && unsafe { !(*live).named.is_null() }
+}
+
+/// The element-kind fact of an array's layout (object model step 7): do its
+/// elements or `length` carry a descriptor — an accessor or non-default
+/// attributes on an index key, or on `length`? Those live as keys of the
+/// array's named layout object, so the fact is that layout's attribute
+/// summary in its shape record. A layout with only named keys (tsc's
+/// `pos`/`end`, including named accessors) leaves the elements plain. (A sparse index past the
+/// dense part is a default-attribute layout key too; every reader consults it
+/// only at `index >= capacity`, `array_sparse_index_property_get`.) Resolves a
+/// growth alias; `arr` is an array head or a growth alias of one, as for
+/// [`array_object_flags`].
+#[inline]
+pub(crate) fn array_has_element_descriptors(arr: *const ArrayHeader) -> bool {
+    let live = clean_arr_ptr(arr);
+    // SAFETY: `clean_arr_ptr` returned the live head or null.
+    !live.is_null() && unsafe { array_has_element_descriptors_resolved(live) }
+}
+
+/// [`array_has_element_descriptors`] for a head the caller already resolved
+/// (not a growth stub).
+///
+/// # Safety
+/// `live` is a live, non-forwarded `GC_TYPE_ARRAY` head; nothing below
+/// allocates.
+#[inline(always)]
+pub(crate) unsafe fn array_has_element_descriptors_resolved(live: *const ArrayHeader) -> bool {
+    if super::array_iteration_facts() & super::indexing_support::ELEMENT_DESCRIPTORS_REACHABLE == 0
+    {
+        return false;
     }
-    let owner = clean_arr_ptr_mut(owner as *mut ArrayHeader);
-    if owner.is_null() {
-        return;
+    let named = (*live).named;
+    !named.is_null() && named_layout_holds_element_descriptors(named)
+}
+
+unsafe fn named_layout_holds_element_descriptors(
+    named: *const crate::object::ObjectHeader,
+) -> bool {
+    // Once the holder has an overflow it is the key-order authority (object
+    // model step 4): its keys column lists every own key, fixed or not.
+    let table = crate::object::overflow::keys_array(named);
+    if !table.is_null() {
+        return super::named_props::keys_hold_element_descriptors(table, (*table).length);
     }
-    unsafe {
-        let header = (owner as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
-        (*header)._reserved |= crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS;
+    let word = crate::object::layout_desc::layout_id_of_word((*named).parent_class_id);
+    let Some(record) = crate::object::shapes::layout_record(word) else {
+        return true;
+    };
+    match record.element_kind() {
+        0 => false,
+        1 => true,
+        _ => {
+            // This is the named holder's real keys array, not an arbitrary
+            // JS array-like value. ObjectKeys::owned would ask the generic
+            // js_array_length reader (Proxy/string provenance callbacks),
+            // falsely making this read and its numeric guards Reenters.
+            if record.keys() == 0 {
+                return false;
+            }
+            super::named_props::keys_hold_element_descriptors(
+                record.keys() as usize as *const ArrayHeader,
+                record.logical_key_count(),
+            )
+        }
     }
 }
 
@@ -237,7 +288,16 @@ unsafe fn install_template_raw_property(
         "raw".to_string(),
         crate::object::PropertyAttrs::new(false, false, false),
     );
-    cooked
+    // `set_property_attrs` materializes the array's property reserve
+    // (`array_property_bag_ensure` → `materialize_inline`), and that move leaves
+    // a forwarding stub at `cooked`. Return the LIVE head, which is what the
+    // doc above already promises: the caller keys the cooked/raw pair on this
+    // pointer, hands it to the tag, and freezes and caches it, while the read
+    // path (`js_template_raw` → `clean_arr_ptr`) resolves the receiver before
+    // the lookup. A stub key therefore never matches the resolved receiver, and
+    // `strings.raw` came back `undefined` even though the own `raw` property
+    // resolved fine (node-suite `globals/tagged-template-cache-freeze`, #9202).
+    clean_arr_ptr_mut(cooked)
 }
 
 /// Register the (cooked, raw) pair for a tagged-template call. Returns
@@ -359,7 +419,6 @@ pub fn scan_template_raw_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
     });
     // Named properties of arrays that were full when they gained their first
     // one (`array/named_props.rs`, `FULL_ARRAY_NAMED_PROPS`).
-    super::named_props::scan_full_array_named_property_roots_mut(visitor);
 }
 
 /// The payload bytes of a heap string, or `None` for a null pointer.
@@ -425,6 +484,54 @@ pub(crate) fn test_template_raw_roots() -> (usize, usize) {
 #[inline(always)]
 pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
     let bits = arr as u64;
+    // A POINTER_TAG word names a GC-headed object (honest pointers): its
+    // header answers without address admission.
+    if let Some(header) = crate::value::addr_class::pointer_value_header(bits) {
+        let cleaned = (bits & crate::value::POINTER_MASK) as *const ArrayHeader;
+        return unsafe { clean_headed_arr_ptr(cleaned, header) };
+    }
+    // Fast lane for the overwhelmingly common raw receiver: a live plain
+    // array on a page the arena owns. A raw word carries no tag, so page
+    // ownership is its admission; the header's type, forwarding and arena
+    // bits then settle the ordinary case. Every other input (forwarded
+    // stubs, lazy arrays, malloc-backed objects, registered buffers/typed
+    // arrays, inconsistent headers, other tags) takes the one out-of-line
+    // resolver, so the inlined part stays a few instructions per caller.
+    {
+        let addr = bits as usize;
+        if bits >> 48 == 0
+            && crate::value::addr_class::is_above_handle_band(addr)
+            && addr % std::mem::align_of::<crate::gc::GcHeader>() == 0
+            && !matches!(
+                crate::arena::classify_heap_generation(addr),
+                crate::arena::HeapGeneration::Unknown
+            )
+        {
+            // SAFETY: the address is on an arena page this process owns and
+            // is header-aligned; the header word precedes every arena block.
+            let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            let (obj_type, gc_flags) = unsafe { ((*header).obj_type, (*header).gc_flags) };
+            if obj_type == crate::gc::GC_TYPE_ARRAY
+                && gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && gc_flags & crate::gc::GC_FLAG_ARENA != 0
+            {
+                let hdr = unsafe { &*arr };
+                if hdr.length <= hdr.capacity {
+                    return arr;
+                }
+            }
+        }
+    }
+    clean_arr_ptr_resolve(arr)
+}
+
+/// The full [`clean_arr_ptr`] resolver: tag stripping, allocator admission
+/// of raw words, forwarding chains, lazy arrays and the sparse/buffer
+/// exceptions. One out-of-line copy shared by every caller.
+#[cold]
+#[inline(never)]
+fn clean_arr_ptr_resolve(arr: *const ArrayHeader) -> *const ArrayHeader {
+    let bits = arr as u64;
     let top16 = bits >> 48;
     let cleaned = if top16 >= 0x7FF8 {
         if top16 == 0x7FFC || (bits & 0x0000_FFFF_FFFF_FFFF) == 0 {
@@ -440,41 +547,6 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
     // header reads below require allocator ownership as well.
     if !crate::value::addr_class::is_plausible_heap_addr(cleaned as usize) {
         return std::ptr::null();
-    }
-    // Fast lane for the overwhelmingly common receiver: a live plain array on
-    // a page the arena owns. The tracked-header classifier below re-derives
-    // page ownership, type-table membership, size and storage consistency on
-    // every call, and every runtime array entry point (push, pop, length,
-    // some, length assignment, …) funnels through here — it was the largest
-    // runtime leaf on the ECS command path. The cached generation classifier
-    // is the same page-ownership answer the write barrier relies on; with an
-    // in-band, aligned address on an owned page, the header's type, forwarding
-    // and arena bits settle the ordinary case. Forwarded stubs, lazy arrays,
-    // malloc-backed objects, registered buffers/typed arrays and any
-    // inconsistent header keep the full resolver.
-    {
-        let addr = cleaned as usize;
-        if addr >= crate::gc::GC_HEADER_SIZE
-            && addr % std::mem::align_of::<crate::gc::GcHeader>() == 0
-            && !matches!(
-                crate::arena::classify_heap_generation(addr),
-                crate::arena::HeapGeneration::Unknown
-            )
-        {
-            // SAFETY: the address is on an arena page this process owns and
-            // is header-aligned; the header word precedes every arena block.
-            let header = (addr - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-            let (obj_type, gc_flags) = unsafe { ((*header).obj_type, (*header).gc_flags) };
-            if obj_type == crate::gc::GC_TYPE_ARRAY
-                && gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-                && gc_flags & crate::gc::GC_FLAG_ARENA != 0
-            {
-                let hdr = unsafe { &*cleaned };
-                if hdr.length <= hdr.capacity && hdr.length <= 100_000_000 {
-                    return cleaned;
-                }
-            }
-        }
     }
     // Issue #233: follow GC_FLAG_FORWARDED forwarding chains. When
     // an array grows (js_array_grow) we install a forwarding pointer
@@ -615,6 +687,33 @@ pub(crate) fn clean_arr_ptr(arr: *const ArrayHeader) -> *const ArrayHeader {
     cleaned
 }
 
+/// [`clean_arr_ptr`] for an address whose GC header the caller already holds:
+/// a `POINTER_TAG` payload, or an array a runtime structure owns (a shape's
+/// keys array). A live, unforwarded dense array answers from its header;
+/// forwarded, lazy and sparse arrays take the full resolver, and any other
+/// kind is not an array.
+///
+/// # Safety
+/// `header` must be `arr`'s GC header.
+#[inline(always)]
+pub(crate) unsafe fn clean_headed_arr_ptr(
+    arr: *const ArrayHeader,
+    header: &crate::gc::GcHeader,
+) -> *const ArrayHeader {
+    match header.obj_type {
+        crate::gc::GC_TYPE_ARRAY
+            if header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && (*arr).length <= (*arr).capacity =>
+        {
+            arr
+        }
+        crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY => clean_arr_ptr_resolve(arr),
+        // The resolver rejects every tracked non-array; the header is that
+        // proof already.
+        _ => std::ptr::null(),
+    }
+}
+
 #[inline(always)]
 pub(crate) fn clean_arr_ptr_mut(arr: *mut ArrayHeader) -> *mut ArrayHeader {
     clean_arr_ptr(arr as *const ArrayHeader) as *mut ArrayHeader
@@ -737,12 +836,8 @@ pub(crate) fn array_ptr_as_proxy(arr: *const ArrayHeader) -> Option<f64> {
     } else {
         bits
     };
-    if crate::value::addr_class::is_proxy_id_band(raw as usize) {
-        const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-        let boxed = f64::from_bits(POINTER_TAG | raw);
-        if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
-            return Some(boxed);
-        }
+    if crate::value::addr_class::is_proxy_cell(raw as usize) {
+        return Some(f64::from_bits(crate::value::POINTER_TAG | raw));
     }
     None
 }
@@ -861,13 +956,15 @@ pub(crate) fn normalize_array_receiver(arr: *const ArrayHeader) -> *const ArrayH
 }
 
 /// Array header - precedes the elements in memory
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct ArrayHeader {
     /// Number of elements in the array
     pub length: u32,
     /// Available slots from logical element zero to the end of the allocation.
     /// Dense shift advances that start by reducing this value. See storage.rs.
     pub capacity: u32,
+    /// Ordinary own-property layout, independent of the element backing.
+    pub named: *mut crate::object::ObjectHeader,
 }
 
 #[inline]
@@ -901,7 +998,7 @@ pub(crate) fn value_bits_to_number(value_bits: u64) -> Option<f64> {
         return Some((lower as i32) as f64);
     }
     let upper = value_bits >> 48;
-    if (0x7FF9..=0x7FFF).contains(&upper) {
+    if (0x7FF9..=0x7FFF).contains(&upper) || upper == (crate::value::HANDLE_TAG >> 48) {
         return None;
     }
     Some(canonical_raw_f64(f64::from_bits(value_bits)))
@@ -1027,7 +1124,7 @@ pub(super) unsafe fn set_array_raw_f64_layout_flag(arr: *const ArrayHeader) {
     }
 }
 
-#[inline]
+#[inline(always)]
 unsafe fn clear_array_raw_f64_layout_flag(arr: *const ArrayHeader) {
     if let Some(header) = array_gc_header(arr) {
         let raw_bits = crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES;
@@ -1548,7 +1645,7 @@ pub(crate) unsafe fn array_numeric_raw_f64_get(arr: *mut ArrayHeader, index: u32
     }
     // An index converted to an accessor (or given custom attrs) via
     // `Object.defineProperty` must dispatch through the slow path.
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_has_element_descriptors_resolved(arr) {
         return None;
     }
     if index >= (*arr).length {
@@ -1572,7 +1669,7 @@ pub(crate) unsafe fn array_numeric_raw_f64_set_inbounds(
         return false;
     }
     // Accessor setters / non-writable attrs on indices need the slow path.
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_has_element_descriptors_resolved(arr) {
         return false;
     }
     let original_bits = value.to_bits();
@@ -1692,6 +1789,20 @@ pub extern "C" fn js_array_clear_numeric_layout(arr: *mut ArrayHeader) {
     }
 }
 
+/// The first non-Number write into a raw-f64 array whose header the caller
+/// just probed: clear both raw bits in place. Out of line so the common exits
+/// of the note (Number, or bits already clear) keep a frameless prologue.
+///
+/// # Safety
+/// `arr` is a live, non-forwarded `GC_TYPE_ARRAY` head (the caller's probe).
+#[inline(never)]
+unsafe fn demote_probed_raw_f64_array(arr: *mut ArrayHeader) {
+    let header = (arr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
+    (*header)._reserved &=
+        !(crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES);
+    crate::typed_feedback::invalidate_representation_change(arr as usize);
+}
+
 #[no_mangle]
 pub extern "C" fn js_array_note_numeric_write(arr: *mut ArrayHeader, value_bits: u64) {
     // A Number never downgrades the raw-f64 layout: nothing to clear, so do
@@ -1699,20 +1810,29 @@ pub extern "C" fn js_array_note_numeric_write(arr: *mut ArrayHeader, value_bits:
     if value_bits_are_numeric(value_bits) {
         return;
     }
-    // Exact, non-forwarded ordinary Array whose raw-f64 bits are already
-    // clear: the note is a no-op. Answer from the magnitude-checked live
-    // header probe (the same discipline as the generated guards) instead of
-    // the tracked-allocation resolver. Forwarding stubs and every other brand
-    // keep the complete resolver below.
+    // Exact, non-forwarded ordinary Array: the magnitude-checked live header
+    // probe (the same discipline as the generated guards) answers without the
+    // tracked-allocation resolver. Raw bits already clear: the note is a
+    // no-op. Raw bit set: this is the first non-Number write, and clearing the
+    // two bits in the header is the whole demotion. Forwarding stubs and every
+    // other brand keep the complete resolver below.
     let raw_bits = crate::gc::GC_ARRAY_RAW_F64_LAYOUT | crate::gc::GC_ARRAY_RAW_F64_HOLES;
-    let already_clear = unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) }
-        .is_some_and(|header| {
+    let probed = unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) }
+        .filter(|header| {
             header.obj_type == crate::gc::GC_TYPE_ARRAY
                 && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-                && header._reserved & raw_bits == 0
-        });
-    if already_clear {
-        return;
+        })
+        .map(|header| header._reserved & raw_bits != 0);
+    match probed {
+        Some(false) => return,
+        Some(true) => {
+            // SAFETY: the probe just validated this live, non-forwarded
+            // array header; this is the same header store the
+            // resolver path performs once it has returned this head.
+            unsafe { demote_probed_raw_f64_array(arr) };
+            return;
+        }
+        None => {}
     }
     let arr = clean_arr_ptr_mut(arr);
     unsafe {

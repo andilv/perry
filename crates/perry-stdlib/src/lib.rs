@@ -17,6 +17,8 @@
 
 // Anchors are `#[used(compiler)]`: retained by rustc, not ld64 dead-strip roots.
 #![feature(used_with_arg)]
+// `common::wrapper_imports`: weak defaults for the wrapper archives' symbols.
+#![cfg_attr(target_env = "msvc", feature(linkage))]
 // Re-export the updater crate so its #[no_mangle] FFI symbols are
 // retained in libperry_stdlib.a (Cargo would otherwise drop unused
 // rlib deps during the staticlib bundle step).
@@ -168,10 +170,8 @@ pub mod fetch_blob;
 pub use fetch_blob::*;
 
 // === Web Streams API (issue #237) ===
-// Per-binding gate (v0.5.572): `bundled-streams` is the only flag
-// that toggles `pub mod streams`. The well-known flip strips
-// `bundled-streams` to route to perry-ext-streams without
-// duplicate-symbol risk. `http-client` callers still get streams
+// `bundled-streams` is the only flag that toggles `pub mod streams`.
+// `http-client` callers still get streams
 // transitively because the umbrella pulls in `bundled-streams`
 // (declared in this crate's Cargo.toml). Default-on through
 // `default = ["full"]` and through `--features http-client`,
@@ -363,3 +363,6 @@ mod buffer_b1_test_support;
 
 #[cfg(all(test, feature = "compression-gzip"))]
 mod buffer_b1_zlib_tests;
+
+#[cfg(test)]
+mod test_runtime;

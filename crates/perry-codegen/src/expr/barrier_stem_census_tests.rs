@@ -1056,12 +1056,10 @@ fn private_field_set_ir() -> String {
         .expect("LLVM IR should be UTF-8")
 }
 
-/// `class Boxed { v: any; constructor(v) { this.v = v } }` plus an escaping
-/// `new Boxed(1)` — the complete parameter-to-field constructor is what selects
-/// constructor-free prologue stores, and the boxed field requires their
-/// value-and-generation-tested barrier.
+/// A complete five-field boxed constructor exceeds the compact birth budget,
+/// so its direct prologue stores retain the value/generation-tested barrier.
 fn ctor_prologue_ir() -> String {
-    super::class_field_barrier_tests::ir()
+    super::class_field_barrier_tests::wide_prologue_ir()
 }
 
 /// A confined generator binding is a fixed JSValue slot in its private resume
@@ -1449,7 +1447,8 @@ fn generator_fixed_slot_store_uses_the_shared_barrier_operation() {
         "no per-site barrier scaffold"
     );
     assert!(
-        ir.contains("call double @js_object_get_field_ic("),
+        (ir.contains("call double @js_object_get_field_value(")
+            || ir.contains("call double @js_object_get_field_slow(")),
         "generic continuation reads call the complete collecting operation"
     );
     assert!(

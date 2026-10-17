@@ -277,7 +277,8 @@ pub unsafe extern "C" fn js_ext_http_server_dispatch_method(
     let is_h2 = get_handle::<Http2SecureServer>(handle).is_some();
     // Server re-boxed as POINTER_TAG so chained calls (`server.on(...).on(...)`,
     // `server.listen(...).address()`) keep flowing through this same dispatcher.
-    let self_ref = f64::from_bits(POINTER_TAG | (handle as u64 & PTR_MASK));
+    let self_ref =
+        f64::from_bits(perry_ffi::JsValue::from_object_ptr(handle as usize as *mut u8).bits());
 
     match method.as_str() {
         "listen" => {
@@ -672,7 +673,12 @@ pub unsafe extern "C" fn js_ext_http_server_dispatch_property(
                 if server.alpn_callback == 0 {
                     undef
                 } else {
-                    f64::from_bits(POINTER_TAG | (server.alpn_callback as u64 & PTR_MASK))
+                    f64::from_bits(
+                        perry_ffi::JsValue::from_object_ptr(
+                            server.alpn_callback as usize as *mut u8,
+                        )
+                        .bits(),
+                    )
                 }
             })
             .unwrap_or(undef),
@@ -791,7 +797,7 @@ pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_method(
         "unref" => self_ref,
         "getSession" => {
             let buffer = perry_ffi::alloc_buffer(&[]);
-            f64::from_bits(POINTER_TAG | (buffer as u64 & PTR_MASK))
+            f64::from_bits(perry_ffi::JsValue::from_object_ptr(buffer as usize as *mut u8).bits())
         }
         "isSessionReused" => bool_value(false),
         "getPeerCertificate" => json_string_value(
@@ -1258,17 +1264,24 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_property(
 /// `out.constructor.name` reads "ServerResponse"/"IncomingMessage" the way
 /// the corpus outgoing-message tests expect (#4909).
 fn constructor_object(name: &str) -> f64 {
-    let (packed, shape_id) = perry_ffi::build_object_shape(&["name"]);
-    let obj =
-        unsafe { js_object_alloc_with_shape(shape_id, 1, packed.as_ptr(), packed.len() as u32) };
-    if obj.is_null() {
+    let _record_roots = perry_ffi::TransientRootScope::enter();
+    let obj = _record_roots.root_addr(
+        (unsafe {
+            perry_ffi::runtime_layouts::alloc_runtime_record(std::ptr::addr_of!(
+                perry_ffi::runtime_layouts::RECORD_F13_0
+            ))
+        }) as i64,
+    );
+    if (obj.get() as *mut perry_ffi::ObjectHeader).is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
     let value = JsValue::from_string_ptr(alloc_string(name).as_raw());
     unsafe {
-        perry_ffi::js_object_set_field(obj, 0, value);
+        perry_ffi::runtime_layouts::init_runtime_field(&obj, 0, value);
     }
-    f64::from_bits(JsValue::from_object_ptr(obj as *mut u8).bits())
+    f64::from_bits(
+        JsValue::from_object_ptr((obj.get() as *mut perry_ffi::ObjectHeader) as *mut u8).bits(),
+    )
 }
 
 /// Dispatch a property write on a registered server-side `ServerResponse`.
@@ -1405,7 +1418,7 @@ unsafe fn args_slice<'a>(args_ptr: *const f64, args_len: usize) -> &'a [f64] {
 
 #[inline]
 fn handle_to_pointer_f64(handle: i64) -> f64 {
-    f64::from_bits(POINTER_TAG | (handle as u64 & PTR_MASK))
+    f64::from_bits(perry_ffi::JsValue::from_object_ptr(handle as usize as *mut u8).bits())
 }
 
 #[inline]

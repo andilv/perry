@@ -151,6 +151,7 @@ fn own_slot(env: f64, name: &str) -> Option<u32> {
     unsafe {
         let keys = crate::object::object_keys(obj);
         crate::object::keys_find_slot_by_bytes(keys.arr(), keys.count(), name.as_bytes())
+            .map(|position| keys.storage_slot(position))
     }
 }
 
@@ -160,7 +161,7 @@ fn own_value(env: f64, name: &str) -> Option<f64> {
     })
 }
 
-fn env_parent(env: f64) -> Option<f64> {
+pub(crate) fn env_parent(env: f64) -> Option<f64> {
     own_value(env, PARENT_KEY)
 }
 

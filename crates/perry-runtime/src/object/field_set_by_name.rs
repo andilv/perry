@@ -46,6 +46,8 @@ pub extern "C" fn js_object_set_field_by_name(
     key: *const crate::StringHeader,
     value: f64,
 ) {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::generic_store(obj, key, value);
     if !key.is_null() {
         unsafe {
             let bytes = std::slice::from_raw_parts(
@@ -141,14 +143,11 @@ pub extern "C" fn js_object_set_field_by_name(
         } else {
             addr
         };
-        if crate::value::addr_class::is_proxy_id_band(raw_addr as usize) && !key.is_null() {
-            const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-            let boxed = f64::from_bits(POINTER_TAG | (raw_addr & 0x0000_FFFF_FFFF_FFFF));
-            if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
-                let key_f64 = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
-                crate::proxy::js_proxy_set(boxed, key_f64, value);
-                return;
-            }
+        if crate::value::addr_class::is_proxy_cell(raw_addr as usize) && !key.is_null() {
+            let boxed = f64::from_bits(crate::value::POINTER_TAG | raw_addr);
+            let key_f64 = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
+            crate::proxy::js_proxy_set(boxed, key_f64, value);
+            return;
         }
     }
     // FAST LANE (mirror of the read lane in `js_object_get_field_by_name`,
@@ -176,9 +175,18 @@ pub extern "C" fn js_object_set_field_by_name(
         {
             let key_gc =
                 (key as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            // A POINTER_TAG receiver is honest, and its arena flag excludes
+            // the malloc-backed exotics; a raw word needs the page ownership
+            // proof before its header is read.
             if (*key_gc).gc_flags & crate::gc::GC_FLAG_INTERNED != 0
-                && crate::arena::classify_heap_generation(raw)
-                    != crate::arena::HeapGeneration::Unknown
+                && if top16 == 0x7FFD {
+                    (*((raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)).gc_flags
+                        & crate::gc::GC_FLAG_ARENA
+                        != 0
+                } else {
+                    crate::arena::classify_heap_generation(raw)
+                        != crate::arena::HeapGeneration::Unknown
+                }
             {
                 let gc_hdr =
                     (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
@@ -196,14 +204,10 @@ pub extern "C" fn js_object_set_field_by_name(
                     && (*gc_hdr)._reserved & LANE_BLOCKING == 0
                 {
                     let class_id = (*o).class_id;
-                    // #6595: a per-evaluation CLASS OBJECT must never take
-                    // this lane — it skips the #6530
-                    // `mirror_class_object_static_write` hook every in-body
-                    // completion runs, and (template cid, key) plans recorded
-                    // by instances sharing the cid would falsely certify it.
-                    // See the matching gates at the plan record sites.
+                    // Class objects must reach the static-write mirror.
+                    // The receiver ShapeId kind supplies that distinction;
+                    // ordinary function instances need no class identity.
                     if crate::object::object_is_regular(o)
-                        && class_id != 0
                         && class_id != NATIVE_MODULE_CLASS_ID
                         // #9019: reserved-layout iterator receivers must
                         // reach the tail so their floor seed runs before
@@ -214,9 +218,8 @@ pub extern "C" fn js_object_set_field_by_name(
                         // index below the floor.
                         && crate::object::reserved_slot_floor_for_class_id(class_id) == 0
                         && super::prop_plan::store_plan_check(
-                            class_id,
+                            super::shapes::object_shape_stamp(o),
                             key as usize,
-                            super::prop_plan::receiver_proto_bits(o),
                         )
                     {
                         let prev_shape_id = super::shapes::object_shape_stamp(o);
@@ -258,10 +261,7 @@ pub extern "C" fn js_object_set_field_by_name(
                                 }
                                 // #8113: one bound probe, reused.
                                 let live_slots = crate::object::object_live_slot_count(o);
-                                let alloc_limit = std::cmp::max(
-                                    live_slots,
-                                    crate::object::INLINE_SLOT_FLOOR as u32,
-                                ) as usize;
+                                let alloc_limit = crate::object::object_inline_capacity(o) as usize;
                                 if (slot_idx as usize) < alloc_limit {
                                     if slot_idx >= live_slots {
                                         set_object_live_slot_count(o, slot_idx + 1);
@@ -449,30 +449,40 @@ pub extern "C" fn js_object_set_field_by_name(
                     let name_ptr =
                         (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                     let name_len = (*key).byte_len as usize;
-                    let name = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len))
-                        .unwrap_or("")
-                        .to_string();
+                    // Keep the key alive independently of the StringHeader:
+                    // class accessor lookup and prototype materialization can
+                    // allocate and move the original JS string.
+                    let name_storage = std::slice::from_raw_parts(name_ptr, name_len).to_vec();
+                    let name = name_storage.as_slice();
+                    let name_str = std::str::from_utf8(name).ok();
                     let recv = crate::object::class_value::boxed_class_word(bits);
                     let is_prototype_ref = super::class_prototype_ref_id(recv).is_some();
                     if is_prototype_ref {
-                        super::class_registry::class_prototype_set(class_id, name, value.to_bits());
+                        super::class_registry::class_prototype_set_bytes(
+                            class_id,
+                            name,
+                            value.to_bits(),
+                        );
                         return;
                     }
                     if !is_prototype_ref
-                        && name == "name"
-                        && !super::class_registry::class_static_key_deleted(class_id, &name)
-                        && super::class_registry::lookup_static_method_in_chain(class_id, &name)
-                            .is_none()
-                        && super::class_registry::class_static_defined_attrs(class_id, &name)
+                        && name_str == Some("name")
+                        && !super::class_registry::class_static_key_deleted_bytes(class_id, name)
+                        && super::class_registry::lookup_static_method_in_chain_bytes(
+                            class_id, name,
+                        )
+                        .is_none()
+                        && super::class_registry::class_static_defined_attrs_bytes(class_id, name)
                             .is_none_or(|(writable, _, _)| !writable)
                     {
                         return;
                     }
                     let has_own_data =
-                        crate::object::class_value::class_static_get(class_id, &name).is_some();
+                        crate::object::class_value::class_static_get_bytes(class_id, name)
+                            .is_some();
                     if !has_own_data
-                        && super::class_registry::class_static_accessor_setter_apply(
-                            class_id, &name, recv, value,
+                        && super::class_registry::class_static_accessor_setter_apply_bytes(
+                            class_id, name, recv, value,
                         )
                     {
                         return;
@@ -482,7 +492,7 @@ pub extern "C" fn js_object_set_field_by_name(
                     // from Function.prototype. Prototype refs are plain objects.
                     if !is_prototype_ref
                         && !has_own_data
-                        && matches!(name.as_str(), "caller" | "arguments")
+                        && matches!(name_str, Some("caller" | "arguments"))
                     {
                         crate::fs::validate::throw_type_error_with_code(
                             "Restricted function property access",
@@ -493,13 +503,21 @@ pub extern "C" fn js_object_set_field_by_name(
                         // A read-only own static (defineProperty writable:false):
                         // strict-mode [[Set]] throws; the value stays.
                         if has_own_data
-                            && super::class_registry::class_static_defined_attrs(class_id, &name)
-                                .is_some_and(|(writable, _, _)| !writable)
+                            && super::class_registry::class_static_defined_attrs_bytes(
+                                class_id, name,
+                            )
+                            .is_some_and(|(writable, _, _)| !writable)
                         {
-                            let message = format!(
-                                "Cannot assign to read only property '{name}' of function '{}'",
-                                super::class_registry::class_ref_to_string(class_id)
-                            );
+                            let class_name = super::class_registry::class_ref_to_string(class_id);
+                            let message = if let Some(name) = name_str {
+                                format!(
+                                    "Cannot assign to read only property '{name}' of function '{class_name}'"
+                                )
+                            } else {
+                                format!(
+                                    "Cannot assign to read only property of function '{class_name}'"
+                                )
+                            };
                             crate::node_submodules::diagnostics::throw_type_error_no_code(
                                 message.as_bytes(),
                             );
@@ -508,7 +526,13 @@ pub extern "C" fn js_object_set_field_by_name(
                         // property dispatch and the LLVM global used by direct
                         // `C.name` reads. Keep both coherent for every runtime
                         // spelling, including a genuinely dynamic `C[key]`.
-                        class_ref_dynamic_prop_root_store(class_id, &name, value);
+                        if let Some(name) = name_str {
+                            class_ref_dynamic_prop_root_store(class_id, name, value);
+                        } else {
+                            crate::object::class_value::class_static_set_bytes(
+                                class_id, name, value,
+                            );
+                        }
                     }
                 }
                 return;

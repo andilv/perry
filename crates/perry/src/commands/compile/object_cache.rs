@@ -23,6 +23,8 @@
 //!    writes, silent IO-error degradation, lock-free shared `&self`
 //!    access (each cache key is per-module so writes never conflict).
 
+use super::compile_env::{compile_env_value as object_cache_env_value, COMPILE_ENV_VARS};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -239,13 +241,9 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 /// same final HIR reuse the cached `.o`. Behavior changes still produce
 /// a different HIR and miss the cache as before.
 ///
-/// We also mix in environment variables that `perry-codegen` reads
-/// at compile time but that aren't part of `CompileOptions`:
-/// `PERRY_DEBUG_INIT`, `PERRY_DEBUG_SYMBOLS`, `PERRY_FUNCTION_SOURCE`, `PERRY_LLVM_CLANG`,
-/// `PERRY_WRITE_BARRIERS`, `PERRY_SHADOW_STACK`,
-/// `PERRY_DISABLE_BUFFER_FAST_PATH`, `PERRY_VERIFY_NATIVE_REGIONS`,
-/// and `PERRY_TARGET_CPU`. See the env-var
-/// block at the bottom of this function for the rationale.
+/// We also mix in environment inputs read at compile time that are not part
+/// of `CompileOptions`. `compile_env::COMPILE_ENV_VARS` is the authority
+/// shared with the build cache, including contract and proof negative controls.
 ///
 /// NOT captured in the key: the host CPU. By default (`PERRY_TARGET_CPU`
 /// unset) `compile_ll_to_object` passes `-mcpu=native`/`-march=native` to
@@ -263,14 +261,21 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 /// codesigning) affects the *linked binary*, not the object file — so
 /// a per-module `.o` cache can reuse bytes across runs as long as LLVM
 /// itself emits deterministic object code, which it does by default.
+fn section_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 pub fn compute_object_cache_key(
     opts: &perry_codegen::CompileOptions,
     hir_hash: u64,
     perry_version: &str,
 ) -> u64 {
-    compute_object_cache_key_with_env(opts, hir_hash, perry_version, |name| {
-        std::env::var(name).ok()
-    })
+    compute_object_cache_key_with_env(opts, hir_hash, perry_version, object_cache_env_value)
 }
 
 /// Replay freshness uses the normal complete lowering key, excluding only
@@ -290,7 +295,7 @@ pub(super) fn typed_feedback_lowering_key(
         ) {
             None
         } else {
-            std::env::var(name).ok()
+            object_cache_env_value(name)
         }
     })
 }
@@ -303,9 +308,7 @@ fn compute_object_cache_key_with_env(
 ) -> u64 {
     let mut h = Djb2Hasher::new();
 
-    // Perry version + bitcode_link gate (we shouldn't be called when
-    // emit_ir_only=true, but include it so key-space is disjoint if the
-    // caller ever forgets to check).
+    // Perry version.
     h.field("v", perry_version);
     // Build id of the running perry binary (issue #544). Hashed once per
     // process; see `perry_build_id` for rationale. The version field above
@@ -366,12 +369,46 @@ fn compute_object_cache_key_with_env(
         "program_class_shape_ids",
         &format!("{:?}", opts.program_class_shape_ids),
     );
+    // wpfacts (design section 7): the digest of the whole-program facts this
+    // module can observe, and its contract-build claims section. A fact
+    // change recompiles exactly the modules that can see it.
+    h.field(
+        "program_facts",
+        &format!(
+            "{:016x}:{}:{:016x}",
+            opts.program_facts.digest,
+            opts.program_facts.contract_section.len(),
+            section_hash(&opts.program_facts.contract_section)
+        ),
+    );
+    h.field(
+        "dynamic_code_reach",
+        &format!("{:?}", opts.program_facts.dynamic_code_reach),
+    );
+    // Object model case 2c: the program's families and key colouring decide
+    // every module's descriptors and coloured read sites.
+    h.field(
+        "program_layouts",
+        &format!(
+            "{:016x}:{}:{}",
+            opts.program_layouts.digest,
+            opts.program_layouts.families.len(),
+            opts.program_layouts.mask_words
+        ),
+    );
+    // The runtime call-effect table decides which calls become statepoints,
+    // leaf-marked calls and plain calls rather than invokes: a module
+    // compiled under another table is a different object.
+    h.field("gc_effects", &format!("{:016x}", opts.gc_effects.digest()));
     // #11394: a module's method calls lower differently when ANY module in the
     // program writes that method name onto a builtin prototype.
     h.field(
         "patched_proto_methods",
         &perry_codegen::program_patched_proto_methods().join("|"),
     );
+    // Object model step 3: method calls bind the prototype constants the
+    // whole program's write census proves.
+    h.field("proto_census", &perry_codegen::program_proto_census_key());
     // A module's native-module namespaces and wrapper calls lower differently
     // depending on which library the compile routes each module to.
     h.field(
@@ -1105,395 +1142,18 @@ fn compute_object_cache_key_with_env(
         h.field("dynamic_import_path_to_prefix", &s);
     }
 
-    // Environment variables read by `perry-codegen` that influence the
-    // emitted .o bytes. Not part of `CompileOptions`, but just as real an
-    // input to `compile_module` / `compile_ll_to_object`:
-    //   - PERRY_DEBUG_INIT=1 bakes `puts("INIT: <prefix>")` calls around the
-    //     eager initializer chain in the entry object (entry.rs).
-    //   - PERRY_DEBUG_SYMBOLS=1 adds `-g` to clang → embeds DWARF sections
-    //     into the object (linker.rs).
-    //   - PERRY_FUNCTION_SOURCE=header elides function bodies from
-    //     `fn.toString()` metadata (#10574).
-    //   - PERRY_LLVM_CLANG selects which clang binary compiles .ll → .o;
-    //     different clang versions/builds emit different bytes (linker.rs).
-    //   - PERRY_WRITE_BARRIERS=0/off/false suppresses generated barrier
-    //     calls at heap-store sites (codegen.rs / expr.rs).
-    //     Rooting selection is fixed by the target in the cache identity.
-    //   - PERRY_DISABLE_BUFFER_FAST_PATH=1 overrides CompileOptions and
-    //     changes Buffer/Uint8Array lowering.
-    //   - PERRY_VERIFY_NATIVE_REGIONS=1 overrides CompileOptions and must
-    //     not be bypassed by a stale cache hit.
-    //   - PERRY_TARGET_CPU (#6125, set directly or promoted from `--march` /
-    //     perry.toml `[build] march`/`native_tuning`) changes the clang
-    //     `-march`/`-mcpu` tuning flag, i.e. which instruction-set baseline
-    //     the .o bytes assume. Serving a host-native-tuned object to a
-    //     pinned-baseline build would silently ship AVX-512 again.
-    // Hashing the values (not just presence) means a persistent override
-    // like PERRY_LLVM_CLANG=/opt/homebrew/opt/llvm/bin/clang in a shell rc
-    // still gets cache reuse across runs, while flipping a debug flag on
-    // or off cleanly invalidates.
-    let debug_init = opts
-        .is_entry_module
-        .then(|| env_var("PERRY_DEBUG_INIT"))
-        .flatten();
-    h.field("env_debug_init", debug_init.as_deref().unwrap_or(""));
-    h.field(
-        "env_debug_symbols",
-        env_var("PERRY_DEBUG_SYMBOLS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_llvm_clang",
-        env_var("PERRY_LLVM_CLANG").as_deref().unwrap_or(""),
-    );
-    // exp/llvm-inprocess: the in-process backend emits with its own pinned
-    // LLVM; sharing objects with the clang subprocess path would make every
-    // A/B between the backends vacuous.
-    h.field(
-        "env_llvm_inprocess",
-        env_var("PERRY_LLVM_INPROCESS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_write_barriers",
-        env_var("PERRY_WRITE_BARRIERS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_ll_size_opt",
-        env_var("PERRY_LL_SIZE_OPT").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_ll_opt_level",
-        env_var("PERRY_LL_OPT_LEVEL").as_deref().unwrap_or(""),
-    );
-    // #8583/#8679: the post-RS4GC instruction budget decides whether functions
-    // are re-lowered onto shadow frames; two settings must never share an object.
-    h.field(
-        "env_ll_rs4gc_max_instrs",
-        env_var("PERRY_LL_RS4GC_MAX_INSTRS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // Explicit-safepoint contract: flips audited AllocNoReentry helpers
-    // between statepoint and plain call. Two arms sharing a cached object
-    // would make the contract's metadata reduction unmeasurable.
-    h.field(
-        "env_gc_safepoint_only",
-        env_var("PERRY_GC_SAFEPOINT_ONLY").as_deref().unwrap_or(""),
-    );
-    // #7088: flips the shadow-slot store between an inline sequence and the
-    // `js_shadow_slot_*` calls. Two arms that shared a cached object would
-    // silently measure the same code.
-    h.field(
-        "env_disable_buffer_fast_path",
-        env_var("PERRY_DISABLE_BUFFER_FAST_PATH")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_verify_native_regions",
-        env_var("PERRY_VERIFY_NATIVE_REGIONS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_target_cpu",
-        env_var("PERRY_TARGET_CPU").as_deref().unwrap_or(""),
-    );
-    // Codegen tuning/emission toggles (#6394). Each is read by perry-codegen
-    // at compile time and changes the emitted IR / .o bytes, so a warm cache
-    // must not serve an object built under a different setting. These are
-    // process-env reads (`std::env::var`), NOT runtime globals: the class-field
-    // inline guard, typed-array view guard, and TA kind cache are emitted as
-    // loads of `@PERRY_*` globals resolved at run time — codegen emits them
-    // identically regardless of the compile-time environment, so they are
-    // deliberately absent here.
-    h.field(
-        "env_typed_feedback",
-        env_var("PERRY_TYPED_FEEDBACK").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_typed_feedback_trace",
-        env_var("PERRY_TYPED_FEEDBACK_TRACE")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // Also consumed by the replay freshness fingerprint. A changed concat
-    // lane must not reuse a catalog produced with different lowering inputs.
-    h.field(
-        "env_concat_site_cache",
-        env_var("PERRY_CONCAT_SITE_CACHE").as_deref().unwrap_or(""),
-    );
-    // #11354: a `=1` build emits a route-count call per fused receiver compare.
-    h.field(
-        "env_recv_route_count",
-        env_var("PERRY_RECV_ROUTE_COUNT").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_full_outline_ic",
-        env_var("PERRY_FULL_OUTLINE_IC").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_full_outline_ic_min_funcs",
-        env_var("PERRY_FULL_OUTLINE_IC_MIN_FUNCS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_outline_method_dispatch",
-        env_var("PERRY_OUTLINE_METHOD_DISPATCH")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // #11360: a `=1` build emits a census counter bump per store route.
-    // #11489: method-site and agent-pointer access A/B switches.
-    h.field(
-        "env_method_site",
-        env_var("PERRY_METHOD_SITE").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_constfn_shape",
-        env_var("PERRY_CONSTFN_SHAPE").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_agent_ptr_access",
-        env_var("PERRY_AGENT_PTR_ACCESS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_store_census",
-        env_var("PERRY_STORE_CENSUS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_inline_new",
-        env_var("PERRY_INLINE_NEW").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_inline_ctor",
-        env_var("PERRY_INLINE_CTOR").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_string_init_chunk_size",
-        env_var("PERRY_STRING_INIT_CHUNK_SIZE")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // #10574: header vs full function source changes the retained-source
-    // constants in `__perry_init_strings_*`.
-    h.field(
-        "env_function_source",
-        env_var("PERRY_FUNCTION_SOURCE").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_entry_symbol",
-        env_var("PERRY_ENTRY_SYMBOL").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_codegen_units",
-        env_var("PERRY_CODEGEN_UNITS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_codegen_unit_size",
-        env_var("PERRY_CODEGEN_UNIT_SIZE").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_codegen_unit_bytes",
-        env_var("PERRY_CODEGEN_UNIT_BYTES").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_gc_moving_loop_polls",
-        env_var("PERRY_GC_MOVING_LOOP_POLLS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // Inline-hot-small (#6850 follow-up): the enable flag changes the emitted
-    // IR (`inlinehint` attribute) AND the clang args (`-inlinehint-threshold`),
-    // and the size-cap / threshold change which functions get the hint and how
-    // aggressively they inline — all affect the .o bytes, so a warm cache must
-    // not serve an object built under a different setting.
-    h.field(
-        "env_inline_hot_small",
-        env_var("PERRY_INLINE_HOT_SMALL").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_inline_hot_small_cap",
-        env_var("PERRY_INLINE_HOT_SMALL_CAP")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_inline_hot_small_threshold",
-        env_var("PERRY_INLINE_HOT_SMALL_THRESHOLD")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_inline_hot_small_max_sites",
-        env_var("PERRY_INLINE_HOT_SMALL_MAX_SITES")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // Non-BigInt inline bitwise fast path: `=0`/`off`/`false` reverts the six
-    // bitwise ops to the `js_dynamic_bit*` runtime call for non-statically-
-    // numeric operands, which changes the emitted IR / .o bytes — a warm cache
-    // must not serve an object built under the other setting.
-    h.field(
-        "env_inline_nonbigint_bitwise",
-        env_var("PERRY_INLINE_NONBIGINT_BITWISE")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // Inline checked-f64 typed-array-param read: `=0`/`off`/`false` reverts a
-    // numeric-context typed-array parameter read (`n += S[i]`) from the inline
-    // checked load back to the `js_typed_array_get` runtime call, which changes
-    // the emitted IR / .o bytes — a warm cache must not serve an object built
-    // under the other setting.
-    h.field(
-        "env_ta_param_f64_read",
-        env_var("PERRY_TA_PARAM_F64_READ").as_deref().unwrap_or(""),
-    );
-    // Native-i32 residency for integer-valued locals seeded by possibly-OOB int
-    // typed-array reads (bcryptjs `_encipher` Feistel accumulators): `=0`/`off`/
-    // `false` reverts `l`/`r`-shaped locals from an i32 shadow slot back to the
-    // f64 slot + per-access ToInt32 round-trip, which changes the emitted IR /
-    // .o bytes — a warm cache must not serve an object built under the other
-    // setting.
-    h.field(
-        "env_int_valued_locals",
-        env_var("PERRY_INT_VALUED_LOCALS").as_deref().unwrap_or(""),
-    );
-    // Representation-selection Phase 1 — canonical unboxed i32 locals:
-    // `=0`/`off`/`false` reverts eligible integer locals from canonical-i32
-    // storage (single i32 slot, no double slot, no shadow binding) back to
-    // the parallel-shadow model (double slot + mirrored i32 writes), which
-    // changes the emitted IR / .o bytes — a warm cache must not serve an
-    // object built under the other setting.
-    h.field(
-        "env_canonical_i32_locals",
-        env_var("PERRY_CANONICAL_I32_LOCALS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // #10779 — NaN canonicalisation on ArrayBuffer float-lane reads.
-    // `=0`/`off`/`false` drops the `fcmp uno` + `select` pair from every
-    // Float64Array / Float32Array / DataView float read, which changes the
-    // emitted IR / .o bytes — a warm cache must not serve an object built
-    // under the other setting. It exists so the fix's cost can be measured
-    // with one compiler binary; it is not a supported runtime configuration.
-    h.field(
-        "env_nanbox_canon",
-        env_var("PERRY_NANBOX_CANON").as_deref().unwrap_or(""),
-    );
-    // Representation-selection Phase 3a — canonical string locals
-    // (tagged-at-rest): `=0`/`off`/`false` reverts the lowerings that consult a
-    // SELECTED `Str` local (`+=` tag-dispatch, direct string compares, the
-    // char-access receiver fast arm) back to the pre-phase sequences, which
-    // changes the emitted IR / .o bytes — a warm cache must not serve an object
-    // built under the other setting.
-    h.field(
-        "env_canonical_str_locals",
-        env_var("PERRY_CANONICAL_STR_LOCALS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // #7128 — string fast paths that key on a value's STATIC string type and
-    // never on a canonical-`Str` selection: the inline `StringRef` retag, the
-    // proven-heap string operand handle, and the tag-dispatched `.length`.
-    // They shipped under `PERRY_CANONICAL_STR_LOCALS`, which made that knob
-    // move 24 of 26 census workloads and stop being evidence about the
-    // representation it names. `=0`/`off`/`false` reverts all three, which
-    // changes the emitted IR / .o bytes — so it keys the cache too.
-    h.field(
-        "env_static_string_lowering",
-        env_var("PERRY_STATIC_STRING_LOWERING")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // Representation-selection Phase 2 — specialized calling convention:
-    // `PERRY_SPECIALIZED_ABI=0/off/false` removes the specialized entries and
-    // their static/guarded dispatch sites; `PERRY_SPECIALIZED_ABI_MAX`
-    // changes which functions get an entry. Both change emitted IR / .o
-    // bytes — an unkeyed flag would make A/B arms silently share objects.
-    h.field(
-        "env_specialized_abi",
-        env_var("PERRY_SPECIALIZED_ABI").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_specialized_abi_max",
-        env_var("PERRY_SPECIALIZED_ABI_MAX")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // #8175 — `preserve_nonecc` on recursion-participating specialized
-    // clones: `=0`/`off`/`false` keeps the default C convention, which
-    // changes the emitted IR / .o bytes; the knob exists precisely for
-    // single-binary A/B arms, so it must never let those arms share objects.
-    h.field(
-        "env_spec_preserve_none",
-        env_var("PERRY_SPEC_PRESERVE_NONE").as_deref().unwrap_or(""),
-    );
-    // Representation-selection Phase 3b — shape-proven Ptr<Shape> locals:
-    // `=0`/`off`/`false` reverts proven object locals from bare fixed-offset
-    // access (no guard diamond, unguarded direct method calls) back to the
-    // guarded class-field path, which changes the emitted IR / .o bytes — a
-    // warm cache must not serve an object built under the other setting.
-    h.field(
-        "env_ptr_shape_locals",
-        env_var("PERRY_PTR_SHAPE_LOCALS").as_deref().unwrap_or(""),
-    );
-    // Representation-selection Phase 5a — proven-`this` method clones. Off
-    // removes the `$pshape` bodies and routes both proven call sites back to
-    // the public guarded body, changing the emitted IR / .o bytes.
-    h.field(
-        "env_ptr_shape_this",
-        env_var("PERRY_PTR_SHAPE_THIS").as_deref().unwrap_or(""),
-    );
-    // Representation-selection Phase 4a.3 — Ptr<NumArray> locals:
-    // `=0`/`off`/`false` reverts proven numeric-array locals from guard-free
-    // element access back to the Phase 4a.1/4a.2 guarded tiers, which changes
-    // the emitted IR / .o bytes — a warm cache must not serve an object built
-    // under the other setting.
-    h.field(
-        "env_ptr_numarray_locals",
-        env_var("PERRY_PTR_NUMARRAY_LOCALS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    // FEAT_JSCVT ToInt32 (`fjcvtzs` on apple-arm64): flipping it changes
-    // every `toint32_wrap` emission site's IR, so it must key the cache.
-    h.field("env_jscvt", env_var("PERRY_JSCVT").as_deref().unwrap_or(""));
-    // #8105 — number-by-construction locals: `=0`/`off`/`false` empties the
-    // fact, so every reassigned numeric accumulator returns to the
-    // BigInt-aware dynamic helper. Different IR, different .o bytes.
-    h.field(
-        "env_number_by_construction",
-        env_var("PERRY_NUMBER_BY_CONSTRUCTION")
-            .as_deref()
-            .unwrap_or(""),
-    );
-
-    // #10884 step 4b — the region kill switch. Same reasoning as the build
-    // cache above, and the same trap #10929 fell into: keying ONE of the two
-    // caches leaves the other serving objects compiled the other way.
-    h.field(
-        "env_region_reads",
-        env_var("PERRY_REGION_READS").as_deref().unwrap_or(""),
-    );
-
-    // #11650 loop regions: three more compile-time switches on the same
-    // lowering, keyed here for the same reason (keying only one of the two
-    // caches leaves the other serving objects compiled the other way).
-    h.field(
-        "env_regions",
-        env_var("PERRY_REGIONS").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_region_nodes_per_bare",
-        env_var("PERRY_REGION_NODES_PER_BARE")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_region_spill",
-        env_var("PERRY_REGION_SPILL").as_deref().unwrap_or(""),
-    );
+    // Version the shared-list serialization so pre-unification cache entries
+    // cannot hit. Hash names and distinguish absence from a present empty value.
+    h.field("compile_env_format", "shared-lossless-v1");
+    h.field("nanbox_canon_contract", "required-handle-tag-v1");
+    for name in COMPILE_ENV_VARS {
+        let value = env_var(name);
+        let encoded = match value {
+            Some(value) => format!("set:{value}"),
+            None => "unset".to_owned(),
+        };
+        h.field(name, &encoded);
+    }
 
     h.finish()
 }
@@ -1560,7 +1220,7 @@ fn serialize_namespace_entry_kind(kind: &perry_codegen::NamespaceEntryKind, out:
 /// source hash). Atomic counters track hit/miss/store for verbose reporting.
 pub struct ObjectCache {
     /// Where to read/write cached objects. `None` when the cache is
-    /// disabled (via `--no-cache`, bitcode-link mode, or non-writable
+    /// disabled (via `--no-cache`, or a non-writable
     /// project root).
     cache_dir: Option<PathBuf>,
     hits: AtomicUsize,
@@ -1805,7 +1465,7 @@ impl ObjectCache {
     }
 
     /// Whether the cache is actually writing to disk. `false` when
-    /// disabled by `--no-cache`, by bitcode-link mode, or by a
+    /// disabled by `--no-cache`, or by a
     /// create-dir failure.
     pub fn is_enabled(&self) -> bool {
         self.cache_dir.is_some()

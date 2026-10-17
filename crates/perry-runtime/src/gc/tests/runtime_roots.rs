@@ -1,12 +1,10 @@
 use super::super::*;
 use super::support::*;
 use std::cell::Cell;
-mod accessor_shape_expiry;
 mod arraylike_callbacks;
 mod bound_method_builder;
 mod call_argument_lists;
 mod callback_scanners;
-mod class_shape_expiry;
 mod explicit_this_forwarding;
 mod fs_options_object;
 mod fs_stream_registry;
@@ -17,9 +15,9 @@ mod handle_stack;
 mod hidden_keys;
 mod hook_dispatch_handles;
 mod interned_string_caches;
-mod iter_result_keys;
 mod iterator_helper_roots;
 mod json_construction;
+mod json_ic_leaf;
 mod json_key_lifetime;
 mod json_record_output;
 mod json_shape_template;
@@ -212,9 +210,10 @@ fn test_scoped_root_scanner_registry_guard_restores_counts() {
         register_runtime_handle_root_scanner_for_tests();
         let during = root_scanner_registry_counts();
         assert_eq!(during.0, before.0 + 1);
-        // The guard starts the mutable registry from its one runtime-cache
-        // scanner (the intrinsic prototype addresses), then the handle scanner.
-        assert_eq!(during.1, 2);
+        // The guard starts the mutable registry from its two runtime-state
+        // scanners (the intrinsic prototype addresses and the property atom
+        // table), then the handle scanner.
+        assert_eq!(during.1, 3);
         assert_eq!(during.2, before.2);
         assert_eq!(during.3, before.3);
     }
@@ -424,7 +423,7 @@ fn test_runtime_root_visitor_marks_and_rewrites_nanbox_slot() {
 
 #[test]
 fn test_prototype_resolution_stack_rewrites_owner_for_gc_reentry() {
-    let base_depth = crate::object::prototype_chain::resolution_stack_savepoint();
+    let here = crate::exception::frame_mark();
     let nursery_owner = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
     let valid_ptrs = build_valid_pointer_set();
     let relocated_owner = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
@@ -438,6 +437,7 @@ fn test_prototype_resolution_stack_rewrites_owner_for_gc_reentry() {
     assert!(
         crate::object::prototype_chain::test_resolution_stack_enter_and_forget(
             nursery_owner as usize,
+            here,
         )
     );
     crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut(
@@ -446,8 +446,9 @@ fn test_prototype_resolution_stack_rewrites_owner_for_gc_reentry() {
     let reentry_was_blocked =
         !crate::object::prototype_chain::test_resolution_stack_enter_and_forget(
             relocated_owner as usize,
+            here,
         );
-    crate::object::prototype_chain::resolution_stack_restore(base_depth);
+    crate::object::prototype_chain::resolution_stack_unwind_to(here + 1);
 
     assert!(
         reentry_was_blocked,

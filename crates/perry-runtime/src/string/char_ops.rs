@@ -11,6 +11,24 @@ pub(crate) use utf16_index::{prune_dead_utf16_indexes, scan_utf16_index_roots_mu
 #[cfg(test)]
 mod computed_property_tests;
 
+/// String-method ToNumber, preserving undefined for operation-specific
+/// defaults. One shared fast path replaces the emitted guard at every site.
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn js_string_number_coerce(value: f64) -> f64 {
+    let bits = value.to_bits();
+    if (bits & 0x7FFF_0000_0000_0000) < 0x7FF9_0000_0000_0000 || bits == crate::value::TAG_UNDEFINED
+    {
+        value
+    } else {
+        crate::builtins::js_number_coerce(value)
+    }
+}
+
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_NUMBER_COERCE: extern "C" fn(f64) -> f64 = js_string_number_coerce;
+
 /// JS index coercion for the String character-access methods (#2787).
 /// Applies `ToIntegerOrInfinity`: a non-numeric argument is first run through
 /// the full `ToNumber` (`js_number_coerce`) so an object index with a custom
@@ -25,20 +43,16 @@ mod computed_property_tests;
 #[no_mangle]
 pub extern "C" fn js_string_index_to_i32(index: f64) -> i32 {
     let jsval = crate::value::JSValue::from_bits(index.to_bits());
-    // Fast path: a real number / int32 needs no ToNumber. Anything else
-    // (object, string, bool, null, undefined, bigint, symbol) goes through
-    // `ToNumber` first (may throw on Symbol, may run user `valueOf`/`toString`).
-    let n = if jsval.is_int32() {
-        jsval.as_int32() as f64
-    } else if jsval.is_number() {
+    // Only a plain double is unconditionally a Number. Legacy class
+    // constructor values can share INT32's representation: the full
+    // ToNumber entry owns that distinction and user ToPrimitive calls.
+    let n = if jsval.is_number() {
         index
     } else {
         crate::builtins::js_number_coerce(index)
     };
-    // Rust's saturating float-to-int conversion supplies exactly this
-    // helper's ToIntegerOrInfinity + i32 clamp: truncate toward zero, NaN
-    // to zero, infinities/out-of-range values to the nearest endpoint.
-    // Calling libm trunc first repeats work the conversion already does.
+    // ToNumber has produced a canonical double. Rust supplies truncation,
+    // NaN -> zero and saturation without another boxed-int tag check.
     n as i32
 }
 
@@ -54,6 +68,36 @@ pub extern "C" fn js_string_end_index_to_i32(value: f64, len: i32) -> i32 {
     }
     js_string_index_to_i32(value)
 }
+
+/// ToIntegerOrInfinity on an already-coerced Number (or undefined).
+/// This entry cannot invoke user code. Rust supplies truncation and saturation.
+#[no_mangle]
+pub extern "C" fn js_string_number_index_to_i32(index: f64) -> i32 {
+    let value = crate::value::JSValue::from_bits(index.to_bits());
+    if value.is_int32() {
+        value.as_int32()
+    } else {
+        index as i32
+    }
+}
+
+/// Already-coerced end index; undefined retains the method's default.
+#[no_mangle]
+pub extern "C" fn js_string_number_end_index_to_i32(value: f64, len: i32) -> i32 {
+    if value.to_bits() == crate::value::TAG_UNDEFINED {
+        len
+    } else {
+        js_string_number_index_to_i32(value)
+    }
+}
+
+// Generated code is the only caller of the end-index twin in some programs.
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_NUMBER_INDEX: extern "C" fn(f64) -> i32 = js_string_number_index_to_i32;
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_NUMBER_END_INDEX: extern "C" fn(f64, i32) -> i32 = js_string_number_end_index_to_i32;
 
 /// Get character code at index (returns UTF-16 code unit, or NaN if out of bounds).
 /// Index is in UTF-16 code units (matches JS spec). For ASCII strings this is

@@ -50,7 +50,7 @@ pub(crate) unsafe fn define_own_data_from_shape(
     // Reuse the named store's own-slot proof before probing a key-ADD edge:
     // the latter cannot answer an overwrite and was doing its full key
     // interning, transition and receiver checks first on every literal tail.
-    let id = (*obj).parent_class_id;
+    let id = (*obj).shape_word();
     // Declared class fields commonly CREATE; retain their key-add-first
     // admission instead of scanning all preceding own keys at each birth.
     let record = if (*obj).class_id == 0
@@ -113,7 +113,7 @@ unsafe fn define_other(
     // allocating (a pooled literal or an SSO immediate resolves to its
     // interned twin). Private names and canonical indices are refused there:
     // they are not ordinary named properties.
-    let Some(key) = super::chain_store::interned_key_for_store(key_value) else {
+    let Some(key) = super::store_key::interned_key_for_store(key_value) else {
         // The interned-key store funnels validate this same header themselves.
         // Content lookup reads the shape directly, so validate only this lane.
         let header = crate::value::addr_class::try_read_gc_header(addr)?;

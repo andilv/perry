@@ -1,8 +1,12 @@
-//! Equality / comparison / starts-with / ends-with / well-formedness /
-//! normalization / locale-compare.
+//! String comparison, prefix/suffix checks, normalization and locale comparison.
 
 use super::*;
 use crate::string::wtf8::{self, Wtf8Str};
+
+mod keys;
+#[cfg(test)]
+pub(crate) use keys::test_key_byte_reads;
+pub(crate) use keys::{js_string_key_bytes, js_string_key_matches, js_string_key_matches_bytes};
 
 /// Lexicographic comparison of two UTF-8 byte slices by **UTF-16 code unit**,
 /// matching ECMAScript string relational comparison (`<`/`>` and the default
@@ -320,121 +324,6 @@ fn compare_inline_or_mixed_strings(a: f64, b: f64) -> i32 {
     }
 }
 
-/// SSO-aware key match: compare a stored-key `JSValue` (which may be a
-/// `STRING_TAG` heap pointer OR a `SHORT_STRING_TAG` inline SSO value)
-/// against an incoming heap `*const StringHeader` key.
-///
-/// This is the safe replacement for the `key_val.is_string() && js_string_equals(key, key_val.as_string_ptr())`
-/// pattern that recurs in `object/field_get_set.rs`, `object/object_ops.rs`,
-/// `object/delete_rest.rs`, etc. — `is_string()` is STRING_TAG-only, so
-/// any SSO-stored key is silently skipped, which makes `Object.keys`,
-/// `key in obj`, `delete obj[k]`, `obj[k] = v`, and `Object.assign`
-/// drop or duplicate keys whose name is ≤ 5 ASCII bytes (#1781).
-///
-/// Returns `true` iff the stored value is some kind of string AND its
-/// byte contents are equal to the incoming heap key. Returns `false`
-/// for non-string stored values or a null incoming key.
-///
-/// Inline byte comparison — no allocation, no heap materialization of
-/// the SSO operand. Safe on the hot path.
-#[inline]
-pub(crate) unsafe fn js_string_key_matches(
-    stored: crate::JSValue,
-    incoming: *const StringHeader,
-) -> bool {
-    if incoming.is_null() {
-        return false;
-    }
-    // Heap-stored key: defer to the existing equals routine.
-    if stored.is_string() {
-        return js_string_equals(incoming, stored.as_string_ptr()) != 0;
-    }
-    // SSO-stored key: compare the incoming heap bytes against the
-    // inline SSO bytes without materializing the SSO to the heap.
-    if stored.is_short_string() {
-        let incoming_len = (*incoming).byte_len as usize;
-        let sso_len = stored.short_string_len();
-        if incoming_len != sso_len {
-            return false;
-        }
-        let incoming_data = (incoming as *const u8).add(std::mem::size_of::<StringHeader>());
-        let incoming_bytes = std::slice::from_raw_parts(incoming_data, incoming_len);
-        let mut sso_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-        let n = stored.short_string_to_buf(&mut sso_buf);
-        return &sso_buf[..n] == incoming_bytes;
-    }
-    false
-}
-
-/// SSO-aware byte-slice match for cases where the incoming key already
-/// lives as a `&[u8]` slice (typed-feedback guards, `js_object_get_own_field_or_undef`,
-/// etc.) — same SSO blind-spot fix as [`js_string_key_matches`] but
-/// without the round-trip through a heap `StringHeader` for the
-/// incoming side. Returns `true` iff the stored value is some kind of
-/// string and its bytes equal `incoming_bytes`.
-#[inline]
-pub(crate) unsafe fn js_string_key_matches_bytes(
-    stored: crate::JSValue,
-    incoming_bytes: &[u8],
-) -> bool {
-    #[cfg(test)]
-    KEY_BYTE_READS.with(|count| count.set(count.get() + 1));
-    if stored.is_string() {
-        let stored_ptr = stored.as_string_ptr();
-        if stored_ptr.is_null() {
-            return false;
-        }
-        let stored_len = (*stored_ptr).byte_len as usize;
-        if stored_len != incoming_bytes.len() {
-            return false;
-        }
-        let stored_data = (stored_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-        let stored_slice = std::slice::from_raw_parts(stored_data, stored_len);
-        return stored_slice == incoming_bytes;
-    }
-    if stored.is_short_string() {
-        let sso_len = stored.short_string_len();
-        if sso_len != incoming_bytes.len() {
-            return false;
-        }
-        let mut sso_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-        let n = stored.short_string_to_buf(&mut sso_buf);
-        return &sso_buf[..n] == incoming_bytes;
-    }
-    false
-}
-
-/// Extract the bytes of a stored-key JSValue (STRING_TAG or SHORT_STRING_TAG)
-/// into a caller-provided buffer + length. Returns `None` for non-string
-/// stored values. The slice borrowing into either the SSO buffer
-/// (`stored_buf`) or the heap pointer is the caller's responsibility.
-///
-/// Used by paths like `Object.keys` and `Object.assign` that need to
-/// materialize the key string into a usable form regardless of which
-/// representation it currently has.
-#[inline]
-pub(crate) unsafe fn js_string_key_bytes(
-    stored: crate::JSValue,
-    stored_buf: &mut [u8; crate::value::SHORT_STRING_MAX_LEN],
-) -> Option<&[u8]> {
-    #[cfg(test)]
-    KEY_BYTE_READS.with(|count| count.set(count.get() + 1));
-    if stored.is_string() {
-        let stored_ptr = stored.as_string_ptr();
-        if stored_ptr.is_null() {
-            return None;
-        }
-        let len = (*stored_ptr).byte_len as usize;
-        let data = (stored_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-        return Some(std::slice::from_raw_parts(data, len));
-    }
-    if stored.is_short_string() {
-        let n = stored.short_string_to_buf(stored_buf);
-        return Some(&stored_buf[..n]);
-    }
-    None
-}
-
 /// Validate and coerce the search string for String.prototype.includes,
 /// startsWith, and endsWith.
 ///
@@ -446,17 +335,34 @@ pub extern "C" fn js_string_search_value_to_string(
     value: f64,
     method_id: i32,
 ) -> *mut StringHeader {
-    if string_search_is_regexp(value) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let value = scope.root_nanbox_f64(value);
+    if string_search_is_regexp(value.get_nanbox_f64()) {
         throw_regexp_search_type_error(method_id);
     }
     // ToString(searchString): a Symbol throws a TypeError (§7.1.17) rather than
     // stringifying to "Symbol(...)".
+    let value = value.get_nanbox_f64();
     crate::builtins::reject_symbol_to_string(value);
     crate::value::js_jsvalue_to_string(value)
 }
 
+/// Search argument already proven to be a string. IsRegExp is false and
+/// ToString is identity. Return the boxed string so short-string
+/// materialization remains the caller's ordinary unboxing operation.
+#[no_mangle]
+pub extern "C" fn js_string_search_string_to_string(value: f64) -> f64 {
+    value
+}
+
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
+static KEEP_SEARCH_STRING: extern "C" fn(f64) -> f64 = js_string_search_string_to_string;
+
 fn string_search_is_regexp(value: f64) -> bool {
-    let jsval = crate::value::JSValue::from_bits(value.to_bits());
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let value = scope.root_nanbox_f64(value);
+    let jsval = crate::value::JSValue::from_bits(value.get_nanbox_u64());
     if !jsval.is_pointer() {
         return false;
     }
@@ -470,14 +376,20 @@ fn string_search_is_regexp(value: f64) -> bool {
     if !match_sym.is_null() {
         let match_sym_f64 =
             f64::from_bits(crate::value::JSValue::pointer(match_sym as *const u8).bits());
-        let matcher = unsafe { crate::symbol::js_object_get_symbol_property(value, match_sym_f64) };
+        let matcher = unsafe {
+            crate::symbol::js_object_get_symbol_property(value.get_nanbox_f64(), match_sym_f64)
+        };
         if matcher.to_bits() != crate::value::TAG_UNDEFINED {
             return crate::value::js_is_truthy(matcher) != 0;
         }
     }
 
+    // Symbol.match getters may run user code and evacuate the receiver. Read
+    // the current pointer from the handle before consulting RegExp's internal
+    // data, rather than using the pre-getter `jsval` snapshot above.
+    let value = crate::value::JSValue::from_bits(value.get_nanbox_u64());
     crate::regex::regexp_data_of(crate::value::js_nanbox_pointer(
-        (jsval.as_pointer::<u8>()) as i64,
+        (value.as_pointer::<u8>()) as i64,
     ))
     .is_some()
 }
@@ -1103,33 +1015,20 @@ fn locale_compare_numeric(a: Wtf8Str<'_>, b: Wtf8Str<'_>) -> f64 {
     locale_compare_canonical(a, b, locale_compare_numeric_raw)
 }
 
-/// `String.prototype.localeCompare(other, locales, options)` — honors the
-/// `{ numeric: true }` collation option (natural sort); `locales` is ignored
-/// (no Intl/ICU). `options` arrives as a NaN-boxed JSValue (the options object,
-/// or undefined when absent). Reads `options.numeric` (ToBoolean) and routes to
-/// `locale_compare_numeric` when set, else to the default `js_string_locale_compare`.
+/// `String.prototype.localeCompare(other, locales, options)` after the Collator
+/// arguments were resolved by `js_string_resolve_collator_args`: `numeric` is
+/// that call's result (1 = `{ numeric: true }`, natural sort). `locales` and
+/// `options` are NOT passed: they were read before the caller took `a` and `b`,
+/// and this function reads no JS value, so nothing can collect while it holds
+/// the two string addresses (#12539).
 #[no_mangle]
-pub extern "C" fn js_string_locale_compare_opts(
+pub extern "C" fn js_string_locale_compare_resolved(
     a: *const StringHeader,
     b: *const StringHeader,
-    options: f64,
+    numeric: i32,
 ) -> f64 {
-    let numeric = {
-        let ptr =
-            crate::value::js_nanbox_get_pointer(options) as *const crate::object::ObjectHeader;
-        if ptr.is_null() || (ptr as usize) < 0x10000 {
-            false
-        } else {
-            let key = crate::string::js_string_from_bytes(b"numeric".as_ptr(), 7);
-            let v = crate::object::js_object_get_field_by_name_f64(ptr, key);
-            crate::value::js_is_truthy(v) != 0
-        }
-    };
-    if !numeric {
-        return js_string_locale_compare(a, b);
-    }
-    if !is_valid_string_ptr(a) || !is_valid_string_ptr(b) {
-        // Match the validity edge-cases of the default path.
+    if numeric == 0 || !is_valid_string_ptr(a) || !is_valid_string_ptr(b) {
+        // Invalid operands take the validity edge-cases of the default path.
         return js_string_locale_compare(a, b);
     }
     // SAFETY: both pointers were just validated above; see
@@ -1530,6 +1429,229 @@ mod numeric_collation_tests {
     }
 }
 
+#[cfg(test)]
+mod locale_compare_moving_roots_tests {
+    use super::*;
+
+    extern "C" fn numeric_true_getter(
+        _closure: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
+    ) -> f64 {
+        crate::gc::gc_collect_minor();
+        f64::from_bits(crate::value::TAG_TRUE)
+    }
+
+    #[test]
+    fn moving_locale_compare_options_getter_runs_before_the_strings_are_read() {
+        let _gc = crate::gc::CopyingNurseryTestGuard::new(0);
+        let _triggers = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+        let _force = crate::gc::knob_overrides::ForcedEvacuationTestGuard::on();
+        crate::gc::register_runtime_handle_root_scanner_for_tests();
+        crate::gc::gc_register_mutable_root_scanner(
+            crate::object::shapes::scan_shape_table_rekey_mut,
+        );
+        crate::gc::gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let a = scope.root_string_ptr(crate::string::js_string_from_str("file2"));
+        let b = scope.root_string_ptr(crate::string::js_string_from_str("file10"));
+        let options_ptr = crate::object::js_object_alloc(0, 0);
+        let options = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(options_ptr as i64));
+        let getter = crate::value::js_nanbox_pointer(crate::closure::js_closure_alloc(
+            crate::fn_info!(numeric_true_getter, 0),
+            0,
+        ) as i64);
+        let key = crate::string::js_string_from_bytes(b"numeric".as_ptr(), 7);
+        crate::object::js_object_define_getter(
+            options.get_nanbox_f64(),
+            f64::from_bits(crate::value::JSValue::string_ptr(key).bits()),
+            getter,
+        );
+
+        let a_before = a.get_raw_const_ptr::<StringHeader>() as usize;
+        let b_before = b.get_raw_const_ptr::<StringHeader>() as usize;
+        let options_before = crate::value::js_nanbox_get_pointer(options.get_nanbox_f64()) as usize;
+        // The Collator resolution runs the getter (and its collection) once,
+        // before either string address is taken; the comparison reads no
+        // option (#12539).
+        let numeric = super::super::js_string_resolve_collator_args(
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+            options.get_nanbox_f64(),
+        );
+        assert_eq!(numeric, 1);
+        let result = js_string_locale_compare_resolved(
+            a.get_raw_const_ptr::<StringHeader>(),
+            b.get_raw_const_ptr::<StringHeader>(),
+            numeric,
+        );
+
+        assert_eq!(result, -1.0);
+        assert_ne!(
+            a_before,
+            a.get_raw_const_ptr::<StringHeader>() as usize,
+            "the getter's forced moving minor must relocate the first string"
+        );
+        assert_ne!(
+            b_before,
+            b.get_raw_const_ptr::<StringHeader>() as usize,
+            "the getter's forced moving minor must relocate the second string"
+        );
+        assert_ne!(
+            options_before,
+            crate::value::js_nanbox_get_pointer(options.get_nanbox_f64()) as usize,
+            "the getter's forced moving minor must relocate its options receiver"
+        );
+    }
+}
+
+#[cfg(test)]
+mod search_value_moving_roots_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static MATCH_GETTER: Cell<(u64, u32)> = const { Cell::new((crate::value::TAG_UNDEFINED, 0)) };
+    }
+
+    extern "C" fn match_getter(
+        _closure: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
+    ) -> f64 {
+        crate::gc::gc_collect_minor();
+        let bits = MATCH_GETTER.with(|state| {
+            let (result, calls) = state.get();
+            state.set((result, calls + 1));
+            result
+        });
+        f64::from_bits(bits)
+    }
+
+    fn runtime_moving_gc() -> crate::gc::RuntimeHandleScope {
+        crate::gc::register_runtime_handle_root_scanner_for_tests();
+        crate::gc::gc_register_mutable_root_scanner(
+            crate::object::shapes::scan_shape_table_rekey_mut,
+        );
+        crate::gc::gc_register_mutable_root_scanner(crate::object::scan_shape_cache_roots_mut);
+        crate::gc::RuntimeHandleScope::new()
+    }
+
+    unsafe fn search_object(
+        scope: &crate::gc::RuntimeHandleScope,
+        result: f64,
+    ) -> crate::gc::RuntimeHandle<'_> {
+        MATCH_GETTER.with(|state| state.set((result.to_bits(), 0)));
+        let object = crate::object::js_object_alloc(0, 0);
+        let object = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(object as i64));
+        let getter = crate::value::js_nanbox_pointer(crate::closure::js_closure_alloc(
+            crate::fn_info!(match_getter, 0),
+            0,
+        ) as i64);
+        let symbol = crate::symbol::well_known_symbol("match");
+        let symbol = f64::from_bits(crate::value::JSValue::pointer(symbol as *const u8).bits());
+        crate::object::js_object_define_getter(object.get_nanbox_f64(), symbol, getter);
+        object
+    }
+
+    unsafe fn search_regexp(
+        scope: &crate::gc::RuntimeHandleScope,
+        result: f64,
+    ) -> crate::gc::RuntimeHandle<'_> {
+        MATCH_GETTER.with(|state| state.set((result.to_bits(), 0)));
+        let pattern = scope.root_string_ptr(js_string_from_str("needle"));
+        let flags = scope.root_string_ptr(js_string_from_str(""));
+        let regexp = scope.root_raw_mut_ptr(pattern.with_const_ptr(|pattern| {
+            flags.with_const_ptr(|flags| crate::regex::js_regexp_new(pattern, flags))
+        }));
+        let regexp = scope.root_nanbox_f64(regexp.with_mut_ptr(
+            |regexp: *mut crate::regex::RegExpHeader| {
+                crate::value::js_nanbox_pointer(regexp as i64)
+            },
+        ));
+        let getter = crate::value::js_nanbox_pointer(crate::closure::js_closure_alloc(
+            crate::fn_info!(match_getter, 0),
+            0,
+        ) as i64);
+        let prototype = crate::object::js_object_alloc(0, 0);
+        let prototype = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(prototype as i64));
+        let symbol = crate::symbol::well_known_symbol("match");
+        let symbol = f64::from_bits(crate::value::JSValue::pointer(symbol as *const u8).bits());
+        crate::object::js_object_define_getter(prototype.get_nanbox_f64(), symbol, getter);
+        crate::object::js_object_set_prototype_of(
+            regexp.get_nanbox_f64(),
+            prototype.get_nanbox_f64(),
+        );
+        regexp
+    }
+
+    fn object_string(value: f64) -> String {
+        let result = js_string_search_value_to_string(value, 0);
+        string_as_str(result).to_owned()
+    }
+
+    #[test]
+    fn search_value_moving_roots_handle_symbol_match_getters_and_primitives() {
+        let _gc = crate::gc::CopyingNurseryTestGuard::new(0);
+        let _triggers = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+        let _force = crate::gc::knob_overrides::ForcedEvacuationTestGuard::on();
+        let scope = runtime_moving_gc();
+
+        for answer in [
+            f64::from_bits(crate::value::TAG_FALSE),
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        ] {
+            let search = unsafe { search_object(&scope, answer) };
+            let before = crate::value::js_nanbox_get_pointer(search.get_nanbox_f64()) as usize;
+            assert_eq!(object_string(search.get_nanbox_f64()), "[object Object]");
+            let after = crate::value::js_nanbox_get_pointer(search.get_nanbox_f64()) as usize;
+            assert_ne!(
+                before, after,
+                "Symbol.match getter must evacuate the receiver"
+            );
+            assert_eq!(MATCH_GETTER.with(|state| state.get().1), 1);
+        }
+
+        let search = unsafe { search_regexp(&scope, f64::from_bits(crate::value::TAG_UNDEFINED)) };
+        let before = crate::value::js_nanbox_get_pointer(search.get_nanbox_f64()) as usize;
+        let thrown = crate::exception::catch_js_throw(|| {
+            js_string_search_value_to_string(search.get_nanbox_f64(), 0);
+        })
+        .expect_err("undefined Symbol.match must fall back to the RegExp internal slot");
+        assert_ne!(
+            before,
+            crate::value::js_nanbox_get_pointer(search.get_nanbox_f64()) as usize,
+            "undefined getter must evacuate the RegExp receiver"
+        );
+        assert_eq!(MATCH_GETTER.with(|state| state.get().1), 1);
+        let error = crate::value::js_nanbox_get_pointer(thrown) as *mut crate::error::ErrorHeader;
+        assert_eq!(
+            crate::error::js_error_get_kind(error),
+            crate::error::ERROR_KIND_TYPE_ERROR
+        );
+
+        let search = unsafe { search_object(&scope, f64::from_bits(crate::value::TAG_TRUE)) };
+        let before = crate::value::js_nanbox_get_pointer(search.get_nanbox_f64()) as usize;
+        let thrown = crate::exception::catch_js_throw(|| {
+            js_string_search_value_to_string(search.get_nanbox_f64(), 0);
+        })
+        .expect_err("truthy Symbol.match must reject a RegExp-like search value");
+        let after = crate::value::js_nanbox_get_pointer(search.get_nanbox_f64()) as usize;
+        assert_ne!(
+            before, after,
+            "truthy getter must also force receiver evacuation"
+        );
+        assert_eq!(MATCH_GETTER.with(|state| state.get().1), 1);
+        let error = crate::value::js_nanbox_get_pointer(thrown) as *mut crate::error::ErrorHeader;
+        assert_eq!(
+            crate::error::js_error_get_kind(error),
+            crate::error::ERROR_KIND_TYPE_ERROR
+        );
+
+        let primitive = js_string_search_value_to_string(42.0, 0);
+        assert_eq!(string_as_str(primitive), "42");
+        assert_eq!(MATCH_GETTER.with(|state| state.get().1), 1);
+    }
+}
+
 /// #10094: the primary collation pass stopped materializing two lowercased
 /// `String`s per comparison. These tests pin the two properties that makes
 /// safe — the ordering is byte-for-byte what the allocating formulation
@@ -1887,107 +2009,4 @@ mod locale_collation_tests {
         // A Σ *after* the deciding position must not force the fallback.
         assert!(locale_primary_cmp("aΣ", "bΣ").is_some());
     }
-}
-
-#[cfg(test)]
-mod tests_sso_helpers {
-    use super::*;
-    use crate::value::SHORT_STRING_MAX_LEN;
-    use crate::{js_string_from_bytes, JSValue};
-
-    /// #1781: a STRING_TAG heap key and a SHORT_STRING_TAG inline key
-    /// with the same bytes must both match an incoming heap key.
-    #[test]
-    fn key_matches_heap_and_sso_for_same_bytes() {
-        for name in ["a", "id", "tag", "name", "mango"] {
-            let bytes = name.as_bytes();
-            assert!(bytes.len() <= SHORT_STRING_MAX_LEN);
-
-            let incoming = js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
-            let heap_stored = JSValue::string_ptr(incoming);
-            let sso_stored = JSValue::try_short_string(bytes).expect("len<=5 encodes as SSO");
-            assert!(sso_stored.is_short_string(), "{name:?} should be SSO");
-
-            unsafe {
-                assert!(
-                    js_string_key_matches(heap_stored, incoming),
-                    "heap match failed for {name:?}"
-                );
-                assert!(
-                    js_string_key_matches(sso_stored, incoming),
-                    "SSO match failed for {name:?}"
-                );
-                assert!(
-                    js_string_key_matches_bytes(heap_stored, bytes),
-                    "heap bytes-match failed for {name:?}"
-                );
-                assert!(
-                    js_string_key_matches_bytes(sso_stored, bytes),
-                    "SSO bytes-match failed for {name:?}"
-                );
-            }
-        }
-    }
-
-    /// Different-length stored vs incoming must return false even when one
-    /// is SSO and the other is heap.
-    #[test]
-    fn key_matches_rejects_different_bytes_across_reps() {
-        let incoming = js_string_from_bytes(b"id".as_ptr(), 2);
-        let sso_other = JSValue::try_short_string(b"tag").expect("SSO");
-        let heap_other_ptr = js_string_from_bytes(b"other".as_ptr(), 5);
-        let heap_other = JSValue::string_ptr(heap_other_ptr);
-
-        unsafe {
-            assert!(!js_string_key_matches(sso_other, incoming));
-            assert!(!js_string_key_matches(heap_other, incoming));
-        }
-    }
-
-    /// Non-string stored values (undefined / number / pointer) must return false
-    /// without dereferencing the payload.
-    #[test]
-    fn key_matches_rejects_non_string_stored() {
-        let incoming = js_string_from_bytes(b"id".as_ptr(), 2);
-        for stored in [
-            JSValue::undefined(),
-            JSValue::null(),
-            JSValue::int32(42),
-            JSValue::bool(true),
-        ] {
-            unsafe {
-                assert!(!js_string_key_matches(stored, incoming));
-                assert!(!js_string_key_matches_bytes(stored, b"id"));
-            }
-        }
-    }
-
-    /// SSO key_bytes() round-trip: returns the inline bytes for SSO,
-    /// the heap bytes for STRING_TAG, None for everything else.
-    #[test]
-    fn key_bytes_round_trips_sso_and_heap() {
-        let sso = JSValue::try_short_string(b"path").expect("SSO");
-        let heap = JSValue::string_ptr(js_string_from_bytes(b"longish".as_ptr(), 7));
-        let mut buf = [0u8; SHORT_STRING_MAX_LEN];
-        unsafe {
-            assert_eq!(js_string_key_bytes(sso, &mut buf), Some(b"path".as_ref()));
-            assert_eq!(
-                js_string_key_bytes(heap, &mut buf),
-                Some(b"longish".as_ref())
-            );
-            assert_eq!(js_string_key_bytes(JSValue::int32(7), &mut buf), None);
-        }
-    }
-}
-
-// Count actual stored-key byte reads/comparisons, including both indexed
-// content validation and the linear lookup backstops. No timing dependence.
-#[cfg(test)]
-thread_local! {
-    static KEY_BYTE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn test_key_byte_reads() -> u64 {
-    KEY_BYTE_READS.with(std::cell::Cell::get)
 }

@@ -12,6 +12,7 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::codegen::FpContractMode;
 use crate::types::LlvmType;
@@ -59,6 +60,42 @@ impl Default for FpFlags {
 /// prefixed module uses [`crate::module::LlModule::null_guard_global`].
 pub(crate) const DEFAULT_NULL_GUARD_GLOBAL: &str = "perry_null_guard_zero";
 
+/// One entry of the function's EH-scope stack (ehfree design §4.1).
+///
+/// `pad` is the unwind destination every call emitted inside the scope
+/// targets (empty on WASI, whose `try` uses setjmp transport and has no
+/// landing pad). `after_pad` is the ordinary block an INNER action scope
+/// branches to once its own actions ran: the catch entry for a handler
+/// scope, or this scope's action block for an action scope. `None` when the
+/// scope cannot be chained to (WASI, or a scope pushed by a unit test).
+///
+/// `handle_height` is the `i64` SSA value holding the runtime-handle stack's
+/// height when the handler scope was entered (`js_eh_handle_height`; an
+/// action scope carries its handler's); every pad of the scope passes it to
+/// `js_eh_pad_enter`. `None` on WASI and in unit tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EhScope {
+    pub pad: String,
+    pub after_pad: Option<String>,
+    /// True for a scope whose pad runs actions of the same function and then
+    /// continues at the enclosing scope's `after_pad` (`stmt::eh_actions`);
+    /// false for a real handler (`try`, the async rejection boundary).
+    pub is_action: bool,
+    pub handle_height: Option<String>,
+}
+
+impl EhScope {
+    /// A handler scope whose pad funnels into `after_pad`.
+    pub fn handler(pad: String, after_pad: Option<String>) -> Self {
+        Self {
+            pad,
+            after_pad,
+            is_action: false,
+            handle_height: None,
+        }
+    }
+}
+
 /// Function-wide register counter shared between all blocks in a function.
 ///
 /// Registers are `%r1`, `%r2`, … unique across the entire function body —
@@ -69,15 +106,17 @@ pub struct RegCounter {
     /// Exact byte-owner root slots retained on the returning edge of actual
     /// calls. This is compiler state: numeric loads emit no lifetime work.
     byte_owner_root_slots: RefCell<Vec<String>>,
-    /// Invoke-EH (#7302): stack of landing-pad labels for the active
-    /// handler scopes, innermost last. While non-empty, every emitted call
-    /// that can reach `js_throw` becomes an `invoke` unwinding to the top
-    /// label (followed by an inline continuation label, so the emitting
-    /// code keeps appending transparently). Lexical scoping matches the
-    /// dynamic handler stack: `lower_try` pushes around the try body only —
-    /// catch/finally bodies see the *enclosing* scope, which is exactly
-    /// where a throw escaping them lands at runtime.
-    eh_unwind_labels: RefCell<Vec<String>>,
+    /// Invoke-EH (#7302): the active EH scopes, innermost last. While
+    /// non-empty, every emitted call that can reach `js_throw` becomes an
+    /// `invoke` unwinding to the top scope's pad (followed by an inline
+    /// continuation label, so the emitting code keeps appending
+    /// transparently). Lexical scoping matches the dynamic handler stack:
+    /// `lower_try` pushes around the try body only — catch/finally bodies see
+    /// the *enclosing* scope, which is exactly where a throw escaping them
+    /// lands at runtime. A bracket the function opens inside a handler of its
+    /// own pushes an *action* scope (`stmt::eh_actions`) whose pad closes the
+    /// bracket and then continues at the enclosing scope's `after_pad`.
+    eh_scopes: RefCell<Vec<EhScope>>,
     /// Every alloca this function has published to the precise-root collector
     /// with `js_shadow_slot_bind(idx, ptr)`.
     ///
@@ -129,6 +168,15 @@ pub struct RegCounter {
     /// Dirty flags of the function's hoisted byte-cell access proofs. The same
     /// call-emission choke point sets them; the next byte access revalidates.
     byte_access_dirty_slots: RefCell<Vec<String>>,
+    /// Flags of the open class-guard run (`expr::class_guard_memo`). The
+    /// same choke point clears them; the run's end unregisters them.
+    guard_memo_slots: RefCell<Vec<String>>,
+    /// The compilation's runtime call-effect table, injected by
+    /// `LlModule::define_function` (and the other module entry points) from
+    /// `CompileOptions::gc_effects`. `None` for functions built outside a
+    /// module (tests): [`Self::gc_effects`] then names the committed tables
+    /// explicitly.
+    gc_effects: RefCell<Option<Arc<crate::gc_call_effects::GcEffects>>>,
 }
 
 impl RegCounter {
@@ -136,14 +184,32 @@ impl RegCounter {
         Self {
             value: Cell::new(0),
             byte_owner_root_slots: RefCell::new(Vec::new()),
-            eh_unwind_labels: RefCell::new(Vec::new()),
+            eh_scopes: RefCell::new(Vec::new()),
             shadow_slot_allocas: RefCell::new(HashSet::new()),
             preserve_none_fns: RefCell::new(None),
             fn_infos: RefCell::new(None),
             null_guard_symbol: RefCell::new(None),
             stable_packed_revalidation_slots: RefCell::new(Vec::new()),
             byte_access_dirty_slots: RefCell::new(Vec::new()),
+            guard_memo_slots: RefCell::new(Vec::new()),
+            gc_effects: RefCell::new(None),
         }
+    }
+
+    /// Install the compilation's call-effect table on this function.
+    pub(crate) fn set_gc_effects(&self, effects: Arc<crate::gc_call_effects::GcEffects>) {
+        *self.gc_effects.borrow_mut() = Some(effects);
+    }
+
+    /// The compilation's call-effect table. A function built outside a module
+    /// (unit tests) was given none and reads the committed tables.
+    pub(crate) fn gc_effects(&self) -> Arc<crate::gc_call_effects::GcEffects> {
+        if let Some(effects) = &*self.gc_effects.borrow() {
+            return Arc::clone(effects);
+        }
+        let committed = crate::gc_call_effects::GcEffects::committed_fallback();
+        *self.gc_effects.borrow_mut() = Some(Arc::clone(&committed));
+        committed
     }
 
     /// Point this function's null-guard loads at `global` (a bare symbol
@@ -188,6 +254,18 @@ impl RegCounter {
 
     fn byte_access_dirty_slots(&self) -> Vec<String> {
         self.byte_access_dirty_slots.borrow().clone()
+    }
+
+    pub(crate) fn push_guard_memo_slot(&self, slot: String) {
+        self.guard_memo_slots.borrow_mut().push(slot);
+    }
+
+    pub(crate) fn clear_guard_memo_slots(&self) {
+        self.guard_memo_slots.borrow_mut().clear();
+    }
+
+    fn guard_memo_slots(&self) -> Vec<String> {
+        self.guard_memo_slots.borrow().clone()
     }
 
     /// Install the module's `preserve_nonecc` symbol registry (#8175). Called
@@ -264,23 +342,39 @@ impl RegCounter {
         self.shadow_slot_allocas.borrow()
     }
 
-    /// Enter an invoke-EH handler scope: calls emitted from here until the
-    /// matching pop unwind to `lpad_label`.
+    /// Enter an invoke-EH handler scope that cannot be chained to: calls
+    /// emitted from here until the matching pop unwind to `lpad_label`.
     pub fn push_eh_scope(&self, lpad_label: String) {
-        self.eh_unwind_labels.borrow_mut().push(lpad_label);
+        self.push_eh_scope_entry(EhScope::handler(lpad_label, None));
     }
 
-    pub fn pop_eh_scope(&self) {
-        self.eh_unwind_labels.borrow_mut().pop();
+    /// Enter an EH scope: calls emitted from here until the matching pop
+    /// unwind to `scope.pad`.
+    pub fn push_eh_scope_entry(&self, scope: EhScope) {
+        self.eh_scopes.borrow_mut().push(scope);
+    }
+
+    pub fn pop_eh_scope(&self) -> Option<EhScope> {
+        self.eh_scopes.borrow_mut().pop()
     }
 
     /// Landing pad of the innermost active handler scope, if any.
     pub fn current_eh_unwind_label(&self) -> Option<String> {
-        self.eh_unwind_labels
+        self.eh_scopes
             .borrow()
             .last()
+            .map(|scope| scope.pad.clone())
             .filter(|label| !label.is_empty())
-            .cloned()
+    }
+
+    /// The innermost active EH scope, if any.
+    pub fn innermost_eh_scope(&self) -> Option<EhScope> {
+        self.eh_scopes.borrow().last().cloned()
+    }
+
+    /// Number of active EH scopes (handlers and action scopes).
+    pub fn eh_scope_depth(&self) -> usize {
+        self.eh_scopes.borrow().len()
     }
 
     pub fn next(&self) -> u32 {
@@ -328,7 +422,7 @@ impl LlBlock {
             name.starts_with("llvm.")
                 || name.starts_with("js_shadow_")
                 || name.starts_with("js_write_barrier")
-                || crate::gc_call_effects::classify_direct_callee(name)
+                || self.counter.gc_effects().classify_direct_callee(name)
                     == crate::gc_call_effects::GcCallEffect::CannotCollect
         }) {
             return;
@@ -458,7 +552,7 @@ impl LlBlock {
                 // change its backing, bounds or JS-visible state.
                 || (matches!(crate::module::helper_memory_effect(callee),
                     crate::module::HelperMemoryEffect::None | crate::module::HelperMemoryEffect::ReadOnly)
-                    && crate::gc_call_effects::classify_direct_callee(callee)
+                    && self.counter.gc_effects().classify_direct_callee(callee)
                         == crate::gc_call_effects::GcCallEffect::CannotCollect)
         }) {
             return;
@@ -467,6 +561,9 @@ impl LlBlock {
             self.store(crate::types::I1, "1", &slot);
         }
         for slot in self.counter.byte_access_dirty_slots() {
+            self.store(crate::types::I8, "0", &slot);
+        }
+        for slot in self.counter.guard_memo_slots() {
             self.store(crate::types::I8, "0", &slot);
         }
     }
@@ -650,6 +747,17 @@ impl LlBlock {
             ty: "double",
             a: a.to_string(),
             b: b.to_string(),
+        });
+        r
+    }
+
+    /// `freeze <ty> a` (see [`crate::inst::LlInst::Freeze`]).
+    pub fn freeze(&mut self, ty: LlvmType, a: &str) -> String {
+        let r = self.reg();
+        self.push_inst(crate::inst::LlInst::Freeze {
+            dst: r.clone(),
+            ty,
+            a: a.to_string(),
         });
         r
     }
@@ -865,6 +973,20 @@ impl LlBlock {
             ty,
             ptr: ptr.to_string(),
             flavor: crate::inst::LoadFlavor::AtomicMonotonic(alignment),
+        });
+        r
+    }
+
+    /// Unordered atomic load of a monotone runtime latch (#11915): atomic (no
+    /// data race with the runtime's writer) but unordered, so the backend can
+    /// fold it into a compare with memory.
+    pub fn load_atomic_unordered(&mut self, ty: LlvmType, ptr: &str, alignment: u32) -> String {
+        let r = self.reg();
+        self.push_inst(crate::inst::LlInst::Load {
+            dst: r.clone(),
+            ty,
+            ptr: ptr.to_string(),
+            flavor: crate::inst::LoadFlavor::AtomicUnordered(alignment),
         });
         r
     }
@@ -1138,6 +1260,7 @@ impl LlBlock {
                 args: vec![("double", val.to_string())],
                 cconv: None,
                 gc_leaf: false,
+                no_inline: false,
             });
             return r;
         }
@@ -1496,7 +1619,7 @@ impl LlBlock {
     /// LlBlock keeps appending into the continuation transparently.
     fn eh_invoke_suffix(&mut self, func_name: &str) -> Option<(String, String)> {
         let lpad = self.counter.current_eh_unwind_label()?;
-        if crate::eh_mode::callee_is_nothrow(func_name) {
+        if crate::eh_mode::nothrow_callee(&self.counter.gc_effects(), func_name) {
             return None;
         }
         let cont = format!("eh.cont{}", self.counter.next());
@@ -1521,7 +1644,7 @@ impl LlBlock {
     }
 
     pub fn call(&mut self, ret_ty: LlvmType, func_name: &str, args: &[(LlvmType, &str)]) -> String {
-        self.call_with_gc_leaf(ret_ty, func_name, args, false)
+        self.call_with_gc_leaf(ret_ty, func_name, args, false, false)
     }
 
     /// Direct-call counterpart of [`Self::call_indirect_gc_leaf`].
@@ -1531,7 +1654,17 @@ impl LlBlock {
         func_name: &str,
         args: &[(LlvmType, &str)],
     ) -> String {
-        self.call_with_gc_leaf(ret_ty, func_name, args, true)
+        self.call_with_gc_leaf(ret_ty, func_name, args, true, false)
+    }
+
+    /// Call an already selected cold body without copying it into this site.
+    pub fn call_noinline(
+        &mut self,
+        ret_ty: LlvmType,
+        func_name: &str,
+        args: &[(LlvmType, &str)],
+    ) -> String {
+        self.call_with_gc_leaf(ret_ty, func_name, args, false, true)
     }
 
     fn call_with_gc_leaf(
@@ -1540,6 +1673,7 @@ impl LlBlock {
         func_name: &str,
         args: &[(LlvmType, &str)],
         gc_leaf: bool,
+        no_inline: bool,
     ) -> String {
         self.dirty_revalidations_before_call(Some(func_name));
         // #835 + #846: record this emission against the FFI provenance
@@ -1563,10 +1697,11 @@ impl LlBlock {
         if let Some((cont, lpad)) = self.eh_invoke_suffix(func_name) {
             let arg_str = format_args(args);
             let cc = cconv.map(|c| format!("{c} ")).unwrap_or_default();
+            let inline_attr = if no_inline { " noinline" } else { "" };
             let leaf_attr = if gc_leaf { " \"gc-leaf-function\"" } else { "" };
             self.emit(format!(
-                "{} = invoke {}{} @{}({}){} to label %{} unwind label %{}",
-                r, cc, ret_ty, func_name, arg_str, leaf_attr, cont, lpad
+                "{} = invoke {}{} @{}({}){}{} to label %{} unwind label %{}",
+                r, cc, ret_ty, func_name, arg_str, inline_attr, leaf_attr, cont, lpad
             ));
             self.emit_inline_label(&cont);
         } else {
@@ -1577,6 +1712,7 @@ impl LlBlock {
                 args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
                 cconv,
                 gc_leaf,
+                no_inline,
             });
         }
         self.keep_byte_owners_after_call(Some(func_name));
@@ -1610,6 +1746,7 @@ impl LlBlock {
                 args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
                 cconv,
                 gc_leaf: false,
+                no_inline: false,
             });
         }
         self.keep_byte_owners_after_call(Some(func_name));

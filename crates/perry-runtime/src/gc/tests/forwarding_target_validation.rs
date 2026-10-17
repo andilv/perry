@@ -195,15 +195,13 @@ fn a_forwarding_target_must_be_an_object_start() {
 /// how #8040 happened — so assert the shape the gate depends on.
 #[test]
 fn the_dead_key_prune_registry_keeps_its_shape() {
-    use crate::gc::dead_owner::{DeadKeyOwner, DEAD_KEY_PRUNES};
+    use crate::gc::dead_owner::DEAD_KEY_PRUNES;
 
-    assert!(
-        DEAD_KEY_PRUNES.len() >= 19,
-        "DEAD_KEY_PRUNES shrank to {} entries; a prune was removed from the \
-         fan-out, and every `dead_owner:` verdict in \
-         scripts/gc_rekeyed_key_tables.json that named it is now a lie",
-        DEAD_KEY_PRUNES.len()
-    );
+    // Removal is required when an owner table disappears. The census/rekey
+    // gate checks every remaining table's death verdict, so a fixed historical
+    // count would reject authorized table deletions without detecting an
+    // orphaned remaining table. Keep the structural and required-owner checks.
+    assert!(!DEAD_KEY_PRUNES.is_empty());
 
     let mut labels: Vec<&str> = DEAD_KEY_PRUNES.iter().map(|entry| entry.table).collect();
     let total = labels.len();
@@ -214,16 +212,5 @@ fn the_dead_key_prune_registry_keeps_its_shape() {
         total,
         "DEAD_KEY_PRUNES table labels must be unique — the registry is an \
          inventory, and two entries with one label hide a table"
-    );
-
-    // #8168's table, narrowed to closures. Its absence from the fan-out IS
-    // #8040; if a refactor ever drops it again, fail here rather than in a
-    // `TypeError: value is not a function` several collections later.
-    assert!(
-        DEAD_KEY_PRUNES.iter().any(
-            |entry| entry.table == "FUNCTION_CLASS_IDS" && entry.owner == DeadKeyOwner::Closure
-        ),
-        "FUNCTION_CLASS_IDS must stay registered with the GC_TYPE_CLOSURE \
-         predicate (#8168)"
     );
 }

@@ -43,12 +43,6 @@ fn typed_feedback_enabled() -> bool {
     }
 }
 
-/// Whether typed-feedback tracing is active. Instrumented runtime guards
-/// record observations through their collecting continuation in this mode.
-pub(crate) fn typed_feedback_active() -> bool {
-    typed_feedback_enabled()
-}
-
 /// Numeric loop guards only decline when tracing was requested. Unit tests
 /// collect site observations unconditionally, without enabling trace mode.
 pub(crate) fn typed_feedback_trace_requested() -> bool {
@@ -1139,11 +1133,10 @@ pub extern "C" fn js_typed_feedback_object_set_field_by_name_fast(
 mod guards;
 pub use guards::{
     js_closure_exact_func_guard, js_object_own_method_cache_miss,
-    js_typed_feedback_class_field_get_guard, js_typed_feedback_class_field_set_guard,
-    js_typed_feedback_closure_direct_call_guard, js_typed_feedback_method_direct_call_guard,
-    js_typed_feedback_native_call_method, js_typed_feedback_native_call_method_apply,
-    js_typed_feedback_native_call_method_by_id, MethodPicCache, MethodPicCacheSlot,
-    METHOD_PIC_WORDS,
+    js_typed_feedback_class_field_get_guard, js_typed_feedback_closure_direct_call_guard,
+    js_typed_feedback_method_direct_call_guard, js_typed_feedback_native_call_method,
+    js_typed_feedback_native_call_method_apply, js_typed_feedback_native_call_method_by_id,
+    MethodPicCache, MethodPicCacheSlot, METHOD_PIC_WORDS,
 };
 
 #[path = "typed_feedback/trace.rs"]
@@ -1286,7 +1279,7 @@ fn plain_array_index_guard_impl(
         // reads and writes through their holder shapes; the inline
         // raw-slot fast path the guard admits would bypass them (test262
         // sort/precise-* read accessor indices after defineProperty).
-        if (*header)._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+        if crate::array::array_has_element_descriptors_resolved(arr as *const ArrayHeader) {
             return false;
         }
         // A polluted `Array.prototype[i]` (or custom array prototype) makes
@@ -1436,11 +1429,9 @@ pub(crate) unsafe fn packed_f64_loop_admits_live_array(
     // Accessor/descriptor indices, a prototype that can serve holes, and
     // frozen/sealed/non-extensible receivers all keep the ordinary path.
     if flags
-        & (crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS
-            | crate::gc::OBJ_FLAG_FROZEN
-            | crate::gc::OBJ_FLAG_SEALED
-            | crate::gc::OBJ_FLAG_NO_EXTEND)
+        & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND)
         != 0
+        || crate::array::array_has_element_descriptors_resolved(arr)
         || crate::array::array_index_fast_path_invalid_for(flags)
     {
         return false;
@@ -1800,6 +1791,10 @@ fn packed_u32_array_loop_guard(arr: *const ArrayHeader) -> bool {
 }
 
 fn numeric_array_push_guard(arr: *const ArrayHeader, value: f64) -> bool {
+    // #11915: the inline push stands for `Array.prototype.push`.
+    if !crate::object::builtin_proto::pristine(crate::object::builtin_proto::BuiltinProto::Array) {
+        return false;
+    }
     let raw_addr = normalize_raw_object_addr(arr as u64);
     let Some(header) = gc_header_for_user_addr(raw_addr) else {
         return false;
@@ -1817,20 +1812,19 @@ fn numeric_array_push_guard(arr: *const ArrayHeader, value: f64) -> bool {
         if flags
             & (crate::gc::OBJ_FLAG_FROZEN
                 | crate::gc::OBJ_FLAG_SEALED
-                | crate::gc::OBJ_FLAG_NO_EXTEND
-                | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+                | crate::gc::OBJ_FLAG_NO_EXTEND)
             != 0
+            || crate::array::array_has_element_descriptors_resolved(arr)
         {
             return false;
         }
         // A non-writable `length` is reachable only through a descriptor
-        // write, and every one of those marks the receiver
-        // `OBJ_FLAG_ARRAY_DESCRIPTORS` (`array::named_props::mark_array_descriptors`
-        // — the bit is documented there as the shared "index-accessor /
-        // non-writable-length / sparse-index" gate). The flag test above has
-        // already returned `false` for any receiver carrying it, so by this
+        // write, which makes `length` a non-writable key of the array's named
+        // layout (`array::array_has_element_descriptors`, the shared
+        // "index-accessor / non-writable-length / sparse-index" fact). The test
+        // above has already returned `false` for any such receiver, so by this
         // point the array provably has no descriptors and its `length` is
-        // provably writable. `array::push_pop::array_length_is_non_writable_with_flags`
+        // provably writable. `array::push_pop::array_length_is_non_writable`
         // encodes the same implication the other way round, short-circuiting on
         // the flag before it will look a descriptor up at all.
         //
@@ -1862,6 +1856,11 @@ fn object_key_matches_field(
     }
     unsafe {
         let obj = object_addr as *mut ObjectHeader;
+        // A layout slot of an object with an overflow may hold a deleted
+        // key's hole; the layout alone proves no field (object model step 4).
+        if crate::object::overflow::has_overflow(obj) {
+            return false;
+        }
         let Some(descriptor) = crate::object::shapes::object_shape_descriptor(obj) else {
             return false;
         };
@@ -2267,6 +2266,9 @@ pub extern "C" fn js_typed_feedback_array_index_get_fallback_boxed(
         {
             return crate::proxy::js_proxy_get(proxy, index);
         }
+    }
+    if receiver_value.is_handle() {
+        return f64::from_bits(TAG_UNDEFINED);
     }
 
     let raw_addr = normalize_raw_object_addr(receiver.to_bits());

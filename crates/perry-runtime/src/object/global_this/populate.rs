@@ -170,7 +170,7 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     // so these are populated before the subclass iterations consume them.
     let mut error_ctor_bits: Option<u64> = None;
     let mut error_proto_bits: Option<u64> = None;
-    for (identity_index, declaration) in GLOBAL_THIS_BUILTIN_CONSTRUCTORS.iter().enumerate() {
+    for declaration in GLOBAL_THIS_BUILTIN_CONSTRUCTORS {
         let name = declaration.name;
         if name == "Buffer" {
             let name_bytes = name.as_bytes();
@@ -237,20 +237,10 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             }
             continue;
         }
-        let info = declaration.info as *const crate::closure::JsFunctionInfo;
-        // Every constructor takes its declaration identity as immutable scalar
-        // input, using the same capture representation as shared bodies.
-        let captures = 1 | crate::closure::NO_THIS_REBIND_FLAG;
-        let closure_ptr = crate::closure::js_closure_alloc(info, captures);
+        let closure_ptr =
+            super::super::global_this_tables::alloc_builtin_constructor(declaration.identity);
         if closure_ptr.is_null() {
             continue;
-        }
-        {
-            crate::closure::js_closure_set_capture_bits(
-                closure_ptr,
-                0,
-                JSValue::int32(identity_index as i32 + 1).bits(),
-            );
         }
         // #2889: install static methods (`Object.keys`, `Array.isArray`, ...)
         // on the constructor closure so rebound usage like
@@ -258,10 +248,44 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
         // The prototype is an own static data property too. Include it in
         // the initial attributed layout so adding name/length cannot spill it.
         let proto_obj = if name == "Array" {
-            crate::array::js_array_alloc(0) as *mut ObjectHeader
+            // A runtime with no compiled entry (the Rust tests) registers the
+            // static layouts at realm bootstrap, as `js_shape_run_static_seed`
+            // does before any user code (§6a); `%Array.prototype%` is born on
+            // one of them.
+            #[cfg(test)]
+            crate::object::layout_desc::register_static_layouts();
+            let arr = crate::array::js_array_alloc(0);
+            // SAFETY: the fresh intrinsic, under this bootstrap's no-move scope.
+            unsafe {
+                crate::array::array_prototype_property_bag_ensure(
+                    arr,
+                    super::proto_room::BUILTIN_PROTOTYPE_ROOM,
+                );
+            }
+            arr as *mut ObjectHeader
+        } else if name == "Function" {
+            // Born on its static layout (`runtime_layouts::FUNCTION_PROTOTYPE`,
+            // a callable ordinary kind); the population fills its slots.
+            // SAFETY: a registered runtime descriptor with the default prototype.
+            unsafe {
+                crate::object::layout_desc::alloc_layout_prototype(
+                    std::ptr::addr_of!(crate::object::runtime_layouts::FUNCTION_PROTOTYPE),
+                    0,
+                )
+            }
         } else {
             super::proto_room::alloc_builtin_prototype()
         };
+        if declaration.prototype_callable {
+            // The declaration is immutable birth metadata, independent of the
+            // public name/property. Publish the callable shape and header fact.
+            unsafe {
+                crate::object::shapes::publish_callable_object_kind(
+                    proto_obj,
+                    crate::object::shapes::ShapeObjectKind::CallableOrdinary,
+                );
+            }
+        }
         install_builtin_constructor_statics(
             name,
             closure_ptr,
@@ -357,7 +381,24 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
                         proto_obj as usize,
                         serial,
                     );
+                    name_first_realm_prototype(proto_obj, serial);
                 }
+            }
+            if let Some(serial) = declaration.named_serial {
+                // SAFETY: `proto_obj` is the live intrinsic array; its holder
+                // of named properties is the object the serial names.
+                unsafe {
+                    let holder = crate::array::array_property_bag(
+                        proto_obj as *const crate::array::ArrayHeader,
+                    );
+                    if !holder.is_null() {
+                        name_first_realm_prototype(holder, serial);
+                    }
+                }
+            }
+            if let Some(serial) = declaration.sealed_serial {
+                // SAFETY: as above; runtime layouts name it by this serial.
+                unsafe { crate::object::builtin_proto::seal_runtime_prototype(proto_obj, serial) };
             }
             if name == "Function" {
                 crate::closure::shape::FUNCTION_PROTOTYPE_PTR
@@ -891,6 +932,10 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
     // `globalThis.<Builtin>` still names its intrinsic — before any user code
     // can reassign the writable `globalThis.Function`.
     crate::array::prime_prototype_addr_cache();
+    // #11915: every runtime-owned install and link above is done; from here a
+    // mutation of an intrinsic prototype is the program's, and withdraws its
+    // family's `Pristine` fact.
+    crate::object::builtin_proto::seal_realm(singleton());
     if let Some(started) = bootstrap_started {
         eprintln!(
             "[gc-globalthis-bootstrap] elapsed_us={}",
@@ -1122,3 +1167,20 @@ fn install_error_static_fn(
 // installed there, so the read returned `undefined`. These thunks delegate
 // to the same runtime helpers the direct `Object.keys(x)` lowering uses.
 // =====================================================================
+
+/// Give the agent's first realm's builtin prototype `proto` its reserved
+/// intrinsic `serial` and write the serial's identity word, which names it
+/// for the agent's life (`builtin_proto::name_runtime_prototype`, the
+/// encoding of runtime prototype families): the unknown-receiver probe reaches
+/// `%Function.prototype%` and `%Array.prototype%`'s holder through it, as the
+/// slow reads reach the first realm's intrinsics (`array::prototype_addr`).
+///
+/// # Safety
+/// `proto` is a live ordinary object whose serial is 0 or `serial`.
+unsafe fn name_first_realm_prototype(proto: *mut ObjectHeader, serial: u64) {
+    if crate::object::shapes::identity_word_slot(serial).is_some_and(|slot| *slot != 0) {
+        return;
+    }
+    crate::object::proto_validity::assign_intrinsic_prototype_serial(proto as usize, serial);
+    let _ = crate::object::builtin_proto::name_runtime_prototype(proto, serial);
+}

@@ -14,13 +14,18 @@ mod construction;
 mod from_space;
 mod region;
 pub(crate) use construction::ConstructionBatch;
+pub(crate) use region::Kind as ArenaBlockKind;
 mod inline;
-mod map_allocations;
 mod page_meta;
 mod pinned;
 pub(crate) use pinned::{collect_pinned_arena_headers, note_pinned_arena_header};
 /// #11842: record, poison and protect what the non-moving sweeps free.
 mod old_sweep_quarantine;
+mod owned_stores;
+pub(crate) use owned_stores::{
+    finalize_dead_copied_minor_from_space_owned_stores, note_owned_store_copied,
+    note_young_owned_store, young_owned_stores_may_exist,
+};
 /// #7742: whole-block in-place promotion of a (near-)fully-live young
 /// generation, in place of object-by-object evacuation.
 mod promote;
@@ -37,7 +42,6 @@ mod stats;
 /// #11471: thread-exit release of process-global address-keyed tables.
 pub mod thread_exit;
 mod walk;
-pub(crate) use map_allocations::walk_map_allocations;
 
 #[cfg(test)]
 mod tests;
@@ -46,11 +50,13 @@ mod tests_alloc_fast;
 #[cfg(test)]
 mod tests_batch_unregister;
 #[cfg(test)]
+mod tests_inline_state;
+#[cfg(test)]
 mod tests_page_meta_audit;
 #[cfg(test)]
-mod tests_promoted_runs;
-#[cfg(test)]
 mod tests_page_walk;
+#[cfg(test)]
+mod tests_promoted_runs;
 
 // Cross-sibling shared types/thread-locals (used by sibling modules via
 // `use super::*;`). These are not part of the crate-public surface
@@ -80,7 +86,8 @@ pub(crate) use block::{
     reset_gc_trigger_arena_probe,
 };
 pub(crate) use page_meta::{
-    address_span_overlaps_pages, defer_old_object_page_registration, page_class_table_report,
+    address_span_overlaps_pages, defer_old_object_page_registration,
+    defer_promoted_old_object_page_registration, page_class_table_report,
     register_block_space_with_object_starts, register_old_object_pages, shrink_page_tables,
     unregister_block_generation, unregister_old_block_pages, OLD_GEN_RECLAIM_POOLED_BYTES,
     OLD_GEN_RECLAIM_RETURNED_BYTES, OLD_GEN_RECLAIM_REUSABLE_BYTES,
@@ -109,8 +116,8 @@ pub use allocators::{
     arena_alloc_longlived, arena_alloc_old, js_arena_alloc,
 };
 pub(crate) use allocators::{
-    arena_alloc_gc_no_collect, arena_alloc_gc_old_born_tenured, arena_alloc_gc_old_excluding_pages,
-    arena_alloc_gc_survivor,
+    arena_alloc_gc_collecting_holder, arena_alloc_gc_no_collect, arena_alloc_gc_old_born_tenured,
+    arena_alloc_gc_old_excluding_pages, arena_alloc_gc_promoted, arena_alloc_gc_survivor,
 };
 
 // walk.rs
@@ -177,8 +184,8 @@ pub(crate) use page_meta::{
     materialize_promoted_page_runs_for_object, old_arena_block_range_index,
     old_arena_headers_on_pages, old_arena_movable_block_ranges, old_arena_page_index_remove_object,
     old_arena_source_blocks_for_pages, old_arena_walk_objects_on_pages, old_object_page_overlaps,
-    old_object_single_page, old_page_account_dirty_slot, old_page_account_dirty_slots,
-    old_page_account_promoted_object, old_page_account_swept_object, old_page_account_swept_tally,
+    old_object_single_page, old_page_account_became_never_move, old_page_account_dirty_slot,
+    old_page_account_dirty_slots, old_page_account_swept_object, old_page_account_swept_tally,
     old_page_clear_dirty, old_page_mark_dirty, old_page_meta_snapshot, old_page_summary,
     old_pages_begin_gc_cycle, old_pages_reset_sweep_accounting, record_arena_object_start,
     uniform_heap_generation, unregister_old_object_pages, unregister_old_objects_batch,

@@ -156,8 +156,10 @@ pub extern "C" fn js_object_get_own_field_or_undef(
         }
         let keys_gc =
             (keys as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*keys_gc).obj_type != crate::gc::GC_TYPE_ARRAY
-            || (*keys_gc).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        if !matches!(
+            (*keys_gc).obj_type,
+            crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_OVERFLOW
+        ) || (*keys_gc).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return f64::from_bits(TAG_UNDEF);
         }
@@ -172,12 +174,8 @@ pub extern "C" fn js_object_get_own_field_or_undef(
         if key_count > (*keys).capacity as usize || key_count > 65536 {
             return f64::from_bits(TAG_UNDEF);
         }
-        let key_slots = crate::array::array_elements_ptr(keys as *const crate::array::ArrayHeader)
-            as *const f64;
-        let alloc_limit = std::cmp::max(
-            crate::object::object_live_slot_count(obj),
-            crate::object::INLINE_SLOT_FLOOR as u32,
-        ) as usize;
+        let key_slots = crate::object::keys_array_dense_slots(keys).0;
+        let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
         for i in 0..key_count {
             let key_val = crate::JSValue::from_bits((*key_slots.add(i)).to_bits());
             // #1781: SSO-aware match by byte slice — the
@@ -190,6 +188,7 @@ pub extern "C" fn js_object_get_own_field_or_undef(
                 if crate::object::key_attrs::key_is_accessor_at(keys, i as u32) {
                     return f64::from_bits(TAG_UNDEF);
                 }
+                let i = crate::object::key_attrs::key_storage_slot(keys, i as u32) as usize;
                 let val = if i < alloc_limit {
                     js_object_get_field(obj, i as u32)
                 } else {
@@ -198,6 +197,10 @@ pub extern "C" fn js_object_get_own_field_or_undef(
                         None => return f64::from_bits(TAG_UNDEF),
                     }
                 };
+                // A slot holding the hole is an absent optional key.
+                if val.bits() == crate::value::TAG_HOLE {
+                    return f64::from_bits(TAG_UNDEF);
+                }
                 return f64::from_bits(val.bits());
             }
         }

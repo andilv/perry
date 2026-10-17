@@ -158,6 +158,10 @@ impl PageGenerationCache {
 // that — an 8.6% regression on the same row (0/7 pairs). Keep the scan short.
 const PAGE_GENERATION_CACHE_WAYS: usize = 4;
 
+mod local;
+pub(crate) use local::page_generations_hot_addr;
+use local::with_page_generations;
+
 mod compact;
 use compact::{page_count, PageObjects};
 mod storage;
@@ -252,7 +256,7 @@ pub(crate) struct OldArenaSourceBlockSelection {
 // exists; everything else in this file was simply never migrated.
 thread_local! {
     static PAGE_GENERATIONS: RefCell<PageGenerationMap> =
-        RefCell::new(crate::fast_hash::new_ptr_hash_map());
+        const { RefCell::new(crate::fast_hash::new_ptr_hash_map()) };
 
     static PAGE_GENERATION_CACHE: UnsafeCell<PageGenerationCacheSet> =
         const { UnsafeCell::new(PageGenerationCacheSet::empty()) };
@@ -260,15 +264,15 @@ thread_local! {
 
 crate::perry_thread_local! {
     static OLD_GEN_PAGE_OBJECTS: RefCell<OldGenPageObjectMap> =
-        RefCell::new(OldGenPageObjectMap::default());
+        const { RefCell::new(OldGenPageObjectMap::new()) };
 
     static OLD_GEN_PAGE_META: RefCell<OldGenPageMetaMap> =
-        RefCell::new(OldGenPageMetaMap::default());
+        const { RefCell::new(OldGenPageMetaMap::new()) };
 
     /// Promoted-block pages whose object list is DESCRIBED rather than stored —
     /// see [`register_promoted_page_run`].
     static OLD_GEN_PAGE_PROMOTED_RUNS: RefCell<crate::fast_hash::PtrHashMap<usize, PromotedPageRun>> =
-        RefCell::new(crate::fast_hash::new_ptr_hash_map());
+        const { RefCell::new(crate::fast_hash::new_ptr_hash_map()) };
 
     /// Monotone-within-a-window latch so the common case — a program that never
     /// promotes a block in place — pays one `Cell` read per reader instead of a
@@ -297,11 +301,6 @@ thread_local! {
 /// Address of this thread's `PAGE_GENERATION_CACHE`.
 pub(crate) fn page_generation_cache_hot_addr() -> *mut u8 {
     PAGE_GENERATION_CACHE.with(|c| c.get() as *mut u8)
-}
-
-/// Address of this thread's `PAGE_GENERATIONS`.
-pub(crate) fn page_generations_hot_addr() -> *mut u8 {
-    PAGE_GENERATIONS.with(|p| p as *const _ as *mut u8)
 }
 
 /// [`PAGE_GENERATION_CACHE`] without a TLS resolution — see `crate::tls_hot`.
@@ -453,7 +452,7 @@ pub(crate) fn register_block_space_with_object_starts(
     };
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
-    PAGE_GENERATIONS.with(|pages| {
+    with_page_generations(|pages| {
         let mut pages = pages.borrow_mut();
         for key in first_key..=last_key {
             match pages.entry(key) {
@@ -540,7 +539,7 @@ fn retag_block_space_inner(
     let end = base + size;
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
-    PAGE_GENERATIONS.with(|pages| {
+    with_page_generations(|pages| {
         let mut pages = pages.borrow_mut();
         for key in first_key..=last_key {
             let Some(slot) = pages.get_mut(&key) else {
@@ -842,7 +841,7 @@ pub(crate) fn unregister_block_generation(base: usize, size: usize) {
     let first_key = generation_class_key_for_addr(base);
     let last_key = generation_class_key_for_addr(end - 1);
     let mut removed_old_block = false;
-    PAGE_GENERATIONS.with(|pages| {
+    with_page_generations(|pages| {
         let mut pages = pages.borrow_mut();
         for key in first_key..=last_key {
             let mut remove_page = false;
@@ -1007,7 +1006,9 @@ fn classify_heap_space_in_range_uncached(
 
 /// Record headers whose public pointer validators require an exact allocation
 /// start. Maps follow an external payload; box accessors must reject foreign
-/// and interior pointers without consulting a per-cell registry. Other types
+/// and interior pointers without consulting a per-cell registry. Collection
+/// stores and context snapshot holders record theirs so a copying minor can
+/// find the young ones that died (`arena/owned_stores.rs`). Other types
 /// avoid this metadata write on their bump-allocation path.
 #[inline(always)]
 pub(crate) fn record_arena_object_start(header_addr: usize, obj_type: u8) {
@@ -1019,6 +1020,13 @@ pub(crate) fn record_arena_object_start(header_addr: usize, obj_type: u8) {
     if !matches!(
         obj_type,
         crate::gc::GC_TYPE_MAP
+            | crate::gc::GC_TYPE_SET
+            | crate::gc::GC_TYPE_SYMBOL
+            | crate::gc::GC_TYPE_MAP_STORE
+            | crate::gc::GC_TYPE_SET_STORE
+            | crate::gc::GC_TYPE_ASYNC_SNAPSHOT
+            | crate::gc::GC_TYPE_PROXY
+            | crate::gc::GC_TYPE_ASYNC_RESOURCE_STATE
             | crate::gc::GC_TYPE_BOX
             | crate::gc::GC_TYPE_I32_BOX
             | crate::gc::GC_TYPE_BOOL_BOX
@@ -1204,12 +1212,43 @@ pub(crate) const DEFERRED_OLD_PAGE_REGISTRATION_CAP: usize = 8_192;
 /// for why this is invisible to every consumer of the index.
 #[inline]
 pub(crate) fn defer_old_object_page_registration(header_addr: usize, total_size: usize) {
+    defer_old_page_entry(header_addr, total_size, 0);
+}
+
+/// A deferred entry's header word carries the promotion facts in its low bits
+/// (old-gen headers are 8-byte aligned): the copying minor's promotion owes
+/// the page its live (and pinned) accounting as well as the registration, and
+/// both are applied by the same flush, with one page lookup per run.
+const DEFERRED_PROMOTED_LIVE: usize = 1;
+const DEFERRED_PROMOTED_PINNED: usize = 2;
+const DEFERRED_MARKS: usize = 7;
+
+/// [`defer_old_object_page_registration`] for an object the copying minor
+/// promoted: the flush also counts it live on its pages (and pinned), which
+/// is what the per-object eager accounting used to do at the move.
+#[inline]
+pub(crate) fn defer_promoted_old_object_page_registration(
+    header_addr: usize,
+    total_size: usize,
+    pinned: bool,
+) {
+    let marks = DEFERRED_PROMOTED_LIVE | if pinned { DEFERRED_PROMOTED_PINNED } else { 0 };
+    defer_old_page_entry(header_addr, total_size, marks);
+}
+
+#[inline]
+fn defer_old_page_entry(header_addr: usize, total_size: usize, marks: usize) {
     if header_addr == 0 || total_size == 0 {
         return;
     }
+    debug_assert_eq!(
+        header_addr & DEFERRED_MARKS,
+        0,
+        "old-gen header is not 8-aligned"
+    );
     let full = DEFERRED_OLD_PAGE_REGISTRATIONS.with(|buf| {
         let mut buf = buf.borrow_mut();
-        buf.push((header_addr, total_size));
+        buf.push((header_addr | marks, total_size));
         buf.len() >= DEFERRED_OLD_PAGE_REGISTRATION_CAP
     });
     if full {
@@ -1257,10 +1296,17 @@ fn flush_deferred_old_page_registrations_batch() {
         OLD_GEN_PAGE_META.with(|meta| {
             let mut meta = meta.borrow_mut();
             // Entries arrive in allocation order, so consecutive ones share a
-            // page; cache that page's pre-batch length across the run.
+            // page: resolve that page's object list (and, when needed, its
+            // metadata) once per run, and cache its pre-batch length. Both
+            // maps box their page chunks and nothing is removed during the
+            // flush, so the cached entries stay put while other pages insert.
             let mut run_page: Option<usize> = None;
             let mut run_base_len: usize = 0;
-            for &(header_addr, total_size) in &pending {
+            let mut run_headers: *mut compact::PageObjects = std::ptr::null_mut();
+            let mut run_meta: *mut compact::StoredPageMeta = std::ptr::null_mut();
+            for &(word, total_size) in &pending {
+                let marks = word & DEFERRED_MARKS;
+                let header_addr = word & !DEFERRED_MARKS;
                 let object_end = header_addr + total_size;
                 let first_page = generation_page_for_addr(header_addr);
                 let last_page = generation_page_for_addr(object_end - 1);
@@ -1272,22 +1318,42 @@ fn flush_deferred_old_page_registrations_batch() {
                     if overlap_start >= overlap_end {
                         continue;
                     }
-                    let headers = index.get_or_insert(page);
                     if run_page != Some(page) {
                         run_page = Some(page);
-                        run_base_len = headers.len();
+                        run_headers = index.get_or_insert(page);
+                        run_meta = std::ptr::null_mut();
+                        // SAFETY: just resolved from the map for this page.
+                        run_base_len = unsafe { (*run_headers).len() };
                     }
-                    if headers.contains_prefix(page, header_addr, run_base_len) {
+                    // SAFETY: `run_headers` names this page's boxed entry; see
+                    // the run comment above.
+                    let headers = unsafe { &mut *run_headers };
+                    let bytes = page_count(overlap_end - overlap_start);
+                    let fresh = !headers.contains_prefix(page, header_addr, run_base_len);
+                    if !fresh && marks == 0 {
                         continue;
                     }
-                    headers.push(page, header_addr);
-                    // Identical to `update_old_page_meta_for_object(.., true)`
-                    // for this one page, applied here so no staging Vec exists.
-                    let page_meta = meta.get_or_insert(page);
-                    page_meta.allocated_bytes = page_meta
-                        .allocated_bytes
-                        .saturating_add(page_count(overlap_end - overlap_start));
-                    page_meta.object_count = page_meta.object_count.saturating_add(1);
+                    if run_meta.is_null() {
+                        run_meta = meta.get_or_insert(page);
+                    }
+                    // SAFETY: as `run_headers`.
+                    let page_meta = unsafe { &mut *run_meta };
+                    if fresh {
+                        headers.push(page, header_addr);
+                        // Identical to `update_old_page_meta_for_object(.., true)`
+                        // for this one page, applied here so no staging Vec exists.
+                        page_meta.allocated_bytes = page_meta.allocated_bytes.saturating_add(bytes);
+                        page_meta.object_count = page_meta.object_count.saturating_add(1);
+                    }
+                    if marks & DEFERRED_PROMOTED_LIVE != 0 {
+                        page_meta.live_bytes = page_meta.live_bytes.saturating_add(bytes);
+                        page_meta.live_object_count = page_meta.live_object_count.saturating_add(1);
+                        if marks & DEFERRED_PROMOTED_PINNED != 0 {
+                            page_meta.pinned_bytes = page_meta.pinned_bytes.saturating_add(bytes);
+                            page_meta.pinned_object_count =
+                                page_meta.pinned_object_count.saturating_add(1);
+                        }
+                    }
                     page_meta.refresh_policy_bits();
                 }
             }
@@ -1493,6 +1559,9 @@ pub(crate) fn old_page_account_swept_object(
     if header_addr == 0 || total_size == 0 {
         return;
     }
+    // I1: a live never-move object holds its page like a pinned one.
+    let pinned = pinned
+        || (live && unsafe { crate::gc::never_move::is_never_move(header_addr as *const _) });
     let overlaps = old_object_page_overlaps(header_addr, total_size);
     if overlaps.is_empty() {
         return;
@@ -1518,14 +1587,16 @@ pub(crate) fn old_page_account_swept_object(
     });
 }
 
-pub(crate) fn old_page_account_promoted_object(
-    header_addr: usize,
-    total_size: usize,
-    pinned: bool,
-) {
+/// I1: a live old object that just became never-move holds its page(s) from
+/// now on, like a pinned object, until the next sweep recounts the page with
+/// the same rule (`old_page_account_swept_object`).
+pub(crate) fn old_page_account_became_never_move(header_addr: usize, total_size: usize) {
     if header_addr == 0 || total_size == 0 {
         return;
     }
+    // #7624: a page whose registration is still deferred must exist before
+    // its pinned bytes are added, or the flush would overwrite them.
+    flush_deferred_old_page_registrations();
     let overlaps = old_object_page_overlaps(header_addr, total_size);
     if overlaps.is_empty() {
         return;
@@ -1534,12 +1605,8 @@ pub(crate) fn old_page_account_promoted_object(
         let mut meta = meta.borrow_mut();
         for (page, bytes) in overlaps {
             let page_meta = meta.get_or_insert(page);
-            page_meta.live_bytes = page_meta.live_bytes.saturating_add(page_count(bytes));
-            page_meta.live_object_count = page_meta.live_object_count.saturating_add(1);
-            if pinned {
-                page_meta.pinned_bytes = page_meta.pinned_bytes.saturating_add(page_count(bytes));
-                page_meta.pinned_object_count = page_meta.pinned_object_count.saturating_add(1);
-            }
+            page_meta.pinned_bytes = page_meta.pinned_bytes.saturating_add(page_count(bytes));
+            page_meta.pinned_object_count = page_meta.pinned_object_count.saturating_add(1);
             page_meta.refresh_policy_bits();
         }
     });
@@ -1694,7 +1761,10 @@ fn old_arena_ranges(movable_only: bool) -> Vec<(usize, usize, usize, usize)> {
                 if block.data.is_null() || block.size == 0 {
                     return None;
                 }
-                if movable_only && matches!(block.extent_kind, super::region::Kind::LargeObject) {
+                if movable_only
+                    && (matches!(block.extent_kind, super::region::Kind::CollectingHolder)
+                        || matches!(block.extent_kind, super::region::Kind::LargeObject))
+                {
                     return None;
                 }
                 let base = block.data as usize;
@@ -1950,7 +2020,7 @@ pub(crate) fn old_page_meta_for_tests(page: usize) -> Option<OldPageMeta> {
 pub(crate) fn page_meta_census() -> Vec<crate::gc::census::SideTableRow> {
     use crate::gc::census::hash_table_bytes;
     let mut rows = Vec::new();
-    PAGE_GENERATIONS.with(|m| {
+    with_page_generations(|m| {
         let m = m.borrow();
         rows.push((
             "arena.page_generations",

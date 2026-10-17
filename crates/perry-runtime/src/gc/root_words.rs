@@ -276,6 +276,9 @@ pub(super) fn mark_precise_root_in_scope(
 ) -> bool {
     let Some(addr) = root.address() else {
         if let PreciseRoot::JSValue(bits) = root {
+            if bits & TAG_MASK == crate::value::HANDLE_TAG {
+                observe_handle_root(bits, valid_ptrs);
+            }
             verify_jsvalue_root_word(bits, "scanned");
         }
         return false;
@@ -283,6 +286,12 @@ pub(super) fn mark_precise_root_in_scope(
     // A tagged handle is a root of its provider's JSValue edges, not a GC
     // allocation. Decode the source first so numeric bits cannot observe ids.
     if crate::value::addr_class::is_handle_band(addr) {
+        #[cfg(any(test, perry_check_contracts))]
+        if let PreciseRoot::JSValue(bits) = root {
+            if precise_root_verification() {
+                super::verify_honest::verify_honest_root_word(bits);
+            }
+        }
         if super::full_trace::handle_trace_active() {
             super::full_trace::observe_handle(root.bits(), valid_ptrs);
         }
@@ -297,6 +306,16 @@ pub(super) fn mark_precise_root_in_scope(
         return false;
     };
     unsafe { mark_admitted_root_header(header, write_scope.is_some()) }
+}
+
+/// A `HANDLE_TAG` root names its provider's JSValue edges, not a GC
+/// allocation. Out of line: every inlined root marker shares one copy.
+#[cold]
+#[inline(never)]
+fn observe_handle_root(bits: u64, valid_ptrs: &ValidPointerSet) {
+    if super::full_trace::handle_trace_active() {
+        super::full_trace::observe_handle(bits, valid_ptrs);
+    }
 }
 
 /// Shade an admitted header. A root write never re-shades a forwarding alias.

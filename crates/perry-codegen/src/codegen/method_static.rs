@@ -178,6 +178,13 @@ pub(in crate::codegen) fn compile_static_method(
     for p in &f.params {
         local_types.insert(p.id, p.ty.clone());
     }
+    // The body's one seed set (`typed_locals::outer_proofs`); no captures.
+    let outer_proofs = crate::collectors::typed_locals::outer_proofs(
+        None,
+        &cross_module.definite_init,
+        Some(f.id),
+    );
+    crate::collectors::typed_locals::seed_local_types(&outer_proofs, &mut local_types);
 
     let clamp_fn_ids: std::collections::HashSet<u32> = cross_module
         .clamp3_functions
@@ -249,6 +256,10 @@ pub(in crate::codegen) fn compile_static_method(
         locals,
         local_types,
         proven_local_types: std::collections::HashMap::new(),
+        typed_locals: crate::collectors::typed_locals::outer_only(&outer_proofs),
+        code_unit_locals: std::collections::HashSet::new(),
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -270,10 +281,15 @@ pub(in crate::codegen) fn compile_static_method(
         pending_labels: Vec::new(),
         classes,
         class_hierarchy: &cross_module.class_hierarchy,
+        wpfacts: cross_module.wpfacts.clone(),
+        program_layouts: cross_module.program_layouts.clone(),
+        wpfacts_sites: 0,
+        wpfacts_tested: Vec::new(),
+        wpfacts_this: Vec::new(),
         this_stack: vec![this_slot],
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: false,
+        lexical_this_uses_derived_binding: None,
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         // A static method's `this` is the class constructor (bound above to
@@ -335,6 +351,7 @@ pub(in crate::codegen) fn compile_static_method(
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
+        constructed_kind_locals: HashMap::new(),
         namespace_imports: &cross_module.namespace_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
         namespace_member_nested: &cross_module.namespace_member_nested,
@@ -359,6 +376,7 @@ pub(in crate::codegen) fn compile_static_method(
         imported_class_original_names: &cross_module.imported_class_original_names,
         interfaces: &cross_module.interfaces,
         try_depth: 0,
+        derived_super_closes: Vec::new(),
         pending_declares: Vec::new(),
         pending_helpers: Vec::new(),
         array_record_length_local: None,
@@ -413,6 +431,8 @@ pub(in crate::codegen) fn compile_static_method(
         spec_ta_ready: std::collections::HashSet::new(),
         spec_i32_params: std::collections::HashSet::new(),
         spec_bool_params: std::collections::HashSet::new(),
+        typed_element_locals: std::collections::HashSet::new(),
+        class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -489,7 +509,6 @@ pub(in crate::codegen) fn compile_static_method(
         was_unrolled: f.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
-        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

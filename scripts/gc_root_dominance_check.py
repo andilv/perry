@@ -158,7 +158,7 @@ _CONTINUATION_HEAD_RE = re.compile(
 CALL_RE = re.compile(r"\b(?:call|invoke)\s+[^@]*@([\w.$]+)\(")
 BIND_RE = re.compile(r"call void @js_shadow_slot_bind\(i32 (\d+), ptr %([\w.$]+)\)")
 CLEAR_RE = re.compile(r"call void @js_shadow_slot_set\(i32 (\d+), i64 0\)")
-STORE_RE = re.compile(r"^\s*store\s+([\w\[\]x* ]+?)\s+([^,]+),\s*ptr %([\w.$]+)")
+STORE_RE = re.compile(r"^\s*store\s+(?:volatile\s+)?([\w\[\]x* ]+?)\s+([^,]+),\s*ptr %([\w.$]+)")
 # All CFG-edge readers use the same token grammar as LABEL_RE. A narrower
 # branch regex drops the edge rather than failing, which makes reachable blocks
 # look dead and can turn a real dominance violation into a clean result.
@@ -532,6 +532,10 @@ NONCOLLECTING = {
     "js_object_get_class_id", "js_object_get_own_field_or_undef",
     "js_object_mark_class", "js_class_object_pin_parent",
     "js_new_target_get", "js_new_target_set",
+    # object/this_binding.rs -- the compiled `new` bridge: swaps the cell and
+    # pushes/pops the displaced value on a Rust Vec (the bridge stack, a
+    # scanned root). No Perry allocation, no user code, no poll.
+    "js_new_target_enter", "js_new_target_leave",
     # closure/unbox.rs:25 -- a tag check on the NaN-boxed callee and a low-48
     # mask. No allocation, no user code, no poll. It sits between every
     # dynamic call's last argument and its `js_closure_callN`, so leaving it
@@ -757,7 +761,15 @@ _EXTERN_C_FN_RE = re.compile(r'extern\s+"C(?:-unwind)?"\s+fn\s+(js_\w+)')
 _MACRO_ITEM_OPEN_RE = re.compile(r'^(?:\w+::)*\w+!\s*[({]')
 _MACRO_ITEM_INLINE_RE = re.compile(
     r'^(?:\w+::)*\w+!\s*[({]\s*(js_\w+)\s*(?:=>|[,)])')
+# Export declarations can put a receiver-kind token before a literal fn.
+# Read the declaration shape rather than listing the seven generated names.
+_MACRO_ITEM_FN_RE = re.compile(
+    r'(?m)^(?:\w+::)*\w+!\s*[({]\s*(?:\w+\s*,\s*)?fn\s+(js_\w+)\s*\(')
 _MACRO_ITEM_ARG_RE = re.compile(r'^[ \t]+(js_\w+)\s*(?:=>|[,)])')
+# A checked/body declaration names two exports, with the shared operation
+# after '='. Recognize its syntax, independent of the macro or method name.
+_MACRO_ITEM_PAIR_RE = re.compile(
+    r'^[ \t]*(js_\w+)\s*/\s*(js_\w+)\s*=')
 
 # The runtime crates that export the C-ABI surface perry-codegen calls.
 SYMBOL_ROOTS = (
@@ -766,6 +778,12 @@ SYMBOL_ROOTS = (
     # of perry-stdlib. --verify-symbols found 47 otherwise invisible exports.
     "crates/perry-ext-zlib/src",
 )
+
+
+def _macro_declaration_code(text):
+    """Mask ordinary strings/comments without shifting declaration positions."""
+    mask = lambda match: re.sub(r"[^\n]", " ", match.group(0))
+    return _STRING_LIT_RE.sub(mask, _LINE_COMMENT_RE.sub(mask, text))
 
 
 def _macro_defined_symbols(text):
@@ -778,7 +796,7 @@ def _macro_defined_symbols(text):
           /// doc
           js_path_basename_ext_value => super::js_path_basename_ext, ..);
     """
-    out, lines, i = set(), text.split("\n"), 0
+    out, lines, i = set(_MACRO_ITEM_FN_RE.findall(_macro_declaration_code(text))), _macro_declaration_code(text).split("\n"), 0
     while i < len(lines):
         if not _MACRO_ITEM_OPEN_RE.match(lines[i]):
             i += 1
@@ -791,6 +809,10 @@ def _macro_defined_symbols(text):
             stripped = re.sub(r'//.*', '', lines[j])
             depth += (stripped.count('(') + stripped.count('{')
                       - stripped.count(')') - stripped.count('}'))
+            pair_line = stripped[_MACRO_ITEM_OPEN_RE.match(stripped).end():] if j == i else stripped
+            pair = _MACRO_ITEM_PAIR_RE.match(pair_line)
+            if pair:
+                out.update(pair.groups())
             if j > i:
                 arg = _MACRO_ITEM_ARG_RE.match(lines[j])
                 if arg:
@@ -839,6 +861,15 @@ def _c_symbol_bodies(roots):
                     body = _balanced_body(src, match.end() - 1)
                     if body is not None:
                         yield match.group(1), body
+
+
+def _macro_function_bodies(text):
+    """Literal function bodies supplied to item-position export macros."""
+    code = _macro_declaration_code(text)
+    for match in _MACRO_ITEM_FN_RE.finditer(code):
+        body = _balanced_body(code, match.end())
+        if body is not None:
+            yield match.group(1), body
 
 
 def _macro_rule_bodies(text):
@@ -1079,6 +1110,14 @@ _NON_DEFINING_MACROS = frozenset((
 _INDENTED_MACRO_RE = re.compile(
     r'^[ \t]+(?:\w+::)*(\w+)!\s*[({]\s*(js_\w+)\s*(?:=>|[,)])')
 
+_INDENTED_MACRO_FN_RE = re.compile(
+    r'(?m)^[ \t]+(?:\w+::)*(\w+)!\s*[({]\s*'
+    r'(?:\w+\s*,\s*)?fn\s+(js_\w+)\s*\(')
+
+_INDENTED_MACRO_PAIR_RE = re.compile(
+    r'(?m)^[ \t]+(?:\w+::)*(\w+)!\s*[({]\s*'
+    r'(js_\w+)\s*/\s*(js_\w+)\s*=')
+
 
 def indented_macro_exports(roots=SYMBOL_ROOTS):
     """`[(path, lineno, macro, symbol)]` for INDENTED macro calls naming a `js_*`.
@@ -1099,6 +1138,15 @@ def indented_macro_exports(roots=SYMBOL_ROOTS):
             m = _INDENTED_MACRO_RE.match(line)
             if m and m.group(1) not in _NON_DEFINING_MACROS:
                 hits.append((path, lineno, m.group(1), m.group(2)))
+        for m in _INDENTED_MACRO_FN_RE.finditer(_macro_declaration_code(src)):
+            if m.group(1) not in _NON_DEFINING_MACROS:
+                hits.append((path, src.count("\n", 0, m.start()) + 1,
+                             m.group(1), m.group(2)))
+        for m in _INDENTED_MACRO_PAIR_RE.finditer(_macro_declaration_code(src)):
+            if m.group(1) not in _NON_DEFINING_MACROS:
+                for sym in m.group(2, 3):
+                    hits.append((path, src.count("\n", 0, m.start()) + 1,
+                                 m.group(1), sym))
     return sorted(hits)
 
 
@@ -1339,6 +1387,8 @@ def runtime_symbol_bodies(roots=SYMBOL_ROOTS):
                 # call-graph walk sees the calls it makes instead of treating it
                 # as a leaf that reaches nothing -- which is the same silent
                 # under-count in a different coat.
+                for sym, body in _macro_function_bodies(src):
+                    bodies[sym].append(_strip_noncode(body))
                 for sym in _macro_defined_symbols(src):
                     for macro_body in _macro_rule_bodies(src):
                         bodies[sym].append(macro_body)
@@ -1724,6 +1774,10 @@ POLL_CAPABLE_RUNTIME = {
     "js_jsvalue_to_string_method", "js_jsvalue_to_string_radix",
     "js_string_coerce", "js_string_coerce_method_this",
     "js_number_coerce", "js_object_coerce",
+    # Full string argument coercion/validation can invoke user code. The
+    # number/string-only entries used after coercion are deliberately absent.
+    "js_string_index_to_i32", "js_string_end_index_to_i32", "js_string_number_coerce",
+    "js_string_search_value_to_string", "js_string_resolve_collator_args",
     # #10762: the NaN-box-returning twins the `String(x)`, `${x}` and
     # `x.toString()` lowerings call instead. Each forwards every non-number,
     # non-string argument to its pointer-returning original above, so each can
@@ -2900,7 +2954,7 @@ GLOBAL_ROOT_RE = re.compile(r"@perry_global_[\w.$]+")
 #
 # One definition, both modes, so the next reader cannot re-derive half of it.
 REWRITTEN_LOAD_RE = re.compile(
-    r"load\s+\S+,\s*ptr\s+@(?:"
+    r"load\s+(?:volatile\s+)?\S+,\s*ptr\s+@(?:"
     r"(?P<strhandle>[\w.$]*_\.str\.\d+\.handle)"   # string-literal handles
     r"|(?P<global>perry_global_[\w.$]+)"           # module-level variables
     r"|(?P<classkeys>perry_class_keys_[\w.$]+)"    # class keys (old-gen, C4b movable)
@@ -3030,7 +3084,7 @@ def heap_source_kind(ins, slot_of_alloca):
         kind = rewritten_load_kind(ins.text)
         if kind is not None:
             return kind
-        m = re.search(r"load\s+(?:i64|double)\s*,\s*ptr %([\w.$]+)", ins.text)
+        m = re.search(r"load\s+(?:volatile\s+)?(?:i64|double)\s*,\s*ptr %([\w.$]+)", ins.text)
         if m and m.group(1) in slot_of_alloca:
             return "slotload"
     return None
@@ -3702,9 +3756,9 @@ def _is_heap_source(ins, **kw):
 # whose address escapes leaves the report standing. The self-test plants each.
 FLAG_SEARCH_BUDGET = 400_000
 _FLAG_LOAD_RE = re.compile(
-    r"^\s*%([\w.$]+)\s*=\s*load\s+i1,\s*ptr\s+%([\w.$]+)\s*(?:,.*)?$")
+    r"^\s*%([\w.$]+)\s*=\s*load\s+(?:volatile\s+)?i1,\s*ptr\s+%([\w.$]+)\s*(?:,.*)?$")
 _FLAG_STORE_RE = re.compile(
-    r"^\s*store\s+i1\s+([^,]+),\s*ptr\s+%([\w.$]+)\s*(?:,.*)?$")
+    r"^\s*store\s+(?:volatile\s+)?i1\s+([^,]+),\s*ptr\s+%([\w.$]+)\s*(?:,.*)?$")
 _I1_LOGIC_RE = re.compile(
     r"^\s*%[\w.$]+\s*=\s*(and|or|xor)\s+i1\s+([^,\s]+),\s*([^,\s]+)\s*$")
 
@@ -5040,6 +5094,176 @@ def check_func_statepoints(module, f, want_moving_only=False,
 
             if hit is not None:
                 out.append(hit)
+
+    out.extend(_tracked_across_statepoint(module, f, def_of, tracked,
+                                          use_graph, idom, poll_reaching,
+                                          want_moving_only))
+    return out
+
+
+_AS1_BASE_CAST_RE = re.compile(
+    r"=\s*(?:inttoptr|bitcast|addrspacecast)\b(.*)\bto\s+ptr\s+addrspace\(1\)\s*$")
+_AS1_SELECT_RE = re.compile(r"=\s*select\s+[^,]+,\s*ptr\s+addrspace\(1\)\s+(\S+),"
+                            r"\s*ptr\s+addrspace\(1\)\s+(\S+)\s*$")
+
+
+def _constant_based(reg, def_of, memo, visiting=None):
+    """Is every base `reg` can carry a CONSTANT, so RS4GC never relocates it?
+
+    Followed through `phi`, `select`, `freeze`, a pointer cast and a `gep`'s
+    base, which are the forms RS4GC's own base-pointer search looks through.
+    A cast of a REGISTER into the tracked domain is a base of its own — the
+    raw-word re-entry — and answers False. Unreadable forms answer False, so
+    a gap here reports a hazard rather than hiding one. A phi cycle back to a
+    register still being resolved contributes nothing either way; only the
+    top-level answer is memoized, so no optimistic assumption leaks out.
+    """
+    if reg in memo:
+        return memo[reg]
+    top = visiting is None
+    if top:
+        visiting = set()
+    elif reg in visiting:
+        return True
+    visiting.add(reg)
+
+    def const(text):
+        text = text.strip()
+        if not text.startswith("%"):
+            return not operand_regs(text)
+        return _constant_based(text[1:], def_of, memo, visiting)
+
+    ins = def_of.get(reg)
+    ok = False
+    if ins is not None and ins.callee is None:
+        body = ins.text.split(" = ", 1)[-1].strip()
+        if body.startswith("phi "):
+            edges = phi_incoming(ins)
+            if edges and len(edges) == body.count("["):
+                ok = all(const(v) for v, _p in edges)
+        elif body.startswith("freeze "):
+            ok = all(const("%" + r) for r in operand_regs(ins.text))
+        elif body.startswith("getelementptr"):
+            m = re.search(r"ptr\s+addrspace\(1\)\s+(%[\w.$]+|[^%,\s][^,]*?),",
+                          body)
+            ok = m is not None and const(m.group(1))
+        else:
+            m = _AS1_SELECT_RE.search(ins.text)
+            if m:
+                ok = const(m.group(1)) and const(m.group(2))
+            else:
+                m = _AS1_BASE_CAST_RE.search(ins.text)
+                ok = m is not None and not operand_regs(m.group(1))
+    if top:
+        memo[reg] = ok
+    return ok
+
+
+def _tracked_across_statepoint(module, f, def_of, tracked, use_graph, idom,
+                               poll_reaching, want_moving_only):
+    """A `ptr addrspace(1)` register used, un-relocated, below a safepoint.
+
+    Everything above stops at the tracked line on the premise that "LLVM owns
+    it": RS4GC relocates a tracked register at every safepoint it is live
+    across and rewrites every use below to the `gc.relocate`. That premise is
+    a property of the IR, not of the type, so it is CHECKED here rather than
+    assumed. In conforming RS4GC output this finds nothing: the original
+    register's last use is at or above the safepoint, and everything below
+    names the relocation. A use of the ORIGINAL register below a safepoint is
+    a pointer the collector may have moved (or, outside the bundle, never
+    seen at all):
+
+      unrooted  the safepoint's "gc-live" bundle does not name it (or any
+                tracked register it was cast from), so nothing marks or
+                rewrites the object;
+      stale     the bundle names it, the object survives and is relocated,
+                but this use reads the pre-move register instead of the
+                relocate.
+
+    Without this, a raw word that RE-ENTERS the tracked domain
+    (`inttoptr ... to ptr addrspace(1)`) and is then used across a safepoint
+    is invisible: the untracked chain stops at the re-entry, and the tracked
+    register was taken on trust. That is the shape `--seeded-violations`
+    planted at `stack_guard.ok.1` in zod's classic/compat.ts and the gate
+    reported 39/40.
+
+    A phi operand is checked on its own incoming edge, the window ending at
+    that predecessor's terminator, as `_phi_edge_hazard` does.
+    """
+    statepoint_blocks = {b for b in f.blocks
+                         if any(i.is_statepoint for i in f.insns[b])}
+    if not statepoint_blocks:
+        return []
+    between_cache = {}
+
+    def window_statepoints(A, B):
+        if A.block == B.block:
+            return [c for c in f.insns[A.block]
+                    if c.is_statepoint and A.idx < c.idx < B.idx]
+        hits = [c for c in f.insns[A.block]
+                if c.is_statepoint and c.idx > A.idx]
+        hits += [c for c in f.insns[B.block]
+                 if c.is_statepoint and c.idx < B.idx]
+        key = (A.block, B.block)
+        mids = between_cache.get(key)
+        if mids is None:
+            mids = [c for m in between_blocks(f, A.block, B.block)
+                    if m in statepoint_blocks
+                    for c in f.insns[m] if c.is_statepoint]
+            between_cache[key] = mids
+        return hits + mids
+
+    users = defaultdict(list)
+    for b in f.blocks:
+        for ins in f.insns[b]:
+            for r in operand_regs(ins.text):
+                if r in tracked:
+                    users[r].append(ins)
+
+    constant_memo = {}
+    out = []
+    for reg in sorted(users):
+        src = def_of.get(reg)
+        if src is None:
+            continue
+        if _constant_based(reg, def_of, constant_memo):
+            # RS4GC relocates a value through its BASE; a value whose every
+            # base is a constant (`null`, `inttoptr (i64 C to ptr
+            # addrspace(1))` — perry's NaN-boxed `undefined` or a number in
+            # pointer clothing) names no heap object and is never relocated.
+            continue
+        as1 = None
+        for use in users[reg]:
+            if use is src:
+                continue
+            if _is_phi(use):
+                ends = [Insn("", p, len(f.insns[p]))
+                        for v, p in phi_incoming(use)
+                        if v.strip() == "%" + reg and p in f.insns
+                        and dominates(idom, src.block, p)]
+            elif dominates(idom, src.block, use.block) and not (
+                    use.block == src.block and use.idx <= src.idx):
+                ends = [use]
+            else:
+                ends = []
+            for end in ends:
+                sps = window_statepoints(src, end)
+                if not sps:
+                    continue
+                if as1 is None:
+                    as1 = _cast_closure(use_graph, _back_closure(def_of, reg),
+                                        tracked, stop_at_tracked=False) & tracked
+                    as1.add(reg)
+                rooted = any(as1 & set(sp.live) for sp in sps)
+                v = StatepointHazard(module, f.name, src, "tracked", use, sps,
+                                     rooted, poll_reaching)
+                if want_moving_only and not v.moving:
+                    continue
+                out.append(v)
+                break
+            else:
+                continue
+            break
     return out
 
 
@@ -5322,6 +5546,13 @@ def _sp_seed_sites(lines):
                     aliases.add(probe.result)
                 continue
             if probe.result == reg:
+                continue
+            # Float arithmetic and ordered compares prove the operand is a
+            # raw number (`use_proves_numeric`), and the checker exempts
+            # exactly those uses. A safepoint planted above one is not a
+            # violation, so a non-report there is CORRECT and must not count
+            # as a miss; look past it for a use the checker does read.
+            if use_proves_numeric(text):
                 continue
             use_at = j
             break
@@ -5657,6 +5888,92 @@ join.2:
 }
 """.replace("__SAFEPOINT__", _sp())
 
+# ★ A raw word that RE-ENTERS the tracked domain, in the stack-guard prologue
+# every perry function opens with — the shape `--seeded-violations` missed in
+# zod's classic/compat.ts (39/40). The parameter is laundered out through the
+# tied-register identity, boxed, and cast back IN with `inttoptr`; the
+# re-entered `ptr addrspace(1)` register is then used below a safepoint. The
+# untracked chain stops at the re-entry, so before `_tracked_across_statepoint`
+# nothing looked at the tracked register's own uses at all.
+#
+# `__SAFEPOINT__` / `__USE__` vary per arm:
+#   clean     no safepoint (the corpus's real shape: the seeder's subject)
+#   unrooted  a safepoint with an EMPTY bundle, the original register used
+#   stale     the bundle names it and relocates it, the ORIGINAL still used
+#   rooted    the bundle names it and the use reads the RELOCATION (control)
+_SELFTEST_SP_STACK_GUARD_REENTRY = """\
+define double @perry_fn_selftest__sp_stack_guard_reentry(double %a) gc "statepoint-example" {
+entry.0:
+  %rs4gc.b1 = bitcast double %a to i64
+  %rs4gc.s1 = inttoptr i64 %rs4gc.b1 to ptr addrspace(1)
+  %lim = load ptr, ptr getelementptr inbounds nuw (i8, ptr @PERRY_AGENT_PTRS, i64 16), align 8
+  %spr = call i64 @llvm.read_register.i64(metadata !0)
+  %limw = ptrtoint ptr %lim to i64
+  %ovf = icmp ult i64 %spr, %limw
+  br i1 %ovf, label %stack_guard.overflow.2, label %stack_guard.ok.1
+
+stack_guard.ok.1:                                 ; preds = %entry.0
+  %w.rs4o = call i64 asm "", "=r,0"(ptr addrspace(1) %rs4gc.s1) #12
+  %w = bitcast i64 %w.rs4o to double
+  %rs4gc.b2 = bitcast double %w to i64
+  %rs4gc.s2 = inttoptr i64 %rs4gc.b2 to ptr addrspace(1)
+__SAFEPOINT__
+  %u.rs4o = call i64 asm "", "=r,0"(ptr addrspace(1) __USE__) #12
+  %r = call double @js_object_get_field_by_name_f64(i64 %u.rs4o, i64 0)
+  ret double %r
+
+stack_guard.overflow.2:                           ; preds = %entry.0
+  %tok.ovf = call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0(i64 2882400000, i32 0, ptr elementtype(void ()) @js_stack_overflow, i32 0, i32 0, i32 0, i32 0)
+  unreachable
+}
+"""
+_SP_RELOC_S2 = ("\n  %rs4gc.s2.relocated = call coldcc ptr addrspace(1) "
+                "@llvm.experimental.gc.relocate.p1(token %tok, i32 0, i32 0)")
+
+
+def _stack_guard_reentry(arm):
+    sp, use = {
+        "clean": ("", "%rs4gc.s2"),
+        "unrooted": (_sp(), "%rs4gc.s2"),
+        "stale": (_sp(live=("rs4gc.s2",)) + _SP_RELOC_S2, "%rs4gc.s2"),
+        "rooted": (_sp(live=("rs4gc.s2",)) + _SP_RELOC_S2,
+                   "%rs4gc.s2.relocated"),
+    }[arm]
+    text = _SELFTEST_SP_STACK_GUARD_REENTRY.replace("__USE__", use)
+    if not sp:
+        return text.replace("__SAFEPOINT__\n", "")
+    return text.replace("__SAFEPOINT__", sp)
+
+
+# A tracked phi whose every incoming value is a CONSTANT (`inttoptr (i64 C to
+# ptr addrspace(1))`: perry's NaN-boxed `undefined`, a number) has no heap
+# base, so RS4GC never relocates it and its use below a safepoint is correct —
+# the shape test_gap_new_local_shadows_class's `main` produced the first time
+# `_tracked_across_statepoint` ran over the curated corpus. `__EDGE__` is the
+# second incoming value: a constant (clean) or a register re-entering the
+# tracked domain (a real base, so the use is an unrooted hazard).
+_SELFTEST_SP_CONSTANT_PHI = """\
+define double @perry_fn_selftest__sp_constant_phi(i1 %c, i64 %x) gc "statepoint-example" {
+entry.0:
+  br i1 %c, label %a.1, label %b.2
+
+a.1:                                              ; preds = %entry.0
+  br label %join.3
+
+b.2:                                              ; preds = %entry.0
+  %re = inttoptr i64 %x to ptr addrspace(1)
+  br label %join.3
+
+join.3:                                           ; preds = %b.2, %a.1
+  %k = phi ptr addrspace(1) [ inttoptr (i64 9222246136947933185 to ptr addrspace(1)), %a.1 ], [ __EDGE__, %b.2 ]
+__SAFEPOINT__
+  %w = call i64 asm "", "=r,0"(ptr addrspace(1) %k) #12
+  %r = bitcast i64 %w to double
+  ret double %r
+}
+""".replace("__SAFEPOINT__", _sp())
+
+
 # A `define` whose name this parser cannot read must RAISE, not be skipped.
 _SELFTEST_SP_BAD_DEFINE = """\
 define double @<mangled>(double %a) {
@@ -5838,6 +6155,40 @@ def statepoint_self_test():
                       file=sys.stderr)
                 ok = False
 
+        # A Number reload whose first use is float arithmetic: the checker
+        # exempts that use (`use_proves_numeric`), so the mutator must not
+        # plant above it -- the correct non-report would count as a miss
+        # (Closed World 5d's Number comparator bodies, 4 of 40 seeds). With a
+        # real use further down it plants above that one; with none, there
+        # is no site at all.
+        text = Path(paths["reloaded"]).read_text()
+        text = re.sub(
+            r"ptrtoint ptr addrspace\(1\) (%[\w.$]+) to i64",
+            r'call i64 asm "", "=r,0"(ptr addrspace(1) \1)', text)
+        numeric_first = text.replace(
+            "  %r = call double",
+            "  %raw.box = bitcast i64 %raw to double\n"
+            "  %raw.num = fsub double %raw.box, 1.000000e+00\n"
+            "  %r = call double").splitlines()
+        sites = [at for at, _ in _sp_seed_sites(numeric_first)]
+        if [numeric_first[at].lstrip()[:7] for at in sites] != ["%r = ca"]:
+            print("self-test FAIL: numeric-first reload seeded at "
+                  f"{[numeric_first[at] for at in sites]}", file=sys.stderr)
+            ok = False
+        numeric_only = text.replace(
+            "  %r = call double @js_object_get_field_by_name_f64(i64 %raw, i64 0)",
+            "  %raw.box = bitcast i64 %raw to double\n"
+            "  %r = fsub double %raw.box, 1.000000e+00").splitlines()
+        if "fsub" not in "\n".join(numeric_only):
+            print("self-test FAIL: numeric-only fixture did not build",
+                  file=sys.stderr)
+            ok = False
+        sites = [numeric_only[at] for at, _ in _sp_seed_sites(numeric_only)]
+        if sites:
+            print(f"self-test FAIL: numeric-only reload seeded at {sites}",
+                  file=sys.stderr)
+            ok = False
+
         # --- the two classes, and the control -----------------------------
         for name, want_class in (("unrooted", "unrooted"), ("stale", "stale")):
             hits = _scan_statepoints([paths[name]], moving_only=True)
@@ -5936,6 +6287,92 @@ def statepoint_self_test():
                   f"{[(h.kind_class, h.kind) for h in hits]}. If this is 0, "
                   "the false-positive fix above also deleted the mode's "
                   "ability to see a genuine phi-mediated hazard.",
+                  file=sys.stderr)
+            ok = False
+
+        # #12538: the same unrelocated live GC value across each coercing
+        # entry must be moving; its scalar/string-only twin is the control.
+        for entry, twin, signature, operands, argc in (
+                ("js_string_index_to_i32", "js_string_number_index_to_i32",
+                 "i32 (double)", "double 0.0", 1),
+                ("js_string_end_index_to_i32", "js_string_number_end_index_to_i32",
+                 "i32 (double, i32)", "double 0.0, i32 7", 2),
+                ("js_string_search_value_to_string", "js_string_search_string_to_string",
+                 "ptr (double, i32)", "double 0.0, i32 0", 2),
+                ("js_string_resolve_collator_args", None,
+                 "i32 (double, double)", "double 0.0, double 0.0", 2)):
+            def fixture_for(arm, callee):
+                text = _stack_guard_reentry(arm).replace(
+                    "@js_gc_loop_safepoint", "@" + callee)
+                sig, ops, n = signature, operands, argc
+                if callee == "js_string_search_string_to_string":
+                    sig, ops, n = "double (double)", "double 0.0", 1
+                return text.replace(
+                    "elementtype(void ()) @" + callee + ", i32 0, i32 0, i32 0, i32 0",
+                    "elementtype(" + sig + ") @" + callee
+                    + f", i32 {n}, i32 0, {ops}, i32 0, i32 0")
+            for callee, count in ((entry, 1), (twin, 0)):
+                if callee is None:
+                    continue
+                p = os.path.join(td, "sp_string_coercion.ll")
+                fixture = fixture_for("unrooted", callee)
+                Path(p).write_text(fixture)
+                hits = _scan_statepoints([p], moving_only=True)
+                if len(hits) != count:
+                    print(f"self-test FAIL: {callee} live across coercion: "
+                          f"{len(hits)} hazards, expected {count}", file=sys.stderr)
+                    ok = False
+            p = os.path.join(td, "sp_string_coercion_relocated.ll")
+            Path(p).write_text(fixture_for("rooted", entry))
+            if _scan_statepoints([p], moving_only=True):
+                print(f"self-test FAIL: {entry} relocated control", file=sys.stderr)
+                ok = False
+
+        # ★★ Re-entry into the tracked domain, in the stack-guard prologue
+        # (the 39/40 seeded miss in zod's classic/compat.ts). Four arms that
+        # differ only in the safepoint's bundle and which register the use
+        # reads, plus the real-corpus seeder run over the clean arm: it plants
+        # an unbundled safepoint between the re-entered register and its use,
+        # which the unfixed checker did not report.
+        sg = {}
+        for arm in ("clean", "unrooted", "stale", "rooted"):
+            p = os.path.join(td, f"sp_stack_guard_{arm}.ll")
+            Path(p).write_text(_stack_guard_reentry(arm))
+            sg[arm] = _scan_statepoints([p], moving_only=True)
+        for arm, want in (("clean", None), ("rooted", None),
+                          ("unrooted", "unrooted"), ("stale", "stale")):
+            got = [(h.kind_class, h.kind) for h in sg[arm]]
+            if (want is None and got) or (want is not None
+                                          and got != [(want, "tracked")]):
+                print(f"self-test FAIL: stack-guard re-entry arm {arm!r} must "
+                      f"report {[(want, 'tracked')] if want else []}, got "
+                      f"{got}. A `ptr addrspace(1)` register used below a "
+                      "safepoint without going through its relocation is "
+                      "a pointer the collector moved (stale) or never saw "
+                      "(unrooted); RS4GC's output never contains one, so "
+                      "trusting the type instead of checking the uses hides "
+                      "exactly the value that re-entered the tracked domain.",
+                      file=sys.stderr)
+                ok = False
+        for edge, want in (
+                ("inttoptr (i64 4621256167635550208 to ptr addrspace(1))", []),
+                ("%re", [("unrooted", "tracked")])):
+            p = os.path.join(td, "sp_constant_phi.ll")
+            Path(p).write_text(_SELFTEST_SP_CONSTANT_PHI.replace("__EDGE__", edge))
+            got = [(h.kind_class, h.kind)
+                   for h in _scan_statepoints([p], moving_only=True)]
+            if got != want:
+                print(f"self-test FAIL: a tracked phi over {edge!r} must report "
+                      f"{want}, got {got}. A value whose every base is a "
+                      "constant is never relocated, so its use below a "
+                      "safepoint is correct; one register base makes it a "
+                      "real pointer again.", file=sys.stderr)
+                ok = False
+        if seeded_statepoint_test(
+                [os.path.join(td, "sp_stack_guard_clean.ll")], True, 1):
+            print("self-test FAIL: a safepoint seeded between a re-entered "
+                  "tracked register and its use in the stack-guard block went "
+                  "unreported -- the zod classic/compat.ts 39/40 miss.",
                   file=sys.stderr)
             ok = False
 
@@ -6383,6 +6820,22 @@ entry.0:
                   file=sys.stderr)
             ok = False
 
+        # Production shadow roots are volatile stores. The qualifier is
+        # not the LLVM value type: swallowing it as the type made the value
+        # parse as "ptr %obj" and silently skipped both planted hazards.
+        for name, fixture, expected in (
+            ("volatile_planted", _SELFTEST_PLANTED, 2),
+            ("volatile_clean", _SELFTEST_CLEAN, 0),
+        ):
+            path = os.path.join(td, name + ".ll")
+            with open(path, "w") as fh:
+                fh.write(fixture.replace("store ptr ", "store volatile ptr "))
+            hits, _ = _scan([path], True, "alloc")
+            if len(hits) != expected:
+                print(f"self-test FAIL: {name}: {len(hits)} violations, "
+                      f"expected {expected}", file=sys.stderr)
+                ok = False
+
         # --- #11604: phi edges that REPLACE the value, both directions ------
         #
         # The safe join must clear, and the refinement that clears it must
@@ -6577,6 +7030,14 @@ entry.0:
                   "POLL_CAPABLE_RUNTIME. Codegen emits these and never emits "
                   "js_object_get_field_by_name, so dropping them puts the GET "
                   "half of property access back outside --moving-only.",
+                  file=sys.stderr)
+            ok = False
+        _numeric_index_coercers = {
+            "js_string_index_to_i32", "js_string_end_index_to_i32",
+        }
+        if not _numeric_index_coercers <= POLL_CAPABLE_RUNTIME:
+            print("self-test FAIL: tagged string-index coercion helpers must "
+                  f"stay poll-capable: {sorted(_numeric_index_coercers - POLL_CAPABLE_RUNTIME)}",
                   file=sys.stderr)
             ok = False
 
@@ -6940,6 +7401,15 @@ entry.0:
             ("flag_refresh_not_cleared", _SELFTEST_FLAG_REFRESH_NOT_CLEARED, 1),
             ("flag_refresh_escaped", _SELFTEST_FLAG_REFRESH_ESCAPED, 1),
             ("flag_refresh_inverted", _SELFTEST_FLAG_REFRESH_INVERTED, 1),
+        )
+        # Volatile accesses do not expose a local flag's address. Apply
+        # the same safe, sabotaged and fail-closed controls to production's
+        # volatile spelling, including the derived base's stores and loads.
+        fl_cases += tuple(
+            ("volatile_" + name,
+             text.replace("store ", "store volatile ").replace("= load ", "= load volatile "),
+             want)
+            for name, text, want in fl_cases
         )
         for name, text, want in fl_cases:
             fp = os.path.join(td, name + ".ll")
@@ -7322,6 +7792,58 @@ const char *decoy = "void js_c_string(void) { js_string_coerce(value); }";
                 or len(bodies.get('js_c_bridge', [])) != 2
                 or reaching != {'js_c_new', 'js_c_bridge'}):
             print('self-test FAIL: native C export/body/call population', file=sys.stderr)
+            ok = False
+    with tempfile.TemporaryDirectory() as native:
+        Path(native, "exports.rs").write_text("""
+kind_export! {
+    Family, fn js_macro_new(v: f64) -> f64 { js_string_coerce(v) }
+}
+kind_export! { Family, fn js_macro_leaf(v: f64) -> f64 { v } }
+fn local() {
+    kind_export! { Family, fn js_not_an_item(v: f64) -> f64 { v } }
+}
+// kind_export! { Family, fn js_prose_new(v: f64) -> f64 { v } }
+const DECOY: &str = "kind_export! { Family, fn js_text_new(v: f64) -> f64 { v } }";
+""")
+        roots = (native,)
+        names = runtime_symbols(roots)
+        bodies = runtime_symbol_bodies(roots)
+        reaching = poll_reaching_runtime_symbols(runtime_direct_callees(bodies),
+                                                  {"js_string_coerce"})
+        indented = [(macro, sym) for _, _, macro, sym in indented_macro_exports(roots)]
+        if (names != {"js_macro_new", "js_macro_leaf"}
+                or reaching != {"js_macro_new"}
+                or indented != [("kind_export", "js_not_an_item")]):
+            print("self-test FAIL: macro fn declaration/body population",
+                  file=sys.stderr)
+            ok = False
+    with tempfile.TemporaryDirectory() as native:
+        Path(native, "exports.rs").write_text("""
+macro_rules! paired_exports {
+    ($checked:ident / $body:ident = $value:expr) => {
+        pub extern "C" fn $checked(v: f64) -> f64 { js_number_coerce(v) }
+        pub extern "C" fn $body(v: f64) -> f64 { v }
+    };
+}
+paired_exports! {
+    js_pair_new / js_pair_direct = 0;
+    // js_comment_new / js_comment_direct = 0;
+}
+paired_exports! { js_inline_new / js_inline_direct = 0; }
+fn local() {
+    paired_exports! { js_not_item_new / js_not_item_direct = 0; }
+}
+const DECOY: &str = "paired_exports! { js_text_new / js_text_direct = 0; }";
+""")
+        roots = (native,)
+        names = runtime_symbols(roots)
+        reaching = poll_reaching_runtime_symbols(
+            runtime_direct_callees(runtime_symbol_bodies(roots)), {"js_number_coerce"})
+        expected = {"js_pair_new", "js_pair_direct", "js_inline_new", "js_inline_direct"}
+        indented = {sym for _, _, _, sym in indented_macro_exports(roots)}
+        if (names != expected or reaching != expected
+                or indented != {"js_not_item_new", "js_not_item_direct"}):
+            print("self-test FAIL: paired macro export/body population", file=sys.stderr)
             ok = False
     poll = {"js_object_get_field_by_name", "js_string_coerce",
             "js_number_coerce"}

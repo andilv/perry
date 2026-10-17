@@ -8,7 +8,7 @@ mod shape_inherited;
 
 /// Wall 10 — read a property a framework attached to a native registry handle
 /// via `Object.setPrototypeOf(handle, proto)` (Express's `res`/`req`). The link
-/// is keyed by the handle id in `OBJECT_PROTOTYPES`. Returns `None` (so the
+/// is keyed by the handle id in the owner property bag. Returns `None` (so the
 /// caller yields `undefined`) when no recorded prototype carries the key.
 /// Cheap when no prototype was recorded (the common handle case).
 fn handle_proto_inherited_field(
@@ -31,18 +31,17 @@ fn handle_proto_inherited_field(
 /// Both accessors are pure address computations from LLVM's point of view —
 /// `readnone`, no observable side effect — so once this code was inlined into
 /// `js_object_get_field_by_name` the optimizer hoisted BOTH out of the
-/// `is_proxy_id_band` guard above them and ran them unconditionally on every
+/// `is_proxy_cell` guard above them and ran them unconditionally on every
 /// call, proxy receiver or not. Measured on an `o[k]` loop over a two-property
 /// plain object (never a Proxy): two `_tlv_get_addr` calls sitting directly in
 /// `js_object_get_field_by_name`'s prologue, 9.2% of the whole access.
 /// `#[inline(never)]` keeps the optimizer from seeing inside this function at
-/// the call site, so it cannot hoist anything out of it; `is_proxy_id_band`
+/// the call site, so it cannot hoist anything out of it; `is_proxy_cell`
 /// itself stays inline in the caller since it touches no thread-local.
 #[cold]
 #[inline(never)]
 fn proxy_receiver_get(raw_addr: u64, key: *const crate::StringHeader) -> Option<JSValue> {
-    const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-    let boxed = f64::from_bits(POINTER_TAG | (raw_addr & 0x0000_FFFF_FFFF_FFFF));
+    let boxed = f64::from_bits(crate::value::POINTER_TAG | (raw_addr & 0x0000_FFFF_FFFF_FFFF));
     if crate::proxy::js_proxy_is_proxy(boxed) == 0 {
         return None;
     }
@@ -98,6 +97,88 @@ pub extern "C" fn js_object_get_field_by_name(
 /// out so a class function object is routed here BEFORE the closure arms of
 /// the generic read (`get_field_by_name_after_site_miss`), which it
 /// would otherwise walk end to end first.
+unsafe fn class_value_get_wtf8_field(
+    class_value: f64,
+    class_id: u32,
+    is_prototype_ref: bool,
+    key: *const crate::StringHeader,
+    name: &[u8],
+) -> JSValue {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let class_value = scope.root_nanbox_f64(class_value);
+    let key = scope.root_string_ptr(key);
+    if is_prototype_ref {
+        if super::super::native_module::class_has_own_method_bytes(class_id, name) {
+            if let Some(value) =
+                super::super::class_registry::class_method_slot_value_bytes(class_id, name)
+            {
+                return JSValue::from_bits(value);
+            }
+        }
+        if let Some((value, _)) =
+            super::super::class_registry::class_chain_getter_value_bytes(class_id, name, || {
+                class_value.get_nanbox_f64()
+            })
+        {
+            return value;
+        }
+        return key.with_const_ptr::<crate::StringHeader, _>(|key| {
+            crate::object::class_value::class_prototype_get(
+                class_id,
+                key,
+                class_value.get_nanbox_f64(),
+            )
+        });
+    }
+
+    // A capture-carrying class declaration may be referenced through its
+    // template ClassRef from an earlier-created helper closure. Runtime-added
+    // static properties live on the current evaluation's heap class object,
+    // so give that object first chance to answer the exact WTF-8 key too.
+    if let Some(class_object) = super::super::class_registry::class_object_value_for_cid(class_id) {
+        let class_object = JSValue::from_bits(class_object.to_bits());
+        if class_object.is_pointer() {
+            let class_object = class_object.as_pointer::<ObjectHeader>();
+            if !class_object.is_null() {
+                let value = key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                    js_object_get_field_by_name(class_object, key)
+                });
+                if !value.is_undefined() {
+                    return value;
+                }
+            }
+        }
+    }
+
+    if super::super::class_registry::class_static_key_deleted_bytes(class_id, name) {
+        return key.with_const_ptr::<crate::StringHeader, _>(|key| {
+            crate::object::class_value::class_prototype_get(
+                class_id,
+                key,
+                class_value.get_nanbox_f64(),
+            )
+        });
+    }
+    if let Some(value) = crate::object::class_value::class_static_get_bytes(class_id, name) {
+        return JSValue::from_bits(value.to_bits());
+    }
+    if let Some(value) =
+        crate::object::class_value::inherited_static_method_value_bytes(class_id, name)
+    {
+        return JSValue::from_bits(value.to_bits());
+    }
+    if let Some(value) = super::super::class_registry::class_static_accessor_getter_value_bytes(
+        class_id,
+        name,
+        class_value.get_nanbox_f64(),
+    ) {
+        return JSValue::from_bits(value.to_bits());
+    }
+    key.with_const_ptr::<crate::StringHeader, _>(|key| {
+        crate::object::class_value::class_prototype_get(class_id, key, class_value.get_nanbox_f64())
+    })
+}
+
 #[inline(never)]
 pub(crate) fn class_value_get_field(
     obj: *const ObjectHeader,
@@ -131,8 +212,18 @@ pub(crate) fn class_value_get_field(
     unsafe {
         let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
         let name_len = (*key).byte_len as usize;
-        let name =
-            std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)).unwrap_or("");
+        let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+        let name = std::str::from_utf8(name_bytes).unwrap_or("");
+        if name.is_empty() && !name_bytes.is_empty() {
+            let name_bytes = name_bytes.to_vec();
+            return class_value_get_wtf8_field(
+                class_value,
+                class_id,
+                is_prototype_ref,
+                key,
+                &name_bytes,
+            );
+        }
         // v0.5.752: class_ref.constructor synthesizes back to the
         // same class ref so drizzle's
         // `Object.getPrototypeOf(value).constructor === Class` chain
@@ -668,7 +759,7 @@ fn get_field_by_name_past_data_probe(
         } else {
             addr
         };
-        if crate::value::addr_class::is_proxy_id_band(raw_addr as usize) && !key.is_null() {
+        if crate::value::addr_class::is_proxy_cell(raw_addr as usize) && !key.is_null() {
             if let Some(value) = proxy_receiver_get(raw_addr, key) {
                 return value;
             }
@@ -735,9 +826,18 @@ fn get_field_by_name_past_data_probe(
         {
             let key_gc =
                 (key as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            // A POINTER_TAG receiver is honest, and its arena flag excludes
+            // the malloc-backed exotics; a raw word needs the page ownership
+            // proof before its header is read.
             if (*key_gc).gc_flags & crate::gc::GC_FLAG_INTERNED != 0
-                && crate::arena::classify_heap_generation(raw)
-                    != crate::arena::HeapGeneration::Unknown
+                && if top16 == 0x7FFD {
+                    (*((raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)).gc_flags
+                        & crate::gc::GC_FLAG_ARENA
+                        != 0
+                } else {
+                    crate::arena::classify_heap_generation(raw)
+                        != crate::arena::HeapGeneration::Unknown
+                }
             {
                 let gc_hdr =
                     (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
@@ -757,24 +857,18 @@ fn get_field_by_name_past_data_probe(
                             && ((keys as u64) >> 48) == 0
                             && crate::value::addr_class::is_above_handle_band(keys as usize)
                         {
-                            let alloc_limit = std::cmp::max(
-                                crate::object::object_live_slot_count(o),
-                                crate::object::INLINE_SLOT_FLOOR as u32,
-                            ) as usize;
+                            let alloc_limit = crate::object::object_inline_capacity(o) as usize;
                             if let Some(idx) = super::super::prop_plan::read_plan_lookup(
                                 keys as usize,
                                 key as usize,
                                 keys_view.count(),
                             ) {
-                                prime_read_stub(o, key, idx, (idx as usize) < alloc_limit);
-                                return if (idx as usize) < alloc_limit {
-                                    super::accessors::js_object_get_field(o, idx)
-                                } else {
-                                    match super::super::overflow_get(raw, idx as usize) {
-                                        Some(b) => JSValue::from_bits(b),
-                                        None => JSValue::undefined(),
-                                    }
-                                };
+                                let idx = keys_view.storage_slot(idx);
+                                if let Some(value) =
+                                    fast_lane_own_read(o, key, raw, idx, alloc_limit)
+                                {
+                                    return value;
+                                }
                             }
                             let keys_gc = (keys as *const u8).sub(crate::gc::GC_HEADER_SIZE)
                                 as *const crate::gc::GcHeader;
@@ -802,21 +896,17 @@ fn get_field_by_name_past_data_probe(
                                             key,
                                         )
                                     {
-                                        let i = i as usize;
-                                        prime_read_stub(o, key, i as u32, i < alloc_limit);
                                         super::super::prop_plan::read_plan_record(
                                             keys as usize,
                                             key as usize,
-                                            i as u32,
+                                            i,
                                         );
-                                        return if i < alloc_limit {
-                                            super::accessors::js_object_get_field(o, i as u32)
-                                        } else {
-                                            match super::super::overflow_get(raw, i) {
-                                                Some(b) => JSValue::from_bits(b),
-                                                None => JSValue::undefined(),
-                                            }
-                                        };
+                                        let i = keys_view.storage_slot(i);
+                                        if let Some(value) =
+                                            fast_lane_own_read(o, key, raw, i, alloc_limit)
+                                        {
+                                            return value;
+                                        }
                                     }
                                 }
                             }
@@ -1085,7 +1175,7 @@ fn get_field_by_name_past_data_probe(
                             b"byteOffset" => {
                                 return JSValue::number(
                                     crate::typedarray_view::js_typed_array_byte_offset(ta) as f64,
-                                )
+                                );
                             }
                             b"BYTES_PER_ELEMENT" => return JSValue::number(elem_size as f64),
                             // `(new Int8Array(…)).constructor === Int8Array`. The
@@ -1357,10 +1447,12 @@ fn get_field_by_name_past_data_probe(
             if class_id != 0 {
                 let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                 let name_len = (*key).byte_len as usize;
-                let name = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len))
-                    .unwrap_or("");
-                if !name.is_empty()
-                    && !super::super::class_registry::class_static_key_deleted(class_id, name)
+                let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+                let name = std::str::from_utf8(name_bytes).ok();
+                if !name_bytes.is_empty()
+                    && !super::super::class_registry::class_static_key_deleted_bytes(
+                        class_id, name_bytes,
+                    )
                 {
                     // A class object owns every static method its template
                     // declares (`define_class_object_own_properties`), and so
@@ -1369,15 +1461,16 @@ fn get_field_by_name_past_data_probe(
                     // DELETED from its object: it must not come back. Only a
                     // method of a shared (never-evaluated-to-an-object) class
                     // is served from the registry.
-                    if super::super::class_registry::lookup_static_method_owner(class_id, name)
-                        .is_some_and(|(owner, _)| {
-                            let object_owned =
-                                super::super::class_registry::class_object_value_for_cid(owner)
-                                    .is_some()
-                                    || owner == class_id;
-                            !object_owned
-                        })
-                    {
+                    if super::super::class_registry::lookup_static_method_owner_bytes(
+                        class_id, name_bytes,
+                    )
+                    .is_some_and(|(owner, _)| {
+                        let object_owned =
+                            super::super::class_registry::class_object_value_for_cid(owner)
+                                .is_some()
+                                || owner == class_id;
+                        !object_owned
+                    }) {
                         let heap_name = {
                             let layout =
                                 std::alloc::Layout::from_size_align(name_len.max(1), 1).unwrap();
@@ -1389,9 +1482,9 @@ fn get_field_by_name_past_data_probe(
                         return JSValue::from_bits(result.to_bits());
                     }
                     if let Some(v) =
-                        super::super::class_registry::class_static_accessor_getter_value(
+                        super::super::class_registry::class_static_accessor_getter_value_bytes(
                             class_id,
-                            name,
+                            name_bytes,
                             class_value,
                         )
                     {
@@ -1399,13 +1492,15 @@ fn get_field_by_name_past_data_probe(
                     }
                     // Fresh nested Promise subclasses inherit the same reified
                     // statics as ClassRef receivers (`P.all`, `P.resolve`, ...).
-                    if super::super::promise_parent_in_chain(class_id)
-                        && super::super::promise_static_function_spec(name).is_some()
-                    {
-                        let value =
-                            super::super::js_promise_static_function_value(name_ptr, name_len);
-                        if value.to_bits() != crate::value::TAG_UNDEFINED {
-                            return JSValue::from_bits(value.to_bits());
+                    if let Some(name) = name.filter(|name| !name.is_empty()) {
+                        if super::super::promise_parent_in_chain(class_id)
+                            && super::super::promise_static_function_spec(name).is_some()
+                        {
+                            let value =
+                                super::super::js_promise_static_function_value(name_ptr, name_len);
+                            if value.to_bits() != crate::value::TAG_UNDEFINED {
+                                return JSValue::from_bits(value.to_bits());
+                            }
                         }
                     }
                 }
@@ -1438,8 +1533,7 @@ fn get_field_by_name_past_data_probe(
         // `0` — distinguishable from a raw heap pointer because real
         // ObjectHeader allocations live above 0x10000 and from null /
         // undefined because both are NaN-boxed with top16 == 0x7FFC.
-        let is_primitive_number =
-            (top16 != 0 && !(0x7FF9..=0x7FFF).contains(&top16)) || (top16 == 0 && bits == 0);
+        let is_primitive_number = JSValue::from_bits(bits).is_number() && (top16 != 0 || bits == 0);
         if is_primitive_number {
             // #2138: auto-box the primitive number for the inherited
             // `.constructor` read so `n.constructor === Number` (and the
@@ -1494,7 +1588,7 @@ fn get_field_by_name_past_data_probe(
         let top16 = bits >> 48;
         let raw = if top16 == 0 {
             bits as usize
-        } else if top16 == 0x7FFD {
+        } else if top16 == (crate::value::HANDLE_TAG >> 48) {
             (bits & 0x0000_FFFF_FFFF_FFFF) as usize
         } else {
             0
@@ -1876,6 +1970,83 @@ mod null_key_guard_5972 {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod wtf8_class_object_forwarding_tests {
+    use super::*;
+
+    #[test]
+    fn template_class_ref_forwards_runtime_wtf8_static_properties() {
+        let _global = crate::gc::global_side_table_test_lock();
+        unsafe {
+            const CID: u32 = 62_447;
+            crate::object::js_register_class_id(CID);
+            crate::object::js_register_class_name(CID, b"LateStatic".as_ptr(), 10);
+
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let template =
+                scope.root_nanbox_f64(crate::object::class_value::js_class_value(CID as i32));
+            let class = scope.root_raw_mut_ptr(crate::object::js_object_alloc(CID, 0));
+            class
+                .with_mut_ptr::<ObjectHeader, _>(|p| crate::object::js_object_mark_class(p as i64));
+
+            for bytes in [&b"ascii"[..], &b"\xed\xa0\x80"[..], &b"\xed\xb0\x80"[..]] {
+                let key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+                    bytes.as_ptr(),
+                    bytes.len() as u32,
+                ));
+                key.with_const_ptr::<crate::StringHeader, _>(|key| {
+                    class.with_mut_ptr::<ObjectHeader, _>(|p| {
+                        crate::object::js_object_set_field_by_name(p, key, 42.0)
+                    });
+                    class.with_const_ptr::<ObjectHeader, _>(|p| {
+                        assert_eq!(
+                            js_object_get_field_by_name(p, key).as_number(),
+                            42.0,
+                            "heap class own property {bytes:?}"
+                        );
+                    });
+                    let template_ptr =
+                        crate::value::js_nanbox_get_pointer(template.get_nanbox_f64())
+                            as *const ObjectHeader;
+                    assert_eq!(
+                        js_object_get_field_by_name(template_ptr, key).as_number(),
+                        42.0,
+                        "template class ref must forward key {bytes:?}"
+                    );
+                });
+            }
+        }
+    }
+}
+
+/// The fast lane's own data read of storage slot `slot`: primes the read stub
+/// and answers the value, or `None` when the slot holds the hole (an absent
+/// optional key, `key_view`), so the generic read continues to the
+/// prototype. Out of line so the lane's caller keeps its frame.
+#[inline(never)]
+unsafe fn fast_lane_own_read(
+    o: *const ObjectHeader,
+    key: *const crate::StringHeader,
+    raw: usize,
+    slot: u32,
+    alloc_limit: usize,
+) -> Option<JSValue> {
+    let inline = (slot as usize) < alloc_limit;
+    let value = if inline {
+        super::accessors::js_object_get_field(o, slot)
+    } else {
+        match super::super::overflow_get(raw, slot as usize) {
+            Some(b) => JSValue::from_bits(b),
+            None => JSValue::undefined(),
+        }
+    };
+    if value.bits() == crate::value::TAG_HOLE {
+        return None;
+    }
+    prime_read_stub(o, key, slot, inline);
+    Some(value)
 }
 
 /// Record `(shape token, key content) -> slot` for the megamorphic read stub.

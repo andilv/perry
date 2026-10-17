@@ -199,9 +199,9 @@ pub extern "C" fn js_object_keys_value(value: f64) -> *mut ArrayHeader {
             return out;
         }
     }
-    if jv.is_pointer() {
-        let ptr = jv.as_pointer::<u8>() as usize;
-        // A POINTER_TAG registry handle (zlib stream, fetch Request/Response/
+    if jv.is_reference() {
+        let ptr = jv.reference_payload();
+        // A native handle (HANDLE_TAG: zlib stream, fetch Request/Response/
         // Headers/Blob, …) is not an address — never dereference it. Its TYPED
         // surface (`blob.size`, `response.status`) lives on the prototype as
         // accessors, so it contributes no own keys; but anything the USER
@@ -321,7 +321,7 @@ pub(crate) fn for_in_keys_with(value: f64, lazy_shadow: bool) -> *mut ArrayHeade
     let out = scope.root_raw_mut_ptr(crate::array::js_array_alloc(8));
     // Non-pointer primitives (number/boolean, boxed string) have only their own
     // enumerable keys; every prototype property they inherit is non-enumerable.
-    if !jv.is_pointer() {
+    if !jv.is_reference() {
         if diag {
             crate::hot_diag::enum_with(|d| d.for_in_primitive += 1);
         }
@@ -386,7 +386,7 @@ pub(crate) fn for_in_keys_with(value: f64, lazy_shadow: bool) -> *mut ArrayHeade
     // Depth cap guards against pathological / cyclic prototype graphs.
     for _ in 0..1000 {
         let cv = JSValue::from_bits(current.get_nanbox_u64());
-        if cv.is_null() || cv.is_undefined() || !cv.is_pointer() {
+        if cv.is_null() || cv.is_undefined() || (!cv.is_reference()) {
             break;
         }
         // Emit this level's enumerable own keys (OrdinaryOwnPropertyKeys order),
@@ -883,9 +883,9 @@ pub extern "C" fn js_object_values_value(value: f64) -> *mut ArrayHeader {
             )
         };
     }
-    if jv.is_pointer() {
-        let ptr = jv.as_pointer::<u8>() as usize;
-        // A POINTER_TAG registry handle — see `js_object_keys_value`. Derive the
+    if jv.is_reference() {
+        let ptr = jv.reference_payload();
+        // A native handle (HANDLE_TAG) — see `js_object_keys_value`. Derive the
         // values from its own enumerable keys so a user expando
         // (`handle.foo = 1`) shows up here exactly as it does in `Object.keys`
         // (#6363), instead of dereferencing unmapped low memory.
@@ -995,9 +995,9 @@ pub extern "C" fn js_object_entries_value(value: f64) -> *mut ArrayHeader {
             )
         };
     }
-    if jv.is_pointer() {
-        let ptr = jv.as_pointer::<u8>() as usize;
-        // A POINTER_TAG registry handle — see `js_object_keys_value` / the
+    if jv.is_reference() {
+        let ptr = jv.reference_payload();
+        // A native handle (HANDLE_TAG) — see `js_object_keys_value` / the
         // `Object.values` twin above (#6363).
         if crate::value::addr_class::is_handle_band(ptr) {
             return handle_own_entries(value, HandleEnum::Entries);
@@ -1022,20 +1022,24 @@ pub extern "C" fn js_object_entries_value(value: f64) -> *mut ArrayHeader {
 /// else `None`. These are the keys that `OrdinaryOwnPropertyKeys` enumerates
 /// first, in ascending numeric order. (#2438)
 pub(crate) fn canonical_array_index(s: &str) -> Option<u32> {
-    let b = s.as_bytes();
-    if b == b"0" {
-        return Some(0);
-    }
-    // Non-empty, no leading zero, every byte an ASCII digit.
-    if b.is_empty() || b[0] == b'0' || !b.iter().all(|c| c.is_ascii_digit()) {
+    canonical_array_index_bytes(s.as_bytes())
+}
+
+/// Canonical decimal index from a key's bytes; Unicode keys are not indices.
+/// This is a pure read, also used by layout element-kind publication.
+pub(crate) fn canonical_array_index_bytes(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > 10 || (bytes.len() > 1 && bytes[0] == b'0') {
         return None;
     }
-    // Array-index range is `0..=2^32-2` (4294967294). 4294967295 is reserved
-    // for `.length`, not a valid index; larger values are ordinary string keys.
-    match s.parse::<u64>() {
-        Ok(n) if n <= 4_294_967_294 => Some(n as u32),
-        _ => None,
+    let mut index = 0u32;
+    for &byte in bytes {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        index = index.checked_mul(10)?.checked_add(digit as u32)?;
     }
+    (index != u32::MAX).then_some(index)
 }
 
 /// Compute the position order that `OrdinaryOwnPropertyKeys` mandates for an
@@ -1126,10 +1130,10 @@ pub(crate) unsafe fn keys_contain_array_index(keys_view: crate::object::ObjectKe
         }
     }
     // Fallback for anything that doesn't look like a plain dense keys array.
-    let len = keys_view.count().min(crate::array::js_array_length(keys));
+    let len = keys_view.count();
     let mut sso_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     for i in 0..len {
-        let key_val = crate::array::js_array_get(keys, i);
+        let key_val = keys_view.get(i);
         let is_idx = crate::string::js_string_key_bytes(key_val, &mut sso_buf)
             .and_then(|b| std::str::from_utf8(b).ok())
             .and_then(canonical_array_index)
@@ -1415,12 +1419,16 @@ fn js_object_keys_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
                 let arr = crate::array::clean_arr_ptr(stripped as *const crate::array::ArrayHeader);
                 let length = (*arr).length;
                 if length > 100_000 {
-                    let names = crate::array::array_named_property_names(arr, true);
                     let dense_limit = if length > (*arr).capacity && (*arr).capacity <= 1_000_000 {
                         (*arr).capacity
                     } else {
                         0
                     };
+                    let names = crate::array::array_named_property_enumeration_names(
+                        arr,
+                        true,
+                        dense_limit,
+                    );
                     let result = crate::array::js_array_alloc(
                         dense_limit.saturating_add(names.len() as u32),
                     );
@@ -1476,7 +1484,7 @@ fn js_object_keys_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
                     let key_box = crate::string::js_string_new_sso(s.as_ptr(), s.len() as u32);
                     crate::array::js_array_push_f64(result, key_box);
                 }
-                let named = crate::array::array_named_property_names(arr, true);
+                let named = crate::array::array_named_property_enumeration_names(arr, true, length);
                 for name in &named {
                     let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
                     crate::array::js_array_push(result, JSValue::string_ptr(key));
@@ -1640,8 +1648,10 @@ pub(crate) unsafe fn instance_private_key_hidden(
         return false;
     }
     let mut buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-    crate::string::js_string_key_bytes(key_val, &mut buf)
-        .is_some_and(|bytes| own_key_hidden_bytes(obj, bytes))
+    match crate::string::js_string_key_bytes(key_val, &mut buf) {
+        Some(bytes) => own_key_hidden_bytes(obj, bytes),
+        None => crate::object::key_view::own_key_is_hole(obj, key_val),
+    }
 }
 
 /// Hide a physical private slot, independently of an equally spelled
@@ -1652,13 +1662,16 @@ pub(crate) unsafe fn own_slot_hidden(
     key: crate::JSValue,
 ) -> bool {
     let keys = crate::object::object_keys(obj);
-    if !keys.is_null()
-        && crate::object::key_attrs::entry_is_private(crate::object::key_attrs::keys_entry(
-            keys.arr(),
-            slot,
-        ))
-    {
-        return true;
+    if !keys.is_null() {
+        let entry = crate::object::key_attrs::keys_entry(keys.arr(), slot);
+        // The entry says whether the key is optional: only then can its slot
+        // hold the hole that makes it absent (`key_view`).
+        if crate::object::key_attrs::entry_is_private(entry)
+            || (entry & crate::object::key_attrs::ENTRY_OPTIONAL != 0
+                && crate::object::key_view::position_is_hole(obj, keys, slot))
+        {
+            return true;
+        }
     }
     let mut buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     (*obj).class_id != 0
@@ -1668,24 +1681,33 @@ pub(crate) unsafe fn own_slot_hidden(
 
 /// Can any own key of `obj` be hidden from reflection
 /// ([`own_key_hidden_bytes`])? One header and one shape-record load: a plain
-/// object no class installed a private field on answers `false`.
+/// object no class installed a private field on, whose layout has no holes
+/// (`key_view`), answers `false`.
 #[inline]
 pub(crate) unsafe fn own_keys_may_hide(obj: *const ObjectHeader) -> bool {
     !obj.is_null()
         && ((*obj).class_id != 0
             || crate::object::key_attrs::object_summary(obj)
-                & crate::object::key_attrs::SUMMARY_PRIVATE
+                & (crate::object::key_attrs::SUMMARY_PRIVATE
+                    | crate::object::key_attrs::SUMMARY_HOLES)
                 != 0)
 }
 
-/// [`instance_private_key_hidden`] for a key held as bytes.
+/// [`instance_private_key_hidden`] for a key held as bytes: a private field,
+/// a runtime-internal key, or a layout key whose slot holds the hole
+/// (`key_view`), which is absent.
 #[inline]
 pub(crate) unsafe fn own_key_hidden_bytes(obj: *const ObjectHeader, key: &[u8]) -> bool {
     if obj.is_null() {
         return false;
     }
-    crate::object::key_attrs::object_key_is_private(obj, key)
+    // One summary load answers both per-key questions for most objects.
+    let summary = crate::object::key_attrs::object_summary(obj);
+    (summary & crate::object::key_attrs::SUMMARY_PRIVATE != 0
+        && crate::object::key_attrs::object_key_is_private(obj, key))
         || ((*obj).class_id != 0 && is_internal_runtime_key_bytes(key))
+        || (crate::object::key_view::summary_may_have_holes(summary)
+            && crate::object::key_view::own_key_bytes_is_hole(obj, key))
 }
 
 /// True for perry's hidden runtime-internal own keys — the
@@ -1863,7 +1885,8 @@ fn js_object_values_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
                     let v = crate::array::js_array_get(arr, i);
                     crate::array::js_array_push_f64(result, f64::from_bits(v.bits()));
                 }
-                for name in crate::array::array_named_property_names(arr, true) {
+                for name in crate::array::array_named_property_enumeration_names(arr, true, length)
+                {
                     if let Some(v) = crate::array::array_named_property_get_by_name(arr, &name) {
                         crate::array::js_array_push_f64(result, v);
                     }

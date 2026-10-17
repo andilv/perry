@@ -61,6 +61,10 @@ pub(crate) unsafe fn try_own_store(
     key: *const crate::StringHeader,
     value: f64,
 ) -> bool {
+    if super::overflow::has_overflow(obj) {
+        return false;
+    }
+
     let record = if let Some(record) = ordinary_receiver_record(obj) {
         record
     } else {
@@ -132,6 +136,10 @@ pub(crate) unsafe fn try_own_store(
             {
                 return false;
             }
+            let slot = super::key_attrs::key_storage_slot(
+                record.keys() as usize as *const crate::ArrayHeader,
+                slot as u32,
+            ) as usize;
             if store_proven_own_slot(obj, record, slot, value) {
                 return true;
             }
@@ -154,6 +162,11 @@ pub(crate) unsafe fn store_proven_own_slot(
         value.to_bits()
     };
     if slot < record.live_inline_slot_count() as usize {
+        // The two inline stores below bypass `store_object_field_slot`, so
+        // they report to the sealed-prototype hook themselves (one meta load
+        // and flag test): an own-key overwrite of `%Array.prototype%`'s
+        // `join` must set its shadow bit like any other slot store.
+        super::builtin_proto::note_value_store(obj, slot, false, "own store");
         let rep = super::field_rep::slot_rep(record.rep(), slot as u32);
         let address = obj
             .cast::<u8>()
@@ -206,28 +219,24 @@ unsafe fn store_proven_own_slot_slow(
     false
 }
 
-/// Null and realm-default chains already have an authoritative answer. Reuse
-/// that answer rather than resolving and recording a second chain fact for
-/// each plain-object predecessor. Custom and class chains use record facts.
+/// Can an inherited setter, accessor or non-writable property block adding
+/// `key` to `obj`? Null and realm-default chains have an authoritative
+/// answer. Known holders and declared class chains answer from their shapes;
+/// unknown chains use the generic operation. No chain answer is cached.
 #[inline]
 unsafe fn inherited_store_blocked(
     record: shapes::ShapeRecordRef,
-    key: *const crate::StringHeader,
+    obj: *const ObjectHeader,
+    key: f64,
     bytes: &[u8],
-) -> Option<bool> {
-    // The prototype identity also covers anonymous closed-literal class ids.
-    // Header class_id alone cannot distinguish their DEFAULT link from a
-    // declaration's CLASS link; shape minting already made that distinction.
-    match record.proto_id() {
-        shapes::PROTO_ID_NULL => return Some(false),
-        shapes::PROTO_ID_DEFAULT => {
-            return Some(super::object_proto_may_intercept_key(
-                crate::value::js_nanbox_string(key as i64),
-            ));
-        }
-        _ => {}
+) -> bool {
+    if let Some(blocked) = super::descriptor_state::layout_store_may_intercept(record, obj, bytes) {
+        return blocked;
     }
-    record.store_chain_blocks(bytes, super::proto_validity::proto_validity())
+    // Unknown chains use the generic operation. The caller holds an unrooted
+    // receiver, so suppress collection over any materialization in that walk.
+    let _no_move = crate::gc::GcSuppressScope::new();
+    super::plain_data_write_may_intercept(obj as usize, (*obj).class_id, key)
 }
 
 /// A warm shape proof needs no outer PutValue scope or key conversion. The
@@ -262,11 +271,124 @@ pub(crate) unsafe fn try_warm_transition(
         || bytes
             .first()
             .is_some_and(|b| *b == b'#' || b.is_ascii_digit())
-        || inherited_store_blocked(record, key, bytes) != Some(false)
+        || inherited_store_blocked(
+            record,
+            obj,
+            crate::value::js_nanbox_string(key as i64),
+            bytes,
+        )
     {
         return None;
     }
     super::object_set_field_by_name_transition_chain_proven_value(obj, key, value, refresh)
+}
+
+/// A dynamic-key write (§3.3): a key the receiver's layout names is a slot
+/// store, which the caller's ordinary path performs; any other key goes to
+/// the receiver's overflow, which takes it with one append. `None` leaves the
+/// write to the complete `[[Set]]` (an exotic, frozen, sealed or
+/// descriptor-carrying receiver, or a key a prototype could intercept) and
+/// guarantees nothing was allocated, so the caller's operands are current.
+/// `key` is a heap or inline string.
+pub(crate) unsafe fn try_dynamic_store(
+    obj: *mut ObjectHeader,
+    key: f64,
+    value: f64,
+) -> Option<f64> {
+    let record = dynamic_store_receiver(obj)?;
+    let k = crate::JSValue::from_bits(key.to_bits());
+    if !k.is_string() && !k.is_short_string() {
+        return None;
+    }
+    let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let bytes = crate::string::js_string_key_bytes(k, &mut scratch)?;
+    if bytes == b"__proto__"
+        || bytes
+            .first()
+            .is_some_and(|b| *b == b'#' || b.is_ascii_digit())
+    {
+        return None;
+    }
+    let keys = record.keys() as usize as *const crate::ArrayHeader;
+    if !keys.is_null()
+        && super::keys_find_property_slot_by_bytes(keys, record.logical_key_count(), bytes)
+            .is_some()
+    {
+        return None;
+    }
+    // The overflow takes dynamic keys of realm-default and null-prototype
+    // bags, as step 4 landed it. A receiver with a class or recorded
+    // prototype keeps its layout transitions until the unknown-receiver probe
+    // (step 5) serves reads of overflowed objects: an overflowed object
+    // primes no own-slot way, so routing those receivers here would send
+    // every later read of them to the generic lookup (Effect +92%).
+    if !matches!(
+        record.proto_id(),
+        shapes::PROTO_ID_DEFAULT | shapes::PROTO_ID_NULL
+    ) {
+        return None;
+    }
+    if inherited_store_blocked(record, obj, key, bytes) {
+        return None;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner = scope.root_raw_mut_ptr(obj);
+    let value = scope.root_nanbox_f64(value);
+    let atom = crate::string::property_atom_from_value(key.to_bits());
+    // The layout does not hold the key (probed above): the write is the
+    // overflow's existing entry or one append.
+    super::overflow::store_unfixed_routed(
+        owner.get_raw_mut_ptr::<ObjectHeader>(),
+        (atom & crate::value::POINTER_MASK) as *const crate::StringHeader,
+        value.get_nanbox_f64(),
+    );
+    Some(value.get_nanbox_f64())
+}
+
+/// The receiver a dynamic-key write may extend through its overflow: an
+/// ordinary, extensible object with no own descriptors and no exotic surface.
+unsafe fn dynamic_store_receiver(obj: *mut ObjectHeader) -> Option<shapes::ShapeRecordRef> {
+    if !crate::value::addr_class::is_plausible_heap_addr(obj as usize)
+        || !(obj as usize).is_multiple_of(std::mem::align_of::<crate::gc::GcHeader>())
+    {
+        return None;
+    }
+    let header = crate::value::addr_class::try_read_gc_header(obj as usize)?;
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        || header._reserved
+            & (crate::gc::OBJ_FLAG_FROZEN
+                | crate::gc::OBJ_FLAG_SEALED
+                | crate::gc::OBJ_FLAG_NO_EXTEND
+                | crate::gc::OBJ_FLAG_HAS_DESCRIPTORS
+                | crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO)
+            != 0
+    {
+        return None;
+    }
+    let id = super::layout_desc::layout_id_of_word((*obj).parent_class_id);
+    if id.wrapping_sub(shapes::SHAPE_ID_BASE)
+        >= shapes::EXOTIC_SHAPE_ID_BASE - shapes::SHAPE_ID_BASE
+    {
+        return None;
+    }
+    let record = shapes::shape_record_by_id(id)?;
+    if !record.object_kind().is_ordinary_layout()
+        || (*obj).class_id == super::NATIVE_MODULE_CLASS_ID
+    {
+        return None;
+    }
+    let meta = (*obj).meta;
+    if !meta.is_null()
+        && ((*meta).elements != 0
+            || (*meta).flags
+                & (super::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
+                    | super::OBJECT_META_FLAG_NATIVE_ALIAS)
+                != 0)
+    {
+        return None;
+    }
+    Some(record)
 }
 
 /// A projected array bag already names its prototype chain. Reuse its
@@ -316,10 +438,7 @@ unsafe fn try_warm_array_transition(
     {
         return None;
     }
-    if shapes::object_shape_record(bag)?
-        .store_chain_blocks(bytes, super::proto_validity::proto_validity())
-        != Some(false)
-    {
+    if array_bag_chain_blocks(bag, bytes) {
         return None;
     }
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -336,6 +455,160 @@ unsafe fn try_warm_array_transition(
         value_root.get_nanbox_f64(),
     ));
     stored.map(|_| value_root.get_nanbox_f64())
+}
+
+/// Array named properties use the same shaped bag as customized descriptors.
+/// Its prototype edge names the array chain; elements and length stay exotic.
+unsafe fn try_array_store(
+    target: f64,
+    key: f64,
+    value: f64,
+    name: &str,
+    may_move: &mut bool,
+) -> Option<f64> {
+    let key_ptr = (key.to_bits() & crate::value::POINTER_MASK) as *const crate::StringHeader;
+    if name == "length"
+        || name == "__proto__"
+        || name.starts_with('#')
+        || super::canonical_array_index(name).is_some()
+    {
+        return None;
+    }
+    let arr = crate::array::clean_arr_ptr_mut(
+        (target.to_bits() & crate::value::POINTER_MASK) as *mut crate::ArrayHeader,
+    );
+    let flags = crate::array::array_object_flags_resolved(arr);
+    if flags & (crate::gc::GC_ARRAY_CUSTOM_PROTO | crate::gc::OBJ_FLAG_FROZEN) != 0 {
+        return None;
+    }
+    let bag = crate::array::array_property_bag(arr);
+    let existing = if bag.is_null() {
+        crate::array::array_named_property_has(arr, key_ptr)
+    } else {
+        super::obj_value_has_own_key(crate::value::js_nanbox_pointer(bag as i64), key)
+    };
+    if !existing && flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0 {
+        return None;
+    }
+    *may_move = true;
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner = scope.root_nanbox_f64(target);
+    let key_root = scope.root_string_ptr(key_ptr);
+    let value_root = scope.root_nanbox_f64(value);
+    let bag = crate::array::array_property_bag_ensure(arr);
+    let bag_root = scope.root_raw_mut_ptr(bag);
+    if bag.is_null() {
+        return None;
+    }
+    // This internal holder has ordinary data/descriptor semantics; it is
+    // not one of the runtime-born special objects the unmarked kind covers.
+    if shapes::object_shape_record(bag)?.object_kind() == shapes::ShapeObjectKind::OrdinaryUnmarked
+    {
+        super::alloc_plain::mark_object_plain_ordinary(bag);
+    }
+    if !existing {
+        // Array.prototype is itself an array. Its named-property bag is
+        // the ordinary shape projection of this named-only chain. Marking
+        // that bag makes subsequent named descriptor edits invalidate the
+        // proof through the existing shape-stamp hook.
+        let mut array_proto = crate::array::array_prototype_addr();
+        if array_proto == 0 {
+            let _ = super::js_get_global_this();
+            array_proto = crate::array::array_prototype_addr();
+        }
+        if array_proto == 0 {
+            return None;
+        }
+        let owner_arr = crate::array::clean_arr_ptr_mut(
+            (owner.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK)
+                as *mut crate::ArrayHeader,
+        );
+        let array_proto = crate::array::clean_arr_ptr_mut(array_proto as *mut crate::ArrayHeader);
+        let prototype = if owner_arr == array_proto {
+            crate::value::js_nanbox_pointer(crate::array::object_prototype_addr() as i64)
+        } else {
+            crate::value::js_nanbox_pointer(array_proto as i64)
+        };
+        let proto_root = scope.root_nanbox_f64(prototype);
+        let proto_addr = (prototype.to_bits() & crate::value::POINTER_MASK) as usize;
+        let header = crate::value::addr_class::try_read_gc_header(proto_addr)?;
+        let prototype = if header.obj_type == crate::gc::GC_TYPE_ARRAY {
+            let proto_arr = crate::array::clean_arr_ptr_mut(proto_addr as *mut crate::ArrayHeader);
+            if crate::array::array_object_flags_resolved(proto_arr)
+                & crate::gc::GC_ARRAY_CUSTOM_PROTO
+                != 0
+            {
+                return None;
+            }
+            let proto_bag = crate::array::array_property_bag_ensure(proto_arr);
+            if proto_bag.is_null() {
+                return None;
+            }
+            let proto_bag_root = scope.root_raw_mut_ptr(proto_bag);
+            let object_proto_addr = crate::array::object_prototype_addr();
+            if object_proto_addr == 0 {
+                return None;
+            }
+            let object_proto = crate::value::js_nanbox_pointer(object_proto_addr as i64);
+            if super::prototype_chain::object_static_prototype(proto_bag as usize)
+                != Some(object_proto.to_bits())
+            {
+                // Internal construction of `%Array.prototype%`'s bag, not a
+                // modification of it (#11915, `builtin_proto`).
+                super::own_override::as_builtin_definition(|| {
+                    super::prototype_chain::object_link_created_prototype(
+                        proto_bag as usize,
+                        object_proto.to_bits(),
+                    )
+                });
+            }
+            crate::value::js_nanbox_pointer(proto_bag_root.get_raw_mut_ptr::<ObjectHeader>() as i64)
+        } else if header.obj_type == crate::gc::GC_TYPE_OBJECT {
+            proto_root.get_nanbox_f64()
+        } else {
+            return None;
+        };
+        let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
+        if super::prototype_chain::object_static_prototype(bag as usize)
+            != Some(prototype.to_bits())
+        {
+            // Internal construction, not observable prototype surgery. The
+            // new shape names the edge; no global plan invalidation is needed.
+            super::prototype_chain::object_link_created_prototype(
+                bag as usize,
+                prototype.to_bits(),
+            );
+        }
+    }
+    let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
+    let key = key_root.get_raw_const_ptr::<crate::StringHeader>();
+    let key_value = crate::value::js_nanbox_string(key as i64);
+    let result = try_store_with_refresh(
+        crate::value::js_nanbox_pointer(bag as i64),
+        key_value,
+        value_root.get_nanbox_f64(),
+        may_move,
+    );
+    if result.is_some() {
+        return Some(value_root.get_nanbox_f64());
+    }
+    if !existing {
+        // The first transition has no edge yet. A proven chain can create it
+        // through the ordinary bag store; later receivers reuse that edge.
+        let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
+        let key = key_root.get_raw_const_ptr::<crate::StringHeader>();
+        shapes::object_shape_record(bag)?;
+        let bytes = crate::string::header_str_checked(key)?.as_bytes();
+        if !array_bag_chain_blocks(bag, bytes) {
+            super::object_ops::define_property_force_store_value(
+                bag,
+                key,
+                value_root.get_nanbox_f64(),
+            );
+            return Some(value_root.get_nanbox_f64());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -382,19 +655,14 @@ mod tests {
             ] {
                 super::super::alloc_plain::mark_object_plain_ordinary(obj);
                 let before = shapes::object_shape_record(obj).unwrap();
-                assert_eq!(
-                    inherited_store_blocked(before, key, b"plainShapeAnswerOnly"),
-                    Some(false)
-                );
+                assert!(!inherited_store_blocked(
+                    before,
+                    obj,
+                    crate::value::js_nanbox_string(key as i64),
+                    b"plainShapeAnswerOnly"
+                ));
                 let owner = crate::value::js_nanbox_pointer(obj as i64);
                 assert_eq!(try_store(owner, boxed_key, 17.0), Some(17.0));
-                assert_eq!(
-                    before.store_chain_blocks(
-                        b"plainShapeAnswerOnly",
-                        super::super::proto_validity::proto_validity()
-                    ),
-                    None
-                );
                 assert_eq!(
                     super::super::js_object_get_field_by_name_f64(obj, key),
                     17.0
@@ -486,15 +754,19 @@ mod tests {
             let header = (arr as *mut u8)
                 .sub(crate::gc::GC_HEADER_SIZE)
                 .cast::<crate::gc::GcHeader>();
-            for flag in [
-                crate::gc::OBJ_FLAG_FROZEN,
-                crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS,
-            ] {
-                let saved = (*header)._reserved;
-                (*header)._reserved |= flag;
-                assert!(!try_own_store(arr.cast(), index, 44.0));
-                (*header)._reserved = saved;
-            }
+            let saved = (*header)._reserved;
+            (*header)._reserved |= crate::gc::OBJ_FLAG_FROZEN;
+            assert!(!try_own_store(arr.cast(), index, 44.0));
+            (*header)._reserved = saved;
+            // An element descriptor is a key of the array's named layout: its
+            // attribute summary sends every own element store to the exact path.
+            crate::object::set_property_attrs(
+                arr as usize,
+                "0".to_string(),
+                crate::object::PropertyAttrs::new(false, true, true),
+            );
+            assert!(crate::array::array_has_element_descriptors(arr));
+            assert!(!try_own_store(arr.cast(), index, 44.0));
             assert_eq!(crate::array::js_array_get_f64(arr, 1), 33.0);
         }
     }
@@ -628,17 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn shape_add_retires_its_slot_proof_at_dictionary_conversion() {
+    fn shape_add_retires_its_slot_proof_once_the_overflow_exists() {
         let _lock = crate::gc::global_side_table_test_lock();
         let _triggers = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
         let _ = super::super::js_get_global_this();
-        struct Restore(Option<u64>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                super::super::dictionary::test_arm_latch(self.0);
-            }
-        }
-        let _restore = Restore(super::super::dictionary::test_arm_latch(Some(3)));
         let obj = super::super::js_object_alloc(0, 0);
         unsafe { super::super::alloc_plain::mark_object_plain_ordinary(obj) };
         let target = crate::value::js_nanbox_pointer(obj as i64);
@@ -653,18 +918,19 @@ mod tests {
                 0,
             );
         }
+        // Object model step 4: no append converts a receiver; its overflow is
+        // established (here directly, as a delete or a computed-key add
+        // would) and from then on no layout slot proof serves its stores.
+        assert!(unsafe { super::super::overflow::establish_order(obj) });
         assert!(
-            unsafe { super::super::dictionary::is_dictionary(obj) },
-            "the conversion must actually run"
-        );
-        let dictionary_record = unsafe { shapes::object_shape_record(obj).unwrap() };
-        assert_eq!(
-            unsafe {
-                dictionary_record
-                    .own_store_slot(crate::string::canonical_key(b"dictionaryAppendWitness0"))
+            !unsafe {
+                try_own_store(
+                    obj,
+                    crate::string::canonical_key(b"dictionaryAppendWitness0"),
+                    0.0,
+                )
             },
-            None,
-            "a dictionary record cannot prove own absence"
+            "an overflow receiver takes no layout slot proof"
         );
         for i in 0..8 {
             let name = format!("dictionaryAppendWitness{i}");
@@ -703,9 +969,9 @@ mod tests {
             None
         );
         assert!(!may_move);
-        // Conversion during the value-bearing publication also retires the
-        // slot proof; the dictionary setter must write the pending value.
-        super::super::dictionary::test_arm_latch(Some(1));
+        // A value-bearing add on a fresh receiver: object model step 4 has no
+        // conversion at publication (a layout key add is a transition), and
+        // the pending value is written.
         let fresh = super::super::js_object_alloc(0, 0);
         unsafe { super::super::alloc_plain::mark_object_plain_ordinary(fresh) };
         let fresh_value = crate::value::js_nanbox_pointer(fresh as i64);
@@ -717,7 +983,6 @@ mod tests {
             fresh_value,
             0,
         );
-        assert!(unsafe { super::super::dictionary::is_dictionary(fresh) });
         assert_eq!(
             super::super::js_object_get_field_by_name_f64(fresh, atom),
             37.0
@@ -1379,15 +1644,10 @@ mod tests {
         let receiver = crate::value::js_nanbox_pointer(arr as i64);
         assert_eq!(unsafe { try_store(receiver, key_value, 23.0) }, Some(23.0));
         let arr_root = scope.root_raw_mut_ptr(arr);
-        let mut cache: crate::object::PicCache = [0; crate::object::PIC_CACHE_WORDS];
-        let mut cache_slot = &mut cache as *mut _;
-        let packed = std::sync::atomic::AtomicU64::new(0xFFFF_FFFF);
         assert_eq!(
-            crate::object::field_get_set::js_object_get_field_ic_miss_packed(
+            crate::object::field_get_set::get_field_miss(
                 arr_root.get_raw_mut_ptr::<crate::ArrayHeader>().cast(),
-                key,
-                &mut cache_slot,
-                &packed
+                key
             ),
             23.0
         );
@@ -1403,11 +1663,9 @@ mod tests {
         }
         let spill_key = crate::string::canonical_key(b"transformFlags");
         assert_eq!(
-            crate::object::field_get_set::js_object_get_field_ic_miss_packed(
+            crate::object::field_get_set::get_field_miss(
                 arr_root.get_raw_mut_ptr::<crate::ArrayHeader>().cast(),
-                spill_key,
-                &mut cache_slot,
-                &packed
+                spill_key
             ),
             29.0
         );
@@ -1431,26 +1689,13 @@ mod tests {
         let key_value = crate::value::js_nanbox_string(key as i64);
         let a_value = crate::value::js_nanbox_pointer(a as i64);
         crate::proxy::js_put_value_set(a_value, key_value, 1.0, a_value, 0);
-        let validity = super::super::proto_validity::proto_validity();
-        assert_eq!(
-            shape.store_chain_blocks(b"rangePos", validity),
-            Some(false),
-            "the proof must be live"
-        );
-        let b_shape = unsafe { shapes::object_shape_record(b) }.unwrap();
-        assert_eq!(
-            b_shape.store_chain_blocks(b"rangePos", validity),
-            Some(false),
-            "a different receiver uses its shape's fact"
-        );
+        assert!(super::super::obj_value_has_own_key(a_value, key_value));
+        let _ = shape;
         super::super::set_property_attrs(
             proto as usize,
             "rangePos".into(),
             super::super::PropertyAttrs::new(false, true, true),
         );
-        let new_validity = super::super::proto_validity::proto_validity();
-        assert_ne!(new_validity, validity);
-        assert_eq!(b_shape.store_chain_blocks(b"rangePos", new_validity), None);
         let b_value = crate::value::js_nanbox_pointer(b as i64);
         crate::proxy::js_put_value_set(b_value, key_value, 2.0, b_value, 0);
         assert!(!super::super::obj_value_has_own_key(b_value, key_value));
@@ -1505,7 +1750,7 @@ pub(crate) unsafe fn try_store_with_refresh(
     let shape = shapes::object_shape_descriptor(obj)?;
     if !shape.object_kind.is_ordinary_layout()
         || (*obj).class_id == super::NATIVE_MODULE_CLASS_ID
-        || super::dictionary::is_dictionary(obj)
+        || super::overflow::has_overflow(obj)
     {
         return None;
     }
@@ -1526,33 +1771,12 @@ pub(crate) unsafe fn try_store_with_refresh(
     // A transition edge only exists for an absent own key. The prototype
     // fact is attached to its predecessor shape, never to the call site.
     let record = shape.record_ref()?;
-    let blocked = match inherited_store_blocked(record, key_ptr, bytes) {
-        Some(blocked) => blocked,
-        None => {
-            *may_move = true;
-            let scope = crate::gc::RuntimeHandleScope::new();
-            let obj_root = scope.root_raw_mut_ptr(obj);
-            let key_root = scope.root_string_ptr(key_ptr);
-            let value_root = scope.root_nanbox_f64(value);
-            if !super::chain_store::mark_chain_hops(&scope, target) {
-                return None;
-            }
-            let obj = obj_root.get_raw_mut_ptr::<ObjectHeader>();
-            let key_ptr = key_root.get_raw_const_ptr::<crate::StringHeader>();
-            let key = crate::value::js_nanbox_string(key_ptr as i64);
-            let blocked = super::plain_data_write_may_intercept(obj as usize, (*obj).class_id, key);
-            let record = shapes::object_shape_record(obj)?;
-            record.note_store_chain(
-                crate::string::header_str_checked(key_ptr)?.as_bytes(),
-                super::proto_validity::proto_validity(),
-                blocked,
-            );
-            if blocked {
-                return None;
-            }
-            return apply_proven_add(&obj_root, &key_root, &value_root);
-        }
-    };
+    let blocked = inherited_store_blocked(
+        record,
+        obj,
+        crate::value::js_nanbox_string(key_ptr as i64),
+        bytes,
+    );
     if blocked {
         return None;
     }
@@ -1611,7 +1835,7 @@ unsafe fn apply_proven_add(
     let predecessor = shapes::object_shape_stamp(obj);
     let predecessor_rep = record.rep();
     let number_lane = slot < super::field_rep::REP_SLOTS as usize
-        && slot < (record.live_inline_slot_count() as usize).max(super::INLINE_SLOT_FLOOR)
+        && slot < super::object_inline_capacity(obj) as usize
         && super::field_rep::f64_slot_bits(value.get_nanbox_f64().to_bits()).is_some();
     if number_lane {
         // Publish the value-bearing edge directly, as the named-store tail
@@ -1639,7 +1863,7 @@ unsafe fn apply_proven_add(
             true,
         );
         let obj = owner.get_raw_mut_ptr::<ObjectHeader>();
-        if super::dictionary::is_dictionary(obj) {
+        if super::overflow::has_overflow(obj) {
             return None;
         }
         super::js_object_set_field(
@@ -1648,7 +1872,7 @@ unsafe fn apply_proven_add(
             crate::JSValue::from_bits(value.get_nanbox_f64().to_bits()),
         );
         let obj = owner.get_raw_mut_ptr::<ObjectHeader>();
-        if let Some(atom) = super::chain_store::interned_key_for_store(
+        if let Some(atom) = super::store_key::interned_key_for_store(
             crate::value::js_nanbox_string(key.get_raw_const_ptr::<crate::StringHeader>() as i64),
         ) {
             super::transition_cache_insert(
@@ -1670,13 +1894,12 @@ unsafe fn apply_proven_add(
     let obj = owner.get_raw_mut_ptr::<ObjectHeader>();
     // Appending can transfer the list to the receiver's dictionary. That
     // store no longer has a shape-owned slot; the complete setter writes it.
-    if super::dictionary::is_dictionary(obj) {
+    if super::overflow::has_overflow(obj) {
         return None;
     }
-    let live_slots = super::object_live_slot_count(obj) as usize;
     let obj = owner.get_raw_mut_ptr::<ObjectHeader>();
     let bits = value.get_nanbox_f64().to_bits();
-    if slot < live_slots.max(super::INLINE_SLOT_FLOOR) {
+    if slot < super::object_inline_capacity(obj) as usize {
         super::js_object_set_field(obj, slot as u32, crate::JSValue::from_bits(bits));
     } else {
         super::overflow_set(obj as usize, slot, bits);
@@ -1686,155 +1909,6 @@ unsafe fn apply_proven_add(
 
 /// Array named properties use the same shaped bag as customized descriptors.
 /// Its prototype edge names the array chain; elements and length stay exotic.
-unsafe fn try_array_store(
-    target: f64,
-    key: f64,
-    value: f64,
-    name: &str,
-    may_move: &mut bool,
-) -> Option<f64> {
-    let key_ptr = (key.to_bits() & crate::value::POINTER_MASK) as *const crate::StringHeader;
-    if name == "length"
-        || name == "__proto__"
-        || name.starts_with('#')
-        || super::canonical_array_index(name).is_some()
-    {
-        return None;
-    }
-    let arr = crate::array::clean_arr_ptr_mut(
-        (target.to_bits() & crate::value::POINTER_MASK) as *mut crate::ArrayHeader,
-    );
-    let flags = crate::array::array_object_flags_resolved(arr);
-    if flags & (crate::gc::GC_ARRAY_CUSTOM_PROTO | crate::gc::OBJ_FLAG_FROZEN) != 0 {
-        return None;
-    }
-    let bag = crate::array::array_property_bag(arr);
-    let existing = if bag.is_null() {
-        crate::array::array_named_property_has(arr, key_ptr)
-    } else {
-        super::obj_value_has_own_key(crate::value::js_nanbox_pointer(bag as i64), key)
-    };
-    if !existing && flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0 {
-        return None;
-    }
-    *may_move = true;
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let owner = scope.root_nanbox_f64(target);
-    let key_root = scope.root_string_ptr(key_ptr);
-    let value_root = scope.root_nanbox_f64(value);
-    let bag = crate::array::array_property_bag_ensure(arr);
-    let bag_root = scope.root_raw_mut_ptr(bag);
-    if bag.is_null() {
-        return None;
-    }
-    // This internal holder has ordinary data/descriptor semantics; it is
-    // not one of the runtime-born special objects the unmarked kind covers.
-    if shapes::object_shape_record(bag)?.object_kind() == shapes::ShapeObjectKind::OrdinaryUnmarked
-    {
-        super::alloc_plain::mark_object_plain_ordinary(bag);
-    }
-    if !existing {
-        // Array.prototype is itself an array. Its named-property bag is
-        // the ordinary shape projection of this named-only chain. Marking
-        // that bag makes subsequent named descriptor edits invalidate the
-        // proof through the existing shape-stamp hook.
-        let mut array_proto = crate::array::array_prototype_addr();
-        if array_proto == 0 {
-            let _ = super::js_get_global_this();
-            array_proto = crate::array::array_prototype_addr();
-        }
-        if array_proto == 0 {
-            return None;
-        }
-        let owner_arr = crate::array::clean_arr_ptr_mut(
-            (owner.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK)
-                as *mut crate::ArrayHeader,
-        );
-        let array_proto = crate::array::clean_arr_ptr_mut(array_proto as *mut crate::ArrayHeader);
-        let prototype = if owner_arr == array_proto {
-            crate::value::js_nanbox_pointer(crate::array::object_prototype_addr() as i64)
-        } else {
-            crate::value::js_nanbox_pointer(array_proto as i64)
-        };
-        let proto_root = scope.root_nanbox_f64(prototype);
-        let proto_addr = (prototype.to_bits() & crate::value::POINTER_MASK) as usize;
-        let header = crate::value::addr_class::try_read_gc_header(proto_addr)?;
-        let prototype = if header.obj_type == crate::gc::GC_TYPE_ARRAY {
-            let proto_arr = crate::array::clean_arr_ptr_mut(proto_addr as *mut crate::ArrayHeader);
-            if crate::array::array_object_flags_resolved(proto_arr)
-                & crate::gc::GC_ARRAY_CUSTOM_PROTO
-                != 0
-            {
-                return None;
-            }
-            let proto_bag = crate::array::array_property_bag_ensure(proto_arr);
-            if proto_bag.is_null() {
-                return None;
-            }
-            let proto_bag_root = scope.root_raw_mut_ptr(proto_bag);
-            let object_proto_addr = crate::array::object_prototype_addr();
-            if object_proto_addr == 0 {
-                return None;
-            }
-            let object_proto = crate::value::js_nanbox_pointer(object_proto_addr as i64);
-            if super::prototype_chain::object_static_prototype(proto_bag as usize)
-                != Some(object_proto.to_bits())
-            {
-                super::prototype_chain::object_link_created_prototype(
-                    proto_bag as usize,
-                    object_proto.to_bits(),
-                );
-            }
-            crate::value::js_nanbox_pointer(proto_bag_root.get_raw_mut_ptr::<ObjectHeader>() as i64)
-        } else if header.obj_type == crate::gc::GC_TYPE_OBJECT {
-            proto_root.get_nanbox_f64()
-        } else {
-            return None;
-        };
-        let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
-        if super::prototype_chain::object_static_prototype(bag as usize)
-            != Some(prototype.to_bits())
-        {
-            // Internal construction, not observable prototype surgery. The
-            // new shape names the edge; no global plan invalidation is needed.
-            super::prototype_chain::object_link_created_prototype(
-                bag as usize,
-                prototype.to_bits(),
-            );
-        }
-    }
-    let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
-    let key = key_root.get_raw_const_ptr::<crate::StringHeader>();
-    let key_value = crate::value::js_nanbox_string(key as i64);
-    let result = try_store_with_refresh(
-        crate::value::js_nanbox_pointer(bag as i64),
-        key_value,
-        value_root.get_nanbox_f64(),
-        may_move,
-    );
-    if result.is_some() {
-        return Some(value_root.get_nanbox_f64());
-    }
-    if !existing {
-        // The first transition has no edge yet. A proven chain can create it
-        // through the ordinary bag store; later receivers reuse that edge.
-        let bag = bag_root.get_raw_mut_ptr::<ObjectHeader>();
-        let key = key_root.get_raw_const_ptr::<crate::StringHeader>();
-        let record = shapes::object_shape_record(bag)?;
-        let bytes = crate::string::header_str_checked(key)?.as_bytes();
-        if record.store_chain_blocks(bytes, super::proto_validity::proto_validity()) == Some(false)
-        {
-            super::object_ops::define_property_force_store_value(
-                bag,
-                key,
-                value_root.get_nanbox_f64(),
-            );
-            return Some(value_root.get_nanbox_f64());
-        }
-    }
-    None
-}
-
 unsafe fn try_function_store(
     target: f64,
     key: f64,
@@ -1907,28 +1981,9 @@ unsafe fn try_function_store(
         if super::key_attrs::object_key_blocks_plain_store(proto, name.as_bytes()) {
             return None;
         }
-        let validity = super::proto_validity::proto_validity();
-        match record.store_chain_blocks(name.as_bytes(), validity) {
-            Some(true) => return None,
-            Some(false) => {}
-            None => {
-                if !super::chain_store::mark_chain_hops(&scope, owner.get_nanbox_f64()) {
-                    return None;
-                }
-                let key = key_root.get_raw_const_ptr::<crate::StringHeader>();
-                let name = crate::string::header_str_checked(key)?;
-                let blocked = chain_blocks(prototype.get_nanbox_f64(), name.as_bytes());
-                let proto = (prototype.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK)
-                    as *const ObjectHeader;
-                shapes::object_shape_record(proto)?.note_store_chain(
-                    name.as_bytes(),
-                    super::proto_validity::proto_validity(),
-                    blocked,
-                );
-                if blocked {
-                    return None;
-                }
-            }
+        // The prototype's own attributes were answered above; walk the rest.
+        if chain_blocks(prototype.get_nanbox_f64(), name.as_bytes()) {
+            return None;
         }
     }
     let ptr = (owner.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK) as usize;
@@ -1966,6 +2021,26 @@ unsafe fn try_function_store(
 
 /// Prototype key summaries are the proof: ordinary writable data cannot
 /// intercept a named add. Unknown kinds and Proxy hops keep the full Set.
+/// May the chain of an array's named-property `bag` intercept a store of
+/// `key`? The bag inherits from the `%Array.prototype%` bag, then
+/// `%Object.prototype%`. While the sealed Array intrinsic's layout word is
+/// unshadowed, that bag still holds exactly the runtime's definitions (all
+/// writable data) and its own link; `%Object.prototype%` answers from its
+/// own word. Anything else walks the chain.
+unsafe fn array_bag_chain_blocks(bag: *mut ObjectHeader, key: &[u8]) -> bool {
+    let array =
+        crate::agent_ptrs::intrinsic_proto(super::builtin_proto::BuiltinProto::Array as usize);
+    let word = (*array).parent_class_id;
+    if word >= shapes::SHAPE_ID_BASE
+        && word < super::layout_desc::UNSHADOWED_WORD_END
+        && super::prototype_chain::object_static_prototype(bag as usize)
+            == Some(crate::value::js_nanbox_pointer(array as i64).to_bits())
+    {
+        return super::descriptor_state::object_proto_may_intercept_name(key);
+    }
+    chain_blocks(crate::value::js_nanbox_pointer(bag as i64), key)
+}
+
 unsafe fn chain_blocks(receiver: f64, key: &[u8]) -> bool {
     let mut hop = super::js_object_get_prototype_of(receiver);
     for _ in 0..64 {
@@ -1989,7 +2064,10 @@ unsafe fn chain_blocks(receiver: f64, key: &[u8]) -> bool {
         if !shape.object_kind.is_ordinary_layout() {
             return true;
         }
-        if shape.summary & super::key_attrs::SUMMARY_BLOCKS_STORE != 0
+        // A hop with an overflow keeps its keys' attributes in its entries,
+        // not in its layout's summary (object model step 4).
+        if (shape.summary & super::key_attrs::SUMMARY_BLOCKS_STORE != 0
+            || super::overflow::has_overflow(obj))
             && super::key_attrs::object_key_blocks_plain_store(obj, key)
         {
             return true;

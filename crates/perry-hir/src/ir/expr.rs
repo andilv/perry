@@ -8,6 +8,19 @@ use crate::types::{FuncId, GlobalId, LocalId, Type};
 /// Fallback when a dynamic `with` object environment does not bind the
 /// assignment target. The object lookup is performed before the RHS is
 /// evaluated, matching ECMAScript Reference resolution order.
+/// Where an [`Expr::ArrayLikeMethod`]'s method value comes from (#11915).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayLikeSource {
+    /// `recv.m(cb, thisArg)` on a proven array: the receiver's own `[[Get]]`.
+    Receiver,
+    /// `Array.prototype.m.call(x, …)` / `[].m.call(x, …)`: a read of
+    /// `%Array.prototype%` at the call.
+    Prototype,
+    /// `const m = [].m; m.call(x, …)`: the value the binding captured. The
+    /// prototype may be patched later without changing what `m` holds.
+    Binding,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WithSetFallback {
     Local(LocalId),
@@ -420,6 +433,11 @@ pub enum Expr {
 
     // Class reference (for new expressions)
     ClassRef(String),
+    /// Lexical home retained by the selected method function object.
+    ClassMethodHome {
+        class_name: String,
+        is_static: bool,
+    },
 
     // Enum member access (e.g., Color.Red)
     EnumMember {
@@ -834,6 +852,12 @@ pub enum Expr {
     // value is not a function` at module init and the import
     // resolves to undefined. Followup to #957 / PR #959.
     GlobalThisExpr,
+    /// `Pristine(namespace)` withdrawn (#12643): true once builtin namespace
+    /// `.0`'s member holder carries its shadow bit, i.e. one of its members
+    /// or its `globalThis` binding may have been replaced. Only the condition
+    /// of a guarded namespace call (`patched_builtin_call`):
+    /// `NamespacePatched(ns) ? <the generic call> : <the intrinsic>`.
+    NamespacePatched(String),
     /// `this` in module top-level code. Node runs the assembled test files
     /// as CJS, where top-level `this` is `module.exports` — a fresh plain
     /// object distinct from `globalThis`. Lowered separately from
@@ -1833,10 +1857,14 @@ pub enum Expr {
     /// preserving receiver identity for the callback's 3rd argument.
     /// `method` is the resolved Array method name; `args` are the post-receiver
     /// positional arguments (already expanded from `.apply`).
+    ///
+    /// `source` says where the method VALUE comes from (#11915), which is what
+    /// a failed builtin-prototype proof must read instead.
     ArrayLikeMethod {
         method: String,
         receiver: Box<Expr>,
         args: Vec<Expr>,
+        source: ArrayLikeSource,
     },
 
     // String methods

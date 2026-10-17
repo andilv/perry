@@ -182,7 +182,7 @@ pub(crate) unsafe fn memo_lookup_value(
     // only for a receiver whose shape states it), and a per-evaluation
     // class's private brand is a fact of that prototype.
     let meta = (*(addr as *const ObjectHeader)).meta;
-    if !meta.is_null() && ((*meta).flags != 0 || (*meta).dictionary_keys != 0) {
+    if !meta.is_null() && ((*meta).flags != 0 || (*meta).overflow != 0) {
         return None;
     }
     ways_lookup(&*memo_ptr, memo & MEMO_KEYED != 0, addr, name)
@@ -242,9 +242,8 @@ unsafe fn hop_admitted(addr: usize) -> bool {
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
-        || crate::closure::is_closure_ptr(addr)
         || (*obj).class_id == crate::object::NATIVE_MODULE_CLASS_ID
-        || crate::object::dictionary::is_dictionary(obj)
+        || crate::object::overflow::has_overflow(obj)
         || crate::object::shapes::object_shape_stamp(obj) == 0
     {
         return false;
@@ -252,7 +251,7 @@ unsafe fn hop_admitted(addr: usize) -> bool {
     let meta = (*obj).meta;
     meta.is_null()
         || ((*meta).elements == 0
-            && (*meta).dictionary_keys == 0
+            && (*meta).overflow == 0
             && (*meta).flags
                 & (crate::object::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER
                     | crate::object::OBJECT_META_FLAG_NATIVE_ALIAS)
@@ -333,7 +332,12 @@ pub(crate) unsafe fn memo_record(
     let mut hop = start;
     loop {
         let depth = way.depth as usize;
-        if depth == CHAIN_MEMO_MAX_HOPS || !hop_admitted(hop as usize) {
+        // A hop whose layout can have holes holds or lacks its optional
+        // keys per object (`key_view`): the memo cannot describe it.
+        if depth == CHAIN_MEMO_MAX_HOPS
+            || !hop_admitted(hop as usize)
+            || crate::object::key_view::object_may_have_holes(hop)
+        {
             return;
         }
         way.hops[depth] = hop as usize;

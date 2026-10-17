@@ -12,6 +12,24 @@ pub struct GcHeader {
     pub size: u32,
 }
 
+impl GcHeader {
+    /// One load of kind and creation-time object facts. Header alignment is
+    /// u32 and these fields occupy its first four bytes on every target.
+    #[inline(always)]
+    pub(crate) fn kind_facts_word(&self) -> u32 {
+        unsafe { std::ptr::read((self as *const Self).cast::<u32>()) }
+    }
+}
+
+/// [[Call]] for OBJECT and PROXY. Set with the class shape at birth, or with
+/// the proxy target at creation; never changed by properties or revocation.
+pub(crate) const GC_OBJECT_CALLABLE: u16 = perry_abi::GC_OBJECT_CALLABLE;
+const _: () = assert!(std::mem::offset_of!(GcHeader, _reserved) == 2);
+const _: () = assert!(GC_TYPE_OBJECT == perry_abi::GC_TYPE_OBJECT);
+const _: () = assert!(GC_TYPE_PROXY == perry_abi::GC_TYPE_PROXY);
+const _: () = assert!(GC_TYPE_SYMBOL == perry_abi::GC_TYPE_SYMBOL);
+const _: () = assert!(GC_TYPE_STRING == perry_abi::GC_TYPE_STRING);
+
 pub const GC_HEADER_SIZE: usize = std::mem::size_of::<GcHeader>(); // 8 bytes
 
 /// The value stored in [`GcHeader::size`]: the exact allocation total, which
@@ -141,6 +159,19 @@ pub const GC_TYPE_BUFFER_CRYPTO_KEY: u8 = 0x51;
 pub const GC_TYPE_SYMBOL: u8 = 32;
 /// Object-owned weak identity table; key/value pairs are conditional edges.
 pub const GC_TYPE_WEAK_STORAGE: u8 = 33;
+/// Nonmoving old-generation context holder; lifetime follows its owner edges.
+pub const GC_TYPE_ASYNC_SNAPSHOT: u8 = 34;
+/// Collecting nonmoving Map store, with inline traced key/value slots.
+pub const GC_TYPE_MAP_STORE: u8 = 35;
+/// Collecting nonmoving Set store with inline traced element slots.
+pub const GC_TYPE_SET_STORE: u8 = 36;
+/// Nonmoving collecting Proxy with object-owned target, handler and props.
+pub const GC_TYPE_PROXY: u8 = 37;
+/// One native parsed-function Rc, owned by an interpreter closure capture.
+pub const GC_TYPE_INTERP_FUNCTION: u8 = 38;
+/// Object-owned async-hooks metadata in a collecting nonmoving holder.
+pub const GC_TYPE_ASYNC_RESOURCE_STATE: u8 = 39;
+pub const GC_TYPE_OVERFLOW: u8 = 40;
 pub const GC_TYPE_MAX: u8 = 0x7f;
 
 /// Is `obj_type` a `BufferHeader` cell of any flavor (Buffer, Uint8Array,
@@ -377,6 +408,7 @@ pub(crate) enum GcAllocationPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GcRewriteDescriptorKind {
     WeakStorage,
+    Overflow,
     Box,
     Scope,
     Leaf,
@@ -385,10 +417,16 @@ pub(crate) enum GcRewriteDescriptorKind {
     RegExp,
     Closure,
     Promise,
+    AsyncSnapshot,
+    AsyncResourceState,
+    Symbol,
     Error,
     Map,
+    MapStore,
     LazyArray,
     Set,
+    SetStore,
+    Proxy,
     Buffer,
     /// #6759 Phase B: one traced NaN-box slot (`ObjectMeta::prototype`).
     ObjectMeta,
@@ -437,17 +475,14 @@ pub(crate) enum GcLargeObjectPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GcMoveHookKind {
     None,
-    ObjectModuleWrapper,
-    ClosureDynamicProps,
+    /// A Map/Set store's copy takes over the native indexes: re-point its
+    /// inline-payload alias and empty the abandoned original.
+    OwnedMapStore,
+    OwnedSetStore,
+    /// An AsyncLocalStorage snapshot holder's copy takes over its vector.
+    OwnedAsyncSnapshot,
     MapForeachStack,
-    SetSideTables,
-    /// Rekey a movable exotic cell's address-keyed expando side table after a
-    /// move. Used by `GC_TYPE_PROMISE`, whose `status`/`value` expandos
-    /// (#5142) live in `object::exotic_expando` keyed by the promise address,
-    /// and by `GC_TYPE_REGEXP`, whose user-assigned properties live there too.
-    /// A dead owner's entry is dropped by the `gc::dead_owner` fan-out
-    /// (`prune_dead_exotic_expando_owners`), not by a per-type hook.
-    ExoticExpandoOwner,
+    SetForeachStack,
     /// Rekey the Node diagnostic record keyed by the ErrorHeader address after
     /// a move. Errors are movable; without this a moved error loses its
     /// `err.code`/`err.syscall`/`err.errno`/path fields. User-assigned props
@@ -464,11 +499,15 @@ pub(crate) enum GcMoveHookKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GcRewriteHookKind {
     None,
+    /// Re-derive the Map/Set header's inline-payload alias from its (possibly
+    /// moved) store after a GC pass rewrote the `store` edge.
+    OwnedMapEntries,
+    OwnedSetElements,
     /// Refresh the owned Map pointer-key index after a GC pass changed key
     /// bits in this Map's entries: object/bigint keys are
     /// indexed by their pointer bits (identity) or pointee content (bigints),
     /// both of which go stale when the referenced allocation is evacuated.
-    MapIndex,
+    OwnedMapIndex,
     WeakStorageIndex,
 }
 
@@ -476,9 +515,12 @@ pub(crate) enum GcRewriteHookKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GcFinalizeHookKind {
     None,
-    MapSideAllocation,
-    SetSideAllocation,
+    InterpFunction,
+    OwnedMapStore,
+    OwnedSetStore,
     PromiseCleanup,
+    AsyncSnapshot,
+    AsyncResourceState,
     NativeHandle,
     /// Drop the embedded `temporal_rs` value in a `GC_TYPE_TEMPORAL` cell so a
     /// heap-owning variant (e.g. a `ZonedDateTime` IANA timezone string) is
@@ -572,7 +614,7 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcExternalBytePolicy::InlinePayload,
         GcLargeObjectPolicy::OldArenaWhenOverThreshold,
         false,
-        GcMoveHookKind::ObjectModuleWrapper,
+        GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
@@ -602,7 +644,7 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcExternalBytePolicy::InlinePayload,
         GcLargeObjectPolicy::MallocTracked,
         false,
-        GcMoveHookKind::ClosureDynamicProps,
+        GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
@@ -617,10 +659,8 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcExternalBytePolicy::None,
         GcLargeObjectPolicy::MallocTracked,
         false,
-        // #5142: a promise is movable, but user-attached expando properties
-        // (`p.status = …`) live in `object::exotic_expando` keyed by the
-        // promise address — rekey that entry when the promise relocates.
-        GcMoveHookKind::ExoticExpandoOwner,
+        // Own properties are traced through the promise metadata edge.
+        GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::PromiseCleanup,
     )),
@@ -662,12 +702,12 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcRewriteDescriptorKind::Map,
         GcLayoutSlotKind::None,
         true,
-        GcExternalBytePolicy::SideAllocation,
+        GcExternalBytePolicy::None,
         GcLargeObjectPolicy::NotApplicable,
         false,
         GcMoveHookKind::MapForeachStack,
-        GcRewriteHookKind::MapIndex,
-        GcFinalizeHookKind::MapSideAllocation,
+        GcRewriteHookKind::OwnedMapEntries,
+        GcFinalizeHookKind::None,
     )),
     Some(gc_type_info_entry(
         GC_TYPE_LAZY_ARRAY,
@@ -714,12 +754,12 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcRewriteDescriptorKind::Set,
         GcLayoutSlotKind::None,
         true,
-        GcExternalBytePolicy::SideAllocation,
+        GcExternalBytePolicy::None,
         GcLargeObjectPolicy::NotApplicable,
         false,
-        GcMoveHookKind::SetSideTables,
-        GcRewriteHookKind::None,
-        GcFinalizeHookKind::SetSideAllocation,
+        GcMoveHookKind::SetForeachStack,
+        GcRewriteHookKind::OwnedSetElements,
+        GcFinalizeHookKind::None,
     )),
     Some(gc_type_info_entry(
         GC_TYPE_NATIVE_HANDLE,
@@ -762,8 +802,7 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         GcLayoutSlotKind::None,
         // Movable (#6186, 2026-07-09 GC audit). Directly analogous to
         // `GC_TYPE_PROMISE` above: a pointer-free arena object with
-        // address-keyed exotic-expando properties, rekeyed on relocation by
-        // the `ExoticExpandoOwner` move hook. The `movable` flag only gates
+        // a traced metadata edge. The `movable` flag only gates
         // OLD-PAGE DEFRAG (`gc_type_is_movable`, oldgen.rs) — the nursery
         // copied-minor already evacuates eden objects regardless of it — so a
         // promoted, long-lived Date could pin its old-gen page from defrag.
@@ -783,10 +822,8 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         // pairing — a pointer-free type may not expose a rewrite descriptor —
         // and caught the flag when it was left at `true`.
         false,
-        // `d.foo = …` expandos live in `object::exotic_expando` keyed by the
-        // Date address; rekey that entry when the cell relocates (mirrors
-        // Promise). Without this a moved Date loses its expando properties.
-        GcMoveHookKind::ExoticExpandoOwner,
+        // Own properties are child edges, requiring no move hook.
+        GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
@@ -795,7 +832,7 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         "temporal",
         GcAllocationPolicy::Arena,
         true,
-        GcRewriteDescriptorKind::Leaf,
+        GcRewriteDescriptorKind::MetaOnly,
         GcLayoutSlotKind::None,
         // Movable (#6186, completing the Date change from #6214 — the
         // non-movable rationale above it was disproven there): `movable`
@@ -809,13 +846,12 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         true,
         GcExternalBytePolicy::None,
         GcLargeObjectPolicy::NotApplicable,
-        // pointer_free: the embedded `temporal_rs` value is plain integers +
+        // Native payload: the embedded `temporal_rs` value is plain integers +
         // `'static` calendar data, never a JSValue. Any Rust-heap it owns is
         // released by the TemporalCleanup finalize hook, not GC tracing.
-        true,
-        // Expando rekey on relocation, mirroring Date: no-op when the cell
-        // has no expando entry.
-        GcMoveHookKind::ExoticExpandoOwner,
+        false,
+        // Own properties are child edges, requiring no move hook.
+        GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::TemporalCleanup,
     )),
@@ -959,14 +995,14 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
     Some(gc_type_info_entry(
         GC_TYPE_SYMBOL,
         "symbol",
-        GcAllocationPolicy::ArenaOrMalloc,
+        GcAllocationPolicy::Arena,
         true,
-        GcRewriteDescriptorKind::Leaf,
+        GcRewriteDescriptorKind::Symbol,
         GcLayoutSlotKind::None,
-        false,
-        GcExternalBytePolicy::InlinePayload,
-        GcLargeObjectPolicy::MallocTracked,
         true,
+        GcExternalBytePolicy::InlinePayload,
+        GcLargeObjectPolicy::OldArenaWhenOverThreshold,
+        false,
         GcMoveHookKind::None,
         GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
@@ -984,6 +1020,111 @@ const CORE_TYPE_INFOS: &[Option<GcTypeInfo>] = &[
         false,
         GcMoveHookKind::None,
         GcRewriteHookKind::WeakStorageIndex,
+        GcFinalizeHookKind::None,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_ASYNC_SNAPSHOT,
+        "async_snapshot",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::AsyncSnapshot,
+        GcLayoutSlotKind::None,
+        true,
+        GcExternalBytePolicy::None,
+        GcLargeObjectPolicy::NotApplicable,
+        false,
+        GcMoveHookKind::OwnedAsyncSnapshot,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::AsyncSnapshot,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_ASYNC_RESOURCE_STATE,
+        "async_resource_state",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::AsyncResourceState,
+        GcLayoutSlotKind::None,
+        false,
+        GcExternalBytePolicy::None,
+        GcLargeObjectPolicy::NotApplicable,
+        false,
+        GcMoveHookKind::None,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::AsyncResourceState,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_OVERFLOW,
+        "object_overflow",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::Overflow,
+        GcLayoutSlotKind::None,
+        true,
+        GcExternalBytePolicy::None,
+        GcLargeObjectPolicy::NotApplicable,
+        false,
+        GcMoveHookKind::None,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::None,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_SET_STORE,
+        "set_store",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::SetStore,
+        GcLayoutSlotKind::None,
+        true,
+        GcExternalBytePolicy::SideAllocation,
+        GcLargeObjectPolicy::OldArenaWhenOverThreshold,
+        false,
+        GcMoveHookKind::OwnedSetStore,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::OwnedSetStore,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_MAP_STORE,
+        "map_store",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::MapStore,
+        GcLayoutSlotKind::None,
+        true,
+        GcExternalBytePolicy::SideAllocation,
+        GcLargeObjectPolicy::OldArenaWhenOverThreshold,
+        false,
+        GcMoveHookKind::OwnedMapStore,
+        GcRewriteHookKind::OwnedMapIndex,
+        GcFinalizeHookKind::OwnedMapStore,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_INTERP_FUNCTION,
+        "interpreted_function",
+        GcAllocationPolicy::Malloc,
+        false,
+        GcRewriteDescriptorKind::Leaf,
+        GcLayoutSlotKind::None,
+        false,
+        GcExternalBytePolicy::None,
+        GcLargeObjectPolicy::MallocTracked,
+        true,
+        GcMoveHookKind::None,
+        GcRewriteHookKind::None,
+        GcFinalizeHookKind::InterpFunction,
+    )),
+    Some(gc_type_info_entry(
+        GC_TYPE_PROXY,
+        "proxy",
+        GcAllocationPolicy::Arena,
+        true,
+        GcRewriteDescriptorKind::Proxy,
+        GcLayoutSlotKind::None,
+        false,
+        GcExternalBytePolicy::None,
+        GcLargeObjectPolicy::NotApplicable,
+        false,
+        GcMoveHookKind::None,
+        GcRewriteHookKind::None,
         GcFinalizeHookKind::None,
     )),
 ];
@@ -1162,34 +1303,36 @@ pub(crate) fn run_gc_rewrite_hook(obj_type: u8, user_ptr: usize) {
         GcRewriteHookKind::WeakStorageIndex => unsafe {
             (*(user_ptr as *mut crate::weakref::storage::WeakStorage)).rebuild();
         },
-        GcRewriteHookKind::MapIndex => {
-            crate::map::rebuild_map_ptr_index_for_gc(user_ptr as *mut crate::map::MapHeader);
-        }
+        GcRewriteHookKind::OwnedMapIndex => unsafe {
+            crate::map::rebuild_owned_map_ptr_index(user_ptr as *mut u8);
+        },
+        GcRewriteHookKind::OwnedMapEntries => unsafe {
+            crate::map::refresh_entries_alias(user_ptr as *mut crate::map::MapHeader);
+        },
+        GcRewriteHookKind::OwnedSetElements => unsafe {
+            crate::set::refresh_elements_alias(user_ptr as *mut crate::set::SetHeader);
+        },
     }
 }
 
 pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user: usize) {
     match gc_type_info(obj_type).map_or(GcMoveHookKind::None, |info| info.move_hook_kind) {
         GcMoveHookKind::None => {}
-        GcMoveHookKind::ObjectModuleWrapper => {
-            // The residual `Object.setPrototypeOf` registry is rekeyed by the
-            // relocation funnel for every owner kind (`gc/layout/transfer.rs`),
-            // which runs before this hook on every move.
-            crate::object::module_wrapper_owner_moved(old_user, new_user);
-        }
-        GcMoveHookKind::ClosureDynamicProps => {
-            crate::closure::closure_dynamic_props_owner_moved(old_user, new_user);
-            crate::dyn_eval_hooks::function_owner_moved(old_user, new_user);
-        }
         GcMoveHookKind::MapForeachStack => {
             crate::map::map_header_moved_for_gc(old_user, new_user);
         }
-        GcMoveHookKind::SetSideTables => {
+        GcMoveHookKind::SetForeachStack => {
             crate::set::set_header_moved_for_gc(old_user, new_user);
         }
-        GcMoveHookKind::ExoticExpandoOwner => {
-            crate::object::exotic_expando::exotic_expando_owner_moved(old_user, new_user);
-        }
+        GcMoveHookKind::OwnedMapStore => unsafe {
+            crate::map::owned_store_moved_for_gc(old_user, new_user);
+        },
+        GcMoveHookKind::OwnedSetStore => unsafe {
+            crate::set::owned_store_moved_for_gc(old_user, new_user);
+        },
+        GcMoveHookKind::OwnedAsyncSnapshot => unsafe {
+            crate::async_context::snapshot_holder_moved_for_gc(old_user, new_user);
+        },
         GcMoveHookKind::ErrorSideTables => {
             crate::node_submodules::diagnostics_gc::error_side_tables_owner_moved(
                 old_user, new_user,
@@ -1203,20 +1346,6 @@ pub(crate) fn gc_type_after_payload_move(obj_type: u8, old_user: usize, new_user
 
 pub(crate) fn gc_type_clear_dead_payload_side_tables(obj_type: u8, user_ptr: usize) {
     match gc_type_info(obj_type).map_or(GcMoveHookKind::None, |info| info.move_hook_kind) {
-        GcMoveHookKind::ObjectModuleWrapper => {
-            crate::object::clear_module_wrapper_for_dead_ptr(user_ptr);
-            // The old per-object KEYS_INDEX prune is gone (#6759 C1): key
-            // indexes are shape records keyed on keys_array identity now,
-            // memory-pruned by `shapes::prune_dead_shape_keys` in the
-            // dead-owner fan-out and correctness-guarded by per-hit
-            // content validation.
-        }
-        GcMoveHookKind::ClosureDynamicProps => {
-            // 2026-07-09 GC audit wave 2: previously an explicit no-op — a
-            // dead closure's `fn.prop = …` / `setPrototypeOf(fn, …)` entries
-            // leaked and resurrected on a new closure at the reused address.
-            crate::closure::clear_closure_side_tables_for_dead_ptr(user_ptr);
-        }
         GcMoveHookKind::ErrorSideTables => {
             crate::node_submodules::diagnostics_gc::error_side_tables_clear_dead(user_ptr);
         }
@@ -1229,19 +1358,33 @@ pub(crate) fn gc_type_clear_dead_payload_side_tables(obj_type: u8, user_ptr: usi
         }
         GcMoveHookKind::None
         | GcMoveHookKind::MapForeachStack
-        | GcMoveHookKind::SetSideTables
-        | GcMoveHookKind::ExoticExpandoOwner => {}
+        | GcMoveHookKind::SetForeachStack
+        | GcMoveHookKind::OwnedMapStore
+        | GcMoveHookKind::OwnedSetStore
+        | GcMoveHookKind::OwnedAsyncSnapshot => {}
     }
 }
 
 pub(crate) unsafe fn gc_type_finalize_unmarked_payload(obj_type: u8, user_ptr: *mut u8) {
     match gc_type_info(obj_type).map_or(GcFinalizeHookKind::None, |info| info.finalize_hook_kind) {
         GcFinalizeHookKind::None => {}
-        GcFinalizeHookKind::MapSideAllocation => {
-            crate::map::finalize_map_side_allocation_for_gc(user_ptr as *mut crate::map::MapHeader);
+        GcFinalizeHookKind::InterpFunction => {
+            // Only the evaluator allocates this kind. Feature-stripped builds
+            // cannot contain one and need no dependency on the evaluator.
+            #[cfg(feature = "dyn-eval")]
+            crate::dyn_eval::function_cell::finalize(user_ptr);
         }
-        GcFinalizeHookKind::SetSideAllocation => {
-            crate::set::finalize_set_side_allocation_for_gc(user_ptr as *mut crate::set::SetHeader);
+        GcFinalizeHookKind::OwnedMapStore => crate::map::finalize_owned_store(user_ptr, true),
+        GcFinalizeHookKind::OwnedSetStore => {
+            crate::set::finalize_owned_store(user_ptr, true);
+        }
+        GcFinalizeHookKind::AsyncSnapshot => {
+            crate::async_context::finalize_snapshot_holder(
+                user_ptr as *mut crate::async_context::AsyncSnapshotHolder,
+            );
+        }
+        GcFinalizeHookKind::AsyncResourceState => {
+            crate::async_hooks::resource_state::finalize(user_ptr.cast(), true);
         }
         GcFinalizeHookKind::PromiseCleanup => {
             let promise = user_ptr as *mut crate::promise::Promise;
@@ -1319,16 +1462,23 @@ pub(crate) fn validate_gc_type_info(info: &GcTypeInfo) -> Result<(), &'static st
             }
         }
         GcRewriteDescriptorKind::WeakStorage
+        | GcRewriteDescriptorKind::Overflow
         | GcRewriteDescriptorKind::Box
         | GcRewriteDescriptorKind::Scope
         | GcRewriteDescriptorKind::Buffer
         | GcRewriteDescriptorKind::MetaOnly
         | GcRewriteDescriptorKind::NativeHandle
         | GcRewriteDescriptorKind::Promise
+        | GcRewriteDescriptorKind::AsyncSnapshot
+        | GcRewriteDescriptorKind::AsyncResourceState
+        | GcRewriteDescriptorKind::Symbol
         | GcRewriteDescriptorKind::Error
         | GcRewriteDescriptorKind::Map
+        | GcRewriteDescriptorKind::MapStore
         | GcRewriteDescriptorKind::LazyArray
-        | GcRewriteDescriptorKind::Set => {
+        | GcRewriteDescriptorKind::Set
+        | GcRewriteDescriptorKind::SetStore
+        | GcRewriteDescriptorKind::Proxy => {
             if info.layout_slot_kind != GcLayoutSlotKind::None {
                 return Err(
                     "external-backed rewrite descriptor must not expose payload layout slots",
@@ -1472,16 +1622,35 @@ pub unsafe fn set_forwarding_address(header: *mut GcHeader, new_user_addr: *mut 
     (*header).gc_flags |= GC_FLAG_FORWARDED;
 }
 
+/// Per-instance builtin constructability. Kind-disjoint from byte-owner
+/// and array bit 7; copying age/layout updates preserve this bit.
+pub(crate) const GC_CLOSURE_NON_CONSTRUCTABLE: u16 = 0x80;
+
 // Object flags stored in GcHeader._reserved (u16) for Object.freeze/seal/preventExtensions
 pub const OBJ_FLAG_FROZEN: u16 = 0x01;
 pub const OBJ_FLAG_SEALED: u16 = 0x02;
 pub const OBJ_FLAG_NO_EXTEND: u16 = 0x04;
 // #1175: object was created with a null prototype (Object.create(null) /
 // querystring.parse). `Object.getPrototypeOf` returns null for these.
-// Bit 6 -- bits 3..5 are the copied-nursery survival counter
-// (`GC_COPY_SURVIVAL_AGE_MASK = 0x0038`) and bits 14..15 the layout state,
-// so 0x08 would be clobbered on every minor GC. Bits 6..13 are free.
+// Bit 6; bits 3..4 are survival age, bit 5 is callability, and 14..15
+// are layout state. See the complete map below before allocating a bit.
 pub const OBJ_FLAG_NULL_PROTO: u16 = 0x40;
+/// I1 (`gc::never_move`): this `GC_TYPE_OBJECT` never moves once it is in
+/// the old generation. The copying minor promotes it at its next survival,
+/// and old-page defragmentation and idle compaction never select it. A
+/// per-site memo may name only an object that carries this bit and is old
+/// (`never_move::stable_memo_referent`), which is what lets the memo hold a
+/// plain address with no root, registry or rewrite. Bit 7 is free for
+/// objects (`OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC`); arrays and byte owners give
+/// it other meanings, so every reader checks `obj_type` first. Set-only.
+pub(crate) const OBJ_FLAG_NEVER_MOVE: u16 = 0x80;
+/// I1 companion (`gc::never_move::note_memo_named`): a site memo stores
+/// this object's address. If a class relink displaces it from a class
+/// identity, the retirement pins it, so the memo keeps reading this object.
+/// Bit 13 shares generic layout initialization's ALL_POINTERS bit. The
+/// object field iterator selects by shape; memo readers require OBJECT.
+/// Layout initialization must finish before this set-only fact is published.
+pub(crate) const OBJ_FLAG_MEMO_NAMED: u16 = 0x2000;
 /// The GC_TYPE_BUFFER payload contains a native data pointer after BufferHeader.
 /// Bit 7 is kind-disjoint from object/array numeric-layout proofs. Generic age
 /// and layout transitions preserve it; no Buffer reader interprets those proofs.
@@ -1489,26 +1658,15 @@ pub(crate) const GC_BUFFER_FOREIGN_DATA: u16 = 0x80;
 /// A Buffer-family view contains a resolved native data pointer at +8.
 /// Kind-disjoint from the Object typed-array-prototype bit. The view's
 /// backing edge is traced and the derived pointer is refreshed on rewrite.
-// Array carries properties outside its ordinary dense-element representation:
-// per-index descriptors (accessors or custom attrs installed via
-// `Object.defineProperty`), a non-writable `length`, or named properties in
-// the array side table. The raw-f64 and callback-free fast paths must decline
-// and route through the property-aware path. This bit is monotone for an
-// allocation, so deleting the last special property may conservatively leave
-// it set. Bit 10 — bits 7/8/9 are taken by
-// `GC_ARRAY_RAW_F64_LAYOUT` (0x80), `OBJ_FLAG_TYPED_ARRAY_PROTO` (0x100),
-// and `GC_ARRAY_ARGUMENTS_OBJECT` (0x200). Only meaningful for
-// `GC_TYPE_ARRAY`.
-pub const OBJ_FLAG_ARRAY_DESCRIPTORS: u16 = 0x400;
+// Bit 10 has no array meaning: an array's element descriptors (accessors or
+// custom attrs on an index key, a non-writable `length`) are a fact of its
+// named layout (`array::array_has_element_descriptors`, object model step 7).
 /// #9064: this `GC_TYPE_OBJECT` has O(1)-delete tombstones whose ShapeId is
 /// deliberately stable. A cached slot is authoritative only after its value
 /// is checked against `TAG_HOLE`; the marker means the cached key was deleted
 /// and the access must take the ordinary lookup path.
 ///
-/// Bit 10 is shared with `OBJ_FLAG_ARRAY_DESCRIPTORS`, which is meaningful
-/// only for `GC_TYPE_ARRAY`. Object and Array payloads are disjoint by the
-/// already-required `obj_type` guard, matching the existing bit sharing at
-/// 7/9/11/12.
+/// Bit 10; only meaningful for `GC_TYPE_OBJECT`.
 pub const OBJ_FLAG_STABLE_TOMBSTONES: u16 = 0x400;
 // #5054: a property/accessor descriptor (or builtin attrs) has been installed
 // on this specific object — the dynamic-write fast path must take the full
@@ -1517,14 +1675,6 @@ pub const OBJ_FLAG_STABLE_TOMBSTONES: u16 = 0x400;
 // path is always correct). #7480 reuses bit 11 for `GC_TYPE_ARRAY` as
 // `GC_ARRAY_ELEMENT_SHAPE`; the two are disjoint by `obj_type`.
 pub const OBJ_FLAG_HAS_DESCRIPTORS: u16 = 0x800;
-/// Heap class-expression value (`class C {}`), as distinct from an ordinary
-/// instance carrying the same `GC_TYPE_OBJECT` allocation tag. This is the
-/// authoritative replacement for `ObjectHeader::object_type ==
-/// OBJECT_TYPE_CLASS`; #8113 deleted that legacy payload word — the note below
-/// is history, kept because it explains why the kind lives in the descriptor
-/// rather than in
-/// #8047 removes it. Bit 13 is preserved by survival-age and layout-state
-/// updates and is otherwise unused for `GC_TYPE_OBJECT`.
 // #2145: this object is a per-kind `<TypedArrayCtor>.prototype` whose
 // `[[Prototype]]` is the shared `%TypedArray%.prototype` intrinsic.
 // `Object.getPrototypeOf(Int8Array.prototype)` returns the cached
@@ -1535,48 +1685,10 @@ pub const OBJ_FLAG_TYPED_ARRAY_PROTO: u16 = 0x100;
 /// `JSValue` slots. This is only meaningful for `GC_TYPE_ARRAY`; object
 /// flags share the same `_reserved` word but never inspect this bit.
 pub(crate) const GC_ARRAY_RAW_F64_LAYOUT: u16 = 0x80;
-/// #10362: this cell owns an entry in the residual static-prototype registry
-/// (`object::prototype_chain`) — i.e. an `Object.setPrototypeOf` whose receiver
-/// `meta_capable_object` turned away, so the prototype could not go in a meta
-/// record and went into the address-keyed table instead.
-///
-/// The registry's readers used to ask only the process-global
-/// `OBJECT_PROTOTYPES_NONEMPTY` latch, which is exact for a process that has
-/// never re-prototyped a non-object and useless for one that has: a single
-/// `Object.setPrototypeOf(anArray, p)` made EVERY traced cell of every
-/// owner-capable kind take the registry's global mutex and a SipHash probe, and
-/// every relocation of one call the rekey hook. Measured on a 200k-array
-/// fixture: 400,000 armed hook calls from three lines of setup, against 155
-/// unarmed. This bit answers the same question per OWNER, so an armed process
-/// pays only for the cells that actually have an entry.
-///
-/// Bit 6, shared with `OBJ_FLAG_NULL_PROTO` exactly as bits 7..12 are already
-/// shared between the OBJECT and ARRAY namespaces, and disjoint from it by
-/// `obj_type`: `OBJ_FLAG_NULL_PROTO` has one setter,
-/// `js_object_alloc_null_proto`, which returns `*mut ObjectHeader`, and every
-/// reader of it is behind an `obj_type == GC_TYPE_OBJECT` guard (audited:
-/// `field_get_set/accessors.rs`, `field_get_set/for_in_stable.rs`,
-/// `field_set_by_name.rs`, `field_set_by_name/tail.rs` via `object_is_regular`,
-/// `builtins/formatting.rs` via both callers' `gc_type` dispatch,
-/// `builtins/formatting/prototype_equality.rs` via `heap_object_addr`,
-/// `native_call_method/object_proto.rs` via `object_ptr_from_value`).
-/// So this bit is **only meaningful for `obj_type != GC_TYPE_OBJECT`**, and a
-/// `GC_TYPE_OBJECT` owner that reaches the registry anyway keeps the
-/// latch-only gate (see `residual_entry_possible_for`).
-///
-/// Set-only, like `GC_ARRAY_NAMED_PROPS` and for the same reason: an entry is
-/// never deleted while its owner lives (a second `setPrototypeOf` overwrites
-/// the same key; the prune only removes DEAD owners, whose header is gone; the
-/// two rekey paths remove-then-insert and the entry survives). So the error is
-/// on the safe side by construction — a stale-set bit costs one probe that the
-/// map answers `None` to, while the dangerous direction (entry present, bit
-/// absent) has no code path that can produce it, because the only writer of the
-/// entry is also the only writer of the bit, under one lock.
-pub(crate) const GC_RESIDUAL_PROTO_OWNER: u16 = 0x40;
-/// #10593: the same bit, read on a `GC_TYPE_ARRAY` as "THIS array's
+/// #10593: a per-array flag, read as "THIS array's
 /// `[[Prototype]]` was retargeted". Arrays are never meta-capable, so every
-/// `Object.setPrototypeOf(arr, p)` records into the residual registry and sets
-/// the bit; it rides growth and every GC relocation for the reasons given
+/// `Object.setPrototypeOf(arr, p)` records in its property bag and sets
+/// this flag; it rides growth and every GC relocation for the reasons given
 /// above, and it is set-only, so a later reset to `Array.prototype` leaves the
 /// array (conservatively) on the slow path.
 ///
@@ -1589,7 +1701,7 @@ pub(crate) const GC_RESIDUAL_PROTO_OWNER: u16 = 0x40;
 /// `Object.prototype`, a retargeted `Array.prototype`, or a retargeted lazy
 /// JSON array (whose materialized storage is a separate allocation that does
 /// not carry this bit).
-pub(crate) const GC_ARRAY_CUSTOM_PROTO: u16 = GC_RESIDUAL_PROTO_OWNER;
+pub(crate) const GC_ARRAY_CUSTOM_PROTO: u16 = 0x40;
 /// Array was synthesized for a function's `arguments` binding. This is only
 /// meaningful for `GC_TYPE_ARRAY`; it lets `util.types.isArgumentsObject`
 /// distinguish Perry's internal `arguments` arrays from user rest arrays.
@@ -1614,7 +1726,7 @@ pub(crate) const GC_ARRAY_ARGUMENTS_OBJECT: u16 = 0x200;
 /// pins that. The readers that only use the bit to DECLINE an object fast path
 /// (`proxy/put_value.rs`, `field_set_by_name*`, `delete_rest.rs`,
 /// `read_stub.rs`, `then_probe.rs`) are type-guarded as well.
-pub(crate) const GC_ARRAY_NAMED_PROPS: u16 = 0x100;
+pub(crate) const GC_ARRAY_KEY_ATTRS: u16 = 0x100;
 /// #8098: this `GC_TYPE_OBJECT` allocation is an ORDINARY plain object. It has
 /// no class, but it also carries none of the per-object `[[Set]]` semantics a
 /// class-less receiver may otherwise have — a `URL`'s `pathname`/`search`/…
@@ -1635,9 +1747,8 @@ pub(crate) const GC_ARRAY_NAMED_PROPS: u16 = 0x100;
 pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x200;
 /// This OBJECT allocation has an Arguments private tail. Its class id stays
 /// zero: the identity does not invent a constructor or private class fields.
-/// Bit 12 is free on OBJECT, whose layout is entirely a ShapeId fact. Array
-/// and closure layout bits are interpreted only after their own kind guard;
-/// object layout transitions never write these bits, and copying preserves it.
+/// Bit 12 is disjoint from object initialization state (14..15). Array
+/// numeric-hole layout uses bit 12 only after its array kind guard.
 pub(crate) const OBJ_FLAG_ARGUMENTS: u16 = 0x1000;
 /// # `GcHeader::_reserved` bit map by GC kind
 ///
@@ -1648,29 +1759,51 @@ pub(crate) const OBJ_FLAG_ARGUMENTS: u16 = 0x1000;
 /// were "the last free bits" while `gc/layout.rs` already owned 12, 13, 14
 /// and 15.
 ///
-/// | bit | OBJECT (`GC_TYPE_OBJECT`) | ARRAY | all kinds |
+/// | bit | OBJECT | PROXY | other uses |
 /// |---|---|---|---|
-/// | 0..2 | `OBJ_FLAG_FROZEN` / `SEALED` / `NO_EXTEND` | same | |
-/// | 3..5 | | | `GC_COPY_SURVIVAL_AGE_MASK` |
-/// | 6 | `OBJ_FLAG_NULL_PROTO` | `GC_ARRAY_CUSTOM_PROTO` (alias) | `GC_RESIDUAL_PROTO_OWNER` (non-object) |
-/// | 7 | available | `GC_ARRAY_RAW_F64_LAYOUT` | byte owner: `GC_BUFFER_FOREIGN_DATA` (out-of-line); byte view: `BYTES_LENGTH_TRACKING` |
-/// | 8 | `OBJ_FLAG_TYPED_ARRAY_PROTO` | `GC_ARRAY_NAMED_PROPS` | byte owner: `BYTES_RESIZABLE` |
-/// | 9 | `OBJ_FLAG_PLAIN_ORDINARY` | `GC_ARRAY_ARGUMENTS_OBJECT` | |
-/// | 10 | `OBJ_FLAG_STABLE_TOMBSTONES` | `OBJ_FLAG_ARRAY_DESCRIPTORS` | |
-/// | 11 | `OBJ_FLAG_HAS_DESCRIPTORS` | element shape (#7480) | |
-/// | 12 | `OBJ_FLAG_ARGUMENTS` | `GC_ARRAY_RAW_F64_HOLES` | |
-/// | 13 | available | `GC_LAYOUT_ALL_POINTERS` | closure/array layout only |
-/// | 14..15 | available | `GC_LAYOUT_STATE_MASK` | closure/array layout only |
+/// | 0..2 | FROZEN / SEALED / NO_EXTEND | no proxy-specific writer | integrity flags |
+/// | 3..4 | survival age | survival age | GC_COPY_SURVIVAL_AGE_MASK, all kinds |
+/// | 5 | GC_OBJECT_CALLABLE | GC_OBJECT_CALLABLE | unused |
+/// | 6 | NULL_PROTO | unused | array: CUSTOM_PROTO |
+/// | 7 | NEVER_MOVE | unused | array: RAW_F64_LAYOUT; closure: NON_CONSTRUCTABLE; byte owner: FOREIGN_DATA; byte view: LENGTH_TRACKING |
+/// | 8 | TYPED_ARRAY_PROTO | unused | array: KEY_ATTRS; byte owner: RESIZABLE |
+/// | 9 | PLAIN_ORDINARY | unused | array: ARGUMENTS_OBJECT |
+/// | 10 | STABLE_TOMBSTONES | unused | byte pin count |
+/// | 11 | HAS_DESCRIPTORS | unused | array: ELEMENT_SHAPE; byte pin count |
+/// | 12 | ARGUMENTS | unused | array: RAW_F64_HOLES; byte pin count |
+/// | 13 | MEMO_NAMED / generic ALL_POINTERS initialization | unused | array/closure: ALL_POINTERS; byte pin count |
+/// | 14..15 | GC_LAYOUT_STATE_MASK initialization | unused | array/closure layout state |
+///
+/// OBJECT has ObjectFields layout: generic layout initialization writes
+/// 13..15 even though its field iterator later selects exclusively by ShapeId.
+/// These bits are not available for an independent object fact. MEMO_NAMED
+/// is published after initialization and its readers require OBJECT.
 ///
 /// Byte families, TypedArray and NativeArena owner only: byte access uses
-/// the active byte-pin count in 9..13, 14 is buffer detached state, and 15
-/// preserves a pre-existing permanent pin.
-/// These types have no dynamic layout-slot state; no header or cell grows.
-///
-/// Object layout is a ShapeId fact. Bits 7 and 13..15 have no object
-/// layout meaning; array and closure layout metadata still uses its listed
-/// bits. Any new header use must be checked against every GC kind.
+/// the active byte-pin count in 9..13, 14 is detached state, and 15
+/// preserves a permanent pin. These kinds have no dynamic layout-slot state.
+/// No header or payload layout grows.
 pub const OBJ_FLAG_RESERVED_BIT_MAP_SEE_DOC: () = ();
+
+/// All independent OBJECT header meanings. Callability must never alias one.
+pub(crate) const GC_OBJECT_CALLABLE_IS_DISJOINT: bool = GC_OBJECT_CALLABLE
+    & (super::layout::GC_LAYOUT_STATE_MASK
+        | super::layout::GC_LAYOUT_ALL_POINTERS
+        | super::layout::GC_COPY_SURVIVAL_AGE_MASK
+        | OBJ_FLAG_FROZEN
+        | OBJ_FLAG_SEALED
+        | OBJ_FLAG_NO_EXTEND
+        | OBJ_FLAG_NULL_PROTO
+        | OBJ_FLAG_NEVER_MOVE
+        | OBJ_FLAG_TYPED_ARRAY_PROTO
+        | OBJ_FLAG_PLAIN_ORDINARY
+        | OBJ_FLAG_STABLE_TOMBSTONES
+        | OBJ_FLAG_HAS_DESCRIPTORS
+        | OBJ_FLAG_ARGUMENTS
+        | OBJ_FLAG_MEMO_NAMED)
+    == 0;
+const _: () = assert!(GC_OBJECT_CALLABLE_IS_DISJOINT);
+
 /// #6011: every element slot in `[0, length)` holds either canonical raw-f64
 /// number bits or `TAG_HOLE` — the hole-tolerant sibling of
 /// `GC_ARRAY_RAW_F64_LAYOUT`. Set when `new Array(n)` hole-initializes a

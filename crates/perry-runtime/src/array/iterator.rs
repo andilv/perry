@@ -156,7 +156,7 @@ pub extern "C" fn js_for_of_to_array(val_f64: f64) -> f64 {
 
 pub(crate) fn entries_array_for_small_handle_value(value: f64) -> Option<*mut ArrayHeader> {
     let bits = value.to_bits();
-    if (bits >> 48) != 0x7FFD {
+    if (bits & crate::value::TAG_MASK) != crate::value::HANDLE_TAG {
         return None;
     }
     entries_array_for_small_handle_id((bits & crate::value::POINTER_MASK) as i64)
@@ -275,34 +275,12 @@ fn undefined_value() -> f64 {
 }
 
 fn async_from_sync_iter_result(value: f64, done: bool) -> f64 {
-    // The result value and the freshly-allocated object are live young objects
-    // held across sibling allocations (the object alloc, and each
-    // `set_field_by_name`, which can grow the shape). The default-on moving
-    // scavenge evacuates young survivors, so cache them in a handle scope and
-    // re-read through the (GC-updated) handles instead of stale raw copies.
-    // Property-name keys use the long-lived allocator so they never move and
-    // need no rooting.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let value_h = scope.root_nanbox_f64(value);
-    let obj = crate::object::js_object_alloc(0, 2);
-    let obj_h = scope.root_raw_mut_ptr(obj);
-    let value_key = crate::string::js_string_from_bytes_longlived(b"value".as_ptr(), 5);
-    let done_key = crate::string::js_string_from_bytes_longlived(b"done".as_ptr(), 4);
-    crate::object::js_object_set_field_by_name(
-        obj_h.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
-        value_key,
-        value_h.get_nanbox_f64(),
-    );
-    crate::object::js_object_set_field_by_name(
-        obj_h.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
-        done_key,
-        if done {
-            f64::from_bits(crate::value::TAG_TRUE)
-        } else {
-            f64::from_bits(crate::value::TAG_FALSE)
-        },
-    );
-    crate::value::js_nanbox_pointer(obj_h.get_raw_mut_ptr::<crate::object::ObjectHeader>() as i64)
+    unsafe {
+        crate::iter_result::make_iter_result(
+            crate::value::JSValue::from_bits(value.to_bits()),
+            done,
+        )
+    }
 }
 
 extern "C" fn async_from_sync_fulfilled(
@@ -491,10 +469,9 @@ fn async_from_sync_call_raw(iter: f64, method: &[u8], args: &[f64]) -> Result<Op
         true
     };
 
-    let trap_buf = crate::exception::js_try_push();
-    // Armed in a C trampoline frame (#9305); everything between the landing
-    // and `js_try_end` below is pure TLS bookkeeping.
-    let outcome = crate::exception::arm_trap_and_run(trap_buf, || {
+    // Runs under the trap shim (`exception::trap`); everything after the
+    // landing below is pure TLS bookkeeping.
+    let outcome = crate::exception::trap(|| {
         let args_ptr = if args.is_empty() {
             std::ptr::null()
         } else {
@@ -529,7 +506,6 @@ fn async_from_sync_call_raw(iter: f64, method: &[u8], args: &[f64]) -> Result<Op
             Err(exc)
         }
     };
-    crate::exception::js_try_end();
     result
 }
 
@@ -550,8 +526,7 @@ fn async_from_sync_call_cached_raw(
             b"Async-from-sync iterator method is not callable",
         ));
     }
-    let trap_buf = crate::exception::js_try_push();
-    let outcome = crate::exception::arm_trap_and_run(trap_buf, || {
+    let outcome = crate::exception::trap(|| {
         let args_ptr = if args.is_empty() {
             std::ptr::null()
         } else {
@@ -574,7 +549,6 @@ fn async_from_sync_call_cached_raw(
             Err(exc)
         }
     };
-    crate::exception::js_try_end();
     result
 }
 
@@ -921,18 +895,6 @@ fn object_like_iterator_result(value: f64) -> bool {
     raw >= 0x10000
 }
 
-/// #7542: does this value carry its OWN `[Symbol.iterator]`? An own method
-/// shadows the prototype, so the patched-prototype shortcut must stand aside
-/// for it and let the ordinary `@@iterator` walk resolve it.
-fn array_has_own_iterator(value: f64) -> bool {
-    let iter_sym = crate::symbol::well_known_symbol("iterator");
-    if iter_sym.is_null() {
-        return false;
-    }
-    let sym_value = f64::from_bits(crate::value::JSValue::pointer(iter_sym as *const u8).bits());
-    unsafe { crate::symbol::has_own_symbol_property(value, sym_value) }
-}
-
 pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
     use crate::value::{js_nanbox_get_pointer, js_nanbox_pointer, JSValue, POINTER_MASK};
 
@@ -1048,11 +1010,15 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
     // not preempt the walk below for that case: `js_get_iterator`'s patched
     // branch reads the PROTOTYPE only, and would throw "not iterable" for an
     // array carrying its own method once the prototype slot has been deleted.
-    if crate::array::array_iteration_not_pristine()
-        && crate::array::js_array_is_array(value()).to_bits() == crate::value::TAG_TRUE
-        && !array_has_own_iterator(value())
+    if crate::array::js_array_is_array(value()).to_bits() == crate::value::TAG_TRUE
+        && crate::array::array_iteration_facts() != 0
     {
-        return js_iterator_to_array(crate::symbol::js_get_iterator(value()));
+        let array =
+            crate::array::clean_arr_ptr(js_nanbox_get_pointer(value()) as *const ArrayHeader);
+        if !array.is_null() && !unsafe { super::iterator_step::array_iteration_is_intrinsic(array) }
+        {
+            return js_iterator_to_array(crate::symbol::js_get_iterator(value()));
+        }
     }
 
     if let Some(entries) = entries_array_for_small_handle_id(raw_ptr() as i64) {
@@ -1185,13 +1151,11 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
             // receiver from the call, so pass it — mirroring `js_get_iterator`.
             // Without it the wrapper saw a stale `this` and the generator
             // yielded nothing (empty spread).
-            let trap_buf = crate::exception::js_try_push();
-            // `js_try_push` captured the handle-stack depth AFTER these roots
-            // were pushed, so the `longjmp` restore leaves them intact and
-            // reading them here is sound. Armed in a C trampoline frame
-            // (#9305); the rethrow below runs after `js_try_end` pops this
-            // trap, so it targets the enclosing handler.
-            let outcome = crate::exception::arm_trap_and_run(trap_buf, || {
+            // These roots belong to this frame, so the trap pad's restore
+            // leaves them intact and reading them here is sound. Runs under
+            // the trap shim (`exception::trap`); the rethrow below runs after
+            // the trap returned, so it targets the enclosing handler.
+            let outcome = crate::exception::trap(|| {
                 crate::closure::js_closure_call0(
                     js_nanbox_get_pointer(rebound_h.get_nanbox_f64())
                         as *const crate::closure::ClosureHeader,
@@ -1201,17 +1165,13 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
             let iter = match outcome {
                 Some(iter) => iter,
                 None => {
-                    // Factory threw: unwind the trap frame before
-                    // re-propagating (mirrors `async_from_sync_call_cached_raw`
-                    // above).
+                    // Factory threw: re-propagate to the enclosing handler.
                     let exc = crate::exception::js_get_exception();
                     crate::exception::js_clear_exception();
-                    crate::exception::js_try_end();
                     crate::exception::js_throw(exc)
                 }
             };
             let iter_h = scope.root_nanbox_f64(iter);
-            crate::exception::js_try_end();
             if crate::array::js_array_is_array(iter_h.get_nanbox_f64()).to_bits()
                 == crate::value::TAG_TRUE
             {
@@ -1313,16 +1273,11 @@ pub(crate) fn is_builtin_iterator_class_id(raw_ptr: usize) -> bool {
 }
 
 fn is_object_like_value(value: f64) -> bool {
-    let jv = crate::value::JSValue::from_bits(value.to_bits());
-    if !jv.is_pointer() {
-        let bits = value.to_bits();
-        return bits != 0
-            && bits <= 0x0000_FFFF_FFFF_FFFF
-            && bits > 0x10000
-            && crate::closure::is_closure_ptr(bits as usize);
+    let bits = value.to_bits();
+    if bits != 0 && bits <= 0x0000_FFFF_FFFF_FFFF {
+        return bits > 0x10000 && crate::closure::is_closure_ptr(bits as usize);
     }
-    let raw = crate::value::js_nanbox_get_pointer(value) as usize;
-    raw >= 0x10000 && !crate::symbol::is_registered_symbol(raw)
+    crate::builtins::arithmetic::js_value_is_object(value)
 }
 
 /// #7562: the drain hit [`MAX_ITERATOR_DRAIN`] without the iterator finishing.

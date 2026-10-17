@@ -123,6 +123,8 @@ pub use barrier::*;
 /// #7630: the runtime slot-store helpers, split from `barrier.rs` (2000-line cap).
 mod barrier_store;
 pub(crate) use barrier_store::*;
+mod producer_birth;
+pub(crate) use producer_birth::{fresh_old_container_store_barrier, ProducerChildBirth};
 mod dirty_page_cache;
 // #7187 Phase B: `crate::arena`'s page-metadata module invalidates the
 // barrier's "already dirty" page cache when it un-stamps or discards a page.
@@ -137,6 +139,7 @@ use barrier_arming::*;
 /// #7645: `GC_FLAG_PINNED` custody + the young-pin latch the copying minor's
 /// eligibility preflight is skipped on. Every write of the bit goes through
 /// `pin::pin_object`; `scripts/gc_pin_sites.py` enforces that in `lint`.
+pub(crate) mod never_move;
 mod pin;
 #[cfg(test)]
 pub(crate) use copying_parent_facts::copy_decode_sabotage;
@@ -207,7 +210,10 @@ pub(crate) use dead_owner::{
 };
 mod old_free;
 use old_free::*;
-pub(crate) use old_free::{old_free_bytes, old_free_filter_range, old_free_take_exact};
+pub(crate) use old_free::{
+    old_free_bytes, old_free_filter_range, old_free_take_exact,
+    old_free_take_exact_collecting_holder,
+};
 mod tenuring;
 use tenuring::*;
 mod oldgen;
@@ -240,6 +246,8 @@ pub(crate) use cycle_malloc_trim::{
 };
 mod verify;
 mod verify_diag;
+#[cfg(any(test, perry_check_contracts))]
+mod verify_honest;
 use verify_diag::*;
 
 /// #7035: whole-heap from-space scan — verification that does NOT depend on
@@ -665,6 +673,10 @@ pub(super) mod knob_overrides {
         pub(crate) fn on() -> Self {
             Self(FORCE_EVACUATE_TEST_OVERRIDE.with(|c| c.replace(Some(true))))
         }
+
+        pub(crate) fn off() -> Self {
+            Self(FORCE_EVACUATE_TEST_OVERRIDE.with(|c| c.replace(Some(false))))
+        }
     }
 
     #[cfg(test)]
@@ -905,7 +917,11 @@ pub(crate) fn gc_try_emergency_reclaim() -> bool {
     if IN_EMERGENCY.with(|c| c.get()) {
         return false;
     }
-    if GC_FLAGS.with(|f| f.get()) & GC_FLAG_IN_ALLOC != 0 || gc_budgeted_cycle_active() {
+    // Holder publication uses the existing no-move scope while its raw
+    // fields are incomplete. An OOM retry must respect that scope too.
+    if GC_FLAGS.with(|f| f.get()) & (GC_FLAG_IN_ALLOC | policy::GC_FLAG_SUPPRESSED) != 0
+        || gc_budgeted_cycle_active()
+    {
         return false;
     }
     IN_EMERGENCY.with(|c| c.set(true));
@@ -1001,6 +1017,28 @@ macro_rules! reg_budgeted_scanner {
 /// build can run inside that window.
 pub(crate) fn register_prototype_addr_cache_scanner() {
     reg_scanner!(crate::array::scan_prototype_addr_cache_roots_mut);
+    reg_scanner!(crate::agent_ptrs::scan_intrinsic_proto_roots_mut);
+}
+
+/// The agent's property atom table (`string::intern`, §3.5) is weak runtime
+/// state keyed by atom address: every heap that can move an atom must rewrite
+/// its entry, or a data key stops meeting its atom after the move (an
+/// object's overflow keys then answer no lookup). `gc_init` registers this
+/// for a program, and a GC test window that starts from an empty scanner
+/// registry registers it too (`ScopedRootScannerRegistryGuard`).
+pub(crate) fn register_property_atom_scanner() {
+    reg_scanner!(crate::string::scan_property_atoms);
+}
+
+/// The realm's prototypes are born old (I1, `gc::never_move`), and a minor
+/// never traces an old object: the young parts of a realm prototype a test
+/// window builds (its identity words and key lists) are rooted only by the
+/// shape table's scanner. `gc_init` registers it for a program; a test window
+/// that starts from an empty scanner registry, builds the realm and runs a
+/// minor registers it with this.
+#[cfg(test)]
+pub(crate) fn register_realm_prototype_scanners_for_tests() {
+    reg_scanner!(crate::object::shapes::scan_shape_table_rekey_mut);
 }
 
 pub fn gc_init() {
@@ -1016,6 +1054,7 @@ pub fn gc_init() {
     crate::perf_hooks::init_time_origin();
     #[cfg(not(perry_gc_instruments))]
     instruments::refuse_instrument_knobs_without_instruments();
+    crate::entry_contracts::require_check_build_if_requested();
     #[cfg(not(perry_hot_diag))]
     crate::hot_diag::refuse_knobs_without_hot_diag();
     // `PERRY_GC_CENSUS`: remember the main thread and install the SIGUSR2
@@ -1072,7 +1111,6 @@ pub fn gc_init() {
     // (object::shapes_prototype): one registration for every heap word a
     // shape record holds (#12313).
     reg_scanner!(crate::object::shapes::scan_shape_table_rekey_mut);
-    reg_scanner!(crate::proxy::scan_proxy_roots_mut);
     // Object/string-valued `err.<prop> = v` user props live as raw bits in
     reg_scanner!(exception_mutable_root_scanner);
     reg_scanner!(async_context_mutable_root_scanner);
@@ -1091,7 +1129,6 @@ pub fn gc_init() {
     // `retired_by_minor=#0`.
     reg_scanner!(crate::builtins::arithmetic::scan_typeof_string_roots_mut);
     reg_scanner!(crate::json::raw_json::scan_raw_json_key_root_mut);
-    reg_scanner!(crate::object::scan_exotic_expando_roots_mut);
     reg_scanner!(crate::array::scan_template_raw_roots_mut);
     // #6981: the memoized `Array.prototype` / `Object.prototype` addresses in
     // `array::indexing`. Raw addresses of movable objects — a relocating cycle
@@ -1103,23 +1140,17 @@ pub fn gc_init() {
     // or Proxy trap can re-enter after moving GC. Rewrite that temporary
     // identity so malformed prototype cycles remain bounded.
     reg_scanner!(crate::object::prototype_chain::scan_prototype_resolution_stack_roots_mut,);
-    // A store site's chain verdict names its interned
-    // key and the receiver's recorded prototype, and compares them on every
-    // use, so both are STRONG roots (`object::chain_store`).
-    reg_scanner!(crate::object::chain_store::scan_chain_store_roots_mut);
+    reg_scanner!(crate::proxy::scan_packed_add_roots_mut);
     reg_scanner!(crate::proxy::scan_setter_site_roots_mut);
-    // An inherited method-site entry roots its direct prototype holder.
-    reg_scanner!(crate::object::method_site::scan_method_site_roots_mut);
     // A site's chain memo names every prototype from the receiver's
     // [[Prototype]] to the holder of the method it answers; it compares each
     // one's header word on use, so each is a STRONG root.
     reg_scanner!(crate::object::method_site::chain_memo::scan_chain_memo_roots_mut);
-    // A read site's holder entry names the object that holds the answer (and
-    // the hops to it); the emitted hit loads through it, so each is a STRONG
-    // root (`object::method_site::read_holder`).
-    reg_scanner!(crate::object::method_site::read_holder::scan_read_holder_roots_mut);
-    reg_scanner!(crate::map::scan_map_iterator_array_roots_mut);
-    reg_scanner!(crate::set::scan_set_iterator_array_roots_mut);
+    // Read and method sites' holder entries are NOT roots: they name only
+    // stable objects (old, never-move) that the receiver's ShapeId keeps
+    // alive (`gc::never_move`, `read_holder.rs` "Weak entries"). A keyed
+    // entry's KEY is still compared by identity and is rooted here until
+    // keys are immortal atoms.
     reg_scanner!(crate::perf_hooks::scan_perf_entries_roots_mut);
     reg_scanner!(crate::perf_histogram::scan_histogram_roots_mut);
     reg_scanner!(crate::v8::scan_v8_promise_hook_roots_mut);
@@ -1128,28 +1159,24 @@ pub fn gc_init() {
     reg_scanner!(crate::object::scan_arguments_object_roots_mut);
     // bun:ffi (#6562): the cached FFIType enum object.
     reg_scanner!(crate::bun_ffi::scan_bun_ffi_roots_mut);
-    #[cfg(feature = "node-api-host")]
-    reg_scanner!(crate::node_api_host::scan_node_api_roots_mut);
-    // #9611: `WebAssembly.Memory.prototype.buffer` is a foreign-backed wrapper
-    // over the engine's linear memory, and the wasm binding table keys it by
-    // address so an import boundary can re-point it after a `memory.grow`.
-    // Metadata-only: the buffer's real owner is the Memory object.
-    #[cfg(feature = "wasm-host")]
-    reg_scanner!(crate::webassembly::scan_wasm_memory_binding_roots_mut);
-    // The imports object a wasm instance was created with. The host holds only
-    // an opaque token for it, so this table is what a collection rewrites.
-    #[cfg(feature = "wasm-host")]
-    reg_scanner!(crate::webassembly::scan_wasm_import_object_roots_mut);
+    // Optional features' scanners, on every thread after the feature's
+    // install filled the slot (`feature_hooks`).
+    if let Some(scanner) = crate::feature_hooks::NODE_API_ROOT_SCANNER.peek() {
+        gc_register_named_mutable_root_scanner(crate::node_api_host::ROOT_SCANNER_NAME, scanner);
+    }
+    if let Some(scanner) = crate::feature_hooks::WASM_ROOT_SCANNER.peek() {
+        gc_register_named_mutable_root_scanner(crate::webassembly::ROOT_SCANNER_NAME, scanner);
+    }
+    // Unit tests reach the Node-API host without perry's installer: install it
+    // with the first initialized thread (which registers its scanner there;
+    // later threads take it from the slot above), as a build with the old
+    // `node-api-host` feature did for every thread.
+    #[cfg(test)]
+    crate::feature_hooks::js_runtime_install_node_api_host();
     reg_budgeted_scanner!(
         crate::object::scan_class_side_table_roots_mut,
         crate::object::scan_class_side_table_roots_mut_step,
         crate::object::new_class_side_table_root_scan_state,
-        MutableRootScannerSource::RuntimeMutableScanner,
-    );
-    reg_budgeted_scanner!(
-        crate::symbol::scan_symbol_side_table_roots_mut,
-        crate::symbol::scan_symbol_side_table_roots_mut_step,
-        crate::symbol::new_symbol_side_table_root_scan_state,
         MutableRootScannerSource::RuntimeMutableScanner,
     );
     // Issue #1813: the dispatch-binding cells (`new.target`, the one-shot
@@ -1198,7 +1225,6 @@ pub fn gc_init() {
     // swept and the next `.next()` would install a freed keys array. It also
     // REWRITES: an evacuating collection moves them like any other array, and
     // the thread-local slot is the only place the new address can be recorded.
-    reg_scanner!(crate::iter_result::scan_iter_result_keys_roots_mut);
     // Same shape as the line above: the shared keys arrays behind
     // `Intl.Segmenter`'s segment records are referenced only by this cache.
     reg_scanner!(crate::intl::segmenter::scan_segment_record_keys_roots_mut);
@@ -1215,7 +1241,6 @@ pub fn gc_init() {
     // `*const ClosureHeader` in a TLS map. The scanner existed but was never
     // called, so the table stayed invisible to the collector.
     crate::os::os_process_emitter::register_process_emitter_root_scanner();
-    reg_scanner!(crate::builtins::scan_boxed_primitive_payload_roots_mut);
     reg_scanner!(crate::weakref::scan_pending_finalization_jobs_roots_mut);
     // #6182: keep the weak-holder registry's stored holder ADDRESSES current
     // across evacuation. Metadata-only (non-rooting) — it rewrites forwarded
@@ -1223,6 +1248,7 @@ pub fn gc_init() {
     // keeps a dead holder alive. Copied-minor liveness/prune is driven by
     // `process_weak_targets_from_registry`; this covers full-cycle currency.
     reg_scanner!(crate::weakref::scan_weak_holders_roots_mut);
+    register_property_atom_scanner();
     reg_scanner!(ephemeron::scan_ephemeron_seeds_roots_mut);
     // Issue #841: GC roots for the per-(submodule, export) function
     // singletons + per-submodule namespace stub objects allocated by
@@ -1243,16 +1269,10 @@ pub fn gc_init() {
     // capture heap words, so copied-minor must rewrite them after moving
     // captured young values or future cache hits miss on stale addresses.
     reg_scanner!(crate::closure::scan_singleton_closure_roots_mut);
-    reg_scanner!(crate::closure::scan_closure_dynamic_props_roots_mut);
     // #8393: built-in prototype methods carry per-closure identity metadata
     // keyed by their raw heap address. Copying minor GC moves those closures;
     // keep the weak metadata keys aligned with the forwarded addresses so
     // value-called methods still reach the prototype dispatch tower.
-    reg_scanner!(crate::object::scan_builtin_closure_metadata_roots_mut);
-    // Generic per-handle expando properties (`blob.colors = [...]` and other
-    // arbitrary own props on native HANDLE values). Keys are stable small handle
-    // ids; only the stored VALUES are JS references that must be traced.
-    reg_scanner!(crate::object::handle_expando::scan_handle_expando_roots_mut);
     // Native-module callable export singletons and process stdio stream
     // singletons store heap pointers in TLS caches; keep them live and rewrite
     // them if a copying collection moves their backing allocations.
@@ -1344,6 +1364,9 @@ pub fn gc_init() {
     );
     #[cfg(feature = "ohos-napi")]
     reg_scanner!(crate::arkts_callbacks::arkts_callbacks_root_scanner_mut);
+    // Establish ThreadHeap before generated code on this thread can read its
+    // exported allocator cursor. Worker agents enter through gc_init too.
+    crate::arena::js_inline_arena_state();
 }
 
 /// #10399: see `js_gc_init`. Default floor for `std::thread` stacks in a
@@ -1436,9 +1459,7 @@ pub extern "C" fn js_gc_init() {
 /// See `emit_schedule_liveness_verdict`.
 #[no_mangle]
 pub extern "C" fn js_gc_release_current_thread_collection_side_allocations() {
-    crate::map::release_current_thread_map_side_allocations();
     crate::json_tape_store::release_current_thread_lazy_tapes();
-    crate::set::release_current_thread_set_side_allocations();
     // Every process-exit path funnels through here — the generated exit
     // epilogue, `js_process_exit`, and the fatal-path teardown — and perry's own
     // exits call `_exit`, so `atexit` alone would not see them. Print the seeded
@@ -1705,31 +1726,34 @@ pub extern "C" fn js_gc_pause_stats(
     out_recent_avg_us: *mut u64,
     out_recent_count: *mut u64,
 ) {
-    GC_STATS.with(|stats| {
-        let stats = stats.borrow();
-        let n = stats.recent_len as usize;
-        let window = &stats.recent_pauses_us[..n.min(GC_RECENT_PAUSE_WINDOW)];
-        let recent_max = window.iter().copied().max().unwrap_or(0);
-        let recent_avg = if window.is_empty() {
-            0
-        } else {
-            window.iter().copied().sum::<u64>() / window.len() as u64
-        };
-        unsafe {
-            if !out_max_us.is_null() {
-                *out_max_us = stats.max_pause_us;
+    GC_STATS.with(
+        #[inline(never)]
+        |stats| {
+            let stats = stats.borrow();
+            let n = stats.recent_len as usize;
+            let window = &stats.recent_pauses_us[..n.min(GC_RECENT_PAUSE_WINDOW)];
+            let recent_max = window.iter().copied().max().unwrap_or(0);
+            let recent_avg = if window.is_empty() {
+                0
+            } else {
+                window.iter().copied().sum::<u64>() / window.len() as u64
+            };
+            unsafe {
+                if !out_max_us.is_null() {
+                    *out_max_us = stats.max_pause_us;
+                }
+                if !out_recent_max_us.is_null() {
+                    *out_recent_max_us = recent_max;
+                }
+                if !out_recent_avg_us.is_null() {
+                    *out_recent_avg_us = recent_avg;
+                }
+                if !out_recent_count.is_null() {
+                    *out_recent_count = n as u64;
+                }
             }
-            if !out_recent_max_us.is_null() {
-                *out_recent_max_us = recent_max;
-            }
-            if !out_recent_avg_us.is_null() {
-                *out_recent_avg_us = recent_avg;
-            }
-            if !out_recent_count.is_null() {
-                *out_recent_count = n as u64;
-            }
-        }
-    });
+        },
+    );
 }
 
 /// Stamp a freshly built, runtime-owned keys array as copy-on-write shared.
@@ -1794,3 +1818,11 @@ pub(crate) fn test_external_side_live_bytes() -> usize {
 
 mod ephemeron;
 pub(crate) use ephemeron::weak_collection_store_barrier;
+
+/// Shared startup for standalone Rust fixtures, which have no emitted main.
+/// Run before a fixture allocates JS objects or enters a destructive GC window.
+#[doc(hidden)]
+pub fn initialize_runtime_fixture() {
+    gc_init();
+    crate::object::static_shapes::js_shape_run_static_seed();
+}

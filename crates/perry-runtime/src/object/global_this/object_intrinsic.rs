@@ -65,6 +65,11 @@ pub(crate) fn ensure_object_intrinsics() -> ObjectPair {
         crate::object::OBJECT_INTRINSIC_PTR.store(ctor as i64, Ordering::Release);
         crate::object::OBJECT_INTRINSIC_PROTO_PTR.store(proto as i64, Ordering::Release);
         crate::array::note_object_prototype_intrinsic(proto as usize);
+        // Complete: every later write to it is the program's.
+        crate::object::builtin_proto::seal_built_intrinsic(
+            crate::object::builtin_proto::BuiltinProto::Object,
+            proto,
+        );
     }
     OBJECT_INTRINSICS_BUILDING.with(|b| b.store(false, Ordering::Release));
     built.unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()))
@@ -135,15 +140,23 @@ fn build_object_intrinsics() -> Option<ObjectPair> {
     // prototype are held as raw pointers across every allocating install
     // below, and both live for the life of the realm.
     let _no_move = crate::gc::GcSuppressScope::new();
-    let info = crate::fn_info!(global_this_object_thunk, 1; with_declared(1));
-    let closure_ptr = crate::closure::js_closure_alloc(info, 0);
+    let closure_ptr = super::super::global_this_tables::alloc_builtin_constructor(
+        super::super::global_this_tables::BuiltinConstructorIdentity::Object,
+    );
     if closure_ptr.is_null() {
         return None;
     }
-    // The intrinsic's terminal edge is published by its birth shape, like
-    // any other null-parent object. No address or name exception is needed
-    // by a presence walk.
-    let proto_obj = js_object_alloc_null_proto(0, super::proto_room::BUILTIN_PROTOTYPE_ROOM);
+    // Born on its static layout (`runtime_layouts::OBJECT_PROTOTYPE`): every
+    // own key and its null [[Prototype]] are layout facts, and the population
+    // below fills the declared slots. Born old and never-move (O3,
+    // `gc::never_move`): the terminal of most inherited and absent reads.
+    // SAFETY: a registered runtime descriptor with a null prototype.
+    let proto_obj = unsafe {
+        crate::object::layout_desc::alloc_layout_prototype(
+            std::ptr::addr_of!(crate::object::runtime_layouts::OBJECT_PROTOTYPE),
+            0,
+        )
+    };
     if proto_obj.is_null() {
         return None;
     }
@@ -162,8 +175,6 @@ fn build_object_intrinsics() -> Option<ObjectPair> {
         super::super::PropertyAttrs::new(true, false, true),
     );
     populate_builtin_prototype_methods("Object", proto_obj);
-    // SAFETY: the fresh prototype, not yet exposed, collection suppressed.
-    unsafe { super::proto_room::fit_builtin_prototype(proto_obj) };
     Some((closure_ptr, proto_obj))
 }
 

@@ -1074,10 +1074,7 @@ const TAKE_SOURCE_REMAINING_KEY: &[u8] = b"__perryTakeSourceRemaining";
 const TAKE_SOURCE_DONE_KEY: &[u8] = b"__perryTakeSourceDone";
 
 fn take_source_done_result() -> f64 {
-    let result = crate::object::js_object_alloc(0, 2);
-    js_object_set_field_by_name(result, hidden_key(b"value"), f64::from_bits(TAG_UNDEFINED));
-    js_object_set_field_by_name(result, hidden_key(b"done"), f64::from_bits(TAG_TRUE));
-    box_pointer(result as *const u8)
+    unsafe { crate::iter_result::make_iter_result(JSValue::undefined(), true) }
 }
 
 fn finish_take_source(iterator: f64, reason: Option<f64>, close_source: bool) {
@@ -1479,7 +1476,7 @@ mod take_tests {
     }
 
     #[test]
-    fn take_does_not_return_source_that_finished_naturally() {
+    fn take_closes_source_that_finished_naturally() {
         let methods = [
             ("next", &SOURCE_NEXT_INFO as StubFn),
             ("return", &SOURCE_RETURN_INFO as StubFn),
@@ -1498,7 +1495,7 @@ mod take_tests {
         assert!(!stream_destroyed(stream));
         assert_eq!(pull(iterator), (false, 1.0));
         assert!(pull(iterator).0);
-        assert!(!has_truthy_hidden(
+        assert!(has_truthy_hidden(
             source,
             crate::runtime_state_key!(b"returned")
         ));

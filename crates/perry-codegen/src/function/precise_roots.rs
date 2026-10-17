@@ -152,7 +152,11 @@ fn rewrite_root_access(
 /// parse plus a hash lookup against the root set (see `rewrite_root_access`).
 /// `equivalence_tests` pins this against the previous per-root form on
 /// generated functions, so the output is identical by test, not by argument.
-fn lower_roots_for_rs4gc(lines: &[&str], root_ptrs: &[String]) -> Option<String> {
+fn lower_roots_for_rs4gc(
+    gc: &crate::gc_call_effects::GcEffects,
+    lines: &[&str],
+    root_ptrs: &[String],
+) -> Option<String> {
     let roots: std::collections::HashSet<&str> = root_ptrs.iter().map(String::as_str).collect();
     let mut out = String::with_capacity(lines.len() * 48 + root_ptrs.len() * 96);
     let mut cast_counter = 0usize;
@@ -211,14 +215,14 @@ fn lower_roots_for_rs4gc(lines: &[&str], root_ptrs: &[String]) -> Option<String>
         }
         if is_call && trimmed.ends_with(')') && !trimmed.contains(" asm ") {
             if let Some(callee) = direct_callee_name(line) {
-                if audited_leaf_callee(callee) {
+                if audited_leaf_callee(gc, callee) {
                     out.push_str(line.trim_end());
                     out.push_str(" \"gc-leaf-function\"\n");
                     continue;
                 }
             }
         }
-        if let Some(marked) = leaf_marked_invoke(line) {
+        if let Some(marked) = leaf_marked_invoke(gc, line) {
             out.push_str(&marked);
             continue;
         }
@@ -231,8 +235,8 @@ fn lower_roots_for_rs4gc(lines: &[&str], root_ptrs: &[String]) -> Option<String>
 
 /// Whether the audited call-effect table lets RS4GC skip the safepoint at a
 /// direct call of `callee`. `AllocNoReentry` keeps its contract gating.
-fn audited_leaf_callee(callee: &str) -> bool {
-    let leaf = match crate::gc_call_effects::classify_direct_callee(callee) {
+fn audited_leaf_callee(gc: &crate::gc_call_effects::GcEffects, callee: &str) -> bool {
+    let leaf = match gc.classify_direct_callee(callee) {
         crate::gc_call_effects::GcCallEffect::CannotCollect => true,
         crate::gc_call_effects::GcCallEffect::AllocNoReentry => {
             crate::codegen::helpers::gc_safepoint_only_contract_enabled()
@@ -258,7 +262,7 @@ fn audited_leaf_callee(callee: &str) -> bool {
 /// arm's `ends_with(')')` — so a site already carrying a call-site attribute,
 /// including a leaf mark emitted by `call_gc_leaf`, is left alone. Inline asm
 /// is marked for the call arm's reason: RS4GC cannot wrap it at all.
-fn leaf_marked_invoke(line: &str) -> Option<String> {
+fn leaf_marked_invoke(gc: &crate::gc_call_effects::GcEffects, line: &str) -> Option<String> {
     let line = line.trim_end();
     let trimmed = line.trim_start();
     if !(trimmed.starts_with("invoke ") || trimmed.contains(" = invoke ")) {
@@ -268,8 +272,8 @@ fn leaf_marked_invoke(line: &str) -> Option<String> {
     if !head.ends_with(')') {
         return None;
     }
-    let leaf =
-        head.contains(" asm ") || direct_invoke_callee_name(head).is_some_and(audited_leaf_callee);
+    let leaf = head.contains(" asm ")
+        || direct_invoke_callee_name(head).is_some_and(|callee| audited_leaf_callee(gc, callee));
     leaf.then(|| format!("{head} \"gc-leaf-function\"{edges}\n"))
 }
 
@@ -309,6 +313,7 @@ fn callee_before_args(call: &str) -> Option<&str> {
 /// recognizer meets a root-alloca use it does not understand, anything else
 /// would emit a frame whose roots the collector cannot find.
 pub(super) fn lower_precise_roots_to_native_stack(
+    gc: &crate::gc_call_effects::GcEffects,
     ir: &str,
     function_name: &str,
     slot_count: u32,
@@ -365,7 +370,7 @@ pub(super) fn lower_precise_roots_to_native_stack(
     // statepoint. Found on the Claude Code bundle, where an early return
     // skipped leaf-marking and the verifier aborted with "Cannot take the
     // address of an inline asm!".
-    match lower_roots_for_rs4gc(&lines, &root_ptrs) {
+    match lower_roots_for_rs4gc(gc, &lines, &root_ptrs) {
         Some(out) => {
             if let Some(mut report) = report {
                 report.note_call(root_ptrs.len());
@@ -475,9 +480,17 @@ mod tests {
         );
     }
 
-    /// #11500: inside a `try` the same audited accessor is an `invoke`, and
-    /// the call-only classification left it a full statepoint (164k of 291k
-    /// `js_closure_get_capture_bits` sites on one real bundle).
+    /// #11500: inside a `try` a leaf callee reached through an `invoke` must
+    /// not be a full statepoint (the call-only classification left 164k of 291k
+    /// `js_closure_get_capture_bits` sites on one real bundle that way).
+    ///
+    /// The callee is a leaf function the module defines itself. A runtime
+    /// symbol cannot be the subject any more: `nothrow_callee` reads the
+    /// generated `throws` column, every Leaf runtime symbol is `throws=no`,
+    /// and so a Leaf runtime callee is a plain `call` inside a `try`. A
+    /// module-defined callee has no table row and is judged may-throw at
+    /// emission, so it is still an `invoke`, and the render pass marks it
+    /// leaf.
     ///
     /// Built the way `lower_try` builds a body — personality, an active EH
     /// scope, a landing pad — so the helper takes the real invoke path rather
@@ -495,8 +508,11 @@ mod tests {
         use crate::types::{I32, I64, PTR, VOID};
         module.declare_personality();
         module.declare_function("js_shadow_slot_bind", VOID, &[I32, PTR]);
-        module.declare_function("js_closure_get_capture_bits", I64, &[I64, I32]);
         module.declare_function("js_map_alloc", I64, &[I32]);
+
+        let leaf_callee = module.define_function("try_probe_leaf_callee", I64, vec![]);
+        leaf_callee.create_block("entry");
+        leaf_callee.block_mut(0).expect("leaf entry").ret(I64, "7");
 
         let function = module.define_function("try_leaf_probe", I64, vec![]);
         function.personality = Some("perry_eh_personality");
@@ -521,12 +537,8 @@ mod tests {
 
         function.push_eh_scope(lpad.clone());
         let try_body = function.block_mut(1).expect("try body");
-        // The audited accessor, with the root live across it.
-        let cap = try_body.call(
-            I64,
-            "js_closure_get_capture_bits",
-            &[(I64, "0"), (I32, "0")],
-        );
+        // The leaf callee, with the root live across it.
+        let cap = try_body.call(I64, "try_probe_leaf_callee", &[]);
         // Control: an unaudited callee in the same try body.
         let unknown = try_body.call(I64, "js_map_alloc", &[(I32, "1")]);
         let live = try_body.load(I64, &root);
@@ -544,7 +556,7 @@ mod tests {
         // Subject check: both try-body calls really are invokes, or the
         // assertions below say nothing about the invoke arm.
         for invoke in [
-            "invoke i64 @js_closure_get_capture_bits(",
+            "invoke i64 @try_probe_leaf_callee(",
             "invoke i64 @js_map_alloc(",
         ] {
             assert!(ir.contains(invoke), "fixture must emit `{invoke}`:\n{ir}");
@@ -553,8 +565,8 @@ mod tests {
         let rewritten = crate::inprocess::statepoint_rewritten_ir(&ir, &target, "try_leaf_probe")
             .expect("try leaf probe must survive RS4GC");
         assert!(
-            rewritten.contains("invoke i64 @js_closure_get_capture_bits("),
-            "#11500: the audited accessor must remain a direct invoke, not a \
+            rewritten.contains("invoke i64 @try_probe_leaf_callee("),
+            "#11500: the leaf callee must remain a direct invoke, not a \
              statepoint:\n{rewritten}"
         );
         assert_eq!(
@@ -600,7 +612,12 @@ mod tests {
                   \x20 %lp = landingpad { ptr, i32 } catch ptr null\n\
                   \x20 ret i64 0\n\
                   }\n";
-        let lowered = lower_precise_roots_to_native_stack(ir, "f", 0);
+        let lowered = lower_precise_roots_to_native_stack(
+            crate::gc_call_effects::committed_for_tests(),
+            ir,
+            "f",
+            0,
+        );
         for expected in [
             "  %a = invoke i64 @js_closure_get_capture_bits(i64 0, i32 0) \"gc-leaf-function\" to label %ok1 unwind label %pad\n",
             "  invoke void @js_box_set_bits(i64 %a, i64 1) \"gc-leaf-function\" to label %ok2 unwind label %pad\n",
@@ -669,7 +686,12 @@ entry:
   ret i64 %r3
 }
 "#;
-        let lowered = lower_precise_roots_to_native_stack(ir, "f", 1);
+        let lowered = lower_precise_roots_to_native_stack(
+            crate::gc_call_effects::committed_for_tests(),
+            ir,
+            "f",
+            1,
+        );
         // THE discriminating clause: reverting `rewrite_root_access`'s two load
         // arms fails here. The RS4GC-level clauses below are the structural
         // companion — they show WHY the launder is needed (the second
@@ -753,7 +775,12 @@ entry:
 }
 "#;
 
-        let lowered = lower_precise_roots_to_native_stack(ir, "f", 1);
+        let lowered = lower_precise_roots_to_native_stack(
+            crate::gc_call_effects::committed_for_tests(),
+            ir,
+            "f",
+            1,
+        );
         assert!(lowered.contains("%a = alloca ptr addrspace(1)"));
         assert!(lowered.contains("%b = alloca ptr addrspace(1)"));
         assert!(!lowered.contains("@js_shadow_slot_bind"));

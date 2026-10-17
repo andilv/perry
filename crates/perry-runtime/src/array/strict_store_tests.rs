@@ -172,17 +172,7 @@ fn strict_dense_number_store_fast_lane_matches_the_general_path() {
 
 /// Whether `f` threw a runtime exception.
 fn catch_runtime_throw(f: impl FnOnce()) -> bool {
-    let env = crate::exception::js_try_push();
-    let jumped = unsafe { crate::ffi::setjmp::setjmp(env as *mut std::os::raw::c_int) };
-    if jumped == 0 {
-        f();
-        crate::exception::js_try_end();
-        false
-    } else {
-        crate::exception::js_try_end();
-        crate::exception::js_clear_exception();
-        true
-    }
+    crate::exception::catch_js_throw(f).is_err()
 }
 
 /// #9394: a rejected element write throws only in STRICT code.
@@ -273,19 +263,11 @@ fn set_length_rejection_throws_only_in_strict_mode() {
             "length".to_string(),
             crate::object::PropertyAttrs::new(false, false, false),
         );
-        // `Object.defineProperty` sets BOTH halves: the attrs side-table entry
-        // above and the per-array `OBJ_FLAG_ARRAY_DESCRIPTORS` gate that makes
-        // the numeric fast paths consult it (`object::array_object_ops`, the
-        // `key_name == "length"` arm). `set_property_attrs` alone only writes
-        // the side table -- an array that carries an attrs entry without the
-        // flag is a state no program can reach, and the predicate rightly
-        // ignores it. Set the flag so this test exercises the shape the
-        // end-to-end fixture produces, rather than a half-built one.
-        *super::header::array_gc_header(locked).expect("live array header") = crate::gc::GcHeader {
-            _reserved: (*super::header::array_gc_header(locked).unwrap())._reserved
-                | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS,
-            ..*super::header::array_gc_header(locked).unwrap()
-        };
+        // The attrs install makes `length` a non-writable key of the array's
+        // named layout: the element-kind fact the numeric fast paths consult
+        // (`array_has_element_descriptors`), exactly as `Object.defineProperty`
+        // leaves it.
+        assert!(super::array_has_element_descriptors(locked));
 
         assert!(
             catch_runtime_throw(|| {

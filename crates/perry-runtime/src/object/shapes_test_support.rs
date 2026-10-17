@@ -93,7 +93,9 @@ pub(crate) fn test_shape_entry_exists(keys_id: usize) -> bool {
 #[cfg(test)]
 pub(crate) fn test_shape_descriptor_count() -> usize {
     // Count dynamic records; intrinsic function layouts are permanent seeds.
-    crate::state::state().shapes.slab().len() - crate::codegen_abi::FUNCTION_SHAPE_COUNT as usize
+    crate::state::state().shapes.slab().len()
+        - crate::codegen_abi::FUNCTION_SHAPE_COUNT as usize
+        - 2
 }
 
 #[cfg(test)]
@@ -109,6 +111,7 @@ pub(crate) fn test_clear_shape_table() {
     unsafe { table.slab_mut().clear() };
     drop(inner);
     table.seed_function_shapes();
+    table.seed_native_birth_layouts();
 }
 
 #[cfg(test)]
@@ -197,7 +200,7 @@ pub(crate) fn test_unused_external_shape_id() -> u32 {
     let table = &crate::state::state().shapes;
     // The top of the ORDINARY band: an external (typed) id is an ordinary
     // shape, which sites may hold; the dictionary band above it is not.
-    let mut id = super::DICTIONARY_SHAPE_ID_BASE - 1;
+    let mut id = super::SITE_SHAPE_ID_END - 1;
     while table.slab().record_ptr(id).is_some() {
         id -= 1;
     }
@@ -266,4 +269,13 @@ pub(crate) fn test_shape_record_is_carrier(id: u32) -> bool {
         .slab()
         .get(id)
         .is_some_and(|record| record.cache_carrier())
+}
+
+/// Negative control for the census: remove only the memo accelerator while
+/// retaining the live authoritative record and its keys family.
+pub(crate) fn test_remove_facts_index(id: u32) {
+    let table = &crate::state::state().shapes;
+    let record = table.slab().get(id).unwrap();
+    let facts = record.facts_key_with_keys(record.keys);
+    table.inner.borrow_mut().facts_remove(facts, id);
 }

@@ -55,25 +55,12 @@ pub extern "C" fn js_jsvalue_equals(a: f64, b: f64) -> i32 {
     let a = f64::from_bits(abits);
     let b = f64::from_bits(bbits);
 
-    // NaN === NaN is false in JS (strict equality follows IEEE 754).
-    // Raw IEEE NaN has top16 = 0x7FF8 (the canonical quiet-NaN). NaN-
-    // boxed tagged values use top16 0x7FFA–0x7FFF and never collide.
-    // Must come BEFORE the abits==bbits fast path: `[1, NaN, 3].indexOf(NaN)`
-    // routes through this helper, both sides decode to f64::NAN (same
-    // bit pattern), and pre-fix the fast path returned 1 (wrongly equal)
-    // so indexOf reported index 1 instead of -1.
-    // Any IEEE NaN — positive 0x7FF8 OR the negative 0xFFF8 payload that libm
-    // returns from out-of-domain acosh/atanh/log/sqrt — is unequal to itself
-    // and to every other value under ===. Must precede the bit-pattern fast
-    // path: two identical negative-NaN bit patterns would otherwise compare
-    // equal (`Math.acosh(0) === Math.acosh(0)` wrongly true → `x !== x` false).
-    if is_number_nan(abits) || is_number_nan(bbits) {
-        return 0;
-    }
-
-    // Fast path: same bit pattern → equal (same number, same pointer, same boolean, etc.)
+    // Identity needs only one NaN check. Unequal NaN bit patterns already
+    // compare false below: numeric comparisons use IEEE equality, and every
+    // nonnumeric route requires its own tag. Rechecking both operands before
+    // dispatch repeats work on every ordinary equality.
     if abits == bbits {
-        return 1;
+        return i32::from(!is_number_nan(abits));
     }
 
     let a_val = JSValue::from_bits(abits);
@@ -170,8 +157,8 @@ pub extern "C" fn js_jsvalue_equals(a: f64, b: f64) -> i32 {
     // couple of cheap GcHeader flag loads. (test262 Object S15.2.1.1_A2_T10 /
     // S15.2.2.1_A2_T3: `Object(arr) === arr`.)
     if a_val.is_pointer() && b_val.is_pointer() {
-        let ra = resolve_forwarding((abits & crate::value::POINTER_MASK) as usize);
-        let rb = resolve_forwarding((bbits & crate::value::POINTER_MASK) as usize);
+        let ra = resolve_value_forwarding(abits);
+        let rb = resolve_value_forwarding(bbits);
         if ra != 0 && ra == rb {
             return 1;
         }
@@ -181,15 +168,27 @@ pub extern "C" fn js_jsvalue_equals(a: f64, b: f64) -> i32 {
     0
 }
 
+/// [`resolve_forwarding`] for a `POINTER_TAG` value: its header is honest, so
+/// a value whose header is not forwarded (the common case) answers with one
+/// flag load; only a forwarded head walks the admitted chain.
+#[inline]
+fn resolve_value_forwarding(bits: u64) -> usize {
+    let addr = (bits & crate::value::POINTER_MASK) as usize;
+    match crate::value::addr_class::pointer_value_header(bits) {
+        Some(header) if header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0 => {
+            resolve_forwarding(addr)
+        }
+        _ => addr,
+    }
+}
+
 /// Follow an object's `GC_FLAG_FORWARDED` chain to its current heap address,
 /// mirroring `clean_arr_ptr`'s forwarding walk. Returns `addr` unchanged when
 /// it is not a forwarded heap pointer (handle/proxy-band registry ids, small
 /// slab allocations, out-of-heap addresses, or live non-forwarded objects), so
 /// callers can compare resolved addresses for object identity.
 /// `try_read_tracked_gc_header` proves arena membership or an exact malloc
-/// registry hit before touching the header. That ownership check is required:
-/// registered symbols also carry `POINTER_TAG`, but their process-lifetime
-/// `Box` allocations have no `GcHeader`. Depth-capped to defend against
+/// registry hit before touching each header of a raw chain. Depth-capped to defend against
 /// corrupted GC cycles.
 pub(crate) fn resolve_forwarding(mut addr: usize) -> usize {
     unsafe {

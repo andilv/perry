@@ -25,12 +25,7 @@ pub(crate) enum SpeciesChoice {
 
 /// `Type(value) is Object` — a heap pointer that is not a Symbol.
 fn is_object_value(value: f64) -> bool {
-    let jv = JSValue::from_bits(value.to_bits());
-    if !jv.is_pointer() {
-        return false;
-    }
-    let raw = crate::value::js_nanbox_get_pointer(value) as usize;
-    raw >= 0x10000 && !crate::symbol::is_registered_symbol(raw)
+    crate::builtins::arithmetic::js_value_is_object(value)
 }
 
 /// `IsConstructor(value)` — a user `class` ref, or a callable that is not a
@@ -110,17 +105,17 @@ unsafe fn resolve_species(original: f64) -> SpeciesChoice {
                 let hdr =
                     (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
                 if (*hdr).obj_type == crate::gc::GC_TYPE_ARRAY
-                    && crate::object::get_accessor_descriptor(raw, "constructor").is_none()
+                    && (*hdr)._reserved & crate::gc::GC_ARRAY_CUSTOM_PROTO == 0
+                    && !super::named_props::array_named_property_has_by_name(arr, "constructor")
                     && crate::object::get_accessor_descriptor(
-                        crate::array::array_prototype_addr(),
+                        crate::array::array_prototype_addr_if_resolved(),
                         "constructor",
                     )
                     .is_none()
                     && !crate::object::descriptor_state::owner_key_is_accessor(
-                        crate::array::object_prototype_addr(),
+                        crate::array::object_prototype_addr_if_resolved(),
                         b"constructor",
                     )
-                    && crate::array::array_named_property_get_by_name(arr, "constructor").is_none()
                 {
                     return SpeciesChoice::Default;
                 }

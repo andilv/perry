@@ -31,9 +31,15 @@ pub extern "C" fn js_object_delete_field(
     mut obj: *mut ObjectHeader,
     key: *const crate::StringHeader,
 ) -> i32 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_ptr(obj, "delete");
     if obj.is_null() || key.is_null() {
         return 1;
     }
+    super::builtin_proto::note_write_addr(
+        (obj as u64 & crate::value::POINTER_MASK) as usize,
+        "delete",
+    );
     if !key.is_null() {
         unsafe {
             let bytes = std::slice::from_raw_parts(
@@ -43,9 +49,6 @@ pub extern "C" fn js_object_delete_field(
             let owner = (obj as u64 & crate::value::POINTER_MASK) as usize;
             crate::typedarray_named::note_named_mutation(owner, bytes);
         }
-    }
-    if let Some(result) = unsafe { super::delete_last_key::try_delete_last_added_field(obj, key) } {
-        return result;
     }
     if let Some(result) = crate::process::process_env_delete_field(obj, key) {
         return result;
@@ -60,9 +63,8 @@ pub extern "C" fn js_object_delete_field(
     // `deleteProperty` trap. (#2846-family Proxy crash cluster.)
     {
         let addr = obj as u64;
-        if crate::value::addr_class::is_proxy_id_band(addr as usize) {
-            const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-            let boxed = f64::from_bits(POINTER_TAG | (addr & 0x0000_FFFF_FFFF_FFFF));
+        if crate::value::addr_class::is_proxy_cell(addr as usize) {
+            let boxed = f64::from_bits(crate::value::POINTER_TAG | (addr & 0x0000_FFFF_FFFF_FFFF));
             if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
                 let key_f64 = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
                 let r = crate::proxy::js_proxy_delete(boxed, key_f64);
@@ -343,6 +345,9 @@ pub extern "C" fn js_object_delete_field(
                 }
             }
         }
+        let bytes = crate::string::OwnedStringBytes::copy_of_key(key);
+        return super::overflow::delete(obj, bytes.as_bytes()) as i32;
+        #[allow(unreachable_code)]
         let mut keys_view = crate::object::object_keys(obj);
         let mut keys = keys_view.arr();
         if keys.is_null() {
@@ -395,7 +400,7 @@ pub extern "C" fn js_object_delete_field(
         // property. Bun and Node remove the property entirely; we
         // match that.
         let field_count = crate::object::object_live_slot_count(obj);
-        let alloc_limit = std::cmp::max(field_count as usize, crate::object::INLINE_SLOT_FLOOR);
+        let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
         let new_count = key_count - 1;
 
         // The clone below exists because one keys_array is shared by every
@@ -805,8 +810,11 @@ pub extern "C" fn js_object_delete_field(
 /// `ObjectHeader*` yields a garbage address that crashes when the GC/kind header
 /// at `[ptr-8]` is read.
 #[inline]
+/// An object receiver: a heap object (`POINTER_TAG`) or a native registry
+/// id (`HANDLE_TAG`, whose own properties are its expandos).
 fn delete_receiver_is_pointer(obj_value: f64) -> bool {
-    crate::value::JSValue::from_bits(obj_value.to_bits()).is_pointer()
+    let value = crate::value::JSValue::from_bits(obj_value.to_bits());
+    value.is_reference()
 }
 
 /// `[[Delete]]` of class `class_id`'s own string key `name` (the class
@@ -853,6 +861,8 @@ pub extern "C" fn js_object_delete_field_value(
     obj_value: f64,
     key: *const crate::StringHeader,
 ) -> i32 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_value(obj_value, "delete");
     if let Some(class_id) = super::class_prototype_ref_id(obj_value) {
         if key.is_null() {
             return 1;
@@ -885,6 +895,8 @@ pub extern "C" fn js_object_delete_field_value(
 /// `js_object_delete_field_value`, delegating real objects to the dynamic path.
 #[no_mangle]
 pub extern "C" fn js_object_delete_dynamic_value(obj_value: f64, key: f64) -> i32 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_value(obj_value, "delete");
     if let Some(class_id) = super::class_prototype_ref_id(obj_value) {
         if unsafe { crate::symbol::js_is_symbol(key) } != 0 {
             let proto = super::class_registry::class_decl_prototype_value(class_id);
@@ -953,9 +965,16 @@ unsafe fn try_delete_stable_sso(obj: *mut ObjectHeader, key: JSValue) -> Option<
         return None;
     }
     let keys = shape.keys as usize as *mut crate::ArrayHeader;
-    if keys.is_null() || shape.logical_key_count == 0 || shape.logical_key_count > 16 {
+    // Tombstones hole slots by key position; keys with their own storage
+    // slots take the ordered overflow table.
+    if keys.is_null()
+        || shape.logical_key_count == 0
+        || shape.logical_key_count > 16
+        || super::key_attrs::keys_have_slots(keys, shape.logical_key_count)
+    {
         return None;
     }
+    super::key_attrs::debug_assert_positional(keys, shape.logical_key_count);
     let keys_gc = crate::value::addr_class::try_read_gc_header(keys as usize)?;
     if keys_gc.obj_type != crate::gc::GC_TYPE_ARRAY
         || keys_gc.gc_flags & (crate::gc::GC_FLAG_FORWARDED | crate::gc::GC_FLAG_SHAPE_SHARED) != 0
@@ -990,9 +1009,7 @@ unsafe fn try_delete_stable_sso(obj: *mut ObjectHeader, key: JSValue) -> Option<
         // The new token still retires every generated cache entry, which is
         // mandatory because slot zero will name a different key next epoch.
         if next_holes == shape.logical_key_count && slot == tail {
-            let alloc_limit = shape
-                .live_inline_slot_count
-                .max(crate::object::INLINE_SLOT_FLOOR as u32);
+            let alloc_limit = crate::object::object_inline_capacity(obj);
             let fields =
                 (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut crate::JSValue;
             let old_value = if slot < alloc_limit {
@@ -1076,9 +1093,7 @@ unsafe fn try_delete_stable_sso(obj: *mut ObjectHeader, key: JSValue) -> Option<
         elements.add(slot as usize) as usize,
         crate::value::TAG_HOLE,
     );
-    let live_slots = shape
-        .live_inline_slot_count
-        .max(crate::object::INLINE_SLOT_FLOOR as u32);
+    let live_slots = crate::object::object_inline_capacity(obj);
     if slot < live_slots {
         let fields =
             (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut crate::JSValue;
@@ -1098,6 +1113,12 @@ unsafe fn try_delete_stable_sso(obj: *mut ObjectHeader, key: JSValue) -> Option<
 /// Returns 1 if successful, 0 otherwise
 #[no_mangle]
 pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> i32 {
+    super::builtin_proto::note_write_addr(
+        (obj as u64 & crate::value::POINTER_MASK) as usize,
+        "delete",
+    );
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_ptr(obj, "delete");
     if let Some(result) = unsafe { super::delete_last_key::try_delete_last_added_dynamic(obj, key) }
     {
         return result;
@@ -1113,9 +1134,8 @@ pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> 
     // `js_object_delete_field`, which has its own guard).
     {
         let addr = obj as u64;
-        if crate::value::addr_class::is_proxy_id_band(addr as usize) {
-            const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
-            let boxed = f64::from_bits(POINTER_TAG | (addr & 0x0000_FFFF_FFFF_FFFF));
+        if crate::value::addr_class::is_proxy_cell(addr as usize) {
+            let boxed = f64::from_bits(crate::value::POINTER_TAG | (addr & 0x0000_FFFF_FFFF_FFFF));
             if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
                 let r = crate::proxy::js_proxy_delete(boxed, key);
                 return if crate::value::js_is_truthy(r) != 0 {
@@ -1328,8 +1348,9 @@ pub extern "C" fn js_object_rest(
             let is_accessor = keys_handle.with_const_ptr::<crate::array::ArrayHeader, _>(|keys| {
                 crate::object::key_attrs::key_is_accessor_at(keys, i as u32)
             });
-            let field_val = src_handle
-                .with_const_ptr::<ObjectHeader, _>(|obj| js_object_get_field(obj, i as u32));
+            let field_val = src_handle.with_const_ptr::<ObjectHeader, _>(|obj| {
+                crate::object::field_get_set::js_object_get_key_field(obj, i as u32)
+            });
             if !is_accessor && field_val.is_undefined() {
                 continue;
             }
@@ -1447,7 +1468,7 @@ mod shape_transition_tests_6759 {
     /// facts install a genuinely fresh id rather than reviving the old one.
     /// Ids are never reused, so "different" is the whole property.
     #[test]
-    fn delete_mints_a_fresh_shape_id_for_a_plain_object() {
+    fn delete_keeps_the_layout_and_holes_the_slot_for_a_plain_object() {
         // This test is specifically about the identity transition caused by
         // slot compaction. Default-on tombstones intentionally preserve slot
         // placement, so pin the compacting lane instead of making the shape
@@ -1460,42 +1481,58 @@ mod shape_transition_tests_6759 {
                 crate::object::js_object_set_field_by_name(obj, key(name), value);
             }
             let _ = crate::object::js_object_get_field_by_name(obj, key("del6759_b"));
-            let before = (*obj).parent_class_id;
+            let before = (*obj).shape_word();
             assert!(
                 is_shape_id(before),
                 "fixture is vacuous — no shape stamp to transition (got {before:#x})"
             );
 
             assert_eq!(js_object_delete_field(obj, key("del6759_a")), 1);
-            assert_eq!(
-                f64::from_bits(js_object_get_field(obj, 1).bits()),
-                3.0,
-                "test premise: the delete did not compact the slots"
-            );
-
-            // The compacted descriptor is installed before delete returns.
-            let after = (*obj).parent_class_id;
+            assert_step4_delete(obj, before, 0, &[("del6759_b", 2.0), ("del6759_c", 3.0)]);
             assert!(
-                is_shape_id(after),
-                "no shape id re-minted after the delete (got {after:#x})"
-            );
-            assert_ne!(
-                after, before,
-                "the delete re-used the pre-delete ShapeId — a shape-id compare \
-                 would accept a compacted object as its own class's shape"
-            );
-            let descriptor = crate::object::shapes::shape_descriptor_by_id(after)
-                .expect("delete must publish a by-id descriptor");
-            assert_eq!(
-                descriptor.keys,
-                crate::object::object_keys(obj).arr() as u64
-            );
-            assert_eq!(descriptor.logical_key_count, 2);
-            assert_eq!(
-                descriptor.live_inline_slot_count,
-                crate::object::object_live_slot_count(obj)
+                crate::object::js_object_get_field_by_name(obj, key("del6759_a")).is_undefined()
             );
         }
+    }
+
+    /// Object model step 4 (§3.2/§3.4): a delete keeps every slot where it is
+    /// (the deleted key's slot holds the hole marker) and sets the shadow bit,
+    /// so the full layout word moves (a full-word compare misses); the
+    /// overflow becomes the key view.
+    unsafe fn assert_step4_delete(
+        obj: *mut crate::object::ObjectHeader,
+        before: u32,
+        deleted_slot: u32,
+        survivors: &[(&str, f64)],
+    ) {
+        assert!(crate::object::overflow::has_overflow(obj));
+        assert_eq!(
+            js_object_get_field(obj, deleted_slot).bits(),
+            crate::value::TAG_HOLE,
+            "the deleted key's slot holds the hole marker"
+        );
+        for (name, value) in survivors {
+            assert_eq!(
+                crate::object::js_object_get_field_by_name(obj, key(name)).as_number(),
+                *value,
+                "a delete compacts nothing: {name} keeps its value"
+            );
+        }
+        let after = (*obj).parent_class_id;
+        assert_ne!(after, before, "the full layout word moves (the shadow bit)");
+        assert!(is_shape_id(crate::object::layout_desc::layout_id_of_word(
+            after
+        )));
+        assert_eq!(
+            crate::object::shapes::object_shape_descriptor(obj)
+                .unwrap()
+                .logical_key_count,
+            3,
+            "the layout keeps every key's slot"
+        );
+        assert!(crate::object::overflow::is_table(
+            crate::object::object_keys(obj).arr()
+        ));
     }
 
     /// #6759 C3 rung 1 — the replacement the pre-rung-1 test named.
@@ -1511,7 +1548,7 @@ mod shape_transition_tests_6759 {
     /// POINTER moves — is kept below, because both are still true and both are
     /// still what `class_field_inline_guard` compares until rung 3.
     #[test]
-    fn delete_mints_a_fresh_shape_id_for_a_class_instance() {
+    fn delete_keeps_the_layout_and_holes_the_slot_for_a_class_instance() {
         // Keep the compacting precondition explicit: the default tombstone
         // path also mints a successor id for class instances, but deliberately
         // leaves surviving fields in their original slots.
@@ -1534,7 +1571,7 @@ mod shape_transition_tests_6759 {
             let keys_before_view = crate::object::object_keys(obj);
             let keys_before = keys_before_view.arr();
             assert_eq!((*obj).class_id, CID, "test premise: a class instance");
-            let before = (*obj).parent_class_id;
+            let before = (*obj).shape_word();
             assert!(
                 is_shape_id(before),
                 "test premise: a class instance is stamped AT BIRTH (got \
@@ -1547,48 +1584,20 @@ mod shape_transition_tests_6759 {
             // the id every later resolve would have minted.
             let _ = crate::object::js_object_get_field_by_name(obj, key("del6759_y"));
             assert_eq!(
-                (*obj).parent_class_id,
+                (*obj).shape_word(),
                 before,
                 "a resolve re-stamped an already-stamped instance with a \
                  DIFFERENT id — every site holding the birth token would miss"
             );
 
             assert_eq!(js_object_delete_field(obj, key("del6759_x")), 1);
-
-            // The compaction really happened: `z` moved from slot 2 to slot 1.
-            assert_eq!(
-                f64::from_bits(js_object_get_field(obj, 1).bits()),
-                30.0,
-                "test premise: the delete did not compact the slots"
-            );
-            // The compacted descriptor is installed before delete returns.
-            let after = (*obj).parent_class_id;
-            assert!(
-                is_shape_id(after),
-                "no shape id re-minted after the delete (got {after:#x})"
-            );
-            assert_ne!(
-                after, before,
-                "the delete re-used the pre-delete ShapeId — a shape-id compare \
-                 would accept a compacted class instance as its own class's shape"
-            );
-            let descriptor = crate::object::shapes::shape_descriptor_by_id(after)
-                .expect("class delete must publish a by-id descriptor");
-            assert_eq!(
-                descriptor.keys,
-                crate::object::object_keys(obj).arr() as u64
-            );
-            assert_eq!(descriptor.logical_key_count, 2);
-            assert_eq!(
-                descriptor.live_inline_slot_count,
-                crate::object::object_live_slot_count(obj)
-            );
+            assert_step4_delete(obj, before, 0, &[("del6759_y", 20.0), ("del6759_z", 30.0)]);
 
             // Still true, and still what the guard compares until rung 3.
             assert_ne!(
                 crate::object::object_keys(obj).arr(),
                 keys_before,
-                "the keys pointer is the guard's compaction evidence and it did not change"
+                "the key view moved to the overflow; the guard's pointer compare must miss"
             );
             assert_eq!(
                 (*obj).class_id,
@@ -1621,8 +1630,8 @@ mod shape_transition_tests_6759 {
             let b = mk();
             let _ = crate::object::js_object_get_field_by_name(a, key("sib6759_b"));
             let _ = crate::object::js_object_get_field_by_name(b, key("sib6759_b"));
-            let id_a = (*a).parent_class_id;
-            let id_b = (*b).parent_class_id;
+            let id_a = (*a).shape_word();
+            let id_b = (*b).shape_word();
             assert!(
                 is_shape_id(id_a) && is_shape_id(id_b),
                 "both must be stamped"
@@ -1636,12 +1645,12 @@ mod shape_transition_tests_6759 {
             assert_eq!(js_object_delete_field(a, key("sib6759_a")), 1);
             let _ = crate::object::js_object_get_field_by_name(a, key("sib6759_c"));
             assert_ne!(
-                (*a).parent_class_id,
+                (*a).shape_word(),
                 id_b,
                 "the compacted instance kept its siblings' ShapeId"
             );
             assert_eq!(
-                (*b).parent_class_id,
+                (*b).shape_word(),
                 id_b,
                 "the untouched sibling's stamp moved — a delete is not a \
                  class-wide shape transition"
@@ -1683,7 +1692,7 @@ mod shape_transition_tests_6759 {
             // makes this test stronger than when the word still started as
             // inheritance data — there is no window in which it was correct.
             assert!(
-                is_shape_id((*leaf).parent_class_id),
+                is_shape_id((*leaf).shape_word()),
                 "test premise: the newborn's header word was not clobbered by a \
                  birth stamp, so the chain is not actually being stressed"
             );
@@ -1697,7 +1706,7 @@ mod shape_transition_tests_6759 {
             // …and it stays clobbered across a resolve.
             let _ = crate::object::js_object_get_field_by_name(leaf, key("chain6759_p"));
             assert!(
-                is_shape_id((*leaf).parent_class_id),
+                is_shape_id((*leaf).shape_word()),
                 "test premise: the word stopped being a stamp, so nothing is being tested"
             );
 

@@ -9,10 +9,10 @@
 //! paths skip every built-in, bound, proxy and native-module probe.
 //!
 //! The object a construction creates is described by `F.prototype`: its
-//! class id and birth ShapeId are the prototype object's birth record
+//! birth ShapeId is the prototype object's birth record
 //! (`ObjectMeta::instance_birth`), minted on the first construction by the
-//! ordinary allocate-then-link sequence and replayed afterwards — the same
-//! class id and the same ShapeId (its `proto_id` is the prototype's serial,
+//! shape birth allocator and replayed afterwards — the same
+//! classless identity and the same ShapeId (its `proto_id` is the prototype's serial,
 //! its record's `prototype` word the prototype itself) that sequence
 //! produces, with no hash lookup and no per-instance record. A reassigned
 //! `F.prototype` is read on the next construction; objects already created
@@ -172,74 +172,6 @@ unsafe fn own_prototype_object(closure: usize) -> Option<*mut ObjectHeader> {
     (header.obj_type == crate::gc::GC_TYPE_OBJECT).then_some(proto as *mut ObjectHeader)
 }
 
-/// `proto`'s birth record `(class id, birth ShapeId)`, when one was minted
-/// and still names the inline size its class has learned.
-///
-/// # Safety
-/// `proto` is a live `ObjectHeader`.
-#[inline]
-unsafe fn birth_record(proto: *const ObjectHeader) -> Option<(u32, u32, u32)> {
-    let meta = (*proto).meta;
-    if meta.is_null() {
-        return None;
-    }
-    let word = (*meta).instance_birth;
-    if word == 0 {
-        return None;
-    }
-    let class_id = word as u32;
-    let shape_id = (word >> 32) as u32;
-    // The birth shape carries the birth live-slot bound, which is the inline
-    // size the class has learned; a class that has since learned a larger
-    // size gets a new record.
-    let slots = crate::object::learned_inline_field_count(class_id);
-    // The id is not pinned: the descriptor table may have retired it and
-    // handed the id to another shape. Replay it only while it still names
-    // the birth facts — keyless, generation 0, no holes, this prototype's
-    // identity (so its record's word IS `proto`) and the learned slots.
-    crate::object::shapes::shape_is_keyless_birth(shape_id, (*meta).proto_serial, slots)
-        .then_some((class_id, shape_id, slots))
-}
-
-/// Mint `proto`'s birth record from the first construction, which takes the
-/// ordinary sequence: an object of `F`'s synthetic class, linked to `proto`
-/// as its class-default prototype. The record is that class id and the
-/// ShapeId the link left; [`birth_record`] re-validates the id's facts on
-/// every replay, so a retired id is never replayed and a dead function's
-/// prototype is not kept alive by a pinned shape. Returns the constructed
-/// object.
-///
-/// The class is the minting function's; a class whose registered prototype is
-/// later moved off `proto` clears the record
-/// ([`forget_birth_record_of_class`]), so a record never outlives the pairing
-/// it was minted from.
-#[cold]
-#[inline(never)]
-unsafe fn mint_birth_record(func_value: f64, proto: *mut ObjectHeader) -> f64 {
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let proto_handle = scope.root_raw_mut_ptr(proto);
-    let class_id = synthetic_class_id_for_function(func_value);
-    let slots = crate::object::learned_inline_field_count(class_id);
-    let obj = scope.root_raw_mut_ptr(js_object_alloc(class_id, slots));
-    let proto_bits = proto_handle
-        .with_mut_ptr::<ObjectHeader, _>(|proto| crate::value::js_nanbox_pointer(proto as i64))
-        .to_bits();
-    obj.with_mut_ptr::<ObjectHeader, _>(|obj| {
-        super::super::super::prototype_chain::object_link_class_default_prototype(
-            obj as usize,
-            proto_bits,
-        )
-    });
-    let shape_id =
-        obj.with_mut_ptr::<ObjectHeader, _>(|obj| crate::object::shapes::object_shape_stamp(obj));
-    let meta = proto_handle
-        .with_mut_ptr::<ObjectHeader, _>(|proto| crate::object::object_meta_ensure(proto));
-    // GC_STORE_AUDIT(POINTER_FREE): a class id and a ShapeId, never a heap
-    // reference.
-    (*meta).instance_birth = u64::from(class_id) | u64::from(shape_id) << 32;
-    obj.with_mut_ptr::<ObjectHeader, _>(|o| crate::value::js_nanbox_pointer(o as i64))
-}
-
 /// The class `class_id`'s registered prototype moved from `old` to another
 /// object: a birth record on `old` minted for that class no longer describes
 /// a construction by its function (#10507).
@@ -255,18 +187,6 @@ pub(crate) unsafe fn forget_birth_record_of_class(old: *mut ObjectHeader, class_
         // GC_STORE_AUDIT(POINTER_FREE): clears a class id / ShapeId pair.
         (*meta).instance_birth = 0;
     }
-}
-
-/// An object born from `proto`'s record: class id and birth ShapeId stamped.
-/// The ShapeId names `proto` (its record's `prototype` word), which is all
-/// the class-default link records; no per-instance record is allocated.
-///
-/// # Safety
-/// `proto` is a live `ObjectHeader` marked as a prototype, and `shape_id`
-/// passed [`birth_record`] for it.
-#[inline]
-unsafe fn born_from_record(class_id: u32, shape_id: u32, slots: u32) -> *mut ObjectHeader {
-    crate::object::object_alloc_born(class_id, slots, shape_id)
 }
 
 /// `new F(...args)` for an ordinary compiled function `F` (`closure`), or
@@ -291,8 +211,7 @@ pub(super) unsafe fn construct_ordinary_compiled_function(
         // Never read: materialize the default prototype the general path
         // would, then read it back off the (possibly moved) function.
         None if own_prototype_value(closure).is_none() => {
-            let class_id = synthetic_class_id_for_function(func_value);
-            ensure_function_prototype_object(func_value, class_id);
+            ensure_function_prototype_object(func_handle.get_nanbox_f64());
             let closure = (func_handle.get_nanbox_u64() & crate::value::POINTER_MASK) as usize;
             own_prototype_object(closure)?
         }
@@ -305,12 +224,29 @@ pub(super) unsafe fn construct_ordinary_compiled_function(
             site,
         );
     }
-    let instance = match birth_record(proto) {
-        Some((class_id, shape_id, slots)) => {
-            crate::value::js_nanbox_pointer(born_from_record(class_id, shape_id, slots) as i64)
-        }
-        None => mint_birth_record(func_handle.get_nanbox_f64(), proto),
-    };
+    let proto_handle = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(proto as i64));
+    // The actual prototype owns the existing shape birth-width family.
+    // Marking can collect, so all later pointer reads use the handle.
+    let serial = crate::object::proto_validity::mark_object_as_prototype(proto as usize)?;
+    let proto = (proto_handle.get_nanbox_u64() & crate::value::POINTER_MASK) as *const ObjectHeader;
+    let birth = crate::object::shapes::keyless_birth_width(
+        serial,
+        crate::object::shapes::object_shape_stamp(proto),
+    );
+    // The existing owner record supplies a scalar shape proof to the same
+    // allocator as Object.create. It validates the chosen width and actual
+    // prototype serial once, then revalidates after any collecting allocation.
+    let recorded = ((*(*proto).meta).instance_birth >> 32) as u32;
+    let obj =
+        crate::object::alloc_basic::object_alloc_created(&proto_handle, serial, birth, recorded);
+    let shape = crate::object::shapes::object_shape_stamp(obj);
+    if shape != recorded {
+        let ptr = crate::value::JSValue::from_bits(proto_handle.get_nanbox_u64())
+            .as_pointer::<ObjectHeader>();
+        // GC_STORE_AUDIT(POINTER_FREE): the existing weak class-id-zero / ShapeId pair.
+        (*(*ptr).meta).instance_birth = u64::from(shape) << 32;
+    }
+    let instance = crate::value::js_nanbox_pointer(obj as i64);
     Some(run_constructor_body(
         func_handle.get_nanbox_f64(),
         instance,
@@ -343,7 +279,7 @@ pub(super) unsafe fn run_constructor_body(
     let scope = crate::gc::RuntimeHandleScope::new();
     let inst_handle = scope.root_nanbox_f64(instance);
     let prev_new_target = crate::object::js_new_target_get();
-    let prev_new_target_handle = scope.root_nanbox_f64(prev_new_target);
+    let prev_new_target_handle = scope.root_new_target_save(prev_new_target);
     crate::object::js_new_target_set(func_value);
     let prev_current_new_target =
         CURRENT_NEW_TARGET.with(|value| value.replace(func_value.to_bits()));

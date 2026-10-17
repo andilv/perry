@@ -18,6 +18,10 @@ docs/src/internals/rfc-deferred-collection.md):
   Reenters   everything else: can reach JavaScript, a poll, an indirect call
              that was not audited, or a symbol outside the archives.
 
+The classes answer "can it collect"; they do not answer "can it throw". A poll
+helper is Reenters yet may be provably unable to throw, and Leaf / AllocOnly
+imply `throws=no` (checked on every run).
+
 HOW
 
 A symbol-level graph is built from `llvm-objdump -d -r` over the archives:
@@ -43,6 +47,20 @@ A symbol-level graph is built from `llvm-objdump -d -r` over the archives:
 The classes are three reverse-reachability fixed points over the same graph
 with different cut sets (a cut node is a sink: nothing reached only through it
 counts). See `classify`.
+
+A fourth solve answers a different question, committed as the table's `throws`
+column: can a call to this symbol unwind (reach `js_throw`, an unwinding raise,
+JavaScript, or a callee nobody audited)? Seeds are the `throw` and `js` named
+seeds, the `unwind` externs, and every structural seed (unaudited indirect
+call, unknown extern). Cuts are `panic`, `teardown` AND the collection
+entry points (`collector`, `poll`): the premise, stated once in seeds.txt, is
+that a collection never unwinds into the frame that triggered it. The graph
+cannot prove that premise (the collector's bodies hold hundreds of unaudited
+indirect calls and reach `js_array_length`, so walking them would make every
+allocating helper and every poll `throws=yes`); it is the premise the hand list
+this column replaces ("the GC has no throw path") stood on, now one reviewed
+rule instead of a name prefix. A symbol absent from the table counts as `yes`
+(codegen's `nothrow_callee`; docs EHFREE_ITEM3 section 2).
 
 Deterministic: every output is sorted, and nothing depends on hash order.
 
@@ -75,6 +93,8 @@ TABLE_DIR = os.path.join(ROOT, "crates", "perry-codegen", "src", "gc_effects")
 TARGETS = ("linux-x86_64", "macos-aarch64", "windows-x86_64")
 CLASSES = ("Leaf", "AllocOnly", "ThrowOnly", "Reenters")
 CLASS_RANK = {c: i for i, c in enumerate(CLASSES)}
+THROWS = ("no", "yes")
+THROWS_RANK = {t: i for i, t in enumerate(THROWS)}
 
 # --------------------------------------------------------------------------
 # tools
@@ -147,6 +167,8 @@ RULE_KINDS = {
     "throw",      # the throw funnel (cut in ThrowOnly); must also match a node
     "panic",      # panic=abort path: never returns, cut in every class
     "teardown",   # runs only at thread/process teardown: cut in every class
+    "nothrow",    # an audited cut: calls through here raise no JS throw (cut in `throws` only)
+    "unwind",     # an extern whose call unwinds (raise/resume): seeds only `throws`
     # exemptions
     "indirect",   # an indirect call inside a matching function is NOT a seed
     "indirect-all", # every real symbol alias must match this exemption
@@ -196,9 +218,16 @@ TARGET_ADDEND = re.compile(r"^(.*?)(?:[+-]0x[0-9a-f]+)?$")
 X86_PREFIXES = {"notrack", "lock", "rep", "repe", "repne", "repz", "repnz", "bnd", "data16", "cs", "ds"}
 
 
+# COFF section symbols (`.text`, `.text$unlikely`, `.rdata$zzz`): a leading-dot section
+# name with an optional `$group` suffix; not callable aliases. Names that merely
+# contain `$` (Rust legacy `_ZN..$u20$..`) do not start with "." and never match.
+COFF_SECTION_SYM = re.compile(r"^\.[A-Za-z_]+(\$[A-Za-z0-9_.]*)?$")
+
+
 def temp_label(name: str) -> bool:
-    """Assembler-temporary labels: not function boundaries."""
-    return name.startswith(("ltmp", "Ltmp", ".L", "L_", "l_", "lCPI", "LCPI", "$"))
+    """Assembler-temporary labels and COFF section symbols: not function boundaries."""
+    return (name.startswith(("ltmp", "Ltmp", ".L", "L_", "l_", "lCPI", "LCPI", "$"))
+            or COFF_SECTION_SYM.match(name) is not None)
 
 
 LLVM_SUFFIX = re.compile(r"(\s*\(\.llvm\.\d+\)|\.llvm\.\d+)$")
@@ -573,7 +602,11 @@ def _got_pinned(cfg: "_Cfg", i: int, reg: str, arch: str, depth: int = 0,
         for k in range(upto - 1, st - 1, -1):
             ins = insns[k]
             if reg in writes(ins):
-                g = (symbol_of or _got_symbol)(ins)
+                # A call may itself carry a GOT relocation for its *callee*,
+                # but the caller-saved register it defines contains the
+                # callee's return value. That value is not pinned to the GOT
+                # symbol (e.g. `call *dlsym@GOTPCREL; call *%rax`).
+                g = None if _flow(ins, arch)[0] == "call" else (symbol_of or _got_symbol)(ins)
                 if g is None and depth < 6 and symbol_of is None:
                     src = _copy_source(ins, arch)
                     if src is not None and src != reg:
@@ -611,7 +644,7 @@ def _got_pinned(cfg: "_Cfg", i: int, reg: str, arch: str, depth: int = 0,
     return sym
 
 
-def _idiom(insns: list[Insn], i: int, arch: str) -> str | None:
+def _idiom(insns: list[Insn], i: int, arch: str, fmt: str = "") -> str | None:
     """Name a recognized compiler/std indirect-call idiom at insns[i].
 
     io_os_functions: a call through `core::io::error::os_functions::
@@ -622,7 +655,10 @@ def _idiom(insns: list[Insn], i: int, arch: str) -> str | None:
     io_error_drop: dropping a `std::io::Error` whose bit-packed repr holds a
     custom payload (tag 0b01). std stores the payload's owner drop function in
     the box; the inlined drop is `leaq -1(%r), %rdi ; call *0x17(%r)` behind
-    an `and $3` tag test. Its only targets are
+    an `and $3` tag test. The Win64 ABI passes the box in %rcx, and
+    x86_64-pc-windows-msvc code spells the untag `movq %r, %rcx ; decq %rcx`
+    right before the call: that exact form is recognized in COFF objects only
+    (under SysV %rcx is the fourth argument, never the box). Its only targets are
     `alloc::io::error::custom_owner_from_box::drop_box_raw::<T>`; the rule
     for it in seeds.txt makes those the callees instead of seeding.
     """
@@ -635,6 +671,12 @@ def _idiom(insns: list[Insn], i: int, arch: str) -> str | None:
             untag = any((w.mn.startswith("lea") and w.ops.startswith("-0x1(%"))
                         or (w.mn.startswith("dec") and w.ops == "%rdi") for w in window[-4:])
             tagtest = any(w.mn.startswith("and") and w.ops.startswith("$0x3,") for w in window)
+            if not untag and fmt.startswith("coff") and len(window) >= 2:
+                # Win64: `movq %r, %rcx ; decq %rcx ; callq *0x17(%r)`, the box
+                # (tagged pointer - 1) in the first Win64 argument register.
+                mov, dec = window[-2], window[-1]
+                untag = (mov.mn.startswith("mov") and mov.ops == f"%{r}, %rcx"
+                         and dec.mn.startswith("dec") and dec.ops == "%rcx")
             if untag and tagtest:
                 return "io_error_drop"
         if re.match(r"^\*0x[0-9a-f]+\(%\w+\)$", ins.ops) and any(
@@ -720,7 +762,7 @@ def analyze_node(node: Node, insns: list[Insn], arch: str):
                         continue
             if i in switch_at:
                 continue
-            idiom = _idiom(insns, i, arch)
+            idiom = _idiom(insns, i, arch, fmt)
             if idiom is not None:
                 node.idioms.add(idiom)
                 continue
@@ -748,7 +790,7 @@ def analyze_node(node: Node, insns: list[Insn], arch: str):
                 continue
             if i in switch_at:
                 continue
-            idiom = _idiom(insns, i, arch)
+            idiom = _idiom(insns, i, arch, fmt)
             if idiom is not None:
                 node.idioms.add(idiom)
                 continue
@@ -995,6 +1037,7 @@ def build_graph(archives: list[str]) -> Graph:
 class Classification:
     def __init__(self):
         self.cls: dict[str, str] = {}        # exported symbol -> class
+        self.throws: dict[str, str] = {}     # exported symbol -> "yes" | "no"
         self.node_of: dict[str, int] = {}
         self.reason: dict[int, dict[str, str]] = {}   # node -> {mode: seed reason}
         self.stats: dict = {}
@@ -1035,12 +1078,12 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
     named: dict[int, tuple[str, Rule]] = {}
     hits: dict[int, int] = collections.Counter()   # rule line -> node hits
     for i in range(len(g.nodes)):
-        for kind in ("poll", "js", "collector", "throw", "panic", "teardown"):
+        for kind in ("poll", "js", "collector", "throw", "panic", "teardown", "nothrow"):
             r = _match_any(by_kind[kind], spell[i])
             if r is not None:
                 hits[r.line] += 1
                 named.setdefault(i, (kind, r))
-    dead = [r for r in rules if r.kind in ("poll", "js", "collector", "throw", "panic", "teardown")
+    dead = [r for r in rules if r.kind in ("poll", "js", "collector", "throw", "panic", "teardown", "nothrow")
             and hits[r.line] == 0]
 
     exempt_ind: dict[int, Rule] = {}
@@ -1140,11 +1183,22 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
                 and g.pred[i] and all(rule_exempt(c) for c in g.pred[i]):
             trusted_ind.add(i)
 
-    def base_seed(i: int) -> str | None:
-        kn = named.get(i)
-        if kn and kn[0] in ("poll", "js"):
-            return f"{kn[0]}:{kn[1].pattern}"
+    # An extern whose call unwinds (`unwind` rules) is a seed of every solve,
+    # even though the extern allowlist keeps it from being an unknown callee:
+    # a function that raises is not a leaf, and Leaf / AllocOnly imply
+    # `throws=no` by construction.
+    unwind_ext: dict[int, str] = {}
+    for i, n in enumerate(g.nodes):
+        for e in sorted(n.externs):
+            r = _match_any(by_kind["unwind"], [e, g.dem.get(e, e)])
+            if r is not None:
+                hits[r.line] += 1
+                unwind_ext.setdefault(i, f"unwind:{e}")
+
+    def structural_seed(i: int) -> str | None:
         n = g.nodes[i]
+        if i in unwind_ext:
+            return unwind_ext[i]
         if i in unknown_idiom:
             return "idiom_without_rule:" + unknown_idiom[i]
         if (n.indirect_calls or n.indirect_jmps) and i not in exempt_ind and i not in trusted_ind:
@@ -1154,7 +1208,21 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
             return "extern:" + bad_ext[0]
         return None
 
+    def base_seed(i: int) -> str | None:
+        kn = named.get(i)
+        if kn and kn[0] in ("poll", "js"):
+            return f"{kn[0]}:{kn[1].pattern}"
+        return structural_seed(i)
+
     base = [base_seed(i) for i in range(len(g.nodes))]
+
+    # `throws` seeds: the throw funnel, JS entries, unwinding raises and the
+    # structural seeds. Collector and poll nodes are cut (`is_cut`), not seeds.
+    def throws_seed(i: int) -> str | None:
+        kn = named.get(i)
+        if kn and kn[0] in ("js", "throw"):
+            return f"{kn[0]}:{kn[1].pattern}"
+        return structural_seed(i)
 
     def solve(mode: str) -> tuple[dict[int, str], dict[int, int]]:
         """Reverse BFS from seeds; cut nodes neither seed nor propagate."""
@@ -1164,6 +1232,8 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
                 return False
             k = kn[0]
             if k in ("panic", "teardown"):
+                return True
+            if mode == "throws" and k in ("collector", "poll", "nothrow"):
                 return True
             if mode in ("L2b", "L2b_throw") and k == "collector":
                 return True
@@ -1177,11 +1247,15 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
         for i in range(len(g.nodes)):
             if is_cut(i):
                 continue
-            s = base[i]
-            if s is None and mode == "L2":
-                kn = named.get(i)
-                if kn and kn[0] == "collector":
-                    s = f"collector:{kn[1].pattern}"
+            s = throws_seed(i) if mode == "throws" else base[i]
+            kn = named.get(i)
+            if s is None and mode == "L2" and kn and kn[0] == "collector":
+                s = f"collector:{kn[1].pattern}"
+            # The throw funnel is a seed of every collection class that does
+            # not cut it, by name: Leaf / AllocOnly imply `throws=no` by
+            # construction, not because its body happens to hold a seed.
+            if s is None and mode in ("L2", "L2b") and kn and kn[0] == "throw":
+                s = f"throw:{kn[1].pattern}"
             if s is not None:
                 bad[i] = s
                 work.append(i)
@@ -1199,8 +1273,9 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
     b2, n2 = solve("L2")
     b2b, n2b = solve("L2b")
     b2t, n2t = solve("L2b_throw")
-    res.witness = {"L2": n2, "L2b": n2b, "L2b_throw": n2t}
-    res.reason = {"L2": b2, "L2b": b2b, "L2b_throw": b2t}
+    bth, nth = solve("throws")
+    res.witness = {"L2": n2, "L2b": n2b, "L2b_throw": n2t, "throws": nth}
+    res.reason = {"L2": b2, "L2b": b2b, "L2b_throw": b2t, "throws": bth}
 
     exported: dict[str, int] = {}
     for i, n in enumerate(g.nodes):
@@ -1219,6 +1294,7 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
         else:
             c = "Reenters"
         res.cls[name] = c
+        res.throws[name] = "yes" if i in bth else "no"
         res.node_of[name] = i
     res.stats = {
         "nodes": len(g.nodes),
@@ -1233,7 +1309,7 @@ def classify(g: Graph, rules: list[Rule], table_filter=None) -> Classification:
         "dead_rules": [f"seeds.txt:{r.line}: {r}" for r in dead],
         "forbidden_calls": forbidden,
         "unused_exemptions": [f"seeds.txt:{r.line}: {r}" for r in rules
-                              if r.kind in ("indirect", "extern") and hits[r.line] == 0],
+                              if r.kind in ("indirect", "extern", "unwind") and hits[r.line] == 0],
     }
     return res
 
@@ -1275,15 +1351,38 @@ TABLE_HEADER = """\
 #          js_object_get_own_field_or_undef reach JS or a collector -> not Leaf.
 #   #11523 CannotCollect helpers whose GcRootRegistryGuard drop flushes a
 #          deferred collection reach the collector -> not Leaf.
-# symbol\tclass
+# The throws column (EHFREE_ITEM3 section 2.1): `yes` if a call can reach
+# js_throw, an unwinding raise, JavaScript or an unaudited callee; `no`
+# otherwise. Only panic and teardown are cut, so polls and collectors are
+# walked. Leaf and AllocOnly imply `no`. A symbol absent from a table is `yes`.
+# symbol\tclass\tthrows
 """
 
 
+NATIVE_OBJECT_STEMS = frozenset(
+    os.path.splitext(filename)[0]
+    for crate in ("perry-runtime", "perry-stdlib")
+    for _, _, filenames in os.walk(os.path.join(ROOT, "crates", crate, "src"))
+    for filename in filenames
+    if os.path.splitext(filename)[1] in (".c", ".cc", ".cpp", ".S")
+)
+NATIVE_MEMBER = re.compile(r"^[0-9a-f]+-(.+)\.(?:o|obj)$")
+
+
 def perry_member(obj: str, name: str) -> bool:
-    """Only symbols from Perry's own crates are tabled; C dependencies
-    (mimalloc, zstd, ...) are never called by codegen by name."""
+    """Table exports owned by Perry, including cc-built native sources.
+
+    Native ownership is derived from source filenames, not symbol names or
+    effects. Their bodies go through the same graph analysis as Rust bodies;
+    dependency objects (mimalloc, zstd, ...) remain outside the table.
+    """
     crate = crate_of(obj)
-    if crate is None or not crate.startswith("perry"):
+    if crate is None:
+        member = obj.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        native = NATIVE_MEMBER.fullmatch(member)
+        if native is None or native.group(1) not in NATIVE_OBJECT_STEMS:
+            return False
+    elif not crate.startswith("perry"):
         return False
     return not name.startswith(("_R", "_ZN", "_Z", "__")) and not temp_label(name)
 
@@ -1292,26 +1391,29 @@ def write_table(res: Classification, target: str, archives: list[str], out: str)
     lines = [TABLE_HEADER.format(target=target,
                                  archives=" ".join(os.path.basename(a) for a in archives))]
     for name in sorted(res.cls):
-        lines.append(f"{name}\t{res.cls[name]}\n")
+        lines.append(f"{name}\t{res.cls[name]}\t{res.throws[name]}\n")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("".join(lines))
     os.replace(tmp, out)
 
 
-def read_table(path: str) -> dict[str, str]:
+def read_table(path: str) -> tuple[dict[str, str], dict[str, str]]:
+    """(class, throws) per symbol."""
     out = {}
+    thr = {}
     with open(path, encoding="utf-8") as fh:
         for n, line in enumerate(fh, 1):
             if line.startswith("#") or not line.strip():
                 continue
             parts = line.rstrip("\n").split("\t")
-            if len(parts) != 2 or parts[1] not in CLASS_RANK:
+            if len(parts) != 3 or parts[1] not in CLASS_RANK or parts[2] not in THROWS_RANK:
                 raise SystemExit(f"{path}:{n}: malformed table row {line!r}")
             if parts[0] in out:
                 raise SystemExit(f"{path}:{n}: duplicate symbol {parts[0]}")
             out[parts[0]] = parts[1]
-    return out
+            thr[parts[0]] = parts[2]
+    return out, thr
 
 
 def compare(committed: dict[str, str], fresh: dict[str, str]):
@@ -1329,6 +1431,23 @@ def compare(committed: dict[str, str], fresh: dict[str, str]):
         ceff, feff = c or "Reenters", f or "Reenters"
         row = (name, c or "(absent)", f or "(absent)")
         if CLASS_RANK[ceff] < CLASS_RANK[feff]:
+            unsafe.append(row)
+        elif c != f:
+            safe.append(row)
+    return unsafe, safe
+
+
+def compare_throws(committed: dict[str, str], fresh: dict[str, str]):
+    """(unsafe, safe) drift of the throws column. Unsafe: the committed table
+    says `no` where the archives prove (or can no longer prove) `yes`; an
+    absent symbol reads as `yes`. Rows are ("throws:<committed>", ...) shaped
+    like `compare`'s so one report prints both."""
+    unsafe, safe = [], []
+    for name in sorted(set(committed) | set(fresh)):
+        c, f = committed.get(name), fresh.get(name)
+        ceff, feff = c or "yes", f or "yes"
+        row = (name, f"throws={c or '(absent)'}", f"throws={f or '(absent)'}")
+        if THROWS_RANK[ceff] < THROWS_RANK[feff]:
             unsafe.append(row)
         elif c != f:
             safe.append(row)
@@ -1366,7 +1485,17 @@ def shadowed_symbols(root: str = ROOT) -> set[str]:
     return out
 
 
-def run_classification(archives: list[str], rules_path: str, strict_rules: bool = True):
+def agreement_violations(res: Classification) -> list[str]:
+    """Leaf / AllocOnly symbols that are not `throws=no`. The throw funnel and
+    every other `throws` seed also seeds both collection solves, and the
+    `throws` cuts are a superset of theirs, so this must be empty: a non-empty
+    list means the solves disagree."""
+    return sorted(n for n, c in res.cls.items()
+                  if c in ("Leaf", "AllocOnly") and res.throws[n] != "no")
+
+
+def run_classification(archives: list[str], rules_path: str, strict_rules: bool = True,
+                       enforce_agreement: bool = True):
     rules = load_rules(rules_path)
     g = build_graph(archives)
     res = classify(g, rules, table_filter=perry_member)
@@ -1374,7 +1503,14 @@ def run_classification(archives: list[str], rules_path: str, strict_rules: bool 
     demoted = sorted(n for n in res.cls if n in shadow and res.cls[n] != "Reenters")
     for n in demoted:
         res.cls[n] = "Reenters"
+    # The linked body may be the other crate's, which the graph cannot see.
+    for n in sorted(n for n in res.cls if n in shadow):
+        res.throws[n] = "yes"
     res.stats["shadowed_demoted"] = demoted
+    bad = agreement_violations(res)
+    if bad and enforce_agreement:
+        raise SystemExit("callgraph: Leaf/AllocOnly symbols with throws=yes -- the solves "
+                         "disagree:\n  " + "\n  ".join(bad[:20]))
     if res.stats["classes"]:
         res.stats["classes"] = dict(collections.Counter(res.cls.values()))
     if res.stats["forbidden_calls"]:
@@ -1392,6 +1528,7 @@ def print_stats(res: Classification, out=sys.stderr):
     print(f"[gc-call-effects] nodes={s['nodes']} edges={s['edges']} "
           f"indirect_call_nodes={s['indirect_call_nodes']} indirect_jump_nodes={s['indirect_jump_nodes']} "
           f"exempted_indirect={s['exempted_indirect_nodes']} trusted_indirect={s['trusted_indirect_nodes']} named_seeds={s['named_seed_nodes']}", file=out)
+    print(f"[gc-call-effects] throws={dict(sorted(collections.Counter(res.throws.values()).items()))}", file=out)
     print(f"[gc-call-effects] classes={dict(sorted(s['classes'].items()))} "
           f"unresolved_externs={len(s['unresolved_externs'])} "
           f"shadowed_demoted={len(s.get('shadowed_demoted', []))}", file=out)
@@ -1418,8 +1555,11 @@ def cmd_check(a):
         print(f"callgraph: only {len(res.cls)} exported symbols classified "
               f"(< {a.min_symbols}) -- wrong archives, or the parser broke", file=sys.stderr)
         return 1
-    committed = read_table(a.table)
+    committed, committed_throws = read_table(a.table)
     unsafe, safe = compare(committed, res.cls)
+    tu, ts = compare_throws(committed_throws, res.throws)
+    unsafe += tu
+    safe += ts
     if a.write_fresh:
         write_table(res, a.target, a.archives, a.write_fresh)
     rc = 0
@@ -1430,7 +1570,8 @@ def cmd_check(a):
         for name, c, f in unsafe[:60]:
             print(f"  {name}: committed {c}, archives say {f}", file=sys.stderr)
             if f != "(absent)":
-                mode = {"Leaf": "L2", "AllocOnly": "L2b", "ThrowOnly": "L2b_throw"}[c]
+                mode = ("throws" if c.startswith("throws=")
+                        else {"Leaf": "L2", "AllocOnly": "L2b", "ThrowOnly": "L2b_throw"}[c])
                 for step in witness_path(g, res, name, mode)[:12]:
                     print(f"      {step}", file=sys.stderr)
     if safe:
@@ -1453,10 +1594,10 @@ def cmd_check(a):
 
 
 def cmd_why(a):
-    g, res = run_classification(a.archives, a.rules)
+    g, res = run_classification(a.archives, a.rules, enforce_agreement=False)
     for name in a.symbols:
         print(f"== {name}: {res.cls.get(name, 'not exported')}")
-        for mode in ("L2", "L2b", "L2b_throw"):
+        for mode in ("L2", "L2b", "L2b_throw", "throws"):
             print(f"  [{mode}]")
             for step in witness_path(g, res, name, mode):
                 print(f"    {step}")
@@ -1484,7 +1625,10 @@ def cmd_lint(a):
         if f"# target: {target}\n" not in head:
             print(f"callgraph lint: {path} does not name target {target}", file=sys.stderr)
             rc = 1
-        table = read_table(path)
+        table, table_throws = read_table(path)
+        if not any(t == "no" for t in table_throws.values()):
+            print(f"callgraph lint: {path}: no throws=no row -- vacuous", file=sys.stderr)
+            rc = 1
         n_leaf = sum(1 for c in table.values() if c == "Leaf")
         if len(table) < a.min_symbols or n_leaf == 0:
             print(f"callgraph lint: {path}: {len(table)} rows, {n_leaf} Leaf -- vacuous", file=sys.stderr)

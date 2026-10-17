@@ -15,12 +15,103 @@ pub const SHAPE_ID_BASE: u32 = 0x8000_0000;
 /// assigns ids there by content and generated code embeds them as immediates;
 /// the runtime's counter never draws from it (design step 4).
 pub const STATIC_SHAPE_ID_COUNT: u32 = 1 << 20;
+/// Object model step 3 (§3.6): a layout word (`ObjectHeader` +4) below this
+/// is an unshadowed ordinary layout (or a word no write stamped); shadowed,
+/// dictionary and exotic words lie at or above it. The site test of a
+/// prototype constant or a known-holder read is one unsigned compare.
+pub const UNSHADOWED_WORD_END: u32 = 0xB000_0000;
 
 /// `array::ArrayHeader` size: element 0 follows it.
-pub const ARRAY_HEADER_SIZE: usize = 8;
+pub const ARRAY_HEADER_SIZE: usize = 16;
+
+/// `PerryLayoutKey.attrs` bit (the runtime's key entry byte, `ENTRY_OPTIONAL`):
+/// the key is a layout's optional or late member. Its slot may hold the hole
+/// marker, and while it does the key is absent (OBJECT_MODEL_2026-10-13.md
+/// §3.2). A descriptor emits it only for such keys; the layout then carries
+/// the "may have holes" summary bit and every other layout keeps its cost.
+pub const LAYOUT_KEY_OPTIONAL: u8 = 0x80;
+
+/// `StaticAtom.kind` (OBJECT_MODEL_2026-10-13.md §6a): a string key.
+pub const ATOM_KIND_STRING: u8 = 0;
+/// `StaticAtom.kind`: a well-known symbol; `string` is null and `index` is
+/// its number in [`WELL_KNOWN_SYMBOLS`].
+pub const ATOM_KIND_WELL_KNOWN_SYMBOL: u8 = 1;
+/// `StaticAtom.kind`: a program symbol (a module-level `const s =
+/// Symbol(desc)`); `string` is the description and `hash` the creation
+/// sequence number the runtime assigns when it creates the symbol.
+pub const ATOM_KIND_PROGRAM_SYMBOL: u8 = 2;
+/// The well-known symbols by number (`StaticAtom.index` of a kind-1 atom),
+/// spelled as `Symbol.<name>`.
+pub const WELL_KNOWN_SYMBOLS: [&str; 15] = [
+    "iterator",
+    "asyncIterator",
+    "hasInstance",
+    "toPrimitive",
+    "toStringTag",
+    "species",
+    "isConcatSpreadable",
+    "match",
+    "matchAll",
+    "replace",
+    "search",
+    "split",
+    "unscopables",
+    "dispose",
+    "asyncDispose",
+];
+/// `WELL_KNOWN_SYMBOLS` number of `Symbol.iterator`.
+pub const WELL_KNOWN_SYMBOL_ITERATOR: u32 = 0;
+const _: () = assert!(WELL_KNOWN_SYMBOLS[WELL_KNOWN_SYMBOL_ITERATOR as usize].len() == 8);
+
+/// The number of well-known symbol `name` (`"iterator"`), if it is one.
+pub fn well_known_symbol_number(name: &str) -> Option<u32> {
+    WELL_KNOWN_SYMBOLS
+        .iter()
+        .position(|n| *n == name)
+        .map(|i| i as u32)
+}
+
+/// The fixed `StaticAtom.hash` of well-known symbol `number`.
+pub const fn well_known_symbol_atom_hash(number: u32) -> u64 {
+    0x9e37_79b9_7f4a_7c15u64.wrapping_mul(number as u64 + 1)
+}
 
 /// `agent_ptrs::PERRY_AGENT_PTRS`: the number of per-agent pointer slots.
-pub const AGENT_PTR_SLOTS: usize = 4;
+pub const AGENT_PTR_SLOTS: usize = 4 + INTRINSIC_FAMILIES;
+/// Slots `AGENT_PTR_INTRINSIC_PROTO + k`: this agent's intrinsic prototype of
+/// builtin family `k` (`object::builtin_proto::BuiltinProto`; for Array the
+/// sealed named-property bag), whose layout word's shadow bit
+/// (`UNSHADOWED_WORD_END`) is `Pristine(k)`. Never null: until the realm is
+/// sealed every slot names `PERRY_PRISTINE_PROTO`, whose word is 0.
+pub const AGENT_PTR_INTRINSIC_PROTO: usize = 4;
+/// Number of builtin prototype families.
+pub const BUILTIN_PROTO_FAMILIES: usize = 16;
+/// The builtin namespace objects whose direct member calls lowering binds to
+/// intrinsics (`Math.max(..)`, `Object.keys(..)`, `console.log(..)`). Namespace
+/// `i` is intrinsic family `BUILTIN_PROTO_FAMILIES + i`: its agent slot
+/// (`AGENT_PTR_INTRINSIC_PROTO + BUILTIN_PROTO_FAMILIES + i`) names the object
+/// that holds the namespace's own members (a constructor's property bag), and
+/// that object's shadow bit (`UNSHADOWED_WORD_END`) is `Pristine(namespace)`:
+/// clear while every member still holds its builtin and `globalThis[name]`
+/// still names the namespace.
+pub const BUILTIN_NAMESPACES: [&str; 15] = [
+    "console", "Math", "JSON", "Reflect", "Object", "Number", "String", "Array", "Promise", "Date",
+    "Symbol", "BigInt", "Atomics", "Intl", "Boolean",
+];
+/// Builtin prototype families plus builtin namespaces: the intrinsic slots.
+pub const INTRINSIC_FAMILIES: usize = BUILTIN_PROTO_FAMILIES + BUILTIN_NAMESPACES.len();
+
+/// The intrinsic family of builtin namespace `name`, if it is one.
+pub fn builtin_namespace_family(name: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < BUILTIN_NAMESPACES.len() {
+        if BUILTIN_NAMESPACES[i].as_bytes() == name.as_bytes() {
+            return Some(BUILTIN_PROTO_FAMILIES + i);
+        }
+        i += 1;
+    }
+    None
+}
 /// Slot 0: the address of this agent's ordinary shape-directory mirror
 /// (`shapes_store::AGENT_SHAPE_DIR[0]`), which a generic read site passes to its
 /// GC-leaf miss front (`js_object_get_field_ic_front`) so the front reads no
@@ -34,6 +125,24 @@ pub const AGENT_PTR_SHAPE_DIR: usize = 0;
 /// that form: the front adds the floor back inside its load displacements,
 /// and the site passes the value its test already holds.
 pub const RECEIVER_HANDLE_FLOOR: usize = 0x20_0000;
+
+/// Object model step 5 (case 2c): the size of one ordinary-band shape record
+/// (`perry-runtime` `object/shapes_store.rs` `ShapeRecord`). Record `id` of
+/// an agent is at `flat_base + (id - SHAPE_ID_BASE) * SHAPE_RECORD_SIZE`,
+/// `flat_base` and the committed id bound at `SHAPE_DIR_FLAT_BASE` and
+/// `SHAPE_DIR_FLAT_BASE + 8` of the agent's shape directory
+/// (`AGENT_PTR_SHAPE_DIR`).
+pub const SHAPE_RECORD_SIZE: usize = 120;
+/// Offset of a record's two-word coloured-key mask (read: the key is inline
+/// data at its colour slot).
+pub const SHAPE_RECORD_COLOUR_MASK: usize = 88;
+/// Offset of a record's two-word coloured-key store mask (the key is also a
+/// plain writable `Any`-lane slot of a store-admitted, non-frozen layout).
+pub const SHAPE_RECORD_COLOUR_STORE_MASK: usize = 104;
+/// Offset of the flat record base in the agent's shape directory.
+pub const SHAPE_DIR_FLAT_BASE: usize = 24;
+/// The layout word's shadow bit (`perry-runtime` `layout_desc.rs`).
+pub const LAYOUT_SHADOW_BIT: u32 = 1 << 30;
 /// Slot 2: this agent's stack limit (#10812) — not a pointer to anything, the
 /// lowest frame address a compiled prologue accepts before it throws
 /// `RangeError: Maximum call stack size exceeded`. Null means unchecked.
@@ -97,6 +206,24 @@ pub const GC_FLAG_FORWARDED: u8 = 0x80;
 /// `gc::GC_HEADER_SIZE`.
 pub const GC_HEADER_SIZE: usize = 8;
 
+/// Creation-time [[Call]] on OBJECT and PROXY only. This bit has no other
+/// meaning; closures are callable by their type byte.
+pub const GC_OBJECT_CALLABLE: u16 = 0x0020;
+pub const GC_TYPE_PROXY: u8 = 37;
+pub const GC_TYPE_SYMBOL: u8 = 32;
+pub const GC_TYPE_STRING: u8 = 3;
+
+/// Classify the first four GC-header bytes, loaded as a native-endian u32.
+/// No shape or target read is needed after the creation-time publication.
+#[inline(always)]
+pub const fn gc_header_word_is_callable(word: u32) -> bool {
+    let bytes = word.to_ne_bytes();
+    let kind = bytes[0];
+    let facts = u16::from_ne_bytes([bytes[2], bytes[3]]);
+    kind == GC_TYPE_CLOSURE
+        || ((kind == GC_TYPE_OBJECT || kind == GC_TYPE_PROXY) && facts & GC_OBJECT_CALLABLE != 0)
+}
+
 /// The JS BODY calling convention. Every native body a function object runs —
 /// a compiled closure body, a value wrapper, a native builtin installed as a
 /// function object, a body an addon registers through perry-ffi — is
@@ -128,6 +255,11 @@ pub const JS_BODY_FIXED_PARAMS: usize = 2;
 
 /// NaN-boxed `undefined` (`value::TAG_UNDEFINED` in the runtime, which
 /// asserts it equals this).
+/// Runtime registry ids have their own quiet-NaN tag. 0x7FFB belongs to
+/// perry-jsruntime's V8 handles; the negative qNaN word is distinct from
+/// every positive tag and the canonical numeric NaN (0x7FF8).
+pub const HANDLE_TAG: u64 = 0xFFF9_0000_0000_0000;
+
 pub const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
 
 /// The receiver a JS body takes as its second native parameter
@@ -703,7 +835,7 @@ pub const PIC_HOLDER_SLOT_SPILL_BIT: i64 = 1 << 31;
 /// holder's inline slot (u32), the raw address of the accessor pair that slot
 /// held at prime time, and the compiled setter it names
 /// (`double set(double this, double v)`).
-pub const PACKED_SET_SETTER_WORD: usize = 9;
+pub const PACKED_SET_SETTER_WORD: usize = 8;
 pub const SETTER_SITE_TAG: u64 = 0xA2C2_0000_0000_0000;
 pub const SETTER_SITE_ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 pub const SETTER_SITE_RECV_SHAPE_OFFSET: usize = 0;
@@ -853,6 +985,28 @@ pub const PACKED_ADD_REP_ONLY_SLOT: u64 = (1 << 15) | PACKED_ADD_CONSTFN_SLOT;
 /// claim (`field_rep_store::constfn_store_info`).
 pub const CLOSURE_CAPTURES_THIS_FLAG: u32 = 0x8000_0000;
 pub const CLOSURE_NO_THIS_REBIND_FLAG: u32 = 0x4000_0000;
+/// Immutable builtin [[Construct]] identity. No closure layout growth.
+pub const CLOSURE_CONSTRUCT_SHIFT: u32 = 23;
+pub const CLOSURE_CONSTRUCT_MASK: u32 = 0x3f80_0000;
+pub const CLOSURE_CAPTURE_COUNT_MASK: u32 = 0x007f_ffff;
+/// Encode an ordinary capture count before adding either `this` flag.
+/// This check must survive release builds: truncation could forge an identity.
+#[inline]
+pub fn checked_closure_capture_count(count: usize) -> u32 {
+    assert!(
+        count <= CLOSURE_CAPTURE_COUNT_MASK as usize,
+        "closure capture count exceeds the 23-bit header capacity"
+    );
+    count as u32
+}
+
+const _: () = assert!(
+    CLOSURE_CONSTRUCT_MASK
+        | CLOSURE_CAPTURE_COUNT_MASK
+        | CLOSURE_CAPTURES_THIS_FLAG
+        | CLOSURE_NO_THIS_REBIND_FLAG
+        == u32::MAX
+);
 
 // Unified byte cell: the type byte carries the element brand and view role.
 pub const BYTES_LEN: usize = 0;
@@ -875,6 +1029,7 @@ pub const BYTES_DETACHED: u16 = 1 << 14;
 pub const BYTES_ELEMENT_SHIFT: [u8; 19] = [0, 0, 0, 1, 1, 2, 2, 1, 2, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0];
 
 pub mod native_class_ids;
+pub mod wasm_host;
 
 /// Slot 3: address of the existing compiled-class function directory.
 pub const AGENT_PTR_CLASS_VALUES: usize = 3;

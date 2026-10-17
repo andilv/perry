@@ -24,7 +24,16 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     // Hoisted byte-access proofs are dirtied by every executed call at the
     // call-emission choke point and revalidated at their next use; no
     // expression boundary refreshes them.
-    lower_expr_inner(ctx, expr)
+    let value = lower_expr_inner(ctx, expr)?;
+    if let Some(desc) = crate::layout_desc::array_families::birth_layout(expr) {
+        Ok(ctx.block().call(
+            DOUBLE,
+            "perry_array_attach_layout",
+            &[(DOUBLE, &value), (crate::types::PTR, &format!("@{desc}"))],
+        ))
+    } else {
+        Ok(value)
+    }
 }
 
 fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
@@ -60,6 +69,9 @@ fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     }
     if let Some(value) = super::literal_descriptor::try_lower(ctx, expr) {
         return Ok(value);
+    }
+    if let Some(result) = super::property_rmw::try_lower_logical(ctx, expr)? {
+        return Ok(result);
     }
     if let Some(lowered) = lower_expr_value(ctx, expr)? {
         if ctx.discard_expr_value {
@@ -126,7 +138,16 @@ fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 ctx.string_length_read_of = saved;
                 result
             }
-            _ => super::property_get::lower(ctx, expr),
+            _ => {
+                // Object model step 3 (§3.6): inherited data through a known
+                // prototype is a read of the known holder.
+                if let Some(read) =
+                    crate::proto_constants::lower_known_holder_read(ctx, object, property, expr)
+                {
+                    return read;
+                }
+                super::property_get::lower(ctx, expr)
+            }
         },
         Expr::Conditional { .. } => super::conditional::lower(ctx, expr),
         Expr::ArrayPush { .. } | Expr::ArrayPushSpread { .. } => {
@@ -208,7 +229,8 @@ fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::ObjectAssign { .. }
         | Expr::SetNewFromArray(..) => super::logical_collections::lower(ctx, expr),
         Expr::StaticMethodCall { .. } => super::static_method::lower(ctx, expr),
-        Expr::SuperMethodCall { .. }
+        Expr::ClassMethodHome { .. }
+        | Expr::SuperMethodCall { .. }
         | Expr::SuperMethodCallSpread { .. }
         | Expr::SuperPropertyGet { .. }
         | Expr::SuperPropertySet { .. }
@@ -537,6 +559,18 @@ fn lower_expr_inner(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         | Expr::EnvGet(..)
         | Expr::EnvGetDynamic(..)
         | Expr::ProcessEnv => super::array_methods::lower(ctx, expr),
+        Expr::NamespacePatched(ns) => {
+            let bit = crate::builtin_proto::emit_namespace_patched(ctx, ns);
+            let blk = ctx.block();
+            let tagged = blk.select(
+                crate::types::I1,
+                &bit,
+                crate::types::I64,
+                crate::nanbox::TAG_TRUE_I64,
+                crate::nanbox::TAG_FALSE_I64,
+            );
+            Ok(blk.bitcast_i64_to_double(&tagged))
+        }
         Expr::GlobalThisExpr
         | Expr::ModuleTopThis
         | Expr::DateToISOString(..)

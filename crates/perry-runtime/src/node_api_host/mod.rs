@@ -14,6 +14,7 @@ mod async_work;
 mod bigint;
 mod buffers;
 mod functions;
+pub(crate) mod hooks;
 mod lifecycle;
 mod loader;
 mod metadata;
@@ -129,7 +130,9 @@ pub(crate) struct ReferenceRecord {
     weak_holder_bits: Option<u64>,
     refcount: u32,
     deleted: bool,
-    finalizer_link: Option<(usize, u64)>,
+    /// A rooted WeakRef to the metadata payload and its scalar finalizer id;
+    /// neither the object address nor the native payload is retained strongly.
+    finalizer_link: Option<(u64, u64)>,
 }
 
 pub(crate) struct NativeCallbackRecord {
@@ -491,6 +494,14 @@ pub(crate) fn catch_value_call(env: NapiEnv, f: impl FnOnce() -> f64) -> Result<
 }
 
 /// Mark and rewrite every native-owned Node-API root.
+/// The name the host's root scanner is registered under.
+pub(crate) const ROOT_SCANNER_NAME: &str = "crate::node_api_host::scan_node_api_roots_mut";
+
+pub(crate) fn install() {
+    symbols::retain();
+    hooks::install();
+}
+
 pub fn scan_node_api_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     NODE_API_ENV.with(|cell| {
         let mut borrowed = cell.borrow_mut();
@@ -510,6 +521,13 @@ pub fn scan_node_api_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) 
                 visitor.visit_nanbox_u64_slot(&mut deferred.promise_bits);
             }
         }
+        // Each native async context owns its token until napi_async_destroy,
+        // including contexts created without a JavaScript resource value.
+        for context in &mut env.async_contexts {
+            if !context.destroyed {
+                crate::async_hooks::resource_state::scan_token(&mut context.ids.async_id, visitor);
+            }
+        }
         for tsfn in &env.tsfns {
             tsfn::scan_tsfn_function_root(tsfn, visitor);
         }
@@ -526,9 +544,11 @@ pub fn scan_node_api_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) 
             if let Some(holder) = reference.weak_holder_bits.as_mut() {
                 visitor.visit_nanbox_u64_slot(holder);
             }
+            if let Some((holder, _)) = reference.finalizer_link.as_mut() {
+                visitor.visit_nanbox_u64_slot(holder);
+            }
         }
     });
-    metadata::scan_object_metadata_roots_mut(visitor);
 }
 
 /// Drain callbacks which must run on the owning Perry agent after GC or a

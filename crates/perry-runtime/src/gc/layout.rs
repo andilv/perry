@@ -4,13 +4,18 @@
 //! path calls is in `layout/transfer.rs`.
 
 use super::*;
-// Copied-nursery survival age in otherwise-unused low `_reserved` bits;
-// bits 0..2 remain object flags and bits 14..15 remain layout state.
+// Young survival ages are 0..3: the fourth survival promotes, and TENURED
+// is already the authoritative encoding of age 4. Two bits suffice; bit 5
+// belongs exclusively to OBJECT/PROXY callability, even on promoted headers.
 pub(super) const GC_COPY_SURVIVAL_AGE_SHIFT: usize = 3;
-pub(super) const GC_COPY_SURVIVAL_AGE_MASK: u16 = 0x0038;
+pub(super) const GC_COPY_SURVIVAL_AGE_MASK: u16 = 0x0018;
 pub(super) const GC_COPY_PROMOTION_SURVIVALS: u8 = 4;
+pub(super) const GC_COPY_YOUNG_AGE_MAX: u8 =
+    (GC_COPY_SURVIVAL_AGE_MASK >> GC_COPY_SURVIVAL_AGE_SHIFT) as u8;
+const _: () = assert!(GC_COPY_PROMOTION_SURVIVALS == GC_COPY_YOUNG_AGE_MAX + 1);
 
-// Array/closure pointer-slot layout state in high `_reserved` bits.
+// Generic pointer-slot initialization state in high `_reserved` bits.
+// OBJECT initialization also writes it; OBJECT field tracing selects by shape.
 pub const GC_LAYOUT_STATE_MASK: u16 = 0xC000;
 pub(super) const GC_LAYOUT_UNKNOWN: u16 = 0x0000;
 /// No payload slot holds a pointer, so `heap_payload_slot_selection` skips the
@@ -100,7 +105,9 @@ pub(super) fn copied_survival_age(reserved: u16, flags: u8) -> u8 {
 
 #[inline]
 pub(super) fn reserved_with_copied_survival_age(reserved: u16, age: u8) -> u16 {
-    let capped = age.min(7) as u16;
+    // Only TENURED headers encode age >= 4; copied_survival_age reads their
+    // age from TENURED before inspecting this word.
+    let capped = age.min(GC_COPY_YOUNG_AGE_MAX) as u16;
     (reserved & !GC_COPY_SURVIVAL_AGE_MASK) | (capped << GC_COPY_SURVIVAL_AGE_SHIFT)
 }
 
@@ -191,10 +198,8 @@ pub(super) unsafe fn layout_header_for_user(user_ptr: usize) -> Option<*mut GcHe
 ///   Skipping either would drop edges the payload bit says nothing about — the
 ///   closure's dynamic property values and static `.prototype`, the object's
 ///   meta record, shape `keys` edge and overflow fields;
-/// * **the array's named-property reserve slots** — `GC_ARRAY_NAMED_PROPS`,
+/// * **the array's named-property reserve slots** — `GC_ARRAY_KEY_ATTRS`,
 ///   which live in front of element 0, outside every layout range;
-/// * **a residual `Object.setPrototypeOf` entry** — the per-owner header bit
-///   from #10611, which is what makes this affordable to ask per object.
 ///
 /// A FORWARDED header is never skippable, whatever its layout: array growth
 /// installs PERMANENT forwarding stubs, and walking the stub is what propagates
@@ -202,11 +207,11 @@ pub(super) unsafe fn layout_header_for_user(user_ptr: usize) -> Option<*mut GcHe
 /// `gc/trace.rs` is there for this reason.
 ///
 /// NOT SUFFICIENT ON ITS OWN FOR THE FULL MARK. `gc/trace.rs` reads every word
-/// of a pointer-free payload through `proxy::gc_observe_traced_value` when a
-/// proxy trace is active, because a proxy id is a `POINTER_TAG` value in the
-/// proxy-id band rather than a heap pointer — which is precisely why the layout
+/// of a pointer-free payload through the native-provider observer when a
+/// provider trace is active, because a native handle is a `POINTER_TAG` value
+/// in the native-id band rather than a heap pointer — which is precisely why the layout
 /// mask is entitled to call a payload holding one pointer free. The full mark's
-/// call site therefore ANDs in `!proxy_trace_active`; the copying minor and the
+/// call site therefore ANDs in `!handle_trace_active`; the copying minor and the
 /// remembered-set rebuild both ignore `PointerFreeRange` and need no such term.
 #[inline]
 pub(crate) unsafe fn gc_object_yields_no_child_slots(header: *const GcHeader) -> bool {
@@ -217,12 +222,7 @@ pub(crate) unsafe fn gc_object_yields_no_child_slots(header: *const GcHeader) ->
     // terms fold into ONE mask compare on a word `move_young` has already
     // loaded, so a non-candidate is rejected in two instructions.
     let reserved = (*header)._reserved;
-    if reserved
-        & (GC_LAYOUT_STATE_MASK
-            | crate::gc::GC_ARRAY_NAMED_PROPS
-            | crate::gc::GC_RESIDUAL_PROTO_OWNER)
-        != GC_LAYOUT_POINTER_FREE
-    {
+    if reserved & (GC_LAYOUT_STATE_MASK | crate::gc::GC_ARRAY_KEY_ATTRS) != GC_LAYOUT_POINTER_FREE {
         return false;
     }
     if (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
@@ -234,7 +234,12 @@ pub(crate) unsafe fn gc_object_yields_no_child_slots(header: *const GcHeader) ->
     // uncovered sibling would simply not be admitted here, costing a walk it
     // could have skipped. `the_array_type_still_pairs_with_the_prefix_free_
     // layout_kind` pins the two table facts this leans on.
-    (*header).obj_type == crate::gc::GC_TYPE_ARRAY
+    if (*header).obj_type != crate::gc::GC_TYPE_ARRAY {
+        return false;
+    }
+    let array =
+        (header as *const u8).add(crate::gc::GC_HEADER_SIZE) as *const crate::array::ArrayHeader;
+    (*array).named.is_null()
 }
 
 #[inline]

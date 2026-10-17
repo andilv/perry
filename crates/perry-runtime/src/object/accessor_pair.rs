@@ -175,7 +175,7 @@ pub(crate) unsafe fn pair_of_value(value: u64) -> Option<Accessor> {
         return None;
     }
     let pair = (value & POINTER_MASK) as *const ArrayHeader;
-    let header = crate::value::addr_class::try_read_gc_header(pair as usize)?;
+    let header = crate::value::addr_class::pointer_value_header(value)?;
     if header.obj_type != crate::gc::GC_TYPE_ARRAY || (*pair).length as usize != PAIR_LEN {
         return None;
     }
@@ -220,7 +220,7 @@ pub(crate) unsafe fn site_getter_word_of_value(value: u64) -> Option<usize> {
         return None;
     }
     let pair = (value & POINTER_MASK) as *const ArrayHeader;
-    let header = crate::value::addr_class::try_read_gc_header(pair as usize)?;
+    let header = crate::value::addr_class::pointer_value_header(value)?;
     if header.obj_type != crate::gc::GC_TYPE_ARRAY || (*pair).length as usize != PAIR_LEN {
         return None;
     }
@@ -232,7 +232,7 @@ pub(crate) unsafe fn site_getter_word_of_value(value: u64) -> Option<usize> {
     let get = closure_of(*w.add(PAIR_GET));
     if get != 0 {
         let closure = (get & POINTER_MASK) as usize;
-        if !crate::closure::is_closure_ptr(closure)
+        if !crate::closure::is_closure_bits(get)
             || crate::closure::closure_reads_this_from_capture(
                 closure as *const crate::closure::ClosureHeader,
             )
@@ -283,8 +283,8 @@ pub(crate) extern "C-unwind" fn holder_closure_getter(this: f64, pair: i64) -> f
 /// `obj` is a live `ObjectHeader` and `pos` a key position whose entry
 /// carries `ENTRY_ACCESSOR`.
 pub(crate) unsafe fn slot_accessor(obj: *const crate::object::ObjectHeader, pos: u32) -> Accessor {
-    let live = crate::object::object_live_slot_count(obj);
-    slot_accessor_with_live(obj, pos, live)
+    let (keys, live) = crate::object::object_keys_and_live_slot_count(obj);
+    slot_accessor_with_live(obj, keys.arr(), pos, live)
 }
 
 /// Read an already-resolved accessor lane without resolving its holder again.
@@ -293,10 +293,17 @@ pub(crate) unsafe fn slot_accessor(obj: *const crate::object::ObjectHeader, pos:
 #[inline]
 pub(crate) unsafe fn slot_accessor_with_live(
     obj: *const crate::object::ObjectHeader,
+    keys: *const crate::ArrayHeader,
     pos: u32,
     live: u32,
 ) -> Accessor {
-    let value = crate::object::field_get_set::object_field_at_with_live(obj, pos, live).bits();
+    let table = crate::object::overflow::table(obj);
+    let value = if table.is_null() {
+        let slot = crate::object::key_attrs::key_storage_slot(keys, pos);
+        crate::object::field_get_set::object_field_at_with_live(obj, slot, live).bits()
+    } else {
+        crate::object::overflow::get_from(table, obj, pos).unwrap_or(crate::value::TAG_UNDEFINED)
+    };
     pair_of_value(value).unwrap_or_default()
 }
 
@@ -308,7 +315,9 @@ pub(crate) unsafe fn slot_accessor_with_live(
 pub(crate) unsafe fn own_accessor(obj: usize, key: &[u8]) -> Option<Accessor> {
     let obj = obj as *const crate::object::ObjectHeader;
     let record = crate::object::shapes::object_shape_record(obj)?;
-    if record.summary() & crate::object::key_attrs::SUMMARY_ACCESSOR == 0 {
+    if crate::object::key_attrs::object_summary(obj) & crate::object::key_attrs::SUMMARY_ACCESSOR
+        == 0
+    {
         return None;
     }
     let keys = crate::object::object_keys_from_shape_record(obj, record);
@@ -323,6 +332,7 @@ pub(crate) unsafe fn own_accessor(obj: usize, key: &[u8]) -> Option<Accessor> {
     }
     Some(slot_accessor_with_live(
         obj,
+        keys.arr(),
         pos,
         record.live_inline_slot_count(),
     ))
@@ -336,6 +346,10 @@ pub(crate) unsafe fn own_accessor(obj: usize, key: &[u8]) -> Option<Accessor> {
 /// `obj` is a live object whose attributes live with its keys, and `key` is
 /// one of its own keys.
 pub(crate) unsafe fn store_own_accessor(obj: usize, key: &str, acc: Option<Accessor>) {
+    store_own_accessor_bytes(obj, key.as_bytes(), acc);
+}
+
+pub(crate) unsafe fn store_own_accessor_bytes(obj: usize, key: &[u8], acc: Option<Accessor>) {
     let _no_move = crate::gc::GcSuppressScope::new();
     let value = match acc {
         Some(acc) => crate::value::js_nanbox_pointer(pair_new(acc) as i64),

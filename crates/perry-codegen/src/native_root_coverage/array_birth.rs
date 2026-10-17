@@ -43,7 +43,7 @@ fn array_elements_and_reduce_callback_are_live_across_inline_births() {
         assert_live_origin(
             function_slice(&rewritten, "main"),
             "js_inline_arena_slow_alloc",
-            "js_object_alloc",
+            "js_object_alloc_plain",
             2,
         );
 
@@ -73,7 +73,7 @@ fn array_elements_and_reduce_callback_are_live_across_inline_births() {
         assert_live_origin(
             function_slice(&rewritten, "main"),
             "perry_birth_empty_array",
-            "js_closure_alloc",
+            "js_closure_alloc_singleton",
             1,
         );
     }

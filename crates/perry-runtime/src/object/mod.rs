@@ -69,6 +69,7 @@ pub(crate) use alloc_basic::{
     object_alloc_born, object_alloc_branded, object_alloc_filled_birth, object_alloc_plain,
     object_alloc_unpublished,
 };
+pub(crate) use alloc_basic::{object_alloc_prototype_old, object_alloc_prototype_old_null_proto};
 #[allow(unused_imports)]
 pub(crate) use alloc_plain::mark_object_plain_ordinary;
 pub use assign::*;
@@ -90,6 +91,7 @@ mod assert;
 mod async_generator_queue;
 mod bigint_dispatch;
 mod buffer_dispatch;
+mod class_accessor_guard;
 mod class_constructors;
 mod class_env;
 mod class_gc_roots;
@@ -119,6 +121,7 @@ mod constfn_key_add;
 pub(crate) mod field_rep;
 pub(crate) mod field_rep_store;
 pub(crate) mod key_attrs;
+pub(crate) mod key_view;
 pub(crate) use census::object_tables_census;
 #[cfg(test)]
 mod bound_method_receiver_tests;
@@ -129,13 +132,10 @@ pub(crate) mod date_proto_thunks;
 pub(crate) mod delete_last_key;
 mod delete_rest;
 pub(crate) mod descriptors;
-pub(crate) mod dictionary;
-mod dictionary_counters;
-#[cfg(test)]
-mod dictionary_tests;
 mod disposable_proto_thunks;
 pub(crate) mod exotic_expando;
 pub(crate) mod field_get_set;
+pub(crate) mod overflow;
 pub(crate) use field_get_set::scan_accessor_receiver_override_root_mut;
 mod field_set_by_name;
 mod gc_slots;
@@ -145,12 +145,12 @@ pub(crate) use gc_slots::{
 };
 pub(crate) mod global_fetch;
 pub(crate) use global_fetch::scan_pending_fetch_signal_root_mut;
+mod global_this;
+pub(crate) mod shape_chain;
 /// Lane 3: the (receiver shape, key) -> (holder, slot) cache that gives an
 /// INHERITED read an inline-cache hit. See the module docs for the guard and
 /// the GC contract.
-pub(crate) mod chain_store;
-mod global_this;
-pub(crate) mod shape_chain;
+pub(crate) mod store_key;
 #[cfg(feature = "dyn-eval")]
 pub(crate) use global_this::install_dyn_eval;
 #[cfg(feature = "temporal")]
@@ -160,7 +160,11 @@ pub(crate) use global_this::{
     temporal_kind_prototype as global_this_temporal_kind_prototype,
     temporal_subclass_super as global_this_temporal_subclass_super,
 };
+pub mod builtin_proto;
+pub(crate) mod builtin_namespace;
+mod builtin_proto_entries;
 pub mod handle_expando;
+pub(crate) mod owned_state_bag;
 pub(crate) mod prop_plan;
 pub(crate) mod proto_validity;
 pub(crate) mod shape_store;
@@ -178,10 +182,10 @@ mod live_slots;
 mod null_stub;
 mod side_table_roots;
 mod string_wrapper;
-pub(crate) use live_slots::set_object_live_slot_count;
 pub use live_slots::{
     js_object_live_slot_count, object_live_slot_count, perry_object_header_abi_revision,
 };
+pub(crate) use live_slots::{object_inline_capacity, set_object_live_slot_count};
 pub(crate) use null_stub::null_stub_value;
 pub use null_stub::{js_unresolved_default_call, js_unresolved_namespace_stub};
 #[cfg(test)]
@@ -257,8 +261,15 @@ pub(crate) mod prototype_chain;
 pub(crate) mod shape_carriers;
 // The MODULE is always compiled, so its unit tests always run and the
 // classifier cannot bit-rot behind a feature nobody builds. Every CALL SITE is
-// `#[cfg(feature = "shape-mint-diag")]`, so with the feature off nothing
-// reaches it and the linker drops it: the shipped runtime is unchanged.
+// `#[cfg(any(test, feature = "shape-mint-diag"))]` at the mint funnel (the
+// other hooks are feature-only), so a stock non-test build never
+// reaches it and the linker drops it: the shipped runtime pays nothing.
+pub mod layout_desc;
+pub(crate) use shapes::layout_probe;
+#[cfg(test)]
+mod layout_desc_tests;
+pub mod runtime_layouts;
+pub(crate) mod shadow;
 #[cfg_attr(not(feature = "shape-mint-diag"), allow(dead_code))]
 pub(crate) mod shape_mint_census;
 pub(crate) mod shapes;
@@ -322,12 +333,13 @@ pub(crate) use class_gc_roots::{
     test_seed_class_parent_closure_root,
 };
 pub use class_registry::*;
-pub(crate) use collection_proto_thunks::{is_builtin_map_set_value, is_builtin_set_add_value};
+pub(crate) use collection_proto_thunks::{
+    is_builtin_map_set_value, is_builtin_set_add_value, throw_incompatible_receiver,
+};
 pub(crate) use data_view_registry::{extends_builtin_data_view, extends_builtin_typed_array};
 pub(crate) use date_proto_thunks::date_to_json_value;
 pub use delete_rest::*;
 pub use descriptors::*;
-pub use exotic_expando::scan_exotic_expando_roots_mut;
 pub use field_get_set::*;
 pub use field_set_by_name::*;
 pub use global_this::*;
@@ -335,9 +347,9 @@ pub(crate) use global_this_tables::*;
 pub use groupby::*;
 pub use instanceof::*;
 pub(crate) use iterator_prototypes::{
-    attach_iterator_prototype, call_overridden_iterator_next, ensure_iterator_prototypes,
-    iterator_next_property_owner, iterator_prototype_for_class_id,
-    iterator_prototypes_materialized, iterator_step_method_is_builtin,
+    attach_iterator_prototype, call_overridden_iterator_next, iterator_next_property_owner,
+    iterator_prototype_for_class_id, iterator_prototypes_materialized,
+    iterator_step_method_is_builtin,
 };
 pub use namespace_create::*;
 pub use native_call_method::*;
@@ -379,6 +391,8 @@ pub use class_meta_registry::{
     js_register_class_has_instance, js_register_class_to_string_tag,
 };
 #[cfg(test)]
+pub(crate) use descriptor_state::set_builtin_accessor_pair;
+#[cfg(test)]
 pub(crate) use descriptor_state::test_may_have_descriptor_entry;
 pub(crate) use descriptor_state::{
     accessor_descriptor_keys_for_obj, class_instance_set_may_intercept, clear_accessor_descriptor,
@@ -388,30 +402,33 @@ pub(crate) use descriptor_state::{
     owner_has_property_descriptors, owner_may_have_descriptor_entries,
     plain_custom_prototype_may_intercept, plain_data_write_may_intercept,
     reflect_getter_closure_bits, set_accessor_descriptor, set_builtin_accessor_descriptor,
-    set_builtin_accessor_pair, set_builtin_property_attrs, set_property_attrs, AccessorDescriptor,
-    PropertyAttrs,
+    set_builtin_property_attrs, set_property_attrs, AccessorDescriptor, PropertyAttrs,
 };
+#[cfg(test)]
+pub(crate) use field_get_set::private_member_access_hints_depth;
 pub(crate) use field_get_set::FieldLookupCaches;
 pub(crate) use field_get_set::{
     class_object_default_to_string, class_object_registry_serves_static,
-    private_evaluation_brand_value, private_lexical_brand_pop, private_lexical_brand_push,
-    private_lexical_brand_stack_restore, private_lexical_brand_stack_savepoint,
-    private_member_access_hints_restore, private_member_access_hints_savepoint,
+    private_evaluation_brand_value, private_lexical_brand_check_marks, private_lexical_brand_pop,
+    private_lexical_brand_push, private_lexical_brand_push_at, private_lexical_brand_unwind_to,
+    private_member_access_hints_check_marks, private_member_access_hints_unwind_to,
     scan_private_lexical_brand_roots_mut,
 };
-#[cfg(test)]
-pub(crate) use this_binding::js_derived_super_scope_push;
-pub(crate) use this_binding::SuperNewTargetScope;
+pub(crate) use field_get_set::{private_lexical_brand_depth, private_lexical_brand_truncate};
 pub(crate) use this_binding::{
-    derived_super_binding_stack_restore, derived_super_binding_stack_savepoint,
-    new_target_trap_restore, new_target_trap_savepoint, scan_dispatch_binding_roots_mut,
+    derived_super_binding_check_marks, derived_super_binding_len, derived_super_binding_truncate,
+    derived_super_binding_unwind_to, new_target_restore_after_throw,
+    scan_dispatch_binding_roots_mut, static_private_owner_check_marks,
     static_private_owner_current, static_private_owner_pop, static_private_owner_push,
-    static_private_owner_stack_restore, static_private_owner_stack_savepoint, static_this_arm,
-    static_this_arm_if_unarmed, static_this_disarm,
+    static_private_owner_push_at, static_private_owner_unwind_to, static_this_arm,
+    static_this_arm_if_unarmed, static_this_disarm, SuperNewTargetScope,
 };
+#[cfg(test)]
+pub(crate) use this_binding::{derived_super_scope_push_at, static_private_owner_depth};
 pub use this_binding::{
-    js_new_target_get, js_new_target_set, js_static_this_arm_classref, js_static_this_arm_value,
-    js_static_this_resolve, js_static_this_resolve_class, js_this_coerce_sloppy,
+    js_new_target_enter, js_new_target_get, js_new_target_leave, js_new_target_set,
+    js_static_this_arm_classref, js_static_this_arm_value, js_static_this_resolve,
+    js_static_this_resolve_class, js_this_coerce_sloppy,
 };
 pub use to_string_tag::js_object_to_string;
 pub(crate) use to_string_tag::typed_array_to_string_tag_name;
@@ -719,10 +736,10 @@ pub(crate) use keys_lookup::*;
 pub(crate) mod array_tail_transition;
 mod call_method_depth;
 #[cfg(test)]
-pub(crate) use call_method_depth::test_enter_catch_method;
+pub(crate) use call_method_depth::{call_method_depth, test_enter_catch_method};
 mod meta_accessors;
 use call_method_depth::CallMethodDepthGuard;
-pub(crate) use call_method_depth::{call_method_depth_restore, call_method_depth_savepoint};
+pub(crate) use call_method_depth::{call_method_depth_check_marks, call_method_depth_unwind_to};
 pub(crate) use meta_accessors::*;
 
 /// Fast direct-mapped inline cache for class shape keys arrays.
@@ -816,41 +833,14 @@ fn shape_cache_insert(
     // value it hands back to codegen), and a cache holding one array while
     // the caller holds another is exactly the divergence this stage exists to
     // remove.
-    let (live, keys) = {
-        // SAFETY: a live keys array or null; `canonicalize` allocates, roots
-        // its own operand, and `across` roots the caller's object.
-        if keys.count() == 0 {
-            // A class's empty backing is observable by generated code, so
-            // retain its non-null representation. Every cached backing,
-            // including an empty one supplied by a caller, must satisfy I3.
-            let stationary = keys.arr().is_null()
-                || unsafe {
-                    crate::arena::pointer_in_old_gen(keys.arr() as usize)
-                        && (*crate::gc::header_from_trusted_user_ptr(keys.arr().cast())).gc_flags
-                            & crate::gc::GC_FLAG_SHAPE_SHARED
-                            != 0
-                };
-            if stationary {
-                (live, keys)
-            } else {
-                live.across(|| {
-                    ObjectKeys::new(
-                        crate::array::js_array_alloc_canonical_keys(0, true, false),
-                        0,
-                    )
-                })
-            }
-        } else {
-            live.across(|| unsafe {
-                canonical_keys::canonicalize(
-                    &canonical_keys::SharedLayout::shape_cache_entry(),
-                    keys.arr(),
-                    keys.count(),
-                )
-                .view()
-            })
-        }
-    };
+    let (live, keys) = live.across(|| unsafe {
+        canonical_keys::canonicalize(
+            &canonical_keys::SharedLayout::shape_cache_entry(),
+            keys.arr(),
+            keys.count(),
+        )
+        .view()
+    });
     let keys_array = keys.arr();
     // Mark the array as shape-shared so `js_object_set_field_by_name`
     // knows it must clone before mutating. The clone path was firing
@@ -1416,6 +1406,7 @@ fn transition_cache_insert(
     // Eagerly stabilize small shapes so growth cannot invalidate a cached
     // target. Large one-off dictionaries stay lazy to avoid prefix copies.
 }
+
 pub fn scan_object_cache_roots(mark: &mut dyn FnMut(f64)) {
     let mut visitor = crate::gc::RuntimeRootVisitor::for_copy(mark);
     scan_object_cache_roots_mut(&mut visitor);
@@ -1539,6 +1530,7 @@ pub(crate) fn test_seed_shape_cache_root(shape_id: u32, keys_array: *mut ArrayHe
     }
     crate::gc::runtime_write_barrier_root_raw_ptr(keys_array);
 }
+
 // `is_valid_obj_ptr` moved to `value/addr_class.rs` (the centralized
 // handle-vs-heap-pointer classification module); re-exported here so the
 // existing `crate::object::is_valid_obj_ptr` call sites keep compiling
@@ -1614,6 +1606,11 @@ pub(crate) unsafe fn object_keys_from_shape_record(
     obj: *const ObjectHeader,
     record: shapes::ShapeRecordRef,
 ) -> ObjectKeys {
+    let overflow = overflow::keys_array(obj);
+    if !overflow.is_null() {
+        return ObjectKeys::owned(overflow);
+    }
+
     if record.keys() != 0 {
         let keys = ObjectKeys::new(
             record.keys() as usize as *mut ArrayHeader,
@@ -1621,9 +1618,7 @@ pub(crate) unsafe fn object_keys_from_shape_record(
         );
         return keys;
     }
-    // A dictionary shape's ordered list belongs to its receiver. Its header
-    // supplies the count; normal shapes use their immutable prefix above.
-    ObjectKeys::owned(dictionary::keys_array(obj))
+    ObjectKeys::NONE
 }
 
 /// Return the two shape facts needed together by callback-free serializers.
@@ -1633,6 +1628,10 @@ pub(crate) unsafe fn object_keys_from_shape_record(
 pub(crate) unsafe fn object_keys_and_live_slots(
     obj: *const ObjectHeader,
 ) -> Option<(ObjectKeys, u32)> {
+    if overflow::has_overflow(obj) {
+        return None;
+    }
+
     shapes::object_shape_record(obj).map(|record| {
         (
             ObjectKeys::new(
@@ -1663,7 +1662,7 @@ pub(crate) unsafe fn object_is_regular(obj: *const ObjectHeader) -> bool {
     };
     header.obj_type == crate::gc::GC_TYPE_OBJECT
         && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-        && shapes::shape_object_kind_by_id((*obj).parent_class_id)
+        && shapes::shape_object_kind_by_id((*obj).shape_word())
             .is_some_and(|kind| kind.is_ordinary_layout())
 }
 
@@ -1684,7 +1683,7 @@ const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 16 - size_of::
 const _: () = assert!(
     std::mem::offset_of!(ObjectHeader, parent_class_id) == crate::codegen_abi::OBJECT_SHAPE_OFFSET
 );
-const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 8);
+const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 16);
 
 pub(crate) mod cell_meta;
 pub(crate) use cell_meta::{cell_expando_ensure, cell_expando_get, cell_meta_slot};
@@ -1750,20 +1749,6 @@ unsafe fn set_object_keys_with_live_rep(
     // `is_shape_id` says so, for class instances too, so an instance still
     // carrying its allocation-time `parent_class_id` (never in the ShapeId
     // range) is left alone.
-    // #10868 step 2.5 stage 1: a dictionary-mode receiver absorbs the
-    // publication into its own record and mints nothing. That is the bound
-    // the mode exists to provide; see `object/dictionary.rs`.
-    if dictionary::is_dictionary(obj) {
-        // A dictionary receiver's list is its own, so its length is its count.
-        debug_assert!(
-            keys_array.is_null()
-                || crate::array::keys_array_len_capped_to_capacity(keys_array) as u32
-                    == keys.count(),
-            "a dictionary receiver publishes an owned list"
-        );
-        dictionary::publish_keys(obj, keys_array, live_inline_slot_count);
-        return;
-    }
     let predecessor = shapes::object_shape_descriptor(obj);
     // #8067/#8113: every visible ShapeId resolves to the exact rooted
     // ordered-keys/live-slot descriptor. Same-pointer appends are versioned
@@ -1774,16 +1759,17 @@ unsafe fn set_object_keys_with_live_rep(
     // `publish_object_shape_from` and every other post-birth publish now
     // route through — this call site no longer needs to remember the note.
     shapes::publish_object_shape_from_rep(obj, predecessor, keys, live_inline_slot_count, rep);
-    // #10868 step 2.5: this is where a receiver whose key list is unique to
-    // it stops interning (`dictionary::should_latch_to_dictionary`). The run
-    // is nonzero only when the append that produced `keys` created the list.
-    if !keys_array.is_null() {
-        let unique_run = canonical_keys::take_unique_run(keys);
-        if dictionary::should_latch_to_dictionary(unique_run)
-            && dictionary::latch_object_to_dictionary(obj)
-        {
-            canonical_keys::note_latched_away(keys);
-        }
+    // A receiver whose key list grows unique to it stops minting layouts:
+    // its overflow becomes the order authority and takes every later key.
+    // The run is nonzero only when the append that produced `keys` created
+    // the list.
+    if !keys_array.is_null()
+        && canonical_keys::take_unique_run(keys) >= overflow::UNIQUE_RUN_TO_OVERFLOW
+        && object_is_regular(obj)
+        && shapes::object_shape_descriptor(obj).is_some_and(|d| d.hole_count == 0)
+    {
+        overflow::ensure(obj);
+        canonical_keys::note_latched_away(keys);
     }
 }
 
@@ -1813,6 +1799,8 @@ mod tombstone_tests;
 #[cfg(test)]
 mod transition_ic_tests;
 #[cfg(test)]
+mod value_of_placeholder_tests;
+#[cfg(test)]
 mod wide_field_read_tests;
 #[cfg(test)]
 mod wide_object_membership_tests;
@@ -1821,6 +1809,5 @@ mod packed_keys;
 pub(crate) use packed_keys::packed_key_names;
 
 pub(crate) use iterator_prototypes::array_record_close_is_absent;
-pub(crate) use iterator_prototypes::{
-    array_iterator_next_is_intrinsic, array_iterator_prototype_addr, shape_member_body_is,
-};
+#[cfg(test)]
+mod record_layout_tests;

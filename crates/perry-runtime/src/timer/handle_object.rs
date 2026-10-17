@@ -246,13 +246,13 @@ pub(crate) unsafe fn try_timer_method_fast_dispatch(object: f64, name: &[u8]) ->
         return None;
     }
     let name_str = std::str::from_utf8_unchecked(name);
-    if crate::object::dictionary::is_dictionary(obj)
+    if crate::object::overflow::has_overflow(obj)
         || crate::object::shapes::object_shape_descriptor(obj)?.logical_key_count != 0
         || crate::object::descriptor_state::may_have_descriptor_entry(obj as usize, name_str, true)
     {
         return None;
     }
-    if crate::object::dictionary::is_dictionary(proto)
+    if crate::object::overflow::has_overflow(proto)
         || crate::object::descriptor_state::may_have_descriptor_entry(
             proto as usize,
             name_str,
@@ -482,6 +482,13 @@ fn build_timer_prototypes() {
         }
         // No `Symbol.toStringTag`: node brands both as `[object Object]`.
         slot.store(proto as i64, Ordering::Release);
+        // Built: the TIMEOUT / IMMEDIATE layouts name this prototype.
+        let serial = if is_immediate {
+            crate::closure::shape::INTRINSIC_SERIAL_IMMEDIATE
+        } else {
+            crate::closure::shape::INTRINSIC_SERIAL_TIMEOUT
+        };
+        unsafe { crate::object::builtin_proto::seal_runtime_prototype(proto, serial) };
     }
 }
 
@@ -507,28 +514,24 @@ pub(super) fn timer_object(id: i64, kind: CallbackTimerKind) -> i64 {
         CallbackTimerKind::Immediate => IMMEDIATE_CLASS_ID,
         _ => TIMEOUT_CLASS_ID,
     };
-    let obj = crate::object::js_object_alloc(class_id, 0);
-    if obj.is_null() {
-        return 0;
-    }
-    // Building the prototype allocates (lazily, on the first timer of a
-    // program) and `GC_TYPE_OBJECT` is movable, so the instance is re-read
-    // through its handle after each allocating step.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let handle = scope.root_raw_mut_ptr(obj);
     let proto = timer_prototype(kind);
-    debug_assert!(
+    assert!(
         !proto.is_null(),
-        "a timer handle must carry its prototype, or it has no methods"
+        "timer prototype must exist before layout birth"
     );
-    if !proto.is_null() {
-        handle.with_mut_ptr::<crate::object::ObjectHeader, _>(|obj| {
-            crate::object::prototype_chain::object_link_class_default_prototype(
-                obj as usize,
-                crate::value::js_nanbox_pointer(proto as i64).to_bits(),
-            );
-        });
+    let desc = match kind {
+        CallbackTimerKind::Immediate => {
+            std::ptr::addr_of!(crate::object::runtime_layouts::IMMEDIATE)
+        }
+        _ => std::ptr::addr_of!(crate::object::runtime_layouts::TIMEOUT),
+    };
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let object = unsafe { crate::object::layout_desc::perry_alloc_layout(desc) };
+    // GC_STORE_AUDIT(POINTER_FREE): timer family brand, published before escape.
+    unsafe {
+        (*object).class_id = class_id;
     }
+    let handle = scope.root_raw_mut_ptr(object);
     handle.with_mut_ptr::<crate::object::ObjectHeader, _>(|obj| unsafe {
         let meta = crate::object::object_meta_ensure(obj);
         debug_assert!(!meta.is_null(), "a timer handle must carry its meta");

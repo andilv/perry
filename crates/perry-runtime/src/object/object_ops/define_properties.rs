@@ -8,11 +8,13 @@ use super::*;
 /// before any per-key callback. Each collected definition is a contiguous
 /// record of rooted handles in this operation's own scope
 /// (`DescView::collected_words`), so the operation owns no Rust-heap buffer:
-/// an abrupt completion leaves nothing to release, and the thrower's
-/// savepoint truncates the records with the rest of the handle stack. No
-/// protected frame is needed.
+/// an abrupt completion leaves nothing to release, and the catching landing
+/// pad drops the records with the rest of this frame's handles (by frame
+/// mark). No protected frame is needed.
 #[no_mangle]
 pub extern "C" fn js_object_define_properties(target: f64, properties: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_value(target, "Object.defineProperties");
     unsafe {
         if !definition_target_is_object(target) {
             throw_object_type_error(b"Object.defineProperties called on non-object");
@@ -69,7 +71,7 @@ pub extern "C" fn js_object_define_properties(target: f64, properties: f64) -> f
         let key_count = name_count + symbols.as_ref().map(length_of).unwrap_or(0);
         // Per-key work runs in its own scope; only the finished record is
         // pushed into `scope`, so records sit back to back from `base`.
-        let base = crate::gc::runtime_handle_stack_savepoint();
+        let base = crate::gc::runtime_handle_stack_len();
         let mut entries = 0usize;
         for index in 0..key_count {
             let words = {
@@ -163,6 +165,8 @@ pub extern "C" fn js_object_define_properties(target: f64, properties: f64) -> f
 /// + inherited property dispatch can consult it.
 #[no_mangle]
 pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_value(obj_value, "Object.setPrototypeOf");
     crate::array::subclass_elements::deopt_value(obj_value);
     const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
     const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
@@ -383,7 +387,7 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
     // path below rejects the handle (`is_valid_obj_ptr` is false for a small
     // id), so without this the prototype was silently dropped and every
     // express response method no-op'd (the Wall-10 express/NestJS blocker).
-    // Record the link in the SAME `OBJECT_PROTOTYPES` side-table keyed by the
+    // Record the link in the SAME owner property bag for the
     // handle id; the small-handle method/property dispatch fallbacks then walk
     // it via `resolve_inherited_field`, binding `this` to the handle so the
     // express method's internal `this.end(...)` / `this.statusCode = …` route
@@ -392,7 +396,7 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
     // canonical path below.
     {
         let top = obj_bits >> 48;
-        let handle_id = if top == 0x7FFD {
+        let handle_id = if top == (crate::value::HANDLE_TAG >> 48) {
             (obj_bits & 0x0000_FFFF_FFFF_FFFF) as usize
         } else {
             0
@@ -413,6 +417,7 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
     // proto's own properties, so the Tag is recognized as a valid Effect.
     if (obj_bits & 0xFFFF_0000_0000_0000) == POINTER_TAG
         && ((proto_bits & 0xFFFF_0000_0000_0000) == POINTER_TAG
+            || (proto_bits & 0xFFFF_0000_0000_0000) == crate::value::HANDLE_TAG
             || proto_bits == crate::value::TAG_NULL)
     {
         let obj_ptr = crate::value::js_nanbox_get_pointer(obj_value) as usize;

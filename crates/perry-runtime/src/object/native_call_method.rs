@@ -33,6 +33,8 @@ mod code_point_at_dispatch_tests;
 #[cfg(test)]
 mod dispatch_arg_coercion_tests;
 #[cfg(test)]
+mod invalid_utf8_method_tests;
+#[cfg(test)]
 mod probe_dispatch_tests;
 #[cfg(test)]
 /// #8139: `toLocaleString` on an array / typed-array / buffer receiver.
@@ -49,10 +51,10 @@ use disposal::{
     js_using_check_disposable, try_disposable_stack_method_dispatch, try_symbol_dispose_dispatch,
 };
 #[cfg(test)]
+pub(crate) use namespace_override::namespace_override_depth;
+#[cfg(test)]
 pub(crate) use namespace_override::test_push_catch_namespace_override;
-pub(crate) use namespace_override::{
-    namespace_override_stack_restore, namespace_override_stack_savepoint,
-};
+pub(crate) use namespace_override::{namespace_override_check_marks, namespace_override_unwind_to};
 pub use object_proto::js_value_to_locale_string;
 use object_proto::{call_builtin_object_proto_method, is_ordinary_object_receiver};
 pub(crate) use object_proto::{
@@ -150,7 +152,7 @@ unsafe fn class_receiver_fast_guard(object: f64, method_bytes: &[u8]) -> Option<
     // #10868 step 2.5 stage 1: a dictionary-mode receiver's own fields are in
     // its `ObjectMeta`, so a null `keys` word would make this shadowing scan
     // vacuously true and let a prototype method win over an own field.
-    if crate::object::dictionary::is_dictionary(obj) {
+    if crate::object::overflow::has_overflow(obj) {
         return None;
     }
     let keys = descriptor.keys as usize as *mut ArrayHeader;
@@ -816,17 +818,17 @@ pub(crate) unsafe fn native_call_method_value_memo(
     // which both finds own-field closures and binds `this`.
     let property_key_jsval = JSValue::from_bits(property_key.to_bits());
     if property_key_jsval.is_any_string() {
-        let str_ptr =
-            crate::value::js_get_string_pointer_unified(property_key) as *const crate::StringHeader;
-        if !str_ptr.is_null() {
-            let bytes_ptr = (str_ptr as *const i8).add(std::mem::size_of::<crate::StringHeader>());
-            let bytes_len = (*str_ptr).byte_len as usize;
-            if memo != 0 {
-                return memo_entries::memo_call(
-                    object, bytes_ptr, bytes_len, args_ptr, args_len, memo, false,
-                );
-            }
-            return js_native_call_method(object, bytes_ptr, bytes_len, args_ptr, args_len);
+        let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+        if let Some(bytes) = crate::string::js_string_key_bytes(property_key_jsval, &mut scratch) {
+            return memo_entries::memo_call(
+                object,
+                bytes.as_ptr() as *const i8,
+                bytes.len(),
+                args_ptr,
+                args_len,
+                memo,
+                false,
+            );
         }
     }
 
@@ -1149,7 +1151,9 @@ pub unsafe extern "C-unwind" fn js_native_call_method_nullsafe(
     // is what makes data properties such as `TLSSocket.authorized` and
     // `alpnProtocol` observable, and also recovers bound method values such as
     // `setKeyCert` when they are read before being called.
-    if args_len == 0 && !method_name_ptr.is_null() && v.is_pointer() {
+    // Native registry ids travel under HANDLE_TAG (honest pointers): a
+    // POINTER_TAG word is never a handle.
+    if args_len == 0 && !method_name_ptr.is_null() && v.is_handle() {
         let handle = crate::value::js_nanbox_get_pointer(object);
         if crate::value::addr_class::is_handle_band(handle as usize) {
             if let Some(dispatch) = crate::object::handle_property_dispatch() {
@@ -1161,6 +1165,30 @@ pub unsafe extern "C-unwind" fn js_native_call_method_nullsafe(
         }
     }
     js_native_call_method(object, method_name_ptr, method_name_len, args_ptr, args_len)
+}
+
+/// A `String.prototype` method's native body, by name, on a string receiver
+/// (#11915, `builtin_proto_entries.rs`): no `Get`, no prototype read — the
+/// builtin itself, for a caller that has already proven `Pristine(String)`.
+/// `None` for a receiver the string arms do not take.
+///
+/// # Safety
+/// `recv` and `args` are NaN-boxed values.
+pub(crate) unsafe fn string_native_method(recv: f64, name: &str, args: &[f64]) -> Option<f64> {
+    let root_scope = crate::gc::RuntimeHandleScope::new();
+    let object_handle = root_scope.root_nanbox_f64(recv);
+    let arg_handles = root_scope.root_nanbox_f64_slice(args);
+    string_methods::dispatch_string(
+        &root_scope,
+        &object_handle,
+        &arg_handles,
+        recv,
+        name,
+        name.as_ptr().cast(),
+        name.len(),
+        args.as_ptr(),
+        args.len(),
+    )
 }
 
 #[no_mangle]
@@ -1228,6 +1256,11 @@ pub(crate) unsafe fn native_call_method_tower(
             args_ptr,
             args_len,
         );
+    }
+    if let Some(result) =
+        call_invalid_utf8_method_exact(object, method_name_ptr, method_name_len, args_ptr, args_len)
+    {
+        return result;
     }
     if !method_name_ptr.is_null() && method_name_len > 0 {
         let method_name_bytes =
@@ -1312,13 +1345,40 @@ pub(crate) unsafe fn native_call_method_tower(
     } else {
         let bytes = std::slice::from_raw_parts(method_name_ptr as *const u8, method_name_len);
         // #10502: validate with `str::from_utf8` (ASCII word-at-a-time fast
-        // path) and fall back to the lossy decoder only for invalid bytes.
-        // `from_utf8_lossy` answers the same `Cow` but walks `Utf8Chunks`
+        // path); WTF-8 keys use the exact-byte property operation.
+        // A lossy decoder would walk `Utf8Chunks`
         // chunk by chunk even for a valid name: ~1.5% of a prototype-method
         // dispatch profile, on every call.
         match std::str::from_utf8(bytes) {
             Ok(name) => std::borrow::Cow::Borrowed(name),
-            Err(_) => String::from_utf8_lossy(bytes),
+            Err(_) => {
+                // WTF-8 keys have no Rust str representation. Perform the
+                // same property operation on their exact bytes, rather than
+                // selecting a replacement-character property in the name tower.
+                let bytes = bytes.to_vec();
+                let scope = crate::gc::RuntimeHandleScope::new();
+                let receiver = scope.root_nanbox_f64(object);
+                let args = if args_ptr.is_null() {
+                    Vec::new()
+                } else {
+                    scope.root_nanbox_f64_slice(std::slice::from_raw_parts(args_ptr, args_len))
+                };
+                let key = crate::string::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
+                let key = scope.root_nanbox_f64(crate::value::js_nanbox_string(key as i64));
+                let function = crate::proxy::js_reflect_get_with_explicit_receiver(
+                    receiver.get_nanbox_f64(),
+                    key.get_nanbox_f64(),
+                    receiver.get_nanbox_f64(),
+                );
+                let function = scope.root_nanbox_f64(function);
+                let args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&args);
+                return crate::object::method_site::js_method_site_call_value(
+                    function.get_nanbox_f64(),
+                    receiver.get_nanbox_f64(),
+                    args.as_ptr(),
+                    args.len(),
+                );
+            }
         }
     };
     let method_name: &str = &method_name_cow;
@@ -2566,6 +2626,73 @@ pub(crate) unsafe fn native_call_method_tower(
     );
 }
 
+/// Preserve the exact property key for method calls whose UTF-8 byte spelling
+/// contains a WTF-8 surrogate. The general dispatch tower below is optimized
+/// around Rust `str`; converting such a key lossily changes it to U+FFFD before
+/// the ordinary class/prototype lookup can answer it.
+///
+/// Valid UTF-8 names keep using the existing specialized tower. For a pointer
+/// receiver and invalid UTF-8 key, do the equivalent `Get(receiver, key)` and
+/// call the resolved value with the original receiver as `this`.
+///
+/// # Safety
+/// The method-name and argument slices are readable for their supplied
+/// lengths.
+unsafe fn call_invalid_utf8_method_exact(
+    receiver: f64,
+    method_name_ptr: *const i8,
+    method_name_len: usize,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> Option<f64> {
+    if method_name_ptr.is_null() || method_name_len == 0 {
+        return None;
+    }
+    let name_bytes = std::slice::from_raw_parts(method_name_ptr.cast::<u8>(), method_name_len);
+    if std::str::from_utf8(name_bytes).is_ok() {
+        return None;
+    }
+    // Keep a stable copy before rooting/allocating anything; the source pointer
+    // can refer to storage owned by a moving JS string.
+    let name_bytes = name_bytes.to_vec();
+    let receiver = canonicalize_bare_gc_receiver(receiver);
+    let args = if args_len != 0 && !args_ptr.is_null() {
+        std::slice::from_raw_parts(args_ptr, args_len).to_vec()
+    } else {
+        Vec::new()
+    };
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(receiver);
+    let args = scope.root_nanbox_f64_slice(&args);
+    let key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+        name_bytes.as_ptr(),
+        name_bytes.len() as u32,
+    ));
+    let key_value = scope.root_nanbox_f64(
+        key.with_const_ptr::<crate::StringHeader, _>(crate::value::nanbox_string_key),
+    );
+    let value = crate::object::js_object_get_index_polymorphic(
+        receiver.get_nanbox_u64() as i64,
+        key_value.get_nanbox_f64(),
+    );
+    let value = scope.root_nanbox_u64(value.to_bits());
+    let rebound = crate::closure::clone_closure_rebind_this(
+        value.get_nanbox_u64(),
+        receiver.get_nanbox_f64(),
+    );
+    let rebound = scope.root_nanbox_u64(rebound);
+    // Rebinding can allocate. Refresh both the receiver and arguments only
+    // after the callee has been rooted, immediately before entering user code.
+    let this_value = receiver.get_nanbox_f64();
+    let args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&args);
+    Some(crate::closure::native_call_value_this(
+        f64::from_bits(rebound.get_nanbox_u64()),
+        crate::closure::JsThis::from_f64(this_value),
+        args.as_ptr(),
+        args.len(),
+    ))
+}
+
 #[cfg(test)]
 mod undefined_fallback_tests {
     //! Regression: a method call that falls through to a "no dispatcher →
@@ -2702,12 +2829,8 @@ mod receiver_repr_guard_tests {
             crate::value::TAG_UNDEFINED,
         );
         assert_eq!(
-            crate::object::field_get_set::js_object_get_field_ic_miss(
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-            )
-            .to_bits(),
+            crate::object::field_get_set::get_field_miss(std::ptr::null(), std::ptr::null())
+                .to_bits(),
             crate::value::TAG_UNDEFINED,
         );
 

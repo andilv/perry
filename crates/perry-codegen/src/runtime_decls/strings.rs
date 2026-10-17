@@ -120,6 +120,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_math_sign", DOUBLE, &[DOUBLE]);
     module.declare_function("js_math_imul", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_math_pow", DOUBLE, &[DOUBLE, DOUBLE]);
+    // Numeric `%` slow path: exact-integer operands within ±2^53 use an
+    // integer remainder, everything else is `fmod` (see expr/binary.rs).
+    module.declare_function("js_number_mod", DOUBLE, &[DOUBLE, DOUBLE]);
 
     // Math.* unary functions: use LLVM intrinsics directly so we
     // get hardware instructions / libm calls instead of depending
@@ -331,6 +334,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_set_string_string", I64, &[I64, I64, I64]);
     module.declare_function("js_map_set_number_key", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_map_get", DOUBLE, &[I64, DOUBLE]);
+    // Kind-typed twin (`perry-runtime` `entry_contracts`): a receiver the
+    // compiler constructed as a Map.
+    module.declare_function("js_map_get__Map", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_declared_map_get", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_map_get_string_key", DOUBLE, &[I64, I64]);
     module.declare_function("js_map_get_number_key", DOUBLE, &[I64, DOUBLE]);
@@ -372,7 +378,6 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_from_iterable", I64, &[DOUBLE]);
     module.declare_function("js_object_has_property", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_in_operator", DOUBLE, &[DOUBLE, DOUBLE]);
-    module.declare_function("js_in_operator_presence_ic", DOUBLE, &[DOUBLE, DOUBLE, PTR]);
     module.declare_function(
         "js_private_brand_check",
         DOUBLE,
@@ -639,6 +644,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_set_delete_f32", I32, &[I64, F32]);
     module.declare_function("js_set_delete_bool", I32, &[I64, I32]);
     module.declare_function("js_set_size", I32, &[I64]);
+    module.declare_function("js_set_size__Set", I32, &[I64]);
     // #2872: ES2024 Set composition methods.
     module.declare_function("js_set_union", I64, &[I64, DOUBLE]);
     module.declare_function("js_set_intersection", I64, &[I64, DOUBLE]);
@@ -653,7 +659,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // NaN-boxed JSValue (string / array / undefined).
     module.declare_function("js_string_to_locale_lower_case", I64, &[I64, DOUBLE]);
     module.declare_function("js_string_to_locale_upper_case", I64, &[I64, DOUBLE]);
-    module.declare_function("js_string_validate_collator_args", VOID, &[DOUBLE, DOUBLE]);
+    module.declare_function("js_string_resolve_collator_args", I32, &[DOUBLE, DOUBLE]);
     module.declare_function("js_string_trim", I64, &[I64]);
     module.declare_function("js_string_trim_start", I64, &[I64]);
     module.declare_function("js_string_trim_end", I64, &[I64]);
@@ -674,6 +680,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_string_fontcolor", I64, &[I64, I64]);
     module.declare_function("js_string_fontsize", I64, &[I64, I64]);
     module.declare_function("js_string_char_at", I64, &[I64, I32]);
+    // The runtime's 128 canonical one-character strings (image strings, each
+    // the agent's atom of its text): emitted `charAt` loads its result here.
+    module.add_external_global("PERRY_ASCII_CHARS", "[128 x ptr]");
     // #3987: `s[key]` canonical-index read — returns the char (NaN-boxed string)
     // for a valid array index, else NaN-boxed `undefined`. Takes the raw key.
     module.declare_function("js_string_index_get", DOUBLE, &[I64, DOUBLE]);
@@ -684,6 +693,10 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // #2787: NaN-safe JS index coercion (undefined/NaN -> 0, trunc, clamp) for
     // the char-access methods, replacing a raw `fptosi` that is UB on a NaN.
     module.declare_function("js_string_index_to_i32", I32, &[DOUBLE]);
+    module.declare_function("js_string_number_coerce", DOUBLE, &[DOUBLE]);
+    module.declare_function("js_string_number_index_to_i32", I32, &[DOUBLE]);
+    module.declare_function("js_string_number_end_index_to_i32", I32, &[DOUBLE, I32]);
+    module.declare_function("js_string_search_string_to_string", DOUBLE, &[DOUBLE]);
     // `end`-arg coercion for slice/substring: `undefined` -> `len` (not 0), else
     // ToIntegerOrInfinity. `(value, len) -> i32`.
     module.declare_function("js_string_end_index_to_i32", I32, &[DOUBLE, I32]);
@@ -707,16 +720,18 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[I64, I64, DOUBLE, DOUBLE],
     );
     module.declare_function(
-        "js_object_get_field_by_key_site",
+        "js_object_get_keyed_slow",
         DOUBLE,
-        &[PTR, I64, I64, DOUBLE, DOUBLE],
+        &[DOUBLE, DOUBLE, I64, I32],
     );
     module.declare_function("js_dyn_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
-    module.declare_function("js_dyn_index_get_site", DOUBLE, &[PTR, DOUBLE, DOUBLE]);
+    // PERRY_CHECK_CONTRACTS: the witness of the declared-kind element proof.
+    module.declare_function("js_typed_element_contract", I32, &[DOUBLE, I32, I64]);
+    // wpfacts slice 2: the contract witness of an elided field access.
     module.declare_function(
-        "js_region_holder_read",
+        "perry_wpfacts_check_field",
         I32,
-        &[PTR, DOUBLE, PTR, I32, PTR, I32],
+        &[DOUBLE, DOUBLE, I64, I64, I64, I32, I32, I32, I64],
     );
     // #8655: guarded packed-array / dense Array-subclass read before the
     // fully generic dynamic dispatcher. Used by unknown-receiver loop reads,
@@ -1223,11 +1238,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         I64,
         &[I64, I32, PTR, I32, I32, I32, I32, I64, PTR, I32],
     );
-    module.declare_function(
-        "js_object_alloc_constfn_static",
-        I64,
-        &[I32, PTR, I32, I32, I32, I32, I64, PTR, I32, PTR],
-    );
+    module.declare_function("perry_alloc_layout", PTR, &[PTR]);
+    module.declare_function("perry_create_family", DOUBLE, &[PTR, DOUBLE]);
+    module.declare_function("perry_bind_family_prototype", VOID, &[PTR, DOUBLE]);
+    // `PERRY_CHECK_CONTRACTS` builds only.
+    module.declare_function("js_create_family_contract_check", VOID, &[PTR, DOUBLE]);
     module.declare_function("js_shape_seed_plain", I32, &[I32, PTR, I32, I32, I32, I64]);
     module.declare_function("js_shape_register_static_seed", VOID, &[PTR]);
     module.declare_function("js_shape_run_static_seed", VOID, &[]);
@@ -1243,6 +1258,12 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Field offsets are load-bearing — keep `#[repr(C)] InlineArenaState`
     // in sync with the GEPs we emit in `lower_call::compile_new`.
     module.declare_function("js_inline_arena_state", PTR, &[]);
+    module.add_external_tls_global(
+        "PERRY_INLINE_ARENA_STATE",
+        "{ ptr, i64, i64, ptr, ptr }",
+        "initialexec",
+    );
+    module.declare_function(crate::function::TLS_ADDRESS_INTRINSIC, PTR, &[PTR]);
     module.declare_function("js_inline_arena_slow_alloc", PTR, &[PTR, I64, I64]);
     module.declare_function("js_gc_note_black_birth", VOID, &[PTR, PTR]);
     module.declare_function("js_object_delete_field", I32, &[I64, I64]);
@@ -1313,6 +1334,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[I64, DOUBLE, DOUBLE, I32],
     );
     module.declare_function("js_map_size", I32, &[I64]);
+    module.declare_function("js_map_size__Map", I32, &[I64]);
     module.declare_function("js_map_clear", VOID, &[I64]);
     module.declare_function("js_set_clear", VOID, &[I64]);
     // Map iteration: entries/keys/values all take a map pointer and return an array pointer.
@@ -1635,6 +1657,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[DOUBLE, DOUBLE, PTR, I64, PTR],
     );
     module.declare_function("js_function_ctor_from_strings", DOUBLE, &[PTR, I64]);
+    module.declare_function("js_eval_in_scope", DOUBLE, &[DOUBLE; 6]);
     // `new <callee>(...spread)` — codegen folds every argument (regular +
     // spread-expanded) into one JS array and hands it here; the runtime
     // materialises a flat buffer and forwards to `js_new_function_construct`.

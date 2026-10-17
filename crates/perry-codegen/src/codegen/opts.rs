@@ -578,6 +578,19 @@ pub struct CompileOptions {
     /// Part of the object-cache key. Default (empty) when the driver ran no
     /// pre-pass.
     pub program_class_shape_ids: super::ProgramClassShapeIds,
+    /// wpfacts: this module's view of the whole-program invariance facts
+    /// (digest for the object-cache key; contract-build claims section).
+    /// Default (zero digest, no section) when the pass did not run.
+    pub program_facts: super::ProgramFactsView,
+    /// Object model step 2 (case 2c): the program's static class families
+    /// and key colouring (`layout_families`), the same value for every
+    /// module; its digest is in the object-cache key.
+    pub program_layouts: std::sync::Arc<crate::layout_families::ProgramLayouts>,
+    /// The runtime call-effect table this compilation lowers under: which
+    /// runtime calls can collect or unwind. One value per compilation, shared
+    /// by every module; its digest is in the object-cache key. Default: the
+    /// committed per-target tables ([`crate::GcEffects::from_committed`]).
+    pub gc_effects: std::sync::Arc<crate::GcEffects>,
 }
 
 /// Issue #100: one entry in a module's namespace-population list.
@@ -904,6 +917,16 @@ impl ImportedCtor {
 /// adding five more individual parameters to every compile_* function.
 /// Built once in `compile_module` from `CompileOptions`.
 pub(crate) struct CrossModuleCtx {
+    /// wpfacts slice 2: the elision facts of this module
+    /// (`CompileOptions::program_facts`).
+    pub wpfacts: std::sync::Arc<super::ElisionFacts>,
+    /// Closed World 5d: per closure, the types of the locals it captures
+    /// from the bodies around it (`collectors::typed_locals::capture_proofs`).
+    pub capture_type_proofs:
+        std::collections::HashMap<u32, std::collections::HashMap<u32, perry_hir::types::Type>>,
+    /// Case 2c: the program's families and colouring
+    /// (`CompileOptions::program_layouts`).
+    pub program_layouts: std::sync::Arc<crate::layout_families::ProgramLayouts>,
     pub program_has_worker: bool,
     pub program_has_thread_agents: bool,
     /// The class and method tables inverted (`class_hierarchy`). Set once
@@ -1296,6 +1319,9 @@ pub(crate) struct CrossModuleCtx {
     /// Untyped string accumulators, module-wide
     /// (`collectors::string_accumulator_locals`).
     pub string_accumulator_locals: std::collections::HashSet<u32>,
+    /// Bindings assigned before any reader can run
+    /// (`collectors::definite_init`), module-wide.
+    pub definite_init: crate::collectors::DefiniteInit,
     /// Debug/benchmark switch that forces Buffer/Uint8Array accesses through
     /// the generic helper path.
     pub disable_buffer_fast_path: bool,

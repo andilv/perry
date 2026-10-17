@@ -54,10 +54,13 @@ pub(super) fn region_handle(ctx: &mut FnCtx<'_>, r: Recv) -> Result<String> {
 /// block created before `b0` — conservative, never wrong.
 pub(super) fn nothing_collects_since(ctx: &FnCtx<'_>, b0: usize, i0: usize) -> bool {
     let blocks = ctx.func.blocks();
+    let gc = ctx.func.gc_effects();
     let cur = ctx.current_block;
     let tail = |b: usize, from: usize| {
         let insts = blocks[b].insts();
-        insts[from.min(insts.len())..].iter().any(inst_may_collect)
+        insts[from.min(insts.len())..]
+            .iter()
+            .any(|inst| inst_may_collect(&gc, inst))
     };
     if cur == b0 {
         return !tail(b0, i0);
@@ -107,13 +110,19 @@ pub(super) fn nothing_collects_since(ctx: &FnCtx<'_>, b0: usize, i0: usize) -> b
 }
 
 /// Can this instruction run a collection (and so move the receiver)?
-pub(super) fn inst_may_collect(inst: &crate::inst::LlInst) -> bool {
-    use crate::gc_call_effects::{classify_direct_callee, GcCallEffect};
+pub(super) fn inst_may_collect(
+    gc: &crate::gc_call_effects::GcEffects,
+    inst: &crate::inst::LlInst,
+) -> bool {
+    use crate::gc_call_effects::GcCallEffect;
     use crate::inst::LlInst;
     let named = |callee: &str| -> bool {
         !(callee.starts_with("llvm.")
             || callee == "js_recv_route_note"
-            || matches!(classify_direct_callee(callee), GcCallEffect::CannotCollect)
+            || matches!(
+                gc.classify_direct_callee(callee),
+                GcCallEffect::CannotCollect
+            )
             || crate::root_reload::is_non_collecting(callee))
     };
     match inst {
@@ -324,6 +333,14 @@ pub(crate) fn try_lower_bare_put(
     Ok(Some(val_double))
 }
 
+/// A fact-tree `.length` leaf over an already-loaded value: a string's UTF-16
+/// length (the same two inline arms as `expr::string_length`) or a live plain
+/// Array's length word (the compact header guard of the record length read),
+/// both data that reading runs no JS for. Any other value yields NaN, which
+/// fails the tree's fold check so the generic arm reads `.length` with
+/// ordinary property semantics. No calls, so no JS has run when the fold is
+/// rejected.
+
 /// `region_read_run`'s hook inside an F-body: a planned fact tree.
 pub(crate) fn try_lower_fact_add_tree(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<Option<String>> {
     let Some(a) = ctx.region_loop_facts.last() else {
@@ -369,8 +386,9 @@ pub(crate) fn try_lower_fact_add_tree(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<O
     }
     let h = region_handle(ctx, r)?;
     for (i, l) in all.iter().enumerate() {
-        if let Expr::PropertyGet { property, .. } = l {
-            let slot = active_slot(ctx, l, r, property).expect("planned with its tree");
+        let read = *l;
+        if let Expr::PropertyGet { property, .. } = read {
+            let slot = active_slot(ctx, read, r, property).expect("planned with its tree");
             let p = bare_read_ptr(ctx, &h, &slot);
             note_emitted(ctx);
             values[i] = Some(ctx.block().load(DOUBLE, &p));
@@ -425,9 +443,6 @@ pub(crate) fn try_lower_fact_add_tree(ctx: &mut FnCtx<'_>, e: &Expr) -> Result<O
         emitted: Vec::new(),
         handles: Vec::new(),
         spill: false,
-        arrays: Vec::new(),
-        emitted_arr: Vec::new(),
-        view_index: HashSet::new(),
         dirty_after: HashSet::new(),
     });
     let slow = lower_expr(ctx, e);

@@ -73,16 +73,7 @@ fn is_registered_collection(addr: usize, obj_type: u8) -> bool {
 /// aligned address in the platform heap range, including unmapped addresses.
 #[inline(always)]
 fn raw_i64_receiver_is_managed(addr: usize) -> bool {
-    if !matches!(
-        crate::arena::classify_heap_space(addr),
-        crate::arena::HeapSpace::Unknown
-    ) {
-        return true;
-    }
-    addr.checked_sub(crate::gc::GC_HEADER_SIZE)
-        .is_some_and(|header| {
-            crate::gc::gc_malloc_header_is_tracked(header as *const crate::gc::GcHeader)
-        })
+    unsafe { crate::value::addr_class::try_read_tracked_gc_header(addr) }.is_some()
 }
 
 fn finite_nonnegative_i32_index(index: f64) -> Option<i32> {
@@ -204,6 +195,16 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
         return unsafe { crate::symbol::js_object_get_symbol_property(value, index) };
     }
     if jsval.is_pointer() && JSValue::from_bits(index.to_bits()).is_any_string() {
+        // An object with an overflow answers an own key with one atom-keyed
+        // hit (§3.4); anything else takes the complete Get below.
+        if let Some(value) = unsafe {
+            crate::object::overflow::own_get_key(
+                (bits & POINTER_MASK) as *const crate::object::ObjectHeader,
+                index.to_bits(),
+            )
+        } {
+            return f64::from_bits(value.bits());
+        }
         let mut scratch = [0; crate::value::SHORT_STRING_MAX_LEN];
         if let Some(bytes) = unsafe {
             crate::string::js_string_key_bytes(JSValue::from_bits(index.to_bits()), &mut scratch)
@@ -266,8 +267,8 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     // address is *in range*, so it was dereferenced as an `ObjectHeader` →
     // garbage/crash. Drop the heuristic: a non-pointer receiver is a number and
     // its indexed read is `undefined` on every platform (#63/#321 denormal-safe).
-    let raw_ptr = if jsval.is_pointer() {
-        (bits & POINTER_MASK) as usize
+    let raw_ptr = if jsval.is_reference() {
+        jsval.reference_payload()
     } else {
         return f64::from_bits(TAG_UNDEFINED);
     };
@@ -372,6 +373,18 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
     // before either thread-local registry/hash probe. The registry remains the
     // authority for a matching tag; the tag only selects which one to ask.
     let receiver_tag = receiver_gc_tag(raw_ptr);
+    // A Proxy's [[Get]] is its `get` trap with ToPropertyKey(key): `p[39756]`
+    // passes "39756". Below, a numeric key would take the element path and
+    // read a word past the Proxy cell (React Flight's client-reference lookup
+    // `bundlerConfig[id]` with a numeric module id read 0, so Next.js's
+    // dynamic pages failed with "Could not find the module").
+    if receiver_tag.is_some_and(|(obj_type, _)| obj_type == crate::gc::GC_TYPE_PROXY) {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let receiver = scope.root_nanbox_f64(value);
+        // SAFETY: a NaN-boxed key; ToPropertyKey may run user code.
+        let key = scope.root_nanbox_f64(unsafe { crate::object::js_to_property_key(index) });
+        return crate::proxy::js_proxy_get(receiver.get_nanbox_f64(), key.get_nanbox_f64());
+    }
     if receiver_tag.is_some_and(|(obj_type, _)| is_registered_collection(raw_ptr, obj_type)) {
         let Some(index) = finite_nonnegative_u32_index(index) else {
             return f64::from_bits(TAG_UNDEFINED);
@@ -502,7 +515,7 @@ pub extern "C" fn js_dyn_index_get(value: f64, index: f64) -> f64 {
             let header = unsafe {
                 &*((arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)
             };
-            if header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0
+            if crate::array::array_has_element_descriptors(arr)
                 || crate::array::array_index_fast_path_invalid_for(header._reserved)
             {
                 return crate::array::js_array_get_f64(arr, idx_i32 as u32);
@@ -686,6 +699,13 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
         }
         return value;
     }
+    // A native handle is an object with no indexed storage and no header:
+    // every computed write is the ordinary receiver-aware [[Set]], which owns
+    // key coercion and the handle's property dispatch (#12540). The probes
+    // below are all for GC-headed or allocator-owned receivers.
+    if jsval.is_handle() {
+        return crate::proxy::js_put_value_set(obj, index, value, obj, strict);
+    }
     let raw_ptr = if jsval.is_pointer() {
         (bits & POINTER_MASK) as usize
     } else if !obj.is_nan()
@@ -714,10 +734,13 @@ pub extern "C" fn js_dyn_index_set_strict(obj: f64, index: f64, value: f64, stri
         // A lazy JSON array must become its ordinary array before [[Set]].
         // Use the tracked probe here: buffer/view receivers have not yet been
         // dispatched and do not necessarily have a GC header before their data.
-        let is_lazy = unsafe {
-            crate::value::addr_class::try_read_tracked_gc_header(raw_ptr)
-                .is_some_and(|h| h.as_ref().obj_type == crate::gc::GC_TYPE_LAZY_ARRAY)
+        let receiver_bits = if jsval.is_pointer() {
+            bits
+        } else {
+            raw_ptr as u64
         };
+        let is_lazy = crate::value::addr_class::tracked_header_of_bits(receiver_bits)
+            .is_some_and(|h| unsafe { h.as_ref() }.obj_type == crate::gc::GC_TYPE_LAZY_ARRAY);
         if is_lazy {
             return unsafe {
                 crate::json_tape::set_lazy_index(raw_ptr as *mut _, index, value, strict)

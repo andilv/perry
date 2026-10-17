@@ -37,6 +37,7 @@ where
         | Expr::PodLayoutAlignOf { .. }
         | Expr::PodLayoutOffsetOf { .. }
         | Expr::NewTarget
+        | Expr::ClassMethodHome { .. }
         | Expr::ClassRef(_)
         | Expr::This
         | Expr::SuperPropertyGet { .. }
@@ -48,6 +49,7 @@ where
         | Expr::EnvGet(_)
         | Expr::ProcessEnv
         | Expr::GlobalThisExpr
+        | Expr::NamespacePatched(_)
         | Expr::ModuleTopThis
         | Expr::ProcessUptime
         | Expr::ProcessCwd
@@ -1641,6 +1643,7 @@ where
             method: _,
             receiver,
             args,
+            ..
         } => {
             f(receiver);
             for a in args {

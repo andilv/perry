@@ -95,9 +95,7 @@
 //! site of its own. That is what keeps the invalidation matrix small enough
 //! to enumerate.
 
-use super::header::{
-    array_elements_ptr, array_gc_header, array_object_flags, clean_arr_ptr, clean_arr_ptr_mut,
-};
+use super::header::{array_elements_ptr, array_gc_header, clean_arr_ptr, clean_arr_ptr_mut};
 use super::ArrayHeader;
 use crate::gc::GC_ARRAY_ELEMENT_SHAPE;
 use std::cell::RefCell;
@@ -289,7 +287,7 @@ fn element_identity_of_bits(value_bits: u64) -> Option<(u32, u32)> {
             return None;
         }
         let obj = addr as *const crate::object::ObjectHeader;
-        let shape_id = (*obj).parent_class_id;
+        let shape_id = (*obj).shape_word();
         if !crate::object::shapes::shape_descriptor_by_id(shape_id)
             .is_some_and(|shape| shape.object_kind.is_ordinary_layout())
         {
@@ -339,7 +337,7 @@ fn element_matches_record(value_bits: u64, record: ElementShapeRecord) -> bool {
         if (*obj).class_id != record.class_id {
             return false;
         }
-        if (*obj).parent_class_id == record.ordinary_shape_id {
+        if (*obj).shape_word() == record.ordinary_shape_id {
             #[cfg(test)]
             EXACT_SHAPE_STORE_HITS.with(|hits| hits.set(hits.get().wrapping_add(1)));
             return true;
@@ -380,7 +378,7 @@ fn element_matches_record(value_bits: u64, record: ElementShapeRecord) -> bool {
 unsafe fn element_identity_of_validated_object(
     obj: *const crate::object::ObjectHeader,
 ) -> Option<(u32, u32)> {
-    let shape_id = (*obj).parent_class_id;
+    let shape_id = (*obj).shape_word();
     if !crate::object::shapes::shape_object_kind_by_id(shape_id)
         .is_some_and(|kind| kind.is_ordinary_layout())
     {
@@ -408,10 +406,10 @@ unsafe fn clear_bit(header: *mut crate::gc::GcHeader) {
 /// An array carrying per-index descriptors (accessors, custom attrs) can
 /// hand back a value its element slot does not hold, so no element proof is
 /// admissible — the same stand-down the raw-f64 element accessors make on
-/// `OBJ_FLAG_ARRAY_DESCRIPTORS`.
+/// an element descriptor in the array's layout.
 #[inline]
 unsafe fn array_admits_element_proof(arr: *const ArrayHeader) -> bool {
-    array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+    !super::array_has_element_descriptors(arr)
 }
 
 #[inline]

@@ -713,6 +713,7 @@ fn test_promise_combinator_setup_handles_survive_copied_minor_gc() {
     activate_malloc_registry_for_tests();
     register_runtime_handle_root_scanner_for_tests();
     gc_register_mutable_root_scanner(promise_mutable_root_scanner);
+    crate::gc::register_realm_prototype_scanners_for_tests();
 
     let scope = RuntimeHandleScope::new();
     let all_value = test_string_value(b"all");
@@ -790,7 +791,6 @@ fn test_promise_contexts_rekey_live_and_drop_dead_from_space_after_copied_minor(
     let live_original = live as usize;
     let live_handle = scope.root_raw_mut_ptr(live);
     let dead = crate::promise::js_promise_new();
-    let dead_original = dead as usize;
     crate::promise::test_seed_promise_context(live, 0.0);
     crate::promise::test_seed_promise_context(dead, 0.0);
 
@@ -799,10 +799,15 @@ fn test_promise_contexts_rekey_live_and_drop_dead_from_space_after_copied_minor(
     assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     let live_after = live_handle.get_raw_mut_ptr::<crate::promise::Promise>() as usize;
     assert_ne!(live_after, live_original);
-    let keys = crate::promise::test_promise_context_keys();
-    assert!(keys.contains(&live_after));
-    assert!(!keys.contains(&live_original));
-    assert!(!keys.contains(&dead_original));
+    assert!(
+        !unsafe { (*(live_after as *const crate::promise::Promise)).callback_context }.is_null()
+    );
+    assert_eq!(
+        crate::async_context::test_snapshot_first_store(&crate::promise::context_for_promise(
+            live_after as *mut crate::promise::Promise
+        )),
+        Some(0.0)
+    );
     crate::promise::test_clear_promise_scanner_roots();
 }
 
@@ -1289,7 +1294,6 @@ fn assert_moved_closure_ptr(bits: u64, original: usize) -> usize {
 fn test_gc_init_mutable_scanner_families_rewrite_runtime_slots() {
     let _async_hook_guard = AsyncHookRuntimeTestGuard::new();
     let _guard = CopyingNurseryTestGuard::new(0);
-    crate::set::test_clear_set_roots();
     let _callback_guard = RuntimeCallbackRootGuard::new();
     let fixture = ForwardedRootFixture::new();
     let active_context_payload = crate::async_context::AsyncLocalStoragePayload::default();
@@ -1333,7 +1337,6 @@ fn test_gc_init_mutable_scanner_families_rewrite_runtime_slots() {
     crate::object::test_seed_transition_cache_root(fixture.nursery_addr());
     crate::object::test_seed_object_cache_roots([fixture.nursery_bits; 7], fixture.nursery_i64());
 
-    crate::object::test_seed_function_class_id_key(fixture.nursery_bits, 0x8200_5501);
     crate::json::test_seed_parse_roots(
         fixture.nursery_value(),
         fixture.nursery_user as *const crate::string::StringHeader,
@@ -1422,8 +1425,6 @@ fn test_gc_init_mutable_scanner_families_rewrite_runtime_slots() {
     assert_eq!(promise.async_step_callback_ptr, fixture.old_addr());
     assert_eq!(promise.async_step_next_ptr, fixture.old_addr());
     assert_eq!(promise.async_step_value_bits, fixture.old_bits);
-    assert_eq!(promise.promise_context_key, fixture.old_addr());
-    assert_eq!(promise.promise_context_store_bits, fixture.old_bits);
     assert_eq!(
         promise.previous_microtask_context_store_bits,
         fixture.old_bits
@@ -1476,10 +1477,6 @@ fn test_gc_init_mutable_scanner_families_rewrite_runtime_slots() {
         ([fixture.old_bits; 7], fixture.old_addr() as i64)
     );
 
-    assert_eq!(
-        crate::object::test_function_class_id_key_for_class(0x8200_5501),
-        fixture.old_bits
-    );
     assert_eq!(
         crate::json::test_parse_roots_snapshot(),
         (fixture.old_bits, fixture.old_addr())
@@ -1569,7 +1566,6 @@ fn test_gc_init_mutable_scanner_families_rewrite_runtime_slots() {
     crate::async_context::clear_store(active_context_handle);
     crate::object::test_clear_transition_cache_root();
     crate::object::test_clear_object_cache_roots();
-    crate::set::test_clear_set_roots();
     crate::string::test_clear_small_int_cache_root(7);
     crate::builtins::test_set_console_log_singleton(0);
     crate::async_hooks::reset_for_tests();

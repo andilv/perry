@@ -2,6 +2,29 @@
 
 use super::*;
 
+#[test]
+fn descriptor_holder_probe_rejects_a_spoofed_native_box_header() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    unsafe {
+        let mut words = Box::new([0u64; 16]);
+        words[0] = crate::gc::GC_TYPE_OBJECT as u64 | ((16 * 8) << 32);
+        let owner = &words[1] as *const u64 as usize;
+
+        assert_eq!(
+            crate::value::addr_class::try_read_gc_header(owner).map(|h| h.obj_type),
+            Some(crate::gc::GC_TYPE_OBJECT),
+            "fixture must fool the magnitude-only reader"
+        );
+        assert!(crate::value::addr_class::try_read_tracked_gc_header(owner).is_none());
+        assert!(!attrs_live_in_keys(owner));
+        assert!(!attrs_live_in_keys_for_install(owner));
+
+        let object = crate::object::js_object_alloc(0, 1);
+        assert!(attrs_live_in_keys(object as usize));
+        assert!(attrs_live_in_keys_for_install(object as usize));
+    }
+}
+
 unsafe fn list_with_entries(entries: &[u8]) -> *mut ArrayHeader {
     let keys = alloc_key_list(entries.len() as u32, true, true);
     let attrs = keys_attrs(keys);
@@ -146,7 +169,7 @@ fn a_dictionary_delete_shifts_the_attributes_with_the_keys() {
             crate::object::js_object_set_field_by_name(obj, key(&format!("dk{i}")), i as f64);
         }
         assert!(
-            crate::object::dictionary::latch_object_to_dictionary(obj),
+            crate::object::overflow::establish_order(obj),
             "premise: the receiver latches to dictionary mode"
         );
         crate::object::set_property_attrs(
@@ -155,7 +178,7 @@ fn a_dictionary_delete_shifts_the_attributes_with_the_keys() {
             crate::object::PropertyAttrs::new(false, true, true),
         );
         assert!(
-            crate::object::dictionary::is_dictionary(obj),
+            crate::object::overflow::has_overflow(obj),
             "premise: still a dictionary"
         );
         crate::object::js_object_delete_field(obj, key("dk1"));
@@ -238,4 +261,22 @@ fn attributed_rekey_keeps_reserved_inline_capacity() {
             crate::JSValue::undefined().bits()
         );
     }
+}
+
+/// #12513: the owner's tagged word answers from its honest header, its raw
+/// address through the allocator proof, and both agree on a real object
+/// (the spoofed native prefix is pinned by
+/// `descriptor_holder_probe_rejects_a_spoofed_native_box_header`).
+#[test]
+fn an_object_owner_answers_as_its_tagged_word_and_its_raw_address() {
+    let _lock = crate::gc::global_side_table_test_lock();
+    let obj = crate::object::js_object_alloc(0, 2);
+    let value = crate::value::js_nanbox_pointer(obj as i64);
+    assert!(attrs_live_in_keys_of_bits(value.to_bits()));
+    assert!(unsafe { attrs_live_in_keys(obj as usize) });
+    let array = crate::array::js_array_alloc(2);
+    assert!(!attrs_live_in_keys_of_bits(
+        crate::value::js_nanbox_pointer(array as i64).to_bits()
+    ));
+    assert!(!unsafe { attrs_live_in_keys(array as usize) });
 }

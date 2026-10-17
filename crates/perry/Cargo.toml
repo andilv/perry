@@ -41,6 +41,7 @@ perry-transform.workspace = true
 # silently ignored when inheriting via `workspace = true`.
 # Re-apply this edge after upstream syncs if it conflicts away.
 perry-codegen = { path = "../perry-codegen", default-features = false }
+perry-wpfacts.workspace = true
 perry-runtime.workspace = true
 perry-diagnostics.workspace = true
 perry-updater.workspace = true

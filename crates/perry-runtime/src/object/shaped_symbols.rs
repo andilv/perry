@@ -5,7 +5,9 @@ use super::*;
 pub(crate) const PRIVATE_ENTRY: u8 = 0x40;
 
 pub(crate) unsafe fn owner(addr: usize) -> Option<*mut ObjectHeader> {
-    let bag = if crate::value::addr_class::try_read_tracked_gc_header(addr).is_some() {
+    let bag = if crate::value::addr_class::is_proxy_cell(addr) {
+        crate::proxy::property_bag(addr)
+    } else if crate::value::addr_class::try_read_tracked_gc_header(addr).is_some() {
         descriptor_state::descriptor_holder(addr)
     } else {
         super::handle_expando::handle_property_bag(addr as i64)
@@ -14,7 +16,11 @@ pub(crate) unsafe fn owner(addr: usize) -> Option<*mut ObjectHeader> {
 }
 
 pub(crate) unsafe fn position(obj: *const ObjectHeader, symbol: usize) -> Option<u32> {
-    let keys = object_keys(obj);
+    position_in(object_keys(obj), symbol)
+}
+
+/// [`position`] in the receiver's already resolved `keys`.
+pub(crate) unsafe fn position_in(keys: ObjectKeys, symbol: usize) -> Option<u32> {
     let bits = crate::value::POINTER_TAG | symbol as u64;
     let (slots, count) = keys.dense_slots();
     (0..count)
@@ -24,8 +30,10 @@ pub(crate) unsafe fn position(obj: *const ObjectHeader, symbol: usize) -> Option
 
 pub(crate) unsafe fn get(addr: usize, symbol: usize) -> Option<u64> {
     let obj = owner(addr)?;
-    let index = position(obj, symbol)?;
-    Some(js_object_get_field(obj, index).bits())
+    let (keys, live) = object_keys_and_live_slot_count(obj);
+    let index = position_in(keys, symbol)?;
+    let value = object_key_field_at_with_keys(obj, keys.arr(), index, live).bits();
+    (value != crate::value::TAG_HOLE).then_some(value)
 }
 
 /// Root all operands while publishing the shared layout and growing storage.
@@ -44,12 +52,32 @@ pub(crate) unsafe fn define(addr: usize, symbol: usize, bits: u64, entry: u8) ->
     let symbol = scope.root_nanbox_u64(crate::value::POINTER_TAG | symbol as u64);
     let value = scope.root_nanbox_u64(bits);
     obj.with_mut_ptr::<ObjectHeader, _>(|current| {
-        let existing = position(
-            current,
+        // Once the object has an overflow it is the order authority: a new
+        // symbol key is an entry there, after every key created before it.
+        // A symbol the layout names keeps meeting its fixed slot (§3.3), also
+        // when it is defined again after a delete.
+        if super::overflow::has_overflow(current) {
+            super::overflow::reattach_fixed(current, symbol.get_nanbox_u64());
+            super::overflow::insert_key_bits(
+                current,
+                symbol.get_nanbox_u64(),
+                value.get_nanbox_u64(),
+                entry,
+            );
+            return true;
+        }
+        // Otherwise a symbol key is a key of the object's layout, as a
+        // defined string key is: builtin prototypes keep their symbol
+        // methods in fixed slots that method sites and shape proofs read.
+        let keys = object_keys(current);
+        let existing = position_in(
+            keys,
             (symbol.get_nanbox_u64() & crate::value::POINTER_MASK) as usize,
         );
+        // An existing key keeps its storage slot; an added key's slot is its
+        // position (`key_attrs::SUMMARY_SLOTS`).
         let index = if let Some(index) = existing {
-            index
+            keys.storage_slot(index)
         } else {
             // Reserved native-layout fields precede dynamic keys just as they do
             // on the string-property append path.
@@ -82,7 +110,7 @@ pub(crate) unsafe fn define(addr: usize, symbol: usize, bits: u64, entry: u8) ->
             index
         };
         let live = object_live_slot_count(current);
-        if index < live.max(INLINE_SLOT_FLOOR as u32) {
+        if index < object_inline_capacity(current) {
             if index >= live {
                 set_object_live_slot_count(current, index + 1);
             }
@@ -96,7 +124,6 @@ pub(crate) unsafe fn define(addr: usize, symbol: usize, bits: u64, entry: u8) ->
             (symbol.get_nanbox_u64() & crate::value::POINTER_MASK) as usize,
             entry,
         );
-        crate::symbol::symbol_property_ic_epoch_bump();
         true
     })
 }
@@ -105,7 +132,7 @@ pub(crate) unsafe fn entries(addr: usize, include_private: bool) -> Vec<(usize, 
     let Some(obj) = owner(addr) else {
         return Vec::new();
     };
-    let keys = object_keys(obj);
+    let (keys, live) = object_keys_and_live_slot_count(obj);
     let (slots, count) = keys.dense_slots();
     let mut result = Vec::new();
     for i in 0..count {
@@ -118,15 +145,22 @@ pub(crate) unsafe fn entries(addr: usize, include_private: bool) -> Vec<(usize, 
         }
         let symbol = (key.bits() & crate::value::POINTER_MASK) as usize;
         // A non-string key in this shape is an actual Symbol, never an encoded name.
-        result.push((symbol, js_object_get_field(obj, i as u32).bits()));
+        let value = object_key_field_at_with_keys(obj, keys.arr(), i as u32, live).bits();
+        if value != crate::value::TAG_HOLE {
+            result.push((symbol, value));
+        }
     }
     result
 }
 
 pub(crate) unsafe fn entry(addr: usize, symbol: usize) -> Option<u8> {
     let obj = owner(addr)?;
-    let pos = position(obj, symbol)?;
-    Some(key_attrs::keys_entry(object_keys(obj).arr(), pos))
+    let (keys, live) = object_keys_and_live_slot_count(obj);
+    let pos = position_in(keys, symbol)?;
+    if object_key_field_at_with_keys(obj, keys.arr(), pos, live).bits() == crate::value::TAG_HOLE {
+        return None;
+    }
+    Some(key_attrs::keys_entry(keys.arr(), pos))
 }
 
 pub(crate) unsafe fn set_entry(addr: usize, symbol: usize, entry: u8) {
@@ -137,6 +171,11 @@ pub(crate) unsafe fn set_entry(addr: usize, symbol: usize, entry: u8) {
     let Some(pos) = position(obj, symbol) else {
         return;
     };
+    let table = super::overflow::table(obj);
+    if !table.is_null() {
+        super::overflow::set_entry_attrs(obj as *mut ObjectHeader, table, pos, entry);
+        return;
+    }
     let _no_move = crate::gc::GcSuppressScope::new();
     let keys = object_keys(obj);
     if key_attrs::keys_entry(keys.arr(), pos) == entry {
@@ -157,24 +196,14 @@ pub(crate) unsafe fn set_entry(addr: usize, symbol: usize, entry: u8) {
         set_object_keys(obj, ObjectKeys::owned(next));
         shapes::transition_object_shape_semantics(obj);
     }
-    crate::symbol::symbol_property_ic_epoch_bump();
 }
 
 pub(crate) unsafe fn accessor(addr: usize, symbol: usize) -> Option<(u64, u64)> {
     if entry(addr, symbol)? & key_attrs::ENTRY_ACCESSOR == 0 {
         return None;
     }
-    let pair =
-        (get(addr, symbol)? & crate::value::POINTER_MASK) as *const crate::array::ArrayHeader;
-    let bits = |i| {
-        let bits = crate::array::js_array_get(pair, i).bits();
-        if bits == crate::value::TAG_UNDEFINED {
-            0
-        } else {
-            bits
-        }
-    };
-    Some((bits(0), bits(1)))
+    let acc = accessor_pair::pair_of_value(get(addr, symbol)?).unwrap_or_default();
+    Some((acc.get, acc.set))
 }
 
 pub(crate) unsafe fn define_accessor(addr: usize, symbol: usize, get: u64, set: u64) -> bool {
@@ -198,15 +227,14 @@ pub(crate) unsafe fn define_accessor(addr: usize, symbol: usize, get: u64, set: 
     } else {
         set
     });
-    let pair = scope.root_raw_mut_ptr(crate::array::js_array_alloc(2));
-    let next = pair.with_mut_ptr(|ptr| {
-        crate::array::js_array_push(ptr, JSValue::from_bits(get.get_nanbox_u64()))
-    });
-    pair.set_raw_mut_ptr(next);
-    let next = pair.with_mut_ptr(|ptr| {
-        crate::array::js_array_push(ptr, JSValue::from_bits(set.get_nanbox_u64()))
-    });
-    pair.set_raw_mut_ptr(next);
+    // String and Symbol accessor entries own the same private pair. Its
+    // closure words are initialized once, rather than pushed through the
+    // public array API and later read as observable array properties.
+    let pair = scope.root_raw_mut_ptr(accessor_pair::pair_new(accessor_pair::Accessor {
+        get: get.get_nanbox_u64(),
+        set: set.get_nanbox_u64(),
+        ..Default::default()
+    }));
     obj.with_mut_ptr::<ObjectHeader, _>(|ptr| {
         let addr = ptr as usize;
         let symbol = (symbol.get_nanbox_u64() & crate::value::POINTER_MASK) as usize;
@@ -240,43 +268,40 @@ pub(crate) unsafe fn delete(addr: usize, symbol: usize) -> bool {
     let Some(obj) = owner(addr) else {
         return false;
     };
-    let Some(pos) = position(obj, symbol) else {
-        return true;
-    };
-    let _no_move = crate::gc::GcSuppressScope::new();
-    let keys = object_keys(obj);
-    let count = keys.count();
-    let mut next = crate::array::js_array_alloc(count.saturating_sub(1));
-    let (slots, _) = keys.dense_slots();
-    for i in 0..count {
-        if i == pos {
-            continue;
+    // Array.prototype's @@iterator is a fixed slot that array iteration
+    // reads (object model step 7): while the object has no overflow, a delete
+    // leaves the layout key and holes that slot, so a redefine refills it.
+    // Deleting an absent key changes nothing, so it establishes no overflow.
+    if !super::overflow::has_overflow(obj) {
+        let Some(pos) = position(obj, symbol) else {
+            return true;
+        };
+        // A refused delete changes nothing either.
+        if key_attrs::keys_entry(object_keys(obj).arr(), pos) & key_attrs::ENTRY_NON_CONFIGURABLE
+            != 0
+        {
+            return false;
         }
-        let index = if i < pos { i } else { i - 1 };
-        next = crate::array::js_array_push(
-            next,
-            JSValue::from_bits((*slots.add(i as usize)).to_bits()),
-        );
-        next = key_attrs::owned_note_append(next, index, key_attrs::keys_entry(keys.arr(), i));
-        if i > pos {
-            let value = js_object_get_field(obj, i);
-            store(obj, index, value.bits());
+        let pos = object_keys(obj).storage_slot(pos);
+        if pos == crate::object::runtime_layouts::ARRAY_PROTOTYPE_ITERATOR_SLOT
+            && crate::value::addr_class::try_read_tracked_gc_header(addr)
+                .is_some_and(|header| header.as_ref().obj_type == crate::gc::GC_TYPE_ARRAY)
+        {
+            let _no_move = crate::gc::GcSuppressScope::new();
+            set_entry(addr, symbol, 0);
+            store(obj, pos, crate::value::TAG_HOLE);
+            return true;
         }
     }
-    store(obj, count - 1, crate::value::TAG_UNDEFINED);
-    let next = if let Some(proof) = canonical_keys::SharedLayout::of_receiver(obj) {
-        canonical_keys::canonicalize(&proof, next, count - 1).view()
-    } else {
-        ObjectKeys::owned(next)
-    };
-    set_object_keys(obj, next);
-    crate::symbol::symbol_property_ic_epoch_bump();
+    if !super::overflow::delete_key_bits(obj, crate::value::POINTER_TAG | symbol as u64) {
+        return false;
+    }
     true
 }
 
 unsafe fn store(obj: *mut ObjectHeader, index: u32, bits: u64) {
     let live = object_live_slot_count(obj);
-    if index < live.max(INLINE_SLOT_FLOOR as u32) {
+    if index < object_inline_capacity(obj) {
         if index >= live {
             set_object_live_slot_count(obj, index + 1);
         }

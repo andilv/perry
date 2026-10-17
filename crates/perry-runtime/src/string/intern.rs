@@ -184,6 +184,23 @@ pub(crate) unsafe fn atom_for_key(
         .flatten()
 }
 
+/// Object model step 0: make `string` (an immutable image string, a static
+/// atom of the program) this agent's atom for `bytes` unless one exists.
+///
+/// # Safety
+/// `string` is an image string whose bytes are `bytes`.
+pub(crate) unsafe fn seed_static_atom(bytes: &[u8], hash: u64, string: *const StringHeader) {
+    if bytes.is_empty() || bytes.len() > INTERN_MAX_BYTE_LEN as usize {
+        return;
+    }
+    let _ = ATOMS.try_with(|t| {
+        let t = &mut *t.get();
+        if t.lookup(bytes, hash).is_none() {
+            t.insert(hash, string);
+        }
+    });
+}
+
 /// Mint (or find) the atom for a pooled literal: the one string object this
 /// agent uses for that text from now on. Called from `__perry_init_strings_*`
 /// in place of `js_string_from_bytes` for pool entries that can be property
@@ -195,6 +212,13 @@ pub(crate) unsafe fn atom_for_key(
 /// weak intern cache's string (see
 /// `AtomTable`: identity, never eligibility). Longer literals are not keys
 /// worth an atom entry use image space without a table entry.
+///
+/// The minted atom is a program property atom, exactly as a literal image
+/// registered by `js_string_register_property_atom` is (§3.5): it carries its
+/// creation hash, so `property_atom` answers with it and a data key with the
+/// same spelling (JSON.parse, a computed key) meets the program's literal at
+/// one address. A tabled string that is not a property atom (legacy layout
+/// seeding) is replaced by it, as registration replaces one.
 #[no_mangle]
 pub extern "C" fn js_string_pool_atom(
     bytes: *const u8,
@@ -206,14 +230,50 @@ pub extern "C" fn js_string_pool_atom(
         return image_string(bytes, len);
     }
     let input = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
-    if let Some(atom) = atom_lookup(input, hash) {
-        return atom as *mut StringHeader;
+    let existing = atom_lookup(input, hash);
+    if let Some(atom) = existing {
+        if unsafe { (*atom).flags } & PROPERTY_ATOM != 0 {
+            return atom as *mut StringHeader;
+        }
     }
     // Nothing is held across the allocation: `bytes` is read-only data in the
     // compiled image. Shared (`refcount = 0`) like every pool literal.
-    let atom: *const StringHeader = image_string(bytes, len);
-    let _ = ATOMS.try_with(|t| unsafe { (*t.get()).insert(hash, atom) });
+    let atom: *const StringHeader = program_atom_image(bytes, len, hash);
+    let _ = ATOMS.try_with(|t| unsafe {
+        let table = &mut *t.get();
+        match existing.and_then(|old| {
+            table
+                .slots
+                .iter_mut()
+                .find(|entry| entry.string_ptr == old as usize)
+        }) {
+            Some(entry) => entry.string_ptr = atom as usize,
+            None => table.insert(hash, atom),
+        }
+    });
     atom as *mut StringHeader
+}
+
+/// An image string laid out as a property atom: the payload, its NUL, then
+/// the creation hash at the next 8-byte boundary (`property_atom_hash`).
+fn program_atom_image(bytes: *const u8, len: u32, hash: u64) -> *mut StringHeader {
+    let header_size = std::mem::size_of::<StringHeader>();
+    let hash_at = (header_size + len as usize + 1 + 7) / 8 * 8;
+    let (string, data) = super::string_storage_alloc_longlived((hash_at + 8 - header_size) as u32);
+    unsafe {
+        let (units, flags) = super::raw_string_metadata(bytes, len);
+        super::init_string_header(string, units, len, len, 0, flags);
+        (*string).flags |= IMAGE_ATOM_FLAGS;
+        std::ptr::copy_nonoverlapping(bytes, data, len as usize);
+        data.add(len as usize).write(0);
+        std::ptr::write_unaligned(
+            ((data.add(len as usize + 1) as usize + 7) & !7) as *mut u64,
+            hash,
+        );
+        let header = (string as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
+        crate::gc::pin_object_non_young(header);
+    }
+    string
 }
 
 /// I2 birth funnel. Longlived is an existing image space: never reset and
@@ -327,6 +387,12 @@ pub extern "C" fn js_string_intern(key: *const StringHeader, hash: u64) -> *cons
             return existing;
         }
 
+        let bytes = std::slice::from_raw_parts(string_data(key), byte_len as usize);
+        if let Some(atom) = atom_lookup(bytes, hash) {
+            publish_intern_entry(hash, atom);
+            return atom;
+        }
+
         // Miss or collision — insert (evict on collision)
         publish_intern_entry(hash, key);
 
@@ -409,6 +475,11 @@ pub(super) fn intern_prehashed_bytes(
     });
     if let Some(existing) = hit {
         return existing;
+    }
+
+    if let Some(atom) = atom_lookup(input, hash) {
+        publish_intern_entry(hash, atom);
+        return atom;
     }
 
     let key = if is_wtf8 {
@@ -572,4 +643,276 @@ pub(crate) fn intern_lookup_bytes(bytes: &[u8]) -> Option<*const StringHeader> {
         }
         None
     })
+}
+
+// Property atoms retain their creation hash after the byte payload. Plain
+// strings carry no hash and keep the existing string ABI and allocation size.
+const PROPERTY_ATOM: u32 = 1 << 3;
+const PROGRAM_ATOM: u32 = 1 << 4;
+/// The atom flags of every image string (codegen's literal images and the
+/// runtime's layout key images, which share their symbols).
+pub(crate) const IMAGE_ATOM_FLAGS: u32 = PROPERTY_ATOM | PROGRAM_ATOM;
+
+/// Is `key` a property atom (the one atom of its text in this agent, its
+/// creation hash stored after the payload)?
+#[inline(always)]
+pub(crate) unsafe fn is_property_atom(key: *const StringHeader) -> bool {
+    (*key).flags & PROPERTY_ATOM != 0
+}
+
+/// Object model step 5 (case 2c): a coloured program atom carries its colour
+/// in `flags` bits 16..24 (mask bit + 1; 0 = no colour) and 24..32 (the
+/// colour slot), written once per agent by [`set_atom_colour`] before user
+/// code runs. A record's colour masks are then one flags load per key at mint
+/// (`object/layout_probe.rs`), not a table lookup.
+const ATOM_COLOUR_SHIFT: u32 = 16;
+
+/// The colour `(mask bit, slot)` of program atom `key`, if it has one.
+///
+/// # Safety
+/// `key` is a live `StringHeader`.
+#[inline(always)]
+pub(crate) unsafe fn atom_colour(key: *const StringHeader) -> Option<(u32, u32)> {
+    let f = (*key).flags;
+    if f & IMAGE_ATOM_FLAGS != IMAGE_ATOM_FLAGS {
+        return None;
+    }
+    let c = (f >> ATOM_COLOUR_SHIFT) & 0xFF;
+    (c != 0).then(|| (c - 1, f >> (ATOM_COLOUR_SHIFT + 8)))
+}
+
+/// Give this agent's atom of `bytes` colour `(bit, slot)`; returns that atom.
+/// A colour that does not fit (`bit >= 127`, `slot >= 256`) stays unset, so
+/// those keys never enter a mask.
+pub(crate) unsafe fn set_atom_colour(
+    bytes: &[u8],
+    hash: u64,
+    bit: u32,
+    slot: u32,
+) -> Option<*const StringHeader> {
+    if bit >= 127 || slot >= 256 {
+        return None;
+    }
+    let a = atom_lookup(bytes, hash)?;
+    if !is_program_atom(a) {
+        return None;
+    }
+    // An image atom is immutable data that codegen already coloured; only an
+    // atom the runtime allocated for the text is written here.
+    if atom_colour(a) != Some((bit, slot)) {
+        if super::is_image_string(a) {
+            return None;
+        }
+        let s = a as *mut StringHeader;
+        (*s).flags = ((*s).flags & 0xFFFF)
+            | ((bit + 1) << ATOM_COLOUR_SHIFT)
+            | (slot << (ATOM_COLOUR_SHIFT + 8));
+    }
+    Some(a)
+}
+
+/// Is `key` a program atom (a property atom the compiled image or a pool
+/// literal owns: immortal, the one atom of its text)?
+#[inline(always)]
+pub(crate) unsafe fn is_program_atom(key: *const StringHeader) -> bool {
+    (*key).flags & IMAGE_ATOM_FLAGS == IMAGE_ATOM_FLAGS
+}
+
+pub(crate) unsafe fn property_atom_hash(key: *const StringHeader) -> u64 {
+    debug_assert!((*key).flags & PROPERTY_ATOM != 0);
+    std::ptr::read_unaligned(
+        (((string_data(key).add((*key).byte_len as usize + 1) as usize) + 7) & !7) as *const u64,
+    )
+}
+
+/// The atom of `key`'s spelling if one exists, without allocating or
+/// inserting: a property atom answers from its stored hash and identity, a
+/// plain string by hashing its bytes. `None` also when the only tabled string
+/// is not a property atom: no object's ordered keys can then hold the spelling.
+pub(crate) unsafe fn existing_property_atom(
+    key: *const StringHeader,
+) -> Option<*const StringHeader> {
+    let bytes = std::slice::from_raw_parts(string_data(key), (*key).byte_len as usize);
+    let existing = if (*key).flags & PROPERTY_ATOM != 0 {
+        let hash = property_atom_hash(key);
+        ATOMS
+            .try_with(|t| (*t.get()).lookup_from(key as usize, bytes, hash))
+            .ok()
+            .flatten()?
+    } else {
+        atom_lookup(
+            bytes,
+            crate::object::key_bytes_hash(bytes.as_ptr(), bytes.len()),
+        )?
+    };
+    ((*existing).flags & PROPERTY_ATOM != 0).then_some(existing)
+}
+
+pub(crate) unsafe fn property_atom(key: *const StringHeader) -> *const StringHeader {
+    if (*key).flags & PROPERTY_ATOM != 0 {
+        let hash = property_atom_hash(key);
+        let bytes = std::slice::from_raw_parts(string_data(key), (*key).byte_len as usize);
+        return ATOMS.with(|t| {
+            let table = &mut *t.get();
+            if let Some(existing) = table.lookup_from(key as usize, bytes, hash) {
+                if (*existing).flags & PROPERTY_ATOM != 0 {
+                    return existing;
+                }
+                if let Some(entry) = table
+                    .slots
+                    .iter_mut()
+                    .find(|e| e.string_ptr == existing as usize)
+                {
+                    entry.string_ptr = key as usize;
+                    return key;
+                }
+            }
+            table.insert(hash, key);
+            key
+        });
+    }
+    let bytes = crate::string::OwnedStringBytes::copy_from_header(key);
+    let hash = crate::object::key_bytes_hash(bytes.as_bytes().as_ptr(), bytes.as_bytes().len());
+    if let Some(atom) = atom_lookup(bytes.as_bytes(), hash) {
+        if (*atom).flags & PROPERTY_ATOM != 0 {
+            return atom;
+        }
+    }
+    let units = (*key).utf16_len;
+    let flags = (*key).flags;
+    let len = bytes.as_bytes().len();
+    let atom = crate::arena::arena_alloc_gc(
+        (std::mem::size_of::<StringHeader>() + len + 1 + 7) / 8 * 8 + 8,
+        8,
+        crate::gc::GC_TYPE_STRING,
+    ) as *mut StringHeader;
+    atom.write(StringHeader {
+        utf16_len: units,
+        byte_len: len as u32,
+        capacity: len as u32,
+        refcount: 0,
+        flags: flags | PROPERTY_ATOM,
+    });
+    std::ptr::copy_nonoverlapping(bytes.as_bytes().as_ptr(), string_data(atom) as *mut u8, len);
+    (string_data(atom) as *mut u8).add(len).write(0);
+    std::ptr::write_unaligned(
+        (((string_data(atom).add(len + 1) as usize) + 7) & !7) as *mut u64,
+        hash,
+    );
+    let _ = ATOMS.try_with(|t| {
+        let table = &mut *t.get();
+        if let Some(existing) = table.lookup(bytes.as_bytes(), hash) {
+            if let Some(entry) = table
+                .slots
+                .iter_mut()
+                .find(|entry| entry.string_ptr == existing as usize)
+            {
+                entry.string_ptr = atom as usize;
+                return;
+            }
+        }
+        table.insert(hash, atom);
+    });
+    atom
+}
+
+pub(crate) unsafe fn property_atom_from_value(bits: u64) -> u64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let key = scope.root_nanbox_f64(f64::from_bits(bits));
+    let header = crate::value::js_get_string_pointer_unified(key.get_nanbox_f64());
+    crate::JSValue::string_ptr(property_atom(header as *const StringHeader) as *mut _).bits()
+}
+
+/// Called by literal initialization before module execution. The image itself
+/// is the program atom; no copied literal or per-site identity is installed.
+#[no_mangle]
+pub unsafe extern "C" fn js_string_register_property_atom(key: *const StringHeader) {
+    let hash = property_atom_hash(key);
+    let _ = ATOMS.try_with(|t| {
+        let table = &mut *t.get();
+        let bytes = std::slice::from_raw_parts(string_data(key), (*key).byte_len as usize);
+        if let Some(existing) = table.lookup(bytes, hash) {
+            if existing == key {
+                return;
+            }
+            if (*existing).flags & PROPERTY_ATOM != 0 {
+                // A live data atom already owns this spelling. Keep canonical
+                // equality until it dies; source-name membership is immutable.
+                if !is_image_string(existing) {
+                    (*(existing as *mut StringHeader)).flags |= PROGRAM_ATOM;
+                }
+                return;
+            }
+            // Legacy layout seeding precedes pools and makes plain pinned
+            // strings. They are not table keys: adopt the image atom here.
+            if let Some(entry) = table
+                .slots
+                .iter_mut()
+                .find(|entry| entry.string_ptr == existing as usize)
+            {
+                entry.string_ptr = key as usize;
+                return;
+            }
+        }
+        table.insert(hash, key);
+    });
+}
+
+pub(crate) unsafe fn property_atom_is_program_named(key: *const StringHeader) -> bool {
+    (*key).flags & PROGRAM_ATOM != 0
+}
+
+/// This weak registry never emits roots in the mark or copy phase. Live atom
+/// addresses are repaired after tracing; dead entries are pruned before sweep.
+pub(crate) fn scan_property_atoms(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    if !visitor.is_metadata_rewrite_phase() {
+        return;
+    }
+    let _ = ATOMS.try_with(|t| unsafe {
+        for entry in &mut (*t.get()).slots {
+            if entry.string_ptr != 0 {
+                visitor.visit_metadata_usize_slot(&mut entry.string_ptr);
+            }
+        }
+    });
+}
+
+pub(crate) fn prune_property_atoms(is_dead: &dyn Fn(usize) -> bool) {
+    let _ = ATOMS.try_with(|t| unsafe {
+        let table = &mut *t.get();
+        let mut removed = false;
+        for entry in &mut table.slots {
+            if entry.string_ptr != 0 && is_dead(entry.string_ptr) {
+                entry.string_ptr = 0;
+                table.len -= 1;
+                removed = true;
+            }
+        }
+        if removed {
+            let capacity = table.slots.len();
+            let old = std::mem::replace(
+                &mut table.slots,
+                vec![
+                    InternEntry {
+                        hash: 0,
+                        string_ptr: 0
+                    };
+                    capacity
+                ],
+            );
+            for entry in old.into_iter().filter(|e| e.string_ptr != 0) {
+                table.place(entry);
+            }
+        }
+    });
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn js_string_register_property_atoms(
+    keys: *const *const StringHeader,
+    count: u32,
+) {
+    for i in 0..count as usize {
+        js_string_register_property_atom(*keys.add(i));
+    }
 }

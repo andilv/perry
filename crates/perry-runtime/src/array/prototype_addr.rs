@@ -136,6 +136,13 @@ const MAP_PROTO_CACHE: usize = 6;
 /// consulted on every indexed array write, and a generic hot slot cost one
 /// more dependent load than the value itself.
 #[inline(always)]
+/// This thread's `Object.prototype` cell (the collector rewrites it; it holds
+/// `usize::MAX` until resolved), for the unknown-receiver probe, which reads
+/// it through the agent's shape directory instead of a thread-local access.
+pub(crate) fn object_prototype_cell() -> *const usize {
+    prototype_addrs()[OBJECT_PROTO_CACHE].as_ptr()
+}
+
 fn prototype_addrs() -> &'static [Cell<usize>; PROTOTYPE_ADDR_CACHE_COUNT] {
     &crate::tls_hot::hot().prototype_addrs
 }
@@ -314,9 +321,7 @@ fn bootstrap_prototype_addr(slot: usize) -> usize {
         0
     };
     // Don't poison the cache with 0: during runtime init the global constructor
-    // may not be materialized yet (symbol writes on other builtin prototypes
-    // call into here via `note_array_proto_iterator_write`). Re-derive until it
-    // resolves.
+    // may not be materialized yet. Re-derive until it resolves.
     if addr != 0 {
         prototype_addrs()[slot].set(addr);
     }

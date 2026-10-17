@@ -208,6 +208,11 @@ unsafe fn set_property_key_resolved(obj_value: f64, key: f64, value: f64) -> f64
     }
     let obj = extract_obj_ptr(obj_value);
     if !obj.is_null() {
+        // §3.3: a key the layout does not name is appended to the overflow.
+        let key_value = crate::value::js_nanbox_string(key_str as i64);
+        if let Some(stored) = super::shape_store::try_dynamic_store(obj, key_value, value) {
+            return stored;
+        }
         js_object_set_field_by_name(obj, key_str, value);
     }
     value
@@ -256,11 +261,11 @@ unsafe fn get_property_key_resolved(obj_value: f64, key: f64) -> f64 {
     // applying that guard here silently lost Request.signal (and any dictionary
     // members supplied by a native Request used as init).
     let receiver = crate::value::JSValue::from_bits(obj_value.to_bits());
-    if receiver.is_pointer() {
-        let handle = receiver.as_pointer::<ObjectHeader>();
-        if !handle.is_null() && crate::value::addr_class::is_handle_band(handle as usize) {
-            return f64::from_bits(js_object_get_field_by_name(handle, key_str).bits());
-        }
+    if receiver.is_handle() {
+        // The by-name read admits a raw id: Proxy ids reach their [[Get]],
+        // every other id its native dispatcher.
+        let handle = receiver.as_handle() as *const ObjectHeader;
+        return f64::from_bits(js_object_get_field_by_name(handle, key_str).bits());
     }
     let obj = extract_obj_ptr(obj_value);
     if obj.is_null() {
@@ -386,10 +391,8 @@ pub unsafe extern "C" fn js_super_accessor_get(home_class_id: u32, key: f64, rec
     let scope = crate::gc::RuntimeHandleScope::new();
     let receiver_handle = scope.root_nanbox_u64(receiver.to_bits());
     let key_handle = scope.root_nanbox_f64(js_to_property_key(key));
-    let base = super::class_super_chain::class_super_base(
-        home_class_id,
-        f64::from_bits(receiver_handle.get_nanbox_u64()),
-    );
+    let home = super::class_registry::class_decl_prototype_value(home_class_id);
+    let base = super::js_object_get_prototype_of(home);
     let base_value = crate::value::JSValue::from_bits(base.to_bits());
     if base_value.is_null() || base_value.is_undefined() {
         let key_hdr = crate::builtins::js_string_coerce(key_handle.get_nanbox_f64());
@@ -545,8 +548,6 @@ mod property_key_tests {
     #[test]
     fn property_key_symbol_accessors_route_through_symbol_storage() {
         unsafe {
-            crate::symbol::test_clear_symbol_side_table_roots();
-
             let obj = js_object_alloc(0, 0);
             let obj_value = crate::value::js_nanbox_pointer(obj as i64);
             let sym = crate::symbol::js_symbol_new_empty();
@@ -565,8 +566,6 @@ mod property_key_tests {
                 123.0
             );
             assert_eq!(js_object_get_property_key(obj_value, sym), 123.0);
-
-            crate::symbol::test_clear_symbol_side_table_roots();
         }
     }
 

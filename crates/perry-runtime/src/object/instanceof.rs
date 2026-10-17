@@ -50,14 +50,14 @@ pub(crate) fn value_is_callable(value: f64) -> bool {
     if !jv.is_pointer() {
         return class_ref_id(value).is_some();
     }
-    // A class function object is a closure: one probe answers both.
-    crate::closure::is_closure_ptr((jv.bits() & crate::value::POINTER_MASK) as usize)
+    crate::value::addr_class::pointer_value_header(jv.bits())
+        .is_some_and(|header| perry_abi::gc_header_word_is_callable(header.kind_facts_word()))
 }
 
 fn small_native_handle_id(value: f64) -> Option<i64> {
     use crate::value::addr_class;
     let bits = value.to_bits();
-    if (bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG {
+    if (bits & crate::value::TAG_MASK) == crate::value::HANDLE_TAG {
         let raw = (bits & crate::value::POINTER_MASK) as i64;
         if addr_class::is_small_handle(raw as usize) {
             return Some(raw);
@@ -268,31 +268,12 @@ fn js_instanceof_dynamic_tail(value: f64, type_ref: f64) -> f64 {
             f64::from_bits(TAG_FALSE)
         };
     }
-    // ES5 function constructors: `x instanceof Foo` where `Foo` is a plain
-    // function used with `new`. `js_new_function_construct` stamps each
-    // instance with `synthetic_class_id_for_function(Foo)`; derive the same
-    // id from the function value here and walk the candidate's class chain
-    // against it. Mirrors the construct site so the common
-    // `if (!(this instanceof Foo)) return new Foo()` guard resolves to true
-    // inside a `new`-invoked body instead of recursing forever (#838 followup).
-    let synthetic_cid = synthetic_class_id_for_function(type_ref);
-    if synthetic_cid != 0 {
-        let r = js_instanceof(value, synthetic_cid);
-        if r.to_bits() == crate::value::TAG_TRUE {
-            return r;
-        }
-        // #5989: the synthetic class-id chain is stamped at construction and does
-        // NOT reflect a prototype installed later via
-        // `Fn.prototype = Object.create(Base.prototype)` — the classic ES5
-        // inheritance idiom react-server-dom's flight Chunk uses to inherit
-        // `Promise.prototype` (so `chunk instanceof Promise` wrongly returned
-        // false). Fall back to the spec `OrdinaryHasInstance` prototype-chain
-        // walk: Perry already walks the real chain for method lookup and
-        // `getPrototypeOf`, so only this id-based shortcut missed it.
-        if ordinary_has_instance_prototype_walk(value, type_ref) {
-            return f64::from_bits(crate::value::TAG_TRUE);
-        }
-        return f64::from_bits(TAG_FALSE);
+    if is_callable_function_value(type_ref) {
+        return f64::from_bits(if ordinary_has_instance_prototype_walk(value, type_ref) {
+            crate::value::TAG_TRUE
+        } else {
+            TAG_FALSE
+        });
     }
     // #2909: nothing recognized the RHS as a constructor/class. Per the
     // ECMAScript `InstanceofOperator`, the right operand must be an object
@@ -461,7 +442,7 @@ fn terminal_prototype_id(value: f64) -> Option<u64> {
     }
     if !matches!(
         record.object_kind(),
-        ShapeObjectKind::Ordinary | ShapeObjectKind::OrdinaryUnmarked | ShapeObjectKind::Dictionary
+        ShapeObjectKind::Ordinary | ShapeObjectKind::OrdinaryUnmarked
     ) || record.weak_collection_brand().is_some()
     {
         return None;
@@ -558,8 +539,8 @@ fn rhs_is_object_value(value: f64) -> bool {
     {
         return false;
     }
-    if jsval.is_pointer() {
-        let ptr = (bits & crate::value::POINTER_MASK) as usize;
+    if jsval.is_reference() {
+        let ptr = jsval.reference_payload();
         // Symbols are primitives; small registry handles aren't real objects
         // here either, but they're still object-typed in JS (`typeof` is
         // "object"), so a "not callable" message is the right one for them.
@@ -935,7 +916,7 @@ mod primitive_lhs_native_brand_tests_11261 {
         }
         let not_primitive = [
             // A POINTER-tagged registry handle and a heap address.
-            f64::from_bits(crate::value::POINTER_TAG | PROBE_HANDLE as u64),
+            f64::from_bits(crate::value::HANDLE_TAG | PROBE_HANDLE as u64),
             f64::from_bits(crate::value::POINTER_TAG | 0x7F12_3456_7890),
             // The raw-bitcast band is left to the downstream decoders.
             f64::from_bits(PROBE_HANDLE as u64),
@@ -990,7 +971,7 @@ mod tagged_native_handle_tests {
                 None,
                 "subnormal bits {id}"
             );
-            let tagged = f64::from_bits(crate::value::POINTER_TAG | id);
+            let tagged = f64::from_bits(crate::value::HANDLE_TAG | id);
             let expected =
                 crate::value::addr_class::is_small_handle(id as usize).then_some(id as i64);
             assert_eq!(small_native_handle_id(tagged), expected);
@@ -1011,7 +992,7 @@ mod tagged_native_handle_tests {
         }
         assert_eq!(
             js_instanceof(
-                f64::from_bits(crate::value::POINTER_TAG | 1),
+                f64::from_bits(crate::value::HANDLE_TAG | 1),
                 CLASS_ID_NET_SOCKET
             )
             .to_bits(),

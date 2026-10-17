@@ -11,6 +11,7 @@
 #![recursion_limit = "256"]
 // Anchors are `#[used(compiler)]`: retained by rustc, not ld64 dead-strip roots.
 #![feature(used_with_arg)]
+#![feature(linkage)]
 // Keep the cold class-cache publisher compact without outlining hot reads.
 #![feature(optimize_attribute)]
 // `agent_ptrs::PERRY_AGENT_PTRS`: a thread-local generated code names directly.
@@ -18,6 +19,11 @@
 // `js_closure_call{N}` jumps to a plain body with `become` (a guaranteed tail
 // call): the entry leaves no frame and touches no argument register.
 #![feature(explicit_tail_calls)]
+// Frame marks (`exception::marks`) read a frame's CFA through the LLVM
+// intrinsics `llvm.addressofreturnaddress` / `llvm.sponentry`; there is no
+// stable spelling, and inline asm cannot name the CFA on every target.
+#![feature(link_llvm_intrinsics)]
+#![allow(internal_features)]
 #![allow(incomplete_features)]
 // WASI (#11377): `std::os::wasi::fs::symlink_path` for `fs.symlink`.
 #![cfg_attr(target_os = "wasi", feature(wasi_ext))]
@@ -111,6 +117,8 @@ pub mod collection_iter;
 pub mod collection_iter_object;
 pub mod collection_receiver;
 pub mod color_parse;
+#[cfg(feature = "contract-checks")]
+pub(crate) mod contracts;
 pub mod date;
 #[cfg(feature = "mod-dgram")]
 pub mod dgram;
@@ -129,6 +137,7 @@ pub(crate) mod eh_lsda;
 #[cfg(not(windows))]
 pub(crate) mod eh_walker;
 pub mod embedded;
+pub mod entry_contracts;
 pub mod error;
 pub mod event_pump;
 pub mod event_target;
@@ -161,11 +170,12 @@ mod native_stack;
 pub mod native_value_profile;
 pub mod navigator;
 pub mod net_validate;
-#[cfg(feature = "node-api-host")]
 pub mod node_api_host;
 mod param_type_guard;
 pub(crate) mod runtime_state_key;
 mod startup_memory_profile;
+/// wpfacts slice 2: run-time witness of each elided field access.
+pub mod wpfacts_check;
 // #6468: the `node:http2` constant tables are only reachable through the
 // `http2` native-module namespace, so a program that never imports `node:http2`
 // links none of them. The auto-optimizer enables `mod-http2-constants` on an
@@ -270,19 +280,13 @@ pub mod v8;
 pub mod validators;
 pub mod value;
 pub mod wasi;
+mod wasm_instance_state;
 pub mod web_storage;
-/// WebAssembly host shims (issue #76). Forward-declares the
-/// `perry_wasm_host_*` C ABI; the wasmi-backed implementation lives in
-/// the separate `perry-wasm-host` crate and is linked in only when the
-/// user passes `--enable-wasm-runtime`.
-///
-/// Gated behind the `wasm-host` Cargo feature so non-wasm programs don't
-/// pull `js_webassembly_*` into libperry_runtime.a — those shims hold
-/// undefined references to `perry_wasm_host_*` which would fail to link
-/// without libperry_wasm_host.a on the line. The auto-optimize path
-/// (crates/perry/src/commands/compile/optimized_libs.rs) flips this
-/// feature on when `ctx.needs_wasm_runtime` is true.
-#[cfg(feature = "wasm-host")]
+/// WebAssembly host shims (issue #76). The wasmi-backed engine lives in the
+/// separate `perry-wasm-host` crate, which perry links only for a program
+/// that uses WebAssembly; it registers its entry points with the runtime
+/// (`webassembly::host`), so this module names none of its symbols, and
+/// `js_runtime_install_wasm_host` installs the engine into the namespace.
 pub mod webassembly;
 // Networking is provided by perry-ext-net; the retired synchronous provider
 // no longer contributes a second js_net_* export surface (#10678).
@@ -479,81 +483,98 @@ pub(crate) mod stdlib_pump {
     crate::perry_thread_local! {
         /// `await` inside a pump callback can synchronously re-enter the host
         /// pump. Lifecycle hooks belong to the outer tick only.
-        static PUMP_DEPTH: Cell<u32> = const { Cell::new(0) };
+        /// One entry per pump level in flight, with the frame mark of the
+        /// level's owner (`crate::exception::marks`): a throw that abandons
+        /// a level skips its guard's drop, and the catching landing pad pops
+        /// the level instead.
+        static PUMP_DEPTH: std::cell::RefCell<crate::exception::CatchStack<()>> =
+            const { std::cell::RefCell::new(crate::exception::CatchStack::new()) };
     }
 
     struct PumpDepthGuard {
-        depth_before: u32,
+        depth_before: usize,
         entered_outer_pump: bool,
     }
 
     impl PumpDepthGuard {
+        /// Enter a pump level owned by the calling frame (`#[inline(always)]`:
+        /// the frame mark must be read in the guard's owner).
+        #[inline(always)]
         fn enter() -> (Self, bool) {
-            crate::exception::note_catch_subsystem_used(crate::exception::catch_subsystem::PUMP);
-            PUMP_DEPTH.with(|depth| {
-                let current = depth.get();
-                depth.set(current.saturating_add(1));
-                let entered_outer_pump = current == 0;
-                if entered_outer_pump {
-                    begin_outer_pump();
-                }
-                (
-                    Self {
-                        depth_before: current,
-                        entered_outer_pump,
-                    },
+            Self::enter_at(crate::exception::frame_mark())
+        }
+
+        fn enter_at(mark: usize) -> (Self, bool) {
+            let current = PUMP_DEPTH.with(|depth| {
+                let mut depth = depth.borrow_mut();
+                let current = depth.len();
+                depth.push(mark, ());
+                current
+            });
+            let entered_outer_pump = current == 0;
+            if entered_outer_pump {
+                begin_outer_pump();
+            }
+            (
+                Self {
+                    depth_before: current,
                     entered_outer_pump,
-                )
-            })
+                },
+                entered_outer_pump,
+            )
         }
     }
 
     impl Drop for PumpDepthGuard {
         fn drop(&mut self) {
-            PUMP_DEPTH.with(|depth| {
-                let current = depth.get();
-                // `js_throw` eagerly restores this counter before choosing
-                // longjmp or system unwinding. The latter subsequently runs
-                // Rust cleanups, so a guard already covered by that restore
-                // must not decrement the enclosing pump's depth a second
-                // time. This mirrors CallMethodDepthGuard.
-                if current > self.depth_before {
-                    depth.set(current - 1);
-                    if self.entered_outer_pump {
-                        end_outer_pump();
-                    }
+            // A landing pad may already have popped this level (its frame was
+            // abandoned and a later system-unwinder cleanup runs this drop):
+            // then it must not pop an enclosing level a second time. This
+            // mirrors CallMethodDepthGuard.
+            let popped = PUMP_DEPTH.with(|depth| {
+                let mut depth = depth.borrow_mut();
+                let popped = depth.len() > self.depth_before;
+                if popped {
+                    depth.truncate(self.depth_before);
                 }
+                popped
             });
+            if popped && self.entered_outer_pump {
+                end_outer_pump();
+            }
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn test_enter_catch_pump() {
-        std::mem::forget(PumpDepthGuard::enter().0);
+    pub(crate) fn test_enter_catch_pump(mark: usize) {
+        std::mem::forget(PumpDepthGuard::enter_at(mark).0);
     }
 
-    /// Capture the re-entrant stdlib-pump depth at `try` entry. A caught JS
-    /// throw can longjmp past `PumpDepthGuard::drop`; exception handling uses
-    /// this savepoint to keep the next top-level pump recognizable as a new
-    /// tick (and therefore run its lifecycle hooks).
-    #[inline]
-    pub(crate) fn pump_depth_savepoint() -> u32 {
-        PUMP_DEPTH.with(|depth| depth.get())
+    /// The re-entrant stdlib-pump depth.
+    #[cfg(test)]
+    pub(crate) fn pump_depth() -> u32 {
+        PUMP_DEPTH.with(|depth| depth.borrow().len() as u32)
     }
 
-    /// Restore a pump-depth savepoint for guards skipped by JS exception
-    /// transport. Guards remember their entry depths, making their later
-    /// system-unwinder cleanup idempotent after this eager restore.
-    pub(crate) fn pump_depth_restore(depth: u32) {
-        PUMP_DEPTH.with(|current| {
-            let before = current.replace(depth);
-            // Only a restore across this thread's outermost pump removes its
-            // process-wide active-pump contribution. A later Rust guard drop
-            // sees the restored TLS depth and therefore remains idempotent.
-            if depth == 0 && before > 0 {
-                end_outer_pump();
-            }
+    /// Landing pad at stack pointer `sp`: pop the pump levels the throw
+    /// abandoned, keeping the next top-level pump recognizable as a new tick
+    /// (and therefore running its lifecycle hooks). Only a restore across this
+    /// thread's outermost pump removes its process-wide active-pump
+    /// contribution; a later guard drop sees the popped level and stays
+    /// idempotent.
+    pub(crate) fn pump_depth_unwind_to(sp: usize) {
+        let emptied = PUMP_DEPTH.with(|depth| {
+            let mut depth = depth.borrow_mut();
+            depth.unwind_to(sp) > 0 && depth.is_empty()
         });
+        if emptied {
+            end_outer_pump();
+        }
+    }
+
+    pub(crate) fn pump_depth_check_marks(sp: usize) {
+        PUMP_DEPTH
+            .with(|depth| crate::exception::marks::check_marks(depth.borrow().marks(), sp, "pump"));
     }
 
     // Runtime-internal reactor pumps (child_process, node-pty) register here
@@ -822,8 +843,7 @@ pub(crate) mod stdlib_pump {
         // and keeps the result live for debug assertions/tests.
         debug_assert!(!outermost || ACTIVE_OUTER_PUMPS.load(Ordering::Acquire) > 0);
         crate::promise::js_native_async_process_pending();
-        #[cfg(feature = "node-api-host")]
-        crate::node_api_host::process_pending();
+        crate::node_api_host::hooks::process_pending();
         crate::os::js_process_signal_drain();
         // Drain the tty resize-pending flag (#347 Phase 3). Lives in
         // perry-runtime, not stdlib, so it runs even when stdlib isn't
@@ -876,8 +896,7 @@ pub(crate) mod stdlib_pump {
         if crate::event_pump::agent_loop_has_outstanding_work() {
             return 1;
         }
-        #[cfg(feature = "node-api-host")]
-        if crate::node_api_host::has_active_work() {
+        if crate::node_api_host::hooks::has_active_work() {
             return 1;
         }
         if crate::promise::js_native_async_has_active() != 0 {
@@ -997,7 +1016,7 @@ pub(crate) mod stdlib_pump {
             use std::sync::mpsc;
             use std::time::Duration;
 
-            assert_eq!(pump_depth_savepoint(), 0);
+            assert_eq!(pump_depth(), 0);
             assert_eq!(ACTIVE_OUTER_PUMPS.load(Ordering::Acquire), 0);
             js_register_aux_tick_begin(counting_tick_begin);
             let ticks_before = TICK_BEGIN_CALLS.load(AtomicOrdering::SeqCst);
@@ -1020,9 +1039,10 @@ pub(crate) mod stdlib_pump {
                 ticks_before + 1
             );
 
-            // Eager exception restoration removes this thread's contribution,
-            // but cannot end the other thread's still-active logical tick.
-            pump_depth_restore(0);
+            // A landing pad above every pump level removes this thread's
+            // contribution, but cannot end the other thread's still-active
+            // logical tick.
+            pump_depth_unwind_to(usize::MAX);
             assert_eq!(ACTIVE_OUTER_PUMPS.load(Ordering::Acquire), 1);
             drop(outer);
             assert_eq!(ACTIVE_OUTER_PUMPS.load(Ordering::Acquire), 1);
@@ -1042,32 +1062,28 @@ pub(crate) mod stdlib_pump {
 
         #[test]
         fn caught_throw_restores_pump_depth_and_guard_drops_are_idempotent() {
-            let base_depth = pump_depth_savepoint();
-            let base_try = crate::exception::test_try_depth();
-            let _jb = crate::exception::js_try_push();
+            let base_depth = pump_depth();
+            let here = crate::exception::frame_mark();
 
             let (outer_guard, outermost) = PumpDepthGuard::enter();
             assert_eq!(outermost, base_depth == 0);
             let (inner_guard, outermost) = PumpDepthGuard::enter();
             assert!(!outermost);
-            assert_eq!(pump_depth_savepoint(), base_depth + 2);
+            assert_eq!(pump_depth(), base_depth + 2);
 
-            // Replay js_throw's eager savepoint restores without performing
-            // the non-returning longjmp. System unwinding may then run both
-            // guards, so their Drops must leave the restored depth alone.
-            crate::exception::test_unwind_innermost_shadow_restore();
-            assert_eq!(pump_depth_savepoint(), base_depth);
+            // Replay the restore of a landing pad in this frame's caller.
+            // System unwinding may then run both guards, so their Drops must
+            // leave the restored depth alone.
+            pump_depth_unwind_to(here + 1);
+            assert_eq!(pump_depth(), base_depth);
             drop(inner_guard);
             drop(outer_guard);
-            assert_eq!(pump_depth_savepoint(), base_depth);
-
-            crate::exception::js_try_end();
-            assert_eq!(crate::exception::test_try_depth(), base_try);
+            assert_eq!(pump_depth(), base_depth);
         }
 
         #[test]
         fn real_longjmp_does_not_leak_pump_depth() {
-            let base_depth = pump_depth_savepoint();
+            let base_depth = pump_depth();
             assert_eq!(base_depth, 0, "test thread began inside a pump");
             let thrown = f64::from_bits(0x7FFD_0000_0000_99F1);
 
@@ -1080,7 +1096,7 @@ pub(crate) mod stdlib_pump {
                 Err(value) => assert_eq!(value.to_bits(), thrown.to_bits()),
                 Ok(()) => panic!("throw unexpectedly returned normally"),
             }
-            assert_eq!(pump_depth_savepoint(), base_depth);
+            assert_eq!(pump_depth(), base_depth);
 
             let (_next_tick_guard, outermost) = PumpDepthGuard::enter();
             assert!(

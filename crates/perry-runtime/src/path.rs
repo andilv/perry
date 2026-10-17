@@ -14,48 +14,11 @@ use crate::string::{js_string_from_bytes, js_string_materialize_to_heap, StringH
 
 /// Helper to extract string from StringHeader pointer
 unsafe fn string_from_header(ptr: *const StringHeader) -> Option<String> {
-    if !is_string_header_ptr(ptr) {
-        return None;
-    }
-    let len = (*ptr).byte_len as usize;
+    let header = crate::value::addr_class::try_read_string_header(ptr)?;
+    let len = header.byte_len as usize;
     let data_ptr = (ptr as *const u8).add(std::mem::size_of::<StringHeader>());
     let bytes = std::slice::from_raw_parts(data_ptr, len);
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
-}
-
-fn is_string_header_ptr(ptr: *const StringHeader) -> bool {
-    if ptr.is_null() || (ptr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
-        return false;
-    }
-    if ptr == crate::string::js_get_empty_string() {
-        return true;
-    }
-    let gc_header =
-        (ptr as *const u8).wrapping_sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    // A string outside the managed arenas (generation `Unknown`) is still a
-    // real string when the GC malloc registry tracks its header — e.g. a
-    // string grown through the append realloc path (`gc_malloc_realloc` →
-    // `gc_malloc(_, GC_TYPE_STRING)`) or a Symbol description. Rejecting those
-    // made every `path.*` builtin throw `The "path" argument must be of type
-    // string.` on a perfectly valid argument. The registry lookup is
-    // dereference-free, so forged pointers are still rejected before the
-    // header reads below (mirrors the empty-string singleton special case
-    // above and `current_heap_header_for_user_ptr`'s Unknown→malloc rule).
-    if matches!(
-        crate::arena::classify_heap_generation(ptr as usize),
-        crate::arena::HeapGeneration::Unknown
-    ) && !crate::gc::gc_malloc_header_is_tracked(gc_header)
-    {
-        return false;
-    }
-    unsafe {
-        if (*gc_header).obj_type != crate::gc::GC_TYPE_STRING {
-            return false;
-        }
-        let byte_len = (*ptr).byte_len;
-        let capacity = (*ptr).capacity;
-        byte_len <= capacity && capacity < 1_073_741_824
-    }
 }
 
 /// Helper to create a JS string from a Rust string
@@ -928,19 +891,18 @@ pub(crate) fn js_path_posix_parse(
     let path_str = unsafe { string_from_header(path_ptr) }.unwrap_or_default();
     let (root, dir, base, ext, name) = parse_posix_components(&path_str);
 
-    // Build the object via shape with packed keys
-    let packed = b"root\0dir\0base\0ext\0name\0";
-    let obj = js_object_alloc_with_shape(0x7FFF_FF20, 5, packed.as_ptr(), packed.len() as u32);
+    // Fill the declared record slots
+    crate::object::runtime_layouts::runtime_record!(obj, RECORD_F418_0);
     let nb = |s: &str| -> f64 {
         let ptr = string_to_js(s);
         crate::value::js_nanbox_string(ptr as i64)
     };
-    js_object_set_field(obj, 0, JSValue::from_bits(nb(&root).to_bits()));
-    js_object_set_field(obj, 1, JSValue::from_bits(nb(&dir).to_bits()));
-    js_object_set_field(obj, 2, JSValue::from_bits(nb(&base).to_bits()));
-    js_object_set_field(obj, 3, JSValue::from_bits(nb(&ext).to_bits()));
-    js_object_set_field(obj, 4, JSValue::from_bits(nb(&name).to_bits()));
-    obj
+    obj.set(0, JSValue::from_bits(nb(&root).to_bits()));
+    obj.set(1, JSValue::from_bits(nb(&dir).to_bits()));
+    obj.set(2, JSValue::from_bits(nb(&base).to_bits()));
+    obj.set(3, JSValue::from_bits(nb(&ext).to_bits()));
+    obj.set(4, JSValue::from_bits(nb(&name).to_bits()));
+    obj.finish()
 }
 
 /// Throw `TypeError [ERR_INVALID_ARG_TYPE]` for a `path.format` descriptor that
@@ -1351,7 +1313,9 @@ fn perex_path_matches_glob(
     let scope = crate::gc::RuntimeHandleScope::new();
     let path = scope.root_string_ptr(path);
     let pattern = scope.root_string_ptr(pattern);
-    if !path.with_const_ptr(|p| crate::string::is_valid_string_ptr(p)) {
+    if !path.with_const_ptr(|p| {
+        unsafe { crate::value::addr_class::try_read_string_header(p) }.is_some()
+    }) {
         path.set_raw_const_ptr(api::caught(|| {
             crate::string::js_string_from_bytes(b"".as_ptr(), 0)
         })?);
@@ -1596,21 +1560,11 @@ pub extern "C" fn js_path_win32_parse(
 
     let path_str = unsafe { string_from_header(path_ptr) }.unwrap_or_default();
     let fields = win32_parse::parse_components(&path_str);
-    let packed = b"root\0dir\0base\0ext\0name\0";
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let obj = scope.root_raw_mut_ptr(js_object_alloc_with_shape(
-        0x7FFF_FF21,
-        5,
-        packed.as_ptr(),
-        packed.len() as u32,
-    ));
+    crate::object::runtime_layouts::runtime_record!(obj, RECORD_F418_0);
     for (index, field) in fields.iter().enumerate() {
-        // Allocate the string first: it can collect, and the object handle is
-        // re-read after it rather than held as a raw pointer across it.
-        let value = JSValue::string_ptr(string_to_js(field));
-        obj.with_mut_ptr(|o| js_object_set_field(o, index as u32, value));
+        obj.set(index as u32, JSValue::string_ptr(string_to_js(field)));
     }
-    obj.with_mut_ptr(|o| o)
+    obj.finish()
 }
 
 /// `path.win32.format({ dir, root, base, name, ext })` — like the POSIX

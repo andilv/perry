@@ -1189,7 +1189,12 @@ fn is_numeric_string_key(key: &str) -> bool {
         && !(key.len() > 1 && key.starts_with('0'))
 }
 
-fn put_value_index_fast_path(ctx: &FnCtx<'_>, target: &Expr, key: &Expr, receiver: &Expr) -> bool {
+pub(crate) fn put_value_index_fast_path(
+    ctx: &FnCtx<'_>,
+    target: &Expr,
+    key: &Expr,
+    receiver: &Expr,
+) -> bool {
     // `PutValueSet` stores the assignment base in both `target` and `receiver`;
     // those two HIR trees describe one source evaluation, not two evaluations
     // that may be coalesced only when pure. Use the same structural-identity
@@ -1258,7 +1263,10 @@ fn put_value_index_fast_path(ctx: &FnCtx<'_>, target: &Expr, key: &Expr, receive
                 | "Float64Array"
         )
     );
-    (recv_unknown || recv_typed_array) && !key_is_static_string_or_symbol
+    // A field declared as a typed array takes `index_set::lower`'s declared
+    // element-kind store (expr/typed_element.rs).
+    let recv_declared_element = super::typed_element::declared_kind(ctx, target).is_some();
+    (recv_unknown || recv_typed_array || recv_declared_element) && !key_is_static_string_or_symbol
 }
 
 fn try_lower_process_env_put_value_set(
@@ -1459,6 +1467,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // Step 4b: a planned-bare store inside a region's F-body.
             if same_put_value_receiver_expr(target, receiver) {
                 if let Expr::String(k) = key.as_ref() {
+                    // Object model step 1: adding an `Object.create(P)` family's key.
+                    if let Some(add) = crate::layout_desc::create_families::add_site(target, k) {
+                        return crate::layout_desc::create_families::lower_add(
+                            ctx, &add, target, value, *strict,
+                        );
+                    }
+                    // Object model step 1: adding a literal family's key.
+                    if let Some(site) = super::family_slot::site(ctx, target, k, true) {
+                        return super::family_slot::lower_set(
+                            ctx, &site, target, k, value, *strict,
+                        );
+                    }
                     if let Some(v) =
                         crate::stmt::region_loop::try_lower_bare_put(ctx, expr, target, k, value)?
                     {
@@ -1466,9 +1486,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     }
                 }
                 // #10741: a planned-bare element store (`a[i] = v`).
-                if let Some(v) = crate::stmt::region_loop::try_lower_bare_index_set(ctx, expr)? {
-                    return Ok(v);
-                }
             }
             if let Expr::String(property) = key.as_ref() {
                 if matches!(property.as_str(), "caller" | "arguments")
@@ -1503,28 +1520,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     // #9459: see the `caller`/`arguments` route above.
                     *strict,
                 );
-            }
-            // #7288: sloppy code is barred from the class-field route above
-            // because that route's fallback throws on a rejected write. The
-            // FAST arm is mode-independent (its precheck rejects frozen /
-            // descriptor-bearing receivers and non-number values), so emit it
-            // here with a sloppy-correct miss path instead of surrendering the
-            // whole optimization. #5094/P1 extends it to boxed slots. See
-            // `property_set::try_lower_sloppy_class_field_store`.
-            if !*strict {
-                if let Expr::String(property) = key.as_ref() {
-                    if same_put_value_receiver_expr(target, receiver)
-                        && matches!(target.as_ref(), Expr::LocalGet(_) | Expr::This)
-                    {
-                        if let Some(result) =
-                            super::property_set::try_lower_sloppy_class_field_store(
-                                ctx, target, property, value,
-                            )?
-                        {
-                            return Ok(result);
-                        }
-                    }
-                }
             }
             if put_value_index_fast_path(ctx, target, key, receiver) {
                 return super::index_set::lower(

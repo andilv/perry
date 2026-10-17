@@ -10,7 +10,6 @@ struct ArrayGlobalsGuard {
     _lock: std::sync::MutexGuard<'static, ()>,
     static_proto: bool,
     index: u8,
-    iteration: u8,
 }
 
 impl ArrayGlobalsGuard {
@@ -19,8 +18,6 @@ impl ArrayGlobalsGuard {
             _lock: crate::typed_feedback::typed_feedback_test_lock(),
             static_proto: crate::object::prototype_chain::array_static_proto_recorded(),
             index: crate::array::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.load(Ordering::Relaxed),
-            iteration: super::super::indexing_support::PERRY_ARRAY_ITERATION_NOT_PRISTINE
-                .load(Ordering::Acquire),
         }
     }
 }
@@ -29,8 +26,6 @@ impl Drop for ArrayGlobalsGuard {
     fn drop(&mut self) {
         crate::object::prototype_chain::test_swap_array_static_proto_recorded(self.static_proto);
         crate::array::test_swap_array_index_fast_path_invalidated(self.index);
-        super::super::indexing_support::PERRY_ARRAY_ITERATION_NOT_PRISTINE
-            .store(self.iteration, Ordering::Release);
     }
 }
 
@@ -149,11 +144,7 @@ fn array_stack_entry_acquires_once_and_publishes_next() {
             value: f64::from_bits(TAG_UNDEFINED),
         };
         assert_eq!(
-            super::super::iterator_step::js_array_record_stack_enter(
-                &mut record,
-                std::ptr::null(),
-                0
-            ),
+            super::super::iterator_step::js_array_record_stack_enter(&mut record, 1, 0),
             1
         );
         assert_eq!(
@@ -232,11 +223,7 @@ fn array_custom_prototype_supplies_the_method_to_both_consumers() {
             value: f64::from_bits(TAG_UNDEFINED),
         };
         assert_eq!(
-            super::super::iterator_step::js_array_record_stack_enter(
-                &mut stack,
-                std::ptr::null(),
-                0
-            ),
+            super::super::iterator_step::js_array_record_stack_enter(&mut stack, 1, 0),
             1
         );
         assert_eq!(FACTORY_CALLS.with(std::cell::Cell::get), 3);
@@ -341,12 +328,154 @@ fn array_next_shape_read_honours_replacement_accessor_own_and_foreign_edge() {
     }
 }
 
+/// A realm whose `%Array.prototype%` is not materialized yet: no code has
+/// reached the prototype, so its iteration member is still the intrinsic and
+/// iteration needs no resolver (the materialization memo is primed before any
+/// user code, `prime_prototype_addr_cache`).
 #[test]
-fn unresolved_array_prototype_uses_the_property_resolver() {
+fn unmaterialized_array_prototype_iterates_with_the_intrinsic() {
     unsafe {
         assert!(matches!(
             prototype_iterator_method(0),
-            IteratorMethod::Generic
+            IteratorMethod::Intrinsic
         ));
+    }
+}
+
+#[test]
+fn unresolved_intrinsic_prototype_has_the_declared_default_iterator() {
+    // Before a realm is exposed there can be no user write to its slot.
+    // Resolving it need not bootstrap the realm just to rediscover the
+    // runtime-declared intrinsic.
+    unsafe {
+        assert!(matches!(
+            prototype_iterator_method(0),
+            IteratorMethod::Intrinsic
+        ));
+    }
+}
+
+/// Object model step 4: while the array's named holder has no overflow, a
+/// delete of its own @@iterator holes the fixed slot and keeps the layout key
+/// (`shaped_symbols::delete`). Once the holder has an overflow, the overflow
+/// is the order authority: the delete goes through it (the fixed slot still
+/// becomes the hole marker, so iteration continues on the prototype), and a
+/// redefinition is an overflow entry that iteration reaches through the
+/// generic GetMethod. Deleting an absent symbol establishes no overflow.
+#[test]
+fn own_iterator_delete_and_redefine_through_the_holders_overflow() {
+    crate::gc::initialize_runtime_fixture();
+    FACTORY_CALLS.with(|calls| calls.set(0));
+    let _stable = crate::gc::GcSuppressScope::new();
+    unsafe {
+        let arr = super::super::js_array_alloc(1);
+        let arr = super::super::js_array_push_f64(arr, 17.0);
+        let value = crate::value::js_nanbox_pointer(arr as i64);
+        let sym = crate::symbol::well_known_symbol("iterator") as usize;
+        let sym_value = crate::value::js_nanbox_pointer(sym as i64);
+        let method = crate::value::js_nanbox_pointer(crate::closure::js_closure_alloc(
+            crate::fn_info!(factory, 0; with_flags(crate::codegen_abi::FN_PERMANENT_IMAGE)),
+            0,
+        ) as i64);
+        crate::symbol::js_object_set_symbol_property(value, sym_value, method);
+        let owner = super::super::array_property_bag(arr);
+        assert_eq!(
+            crate::object::shaped_symbols::position(owner, sym),
+            Some(crate::object::runtime_layouts::ARRAY_PROTOTYPE_ITERATOR_SLOT),
+            "premise: the own method sits in the declared iterator slot"
+        );
+
+        // An absent symbol: nothing to delete, and no overflow appears.
+        let absent = crate::symbol::js_symbol_new_empty();
+        assert!(crate::object::shaped_symbols::delete(
+            arr as usize,
+            (absent.to_bits() & crate::value::POINTER_MASK) as usize,
+        ));
+        assert!(!crate::object::overflow::has_overflow(owner));
+
+        assert!(crate::object::overflow::establish_order(owner));
+        assert_ne!(
+            crate::symbol::js_object_delete_symbol_property(value, sym_value),
+            0
+        );
+        let owner = super::super::array_property_bag(arr);
+        assert!(crate::object::overflow::has_overflow(owner));
+        assert_eq!(
+            iterator_slot_value(
+                owner,
+                crate::object::runtime_layouts::ARRAY_PROTOTYPE_ITERATOR_SLOT
+            ),
+            crate::value::TAG_HOLE,
+            "the delete holes the fixed slot"
+        );
+        assert_eq!(
+            crate::symbol::js_object_get_symbol_property(value, sym_value).to_bits(),
+            crate::symbol::js_object_get_symbol_property(
+                crate::value::js_nanbox_pointer(super::super::array_prototype_addr() as i64),
+                sym_value,
+            )
+            .to_bits(),
+            "after the delete the method is the prototype's"
+        );
+        let iter = array_shape_iterator(value);
+        let next = super::super::js_iterator_next_method(iter);
+        let mut item = 0.0;
+        assert_eq!(super::super::js_iterator_step(iter, next, &mut item), 0);
+        assert_eq!(item, 17.0);
+        assert_eq!(FACTORY_CALLS.with(std::cell::Cell::get), 0);
+
+        crate::symbol::js_object_set_symbol_property(value, sym_value, method);
+        assert_eq!(
+            crate::symbol::js_object_get_symbol_property(value, sym_value).to_bits(),
+            method.to_bits(),
+            "the redefinition is an own property again"
+        );
+        let owner = super::super::array_property_bag(arr);
+        assert_eq!(
+            iterator_slot_value(
+                owner,
+                crate::object::runtime_layouts::ARRAY_PROTOTYPE_ITERATOR_SLOT
+            ),
+            method.to_bits(),
+            "the redefinition meets the layout's fixed slot (§3.3)"
+        );
+        let iter = array_shape_iterator(value);
+        assert_eq!(
+            FACTORY_CALLS.with(std::cell::Cell::get),
+            1,
+            "iteration calls the redefined own method"
+        );
+        let next = super::super::js_iterator_next_method(iter);
+        assert_eq!(super::super::js_iterator_step(iter, next, &mut item), 0);
+        assert_eq!(item, 17.0);
+
+        // An accessor moves out of the fixed slot into its overflow entry;
+        // the hole there is not absence, and iteration calls the getter.
+        let get = crate::closure::js_closure_alloc(crate::fn_info!(getter, 0), 1);
+        crate::closure::js_closure_set_capture_f64(get, 0, method);
+        crate::object::shaped_symbols::define_accessor(
+            arr as usize,
+            sym,
+            JSValue::pointer(get.cast()).bits(),
+            0,
+        );
+        let owner = super::super::array_property_bag(arr);
+        assert_eq!(
+            iterator_slot_value(
+                owner,
+                crate::object::runtime_layouts::ARRAY_PROTOTYPE_ITERATOR_SLOT
+            ),
+            crate::value::TAG_HOLE,
+            "premise: the accessor lives in the overflow entry"
+        );
+        let iter = array_shape_iterator(value);
+        assert_eq!(
+            FACTORY_CALLS.with(std::cell::Cell::get),
+            2,
+            "iteration calls the own getter's method"
+        );
+        let next = super::super::js_iterator_next_method(iter);
+        assert_eq!(super::super::js_iterator_step(iter, next, &mut item), 0);
+        assert_eq!(item, 17.0);
     }
 }

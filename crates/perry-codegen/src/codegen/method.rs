@@ -468,6 +468,13 @@ pub(super) fn compile_method(
     for p in &method.params {
         local_types.insert(p.id, p.ty.clone());
     }
+    // The body's one seed set (`typed_locals::outer_proofs`); no captures.
+    let outer_proofs = crate::collectors::typed_locals::outer_proofs(
+        None,
+        &cross_module.definite_init,
+        Some(method.id),
+    );
+    crate::collectors::typed_locals::seed_local_types(&outer_proofs, &mut local_types);
     if let Some(index) = guarded_clone_param.filter(|_| guarded_undefined_clone) {
         local_types.insert(method.params[index].id, perry_hir::types::Type::Void);
     }
@@ -488,7 +495,7 @@ pub(super) fn compile_method(
             .return_shape_method_class(&class.name, &method.name, method.id)
             .is_some(),
     );
-    let native_facts = crate::collectors::collect_native_region_fact_graph(
+    let mut native_facts = crate::collectors::collect_native_region_fact_graph(
         method_body,
         &[],
         &flat_const_ids,
@@ -503,6 +510,17 @@ pub(super) fn compile_method(
         &cross_module.module_dispatch,
         // #9363: a method body reads the same module-scope views.
         &cross_module.module_global_proven_types,
+    );
+    // Closed World 5d: the body's typed locals (no entry proofs here).
+    let mut code_unit_locals = std::collections::HashSet::new();
+    let typed_locals = crate::collectors::typed_locals::apply(
+        method_body,
+        &std::collections::HashMap::new(),
+        &outer_proofs,
+        &method_boxed_vars,
+        module_globals,
+        &mut native_facts.representation.number_by_construction_locals,
+        &mut code_unit_locals,
     );
     super::helpers::drop_number_local_root_slots(
         &mut shadow_slot_map,
@@ -580,6 +598,10 @@ pub(super) fn compile_method(
         locals,
         local_types,
         proven_local_types: guarded_param_proofs,
+        typed_locals,
+        code_unit_locals,
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -602,10 +624,15 @@ pub(super) fn compile_method(
         pending_labels: Vec::new(),
         classes,
         class_hierarchy: &cross_module.class_hierarchy,
+        wpfacts: cross_module.wpfacts.clone(),
+        program_layouts: cross_module.program_layouts.clone(),
+        wpfacts_sites: 0,
+        wpfacts_tested: Vec::new(),
+        wpfacts_this: vec![(this_slot.clone(), method.id)],
         this_stack: vec![this_slot],
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: false,
+        lexical_this_uses_derived_binding: None,
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         class_stack: vec![class.name.clone()],
@@ -663,6 +690,7 @@ pub(super) fn compile_method(
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
+        constructed_kind_locals: HashMap::new(),
         namespace_imports: &cross_module.namespace_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
         namespace_member_nested: &cross_module.namespace_member_nested,
@@ -687,6 +715,7 @@ pub(super) fn compile_method(
         imported_class_original_names: &cross_module.imported_class_original_names,
         interfaces: &cross_module.interfaces,
         try_depth: 0,
+        derived_super_closes: Vec::new(),
         pending_declares: Vec::new(),
         pending_helpers: Vec::new(),
         array_record_length_local: None,
@@ -741,6 +770,8 @@ pub(super) fn compile_method(
         spec_ta_ready: std::collections::HashSet::new(),
         spec_i32_params: index_param_ids.clone(),
         spec_bool_params: std::collections::HashSet::new(),
+        typed_element_locals: std::collections::HashSet::new(),
+        class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -828,7 +859,6 @@ pub(super) fn compile_method(
         was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
-        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

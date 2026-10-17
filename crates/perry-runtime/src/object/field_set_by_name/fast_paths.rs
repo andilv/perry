@@ -127,10 +127,10 @@ unsafe fn existing_own_data_overwrite(
     if !shape.object_kind.is_ordinary_layout() {
         return false;
     }
-    // #10868 step 2.5 stage 1: this path takes its bound from the descriptor
-    // and its keys pointer from `object_keys_array`; for a dictionary-mode
-    // receiver those name different arrays.
-    if crate::object::dictionary::is_dictionary(obj) {
+    // This path takes its bound from the layout descriptor and its keys
+    // pointer from `object_keys`; for an object with an overflow those name
+    // different lists.
+    if crate::object::overflow::has_overflow(obj) {
         return false;
     }
     let live_slots = shape.live_inline_slot_count;
@@ -221,13 +221,14 @@ unsafe fn existing_own_data_overwrite(
         return false;
     }
 
+    let idx = crate::object::key_attrs::key_storage_slot(keys, idx);
     let vbits = value.to_bits();
     let vbits = if (vbits >> 48) == 0x7FFD && (vbits & 0x0000_FFFF_FFFF_FFFF) == 0 {
         crate::value::TAG_UNDEFINED
     } else {
         vbits
     };
-    let alloc_limit = std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+    let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
     if idx < live_slots {
         // An overwrite of a key the shape already places in a live inline
         // slot keeps the receiver's ShapeId, the layout a class-field read
@@ -305,7 +306,8 @@ pub(crate) fn object_set_field_by_name_transition_only_fast_value(
 
 /// [`object_set_field_by_name_transition_only_fast_value`] for a CLASS
 /// instance whose store site has already proved the prototype chain does not
-/// intercept this key (`object::chain_store`). The plain-object lane refuses
+/// intercept this key (`object::store_key::mark_chain_hops`, then
+/// `class_instance_set_may_intercept`). The plain-object lane refuses
 /// class instances because it cannot prove that itself; with the proof in
 /// hand the append is the same one a plain object takes. Every other check —
 /// receiver kind and flags, an own descriptor for the key, the transition
@@ -352,16 +354,17 @@ pub(crate) unsafe fn add_absent_key_to_null_proto_object(
     let Some((next_keys, slot_idx, target_shape_id)) = edge.transition() else {
         return true;
     };
-    if !super::shapes::install_cached_object_shape_transition(
+    if !super::shapes::install_cached_object_shape_key_add(
         obj,
         prev_shape_id,
         target_shape_id,
         next_keys,
+        key,
     ) {
         set_object_keys(obj, next_keys);
     }
     let live_slots = crate::object::object_live_slot_count(obj);
-    let alloc_limit = std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+    let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
     let vbits = value.to_bits();
     let vbits = if (vbits >> 48) == 0x7FFD && (vbits & 0x0000_FFFF_FFFF_FFFF) == 0 {
         crate::value::TAG_UNDEFINED
@@ -484,7 +487,7 @@ pub(crate) fn try_readd_stable_tombstone(
 
         let new_index = shape.logical_key_count;
         let live_slots = shape.live_inline_slot_count;
-        let alloc_limit = live_slots.max(crate::object::INLINE_SLOT_FLOOR as u32);
+        let alloc_limit = crate::object::object_inline_capacity(obj);
         let old_keys_handle = scope.root_raw_mut_ptr(keys);
         let ((new_keys, old_keys), obj) = obj_handle.across_mut::<ObjectHeader, _>(|| {
             old_keys_handle.across_mut::<ArrayHeader, _>(|| {
@@ -577,9 +580,7 @@ unsafe fn try_readd_stable_tombstone_sso_no_grow(
         return None;
     }
     let new_index = shape.logical_key_count;
-    let alloc_limit = shape
-        .live_inline_slot_count
-        .max(crate::object::INLINE_SLOT_FLOOR as u32);
+    let alloc_limit = crate::object::object_inline_capacity(obj);
     let next_live = if new_index < alloc_limit {
         shape.live_inline_slot_count.max(new_index + 1)
     } else {
@@ -760,7 +761,7 @@ fn object_set_field_by_name_transition_fast_impl_value<const CHAIN_PROVEN: bool>
         // can already have a twin in the existing atom table. Resolve that
         // word without allocating before declining to the rooted fallback.
         let key = if CHAIN_PROVEN && !already_interned {
-            super::chain_store::interned_key_for_store(crate::value::js_nanbox_string(key as i64))?
+            super::store_key::interned_key_for_store(crate::value::js_nanbox_string(key as i64))?
         } else {
             key
         };
@@ -860,11 +861,12 @@ fn object_set_field_by_name_transition_fast_impl_value<const CHAIN_PROVEN: bool>
             return Some(value);
         };
 
-        let cached_install = super::shapes::install_cached_object_shape_transition(
+        let cached_install = super::shapes::install_cached_object_shape_key_add(
             obj,
             prev_shape_id,
             target_shape_id,
             next_keys,
+            interned_key,
         );
         if !cached_install {
             // A remint is not covered by the non-collecting cached stamp.
@@ -877,8 +879,7 @@ fn object_set_field_by_name_transition_fast_impl_value<const CHAIN_PROVEN: bool>
 
         // #8113: one bound probe, reused.
         let live_slots = crate::object::object_live_slot_count(obj);
-        let alloc_limit =
-            std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+        let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
         let slot_usize = slot_idx as usize;
         let vbits = value.to_bits();
         let vbits = if (vbits >> 48) == 0x7FFD && (vbits & 0x0000_FFFF_FFFF_FFFF) == 0 {

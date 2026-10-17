@@ -55,7 +55,7 @@ pub(crate) unsafe fn call_replacer(
 /// NaN-box a heap object/array pointer as the holder `this` for `call_replacer`.
 #[inline]
 unsafe fn holder_value(ptr: *const u8) -> f64 {
-    f64::from_bits(POINTER_TAG | (ptr as u64 & POINTER_MASK))
+    f64::from_bits(super::make_pointer_bits(ptr))
 }
 
 /// Build the spec root holder `{ "": value }` (ECMA-262 `JSON.stringify` step:
@@ -404,6 +404,11 @@ pub(crate) unsafe fn stringify_object_with_replacer_pretty(
         buf.push_str("{}");
         return;
     };
+    // A layout that keeps its own storage slots reads each key through them.
+    let slotted = crate::object::key_attrs::keys_have_slots(keys_view.arr(), keys_view.count());
+    if !slotted {
+        crate::object::key_attrs::debug_assert_positional(keys_view.arr(), keys_view.count());
+    }
     let keys_arr = keys_view.arr() as *const crate::ArrayHeader;
     let keys_root = gc_scope.root_raw_const_ptr(keys_arr);
     let keys_len = keys_view.count();
@@ -433,11 +438,15 @@ pub(crate) unsafe fn stringify_object_with_replacer_pretty(
         crate::object::field_get_set::own_keys_may_hide(ptr as *const crate::ObjectHeader);
     buf.push('{');
     let mut first = true;
-    for f in 0..actual_fields {
+    // OrdinaryOwnPropertyKeys order: array indices ascending, then strings.
+    let key_order = crate::object::ecma_own_key_order(keys_view);
+    for j in 0..actual_fields {
+        let f = key_order.as_ref().map_or(j, |order| order[j as usize]);
         let obj = obj_root.get_raw_const_ptr::<crate::ObjectHeader>();
-        let keys_elements =
-            crate::array::array_elements_ptr(keys_root.get_raw_const_ptr::<crate::ArrayHeader>())
-                as *const f64;
+        let keys_elements = crate::object::keys_array_dense_slots(
+            keys_root.get_raw_const_ptr::<crate::ArrayHeader>(),
+        )
+        .0;
         let fields_ptr = (obj_root.get_raw_const_ptr::<u8>())
             .add(std::mem::size_of::<crate::ObjectHeader>()) as *const f64;
         let replacer = replacer_root.get_raw_const_ptr::<crate::ClosureHeader>();
@@ -493,10 +502,10 @@ pub(crate) unsafe fn stringify_object_with_replacer_pretty(
         // resolve toJSON, then apply the replacer. Overflow slots (f >=
         // alloc_limit) route through js_object_get_field's OVERFLOW_FIELDS
         // lookup.
-        let mut field_val = if f < alloc_limit {
+        let mut field_val = if f < alloc_limit && !slotted {
             *fields_ptr.add(f as usize)
         } else {
-            f64::from_bits(crate::object::js_object_get_field(obj, f).bits())
+            f64::from_bits(crate::object::field_get_set::js_object_get_key_field(obj, f).bits())
         };
         if filter_non_enum && f < keys_len {
             if let Some(gv) =
@@ -996,7 +1005,12 @@ pub(crate) unsafe fn stringify_object_pretty(
     // in-range-but-unmapped garbage address (a denormal double that survived the
     // tag probes) SIGSEGVs here. Require a genuinely GC-tracked allocation first
     // and emit `null` otherwise, rather than faulting inside JSON.stringify.
-    if !super::stringify::ptr_is_tracked_heap_object(ptr) {
+    if crate::value::addr_class::try_read_tracked_gc_header_of_type(
+        ptr as usize,
+        crate::gc::GC_TYPE_OBJECT,
+    )
+    .is_none()
+    {
         buf.push_str("null");
         return;
     }
@@ -1031,8 +1045,13 @@ pub(crate) unsafe fn stringify_object_pretty(
         buf.push_str("{}");
         return;
     };
+    // A layout that keeps its own storage slots reads each key through them.
+    let slotted = crate::object::key_attrs::keys_have_slots(keys_view.arr(), keys_view.count());
+    if !slotted {
+        crate::object::key_attrs::debug_assert_positional(keys_view.arr(), keys_view.count());
+    }
     let keys_len = keys_view.count();
-    let keys_elements = crate::array::array_elements_ptr(keys_view.arr()) as *const f64;
+    let keys_elements = crate::object::keys_array_dense_slots(keys_view.arr()).0;
     let fields_ptr =
         (ptr as *const u8).add(std::mem::size_of::<crate::ObjectHeader>()) as *const f64;
     // Iterate keys_len, not min(...): ≥9-field objects keep overflow values in
@@ -1054,7 +1073,10 @@ pub(crate) unsafe fn stringify_object_pretty(
 
     // Collect non-undefined, non-closure fields
     let mut entries: Vec<(String, f64)> = Vec::new();
-    for f in 0..actual_fields {
+    // OrdinaryOwnPropertyKeys order: array indices ascending, then strings.
+    let key_order = crate::object::ecma_own_key_order(keys_view);
+    for j in 0..actual_fields {
+        let f = key_order.as_ref().map_or(j, |order| order[j as usize]);
         // #9398: tombstoned slot from an O(1) delete — not a key, not
         // serialized. See `tombstoned_key_slot`.
         if tombstoned_key_slot(*keys_elements.add(f as usize))
@@ -1080,10 +1102,10 @@ pub(crate) unsafe fn stringify_object_pretty(
         {
             continue;
         }
-        let mut field_val = if f < alloc_limit {
+        let mut field_val = if f < alloc_limit && !slotted {
             *fields_ptr.add(f as usize)
         } else {
-            f64::from_bits(crate::object::js_object_get_field(obj, f).bits())
+            f64::from_bits(crate::object::field_get_set::js_object_get_key_field(obj, f).bits())
         };
         // Own accessor properties: serialize the getter's return value.
         if filter_non_enum && f < keys_len {
@@ -1167,7 +1189,12 @@ pub(crate) unsafe fn stringify_array_pretty(
     // Same gate as `stringify_object_pretty`: this is the fall-through branch for
     // a pointer that failed the object probes, so a corrupted pointer lands here
     // and the `(*arr).length` read below would fault.
-    if !super::stringify::ptr_is_tracked_heap_object(ptr) {
+    if crate::value::addr_class::try_read_tracked_gc_header_of_type(
+        ptr as usize,
+        crate::gc::GC_TYPE_ARRAY,
+    )
+    .is_none()
+    {
         buf.push_str("null");
         return;
     }
@@ -1247,8 +1274,13 @@ pub(crate) unsafe fn stringify_object_with_array_replacer(
         buf.push_str("{}");
         return;
     };
+    // A layout that keeps its own storage slots reads each key through them.
+    let slotted = crate::object::key_attrs::keys_have_slots(keys_view.arr(), keys_view.count());
+    if !slotted {
+        crate::object::key_attrs::debug_assert_positional(keys_view.arr(), keys_view.count());
+    }
     let keys_len = keys_view.count();
-    let keys_elements = crate::array::array_elements_ptr(keys_view.arr()) as *const f64;
+    let keys_elements = crate::object::keys_array_dense_slots(keys_view.arr()).0;
     let fields_ptr =
         (ptr as *const u8).add(std::mem::size_of::<crate::ObjectHeader>()) as *const f64;
     // Iterate keys_len, not min(...): ≥9-field objects keep overflow values in
@@ -1272,7 +1304,10 @@ pub(crate) unsafe fn stringify_object_with_array_replacer(
     let hide_private =
         crate::object::field_get_set::own_keys_may_hide(ptr as *const crate::ObjectHeader);
     let mut field_map: Vec<(String, f64)> = Vec::new();
-    for f in 0..actual_fields {
+    // OrdinaryOwnPropertyKeys order: array indices ascending, then strings.
+    let key_order = crate::object::ecma_own_key_order(keys_view);
+    for j in 0..actual_fields {
+        let f = key_order.as_ref().map_or(j, |order| order[j as usize]);
         // #9398: tombstoned slot from an O(1) delete — not a key, not
         // serialized. See `tombstoned_key_slot`.
         if tombstoned_key_slot(*keys_elements.add(f as usize))
@@ -1290,10 +1325,10 @@ pub(crate) unsafe fn stringify_object_with_array_replacer(
         {
             continue;
         }
-        let mut field_val = if f < alloc_limit {
+        let mut field_val = if f < alloc_limit && !slotted {
             *fields_ptr.add(f as usize)
         } else {
-            f64::from_bits(crate::object::js_object_get_field(obj, f).bits())
+            f64::from_bits(crate::object::field_get_set::js_object_get_key_field(obj, f).bits())
         };
         if filter_non_enum && f < keys_len {
             if let Some(gv) =

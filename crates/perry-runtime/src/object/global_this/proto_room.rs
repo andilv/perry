@@ -27,18 +27,12 @@ pub(crate) const BUILTIN_PROTOTYPE_ROOM: u32 = 64;
 /// A fresh builtin prototype object with [`BUILTIN_PROTOTYPE_ROOM`] inline
 /// slots. Its caller installs its keys and then calls
 /// [`fit_builtin_prototype`].
+///
+/// Born old and never-move (owner decision O3, `gc::never_move`): every site
+/// memo that answers from a builtin prototype (`%Object.prototype%` above all,
+/// the terminal of most absent reads) is admitted from the first prime.
 pub(crate) fn alloc_builtin_prototype() -> *mut ObjectHeader {
-    js_object_alloc(0, BUILTIN_PROTOTYPE_ROOM)
-}
-
-per_test_global! {
-    static FITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-}
-
-/// Builtin prototypes whose unused room was returned (diagnostic, tests).
-#[cfg(test)]
-pub(crate) fn builtin_prototypes_fitted() -> u64 {
-    FITTED.load(Ordering::Relaxed)
+    crate::object::object_alloc_prototype_old(0, BUILTIN_PROTOTYPE_ROOM)
 }
 
 /// Shrink a builtin prototype born by [`alloc_builtin_prototype`] to the
@@ -72,7 +66,6 @@ pub(crate) unsafe fn fit_builtin_prototype(obj: *mut ObjectHeader) {
     {
         return;
     }
-    FITTED.fetch_add(1, Ordering::Relaxed);
     if !crate::arena::pointer_in_nursery(obj as usize) {
         return;
     }
@@ -105,9 +98,49 @@ pub(crate) unsafe fn fit_builtin_prototype(obj: *mut ObjectHeader) {
 mod tests {
     use super::*;
 
+    /// `%Array.prototype%`'s named holder (its property bag) is born old and
+    /// never-move like every builtin prototype, so an array method site's
+    /// memo admits it before any minor has run.
+    #[test]
+    fn array_prototype_bag_is_born_old_and_never_move() {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(|| unsafe {
+                crate::object::js_get_global_this();
+                let proto = crate::array::array_prototype_addr();
+                assert_ne!(proto, 0, "no %Array.prototype%");
+                let bag =
+                    crate::array::array_property_bag(proto as *const crate::array::ArrayHeader);
+                assert!(!bag.is_null(), "%Array.prototype% has no property bag");
+                let header =
+                    (bag as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+                // Never-move from birth (asked before the memo rule, which
+                // would mark it), and admitted by that rule: old.
+                assert!(crate::gc::never_move::is_never_move(header));
+                assert!(
+                    crate::gc::never_move::stable_memo_referent(bag as usize),
+                    "%Array.prototype%'s bag is young"
+                );
+                let d = crate::object::shapes::object_shape_descriptor(bag).expect("shape");
+                let list = d.keys as usize as *const crate::array::ArrayHeader;
+                for name in ["constructor", "slice", "toString"] {
+                    let s = crate::object::keys_find_slot_by_bytes_resolved(
+                        list,
+                        d.logical_key_count,
+                        name.as_bytes(),
+                    )
+                    .unwrap_or_else(|| panic!("{name} missing"));
+                    assert!(s < d.live_inline_slot_count, "{name} is not inline");
+                }
+            })
+            .expect("spawn")
+            .join()
+            .expect("array-prototype bag test panicked");
+    }
+
     /// `%Object.prototype%` holds its own keys inline (the method site's
-    /// inherited entry reads them there), its live bound is exactly what they
-    /// use, and the allocation's unused room went back.
+    /// inherited entry reads them there) and its live bound is exactly what
+    /// they use: it is born on its static layout, with no room to return.
     #[test]
     fn object_prototype_keys_are_inline_and_the_room_is_returned() {
         std::thread::Builder::new()
@@ -115,7 +148,6 @@ mod tests {
             .spawn(|| unsafe {
                 let (_, proto) = ensure_object_intrinsics();
                 assert!(!proto.is_null());
-                assert!(builtin_prototypes_fitted() > 0, "no prototype was fitted");
                 let d = crate::object::shapes::object_shape_descriptor(proto).expect("shape");
                 let keys = d.logical_key_count;
                 assert!(keys >= 7, "%Object.prototype% has {keys} keys");

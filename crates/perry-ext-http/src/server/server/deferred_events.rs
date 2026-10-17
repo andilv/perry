@@ -30,30 +30,24 @@ unsafe extern "C" fn call_deferred_callbacks(data: *mut std::ffi::c_void) -> f64
 }
 
 /// #4903 — record a pending `'listening'` emit on a server (http / https /
-/// http2 all share the `HttpServer` base). Node registers the
-/// `listen(port, cb)` callback as a *once* `'listening'` listener inside
-/// `listen()`, so the callback goes into the live listener list (correct
-/// emit order vs. listeners added before/after `listen()`) and into
-/// `deferred_listen_cbs`, which the pump uses to remove it again after
-/// the emit fires.
-pub(crate) fn queue_deferred_listening_emit(s: &mut HttpServer, callback: i64) {
+/// http2 all share the `HttpServer` base). The `listen(port, cb)` callback is
+/// not an argument: `register_listen_callback` already put it on the server
+/// when `listen()` was entered (`ListenArgs::settle`), before the bind.
+pub(crate) fn queue_deferred_listening_emit(s: &mut HttpServer) {
     let was_active = server_is_active(s);
     s.pending_listening_emit = true;
-    if callback != 0 {
-        s.listeners
-            .entry("listening".to_string())
-            .or_default()
-            .push(callback);
-        s.deferred_listen_cbs.push(callback);
-    }
     s.finish_activity_change(was_active);
 }
 
-/// Register a `listen(port, cb)` callback ahead of the bind, for a `listen()`
-/// whose bind was posted to the thread that owns the loop. The callback is
-/// rooted from here on (it is in `deferred_listen_cbs`); the `'listening'`
-/// emit itself is armed by `queue_deferred_listening_emit` once the bind has
-/// succeeded on the owner.
+/// Register a `listen(port, cb)` callback on entry to `listen()`, ahead of
+/// everything that can allocate (the options stringify, the bind). Node
+/// registers it as a *once* `'listening'` listener inside `listen()`, so it
+/// goes into the live listener list (correct emit order vs. listeners added
+/// before/after `listen()`) and into `deferred_listen_cbs`, which the pump
+/// uses to remove it again after the emit fires. Both are scanned and
+/// rewritten by `scan_http_server_roots`, so the closure is rooted from here
+/// on; `queue_deferred_listening_emit` arms the emit once the bind succeeds,
+/// `withdraw_listen_callbacks` undoes this when it fails.
 pub(crate) fn register_listen_callback(s: &mut HttpServer, callback: i64) {
     let was_active = server_is_active(s);
     if callback != 0 {
@@ -316,16 +310,11 @@ fn listen_error_message(err: &ListenError) -> String {
 /// receiver **before the next store**, because a field write can collect and a
 /// raw local would be read back stale (#8082).
 unsafe fn build_listen_error_value(err: &ListenError) -> f64 {
-    let keys: [&str; 7] = [
-        "message", "code", "name", "errno", "syscall", "address", "port",
-    ];
-    let (packed, shape_id) = perry_ffi::build_object_shape(&keys);
-    let obj: *mut perry_ffi::ObjectHeader = perry_ffi::js_object_alloc_with_shape(
-        shape_id,
-        keys.len() as u32,
-        packed.as_ptr(),
-        packed.len() as u32,
-    );
+    let obj: *mut perry_ffi::ObjectHeader = unsafe {
+        perry_ffi::runtime_layouts::alloc_runtime_record(std::ptr::addr_of!(
+            perry_ffi::runtime_layouts::RECORD_F17_0
+        ))
+    };
     if obj.is_null() {
         return listen_error_message_value(err);
     }
@@ -576,7 +565,7 @@ mod listen_error_tests {
     #[test]
     fn queueing_an_error_cancels_a_pending_listening_emit() {
         let mut server = HttpServer::with_handler(0);
-        queue_deferred_listening_emit(&mut server, 0);
+        queue_deferred_listening_emit(&mut server);
         server.set_listening(true);
         queue_deferred_error_emit(&mut server, err("EADDRINUSE", "127.0.0.1", 47421));
         assert!(!server.pending_listening_emit);

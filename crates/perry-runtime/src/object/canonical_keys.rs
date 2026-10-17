@@ -85,8 +85,8 @@
 //! keys: a second shape for one layout, and a static ShapeId (which names the
 //! one canonical list of its keys) refused by the mint of its own facts.
 
+use crate::fast_hash::{new_fast_key_hash_map, FastKeyHashMap};
 use std::cell::RefCell;
-use std::collections::HashMap;
 
 use crate::array::ArrayHeader;
 use crate::JSValue;
@@ -140,8 +140,8 @@ pub(crate) struct CanonicalKeys {
 }
 
 impl CanonicalKeys {
-    /// The empty ordered key list. A keyless shape's `keys` fact is 0, so the
-    /// root of the trie owns no array and costs nothing.
+    /// The empty list without a backing. Class globals use `empty_backing`
+    /// for their non-null ABI spelling; both lists extend from the trie root.
     pub(crate) const EMPTY: CanonicalKeys = CanonicalKeys {
         arr: std::ptr::null_mut(),
         count: 0,
@@ -270,7 +270,7 @@ impl SharedLayout {
     /// `obj` is a live object header, or null.
     #[inline]
     pub(crate) unsafe fn of_receiver(obj: *mut crate::object::ObjectHeader) -> Option<Self> {
-        if obj.is_null() || crate::object::dictionary::is_dictionary(obj) {
+        if obj.is_null() || crate::object::overflow::has_overflow(obj) {
             return None;
         }
         Some(SharedLayout { _private: () })
@@ -288,14 +288,14 @@ impl SharedLayout {
 }
 
 const NO_NODE: u32 = u32::MAX;
-/// The empty list. Never freed, owns no array.
+/// The permanent empty node. Its optional backing follows the weak prune.
 const ROOT_NODE: u32 = 0;
 
 struct Node {
     /// Weak backing array. A published node's list is its first `len`
     /// entries; an unpublished prefix borrows a descendant's backing only for
-    /// edge validation and never exposes it as its keys. 0 denotes the root or
-    /// a free slot.
+    /// edge validation and never exposes it as its keys. 0 denotes an
+    /// unbacked root or a free slot.
     addr: usize,
     published: bool,
     parent: u32,
@@ -333,9 +333,9 @@ pub(crate) struct CanonicalTable {
     free: u32,
     /// `(backing address, count)` -> published node id. Many lists share one
     /// backing, so the address alone names a chain, not a list.
-    by_addr: HashMap<(usize, u32), u32>,
+    by_addr: FastKeyHashMap<(usize, u32), u32>,
     /// `(parent node, appended-slot hash)` -> first candidate node.
-    edges: HashMap<(u32, u64), u32>,
+    edges: FastKeyHashMap<(u32, u64), u32>,
     /// `(backing, count, node)` of the list the last append CREATED, for the
     /// publish that immediately follows it ([`take_unique_run`]).
     last_created: (usize, u32, u32),
@@ -364,8 +364,11 @@ impl CanonicalTable {
                 run: 0,
             }],
             free: NO_NODE,
-            by_addr: HashMap::new(),
-            edges: HashMap::new(),
+            // Both keys contain internal numeric identities, with slot text
+            // already hashed and content-validated by the trie. Use the
+            // existing composite-word fold, preserving both tuple fields.
+            by_addr: new_fast_key_hash_map(),
+            edges: new_fast_key_hash_map(),
             last_created: (0, 0, NO_NODE),
             minted: 0,
             reaped: 0,
@@ -708,7 +711,7 @@ impl Appended {
     ///
     /// # Safety
     /// The operand is live.
-    unsafe fn edge_hash(self, entry: u8) -> u64 {
+    unsafe fn edge_hash(self, entry: u64) -> u64 {
         edge_hash_with_entry(self.slot_hash(), entry)
     }
 
@@ -851,11 +854,11 @@ impl Appended {
 }
 
 #[inline]
-fn edge_hash_with_entry(hash: u64, entry: u8) -> u64 {
+fn edge_hash_with_entry(hash: u64, entry: u64) -> u64 {
     if entry == 0 {
         hash
     } else {
-        (hash ^ u64::from(entry).wrapping_mul(0x9E37_79B9_7F4A_7C15)).rotate_left(29)
+        (hash ^ entry.wrapping_mul(0x9E37_79B9_7F4A_7C15)).rotate_left(29)
     }
 }
 
@@ -877,7 +880,7 @@ unsafe fn probe_node(
     pnode: u32,
     parent_len: u32,
     appended: Appended,
-    entry: u8,
+    entry: u64,
     h: u64,
 ) -> Option<u32> {
     probe_matching_node(t, pnode, parent_len, entry, h, |stored| {
@@ -893,7 +896,7 @@ unsafe fn probe_matching_node(
     t: &CanonicalTable,
     pnode: u32,
     parent_len: u32,
-    entry: u8,
+    entry: u64,
     h: u64,
     matches: impl Fn(JSValue) -> bool,
 ) -> Option<u32> {
@@ -913,7 +916,9 @@ unsafe fn probe_matching_node(
                     // The attribute entry is half of the edge: the same key
                     // with other attributes is a different list.
                     if matches(stored)
-                        && crate::object::key_attrs::keys_entry(arr, parent_len) == entry
+                        && crate::object::key_attrs::token_of_word(
+                            crate::object::key_attrs::key_word(arr, parent_len),
+                        ) == entry
                     {
                         return Some(cur);
                     }
@@ -929,7 +934,7 @@ unsafe fn probe(
     parent: CanonicalKeys,
     parent_len: u32,
     appended: Appended,
-    entry: u8,
+    entry: u64,
     h: u64,
 ) -> Option<CanonicalKeys> {
     with_table_or(None, |t| {
@@ -964,7 +969,7 @@ pub(crate) unsafe fn probe_born_layout(
         let mut parent = ROOT_NODE;
         for (i, (key, _)) in entries.iter().enumerate() {
             let bytes = key.as_bytes();
-            let entry = attrs.get(i).copied().unwrap_or(0);
+            let entry = attrs.get(i).copied().unwrap_or(0) as u64;
             let h = crate::object::key_bytes_hash(bytes.as_ptr(), bytes.len());
             let h = edge_hash_with_entry(h, entry);
             parent = probe_matching_node(t, parent, i as u32, entry, h, |stored| {
@@ -1003,11 +1008,23 @@ unsafe fn stamp_shared(arr: *mut ArrayHeader) {
 /// `parent` names a live canonical array (or is empty), `appended` is live,
 /// and the caller has rooted everything it holds across the allocation this
 /// may perform.
+#[inline(always)]
 pub(crate) unsafe fn extend_slot(
-    _proof: &SharedLayout,
+    proof: &SharedLayout,
     parent: CanonicalKeys,
     appended: Appended,
     entry: u8,
+) -> CanonicalKeys {
+    extend_token(proof, parent, appended, entry as u64)
+}
+
+/// [`extend_slot`] for a trie token ([`key_attrs::token_of_word`]): a key
+/// re-appended from an existing list keeps its own storage slot.
+unsafe fn extend_token(
+    _proof: &SharedLayout,
+    parent: CanonicalKeys,
+    appended: Appended,
+    entry: u64,
 ) -> CanonicalKeys {
     let h = appended.edge_hash(entry);
     let parent_len = parent.len();
@@ -1036,8 +1053,8 @@ pub(crate) unsafe fn extend_slot(
     }
     // The child carries an attributes array iff some entry of it is not the
     // default: the parent's summary is exact for a canonical prefix.
-    let with_attrs = entry != 0
-        || crate::object::key_attrs::keys_summary(parent.as_const_ptr(), parent_len) != 0;
+    let with_attrs =
+        entry != 0 || crate::object::key_attrs::keys_need_attrs(parent.as_const_ptr(), parent_len);
 
     // Nothing may be held across the allocation: no table borrow (a collection
     // re-enters this table through its scanner and its prune) and both
@@ -1111,7 +1128,7 @@ pub(crate) unsafe fn extend_slot(
         // copied with its keys, exactly like the keys themselves.
         let attrs = crate::object::key_attrs::keys_attrs(fresh);
         crate::object::key_attrs::copy_entries(parent.as_const_ptr(), 0, attrs, parent_len);
-        crate::object::key_attrs::attrs_write(
+        crate::object::key_attrs::attrs_write_token(
             attrs,
             parent_len,
             entry,
@@ -1179,7 +1196,7 @@ fn backing_capacity(len: u32) -> u32 {
 unsafe fn append_at_tip(
     parent: CanonicalKeys,
     appended: Appended,
-    entry: u8,
+    entry: u64,
     h: u64,
     parent_all_ptr: bool,
     all_ptr: bool,
@@ -1217,7 +1234,7 @@ unsafe fn append_at_tip(
     if !attrs.is_null() {
         // Past every published count, like the key slot: no list sharing the
         // backing sees it until the length below covers it.
-        crate::object::key_attrs::attrs_write(
+        crate::object::key_attrs::attrs_write_token(
             attrs,
             parent_len,
             entry,
@@ -1321,13 +1338,15 @@ pub(crate) unsafe fn rebuild_with_entries(
             );
             (
                 JSValue::from_bits((*slots.add(pos as usize)).to_bits()),
-                crate::object::key_attrs::keys_entry(arr, pos),
+                crate::object::key_attrs::token_of_word(crate::object::key_attrs::key_word(
+                    arr, pos,
+                )),
             )
         });
-        let entry = entry_at(pos, slot, old);
+        let entry = (old & !0xff) | u64::from(entry_at(pos, slot, old as u8));
         // `extend_slot` roots its operands across its own allocation.
         let next = list.with_mut_ptr(|arr: *mut ArrayHeader| {
-            extend_slot(
+            extend_token(
                 proof,
                 CanonicalKeys::new(arr, len),
                 Appended::Slot(slot),
@@ -1360,8 +1379,11 @@ pub(crate) unsafe fn canonicalize(
     keys: *const ArrayHeader,
     len: u32,
 ) -> CanonicalKeys {
-    if keys.is_null() || len == 0 {
+    if keys.is_null() {
         return CanonicalKeys::EMPTY;
+    }
+    if len == 0 {
+        return empty_backing(_proof);
     }
     let already = with_table_or(false, |t| t.by_addr.contains_key(&(keys as usize, len)));
     if already {
@@ -1376,7 +1398,9 @@ pub(crate) unsafe fn canonicalize(
         let mut parent = ROOT_NODE;
         for i in 0..len {
             let slot = Appended::Slot(JSValue::from_bits((*slots.add(i as usize)).to_bits()));
-            let entry = crate::object::key_attrs::keys_entry(keys, i);
+            let entry = crate::object::key_attrs::token_of_word(
+                crate::object::key_attrs::key_word(keys, i),
+            );
             parent = probe_node(t, parent, i, slot, entry, slot.edge_hash(entry))?;
         }
         let node = &t.nodes[parent as usize];
@@ -1409,7 +1433,9 @@ pub(crate) unsafe fn canonicalize(
     let dst = crate::array::array_elements_ptr(fresh) as *mut f64;
     // GC_STORE_AUDIT(INIT): fresh is unpublished; publish length only after
     // all elements are initialized, with no intervening GC allocation.
-    std::ptr::copy_nonoverlapping(slots, dst, len as usize);
+    for i in 0..len as usize {
+        dst.add(i).write(*slots.add(i));
+    }
     // Every heap key of the new list is its text's atom where one exists (see
     // `Appended::atomized`). Heap string to heap string, so `all_ptr` holds.
     for i in 0..len as usize {
@@ -1447,7 +1473,9 @@ pub(crate) unsafe fn canonicalize(
         let mut prefix_all_ptr = true;
         for i in 0..len {
             let slot = Appended::Slot(JSValue::from_bits((*dst.add(i as usize)).to_bits()));
-            let entry = crate::object::key_attrs::keys_entry(fresh, i);
+            let entry = crate::object::key_attrs::token_of_word(
+                crate::object::key_attrs::key_word(fresh, i),
+            );
             let h = slot.edge_hash(entry);
             prefix_all_ptr &= slot.is_pointer();
             parent = match probe_node(t, parent, i, slot, entry, h) {
@@ -1463,6 +1491,29 @@ pub(crate) unsafe fn canonicalize(
             t.own_backing(parent, len);
             CanonicalKeys::new(fresh, len)
         }
+    })
+}
+
+/// The non-null spelling of the empty list required by class keys globals.
+/// It belongs to the trie's root, just as every nonempty backing belongs to
+/// its node. The root's backing is weak and is cleared by the same full-trace
+/// prune; there is no separate singleton cache or immortal allocation.
+pub(crate) unsafe fn empty_backing(_proof: &SharedLayout) -> CanonicalKeys {
+    if let Some(addr) = with_table_or(None, |t| {
+        let root = &t.nodes[ROOT_NODE as usize];
+        root.published.then_some(root.addr)
+    }) {
+        return CanonicalKeys::new(addr as *mut ArrayHeader, 0);
+    }
+    let fresh = crate::array::js_array_alloc_canonical_keys(0, true, false);
+    stamp_shared(fresh);
+    with_table_or(CanonicalKeys::new(fresh, 0), |t| {
+        // Allocation can collect, so resolve the root again after it.
+        if !t.nodes[ROOT_NODE as usize].published {
+            t.publish(ROOT_NODE, fresh as usize, true);
+            t.own_backing(ROOT_NODE, 0);
+        }
+        CanonicalKeys::new(t.nodes[ROOT_NODE as usize].addr as *mut ArrayHeader, 0)
     })
 }
 
@@ -1495,12 +1546,14 @@ pub(crate) unsafe fn rebuild_removing(
             );
             (
                 JSValue::from_bits((*slots.add(pos as usize)).to_bits()),
-                crate::object::key_attrs::keys_entry(arr, pos),
+                crate::object::key_attrs::token_of_word(crate::object::key_attrs::key_word(
+                    arr, pos,
+                )),
             )
         });
         // `extend_slot` roots its operands across its own allocation.
         let next = list.with_mut_ptr(|arr: *mut ArrayHeader| {
-            extend_slot(
+            extend_token(
                 proof,
                 CanonicalKeys::new(arr, len),
                 Appended::Slot(slot),
@@ -1525,7 +1578,7 @@ pub(crate) fn prune_dead_canonical_keys(is_dead_owner: &dyn Fn(usize) -> bool) {
     let live: Vec<(u32, usize)> = CANONICAL_KEYS
         .try_with(|t| {
             let t = t.borrow();
-            (1..t.nodes.len())
+            (0..t.nodes.len())
                 .filter(|&id| t.nodes[id].addr != 0)
                 .map(|id| (id as u32, t.nodes[id].addr))
                 .collect()
@@ -1540,6 +1593,14 @@ pub(crate) fn prune_dead_canonical_keys(is_dead_owner: &dyn Fn(usize) -> bool) {
         return;
     }
     try_with_table(|t| {
+        if dead.contains(&ROOT_NODE) {
+            let root = &mut t.nodes[ROOT_NODE as usize];
+            t.by_addr.remove(&(root.addr, 0));
+            root.addr = 0;
+            root.published = false;
+            CANON_PUBLISHED.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            CANON_BACKINGS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
         t.retire_dead(&dead);
     });
 }

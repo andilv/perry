@@ -38,12 +38,15 @@
 //! (null-proto, chained through a non-identifier key), so closure captures
 //! keep whole scope chains alive through the normal object graph.
 //!
-//! Exception discipline: throws use the runtime's setjmp/longjmp machinery.
-//! Interpreted `try` installs a Rust-side landing pad with the same
-//! `crate::ffi::setjmp` idiom the microtask pump uses; a throw that escapes
-//! the interpreter entirely unwinds to the caller's compiled `try`. The
-//! roots stack is restored via a per-try-depth savepoint recorded by
-//! `js_try_push` (see `exception.rs`), mirroring the shadow-stack savepoint.
+//! Exception discipline: throws use the runtime's landing-pad transport.
+//! Interpreted `try` runs its protected block under a runtime trap
+//! (`crate::exception::trap`); a throw that escapes the interpreter entirely
+//! unwinds to the caller's handler. The interpreter keeps its own state
+//! balanced across that (design §1.1, "dyn_eval"): every entry into
+//! interpreted code ([`interp_entry`]) and every interpreted `try` records
+//! the rooted-stack length and call depth, and restores them when a throw
+//! lands, before it rethrows or handles it. Nothing is recorded by a
+//! compiled `try`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -57,19 +60,15 @@ mod bench;
 mod bridge;
 mod env;
 mod expr;
+pub(crate) mod function_cell;
+mod function_owner;
 mod interp;
-mod registry_lifetime;
-#[cfg(test)]
-pub(crate) use registry_lifetime::register_closure;
-pub(crate) use registry_lifetime::{
-    function_owner_moved, prune_dead_function_owners, prune_dead_function_owners_young,
-};
 #[cfg(test)]
 mod tests;
 
 /// One parsed interpreted function: the (possibly nested) function AST plus
-/// the prepass results the interpreter needs at call time. Registered in the
-/// thread-local `FN_REGISTRY`; closures reference it by id (capture slot 0).
+/// the prepass results the interpreter needs at call time. A collecting native
+/// cell in closure capture zero owns it.
 pub(crate) struct InterpFn {
     /// Parameter patterns (identifiers, destructuring, defaults).
     pub params: Vec<ast::Pat>,
@@ -81,6 +80,7 @@ pub(crate) struct InterpFn {
     pub hoisted_vars: Vec<String>,
     /// Whether assignments in this function use strict PutValue semantics.
     pub strict: bool,
+    pub node_functions: RefCell<HashMap<usize, Rc<InterpFn>>>,
 }
 
 pub(crate) enum InterpBody {
@@ -89,34 +89,29 @@ pub(crate) enum InterpBody {
 }
 
 thread_local! {
-    /// id → parsed function. GC prunes entries with no live closure, active
-    /// invocation/construction, or bounded source-cache entry. See registry_lifetime.
-    static FN_REGISTRY: RefCell<HashMap<u32, Rc<InterpFn>>> =
-        RefCell::new(HashMap::new());
-    static NEXT_FN_ID: Cell<u32> = const { Cell::new(1) };
-
     /// The interpreter's rooted value stack. Every JSValue an interpreter
     /// frame holds across a potential allocation lives here; the GC scanner
     /// below marks and REWRITES the slots, so moving collections can't
-    /// invalidate interpreter state. Truncated on frame exit and restored
-    /// from the per-try-depth savepoint on caught throws.
+    /// invalidate interpreter state. Truncated on frame exit; a throw is
+    /// restored by the interpreter entry or interpreted `try` it lands in
+    /// ([`interp_entry`]).
     static ROOTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
 
     /// Interpreter call depth (native recursion guard — each interpreted
     /// frame recurses through the Rust tree-walker).
     static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
 
-    /// Assembled-source → prepared function id (#6693). `new Function` with a
+    /// Assembled-source → Rust-owned prepared AST (#6693). `new Function` with a
     /// body identical to one already prepared skips the SWC re-parse + subset
     /// scan + hoist prepass entirely — the dominant construction cost — and
-    /// reuses the registered `InterpFn`. Each `new Function` still returns a
+    /// reuses the prepared `InterpFn`. Each `new Function` still returns a
     /// FRESH closure over a fresh per-instance root environment, so identity /
     /// expando semantics are unchanged; only the parse work is shared. Fastify
     /// stacks (ajv / fast-json-stringify / find-my-way) and repeated schema
     /// compiles re-`new Function` identical bodies; distinct bodies simply
     /// miss (no slower than before). Bounded so a pathological distinct-source
-    /// stream can't grow it (or `FN_REGISTRY`) without limit.
-    static SOURCE_FN_CACHE: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+    /// stream cannot grow it without limit.
+    static SOURCE_FN_CACHE: RefCell<HashMap<String, Rc<InterpFn>>> = RefCell::new(HashMap::new());
 
     /// Aggregate byte size of the source strings currently held in
     /// `SOURCE_FN_CACHE`. The entry-count cap alone doesn't bound memory —
@@ -177,27 +172,11 @@ pub(crate) fn fast_scope_enabled() -> bool {
 /// catchable RangeError instead of a native stack overflow.
 const MAX_INTERP_CALL_DEPTH: u32 = 256;
 
-pub(crate) fn register_fn(f: InterpFn) -> u32 {
-    let id = FN_REGISTRY.with(|r| {
-        let mut r = r.borrow_mut();
-        // Ids are recycled once reclaimed, so a long-running process can wrap
-        // the counter; never hand out 0 or an id that is still registered.
-        let id = NEXT_FN_ID.with(|c| loop {
-            let id = c.get();
-            c.set(id.checked_add(1).unwrap_or(1));
-            if id != 0 && !r.contains_key(&id) {
-                break id;
-            }
-        });
-        r.insert(id, Rc::new(f));
-        id
-    });
-    registry_lifetime::note_registered(id);
-    id
+pub(crate) fn register_fn(f: InterpFn) -> f64 {
+    function_cell::new(Rc::new(f))
 }
-
-pub(crate) fn lookup_fn(id: u32) -> Option<Rc<InterpFn>> {
-    FN_REGISTRY.with(|r| r.borrow().get(&id).cloned())
+pub(crate) fn lookup_fn(id: f64) -> Option<Rc<InterpFn>> {
+    function_cell::get(id)
 }
 
 // ── GC safepoints ──────────────────────────────────────────────────────────
@@ -274,7 +253,6 @@ fn interp_safepoints_enabled() -> bool {
 /// Push a value onto the rooted stack; returns its index. The index stays
 /// valid until the owning frame truncates back past it.
 pub(crate) fn root_push(value: f64) -> usize {
-    crate::exception::note_catch_subsystem_used(crate::exception::catch_subsystem::DYN_EVAL);
     ROOTS.with(|r| {
         let mut v = r.borrow_mut();
         v.push(value.to_bits());
@@ -297,7 +275,7 @@ pub(crate) fn roots_len() -> usize {
 }
 
 pub(crate) fn roots_truncate(len: usize) {
-    registry_lifetime::release_function_pins(len);
+    function_owner::release_function_pins(len);
     ROOTS.with(|r| {
         let mut v = r.borrow_mut();
         if v.len() > len {
@@ -308,12 +286,10 @@ pub(crate) fn roots_truncate(len: usize) {
 
 // ── exception-machinery integration ────────────────────────────────────────
 
-/// Savepoint recorded by `js_try_push` for every `try` block (compiled OR
-/// interpreted): packs the roots length and the interpreter call depth. A
-/// throw `longjmp`s past interpreter Rust frames without running their
-/// epilogues, so `js_throw` restores both from the savepoint of the catching
-/// `try` — exactly like the shadow-stack savepoint (#1830) and the
-/// method-depth savepoint (#5591).
+/// The interpreter's state at an entry or an interpreted `try`: the roots
+/// length and the call depth, packed. A throw skips the epilogues of the
+/// interpreter Rust frames it abandons, so the entry (or `try`) that catches
+/// it puts both back.
 #[inline]
 pub(crate) fn interp_savepoint() -> u64 {
     let len = roots_len() as u64;
@@ -328,8 +304,24 @@ pub(crate) fn interp_restore(savepoint: u64) {
     CALL_DEPTH.with(|c| c.set(depth));
 }
 
+/// Run interpreted code entered from outside the interpreter (an
+/// interpreted function call, a script, a direct eval). A throw that leaves
+/// `f` restores the interpreter's rooted stack and call depth to the entry
+/// state and is rethrown to the caller's handler.
+pub(crate) fn interp_entry<R>(f: impl FnOnce() -> R) -> R {
+    let saved = interp_savepoint();
+    match crate::exception::catch_js_throw(f) {
+        Ok(r) => r,
+        Err(err) => {
+            // The exception value is a plain f64 here; nothing below
+            // allocates before `js_throw` roots it again.
+            interp_restore(saved);
+            crate::exception::js_throw(err)
+        }
+    }
+}
+
 pub(crate) fn call_depth_enter() -> Result<(), ()> {
-    crate::exception::note_catch_subsystem_used(crate::exception::catch_subsystem::DYN_EVAL);
     CALL_DEPTH.with(|c| {
         let d = c.get();
         if d >= MAX_INTERP_CALL_DEPTH {
@@ -375,7 +367,7 @@ pub fn dyn_function_from_strings(args: &[String]) -> f64 {
     crate::object::js_install_global_value_surfaces();
     let fn_id = prepare_function_args(args);
     // Keep the prepared AST alive across environment/closure allocations.
-    let prepared = registry_lifetime::pin_function(fn_id).expect("just prepared function");
+    let prepared = function_owner::pin_function(fn_id).expect("just prepared function");
     let function_length = prepared
         .params
         .iter()
@@ -472,7 +464,7 @@ pub(crate) fn function_from_strings_in_with_codegen(
         .map(root_push)
         .collect::<Vec<_>>();
     let fn_id = prepare_function_args(args);
-    let _prepared = registry_lifetime::pin_function(fn_id).expect("just prepared function");
+    let _prepared = function_owner::pin_function(fn_id).expect("just prepared function");
     let rooted_object_envs = object_env_idxs
         .iter()
         .map(|&idx| root_get(idx))
@@ -516,6 +508,26 @@ pub(crate) fn eval_script_in_with_codegen(
 ) -> f64 {
     // Interpreted code reaches `process`/`console` by name.
     crate::object::js_install_global_value_surfaces();
+    interp_entry(|| {
+        eval_script_in_entered(
+            source,
+            global_this,
+            intrinsics,
+            lexical_env,
+            strings_allowed,
+            wasm_allowed,
+        )
+    })
+}
+
+fn eval_script_in_entered(
+    source: &str,
+    global_this: f64,
+    intrinsics: f64,
+    lexical_env: f64,
+    strings_allowed: bool,
+    wasm_allowed: bool,
+) -> f64 {
     let base = roots_len();
     let global_idx = root_push(global_this);
     let intrinsics_idx = root_push(intrinsics);
@@ -550,16 +562,75 @@ pub(crate) fn eval_direct_in(
     strings_allowed: bool,
     wasm_allowed: bool,
 ) -> f64 {
+    eval_direct_in_context(
+        source,
+        global_this,
+        intrinsics,
+        caller_env,
+        caller_variable_env,
+        strings_allowed,
+        wasm_allowed,
+        false,
+        global_this,
+    )
+}
+
+fn eval_direct_in_context(
+    source: &str,
+    global_this: f64,
+    intrinsics: f64,
+    caller_env: f64,
+    caller_variable_env: f64,
+    strings_allowed: bool,
+    wasm_allowed: bool,
+    inherited_strict: bool,
+    this_value: f64,
+) -> f64 {
     // Interpreted code reaches `process`/`console` by name.
     crate::object::js_install_global_value_surfaces();
+    interp_entry(|| {
+        eval_direct_in_entered(
+            source,
+            global_this,
+            intrinsics,
+            caller_env,
+            caller_variable_env,
+            strings_allowed,
+            wasm_allowed,
+            inherited_strict,
+            this_value,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_direct_in_entered(
+    source: &str,
+    global_this: f64,
+    intrinsics: f64,
+    caller_env: f64,
+    caller_variable_env: f64,
+    strings_allowed: bool,
+    wasm_allowed: bool,
+    inherited_strict: bool,
+    this_value: f64,
+) -> f64 {
     let base = roots_len();
+    let this_idx = root_push(this_value);
     let global_idx = root_push(global_this);
     let intrinsics_idx = root_push(intrinsics);
     let caller_env_idx = root_push(caller_env);
     let caller_variable_env_idx = root_push(caller_variable_env);
+    let strict_source;
+    let source = if inherited_strict {
+        strict_source = format!("\"use strict\";\n{source}");
+        strict_source.as_str()
+    } else {
+        source
+    };
     let (script_id, script) = register_script(parse_script_statements(source));
     let statements = script_statements(&script);
-    let strict = script.strict;
+    let strict = inherited_strict || script.strict;
     let lexical_env_idx = root_push(env::env_new(root_get(caller_env_idx)));
     let ret_idx = root_push(bridge::undefined());
     let variable_env_idx = if strict {
@@ -568,7 +639,7 @@ pub(crate) fn eval_direct_in(
         caller_variable_env_idx
     };
     let ctx = interp::Ctx {
-        this_idx: global_idx,
+        this_idx,
         ret_idx,
         global_idx,
         intrinsics_idx,
@@ -587,19 +658,20 @@ pub(crate) fn eval_direct_in(
 /// Register a parsed script/eval body as a pinned, parameterless `InterpFn`.
 /// Nested functions are cached by AST-node address, so the statements must
 /// stay allocated for as long as those cache entries exist: owning them in
-/// the registry lets the GC prune evict the entries together with the AST
-/// (the pin is released when the script's roots are truncated, including by
+/// its own node memo dies with the AST. The cell pin is released when the
+/// script's roots are truncated, including by
 /// a throw). A local `Vec` freed on return would let the next script's parse
 /// reuse an address and resolve to this script's function.
-fn register_script(statements: Vec<ast::Stmt>) -> (u32, registry_lifetime::FunctionPin) {
+fn register_script(statements: Vec<ast::Stmt>) -> (f64, function_owner::FunctionPin) {
     let strict = interp::has_use_strict_directive(&statements);
     let id = register_fn(InterpFn {
         params: Vec::new(),
         body: InterpBody::Block(statements),
         hoisted_vars: Vec::new(),
         strict,
+        node_functions: RefCell::new(HashMap::new()),
     });
-    let pin = registry_lifetime::pin_function(id).expect("just registered script");
+    let pin = function_owner::pin_function(id).expect("just registered script");
     (id, pin)
 }
 
@@ -654,7 +726,7 @@ fn object_environment_chain(global: f64, object_envs: &[f64]) -> f64 {
     result
 }
 
-fn prepare_function_args(args: &[String]) -> u32 {
+fn prepare_function_args(args: &[String]) -> f64 {
     let (params, body) = match args.split_last() {
         Some((body, params)) => (params.join(","), body.as_str()),
         None => (String::new(), ""),
@@ -664,14 +736,14 @@ fn prepare_function_args(args: &[String]) -> u32 {
     // parses, and the parameter text is validated by the same parse.
     let source = format!("(function anonymous({params}\n) {{\n{body}\n}})");
     // Parse cache: an identical assembled source reuses the already-prepared
-    // `InterpFn` (same `FN_REGISTRY` id, same stable AST-node addresses that
+    // `InterpFn` (same native AST, same stable AST-node addresses that
     // the nested-function cache keys on) — skipping SWC parse + subset scan +
     // hoist prepass. A cache hit still builds a fresh root env + closure below.
     let fn_id = if !parse_cache_enabled() {
         prepare_source(&source)
     } else {
-        match SOURCE_FN_CACHE.with(|c| c.borrow().get(&source).copied()) {
-            Some(id) => id,
+        match SOURCE_FN_CACHE.with(|c| c.borrow().get(&source).cloned()) {
+            Some(function) => function_cell::new(function),
             None => {
                 let id = prepare_source(&source);
                 SOURCE_FN_CACHE.with(|c| {
@@ -681,8 +753,7 @@ fn prepare_function_args(args: &[String]) -> u32 {
                         && bytes + source.len() <= SOURCE_FN_CACHE_MAX_BYTES
                     {
                         SOURCE_FN_CACHE_BYTES.with(|b| b.set(bytes + source.len()));
-                        c.insert(source, id);
-                        registry_lifetime::note_permanent(id);
+                        c.insert(source, lookup_fn(id).expect("just prepared AST"));
                     }
                 });
                 id
@@ -694,10 +765,10 @@ fn prepare_function_args(args: &[String]) -> u32 {
 
 /// Parse an assembled `(function anonymous(…){…})` source, reject
 /// out-of-subset constructs eagerly, run the hoist prepass, and register the
-/// resulting `InterpFn`. Returns its `FN_REGISTRY` id. Throws SyntaxError on a
+/// resulting `InterpFn`. Returns its collecting cell. Throws SyntaxError on a
 /// parse failure and TypeError on an unsupported construct — the same
 /// diagnostics as before the parse cache existed; only a cache MISS runs this.
-fn prepare_source(source: &str) -> u32 {
+fn prepare_source(source: &str) -> f64 {
     // `.cjs` pins script (sloppy, non-module) parsing: generated bodies rely
     // on sloppy semantics (find-my-way assigns the undeclared `value`), and
     // module auto-detection must not kick in on `import(`-looking substrings.
@@ -754,4 +825,68 @@ fn extract_wrapper_fn(module: ast::Module) -> Option<ast::Function> {
             _ => return None,
         }
     }
+}
+
+/// Direct eval from compiled code. The binding objects hold native
+/// getter/setter closures, so reads, writes and retained eval closures share
+/// live cells. `scope` is the calling function's eval scope object when it has
+/// a dynamic scope (`perry_hir::lower::dynamic_eval`): the eval's `var`s and
+/// functions are declared there, between the function's own bindings and the
+/// enclosing ones. Otherwise it is undefined and `outer` is unused.
+#[no_mangle]
+pub extern "C" fn js_eval_in_scope(
+    source: f64,
+    own: f64,
+    outer: f64,
+    scope: f64,
+    this_value: f64,
+    strict: f64,
+) -> f64 {
+    let value = crate::value::JSValue::from_bits(source.to_bits());
+    if !value.is_string() {
+        return source;
+    }
+    let roots = crate::gc::RuntimeHandleScope::new();
+    let source = roots.root_nanbox_f64(source);
+    let own = roots.root_nanbox_f64(own);
+    let outer = roots.root_nanbox_f64(outer);
+    let scope = roots.root_nanbox_f64(scope);
+    let this_value = roots.root_nanbox_f64(this_value);
+    let text = bridge::read_string(source.get_nanbox_f64()).expect("string source");
+    let global = roots.root_nanbox_f64(crate::object::js_get_global_this());
+    let has_scope =
+        !crate::value::JSValue::from_bits(scope.get_nanbox_f64().to_bits()).is_undefined();
+    let (env, variable_env) = if has_scope {
+        let env = roots.root_nanbox_f64(script_environment(
+            global.get_nanbox_f64(),
+            &[
+                outer.get_nanbox_f64(),
+                scope.get_nanbox_f64(),
+                own.get_nanbox_f64(),
+            ],
+        ));
+        // lexical → own bindings → the scope object's environment.
+        let own_env = env::env_parent(env.get_nanbox_f64()).expect("own bindings env");
+        let scope_env = env::env_parent(own_env).expect("eval scope env");
+        let scope_env = roots.root_nanbox_f64(scope_env);
+        (env, scope_env)
+    } else {
+        let env = roots.root_nanbox_f64(script_environment(
+            global.get_nanbox_f64(),
+            &[own.get_nanbox_f64()],
+        ));
+        let variable_env = roots.root_nanbox_f64(env::variable_environment(env.get_nanbox_f64()));
+        (env, variable_env)
+    };
+    eval_direct_in_context(
+        &text,
+        global.get_nanbox_f64(),
+        global.get_nanbox_f64(),
+        env.get_nanbox_f64(),
+        variable_env.get_nanbox_f64(),
+        true,
+        true,
+        crate::value::js_is_truthy(strict) != 0,
+        this_value.get_nanbox_f64(),
+    )
 }

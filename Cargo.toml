@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/perry-gc-effects",
     "crates/perry-cli-support",
     "crates/perry-hex",
     "crates/perry-base64",
@@ -9,6 +10,7 @@ members = [
     "crates/perry-parser",
     "crates/perry-api-manifest",
     "crates/perry-hir",
+    "crates/perry-wpfacts",
     "crates/perry-transform",
     "crates/perry-codegen",
     "crates/perry-dispatch",
@@ -35,7 +37,6 @@ members = [
     "crates/perry-ext-ws",
     "crates/perry-ext-net",
     "crates/perry-ext-http",
-    "crates/perry-ext-streams",
     "crates/perry-ext-pdf",
     "crates/perry-ext-ads",
     "crates/perry-ext-parcel-watcher",
@@ -90,12 +91,38 @@ exclude = [
     "third_party/windows-winui",
 ]
 
-# Build only the host-independent product set by default.
+# Build only the host-independent product set by default: the compiler and
+# every archive it links (runtime, stdlib, the WebAssembly host and the routed
+# `perry-ext-*` wrappers of `crates/perry/well_known_bindings.toml`). perry
+# never builds an archive while compiling a program, and the archives must
+# come from ONE Cargo graph (#7358), so they are built with the compiler.
+# `cargo build-perry` (.cargo/config.toml) is the same set for a command line
+# that adds packages; `default_members_match_the_build_perry_alias` keeps the
+# two in step.
 # Platform UI manifests keep their source and dependencies behind target cfgs.
 # Build each platform package explicitly for its applicable target.
 default-members = [
     "crates/perry",
     "crates/perry-container-compose",
+    "crates/perry-runtime-static",
+    "crates/perry-stdlib-static",
+    "crates/perry-wasm-host",
+    "crates/perry-ext-ads",
+    "crates/perry-ext-argon2",
+    "crates/perry-ext-bcrypt",
+    "crates/perry-ext-better-sqlite3",
+    "crates/perry-ext-cheerio",
+    "crates/perry-ext-ethers",
+    "crates/perry-ext-http",
+    "crates/perry-ext-net",
+    "crates/perry-ext-nodemailer",
+    "crates/perry-ext-parcel-watcher",
+    "crates/perry-ext-pdf",
+    "crates/perry-ext-sharp",
+    "crates/perry-ext-typescript",
+    "crates/perry-ext-undici",
+    "crates/perry-ext-ws",
+    "crates/perry-ext-zlib",
 ]
 
 # Aggressive release optimizations for small, fast binaries
@@ -430,6 +457,11 @@ perex = "0.1.13"
 # rated it API-compatible, so every alpha.7 -> alpha.8 change is additive. The
 # RELEASING.md exception wants the release source commit:
 # d72fea0b4644af0b13376bf62b3b8181206d359e (turnloop release PR #109).
+# alpha.9 (turnloop#114, release PR #110 at adc7918faf20b15e95c6cff635f059b5bf1b61f0)
+# only fixes the Android build (Bionic __errno instead of __errno_location;
+# inotify_rm_watch descriptor type) and takes rustls 0.23.46; it is locked once
+# with the owner-approved publish-age override (2026-10-16), which lapses on its
+# own when alpha.9 clears the 7-day window on 2026-10-23.
 # What reaches Perry: `TcpOpts` gains `connect_timeout` and `PoolConfig` gains
 # `max_undelivered`, so both need `..Default::default()` in a struct literal;
 # `Backend::poll` takes a `Budget` (invisible here — Perry implements no
@@ -445,7 +477,7 @@ perex = "0.1.13"
 # against the publishing workflow going green. The soak skill's rule holds:
 # opting out is a committed, reviewable change and never a silent one, so the
 # override lives here in the diff and the lock pins the exact artifact.
-turnloop = "0.1.0-alpha.8"
+turnloop = "0.1.0-alpha.9"
 # turnloop P5 (DESIGN §5b, §12 "P5"): the sans-I/O protocol crates that
 # replace hyper's HTTP/1.1 parser and framer on Perry's server path, and
 # `tokio_rustls` on every TLS path the loop owns. Default features only — the
@@ -471,8 +503,8 @@ turnloop = "0.1.0-alpha.8"
 # rustls process-default provider, failing at RUNTIME ("no rustls crypto
 # provider") rather than at compile time. So this line restores exactly what
 # alpha.6 gave Perry; it does not opt into anything new.
-turnloop-http = { version = "0.1.0-alpha.8", default-features = false }
-turnloop-tls = { version = "0.1.0-alpha.8", default-features = false, features = [
+turnloop-http = { version = "0.1.0-alpha.9", default-features = false }
+turnloop-tls = { version = "0.1.0-alpha.9", default-features = false, features = [
     "ring",
 ] }
 # turnloop WS lane: the sans-I/O WebSocket protocol + HTTP-upgrade helpers that
@@ -480,13 +512,13 @@ turnloop-tls = { version = "0.1.0-alpha.8", default-features = false, features =
 # the `turnloop` feature pulls turnloop-io's LocalExecutor, which Perry cannot
 # adopt for the same reason P5 recorded (it builds its own Driver and drops
 # every completion it did not issue). See docs/turnloop/ws-report.md.
-turnloop-websocket = { version = "0.1.0-alpha.8", default-features = false }
+turnloop-websocket = { version = "0.1.0-alpha.9", default-features = false }
 # turnloop P6 (DESIGN §12 "P6"): the sans-I/O SMTP client and MIME builder that
 # replaces `lettre`'s tokio transport on the outbound mail path. Its `message`
 # module re-exports the same `lettre` 0.11 builder Perry's nodemailer surface
 # already uses, so only the transport changes
 # (docs/turnloop/p6-report.md).
-turnloop-smtp = { version = "0.1.0-alpha.8", default-features = false }
+turnloop-smtp = { version = "0.1.0-alpha.9", default-features = false }
 # turnloop P7 (docs/turnloop/p7-report.md): the sans-I/O database protocol
 # cores that replace sqlx on the
 # paths Perry's bindings own. Default features only, for the same reason as the
@@ -526,6 +558,12 @@ http = "1"
 # ring; rustls's DEFAULT features would add aws-lc-rs (+aws-lc-sys) as a second
 # provider (~1.3 MB stripped, ~1 MB RSS). Keep default-features off; deny.toml
 # bans aws-lc-rs so it can't creep back.
+# rustls 0.23.46 (Cargo.lock) fixes RUSTSEC-2026-0346, -0347, -0348 and -0349 in
+# 0.23.45 (TLS secrets in Debug impls, buffered data after ECH rejection, brotli
+# certificate decompression allocating before authentication, ServerHello key
+# exchange downgrade). Published 2026-10-14, inside the 7-day soak; locked once
+# with the owner-approved one-time publish-age override (2026-10-16). The
+# override lapses on its own on 2026-10-21, when 0.23.46 clears the window.
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"] }
 rustls-pemfile = "2"
 socket2 = "0.6"
@@ -550,6 +588,7 @@ zstd = "0.13"
 perry-parser = { path = "crates/perry-parser" }
 perry-api-manifest = { path = "crates/perry-api-manifest" }
 perry-hir = { path = "crates/perry-hir" }
+perry-wpfacts = { path = "crates/perry-wpfacts" }
 perry-transform = { path = "crates/perry-transform" }
 perry-codegen = { path = "crates/perry-codegen" }
 perry-dispatch = { path = "crates/perry-dispatch" }
@@ -612,7 +651,6 @@ perry-ext-undici = { path = "crates/perry-ext-undici" }
 perry-ext-ws = { path = "crates/perry-ext-ws" }
 perry-ext-net = { path = "crates/perry-ext-net" }
 perry-ext-http = { path = "crates/perry-ext-http" }
-perry-ext-streams = { path = "crates/perry-ext-streams" }
 perry-ext-pdf = { path = "crates/perry-ext-pdf" }
 perry-ext-ads = { path = "crates/perry-ext-ads" }
 perry-ext-parcel-watcher = { path = "crates/perry-ext-parcel-watcher" }

@@ -85,10 +85,15 @@ governed_ext_packages=$(./scripts/release_ext_packages.sh)
 while IFS= read -r package; do
   echo "::group::build $package"
   "${cargo_build[@]}" --profile prod --target "$target" \
-    -p perry -p perry-runtime-static -p perry-stdlib-static -p "$package" \
+    -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host -p "$package" \
     || echo "  (skipped $package -- failed to build on the glibc 2.31 sysroot)"
   echo "::endgroup::"
 done <<< "$governed_ext_packages"
+
+# GC effects sidecars (<archive>.gc-effects) over the final runtime bytes: the
+# ext loop above re-links the runtime, so this is the last write. The table
+# depends only on the bytes, so building it in the container changes nothing.
+bash scripts/gc_call_effects/sidecars.sh "$target_dir/$target/prod"
 
 compiler="$target_dir/$target/prod/perry"
 max_glibc=$(

@@ -5,10 +5,10 @@
 //! `has`, `deleteProperty`, `apply`, `construct`). Traps are closures created
 //! in user code.
 //!
-//! Implementation: a thread-local registry maps a small integer handle to a
-//! `ProxyEntry`. The handle is returned NaN-boxed with POINTER_TAG by codegen.
-//! A handle ID below 0x1000 is used so callers can distinguish a "real proxy"
-//! from a raw heap pointer if needed. A revoked proxy has its `revoked` flag
+//! A collecting, nonmoving GC cell owns target, handler, flags and a props
+//! bag. Its POINTER_TAG payload has bit zero set; ordinary aligned receivers
+//! reject that brand with one bit test, and the positive path proves GC kind
+//! Proxy before reading the cell. The apparent receiver prefix stays zero. A revoked proxy has its `revoked` flag
 //! flipped AND its target/handler slots detached (nulled) so the wrapped
 //! object graphs can be collected; subsequent operations throw the
 //! revoked-proxy TypeError.
@@ -16,9 +16,6 @@
 //! We deliberately do NOT patch generic object.rs/field dispatch — Perry
 //! codegen rewrites known Proxy locals to ProxyGet/ProxySet/etc. variants at
 //! HIR lowering time, which route through the entry points here.
-
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 mod apply_construct;
 pub use apply_construct::{call_proxy_value_with_this, js_proxy_apply, js_proxy_construct};
@@ -41,11 +38,10 @@ pub(crate) use put_value::{
 #[cfg(any(test, feature = "regex-engine"))]
 pub(crate) use put_value::{js_put_value_set_packed_fast, store_and_prime, PackedSetWays};
 pub use put_value::{js_put_value_set_packed_miss, PackedSetSite, PACKED_SET_EMPTY};
-pub(crate) use put_value::{packed_set_cache_resolve, PackedSetWaysSlot, PACKED_SET_CHAIN_WORD};
 pub(crate) use put_value::{store_census, C_REP_CONVERGE, C_REP_MIGRATE, C_REP_VALIDITY_BUMP};
 pub use put_value::{write_pic_way_entry, WritePicCache, WritePicCacheSlot, WRITE_PIC_WORDS};
 mod json;
-mod metadata;
+pub(crate) mod metadata;
 mod own_keys;
 mod prototype;
 mod reflect;
@@ -72,66 +68,21 @@ pub use reflect::{
     js_reflect_set,
 };
 
-/// A single Proxy registry entry.
-///
-/// Revocation detaches: `js_proxy_revoke` stores 0 bits into `target` and
-/// `handler` (spec: [[ProxyTarget]]/[[ProxyHandler]] become null) so the
-/// wrapped graphs can die. Minor collections strongly scan live entries;
-/// full collections instead discover proxy handles through traced slots and
-/// prune entries whose handles were not observed. No valid proxy
-/// target/handler is ever the all-zero-bits number `0.0` (both must be
-/// objects), so 0 bits is an unambiguous detached sentinel. Every trap path
-/// checks `revoked` before touching `target`/`handler`.
+/// Owned proxy fields. Revocation clears both JSValue edges; every trap path
+/// checks the revocation flag before touching either slot. Collection follows
+/// these edges only when it reaches the proxy cell, like any other object.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ProxyEntry {
+    // Both receiver words stay zero, so an inline ShapeId guard (+4) or a
+    // receiver-word probe never matches a Proxy cell.
+    _receiver_words: [u64; 2],
     pub target: f64,  // NaN-boxed target value; 0 bits once revoked
     pub handler: f64, // NaN-boxed handler object (raw f64 bits preserved); 0 bits once revoked
+    pub(crate) props: *mut crate::object::ObjectHeader,
     pub revoked: bool,
-    /// Whether the proxy's (possibly nested) [[ProxyTarget]] was callable at
-    /// creation. Per spec a proxy has a [[Call]] internal method iff its
-    /// target did AT CREATION, and `typeof` of a revoked proxy is unchanged —
-    /// so callability must be snapshotted, not recomputed from `target`
-    /// (which revocation nulls).
-    pub callable: bool,
     /// Creation-time presence of [[Construct]], independent of [[Call]].
     pub constructable: bool,
-}
-
-struct ProxyTraceMarks {
-    seen: Vec<bool>,
-    revision: usize,
-}
-
-thread_local! {
-    /// id -> entry. Index 0 is reserved so we never return a null handle.
-    static PROXIES: RefCell<Vec<Option<Box<ProxyEntry>>>> = RefCell::new(vec![None]);
-    /// Backing store for `Reflect.{define,get,has,delete}Metadata` and friends.
-    ///
-    /// IMPORTANT: keys are raw NaN-box bits of the target value. For the
-    /// canary scope (Nest-style DI) targets are always `ClassRef`s
-    /// (INT32_TAG | class_id) and method-descriptor `.value` closures, both of
-    /// which have stable bit patterns across the program lifetime. Regular
-    /// heap-pointer targets are NOT GC-tracked here, so under the generational
-    /// evacuating GC their entries become stale if the underlying object
-    /// moves. If/when general object metadata becomes load-bearing, register
-    /// a scanner that rewrites `target_bits` during GC fixup (similar to the
-    /// 9 existing scanners in gc.rs).
-    static REFLECT_METADATA: RefCell<HashMap<MetadataKey, f64>> = RefCell::new(HashMap::new());
-    /// Live proxy ids observed by the current full GC trace. `None` outside a
-    /// full trace; minors continue to root every registry entry strongly.
-    static PROXY_FULL_TRACE_LIVE: RefCell<Option<ProxyTraceMarks>> = const { RefCell::new(None) };
-    /// Hot reject-path gate: collector funnels test this before decoding a
-    /// proxy-band payload, so ordinary marking pays one TLS boolean branch.
-    static PROXY_FULL_TRACE_ACTIVE: Cell<bool> = const { Cell::new(false) };
-    /// Monotone liveness counter for diagnostics and non-vacuous tests.
-    static PROXY_GC_RECLAIMED_TOTAL: Cell<u64> = const { Cell::new(0) };
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MetadataKey {
-    target_bits: u64,
-    key: String,
-    property_key: Option<String>,
 }
 
 const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;
@@ -141,143 +92,48 @@ const TAG_FALSE: u64 = 0x7FFC_0000_0000_0003;
 const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
 const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
-/// Tag bits high enough to live inside a 48-bit pointer slot but low enough
-/// that real heap pointers never collide. Keep proxies near the top of the
-/// runtime's small-handle band so Web Fetch handles can occupy a broad
-/// disjoint range below this without sharing visible `POINTER_TAG | id` bits
-/// with a proxy. Any operation on a proxy MUST go through the Proxy* dispatch
-/// helpers in this module. The band boundary is owned by
-/// `value::addr_class` (`PROXY_ID_BAND_START`).
-const PROXY_TAG_BASE: u64 = crate::value::addr_class::PROXY_ID_BAND_START as u64;
-
-/// Number of ids the revocable-Proxy band can encode: `PROXY_ID_BAND_END -
-/// PROXY_ID_BAND_START`, i.e. **65,536**, of which id 0 is reserved so a
-/// handle is never the bare band base.
-///
-/// This is a hard ceiling, not a soft one. `encode_proxy_id` maps id `n` to
-/// `PROXY_TAG_BASE + n`, so the first id at or above this length encodes to
-/// `PROXY_ID_BAND_END` — a payload that `addr_class::is_proxy_id_band` rejects
-/// and that names a Web Streams id. Before the stream band joined the handle
-/// band that payload was a **dereferenceable heap address**: the 65,536th
-/// `new Proxy(...)` in a thread used to hand back a value that the very next
-/// property read dereferenced, SIGSEGV (#8213). Minting one stays refused.
-///
-/// Every other handle band already refuses to allocate past its end
-/// (`common/handle.rs`, `fetch/mod.rs` both panic). The Proxy band was the
-/// one without a guard — and the only one whose ids are minted straight from
-/// user code with no matching free/close call, so it is also the only one a
-/// long-running program reaches by simply staying up (#8213 measured ~4
-/// proxies per HTTP request on a warm Next.js App Route, i.e. this ceiling
-/// lands after roughly 16k requests).
-const PROXY_ID_BAND_LEN: u64 = (crate::value::addr_class::PROXY_ID_BAND_END
-    - crate::value::addr_class::PROXY_ID_BAND_START) as u64;
-
-#[cfg(test)]
-thread_local! {
-    /// Test-only shrink of [`PROXY_ID_BAND_LEN`] so the exhaustion boundary
-    /// can be walked without allocating 65k objects. Thread-local, and the
-    /// test harness gives every test its own thread, so it cannot leak into
-    /// another test. Never set outside `cfg(test)`.
-    static PROXY_ID_BAND_LEN_OVERRIDE: std::cell::Cell<Option<u64>> =
-        const { std::cell::Cell::new(None) };
+/// A Proxy is a nonmoving GC cell of kind `GC_TYPE_PROXY`, boxed under
+/// `POINTER_TAG` like any object (honest pointers), so its header byte is the
+/// whole proof. Returns the cell address.
+pub(crate) fn canonical_address(proxy_boxed: f64) -> Option<usize> {
+    lookup(proxy_boxed).map(|addr| addr as usize)
 }
-
 #[inline]
-fn proxy_id_band_len() -> u64 {
-    #[cfg(test)]
-    {
-        if let Some(len) = PROXY_ID_BAND_LEN_OVERRIDE.with(|c| c.get()) {
-            return len;
-        }
-    }
-    PROXY_ID_BAND_LEN
-}
-
-/// Reserve the id a registry of `len` entries would hand out next, or `None`
-/// when that id would fall outside the band.
-///
-/// Split out from [`js_proxy_new`] because the refusal is the testable half:
-/// the throw itself ends the process when no `try` is open, so the boundary
-/// is asserted here instead.
-fn reserve_proxy_id(len: usize) -> Option<u64> {
-    let id = len as u64;
-    (id < proxy_id_band_len()).then_some(id)
-}
-
-/// The band is full. Throw a catchable `RangeError` rather than mint an
-/// out-of-band id — same trade as `error::throw_allocation_failed` (#5067):
-/// a program that can catch it keeps running, and one that cannot gets a
-/// named error instead of a segfault.
-#[cold]
-fn throw_proxy_band_exhausted() -> ! {
-    let msg = format!(
-        "Too many proxies: this thread's Proxy registry is full ({} entries); \
-         Perry never reclaims a Proxy registry slot",
-        PROXY_ID_BAND_LEN - 1
-    );
-    let handle = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-    let err = crate::error::js_rangeerror_new(handle);
-    crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64))
-}
-
-fn encode_proxy_id(id: u64) -> i64 {
-    (PROXY_TAG_BASE + id) as i64
-}
-
-fn decode_proxy_id(raw: i64) -> Option<u64> {
-    let raw = raw as u64;
-    if raw < PROXY_TAG_BASE {
-        return None;
-    }
-    // Reject payloads at or past the band end so this decoder and
-    // `addr_class::is_proxy_id_band` agree about what a proxy id is. They used
-    // to disagree above the band: `lookup` accepted anything below 4 GiB while
-    // every addr-class consumer read the same payload as a heap address
-    // (#8213). `reserve_proxy_id` makes such an id unmintable; this keeps the
-    // two classifications from drifting apart again.
-    if raw >= crate::value::addr_class::PROXY_ID_BAND_END as u64 {
-        return None;
-    }
-    let id = raw - PROXY_TAG_BASE;
-    if id == 0 {
-        return None;
-    }
-    Some(id)
-}
-
-/// Look up a proxy by NaN-boxed value. Validates that the value is
-/// pointer-tagged with a low-48 payload inside the proxy-id range AND that
-/// the id corresponds to a registered entry, so a regular heap pointer
-/// whose lower bits happen to fall in the encoding range doesn't get
-/// misclassified as a proxy.
 fn lookup(proxy_boxed: f64) -> Option<u64> {
     let bits = proxy_boxed.to_bits();
-    // Proxies are always POINTER_TAG.
-    if (bits >> 48) != (POINTER_TAG >> 48) {
-        return None;
+    let header = crate::value::addr_class::pointer_value_header(bits)?;
+    is_proxy_header(header).then_some(bits & POINTER_MASK)
+}
+/// The Proxy brand: kind and the cell's exact extent. The extent is only
+/// compared once the kind byte matches, so ordinary receivers pay one compare.
+#[inline(always)]
+pub(crate) fn is_proxy_header(header: &crate::gc::GcHeader) -> bool {
+    header.obj_type == crate::gc::GC_TYPE_PROXY
+        && header.size as usize == crate::gc::GC_HEADER_SIZE + std::mem::size_of::<ProxyEntry>()
+}
+fn entry(id: u64) -> Option<ProxyEntry> {
+    // `id` comes from lookup, and no allocation occurs in this leaf. The
+    // collecting-holder class preserves the cell throughout a native call.
+    Some(unsafe { *(id as *const ProxyEntry) })
+}
+pub(crate) fn property_bag(owner: usize) -> *mut crate::object::ObjectHeader {
+    lookup(f64::from_bits(POINTER_TAG | owner as u64)).map_or(std::ptr::null_mut(), |id| unsafe {
+        (*(id as *const ProxyEntry)).props
+    })
+}
+pub(crate) unsafe fn property_bag_ensure(owner: usize) -> *mut crate::object::ObjectHeader {
+    let _publication = crate::gc::GcSuppressScope::new();
+    let id = lookup(f64::from_bits(POINTER_TAG | owner as u64)).expect("live Proxy owner");
+    let cell = id as *mut ProxyEntry;
+    if (*cell).props.is_null() {
+        let bag = crate::object::js_object_alloc(0, 0);
+        crate::gc::runtime_store_gc_heap_word_slot(
+            id as usize,
+            std::ptr::addr_of_mut!((*cell).props) as usize,
+            bag as u64,
+        );
     }
-    let lower48 = bits & POINTER_MASK;
-    // Real heap pointers live >= 0x1_0000_0000 on macOS/iOS arenas.
-    if lower48 >= 0x1_0000_0000 {
-        return None;
-    }
-    let id = decode_proxy_id(lower48 as i64)?;
-    // A collected slot remains a tombstone. Treating it as a non-proxy would
-    // hand the small id-band payload to generic object code, which may
-    // dereference it; fail loudly if the collector ever under-approximates.
-    let status = PROXIES.with(|p| {
-        let v = p.borrow();
-        match v.get(id as usize) {
-            Some(Some(_)) => 1,
-            Some(None) => 2,
-            None => 0,
-        }
-    });
-    match status {
-        1 => Some(id),
-        2 => collected_return(),
-        _ => None,
-    }
+    (*cell).props
 }
 
 /// Keep a proxy id visible to any full collection that starts while a native
@@ -289,162 +145,12 @@ fn pin_proxy_for_native_call(proxy_boxed: f64) -> crate::gc::RuntimeHandleScope 
     scope
 }
 
-/// Arm proxy-id observation for a full trace. The registry becomes weak for
-/// the mark phase until [`gc_finish_full_trace`] prunes unobserved entries.
-pub(crate) fn gc_begin_full_trace() {
-    let (len, has_live_entries) = PROXIES.with(|p| {
-        let proxies = p.borrow();
-        (proxies.len(), proxies.iter().any(Option::is_some))
-    });
-    PROXY_FULL_TRACE_LIVE.with(|live| {
-        assert!(live.borrow().is_none(), "proxy full trace already active");
-        *live.borrow_mut() = Some(ProxyTraceMarks {
-            seen: vec![false; len],
-            revision: 0,
-        });
-    });
-    PROXY_FULL_TRACE_ACTIVE.with(|active| active.set(has_live_entries));
-}
-
-#[inline(always)]
-pub(crate) fn gc_full_trace_active() -> bool {
-    PROXY_FULL_TRACE_ACTIVE.with(Cell::get)
-}
-
-/// Observe one bits value from a collector-owned tracing funnel. Returns true
-/// when it names an existing proxy slot (live or a collected tombstone).
-/// First observation marks the live entry's target/handler immediately; this
-/// closes the cycle without making the whole registry a strong root.
-pub(crate) fn gc_observe_traced_value(bits: u64, valid_ptrs: &crate::gc::ValidPointerSet) -> bool {
-    if !gc_full_trace_active() || (bits & !POINTER_MASK) != POINTER_TAG {
-        return false;
-    }
-    let payload = (bits & POINTER_MASK) as usize;
-    if !crate::value::addr_class::is_proxy_id_band(payload) {
-        return false;
-    }
-    let Some(id) = decode_proxy_id(payload as i64) else {
-        return false;
-    };
-    let entry = PROXIES.with(|proxies| {
-        let proxies = proxies.borrow();
-        proxies.get(id as usize).map(|slot| {
-            slot.as_ref()
-                .map(|entry| (entry.target.to_bits(), entry.handler.to_bits()))
-        })
-    });
-    let Some(entry) = entry else {
-        return false;
-    };
-    let first_observation = PROXY_FULL_TRACE_LIVE.with(|live| {
-        let mut live = live.borrow_mut();
-        let live = live.as_mut().expect("proxy observation outside full trace");
-        if id as usize >= live.seen.len() {
-            live.seen.resize(id as usize + 1, false);
-        }
-        let first = !live.seen[id as usize];
-        live.seen[id as usize] = true;
-        if first {
-            live.revision = live.revision.wrapping_add(1);
-        }
-        first
-    });
-    if first_observation {
-        if let Some((target, handler)) = entry {
-            crate::gc::mark_precise_root(crate::gc::PreciseRoot::JSValue(target), valid_ptrs);
-            crate::gc::mark_precise_root(crate::gc::PreciseRoot::JSValue(handler), valid_ptrs);
-        }
-    }
-    true
-}
-
-/// Revision of the existing collector-owned mark vector. Ephemeron cursors
-/// restart if a late weak read observes a new proxy without adding heap work.
-pub(crate) fn gc_trace_mark_revision() -> usize {
-    PROXY_FULL_TRACE_LIVE.with(|live| live.borrow().as_ref().map_or(0, |live| live.revision))
-}
-
-/// Read the existing full-trace mark for a weak proxy key without observing
-/// it. Minor collections conservatively keep this external registry alive.
-pub(crate) fn gc_weak_key_is_live(bits: u64, minor: bool) -> bool {
-    let Some(id) = decode_proxy_id((bits & POINTER_MASK) as i64) else {
-        return false;
-    };
-    if minor {
-        return PROXIES.with(|proxies| {
-            proxies
-                .borrow()
-                .get(id as usize)
-                .is_some_and(Option::is_some)
-        });
-    }
-    PROXY_FULL_TRACE_LIVE.with(|live| {
-        live.borrow()
-            .as_ref()
-            .and_then(|marks| marks.seen.get(id as usize))
-            .copied()
-            .unwrap_or(false)
-    })
-}
-
-/// End a full proxy trace and tombstone every registry entry whose handle was
-/// not observed. Returns the number reclaimed in this pass.
-pub(crate) fn gc_finish_full_trace() -> usize {
-    PROXY_FULL_TRACE_ACTIVE.with(|active| active.set(false));
-    let live = PROXY_FULL_TRACE_LIVE.with(|state| {
-        state
-            .borrow_mut()
-            .take()
-            .expect("proxy full trace was not active")
-    });
-    let (reclaimed, remaining, slots) = PROXIES.with(|proxies| {
-        let mut proxies = proxies.borrow_mut();
-        let mut reclaimed = 0usize;
-        for (id, slot) in proxies.iter_mut().enumerate().skip(1) {
-            if slot.is_some() && !live.seen.get(id).copied().unwrap_or(false) {
-                slot.take();
-                reclaimed += 1;
-            }
-        }
-        let remaining = proxies.iter().flatten().count();
-        (reclaimed, remaining, proxies.len().saturating_sub(1))
-    });
-    let total = PROXY_GC_RECLAIMED_TOTAL.with(|counter| {
-        let total = counter.get().saturating_add(reclaimed as u64);
-        counter.set(total);
-        total
-    });
-    if crate::gc::gc_diag_enabled() {
-        eprintln!(
-            "[gc-proxy-registry] live={remaining} tombstones={} slots={slots} reclaimed={reclaimed} reclaimed_total={total}",
-            slots.saturating_sub(remaining),
-        );
-    }
-    reclaimed
-}
-
-/// Cancel observation when an in-progress GC cycle is dropped.
-pub(crate) fn gc_abort_full_trace() {
-    // A parked budgeted cycle can be dropped by the GC cycle TLS destructor.
-    // Darwin does not guarantee an order between independent TLS destructors,
-    // so the proxy trace cells may already be unavailable during thread exit.
-    // There is no trace left to observe once that thread is gone; ordinary
-    // cycle cancellation still takes the same cleanup path.
-    let _ = PROXY_FULL_TRACE_ACTIVE.try_with(|active| active.set(false));
-    let _ = PROXY_FULL_TRACE_LIVE.try_with(|live| {
-        live.borrow_mut().take();
-    });
-}
-
-/// Allocate a new proxy. Returns the NaN-boxed POINTER_TAG value holding the
-/// encoded proxy id in the low bits.
-/// `new Proxy(target, handler)` requires both arguments to be objects
-/// (functions count as objects). Node throws
-/// `TypeError: Cannot create proxy with a non-object as target or handler`
-/// when either is a primitive or nullish. (#2846)
 fn proxy_arg_is_object(value: f64) -> bool {
     let bits = value.to_bits();
     let top = bits >> 48;
+    if top == (crate::value::HANDLE_TAG >> 48) {
+        return true;
+    }
     // POINTER_TAG heap value (object / function / array).
     if top == 0x7FFD {
         let ptr = (bits & POINTER_MASK) as usize;
@@ -485,60 +191,71 @@ fn throw_proxy_non_object() -> ! {
 /// directly.
 fn target_callable_at_creation(target: f64) -> bool {
     match lookup(target) {
-        Some(id) => PROXIES.with(|p| {
-            p.borrow()
-                .get(id as usize)
-                .and_then(|o| o.as_ref())
-                .map(|e| e.callable)
-                .unwrap_or(false)
-        }),
-        None => {
-            crate::object::is_class_object_value(target) || crate::object::value_is_callable(target)
-        }
+        Some(id) => unsafe {
+            crate::gc::header_from_trusted_user_ptr(id as *const u8)
+                .as_ref()
+                .unwrap()
+                ._reserved
+                & crate::gc::GC_OBJECT_CALLABLE
+                != 0
+        },
+        None => crate::object::value_is_callable(target),
     }
 }
 
 #[no_mangle]
 pub extern "C" fn js_proxy_new(target: f64, handler: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    crate::contracts::hard_value(target, "new Proxy");
     // #2846: validate both arguments are objects before allocating.
     if !proxy_arg_is_object(target) || !proxy_arg_is_object(handler) {
         throw_proxy_non_object();
     }
     let callable = target_callable_at_creation(target);
     let constructable = is_constructor_function(target);
-    // Reserve BEFORE taking the mutable borrow: `throw_proxy_band_exhausted`
-    // allocates a JS error, which can collect, and `scan_proxy_roots_mut`
-    // borrows `PROXIES` mutably — throwing under an open borrow would panic
-    // the collector (and a caught throw would leave the registry borrowed for
-    // the life of the thread).
-    let Some(reserved) = reserve_proxy_id(PROXIES.with(|p| p.borrow().len())) else {
-        throw_proxy_band_exhausted();
-    };
-    PROXIES.with(|p| {
-        let mut v = p.borrow_mut();
-        let id = v.len() as u64;
-        debug_assert_eq!(id, reserved, "nothing may allocate a proxy id in between");
-        v.push(Some(Box::new(ProxyEntry {
-            target,
-            handler,
-            revoked: false,
+    let _publication = crate::gc::GcSuppressScope::new();
+    let cell = crate::arena::arena_alloc_gc_collecting_holder(
+        std::mem::size_of::<ProxyEntry>(),
+        8,
+        crate::gc::GC_TYPE_PROXY,
+    )
+    .cast::<ProxyEntry>();
+    unsafe {
+        let header = crate::gc::header_from_trusted_user_ptr(cell.cast()).cast_mut();
+        if callable {
+            (*header)._reserved |= crate::gc::GC_OBJECT_CALLABLE;
+        }
+        debug_assert_eq!(
+            perry_abi::gc_header_word_is_callable((*header).kind_facts_word()),
             callable,
-            constructable,
-        })));
-        // A proxy born during a sliced full trace was absent from the begin
-        // snapshot. Arm observation before its handle can be published into a
-        // root/heap slot; the incremental write barrier will record it.
-        if PROXY_FULL_TRACE_LIVE.with(|live| live.borrow().is_some()) {
-            PROXY_FULL_TRACE_ACTIVE.with(|active| active.set(true));
-        }
-        let encoded = encode_proxy_id(id) as u64;
-        if crate::hot_diag::receiver_repr_on() {
-            crate::hot_diag::receiver_repr_note_constructed(
-                crate::hot_diag::ReceiverReprFamily::Proxy,
-            );
-        }
-        f64::from_bits(POINTER_TAG | (encoded & POINTER_MASK))
-    })
+            "Proxy [[Call]] must agree with its creation-time target"
+        );
+        std::ptr::write(
+            cell,
+            ProxyEntry {
+                _receiver_words: [0; 2],
+                target: 0.0,
+                handler: 0.0,
+                props: std::ptr::null_mut(),
+                revoked: false,
+                constructable,
+            },
+        );
+        crate::gc::runtime_store_gc_jsvalue_slot(
+            cell as usize,
+            std::ptr::addr_of_mut!((*cell).target) as usize,
+            target.to_bits(),
+        );
+        crate::gc::runtime_store_gc_jsvalue_slot(
+            cell as usize,
+            std::ptr::addr_of_mut!((*cell).handler) as usize,
+            handler.to_bits(),
+        );
+    }
+    if crate::hot_diag::receiver_repr_on() {
+        crate::hot_diag::receiver_repr_note_constructed(crate::hot_diag::ReceiverReprFamily::Proxy);
+    }
+    f64::from_bits(POINTER_TAG | cell as u64)
 }
 
 /// Revoke a proxy. Subsequent operations will return TAG_UNDEFINED or fire an
@@ -550,13 +267,20 @@ pub extern "C" fn js_proxy_new(target: f64, handler: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn js_proxy_revoke(proxy_boxed: f64) {
     if let Some(id) = lookup(proxy_boxed) {
-        PROXIES.with(|p| {
-            if let Some(Some(entry)) = p.borrow_mut().get_mut(id as usize) {
-                entry.revoked = true;
-                entry.target = f64::from_bits(0);
-                entry.handler = f64::from_bits(0);
-            }
-        });
+        unsafe {
+            let cell = &mut *(id as *mut ProxyEntry);
+            cell.revoked = true;
+            crate::gc::runtime_store_gc_jsvalue_slot(
+                id as usize,
+                std::ptr::addr_of_mut!(cell.target) as usize,
+                0,
+            );
+            crate::gc::runtime_store_gc_jsvalue_slot(
+                id as usize,
+                std::ptr::addr_of_mut!(cell.handler) as usize,
+                0,
+            );
+        }
     }
 }
 
@@ -564,13 +288,9 @@ pub extern "C" fn js_proxy_revoke(proxy_boxed: f64) {
 #[no_mangle]
 pub extern "C" fn js_proxy_is_revoked(proxy_boxed: f64) -> i32 {
     if let Some(id) = lookup(proxy_boxed) {
-        return PROXIES.with(|p| {
-            p.borrow()
-                .get(id as usize)
-                .and_then(|o| o.as_ref())
-                .map(|e| if e.revoked { 1i32 } else { 0 })
-                .unwrap_or(0)
-        });
+        return entry(id)
+            .map(|e| if e.revoked { 1i32 } else { 0 })
+            .unwrap_or(0);
     }
     0
 }
@@ -591,13 +311,9 @@ pub extern "C" fn js_proxy_is_proxy(value: f64) -> i32 {
 /// any non-Proxy value, so the caller falls back to its ordinary array check.
 pub(crate) fn is_array_proxy_step(value: f64) -> Option<f64> {
     let id = lookup(value)?;
-    let (target, revoked) = PROXIES.with(|p| {
-        p.borrow()
-            .get(id as usize)
-            .and_then(|o| o.as_ref())
-            .map(|e| (e.target, e.revoked))
-            .unwrap_or((f64::from_bits(TAG_UNDEFINED), false))
-    });
+    let (target, revoked) = entry(id)
+        .map(|e| (e.target, e.revoked))
+        .unwrap_or((f64::from_bits(TAG_UNDEFINED), false));
     if revoked {
         revoked_return_with_message("Cannot perform 'IsArray' on a proxy that has been revoked");
     }
@@ -607,18 +323,19 @@ pub(crate) fn is_array_proxy_step(value: f64) -> Option<f64> {
 /// Whether a Proxy value's (possibly nested) [[ProxyTarget]] is callable —
 /// the predicate behind `typeof proxyOfFn === "function"` and
 /// `Function.prototype.toString` accepting a proxy receiver. Reads the
-/// creation-time `callable` snapshot (which already resolved through nested
+/// creation-time header fact (which already resolved through nested
 /// proxies), so callability survives revocation (per spec, `typeof` of a
 /// revoked proxy is unchanged) even though revoke nulls the recorded target.
 pub(crate) fn proxy_wraps_callable(value: f64) -> bool {
     match lookup(value) {
-        Some(id) => PROXIES.with(|p| {
-            p.borrow()
-                .get(id as usize)
-                .and_then(|o| o.as_ref())
-                .map(|e| e.callable)
-                .unwrap_or(false)
-        }),
+        Some(id) => unsafe {
+            crate::gc::header_from_trusted_user_ptr(id as *const u8)
+                .as_ref()
+                .unwrap()
+                ._reserved
+                & crate::gc::GC_OBJECT_CALLABLE
+                != 0
+        },
         None => crate::object::value_is_callable(value),
     }
 }
@@ -629,14 +346,10 @@ pub(crate) fn proxy_wraps_callable(value: f64) -> bool {
 #[no_mangle]
 pub extern "C" fn js_proxy_target(proxy_boxed: f64) -> f64 {
     if let Some(id) = lookup(proxy_boxed) {
-        return PROXIES.with(|p| {
-            p.borrow()
-                .get(id as usize)
-                .and_then(|o| o.as_ref())
-                .map(|e| e.target)
-                .filter(|t| t.to_bits() != 0)
-                .unwrap_or(f64::from_bits(TAG_UNDEFINED))
-        });
+        return entry(id)
+            .map(|e| e.target)
+            .filter(|t| t.to_bits() != 0)
+            .unwrap_or(f64::from_bits(TAG_UNDEFINED));
     }
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -646,14 +359,10 @@ pub extern "C" fn js_proxy_target(proxy_boxed: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn js_proxy_handler(proxy_boxed: f64) -> f64 {
     if let Some(id) = lookup(proxy_boxed) {
-        return PROXIES.with(|p| {
-            p.borrow()
-                .get(id as usize)
-                .and_then(|o| o.as_ref())
-                .map(|e| e.handler)
-                .filter(|h| h.to_bits() != 0)
-                .unwrap_or(f64::from_bits(TAG_UNDEFINED))
-        });
+        return entry(id)
+            .map(|e| e.handler)
+            .filter(|h| h.to_bits() != 0)
+            .unwrap_or(f64::from_bits(TAG_UNDEFINED));
     }
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -668,19 +377,24 @@ fn handler_trap(handler: f64, trap_name: &str) -> f64 {
     if obj_ptr.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
-    crate::object::js_object_get_field_by_name_f64(obj_ptr, key)
+    // The ordinary lookup roots and reloads its operands around a getter.
+    // Its native-alias fallback needs the current receiver and a stable name,
+    // because an undefined-returning getter may have moved both heap operands.
+    let result = crate::object::js_object_get_field_by_name(obj_ptr, key);
+    if result.bits() == TAG_UNDEFINED {
+        if let Some(value) = crate::object::native_this_alias::alias_forward_property_read(
+            handler.get_nanbox_f64(),
+            trap_name,
+        ) {
+            return value;
+        }
+    }
+    f64::from_bits(result.bits())
 }
 
 /// Raise a "proxy revoked" TypeError via `js_throw`. Does not return.
 fn revoked_return() -> f64 {
     revoked_return_with_message("Cannot perform operation on a proxy that has been revoked")
-}
-
-fn collected_return() -> ! {
-    let _ = revoked_return_with_message(
-        "Cannot perform operation on a proxy that has been garbage collected",
-    );
-    unreachable!("js_throw returned from collected proxy TypeError")
 }
 
 fn revoked_return_with_message(msg: &str) -> f64 {
@@ -781,17 +495,6 @@ pub(crate) fn value_display_string(value: f64) -> String {
     String::new()
 }
 
-fn reflect_value_is_symbol(value: f64) -> bool {
-    let bits = value.to_bits();
-    (bits >> 48) == (POINTER_TAG >> 48)
-        && if cfg!(target_pointer_width = "32") {
-            (bits & POINTER_MASK) >= crate::value::addr_class::HANDLE_BAND_MAX as u64
-        } else {
-            (bits & POINTER_MASK) >= 0x1_0000_0000
-        }
-        && unsafe { crate::symbol::js_is_symbol(value) != 0 }
-}
-
 /// #6828/#10482: Annex B §B.3.1 `set __proto__` semantics — shared by the
 /// real accessor descriptor installed on `Object.prototype`
 /// (`object/global_this/proto_methods.rs`'s setter closure, reached via
@@ -819,50 +522,17 @@ pub(crate) fn legacy_dunder_proto_set(receiver: f64, value: f64) {
 /// Is `value` a Reflect-acceptable object? Heap objects, class refs (callable
 /// constructors), and proxies all count. Primitives / null / undefined do not.
 pub(crate) fn reflect_value_is_object(value: f64) -> bool {
-    if lookup(value).is_some() {
+    // One shared Type(value) is Object answer: a POINTER_TAG word names a
+    // GC-headed object (honest pointers), so its header byte decides, and
+    // native ids are objects. Raw untagged words keep the allocator proof;
+    // class refs (INT32-tagged constructors) are callable objects.
+    if crate::builtins::arithmetic::js_value_is_object(value) {
         return true;
     }
-    let bits = value.to_bits();
-    // BufferHeader-backed values are objects even when they are not GC heap
-    // allocations. In particular, SharedArrayBuffer uses a process-global,
-    // never-moved backing from `alloc_zeroed`; depending on the surrounding
-    // allocation history its address can fail the generic heap-address test
-    // below. Consult the authoritative registries before that heuristic so
-    // receiver-aware Set reaches CreateDataProperty and records named
-    // expandos such as an own `constructor`.
-    let raw = extract_pointer(bits) as usize;
-    if raw != 0
-        && (crate::buffer::is_registered_buffer(raw)
-            || crate::typedarray::lookup_typed_array_kind(raw).is_some())
-    {
-        return true;
+    let top16 = value.to_bits() >> 48;
+    if top16 == 0 {
+        return crate::object::js_value_is_heap_object(value);
     }
-    let top16 = bits >> 48;
-    if top16 == (POINTER_TAG >> 48) {
-        let lower48 = bits & POINTER_MASK;
-        // A handle-backed native object — Request / Response / Headers, sockets,
-        // streams — is a POINTER_TAG'd small id, not a heap `ObjectHeader`. It is
-        // still an OBJECT to JS, so `Reflect.get(request, k)` must not be refused:
-        // the sub-4GB cutoff below classified every one of them as a non-object and
-        // threw `TypeError: Reflect.get called on non-object`. Next's app-route
-        // runtime wraps the request in a Proxy whose `get` trap forwards through
-        // `Reflect.get(target, …)`, so every authenticated route 500'd.
-        if crate::value::addr_class::is_handle_band(lower48 as usize) {
-            return lower48 != 0;
-        }
-        // The wasm32 heap is entirely below 4 GiB. Its handle-band guard
-        // above separates ids from addresses; the native cutoff cannot.
-        if cfg!(target_pointer_width = "64") && lower48 < 0x1_0000_0000 {
-            return false;
-        }
-        if reflect_value_is_symbol(value) {
-            return false;
-        }
-    }
-    if crate::object::js_value_is_heap_object(value) {
-        return true;
-    }
-    // Class refs (INT32-tagged constructors) are callable objects.
     top16 == 0x7FFE
 }
 
@@ -1017,14 +687,9 @@ fn dispatch_with_explicit_this(f: f64, this_arg: f64, args: &[f64]) -> f64 {
 pub(crate) fn proxy_target_class_id(mut value: f64) -> Option<u32> {
     let mut depth = 0usize;
     while let Some(id) = lookup(value) {
-        value = PROXIES.with(|proxies| {
-            proxies
-                .borrow()
-                .get(id as usize)
-                .and_then(|entry| entry.as_ref())
-                .map(|entry| entry.target)
-                .unwrap_or(f64::from_bits(TAG_UNDEFINED))
-        });
+        value = entry(id)
+            .map(|entry| entry.target)
+            .unwrap_or(f64::from_bits(TAG_UNDEFINED));
         depth += 1;
         if depth >= 32 {
             return None;
@@ -1046,7 +711,8 @@ pub(crate) fn proxy_target_class_id(mut value: f64) -> Option<u32> {
 /// (module-level globals store Arrays/Objects as raw I64s, not NaN-boxed).
 fn extract_pointer(bits: u64) -> u64 {
     let top = bits >> 48;
-    if top == 0x7FFD || top == 0x7FFF {
+    // A native id reaches the by-name/handle dispatch as its raw id.
+    if top == 0x7FFD || top == 0x7FFF || top == (crate::value::HANDLE_TAG >> 48) {
         bits & POINTER_MASK
     } else if top == 0 {
         // Raw untagged pointer (module-level I64 global).
@@ -1059,9 +725,9 @@ fn extract_pointer(bits: u64) -> u64 {
 fn small_handle_from_value(value: f64) -> Option<i64> {
     let bits = value.to_bits();
     let top = bits >> 48;
-    if top == (POINTER_TAG >> 48) {
+    if top == (crate::value::HANDLE_TAG >> 48) {
         let raw = (bits & POINTER_MASK) as i64;
-        if raw > 0 && (raw as u64) < PROXY_TAG_BASE {
+        if raw > 0 && (raw as usize) < crate::value::addr_class::HANDLE_BAND_MAX {
             return Some(raw);
         }
     } else if top == 0 && crate::value::addr_class::is_small_handle(bits as usize) {
@@ -1396,14 +1062,21 @@ fn own_set_descriptor(target: f64, key: f64) -> Option<OwnSetDescriptor> {
     let indexed_owner = unsafe {
         match crate::value::addr_class::try_read_gc_header(addr) {
             Some(header) if header.obj_type == crate::gc::GC_TYPE_OBJECT => {
+                // The indexed answer reads the layout alone; a prototype with
+                // an overflow keeps keys and attributes in its entries (object
+                // model step 4), which the complete lookup below reads.
                 let meta = (*(addr as *const crate::ObjectHeader)).meta;
                 (!meta.is_null()
-                    && (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE != 0)
+                    && (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE != 0
+                    && (*meta).overflow == 0)
                     .then_some(addr)
             }
             Some(header) if header.obj_type == crate::gc::GC_TYPE_ARRAY => {
-                crate::object::shape_store::named_bag(addr as *const crate::ObjectHeader, key.to_bits())
-                    .map(|bag| bag as usize)
+                crate::object::shape_store::named_bag(
+                    addr as *const crate::ObjectHeader,
+                    key.to_bits(),
+                )
+                .map(|bag| bag as usize)
             }
             _ => None,
         }
@@ -1638,15 +1311,8 @@ fn prototype_of_for_set(value: f64) -> Option<f64> {
     if !reflect_value_is_object(value) {
         return None;
     }
-    // A Proxy is a small registered id (`POINTER_TAG | (PROXY_TAG_BASE + id)`),
-    // NOT a heap object. The POINTER_TAG block below would treat that id as a
-    // raw pointer; on Linux (`is_valid_obj_ptr` HEAP_MIN = 0x1000) the ~1MB id
-    // passes the range check and dereferences unmapped low memory → SIGSEGV.
-    // drizzle nests proxies (a proxy whose target is itself a proxy), so this is
-    // reachable when `is(value, type)` walks `getPrototypeOf` over a
-    // proxy-wrapped table/column. Route it through the Proxy `[[GetPrototypeOf]]`
-    // (no-trap → the target's prototype) instead. Returns `None` for a null /
-    // self prototype, matching the heap-object handling below.
+    // A tagged Proxy receiver must dispatch before an ObjectHeader read.
+    // Its own target/handler fields provide the prototype operation.
     if lookup(value).is_some() {
         let proto = reflect_misc::proxy_get_prototype_of_impl(value);
         let proto_bits = proto.to_bits();
@@ -2127,11 +1793,10 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                                 && interned != 0;
                             let verdict = if plan_eligible
                                 && crate::object::prop_plan::store_plan_check(
-                                    class_id,
-                                    interned,
-                                    crate::object::prop_plan::receiver_proto_bits(
+                                    crate::object::shapes::object_shape_stamp(
                                         addr as *const crate::ObjectHeader,
                                     ),
+                                    interned,
                                 ) {
                                 true
                             } else {
@@ -2140,11 +1805,10 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                                 );
                                 if clear && plan_eligible {
                                     crate::object::prop_plan::store_plan_record(
-                                        class_id,
-                                        interned,
-                                        crate::object::prop_plan::receiver_proto_bits(
+                                        crate::object::shapes::object_shape_stamp(
                                             cur_addr() as *const crate::ObjectHeader
                                         ),
+                                        interned,
                                     );
                                 }
                                 clear
@@ -2586,125 +2250,18 @@ static KEEP_REFLECT_OWN_KEYS: extern "C" fn(f64) -> f64 = js_reflect_own_keys;
 #[used(compiler)]
 static KEEP_REFLECT_APPLY: extern "C" fn(f64, f64, f64) -> f64 = js_reflect_apply;
 
-/// #8194: death pruning for `REFLECT_METADATA`.
-///
-/// The key carries the decorator target's NaN-boxed bits, and
-/// `rewrite_metadata_target_bits` **rekeys** them when the target moves.
-/// Entries were removed only by `Reflect.deleteMetadata`, so a target that
-/// simply became unreachable left its address in the key — the #8040 shape,
-/// because the next rewrite pass reads whatever the arena put there.
-///
-/// Non-`POINTER_TAG` keys (class refs, primitives) and handle-band ids are
-/// left alone: they are not heap addresses, and the `gc::dead_owner` probes
-/// decline to attribute them anyway.
-pub(crate) fn prune_dead_reflect_metadata_targets(is_dead_owner: &dyn Fn(usize) -> bool) {
-    REFLECT_METADATA.with(|store| {
-        store.borrow_mut().retain(|key, _| {
-            if (key.target_bits & !POINTER_MASK) != POINTER_TAG {
-                return true;
-            }
-            let addr = (key.target_bits & POINTER_MASK) as usize;
-            addr == 0 || !is_dead_owner(addr)
-        });
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn test_reflect_metadata_len() -> usize {
-    REFLECT_METADATA.with(|store| store.borrow().len())
-}
-
-#[cfg(test)]
-pub(crate) fn test_seed_reflect_metadata(target_bits: u64, key: &str) {
-    REFLECT_METADATA.with(|store| {
-        store.borrow_mut().insert(
-            MetadataKey {
-                target_bits,
-                key: key.to_string(),
-                property_key: None,
-            },
-            f64::from_bits(TAG_UNDEFINED),
-        );
-    });
-}
-
-/// Rewrite a `REFLECT_METADATA` key's POINTER-tagged target bits during the
-/// GC metadata-rewrite phase; non-pointer targets (class refs, primitives)
-/// pass through untouched.
-fn rewrite_metadata_target_bits(
-    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
-    target_bits: u64,
-) -> u64 {
-    if !visitor.is_metadata_rewrite_phase() {
-        return target_bits;
-    }
-    if (target_bits & !POINTER_MASK) != POINTER_TAG {
-        return target_bits;
-    }
-    let mut addr = (target_bits & POINTER_MASK) as usize;
-    if visitor.visit_metadata_usize_slot(&mut addr) {
-        POINTER_TAG | (addr as u64 & POINTER_MASK)
-    } else {
-        target_bits
-    }
-}
-
-/// GC scanner for the proxy registry + reflect-metadata store. A minor trace
-/// must visit every live entry because it does not scan the whole heap. A full
-/// mark trace skips those strong edges and observes proxy handles from roots
-/// and heap slots instead; rewrite/verify phases still visit surviving entry
-/// slots. `REFLECT_METADATA`'s keys are rekeyed during metadata rewrite.
-pub(crate) fn scan_proxy_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    // A full mark trace discovers liveness from proxy-band handles instead of
-    // making the registry itself a root. Minors cannot make that inference
-    // because they do not scan the whole heap, and rewrite/verify phases must
-    // still update the live entries after evacuation.
-    if !(gc_full_trace_active() && visitor.is_mark_phase()) {
-        PROXIES.with(|proxies| {
-            for entry in proxies.borrow_mut().iter_mut().flatten() {
-                visitor.visit_nanbox_f64_slot(&mut entry.target);
-                visitor.visit_nanbox_f64_slot(&mut entry.handler);
-            }
-        });
-    }
-
-    REFLECT_METADATA.with(|store| {
-        let mut store = store.borrow_mut();
-        let needs_rebuild = store
-            .keys()
-            .any(|key| rewrite_metadata_target_bits(visitor, key.target_bits) != key.target_bits);
-        if needs_rebuild {
-            let old = std::mem::take(&mut *store);
-            for (mut key, mut value) in old {
-                visitor.visit_nanbox_f64_slot(&mut value);
-                key.target_bits = rewrite_metadata_target_bits(visitor, key.target_bits);
-                store.insert(key, value);
-            }
-        } else {
-            for value in store.values_mut() {
-                visitor.visit_nanbox_f64_slot(value);
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 pub(crate) fn test_proxy_slot_is_live(proxy_boxed: f64) -> bool {
-    let bits = proxy_boxed.to_bits();
-    let Some(id) = decode_proxy_id((bits & POINTER_MASK) as i64) else {
-        return false;
-    };
-    PROXIES.with(|proxies| {
-        proxies
-            .borrow()
-            .get(id as usize)
-            .is_some_and(Option::is_some)
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn test_proxy_gc_reclaimed_total() -> u64 {
-    PROXY_GC_RECLAIMED_TOTAL.with(Cell::get)
+    // A collected cell is no longer an honest pointer: ask the allocator's
+    // object-start record, not the stale header bytes.
+    let addr = (proxy_boxed.to_bits() & POINTER_MASK) as usize;
+    unsafe {
+        crate::value::addr_class::try_read_tracked_arena_header_of_type(
+            addr,
+            crate::gc::GC_TYPE_PROXY,
+        )
+    }
+    .is_some()
 }
 
 #[cfg(test)]
@@ -2716,177 +2273,6 @@ mod tests {
         f64::from_bits(POINTER_TAG | ((obj as u64) & POINTER_MASK))
     }
 
-    /// #8213: an id past the end of the revocable-Proxy band does not merely
-    /// fail to round-trip — it encodes to a payload every addr-class consumer
-    /// reads as a **dereferenceable heap address**, so the value the 65,536th
-    /// `new Proxy(...)` handed back was segfaulted by the next property read.
-    ///
-    /// The vacuity guard matters here: if the band is ever moved or resized,
-    /// `PROXY_ID_BAND_LEN` moves with it and the loop below would still pass
-    /// while testing a different range, so pin the width too.
-    #[test]
-    fn every_reservable_proxy_id_encodes_inside_the_band() {
-        use crate::value::addr_class;
-
-        assert_eq!(
-            PROXY_ID_BAND_LEN, 0x10000,
-            "the revocable-Proxy band is [0xF0000, 0x100000): 65,536 ids"
-        );
-
-        for len in 0..PROXY_ID_BAND_LEN as usize {
-            let id = reserve_proxy_id(len).expect("inside the band");
-            assert_eq!(id, len as u64);
-            assert!(
-                addr_class::is_proxy_id_band(encode_proxy_id(id) as usize),
-                "id {id} must encode inside the proxy band"
-            );
-        }
-
-        // The first refused id, and why refusing it matters: it would name
-        // another subsystem's handle (the Web Streams band follows the proxy
-        // band), so a proxy minted there would be dispatched as a stream.
-        assert_eq!(reserve_proxy_id(PROXY_ID_BAND_LEN as usize), None);
-        let out_of_band = encode_proxy_id(PROXY_ID_BAND_LEN) as usize;
-        assert!(!addr_class::is_proxy_id_band(out_of_band));
-        assert!(
-            addr_class::is_stream_id_band(out_of_band),
-            "an out-of-band proxy id lands in the Web Streams band"
-        );
-    }
-
-    /// The decoder and `addr_class::is_proxy_id_band` must agree about what a
-    /// proxy id is. Before #8213 they did not: `lookup` accepted any payload
-    /// below 4 GiB, so an out-of-band id was simultaneously "a live proxy"
-    /// (here) and "a heap pointer" (everywhere else).
-    #[test]
-    fn decode_proxy_id_rejects_payloads_outside_the_band() {
-        use crate::value::addr_class;
-
-        assert_eq!(
-            decode_proxy_id(PROXY_TAG_BASE as i64),
-            None,
-            "id 0 reserved"
-        );
-        assert_eq!(
-            decode_proxy_id((PROXY_TAG_BASE - 1) as i64),
-            None,
-            "below band"
-        );
-        assert_eq!(
-            decode_proxy_id((addr_class::PROXY_ID_BAND_END - 1) as i64),
-            Some(PROXY_ID_BAND_LEN - 1),
-            "the last in-band payload still decodes"
-        );
-        assert_eq!(
-            decode_proxy_id(addr_class::PROXY_ID_BAND_END as i64),
-            None,
-            "the first payload past the band is not a proxy id"
-        );
-        assert_eq!(decode_proxy_id(0x1_0000_0000_i64), None);
-    }
-
-    /// End of the live path: `js_proxy_new` stops handing out ids at the band
-    /// edge. The refusal itself is asserted through `reserve_proxy_id` because
-    /// the throw `js_proxy_new` performs exits the process when no `try` is
-    /// open (`exception::js_throw`), which a unit test cannot survive.
-    #[test]
-    fn js_proxy_new_never_mints_past_the_band_edge() {
-        use crate::value::addr_class;
-
-        // Shrink the band so the edge is reachable without 65k allocations.
-        // Index 0 is reserved, so a length of 6 leaves 5 usable ids.
-        PROXY_ID_BAND_LEN_OVERRIDE.with(|c| c.set(Some(6)));
-
-        let mut minted = Vec::new();
-        for _ in 0..5 {
-            let proxy = js_proxy_new(obj_value(), obj_value());
-            let payload = (proxy.to_bits() & POINTER_MASK) as usize;
-            assert!(
-                addr_class::is_proxy_id_band(payload),
-                "{payload:#x} escaped the proxy band"
-            );
-            assert_eq!(js_proxy_is_proxy(proxy), 1);
-            minted.push(proxy);
-        }
-
-        let full = PROXIES.with(|p| p.borrow().len());
-        assert_eq!(full, 6, "registry is at the (shrunk) band edge");
-        assert_eq!(
-            reserve_proxy_id(full),
-            None,
-            "the next new Proxy(...) must be refused, not minted out of band"
-        );
-
-        // Everything minted before the edge still works.
-        for proxy in minted {
-            assert_eq!(js_proxy_is_proxy(proxy), 1);
-            assert_eq!(js_proxy_is_revoked(proxy), 0);
-        }
-    }
-
-    /// The live witness for #8213: what a program that runs off the end of the
-    /// band actually gets. It cannot be observed in-process — `js_throw` with
-    /// no open `try` prints the uncaught error and `process::exit(1)`s — so the
-    /// child re-runs this test against a shrunk band and the parent asserts on
-    /// its exit status and output. `Some(1)` versus a signal death is exactly
-    /// the difference this fix makes: before, the 65,536th `new Proxy(...)`
-    /// returned a payload the next property read dereferenced (SIGSEGV, no
-    /// status code at all).
-    ///
-    /// It also covers the two things a unit test on `reserve_proxy_id` cannot:
-    /// that the registry borrow is released before the throw (an open borrow
-    /// would panic the moment the error allocation reaches the GC's proxy
-    /// scanner), and that the error is allocatable at all with a full registry.
-    #[test]
-    fn exhausting_the_band_reports_a_range_error_instead_of_segfaulting() {
-        // Harness plumbing, deliberately not a `PERRY_GC_*` name (that family
-        // is audited by `scripts/check_gc_env_knobs.py`).
-        const CHILD_ENV: &str = "PERRY_TEST_PROXY_BAND_EXHAUSTION_CHILD";
-
-        if std::env::var_os(CHILD_ENV).is_some() {
-            // Index 0 is reserved, so a length of 4 leaves 3 usable ids and the
-            // 4th call is the one past the edge.
-            PROXY_ID_BAND_LEN_OVERRIDE.with(|c| c.set(Some(4)));
-            for _ in 0..8 {
-                js_proxy_new(obj_value(), obj_value());
-            }
-            unreachable!("js_proxy_new must not mint an id past the band edge");
-        }
-
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("current test binary"),
-        )
-        .arg("proxy::tests::exhausting_the_band_reports_a_range_error_instead_of_segfaulting")
-        .arg("--exact")
-        .arg("--nocapture")
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("launch the band-exhaustion witness");
-
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            output.status.code(),
-            Some(1),
-            "exhaustion must exit(1) after an uncaught RangeError, not die on a \
-             signal and not run past the edge; output was:\n{combined}"
-        );
-        assert!(
-            combined.contains("RangeError"),
-            "the uncaught error must be a RangeError; output was:\n{combined}"
-        );
-        assert!(
-            combined.contains("Too many proxies"),
-            "the message must name the exhausted registry; output was:\n{combined}"
-        );
-    }
-
-    /// 2026-07-09 GC audit (wave 2 batch A): revocation must DETACH — null the
-    /// registry entry's target/handler so `scan_proxy_roots_mut` stops rooting
-    /// the wrapped graphs — while `revoked` keeps gating every trap path.
     #[test]
     fn revoke_detaches_target_and_handler_slots() {
         let target = obj_value();
@@ -2901,11 +2287,10 @@ mod tests {
         assert_eq!(js_proxy_is_revoked(proxy), 1);
 
         let id = lookup(proxy).expect("revoked proxy stays a registered proxy");
-        let (target_bits, handler_bits) = PROXIES.with(|p| {
-            let v = p.borrow();
-            let entry = v[id as usize].as_ref().expect("entry present");
+        let (target_bits, handler_bits) = {
+            let entry = entry(id).expect("live proxy cell");
             (entry.target.to_bits(), entry.handler.to_bits())
-        });
+        };
         assert_eq!(target_bits, 0, "revoke must null [[ProxyTarget]]");
         assert_eq!(handler_bits, 0, "revoke must null [[ProxyHandler]]");
 
@@ -3280,7 +2665,7 @@ mod tests {
             crate::gc::OBJ_FLAG_NULL_PROTO,
             crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO,
             crate::gc::OBJ_FLAG_HAS_DESCRIPTORS,
-            0x0038, // GC_COPY_SURVIVAL_AGE_MASK
+            0x0018, // GC_COPY_SURVIVAL_AGE_MASK
         ] {
             assert_eq!(
                 crate::gc::OBJ_FLAG_PLAIN_ORDINARY & other,
@@ -3303,18 +2688,30 @@ mod tests {
     /// `DirectParser` (`json/parse_api.rs`) — no lazy tape stands between this
     /// probe and the objects it inspects (#7635).
     #[test]
-    fn json_parse_receivers_are_admitted_to_the_whole_loop_write_clone() {
+    fn record_receivers_are_admitted_to_the_whole_loop_write_clone() {
         // This proof honours the process-wide class-field inline gate, and any
         // earlier test that ran `js_gc_init` (typed feedback is always on in
         // test builds) leaves that gate disabled. Establish the premise.
 
         let src = br#"{"x":0,"y":0}"#;
+        let key_ptr = crate::string::js_string_from_bytes(b"y".as_ptr(), 1);
+        let key_y = f64::from_bits(crate::value::STRING_TAG | (key_ptr as u64 & POINTER_MASK));
+        // Object model step 4: a JSON.parse record keeps its fields in its
+        // overflow (§3.4), which this layout proof does not serve until step
+        // 5; the nest goes to ordinary [[Set]].
+        let parsed: Vec<f64> = (0..4)
+            .map(|_| put_value::record_fixture::json(src))
+            .collect();
+        let parsed_array = crate::array::js_array_from_f64(parsed.as_ptr(), parsed.len() as u32);
+        assert_eq!(
+            object_array_numeric_write_guard(boxed_object(parsed_array.cast()), &[key_y], 4),
+            0,
+            "JSON.parse records (overflow receivers) take ordinary [[Set]]"
+        );
+        // The admission itself, on the same records built with fixed slots.
         let mut receivers = Vec::new();
         for _ in 0..4 {
-            let text = crate::string::js_string_from_bytes(src.as_ptr(), src.len() as u32);
-            let value = unsafe { crate::json::js_json_parse(text) };
-            assert!(value.is_pointer(), "JSON.parse must yield an object");
-            receivers.push(f64::from_bits(value.bits()));
+            receivers.push(put_value::record_fixture::record(src));
         }
         let array = crate::array::js_array_from_f64(receivers.as_ptr(), receivers.len() as u32);
         let array_box = boxed_object(array.cast());
@@ -3338,17 +2735,15 @@ mod tests {
                 assert_eq!(
                     crate::object::shapes::object_shape_stamp(*object),
                     crate::object::shapes::object_shape_stamp(objects[0]),
-                    "repeated parses share one keys array, hence one ShapeId"
+                    "records of one key sequence share one ShapeId"
                 );
             }
         }
 
-        let key_ptr = crate::string::js_string_from_bytes(b"y".as_ptr(), 1);
-        let key_y = f64::from_bits(crate::value::STRING_TAG | (key_ptr as u64 & POINTER_MASK));
         assert_eq!(
             object_array_numeric_write_guard(array_box, &[key_y], 4),
             2,
-            "the whole-loop clone must publish slot 1 for a parsed receiver prefix"
+            "the whole-loop clone must publish slot 1 for a record receiver prefix"
         );
 
         // The discriminating quantity: clear the ordinary mark on ONE receiver
@@ -3362,7 +2757,7 @@ mod tests {
             assert_ne!(
                 saved & crate::gc::OBJ_FLAG_PLAIN_ORDINARY,
                 0,
-                "the parser must mark what it allocates"
+                "the record is born marked ordinary"
             );
             (*header)._reserved = saved & !crate::gc::OBJ_FLAG_PLAIN_ORDINARY;
             crate::object::shapes::store_kind::restamp_object_store_kind(objects[2]);
@@ -3387,16 +2782,23 @@ mod tests {
     /// covers a constant-counted nest). A miss that refuses to prime leaves the
     /// site on the runtime path forever.
     #[test]
-    fn json_parse_receivers_prime_the_static_write_pic() {
-        let src = br#"{"n":1}"#;
-        let text = crate::string::js_string_from_bytes(src.as_ptr(), src.len() as u32);
-        let value = unsafe { crate::json::js_json_parse(text) };
-        assert!(value.is_pointer());
-        let target = f64::from_bits(value.bits());
-        let object = (value.bits() & POINTER_MASK) as *mut crate::ObjectHeader;
-
-        let key_ptr = crate::string::js_string_from_bytes(b"n".as_ptr(), 1);
-        let key_ptr = crate::string::js_string_intern(key_ptr, fnv1a(b"n"));
+    fn record_receivers_prime_the_static_write_pic() {
+        // Object model step 4: a JSON.parse record keeps its fields in its
+        // overflow and primes no site until step 5; this pins the admission
+        // on the same record built with fixed slots.
+        // The key is interned before anything mints an atom for its spelling
+        // (a JSON.parse or a canonical key list would): only an interned
+        // string is admitted as a write site's key.
+        let name: &[u8] = b"n8098";
+        let key_ptr = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+        let key_ptr = crate::string::js_string_intern(key_ptr, fnv1a(name));
+        let plain_record = || {
+            let obj = crate::object::js_object_alloc_plain(0);
+            crate::object::js_object_set_field_by_name(obj, key_ptr, 1.0);
+            f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits())
+        };
+        let target = plain_record();
+        let object = (target.to_bits() & POINTER_MASK) as *mut crate::ObjectHeader;
 
         let mut cache: put_value::WritePicCache = [0; put_value::WRITE_PIC_WORDS];
         let mut cache_slot: put_value::WritePicCacheSlot = &mut cache;
@@ -3415,9 +2817,8 @@ mod tests {
 
         // Discriminating half: an otherwise identical parsed receiver with the
         // ordinary mark cleared must NOT prime.
-        let text = crate::string::js_string_from_bytes(src.as_ptr(), src.len() as u32);
-        let value = unsafe { crate::json::js_json_parse(text) };
-        let unmarked = (value.bits() & POINTER_MASK) as *mut crate::ObjectHeader;
+        let value = plain_record();
+        let unmarked = (value.to_bits() & POINTER_MASK) as *mut crate::ObjectHeader;
         unsafe {
             let header =
                 (unmarked as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
@@ -3426,14 +2827,8 @@ mod tests {
         }
         let mut cache2: put_value::WritePicCache = [0; put_value::WRITE_PIC_WORDS];
         let mut cache2_slot: put_value::WritePicCacheSlot = &mut cache2;
-        let stored = put_value::js_put_value_set_ic_miss(
-            f64::from_bits(value.bits()),
-            key_ptr,
-            9.0,
-            0,
-            &mut cache2_slot,
-            0,
-        );
+        let stored =
+            put_value::js_put_value_set_ic_miss(value, key_ptr, 9.0, 0, &mut cache2_slot, 0);
         assert_eq!(stored, 9.0, "the write itself still succeeds");
         assert_eq!(
             cache2[0], 0,
@@ -3468,7 +2863,7 @@ mod tests {
                 addr >= OLD_FLOOR,
                 "{addr:#x} must be at/above the old floor to prove the gap"
             );
-            let boxed = f64::from_bits(POINTER_TAG | (addr as u64));
+            let boxed = f64::from_bits(crate::value::HANDLE_TAG | (addr as u64));
             assert!(
                 create_list_from_array_like(boxed).is_empty(),
                 "{addr:#x} must not be misread as a live Array"
@@ -3515,7 +2910,7 @@ mod tests {
                 addr >= OLD_FLOOR,
                 "{addr:#x} must be at/above the old floor to prove the gap"
             );
-            let boxed = f64::from_bits(POINTER_TAG | (addr as u64));
+            let boxed = f64::from_bits(crate::value::HANDLE_TAG | (addr as u64));
             assert!(
                 array_ptr_from_value(boxed).is_none(),
                 "{addr:#x} must not resolve to an ArrayHeader"
@@ -3548,7 +2943,7 @@ mod tests {
                 addr >= OLD_FLOOR,
                 "{addr:#x} must be at/above the old floor to prove the gap"
             );
-            let boxed = f64::from_bits(POINTER_TAG | (addr as u64));
+            let boxed = f64::from_bits(crate::value::HANDLE_TAG | (addr as u64));
             // Reaching this assertion at all (no SIGSEGV) is half the test.
             let _ = prototype_of_for_set(boxed);
         }

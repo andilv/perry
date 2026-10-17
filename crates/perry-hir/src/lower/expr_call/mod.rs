@@ -266,7 +266,13 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
     // lowered, leaving the flag set. Restoring here keeps it from leaking into
     // a sibling expression.
     let prev_suppress = ctx.suppress_stdlib_dispatch_guard_once;
-    let result = lower_call_inner(ctx, call);
+    // #12643: a namespace call dynamic code may redirect is lowered as usual
+    // and then guarded by its namespace's shadow bit.
+    let mut ns_guard = None;
+    let result = lower_call_inner(ctx, call, &mut ns_guard).map(|fast| match ns_guard {
+        Some(guard) => guard.wrap(fast),
+        None => fast,
+    });
     ctx.suppress_stdlib_dispatch_guard_once = prev_suppress;
     // Restore: drop any native-instance tags this call's pre-scans
     // added (and anything nested calls left above the mark — those
@@ -278,7 +284,11 @@ pub(super) fn lower_call(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Res
     result
 }
 
-fn lower_call_inner(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Result<Expr> {
+fn lower_call_inner(
+    ctx: &mut LoweringContext,
+    call: &ast::CallExpr,
+    ns_guard: &mut Option<patched_builtin_call::NamespaceGuard>,
+) -> Result<Expr> {
     // Safety net for the receiver-lowering memo (see
     // `LoweringContext::prelowered_member_receiver`): the memo is set by
     // `try_static_method_and_instance` only to be consumed by the immediately
@@ -399,10 +409,15 @@ fn lower_call_inner(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Result<E
         .collect::<Result<Vec<_>>>()?;
 
     // #10848: a built-in member the program replaces anywhere must not bind
-    // to its intrinsic — call whatever the property holds at runtime.
+    // to its intrinsic — call whatever the property holds at runtime. One
+    // dynamic code may replace binds it under a `Pristine(namespace)` guard.
     let args = match patched_builtin_call::try_patched_builtin_call(ctx, call, args)? {
-        Ok(expr) => return Ok(expr),
-        Err(args) => args,
+        patched_builtin_call::NamespaceCall::Dynamic(expr) => return Ok(expr),
+        patched_builtin_call::NamespaceCall::Plain(args) => args,
+        patched_builtin_call::NamespaceCall::Guarded(args, guard) => {
+            *ns_guard = Some(guard);
+            args
+        }
     };
     // #11394: likewise a method the program writes onto a builtin PROTOTYPE —
     // no receiver-specific arm may fold the call to its intrinsic.
@@ -515,6 +530,25 @@ fn lower_call_inner(ctx: &mut LoweringContext, call: &ast::CallExpr) -> Result<E
         ast::Callee::Expr(expr) => {
             // Check for super.method() call
             if let ast::Expr::SuperProp(super_prop) = expr.as_ref() {
+                if let (Some(home_id), Some(spread_args)) = (
+                    ctx.object_super_home_stack.last().copied(),
+                    spread_args.as_ref(),
+                ) {
+                    let key = match &super_prop.prop {
+                        ast::SuperProp::Ident(i) => Expr::String(i.sym.to_string()),
+                        ast::SuperProp::Computed(c) => lower_expr(ctx, &c.expr)?,
+                    };
+                    return Ok(Expr::CallSpread {
+                        callee: Box::new(Expr::ObjectSuperPropertyGet {
+                            home: Box::new(Expr::LocalGet(home_id)),
+                            key: Box::new(key),
+                            receiver: Box::new(Expr::This),
+                        }),
+                        args: spread_args.clone(),
+                        type_args: Vec::new(),
+                    });
+                }
+
                 match &super_prop.prop {
                     ast::SuperProp::Ident(ident) => {
                         if let Some(home_id) = ctx.object_super_home_stack.last().copied() {

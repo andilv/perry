@@ -21,15 +21,19 @@ crate::perry_thread_local! {
     /// Lexical ClassDefinitionEvaluation owner for static method/accessor
     /// dispatch. Unlike the `this` argument, this is not replaced by `.call`'s
     /// visible receiver. A stack makes nested dispatch frame-local.
-    static STATIC_PRIVATE_OWNER_STACK: RefCell<crate::exception::CatchStack<u64>> = const {
-        RefCell::new(crate::exception::CatchStack::new(
-            crate::exception::catch_subsystem::STATIC_PRIVATE_OWNER,
-        ))
-    };
+    static STATIC_PRIVATE_OWNER_STACK: RefCell<crate::exception::CatchStack<u64>> =
+        const { RefCell::new(crate::exception::CatchStack::new()) };
 }
 
+/// Push the static-private owner for the calling frame's dispatch.
+#[inline(always)]
 pub(crate) fn static_private_owner_push(value: f64) {
-    STATIC_PRIVATE_OWNER_STACK.with(|stack| stack.borrow_mut().push(value.to_bits()));
+    static_private_owner_push_at(crate::exception::frame_mark(), value);
+}
+
+/// Push the static-private owner for the dispatch the frame `mark` names.
+pub(crate) fn static_private_owner_push_at(mark: usize, value: f64) {
+    STATIC_PRIVATE_OWNER_STACK.with(|stack| stack.borrow_mut().push(mark, value.to_bits()));
 }
 
 pub(crate) fn static_private_owner_pop() {
@@ -42,13 +46,21 @@ pub(crate) fn static_private_owner_current() -> Option<f64> {
     STATIC_PRIVATE_OWNER_STACK.with(|stack| stack.borrow().last().copied().map(f64::from_bits))
 }
 
-#[inline]
-pub(crate) fn static_private_owner_stack_savepoint() -> usize {
-    STATIC_PRIVATE_OWNER_STACK.with(|stack| stack.borrow().len())
+pub(crate) fn static_private_owner_unwind_to(sp: usize) {
+    STATIC_PRIVATE_OWNER_STACK.with(|stack| {
+        stack.borrow_mut().unwind_to(sp);
+    });
 }
 
-pub(crate) fn static_private_owner_stack_restore(depth: usize) {
-    STATIC_PRIVATE_OWNER_STACK.with(|stack| stack.borrow_mut().truncate(depth));
+pub(crate) fn static_private_owner_check_marks(sp: usize) {
+    STATIC_PRIVATE_OWNER_STACK.with(|stack| {
+        crate::exception::marks::check_marks(stack.borrow().marks(), sp, "static_private_owner")
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn static_private_owner_depth() -> usize {
+    STATIC_PRIVATE_OWNER_STACK.with(|stack| stack.borrow().len())
 }
 
 /// Arm the static-`this` override unconditionally (used by the call/apply
@@ -209,24 +221,53 @@ pub extern "C" fn js_new_target_get() -> f64 {
     NEW_TARGET.with(|c| f64::from_bits(c.get()))
 }
 
-/// Set `new.target` and return the previous value.
+/// Set `new.target` and return the previous value. Code that sets it for the
+/// duration of a call roots the previous value with
+/// `RuntimeHandleScope::root_new_target_save` (or `js_new_target_enter`): a
+/// landing pad that truncates the handle stack past that save puts the value
+/// back when the call throws.
 #[no_mangle]
 pub extern "C" fn js_new_target_set(value: f64) -> f64 {
     NEW_TARGET.with(|c| f64::from_bits(c.replace(value.to_bits())))
+}
+
+/// Compiled `new`: publish `value` as `new.target` around the constructor
+/// call and return the displaced value. The save sits on the handle stack
+/// above the height the compiled frame read on entering its handler scope, so
+/// the frame's own landing pad restores it when the call throws.
+#[no_mangle]
+pub extern "C" fn js_new_target_enter(value: f64) -> f64 {
+    let previous = js_new_target_set(value);
+    crate::gc::new_target_save_push(previous.to_bits());
+    previous
+}
+
+/// Compiled `new`: end the innermost bridge after its call returned.
+#[no_mangle]
+pub extern "C" fn js_new_target_leave() {
+    if let Some(previous) = crate::gc::new_target_save_pop_top() {
+        NEW_TARGET.with(|c| c.set(previous));
+    }
+}
+
+/// A landing pad truncated the handle stack past `new.target` saves: put back
+/// the value the oldest of them displaced.
+pub(crate) fn new_target_restore_after_throw(bits: u64) {
+    NEW_TARGET.with(|c| c.set(bits));
 }
 
 /// Publish the construction target while a runtime-dispatched super call runs.
 /// Inline construction can keep new.target only in generated locals, so recover
 /// its identity from the receiver when no dynamic target is already active.
 /// An explicit Reflect.construct target must win, even if its class differs.
-/// Throws are also covered by the NEW_TARGET catch savepoint below.
+/// A throw is covered by the bridge's landing-pad restore.
 pub(crate) struct SuperNewTargetScope<'scope> {
     previous: crate::gc::RuntimeHandle<'scope>,
 }
 
 impl<'scope> SuperNewTargetScope<'scope> {
     pub(crate) fn bind(scope: &'scope crate::gc::RuntimeHandleScope, receiver: f64) -> Self {
-        let previous = scope.root_nanbox_f64(js_new_target_get());
+        let previous = scope.root_new_target_save(js_new_target_get());
         if previous.get_nanbox_f64().to_bits() == crate::value::TAG_UNDEFINED {
             let target = super::private_evaluation_brand_value(receiver).or_else(|| unsafe {
                 let value = crate::value::JSValue::from_bits(receiver.to_bits());
@@ -251,20 +292,6 @@ impl Drop for SuperNewTargetScope<'_> {
     fn drop(&mut self) {
         js_new_target_set(self.previous.get_nanbox_f64());
     }
-}
-
-/// `catch_savepoints!` capture/restore for `NEW_TARGET`: the Temporal/Intl
-/// subclass `super()` bridges (`fetch_globals.rs`, `intl/subclass.rs`)
-/// save/restore `new.target` with a bare statement pair around the parent
-/// constructor call, which neither a `longjmp` nor a system unwind runs, so
-/// every `try` captures it and `js_throw` replays it.
-#[inline]
-pub(crate) fn new_target_trap_savepoint() -> u64 {
-    NEW_TARGET.with(|c| c.get())
-}
-
-pub(crate) fn new_target_trap_restore(bits: u64) {
-    NEW_TARGET.with(|c| c.set(bits));
 }
 
 /// GC mutable-root scanner for the dispatch-binding cells: `new.target`, the
@@ -293,24 +320,76 @@ pub fn scan_dispatch_binding_roots_mut(visitor: &mut crate::gc::RuntimeRootVisit
             visitor.visit_nanbox_u64_slot(bits);
         }
     });
+    DERIVED_SUPER_BINDING_STACK.with(|stack| {
+        for entry in stack.borrow_mut().iter_mut() {
+            visitor.visit_nanbox_u64_slot(&mut entry.this_bits);
+        }
+    });
+}
+
+/// One active derived-constructor activation: its `super()` binding cell, the
+/// object it constructs, and its class.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DerivedSuperBinding {
+    /// The constructor's `i1` binding cell (a native alloca).
+    slot: usize,
+    /// The receiver the activation constructs (NaN-boxed; a GC root, see
+    /// [`scan_dispatch_binding_roots_mut`]).
+    this_bits: u64,
+    /// The class whose constructor body this is (0 = not known to codegen).
+    class_id: u32,
 }
 
 crate::perry_thread_local! {
-    /// Active inline derived-constructor `super()` binding cells. An arrow
-    /// created inside a constructor has its own codegen context, so it cannot
-    /// name the outer function's alloca directly; this stack gives it the
-    /// exact live binding cell without turning the state into a process-global
-    /// boolean.
-    static DERIVED_SUPER_BINDING_STACK: std::cell::RefCell<crate::exception::CatchStack<usize>> = const {
-        std::cell::RefCell::new(crate::exception::CatchStack::new(
-            crate::exception::catch_subsystem::DERIVED_SUPER_BINDING,
-        ))
-    };
+    /// Active derived-constructor `super()` binding cells. An arrow created
+    /// inside a constructor has its own codegen context, so it cannot name the
+    /// outer function's alloca directly; this stack gives it the exact live
+    /// binding cell without turning the state into a process-global boolean.
+    ///
+    /// An arrow finds ITS constructor's entry by the receiver it captured and
+    /// the class it was written in, never by position: the top entry belongs
+    /// to whichever derived constructor is running now, which is another
+    /// object's when the arrow (written in a constructor that finished long
+    /// ago) runs inside a different constructor's `super()`.
+    static DERIVED_SUPER_BINDING_STACK: std::cell::RefCell<crate::exception::CatchStack<DerivedSuperBinding>> =
+        const { std::cell::RefCell::new(crate::exception::CatchStack::new()) };
 }
 
+/// The binding cell of the innermost active activation constructing
+/// `this_bits` as class `class_id` (0 on either side matches any class), or
+/// `None` when that constructor is not running: its binding is then settled
+/// and an arrow written in it reads `this` freely.
+fn derived_binding_slot_for(this_bits: u64, class_id: u32) -> Option<*mut u8> {
+    DERIVED_SUPER_BINDING_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.this_bits == this_bits
+                    && (class_id == 0 || entry.class_id == 0 || entry.class_id == class_id)
+            })
+            .map(|entry| entry.slot as *mut u8)
+    })
+}
+
+/// Open the binding scope of the calling compiled constructor. The entry
+/// belongs to the caller's frame (`caller_frame_mark`): the constructor's own
+/// landing pads keep it; an in-`try` scope of an inlined constructor is closed
+/// by its pad action (perry-codegen `stmt::eh_actions`).
 #[no_mangle]
-pub extern "C" fn js_derived_super_scope_push(slot: *mut u8) {
-    DERIVED_SUPER_BINDING_STACK.with(|stack| stack.borrow_mut().push(slot as usize));
+#[inline(never)]
+pub extern "C" fn js_derived_super_scope_push(slot: *mut u8, this: f64, class_id: u32) {
+    derived_super_scope_push_at(crate::exception::caller_frame_mark(), slot, this, class_id);
+}
+
+pub(crate) fn derived_super_scope_push_at(mark: usize, slot: *mut u8, this: f64, class_id: u32) {
+    let entry = DerivedSuperBinding {
+        slot: slot as usize,
+        this_bits: this.to_bits(),
+        class_id,
+    };
+    DERIVED_SUPER_BINDING_STACK.with(|stack| stack.borrow_mut().push(mark, entry));
 }
 
 #[no_mangle]
@@ -320,25 +399,35 @@ pub extern "C" fn js_derived_super_scope_pop() {
     });
 }
 
-#[inline]
-pub(crate) fn derived_super_binding_stack_savepoint() -> usize {
+pub(crate) fn derived_super_binding_len() -> usize {
     DERIVED_SUPER_BINDING_STACK.with(|stack| stack.borrow().len())
 }
 
-pub(crate) fn derived_super_binding_stack_restore(depth: usize) {
+pub(crate) fn derived_super_binding_truncate(depth: usize) {
     DERIVED_SUPER_BINDING_STACK.with(|stack| stack.borrow_mut().truncate(depth));
 }
 
-/// Bind the innermost derived constructor's `this` from a nested arrow. The
-/// base constructor has already run when this is called; a duplicate therefore
-/// throws at binding time, as required by EvaluateCall(super()).
+pub(crate) fn derived_super_binding_unwind_to(sp: usize) {
+    DERIVED_SUPER_BINDING_STACK.with(|stack| {
+        stack.borrow_mut().unwind_to(sp);
+    });
+}
+
+pub(crate) fn derived_super_binding_check_marks(sp: usize) {
+    DERIVED_SUPER_BINDING_STACK.with(|stack| {
+        crate::exception::marks::check_marks(stack.borrow().marks(), sp, "derived_super_binding")
+    });
+}
+
+/// Bind the `this` of the derived constructor an arrow was written in (the
+/// activation constructing `this` as `class_id`) from that arrow's `super()`.
+/// The base constructor has already run when this is called; a duplicate
+/// therefore throws at binding time, as required by EvaluateCall(super()).
 #[no_mangle]
-pub extern "C" fn js_derived_super_bind_current() -> f64 {
-    let slot = DERIVED_SUPER_BINDING_STACK.with(|stack| stack.borrow().last().copied());
-    let Some(slot) = slot else {
+pub extern "C" fn js_derived_super_bind_current(this: f64, class_id: u32) -> f64 {
+    let Some(slot) = derived_binding_slot_for(this.to_bits(), class_id) else {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     };
-    let slot = slot as *mut u8;
     unsafe {
         if slot.read() != 0 {
             return crate::error::js_throw_reference_error_this_before_super();
@@ -350,14 +439,13 @@ pub extern "C" fn js_derived_super_bind_current() -> f64 {
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
-/// Throw when a separately-emitted arrow reads the active derived
-/// constructor's lexical `this` before `super()` has initialized it.
-/// Ordinary functions have no active binding stack entry, so the helper is a
-/// cheap no-op for their `this` reads.
+/// Throw when a separately-emitted arrow reads its derived constructor's
+/// lexical `this` (`this`, constructed as `class_id`) before that
+/// constructor's `super()` has initialized it. A constructor that is no
+/// longer running has no entry, and its arrows read `this` freely.
 #[no_mangle]
-pub extern "C" fn js_derived_this_check_current() -> f64 {
-    let slot = DERIVED_SUPER_BINDING_STACK.with(|stack| stack.borrow().last().copied());
-    if let Some(slot) = slot {
+pub extern "C" fn js_derived_this_check_current(this: f64, class_id: u32) -> f64 {
+    if let Some(slot) = derived_binding_slot_for(this.to_bits(), class_id) {
         let slot = slot as *const u8;
         unsafe {
             if slot.read() == 0 {
@@ -379,12 +467,19 @@ pub extern "C" fn js_derived_this_check_current() -> f64 {
 #[used(compiler)]
 static KEEP_JS_STATIC_METHOD_ENTRY_ENTER: extern "C" fn(u32, u64) = js_static_method_entry_enter;
 
+/// The owner entry belongs to the calling static method's frame
+/// (`caller_frame_mark`): its own landing pads keep it, its epilogue pops it.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn js_static_method_entry_enter(class_id: u32, this_bits: u64) {
+    static_method_entry_enter_at(crate::exception::caller_frame_mark(), class_id, this_bits);
+}
+
+fn static_method_entry_enter_at(mark: usize, class_id: u32, this_bits: u64) {
     // Minting the owner's function object allocates: root `this` across it.
     let this_scope = crate::gc::RuntimeHandleScope::new();
     let this = this_scope.root_nanbox_f64(f64::from_bits(this_bits));
-    static_private_owner_push(super::class_value::class_value(class_id));
+    static_private_owner_push_at(mark, super::class_value::class_value(class_id));
     static_this_arm(this.get_nanbox_f64());
 }
 
@@ -402,7 +497,9 @@ static KEEP_JS_STATIC_METHOD_ENTRY_ENTER_HOME: extern "C" fn(u32, u64, i64) =
     js_static_method_entry_enter_home;
 
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn js_static_method_entry_enter_home(class_id: u32, this_bits: u64, callee: i64) {
+    let mark = crate::exception::caller_frame_mark();
     let home = if callee == 0 {
         crate::value::TAG_UNDEFINED
     } else {
@@ -417,10 +514,10 @@ pub extern "C" fn js_static_method_entry_enter_home(class_id: u32, this_bits: u6
             crate::value::JSValue::from_bits(home.to_bits()).as_pointer::<super::ObjectHeader>(),
         ) == class_id;
     if !is_home {
-        js_static_method_entry_enter(class_id, this_bits);
+        static_method_entry_enter_at(mark, class_id, this_bits);
         return;
     }
-    static_private_owner_push(home);
+    static_private_owner_push_at(mark, home);
     static_this_arm(f64::from_bits(this_bits));
 }
 
@@ -437,11 +534,14 @@ static KEEP_JS_CLASS_METHOD_ENTRY_ENTER_HOME: extern "C" fn(u32, u64, i64) -> i6
     js_class_method_entry_enter_home;
 
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn js_class_method_entry_enter_home(
     class_id: u32,
     this_bits: u64,
     callee: i64,
 ) -> i64 {
+    // The brand entry belongs to the calling method's frame.
+    let mark = crate::exception::caller_frame_mark();
     let home = if callee == 0 {
         crate::value::TAG_UNDEFINED
     } else {
@@ -461,8 +561,8 @@ pub extern "C" fn js_class_method_entry_enter_home(
         super::private_evaluation_brand_value(f64::from_bits(this_bits))
             .unwrap_or_else(|| f64::from_bits(crate::value::TAG_UNDEFINED))
     };
-    let depth = derived_super_binding_stack_savepoint();
-    super::private_lexical_brand_push(brand);
+    let depth = derived_super_binding_len();
+    super::private_lexical_brand_push_at(mark, brand);
     depth as i64
 }
 
@@ -475,7 +575,7 @@ static KEEP_JS_CLASS_METHOD_ENTRY_LEAVE: extern "C" fn(i64) = js_class_method_en
 #[no_mangle]
 pub extern "C" fn js_class_method_entry_leave(depth: i64) {
     super::private_lexical_brand_pop();
-    derived_super_binding_stack_restore(depth as usize);
+    derived_super_binding_truncate(depth as usize);
 }
 
 /// Epilogue of a static method's closure-convention entry: pops the owner the

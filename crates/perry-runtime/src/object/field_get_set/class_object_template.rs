@@ -618,6 +618,11 @@ unsafe fn class_object_in_template_shape(
     }
     // Born a class object in its final shape (all `Any` lanes, so every slot
     // holds a valid value while still `undefined`).
+    // The validated template names a Class shape. Publish its immutable
+    // [[Call]] fact before the shape stamp's R6 audit, just as the ordinary
+    // class publisher does; this birth skips an intermediate ordinary shape.
+    let header = crate::gc::header_from_trusted_user_ptr(obj.cast()).cast_mut();
+    (*header)._reserved |= crate::gc::GC_OBJECT_CALLABLE;
     crate::object::shapes::stamp_object_shape_id_with_carrier_note(obj, final_shape);
     // The keys carry non-default attribute entries from birth.
     crate::object::descriptor_state::note_attrs_born_with_keys(obj as usize);
@@ -633,10 +638,37 @@ unsafe fn class_object_in_template_shape(
                 .map_or(crate::value::TAG_UNDEFINED, f64::to_bits),
             Fill::Method(code) => {
                 let f = static_method_value(code);
-                class.with_mut_ptr::<ObjectHeader, _>(|class| {
-                    set_static_method_home(f, crate::value::js_nanbox_pointer(class as i64))
-                });
-                crate::value::js_nanbox_pointer(f as i64).to_bits()
+                if f.is_null() {
+                    crate::value::TAG_UNDEFINED
+                } else {
+                    let f = scope.root_raw_mut_ptr(f);
+                    let name = class.with_const_ptr::<ObjectHeader, _>(|class| {
+                        let stored = crate::object::object_keys(class as *const ObjectHeader)
+                            .get(slot as u32);
+                        let mut short = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+                        unsafe {
+                            crate::string::js_string_key_bytes(stored, &mut short)
+                                .map(|bytes| bytes.to_vec())
+                        }
+                    });
+                    // Home first: the name gives the closure its own-property
+                    // bag, ending the fresh pointer-free birth the home install
+                    // requires.
+                    f.with_mut_ptr::<crate::closure::ClosureHeader, _>(|f| {
+                        class.with_mut_ptr::<ObjectHeader, _>(|class| {
+                            set_static_method_home(f, crate::value::js_nanbox_pointer(class as i64))
+                        })
+                    });
+                    if let Some(name) = name {
+                        let f_value = f.with_const_ptr::<crate::closure::ClosureHeader, _>(|f| {
+                            crate::value::js_nanbox_pointer(f as i64)
+                        });
+                        crate::object::native_module::set_function_name_bytes(f_value, &name);
+                    }
+                    f.with_const_ptr::<crate::closure::ClosureHeader, _>(|f| {
+                        crate::value::js_nanbox_pointer(f as i64).to_bits()
+                    })
+                }
             }
             Fill::Parent => {
                 // `js_class_evaluation_object`'s ordering rule: arm before
@@ -708,11 +740,13 @@ unsafe fn record_class_object_template(
         {
             saw_parent = true;
             Fill::Parent
-        } else if let Some(name) = statics.iter().find(|name| is(name.as_bytes())) {
+        } else if let Some(name) = statics.iter().find(|name| is(name)) {
             // A static method's own function object (a static accessor of
             // this name leaves an accessor, which no template records).
             let Some(code) =
-                super::super::class_registry::class_own_static_method_code(class_id, name)
+                super::super::class_registry::parent_static::class_own_static_method_code_bytes(
+                    class_id, name,
+                )
             else {
                 return;
             };
@@ -892,15 +926,20 @@ enum ProtoFill {
 /// template `class_id`: it runs the method's closure-convention entry, and its
 /// home capture names class object `class`. `None` when the template
 /// registered no entry for `name`.
-pub(crate) unsafe fn evaluation_method_value(class_id: u32, name: &str, class: f64) -> Option<f64> {
-    let Some(code) = super::super::class_registry::class_method_entry(class_id, name) else {
+pub(crate) unsafe fn evaluation_method_value_bytes(
+    class_id: u32,
+    name: &[u8],
+    class: f64,
+) -> Option<f64> {
+    let Some(code) = super::super::class_registry::class_method_entry_bytes(class_id, name) else {
         // A computed member is its body: the function object captures it
         // (at home in, and branded by, this evaluation), never a name to
         // look up again after a later evaluation renamed the member.
-        let decl = super::super::class_registry::declarations::class_method_decl(class_id, name)
-            .filter(|decl| decl.name.is_null())?;
+        let decl =
+            super::super::class_registry::declarations::class_method_decl_bytes(class_id, name)
+                .filter(|decl| decl.name.is_null())?;
         return Some(
-            crate::object::native_module::class_method_declaration_value(
+            crate::object::native_module::class_method_declaration_value_bytes(
                 class,
                 name,
                 decl.code as usize,
@@ -908,6 +947,7 @@ pub(crate) unsafe fn evaluation_method_value(class_id: u32, name: &str, class: f
                 decl.has_synthetic_arguments(),
                 decl.has_rest(),
                 0,
+                true,
             ),
         );
     };
@@ -1046,8 +1086,8 @@ pub(crate) unsafe fn record_prototype_template(
         let is = |name: &[u8]| crate::string::js_string_key_matches_bytes(key, name);
         let fill = if slot == 0 && is(b"constructor") && bits == owner {
             ProtoFill::Constructor
-        } else if let Some((name, false)) = members.iter().find(|(name, _)| is(name.as_bytes())) {
-            let Some(code) = super::super::class_registry::class_method_entry(class_id, name)
+        } else if let Some((name, false)) = members.iter().find(|(name, _)| is(name)) {
+            let Some(code) = super::super::class_registry::class_method_entry_bytes(class_id, name)
             else {
                 return;
             };
@@ -1112,12 +1152,15 @@ pub(crate) unsafe fn evaluation_chain_lost_method(
     if let Some(template) = template {
         // The template's prototype keys, all still there: marking the
         // prototype (its first instance) restamps its shape but keeps them.
+        // A holder with an overflow (a delete gives one) keeps its layout
+        // while its own keys change, so the layout alone proves nothing.
         let intact = |o: *const ObjectHeader| {
-            crate::object::shapes::object_shape_descriptor(o).is_some_and(|d| {
-                d.keys == template.keys
-                    && d.logical_key_count == template.logical_key_count
-                    && d.hole_count == 0
-            })
+            !crate::object::overflow::has_overflow(o)
+                && crate::object::shapes::object_shape_descriptor(o).is_some_and(|d| {
+                    d.keys == template.keys
+                        && d.logical_key_count == template.logical_key_count
+                        && d.hole_count == 0
+                })
         };
         if intact(obj) {
             return false;

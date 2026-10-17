@@ -4212,13 +4212,23 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.6"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",
  "serde",
+]
+
+[[package]]
+name = "num-bigint"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
+dependencies = [
+ "num-integer",
+ "num-traits",
 ]
 
 [[package]]
@@ -4280,7 +4290,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
 dependencies = [
- "num-bigint",
+ "num-bigint 0.4.8",
  "num-integer",
  "num-traits",
 ]
@@ -4864,6 +4874,7 @@ dependencies = [
  "perry-runtime",
  "perry-transform",
  "perry-updater",
+ "perry-wpfacts",
  "rand 0.10.3",
  "rayon",
  "rustc-demangle",
@@ -5208,14 +5219,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "perry-ext-streams"
-version = "0.5.1659"
-dependencies = [
- "perry-ffi",
- "perry-runtime",
-]
-
-[[package]]
 name = "perry-ext-typescript"
 version = "0.5.1659"
 dependencies = [
@@ -5281,6 +5284,23 @@ dependencies = [
  "perry-abi",
  "perry-native-registration",
  "perry-runtime",
+]
+
+[[package]]
+name = "perry-gc-effects"
+version = "0.5.1659"
+dependencies = [
+ "anyhow",
+ "clap",
+ "llvm-sys",
+ "object",
+ "perry-perex",
+ "regex",
+ "rustc-demangle",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "walkdir",
 ]
 
 [[package]]
@@ -5381,7 +5401,7 @@ dependencies = [
  "mimalloc",
  "node-semver",
  "notify",
- "num-bigint",
+ "num-bigint 0.5.1",
  "num-traits",
  "perex",
  "perry-abi",
@@ -5745,7 +5765,16 @@ dependencies = [
 name = "perry-wasm-host"
 version = "0.5.1659"
 dependencies = [
+ "perry-abi",
  "wasmi",
+]
+
+[[package]]
+name = "perry-wpfacts"
+version = "0.5.1659"
+dependencies = [
+ "perry-hir",
+ "perry-parser",
 ]
 
 [[package]]
@@ -6581,9 +6610,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -7374,7 +7403,7 @@ dependencies = [
  "bytes-str",
  "either",
  "from_variant",
- "num-bigint",
+ "num-bigint 0.4.8",
  "once_cell",
  "rustc-hash 2.1.2",
  "serde",
@@ -7421,7 +7450,7 @@ checksum = "2839d2cf4e611b944438c304ec59396221b3db4580acd172fcd70522bb450ee9"
 dependencies = [
  "bitflags",
  "is-macro",
- "num-bigint",
+ "num-bigint 0.4.8",
  "once_cell",
  "phf 0.11.3",
  "rustc-hash 2.1.2",
@@ -7442,7 +7471,7 @@ dependencies = [
  "compact_str",
  "dragonbox_ecma",
  "memchr",
- "num-bigint",
+ "num-bigint 0.4.8",
  "once_cell",
  "regex",
  "rustc-hash 2.1.2",
@@ -7503,7 +7532,7 @@ dependencies = [
  "bitflags",
  "compact_str",
  "either",
- "num-bigint",
+ "num-bigint 0.4.8",
  "phf 0.11.3",
  "rustc-hash 2.1.2",
  "seq-macro",
@@ -7631,7 +7660,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a830a070fea84a3a8a8c556463f0551e3bfc6cf2f8bdeecd62fa753e22a72289"
 dependencies = [
  "new_debug_unreachable",
- "num-bigint",
+ "num-bigint 0.4.8",
  "swc_atoms",
  "swc_common",
  "swc_ecma_ast",
@@ -8121,9 +8150,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0df7cb580227c4381eafa7e864e1196378d4ec751ad5aef4ac639e3ef38e9cff"
+checksum = "1c31584700d452b02385d31829045ac5a5369080617761cc2f368baf50f98782"
 dependencies = [
  "js-sys",
  "libc",
@@ -8135,9 +8164,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop-http"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f987647bbe17162ee86afbdfe6d816ee1a56332fac254e0e0a7f1f1f5552d560"
+checksum = "7dc14bd5b84fd4b7f99251eb35764949eeba7c34e2b799c1a7cd6354a58b3381"
 dependencies = [
  "base64 0.22.1",
  "brotli 8.0.4",
@@ -8154,9 +8183,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop-smtp"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a7748a6d8de3ad6cf0413e68c55efd50d52687eba0bc9cbfaf377dfa12fa05b"
+checksum = "80f27404f276cf22d7b622eda17adb9390cf3eca60633b06c19200b342dab47f"
 dependencies = [
  "base64 0.22.1",
  "email-encoding",
@@ -8165,9 +8194,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop-tls"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78914709655dfeb8ec22092a6c3f4bd04747e83c349cf66ff1a7a5b19bc9b6f8"
+checksum = "5eaf0347a3e2f9bb6b41d279c81008c206c155bb28e489913f1e81c7d167a72f"
 dependencies = [
  "ring",
  "rustls",
@@ -8177,9 +8206,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop-wasi-random"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14338681210328e1615ff532657d4afc32cae9143df43cb7eee8a5ea2b5366ac"
+checksum = "3d8c3ed99aa6b0a51deeb5d84343429b9345d7d9b6f242a6548aa3449ebf1c28"
 dependencies = [
  "getrandom 0.3.4",
  "getrandom 0.4.3",
@@ -8187,9 +8216,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop-websocket"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "913e22ea69fe122a366732a63f9fd71128ea6fe3a0dc37a152621a7c1ca52988"
+checksum = "3515aca297ec16b09c45be8912dd2da689e54f18b5773924fac8c30acea41ab5"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -8202,9 +8231,9 @@ dependencies = [
 
 [[package]]
 name = "turnloop-zstd-decoder"
-version = "0.1.0-alpha.8"
+version = "0.1.0-alpha.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2d8115e434249a0a11c3411c8422369113723e80298ad4e3b12a06a1eca278f"
+checksum = "a7e01a0da61b511c891847364765aa2fd9d4fe4b1ae3738d6c3afe3f1c0dce8c"
 dependencies = [
  "twox-hash",
 ]

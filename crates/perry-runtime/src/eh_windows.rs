@@ -14,7 +14,8 @@
 //! precise roots every other target gets.
 //!
 //! So windows-msvc now uses the SAME `invoke`/`landingpad` lowering as
-//! ELF/Mach-O, with Perry's own personality. LLVM classifies a non-MSVC
+//! ELF/Mach-O, with Perry's own personality — for generated `try` and for the
+//! runtime's trap shim (`ffi/perry_trap.ll`) alike. LLVM classifies a non-MSVC
 //! personality as non-funclet EH and emits, for a COFF x64 target:
 //!
 //! ```text
@@ -33,8 +34,8 @@
 //! MSVC x64 unwind tables (.pdata/.xdata) are mandatory for all functions, so
 //! the cross-Rust-frame story needs no `force-unwind-tables` analogue: the
 //! dispatcher steps runtime helper frames unconditionally, running no Rust
-//! cleanups under panic=abort — the longjmp-equivalent semantics the savepoint
-//! restores in `exception.rs` assume.
+//! cleanups under panic=abort; the catching pad restores the managed state
+//! those frames held (`exception::js_eh_pad_enter`).
 
 use crate::eh_lsda::find_landing_pad_in_lsda;
 use core::ffi::c_void;
@@ -63,10 +64,12 @@ unsafe extern "system" {
     ) -> !;
 }
 
-/// Raise the Perry SEH exception. Returns only if the exception came back
-/// (no handler accepted it and something continued execution) — the caller
-/// treats that as transport failure and aborts loudly.
+/// Raise the Perry SEH exception. With no handler, the top-level filter
+/// ([`perry_uncaught_filter`]) ends the process before this returns; it
+/// returns only if something continued execution — the caller treats that as
+/// transport failure and aborts loudly.
 pub(crate) fn raise_perry_exception() -> i32 {
+    crate::gc::allocation_pacing::forbid_throw_in_collection();
     unsafe {
         RaiseException(
             PERRY_SEH_CODE,
@@ -76,6 +79,61 @@ pub(crate) fn raise_perry_exception() -> i32 {
         );
     }
     -1
+}
+
+// ---------------------------------------------------------------------------
+// Uncaught throws.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct ExceptionPointers {
+    record: *mut ExceptionRecord,
+    context: *mut c_void,
+}
+
+type TopLevelFilter = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+
+unsafe extern "system" {
+    fn SetUnhandledExceptionFilter(filter: Option<TopLevelFilter>) -> Option<TopLevelFilter>;
+}
+
+/// `EXCEPTION_CONTINUE_SEARCH` as a top-level filter answers it (the
+/// `ExceptionDisposition` constant above is a different enumeration).
+const FILTER_CONTINUE_SEARCH: i32 = 0;
+
+static PREVIOUS_FILTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The uncaught path on Windows. A Perry throw that no frame's language
+/// handler accepted reaches the thread's top-level filter with the stack
+/// still intact — the counterpart of `_URC_END_OF_STACK` on Itanium targets.
+/// The filter runs the same uncaught sequence (exit listeners, report,
+/// exit). Every other exception goes to the filter that was installed
+/// before Perry's.
+unsafe extern "system" fn perry_uncaught_filter(info: *mut ExceptionPointers) -> i32 {
+    if !info.is_null()
+        && !(*info).record.is_null()
+        && (*(*info).record).exception_code == PERRY_SEH_CODE
+    {
+        crate::exception::exit_uncaught_pending();
+    }
+    let previous = PREVIOUS_FILTER.load(std::sync::atomic::Ordering::Acquire);
+    if previous == 0 {
+        return FILTER_CONTINUE_SEARCH;
+    }
+    // SAFETY: only `SetUnhandledExceptionFilter`'s previous value is stored.
+    let previous: TopLevelFilter = std::mem::transmute(previous);
+    previous(info)
+}
+
+/// Install [`perry_uncaught_filter`] once, before the first raise.
+pub(crate) fn install_uncaught_filter_once() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let previous = SetUnhandledExceptionFilter(Some(perry_uncaught_filter));
+        if let Some(previous) = previous {
+            PREVIOUS_FILTER.store(previous as usize, std::sync::atomic::Ordering::Release);
+        }
+    });
 }
 
 #[repr(C)]
@@ -169,6 +227,14 @@ pub unsafe extern "system" fn perry_eh_personality(
     let func_start = dc
         .image_base
         .wrapping_add((*dc.function_entry).begin_address as u64) as usize;
+
+    // A worker-base handoff (`exception::hand_to_worker_base`) passes every
+    // handler but the base trap's shim.
+    if crate::exception::worker_base_handoff_pending()
+        && func_start != crate::exception::worker_base_shim_addr()
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     // `ControlPc` is a return address — one byte past the call — which could
     // fall into the NEXT call-site range. Same bias the Itanium path applies.
     let ip = (dc.control_pc as usize).wrapping_sub(1);
@@ -204,6 +270,150 @@ pub unsafe extern "system" fn perry_eh_personality(
         }
         _ => EXCEPTION_CONTINUE_SEARCH,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Single-phase transport (the same algorithm as `eh_walker.rs` on Itanium
+// targets, over the OS decoder).
+// ---------------------------------------------------------------------------
+
+/// x64 `CONTEXT` (winnt.h): 1232 bytes, 16-byte aligned. Only rsp/rip are
+/// read or written here; the rest is restored verbatim by
+/// `RtlRestoreContext`, which is why it must be the whole, real layout
+/// (`RtlVirtualUnwind` keeps xmm6..xmm15 in the tail up to date).
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct Context {
+    p_home: [u64; 6],
+    context_flags: u32,
+    mx_csr: u32,
+    seg: [u16; 6],
+    e_flags: u32,
+    dr: [u64; 6],
+    gpr: [u64; 4], // rax rcx rdx rbx
+    rsp: u64,
+    gpr2: [u64; 11], // rbp rsi rdi r8..r15
+    rip: u64,
+    tail: [u8; 512 + 26 * 16 + 6 * 8],
+}
+
+const _: () = assert!(core::mem::size_of::<Context>() == 1232);
+const _: () = assert!(core::mem::offset_of!(Context, rsp) == 0x98);
+const _: () = assert!(core::mem::offset_of!(Context, rip) == 0xF8);
+
+const UNW_FLAG_EHANDLER: u32 = 1;
+
+unsafe extern "system" {
+    fn RtlCaptureContext(context: *mut Context);
+    fn RtlLookupFunctionEntry(
+        control_pc: u64,
+        image_base: *mut u64,
+        history_table: *mut c_void,
+    ) -> *const RuntimeFunction;
+    fn RtlVirtualUnwind(
+        handler_type: u32,
+        image_base: u64,
+        control_pc: u64,
+        function_entry: *const RuntimeFunction,
+        context: *mut Context,
+        handler_data: *mut *mut c_void,
+        establisher_frame: *mut u64,
+        context_pointers: *mut c_void,
+    ) -> *mut c_void;
+    fn RtlRestoreContext(context: *mut Context, exception_record: *mut ExceptionRecord) -> !;
+    fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
+}
+
+/// Throws carried by the single-phase transport / handed to `RaiseException`.
+pub(crate) static FAST_TRANSPORTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `PERRY_EH_WALKER=off|0|system`: every throw takes `RaiseException`.
+fn fast_transport_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *crate::once_init::get_or_init(&ON, || {
+        !matches!(
+            std::env::var("PERRY_EH_WALKER").as_deref(),
+            Ok("off") | Ok("0") | Ok("system")
+        )
+    })
+}
+
+/// The single-phase transport for the throw in progress: walk outward with
+/// `RtlLookupFunctionEntry` + `RtlVirtualUnwind`, and at the first frame
+/// whose language handler is [`perry_eh_personality`] and whose LSDA maps
+/// the call site to a landing pad (the frame the personality would accept,
+/// handoff rule included), resume that frame at the pad with
+/// `RtlRestoreContext`. The context is the frame's own state at its call
+/// site, nonvolatile registers (integer and xmm6..15) as the virtual unwind
+/// restored them: what `RtlUnwindEx` would hand the pad, minus the visits
+/// to the frames in between (no termination handlers run, as with
+/// `RaiseException` under panic=abort, where Rust frames have none).
+///
+/// Returns when the walk declines (no function entry, a non-rising sp, an
+/// unparsable LSDA, or the transport disabled); the caller then raises.
+#[inline(never)]
+pub(crate) fn try_fast_transport() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !fast_transport_enabled() {
+        FALLBACKS.fetch_add(1, Relaxed);
+        return;
+    }
+    let handoff = crate::exception::worker_base_handoff_pending();
+    let (mut low, mut high) = (0usize, 0usize);
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    let mut context: Context = unsafe { core::mem::zeroed() };
+    unsafe { RtlCaptureContext(&mut context) };
+    for _ in 0..4096 {
+        let mut image_base = 0u64;
+        let entry =
+            unsafe { RtlLookupFunctionEntry(context.rip, &mut image_base, core::ptr::null_mut()) };
+        if entry.is_null() {
+            break;
+        }
+        // The frame's own state at its call site, before stepping out of it.
+        let frame = context;
+        let mut handler_data: *mut c_void = core::ptr::null_mut();
+        let mut establisher = 0u64;
+        let handler = unsafe {
+            RtlVirtualUnwind(
+                UNW_FLAG_EHANDLER,
+                image_base,
+                context.rip,
+                entry,
+                &mut context,
+                &mut handler_data,
+                &mut establisher,
+                core::ptr::null_mut(),
+            )
+        };
+        if handler as usize == perry_eh_personality as *const () as usize && !handler_data.is_null()
+        {
+            let func_start = image_base.wrapping_add(unsafe { (*entry).begin_address } as u64);
+            if !handoff || func_start as usize == crate::exception::worker_base_shim_addr() {
+                // Return address minus one, as the personality biases it.
+                let ip = (frame.rip as usize).wrapping_sub(1);
+                match unsafe {
+                    find_landing_pad_in_lsda(handler_data as *const u8, ip, func_start as usize)
+                } {
+                    Ok(Some(pad)) => {
+                        FAST_TRANSPORTS.fetch_add(1, Relaxed);
+                        let mut target = frame;
+                        target.rip = pad as u64;
+                        unsafe { RtlRestoreContext(&mut target, core::ptr::null_mut()) }
+                    }
+                    Ok(None) => {}
+                    Err(()) => break,
+                }
+            }
+        }
+        let sp = context.rsp as usize;
+        if context.rip == 0 || context.rsp <= frame.rsp || sp < low || sp >= high || sp & 7 != 0 {
+            break;
+        }
+    }
+    FALLBACKS.fetch_add(1, Relaxed);
 }
 
 fn eh_trace_enabled() -> bool {

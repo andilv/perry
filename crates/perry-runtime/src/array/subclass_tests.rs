@@ -55,11 +55,11 @@ fn object_header_still_overlays_array_header_length_and_capacity() {
         );
         assert_eq!(
             (*hdr).capacity,
-            (*obj).parent_class_id,
+            (*obj).shape_word(),
             "#8113: ArrayHeader.capacity must alias the ObjectHeader shape word"
         );
         assert!(
-            crate::object::shapes::is_shape_id((*obj).parent_class_id),
+            crate::object::shapes::is_shape_id((*obj).shape_word()),
             "test premise: a birth-stamped object carries a ShapeId in word 1, \
              which is what keeps the forged capacity above the forged length"
         );
@@ -120,7 +120,7 @@ fn array_object_receiver_admits_an_array_subclass_instance() {
     unsafe {
         // Sabotage precondition: the misread is still available (#8113 overlay).
         assert_eq!((*hdr).length, class_id);
-        assert_eq!((*hdr).capacity, (*obj).parent_class_id);
+        assert_eq!((*hdr).capacity, (*obj).shape_word());
         assert!((*hdr).length <= (*hdr).capacity);
         assert!((*hdr).length <= 100_000_000);
     }
@@ -195,7 +195,7 @@ fn dense_array_subclass_reads_slots_until_its_shape_changes() {
 
     assert_eq!(array_subclass_fast_length(receiver), Some(3.0));
     assert_eq!(array_subclass_fast_index_get(receiver, 1), Some(22.0));
-    let stable_shape = unsafe { (*obj).parent_class_id };
+    let stable_shape = unsafe { (*obj).shape_word() };
     let stable_dense_key = unsafe { (*(*obj).meta).array_subclass_dense_key };
     assert_eq!(
         stable_dense_key,
@@ -225,7 +225,7 @@ fn dense_array_subclass_reads_slots_until_its_shape_changes() {
         crate::array::js_array_get_f64(obj as *const ArrayHeader, 1),
         66.0
     );
-    assert_eq!(unsafe { (*obj).parent_class_id }, stable_shape);
+    assert_eq!(unsafe { (*obj).shape_word() }, stable_shape);
     assert!(!array_subclass_fast_index_set(receiver, 3, 55.0));
     assert_eq!(
         js_packed_arraylike_index_get(receiver, 2.0, std::ptr::null_mut()),
@@ -235,7 +235,7 @@ fn dense_array_subclass_reads_slots_until_its_shape_changes() {
     crate::object::js_object_delete_dynamic(obj, 1.0);
     assert_ne!(
         stable_dense_key,
-        (u64::from(class_id) << 32) | unsafe { u64::from((*obj).parent_class_id) },
+        (u64::from(class_id) << 32) | unsafe { u64::from((*obj).shape_word()) },
         "a structural mutation must make the receiver-local proof miss by ShapeId"
     );
     assert_eq!(
@@ -265,14 +265,14 @@ fn dense_array_subclass_layout_follows_the_shape_across_a_prototype_override() {
     crate::object::js_object_set_index_polymorphic(obj as i64, 0.0, 11.0);
 
     assert_eq!(array_subclass_fast_index_get(receiver, 0), Some(11.0));
-    let before = unsafe { (*obj).parent_class_id };
+    let before = unsafe { (*obj).shape_word() };
     crate::object::prototype_chain::object_set_user_prototype(obj as usize, crate::value::TAG_NULL);
     // The prototype is a fact of the shape: the receiver moved to another
     // ShapeId, so no layout cached for the old one (owner word or
     // `(class, ShapeId)` key) can answer for it. What the new shape's layout
     // answers is the receiver's OWN element, which no prototype affects.
     assert_ne!(
-        unsafe { (*obj).parent_class_id },
+        unsafe { (*obj).shape_word() },
         before,
         "a prototype change must move the receiver to another ShapeId"
     );
@@ -302,13 +302,13 @@ fn dense_array_subclass_tail_transitions_reuse_exact_shapes_and_slots() {
     let receiver = crate::value::js_nanbox_pointer(obj as i64);
     crate::node_stream::js_array_subclass_init(receiver, 0.0);
 
-    let mut shapes = vec![unsafe { (*obj).parent_class_id }];
+    let mut shapes = vec![unsafe { (*obj).shape_word() }];
     for value in [11.0, 22.0, 33.0] {
         assert_eq!(
             js_array_push_f64(obj as *mut ArrayHeader, value),
             obj as *mut ArrayHeader
         );
-        shapes.push(unsafe { (*obj).parent_class_id });
+        shapes.push(unsafe { (*obj).shape_word() });
     }
     assert_eq!(array_subclass_fast_length(receiver), Some(3.0));
     assert_eq!(
@@ -328,7 +328,7 @@ fn dense_array_subclass_tail_transitions_reuse_exact_shapes_and_slots() {
     );
 
     assert_eq!(array_subclass_fast_pop(receiver), Some(33.0));
-    assert_eq!(unsafe { (*obj).parent_class_id }, shapes[2]);
+    assert_eq!(unsafe { (*obj).shape_word() }, shapes[2]);
     assert_eq!(
         unsafe { (*(*obj).meta).array_subclass_dense_key },
         (u64::from(class_id) << 32) | u64::from(shapes[2]),
@@ -342,7 +342,7 @@ fn dense_array_subclass_tail_transitions_reuse_exact_shapes_and_slots() {
     assert_eq!(array_subclass_fast_index_get(receiver, 2), None);
 
     assert_eq!(array_subclass_fast_push_one(receiver, 44.0), Some(3.0));
-    assert_eq!(unsafe { (*obj).parent_class_id }, shapes[3]);
+    assert_eq!(unsafe { (*obj).shape_word() }, shapes[3]);
     assert_eq!(
         unsafe { (*(*obj).meta).array_subclass_dense_key },
         (u64::from(class_id) << 32) | u64::from(shapes[3]),
@@ -355,7 +355,7 @@ fn dense_array_subclass_tail_transitions_reuse_exact_shapes_and_slots() {
     assert_eq!(array_subclass_fast_index_get(receiver, 2), Some(44.0));
 
     assert_eq!(js_array_pop_f64(obj as *mut ArrayHeader), 44.0);
-    assert_eq!(unsafe { (*obj).parent_class_id }, shapes[2]);
+    assert_eq!(unsafe { (*obj).shape_word() }, shapes[2]);
     assert_eq!(array_subclass_fast_length(receiver), Some(2.0));
 }
 
@@ -375,10 +375,10 @@ fn numeric_proof_retires_before_exact_tail_transition_lookup() {
     let receiver = crate::value::js_nanbox_pointer(obj as i64);
     crate::node_stream::js_array_subclass_init(receiver, 0.0);
 
-    let mut ordinary_shapes = vec![unsafe { (*obj).parent_class_id }];
+    let mut ordinary_shapes = vec![unsafe { (*obj).shape_word() }];
     for value in [11.0, 22.0, 33.0] {
         js_array_push_f64(obj as *mut ArrayHeader, value);
-        ordinary_shapes.push(unsafe { (*obj).parent_class_id });
+        ordinary_shapes.push(unsafe { (*obj).shape_word() });
     }
     assert!(crate::object::array_tail_transition::lookup_reverse(ordinary_shapes[3]).is_some());
 
@@ -387,7 +387,7 @@ fn numeric_proof_retires_before_exact_tail_transition_lookup() {
         js_packed_arraylike_loop_guard(receiver, 3.0, 1, facts.as_mut_ptr()),
         2
     );
-    let proven_shape = unsafe { (*obj).parent_class_id };
+    let proven_shape = unsafe { (*obj).shape_word() };
     assert!(
         crate::object::shapes::shape_object_kind_by_id(proven_shape)
             == Some(crate::object::shapes::ShapeObjectKind::OrdinaryNumericProof)
@@ -395,20 +395,20 @@ fn numeric_proof_retires_before_exact_tail_transition_lookup() {
     assert_ne!(proven_shape, ordinary_shapes[3]);
     assert!(crate::object::array_tail_transition::lookup_reverse(proven_shape).is_none());
     assert_eq!(array_subclass_fast_pop(receiver), Some(33.0));
-    assert_eq!(unsafe { (*obj).parent_class_id }, ordinary_shapes[2]);
+    assert_eq!(unsafe { (*obj).shape_word() }, ordinary_shapes[2]);
 
     assert_eq!(
         js_packed_arraylike_loop_guard(receiver, 2.0, 1, facts.as_mut_ptr()),
         2
     );
-    let proven_shape = unsafe { (*obj).parent_class_id };
+    let proven_shape = unsafe { (*obj).shape_word() };
     assert!(
         crate::object::shapes::shape_object_kind_by_id(proven_shape)
             == Some(crate::object::shapes::ShapeObjectKind::OrdinaryNumericProof)
     );
     assert_ne!(proven_shape, ordinary_shapes[2]);
     assert_eq!(array_subclass_fast_push_one(receiver, 44.0), Some(3.0));
-    assert_eq!(unsafe { (*obj).parent_class_id }, ordinary_shapes[3]);
+    assert_eq!(unsafe { (*obj).shape_word() }, ordinary_shapes[3]);
     assert_eq!(array_subclass_fast_index_get(receiver, 2), Some(44.0));
 }
 
@@ -603,7 +603,7 @@ fn transition_cache_carrier_bits_follow_live_occupancy_across_full_trace_recompu
     assert!(!obj.is_null());
     let receiver = crate::value::js_nanbox_pointer(obj as i64);
     crate::node_stream::js_array_subclass_init(receiver, 0.0);
-    let before = unsafe { (*obj).parent_class_id };
+    let before = unsafe { (*obj).shape_word() };
     assert_eq!(
         js_array_push_f64(obj as *mut ArrayHeader, 11.0),
         obj as *mut ArrayHeader
@@ -614,7 +614,7 @@ fn transition_cache_carrier_bits_follow_live_occupancy_across_full_trace_recompu
         js_array_push_f64(obj as *mut ArrayHeader, 11.0),
         obj as *mut ArrayHeader
     );
-    let after = unsafe { (*obj).parent_class_id };
+    let after = unsafe { (*obj).shape_word() };
     assert_ne!(before, after);
     let carrier = |id: u32| {
         crate::object::shapes::shape_descriptor_by_id(id)
@@ -634,26 +634,29 @@ fn transition_cache_carrier_bits_follow_live_occupancy_across_full_trace_recompu
         "a full-trace recompute must release descriptors no live entry names"
     );
 
-    // Relearning an edge marks its descriptors again, and a recompute keeps
-    // them. The cleared cache has no reverse edge for the fast pop, so the
-    // generic pop runs; it may mint a different predecessor shape, so the
-    // relearned pair is read back from the object rather than assumed.
+    // The cleared cache has no reverse edge for the fast pop, so the generic
+    // pop runs. Object model step 4: its delete of the last index key goes
+    // through the receiver's overflow (no rollback edge, §3.2), so no tail
+    // transition is learned again for this receiver; its elements stay right.
     assert_eq!(
         crate::array::js_array_pop_f64(obj as *mut ArrayHeader),
         11.0
     );
-    let relearned_predecessor = unsafe { (*obj).parent_class_id };
+    assert!(unsafe { crate::object::overflow::has_overflow(obj) });
     assert_eq!(
         js_array_push_f64(obj as *mut ArrayHeader, 11.0),
         obj as *mut ArrayHeader
     );
-    let relearned_successor = unsafe { (*obj).parent_class_id };
-    assert_ne!(relearned_predecessor, relearned_successor);
-    crate::object::array_tail_transition::recompute_cache_carriers_after_full_trace();
-    assert!(
-        carrier(relearned_predecessor) && carrier(relearned_successor),
-        "a recompute must keep descriptors that a live entry still names"
+    assert_eq!(array_subclass_fast_index_get(receiver, 0), None);
+    assert_eq!(
+        crate::array::js_array_get_f64(obj as *mut ArrayHeader, 0),
+        11.0
     );
+    assert_eq!(
+        crate::array::js_array_pop_f64(obj as *mut ArrayHeader),
+        11.0
+    );
+    assert_eq!(array_subclass_fast_length(receiver), None);
 }
 
 /// The spec push entry (the typed field-push lowering's complete fallback)
@@ -745,34 +748,21 @@ fn array_subclass_named_prefix_token_survives_only_exact_numeric_tail_transition
     js_array_push_f64(obj as *mut ArrayHeader, 11.0);
     js_array_push_f64(obj as *mut ArrayHeader, 22.0);
     let mask_key = crate::string::js_string_from_bytes(b"mask".as_ptr(), 4);
-    let mut cache = [0i64; crate::object::PIC_CACHE_WORDS];
-    let mut cache_slot: crate::object::PicCacheSlot = &mut cache;
-    crate::object::js_object_get_field_ic_miss(obj, mask_key, &mut cache_slot);
-    // S6: the proof lives on the OBJECT only; the site holds just the
-    // `(ShapeId, slot)` pair it primed, never the class-wide token.
-    assert_eq!(cache[2], 0, "the site must not hold the named-prefix token");
-    assert_ne!(
-        cache[0], 0,
-        "the descriptor-bearing receiver still primes the site"
-    );
-    let token = unsafe { (*(*obj).meta).array_subclass_named_prefix_token };
-    assert_ne!(token, 0);
-    assert!(unsafe { array_subclass_named_prefix_token_matches_class(obj, class_id) });
-    assert!(
-        !unsafe { array_subclass_named_prefix_token_matches_class(obj, class_id.wrapping_add(1)) },
-        "the token must pin the exact class rather than merely the Array-subclass family"
-    );
-    assert_eq!(
-        unsafe { array_subclass_named_prefix_token_for_slot(obj, 1) },
-        token,
-        "the IC miss must publish the owner-side token"
-    );
+    crate::object::field_get_set::get_field_miss(obj, mask_key);
 
     let mut index_ic: super::ArrayLikePicCache = [0; super::ARRAYLIKE_PIC_WORDS];
     let mut index_ic_slot: super::ArrayLikePicCacheSlot = &mut index_ic;
     assert_eq!(
         js_packed_arraylike_index_get(receiver, 0.0, &mut index_ic_slot),
         11.0
+    );
+    // S6: the proof lives on the OBJECT only.
+    let token = unsafe { (*(*obj).meta).array_subclass_named_prefix_token };
+    assert_ne!(token, 0);
+    assert!(unsafe { array_subclass_named_prefix_token_matches_class(obj, class_id) });
+    assert!(
+        !unsafe { array_subclass_named_prefix_token_matches_class(obj, class_id.wrapping_add(1)) },
+        "the token must pin the exact class rather than merely the Array-subclass family"
     );
     assert_eq!(
         index_ic[0], token,
@@ -788,15 +778,9 @@ fn array_subclass_named_prefix_token_survives_only_exact_numeric_tail_transition
     );
 
     let zero_key = crate::string::js_string_from_bytes(b"0".as_ptr(), 1);
-    let mut element_cache = [0i64; crate::object::PIC_CACHE_WORDS];
-    let mut element_cache_slot: crate::object::PicCacheSlot = &mut element_cache;
     assert_eq!(
-        crate::object::js_object_get_field_ic_miss(obj, zero_key, &mut element_cache_slot),
+        crate::object::field_get_set::get_field_miss(obj, zero_key),
         11.0
-    );
-    assert_eq!(
-        element_cache[2], 0,
-        "a numeric-element site must never borrow the stable named-prefix identity"
     );
     assert_eq!(
         unsafe { (*(*obj).meta).array_subclass_named_prefix_token },
@@ -889,10 +873,10 @@ fn plain_array_element_shape_consumes_array_subclass_prefix_proof() {
         "the enclosing plain array should prove a class invariant on request"
     );
 
-    let original_shape = unsafe { (*obj).parent_class_id };
+    let original_shape = unsafe { (*obj).shape_word() };
     assert_eq!(array_subclass_fast_push_one(receiver, 33.0), Some(2.0));
     assert_ne!(
-        unsafe { (*obj).parent_class_id },
+        unsafe { (*obj).shape_word() },
         original_shape,
         "the numeric tail transition must actually change the exact ShapeId"
     );
@@ -945,25 +929,17 @@ fn empty_array_subclass_named_prefix_token_survives_warm_tail_cycle() {
     assert_eq!(array_subclass_fast_pop(receiver), Some(11.0));
 
     let change_key = crate::string::js_string_from_bytes(b"change".as_ptr(), 6);
-    let mut cache = [0i64; crate::object::PIC_CACHE_WORDS];
-    let mut cache_slot: crate::object::PicCacheSlot = &mut cache;
-    let via_ic = crate::object::js_object_get_field_ic_miss(obj, change_key, &mut cache_slot);
+    let via_ic = crate::object::field_get_set::get_field_miss(obj, change_key);
     let via_ladder = crate::object::js_object_get_field_by_name_f64(obj, change_key);
     assert_eq!(via_ic.to_bits(), via_ladder.to_bits());
-    // S6: the site holds the `(ShapeId, slot)` pair; the proof stays on the
-    // object.
-    assert_eq!(cache[2], 0, "the site must not hold the named-prefix token");
-    assert_ne!(
-        cache[0], 0,
-        "an empty subclass must arm the declared-field PIC"
-    );
-    let token = unsafe { (*(*obj).meta).array_subclass_named_prefix_token };
+    // S6: the proof stays on the object; a declared-slot read publishes it.
+    let token = unsafe { array_subclass_named_prefix_token_for_slot(obj, 2) };
     assert_ne!(
         token, 0,
         "an empty subclass must carry the declared-prefix proof"
     );
     assert_eq!(
-        unsafe { array_subclass_named_prefix_token_for_slot(obj, 2) },
+        unsafe { (*(*obj).meta).array_subclass_named_prefix_token },
         token
     );
 
@@ -1012,10 +988,10 @@ fn dense_array_subclass_tail_cache_preserves_a_1024_shape_lattice() {
     crate::node_stream::js_array_subclass_init(receiver, 0.0);
 
     let mut shapes = Vec::with_capacity(1025);
-    shapes.push(unsafe { (*obj).parent_class_id });
+    shapes.push(unsafe { (*obj).shape_word() });
     for value in 0u32..1024 {
         js_array_push_f64(obj as *mut ArrayHeader, f64::from(value));
-        shapes.push(unsafe { (*obj).parent_class_id });
+        shapes.push(unsafe { (*obj).shape_word() });
     }
 
     for length in (1u32..=1024).rev() {
@@ -1024,10 +1000,7 @@ fn dense_array_subclass_tail_cache_preserves_a_1024_shape_lattice() {
             Some(f64::from(length - 1)),
             "reverse edge at length {length} must survive unrelated hash collisions"
         );
-        assert_eq!(
-            unsafe { (*obj).parent_class_id },
-            shapes[length as usize - 1]
-        );
+        assert_eq!(unsafe { (*obj).shape_word() }, shapes[length as usize - 1]);
     }
     for value in 0u32..1024 {
         assert_eq!(
@@ -1035,10 +1008,7 @@ fn dense_array_subclass_tail_cache_preserves_a_1024_shape_lattice() {
             Some(f64::from(value + 1)),
             "forward edge at length {value} must remain reusable"
         );
-        assert_eq!(
-            unsafe { (*obj).parent_class_id },
-            shapes[value as usize + 1]
-        );
+        assert_eq!(unsafe { (*obj).shape_word() }, shapes[value as usize + 1]);
     }
 }
 
@@ -1069,13 +1039,13 @@ fn dense_array_subclass_tail_fast_path_declines_restricted_receivers() {
     assert_eq!(array_subclass_fast_index_get(receiver, 0), Some(11.0));
     unsafe { (*header)._reserved &= !crate::gc::OBJ_FLAG_SEALED };
 
-    let shape_before_descriptor = unsafe { (*obj).parent_class_id };
+    let shape_before_descriptor = unsafe { (*obj).shape_word() };
     crate::object::descriptor_state::set_property_attrs(
         obj as usize,
         "0".to_string(),
         crate::object::descriptor_state::PropertyAttrs::new(true, true, false),
     );
-    assert_ne!(unsafe { (*obj).parent_class_id }, shape_before_descriptor);
+    assert_ne!(unsafe { (*obj).shape_word() }, shape_before_descriptor);
     assert_eq!(
         array_subclass_fast_pop(receiver),
         None,
@@ -1111,7 +1081,7 @@ fn dense_array_subclass_tail_transition_edges_survive_moving_gc() {
     let pre_gc_shape = unsafe {
         let live =
             (receiver_h.get_nanbox_f64().to_bits() & 0x0000_FFFF_FFFF_FFFF) as *mut ObjectHeader;
-        (*live).parent_class_id
+        (*live).shape_word()
     };
     assert!(crate::object::array_tail_transition::lookup_reverse(pre_gc_shape).is_some());
     let before = crate::gc::copying_minor_cycles();
@@ -1121,7 +1091,7 @@ fn dense_array_subclass_tail_transition_edges_survive_moving_gc() {
     let live_receiver = receiver_h.get_nanbox_f64();
     let live_obj = (live_receiver.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *mut ObjectHeader;
     assert_eq!(array_subclass_fast_length(live_receiver), Some(3.0));
-    assert_eq!(unsafe { (*live_obj).parent_class_id }, pre_gc_shape);
+    assert_eq!(unsafe { (*live_obj).shape_word() }, pre_gc_shape);
     assert_eq!(
         unsafe { (*(*live_obj).meta).array_subclass_dense_key },
         (u64::from(class_id) << 32) | u64::from(pre_gc_shape),
@@ -1135,7 +1105,7 @@ fn dense_array_subclass_tail_transition_edges_survive_moving_gc() {
     assert_eq!(array_subclass_fast_push_one(live_receiver, 44.0), Some(3.0));
     assert_eq!(array_subclass_fast_index_get(live_receiver, 2), Some(44.0));
     assert!(crate::object::shapes::is_shape_id(unsafe {
-        (*live_obj).parent_class_id
+        (*live_obj).shape_word()
     }));
 }
 

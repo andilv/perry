@@ -313,55 +313,31 @@ fn run_microtasks(mode: MicrotaskDrainMode) -> i32 {
 
     // Then process the task queue.
     //
-    // ── Exception trap (Issue #...): install ONE setjmp for the WHOLE
-    // loop body, instead of a fresh setjmp per microtask. The previous
-    // shape paid setjmp+js_try_push/end every microtask just so that a
-    // `throw` from a callback could be re-routed to reject the chained
-    // `next` promise. setjmp+longjmp on aarch64 saves ~16 callee-saved
-    // x-regs and ~8 d-regs per call — that's ~25 ns per microtask, and
-    // an async benchmark with 200k microtasks pays ~5 ms in setjmp cost
-    // alone. The single outer setjmp captures the same "throw out of a
-    // microtask body" case (since `js_throw` longjmps to the most recent
-    // try block; if no user try is in scope, this one is it). When the
-    // longjmp lands, we read the current promise context out of a
-    // thread-local set just before invoking the callback, reject its
-    // `next`, and continue the loop.
+    // ── Exception trap: ONE handler entry for the WHOLE loop body, not
+    // one per microtask. A `throw` from a callback must be re-routed to
+    // reject the chained `next` promise; the single outer trap captures it
+    // (`js_throw` lands in the innermost handler; if no user try is in
+    // scope, this one is it). When the throw lands, we read the current
+    // promise context out of a thread-local set just before invoking the
+    // callback, reject its `next`, and continue the loop.
     //
-    // ── macOS/BSD: the arm uses `_setjmp` (no signal-mask save) ────
-    // On Apple platforms the C `setjmp(3)` saves the signal mask via a
-    // `sigprocmask` system call AND saves the alt-signal-stack via
-    // `__sigaltstack` — measured at ~43% of `promise_all_chains` CPU.
-    // Perry never `siglongjmp`s out of a signal handler, so the fast
-    // `_setjmp(3)` is used instead. That per-platform choice now lives in
-    // the C trampoline (`src/ffi/perry_sjlj.c`); on glibc Linux the plain
-    // `setjmp(3)` already skips the signal-mask save.
-
-    // #9305: the jmp_buf arm must live in a C frame — see
-    // `exception::arm_trap_and_run`. rustc cannot express `returns_twice`,
-    // so with a raw `setjmp` in this Rust frame LLVM colored the stack slot
-    // of the spilled TLS-base temporary into the task-record copy loop on
-    // the normal path, and the longjmp return path reloaded NULL. One
-    // `js_try_push` for the whole drain, one re-arm per caught throw; the
-    // recovery itself runs inside the NEXT protected invocation, so a throw
-    // out of the rejection plumbing (promise hooks can run JS) still lands
-    // in a live trampoline frame, exactly like the old always-armed setjmp.
-    let trap_buf = crate::exception::js_try_push();
+    // The body runs under the trap shim (`exception::trap`, a landing pad),
+    // one `trap` per caught throw; the recovery itself runs inside the NEXT
+    // protected invocation, so a throw out of the rejection plumbing (promise
+    // hooks can run JS) still lands in a live trap.
     let mut landed = false;
     loop {
-        let completed = crate::exception::arm_trap_and_run(trap_buf, || {
-            pump_protected(mode, reentrant, landed, &mut ran)
-        });
+        let completed =
+            crate::exception::trap(|| pump_protected(mode, reentrant, landed, &mut ran));
         if completed.is_some() {
             break;
         }
-        // A JS throw longjmp-landed in the trampoline. The jmp_buf is stale
-        // until `arm_trap_and_run` re-arms it above, and nothing between
-        // here and there can throw (this assignment is all there is).
+        // A JS throw landed in the trap's pad. Nothing between here and the
+        // next `trap` above can throw (this assignment is all there is).
         // `landed` stays true for the rest of the drain: every re-entry
         // recovers before draining further.
         landed = true;
     }
-    crate::exception::js_try_end();
     crate::node_submodules::diagnostics_channel_drain_uncaught();
 
     finish_gc_boundary();
@@ -417,9 +393,9 @@ fn finish_gc_boundary() {
 /// The microtask trap's protected region (#9305): the recovery for a
 /// just-landed throw (`landed`), the tick/task drain loop, the
 /// jobs-quiescent decrement, rejection processing, and the timer phases.
-/// Runs ONLY under an armed trampoline (`exception::arm_trap_and_run`):
-/// a JS throw that reaches the runner's trap longjmps out of this
-/// function into the trampoline, abandoning this frame — state that must
+/// Runs ONLY under the drain's trap (`exception::trap`): a JS throw that
+/// reaches the runner's trap unwinds out of this function into the trap
+/// shim's landing pad, abandoning this frame — state that must
 /// survive a landing lives behind `ran`'s reference or in TLS, never in
 /// a local.
 fn pump_protected(mode: MicrotaskDrainMode, reentrant: bool, landed: bool, ran: &mut i32) {
@@ -428,9 +404,8 @@ fn pump_protected(mode: MicrotaskDrainMode, reentrant: bool, landed: bool, ran: 
         crate::builtins::restore_queued_microtask_contexts();
         // A microtask's callback threw and unwound here. Read the
         // exception, clear it, and reject the `next` promise of the
-        // microtask that was running. The try frame stays pushed — the
-        // caller re-arms it for the rest of the drain (js_try_end runs
-        // after the pump loop completes).
+        // microtask that was running. The caller runs this recovery under
+        // the next trap of the drain.
         let exc = crate::exception::js_get_exception();
         crate::exception::js_clear_exception();
         let cur = CURRENT_MICROTASK_PROMISE.with(|c| c.replace(std::ptr::null_mut()));
@@ -858,11 +833,17 @@ fn pump_protected(mode: MicrotaskDrainMode, reentrant: bool, landed: bool, ran: 
                     context,
                     async_id,
                     trigger_async_id,
+                    resource,
                 }) => {
                     bump(&MT_RUN_COUNT);
                     // #7497: root BEFORE `enter_microtask_context` — see the
-                    // Task::AsyncStep arm.
+                    // Task::AsyncStep arm. The popped entry no longer owns the
+                    // job's state: this scope does until its destroy.
                     let scope = crate::gc::RuntimeHandleScope::new();
+                    if let Some(state) = crate::async_hooks::resource_state::get(async_id) {
+                        scope.root_raw_mut_ptr(state);
+                    }
+                    let resource_handle = scope.root_nanbox_f64(resource);
                     let callback_handle = scope.root_nanbox_f64(boxed_closure(callback));
                     enter_microtask_context(&context);
                     let callback = rooted_closure(&callback_handle);
@@ -876,13 +857,17 @@ fn pump_protected(mode: MicrotaskDrainMode, reentrant: bool, landed: bool, ran: 
                     CURRENT_MICROTASK_CALLBACK.with(|c| c.set(callback));
                     CURRENT_MICROTASK_VALUE.with(|c| c.set(0.0));
                     CURRENT_MICROTASK_NEXT.with(|c| c.set(std::ptr::null_mut()));
-                    crate::async_hooks::before(async_id, trigger_async_id);
+                    crate::async_hooks::before_scheduled(
+                        async_id,
+                        trigger_async_id,
+                        resource_handle.get_nanbox_f64(),
+                    );
                     crate::closure::js_closure_call0(
                         rooted_closure(&callback_handle),
                         crate::closure::plain_call_receiver(),
                     );
                     crate::async_hooks::after(async_id);
-                    crate::async_hooks::destroy(async_id);
+                    crate::async_hooks::destroy_scheduled(async_id);
                     CURRENT_MICROTASK_PROMISE
                         .with(|c| c.set(prev_promise_handle.get_raw_mut_ptr::<Promise>()));
                     CURRENT_MICROTASK_CALLBACK.with(|c| c.set(prev_callback));

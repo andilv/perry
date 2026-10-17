@@ -2,7 +2,7 @@
 //! addresses it by.
 //!
 //! Split out of `object/mod.rs` for the 2,000-line gate, which the record's
-//! sixteenth word (#10868 step 2.5 stage 1's `dictionary_keys`) took past the
+//! sixteenth word (#10868 step 2.5 stage 1's `overflow`) took past the
 //! cap. The struct and its `offset_of!` pins are one unit — the pins exist
 //! precisely because `perry-codegen` reaches words 4, 6, 7 and 12 by index —
 //! so they move together or the contract is split from the thing it
@@ -40,9 +40,12 @@ pub struct ObjectMeta {
     /// `crate::value::TAG_NULL` for an explicit null prototype, or 0 when
     /// unset (fall back to default prototype resolution).
     pub prototype: u64,
-    /// Reserved words preserve the offsets addressed by emitted code.
-    /// Descriptor facts live exclusively in holder shapes.
-    pub reserved_descriptor_words: [u64; 2],
+    /// The boxed Number/String/Boolean/BigInt/Symbol primitive, NaN-boxed.
+    /// This private child slot replaces the address-keyed payload table.
+    /// Reuse a retired descriptor word so emitted metadata offsets stay fixed.
+    pub boxed_primitive: u64,
+    /// Private Reflect metadata record, a traced NaN-boxed object edge.
+    pub reflect_metadata: u64,
     /// Object state and compact scalar proof payloads. Bit 0 records native
     /// fallback after an ordinary undefined read; shape minting projects that
     /// fact into OrdinaryNativeAlias. Bits 3..4 are unused. Bits 1..2 and
@@ -123,23 +126,18 @@ pub struct ObjectMeta {
     /// Installed by `js_array_subclass_init` under
     /// `array_subclass_elements_enabled()`; never present otherwise.
     pub elements: u64,
-    /// Reserved words preserve the metadata layout across this migration.
-    pub reserved_descriptor_identity: [u64; 2],
-    /// #10868 step 2.5 stage 1: the ordered own-key list of a DICTIONARY-MODE
-    /// receiver — a `GC_TYPE_ARRAY` (`*mut ArrayHeader` bits, 0 = none)
-    /// private to this object, holding the same NaN-boxed key strings (and
-    /// `TAG_HOLE` tombstones) an ordinary receiver keeps in its shape's keys
-    /// array. Values are NOT moved by the mode: the key at position `i` still
-    /// reads inline slot `i` below the live bound and `spill` at or above it.
-    ///
-    /// A traced child edge exactly like `spill` (#6812): it lives and moves
-    /// with this record, which lives and moves with its owner — no
-    /// address-keyed side state, no owner re-keying on evacuation.
-    ///
-    /// Nonzero means "this receiver's keys are here" only in combination with
-    /// a shape that publishes none; `dictionary::is_dictionary` is the single
-    /// spelling of the test. See `object/dictionary.rs`.
-    pub dictionary_keys: u64,
+    /// Scalar identity of a movable Set key; zero means unassigned.
+    pub key_identity: u64,
+    /// Private owner-family state bag, a traced raw array edge. Promises use
+    /// three combinator/reaction slots; ordinary property holders use three
+    /// VM state slots. Node-API metadata, when present on a property holder,
+    /// uses a fourth slot without interpreting the first three. Other owner
+    /// families have separate cells and record layouts.
+    pub owned_state: u64,
+    /// Object-owned ordered overflow table (raw GC_TYPE_OVERFLOW pointer,
+    /// zero until needed). Its entries carry values, attributes and fixed-slot
+    /// references; the collector traces keys and table-owned values directly.
+    pub overflow: u64,
     /// #10868 lever (iv): a stable identity for a prototype or shared class
     /// evaluation holder, assigned once and never changed. Assigning a class
     /// identity alone does not mark it as a prototype. 0 = none assigned.
@@ -228,7 +226,7 @@ const _: () = assert!(std::mem::offset_of!(ObjectMeta, elements) == 96);
 // pin is documentation of where it landed rather than an ABI contract — the
 // contract it must not break is the `native_state`-is-last assertion below,
 // which is what forbids inserting it ahead of one of the offsets above.
-const _: () = assert!(std::mem::offset_of!(ObjectMeta, dictionary_keys) == 120);
+const _: () = assert!(std::mem::offset_of!(ObjectMeta, overflow) == 120);
 // #340/#341: `native_state` must stay the LAST word. The offsets above are
 // addressed by index from emitted code, so a field inserted mid-struct moves
 // them silently; this pins the append instead of trusting the comment.

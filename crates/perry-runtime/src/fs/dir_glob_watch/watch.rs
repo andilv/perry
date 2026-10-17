@@ -358,12 +358,11 @@ fn has_change_listeners(listeners: &HashMap<String, Vec<WatchListener>>) -> bool
 }
 
 fn with_watcher_uncaught_trap<F: FnOnce()>(f: F) {
-    let trap_buf = crate::exception::js_try_push();
     let mut f = Some(f);
-    // Armed in a C trampoline frame (#9305); loop shape so the uncaught
-    // path runs under a fresh arm — see `timer::with_timer_uncaught_trap`.
+    // Runs under the trap shim (`exception::trap`); loop shape so the uncaught
+    // path runs under the next `trap` — see `timer::with_timer_uncaught_trap`.
     loop {
-        let completed = crate::exception::arm_trap_and_run(trap_buf, || {
+        let completed = crate::exception::trap(|| {
             if let Some(f) = f.take() {
                 f();
             } else {
@@ -376,7 +375,6 @@ fn with_watcher_uncaught_trap<F: FnOnce()>(f: F) {
             break;
         }
     }
-    crate::exception::js_try_end();
 }
 
 fn filename_arg_value(filename: &str, encoding: &str) -> f64 {
@@ -548,12 +546,12 @@ fn abort_promise_watcher(id: usize, reason: f64) -> Vec<*mut crate::promise::Pro
 }
 
 fn iterator_result(value: f64, done: bool) -> f64 {
-    let value_key = js_string_from_bytes(b"value".as_ptr(), b"value".len() as u32);
-    let done_key = js_string_from_bytes(b"done".as_ptr(), b"done".len() as u32);
-    let obj = crate::object::js_object_alloc(0, 2);
-    crate::object::js_object_set_field_by_name(obj, value_key, value);
-    crate::object::js_object_set_field_by_name(obj, done_key, bool_value(done));
-    boxed_ptr(obj as *const u8)
+    unsafe {
+        crate::iter_result::make_iter_result(
+            crate::value::JSValue::from_bits(value.to_bits()),
+            done,
+        )
+    }
 }
 
 fn set_named_field(obj: *mut crate::object::ObjectHeader, name: &[u8], value: f64) {

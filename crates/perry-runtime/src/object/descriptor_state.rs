@@ -81,9 +81,27 @@ pub(crate) fn object_proto_may_intercept_key(key: f64) -> bool {
     }) else {
         return true;
     };
+    object_proto_may_intercept_name(bytes)
+}
+
+/// The realm-default answer for an already decoded property name.
+#[inline]
+pub(crate) fn object_proto_may_intercept_name(bytes: &[u8]) -> bool {
     // The intrinsic Annex-B setter is implemented by the ordinary Set walk.
     if bytes == b"__proto__" {
         return true;
+    }
+    // The sealed intrinsic's immutable layout has no store-blocking key
+    // except the Annex-B accessor above. Its own shadow word is the census
+    // answer until a program write changes that object. This is the same
+    // fact builtin call sites read, with no separate chain verdict.
+    let intrinsic =
+        crate::agent_ptrs::intrinsic_proto(super::builtin_proto::BuiltinProto::Object as usize);
+    let word = unsafe { (*intrinsic).parent_class_id };
+    // A zero startup stand-in proves nothing about an already built but
+    // unsealed intrinsic (including runtime fixtures).
+    if word >= super::shapes::SHAPE_ID_BASE && word < super::layout_desc::UNSHADOWED_WORD_END {
+        return false;
     }
     let proto = crate::array::object_prototype_addr_if_resolved();
     proto != 0
@@ -110,11 +128,28 @@ pub(crate) unsafe fn class_instance_set_may_intercept(
 ) -> bool {
     // Decode the key once — used for both the class-chain and per-prototype
     // accessor probes below.
-    let name = match reflect_support::key_to_rust_string(key) {
-        Some(n) => n,
-        // Non-decodable / non-string key: do not risk the fast path.
-        None => return true,
+    let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let Some(bytes) =
+        crate::string::js_string_key_bytes(crate::JSValue::from_bits(key.to_bits()), &mut scratch)
+    else {
+        return true;
     };
+    let Ok(name) = std::str::from_utf8(bytes) else {
+        return true;
+    };
+    // Object model step 3: an `Object.create(P)` object (a synthetic class
+    // id) answers from `P`'s layout, with no chain walk.
+    if name != "__proto__" {
+        if let Some(blocked) = holder_layout_blocks_store(obj_addr, key, name.as_bytes()) {
+            return blocked;
+        }
+        if let Some(blocked) = declared_class_layout_blocks_store(obj_addr, name.as_bytes()) {
+            return blocked;
+        }
+    }
+    // The generic walk can materialize a holder, so retain the name by
+    // value before it can collect. Layout answers above allocate nothing.
+    let name = name.to_owned();
     // Walk the actual prototype objects; their shapes own all accessors.
     let mut proto = js_object_get_prototype_of(crate::value::js_nanbox_pointer(obj_addr as i64));
     let mut depth = 0u32;
@@ -139,10 +174,6 @@ pub(crate) unsafe fn class_instance_set_may_intercept(
             let p = (bits & crate::value::POINTER_MASK) as usize;
             if p == 0 {
                 return false;
-            }
-            if crate::value::addr_class::is_small_handle(p) {
-                // Proxy / handle prototype — assume it may intercept the write.
-                return true;
             }
             p
         } else if top16 == 0 && bits >= (crate::gc::GC_HEADER_SIZE as u64) + 0x1000 {
@@ -173,7 +204,8 @@ pub(crate) unsafe fn class_instance_set_may_intercept(
         // Charter step 3: an ordinary prototype's attributes live with its
         // keys, and its shape's summary proves most hops (methods are
         // non-enumerable, never non-writable) without a key lookup.
-        if super::key_attrs::attrs_live_in_keys(p) {
+        // The walk holds the prototype's word: a tagged one is honest.
+        if super::key_attrs::attrs_live_in_keys_of_bits(bits) {
             if super::key_attrs::object_key_blocks_plain_store(
                 p as *const ObjectHeader,
                 name.as_bytes(),
@@ -205,14 +237,15 @@ pub(crate) fn note_data_descriptor_target(obj: usize, key: &str, attrs: Property
 /// present, never the getter/setter identities, which differ per receiver
 /// (zod binds a fresh closure per schema) and live with the receiver.
 pub(crate) fn note_accessor_descriptor_target(obj: usize, key: &str, acc: &AccessorDescriptor) {
-    note_descriptor_target_edits(
-        obj,
-        &[AttrsEdit::Accessor(
-            key.as_bytes(),
-            acc.get != 0,
-            acc.set != 0,
-        )],
-    );
+    note_accessor_descriptor_target_bytes(obj, key.as_bytes(), acc);
+}
+
+pub(crate) fn note_accessor_descriptor_target_bytes(
+    obj: usize,
+    key: &[u8],
+    acc: &AccessorDescriptor,
+) {
+    note_descriptor_target_edits(obj, &[AttrsEdit::Accessor(key, acc.get != 0, acc.set != 0)]);
 }
 
 /// Apply descriptor facts to the ordinary holder shape. Arrays, functions,
@@ -251,20 +284,20 @@ pub(crate) fn note_attrs_born_with_keys(obj: usize) {
 /// Look up the property descriptor for (obj, key). Returns None if no entry exists,
 /// in which case the JS default `{ writable: true, enumerable: true, configurable: true }` applies.
 pub(crate) fn get_property_attrs(obj: usize, key: &str) -> Option<PropertyAttrs> {
+    get_property_attrs_bytes(obj, key.as_bytes())
+}
+
+pub(crate) fn get_property_attrs_bytes(obj: usize, key: &[u8]) -> Option<PropertyAttrs> {
     unsafe {
         let route = descriptor_route(obj);
         let bag = route.bag;
         if !bag.is_null() {
-            let entry = super::key_attrs::object_key_entry(bag, key.as_bytes());
+            let entry = super::key_attrs::object_key_entry(bag, key);
             let keys = super::object_keys(bag);
             if entry != 0
                 || (bag as usize != obj
-                    && super::keys_find_property_slot_by_bytes(
-                        keys.arr(),
-                        keys.count(),
-                        key.as_bytes(),
-                    )
-                    .is_some())
+                    && super::keys_find_property_slot_by_bytes(keys.arr(), keys.count(), key)
+                        .is_some())
             {
                 return Some(PropertyAttrs {
                     bits: super::key_attrs::entry_to_attr_bits(entry),
@@ -272,10 +305,14 @@ pub(crate) fn get_property_attrs(obj: usize, key: &str) -> Option<PropertyAttrs>
             }
         }
         if !route.integrity_array.is_null() {
-            return array_integrity_attrs(route.integrity_array, key);
+            return std::str::from_utf8(key)
+                .ok()
+                .and_then(|key| array_integrity_attrs(route.integrity_array, key));
         }
     }
-    string_wrapper_index_attrs(obj, key)
+    std::str::from_utf8(key)
+        .ok()
+        .and_then(|key| string_wrapper_index_attrs(obj, key))
 }
 
 /// Default dense/length attributes come from the array's resolved header.
@@ -393,6 +430,171 @@ include!("descriptor_state/skip_key.rs");
 /// proxies and handle prototypes, non-object prototypes (functions, arrays),
 /// typed arrays, exotic expando hosts, class objects, native-module receivers,
 /// frozen prototypes, and any chain deeper than [`CUSTOM_PROTO_WALK_LIMIT`].
+/// Object model step 3 (`OBJECT_MODEL_2026-10-13.md` §3.6): can an inherited
+/// setter or non-writable property block adding `key` to the class-less
+/// object at `obj_addr` whose recorded [[Prototype]] is an ordinary object
+/// `P`? Answered from `P`'s layout (its keys carry their attributes) and from
+/// `P`'s own link: `%Object.prototype%` (the per-key default answer), null,
+/// or `P`'s class (the class-chain answer). `None` when `P` is anything else
+/// (an exotic, a class object, a frozen or descriptor-bearing holder, a
+/// deeper recorded chain): the caller walks.
+///
+/// # Safety
+/// `obj_addr` is a live `ObjectHeader`.
+pub(crate) unsafe fn holder_layout_blocks_store(
+    obj_addr: usize,
+    _key: f64,
+    name: &[u8],
+) -> Option<bool> {
+    holder_word_blocks_store(
+        super::shapes::object_prototype_word(obj_addr as *const ObjectHeader),
+        name,
+    )
+}
+
+/// The same holder-layout answer for a caller already carrying the recorded
+/// prototype edge from its live shape. Reads metadata only; unknown links
+/// return None rather than materializing or walking a chain here.
+#[inline]
+pub(crate) unsafe fn holder_word_blocks_store(bits: u64, name: &[u8]) -> Option<bool> {
+    // A recorded prototype word is a traced edge naming a live heap cell (a
+    // POINTER_TAG value): its header is read directly. Other encodings use
+    // the admitting reader.
+    let payload = bits & crate::value::POINTER_MASK;
+    let header = if bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG && payload != 0
+    {
+        &*crate::gc::header_from_trusted_user_ptr(payload as *const u8)
+    } else {
+        crate::value::addr_class::tracked_header_of_bits(bits)?.as_ref()
+    };
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    {
+        return None;
+    }
+    let p = (bits & crate::value::POINTER_MASK) as usize;
+    let holder = p as *const ObjectHeader;
+    let record = super::shapes::object_shape_record(holder)?;
+    // The layout owns ordinary-store admission and the key attributes.
+    // Exotics/unmarked layouts use the generic operation.
+    if record.object_kind() != super::shapes::ShapeObjectKind::Ordinary {
+        return None;
+    }
+    let meta = (*holder).meta;
+    if !meta.is_null() && (*meta).flags & super::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER != 0 {
+        return None;
+    }
+    if super::key_attrs::object_key_blocks_plain_store_from_record(holder, record, name) {
+        return Some(true);
+    }
+    match record.proto_id() {
+        super::shapes::PROTO_ID_NULL => Some(false),
+        super::shapes::PROTO_ID_DEFAULT => Some(object_proto_may_intercept_name(name)),
+        proto
+            if (super::shapes::PROTO_ID_CLASS..super::shapes::PROTO_ID_MIXED).contains(&proto) =>
+        {
+            declared_class_chain_blocks_store(proto as u32, name)
+        }
+        _ => None,
+    }
+}
+
+/// The ordinary receiver's layout is the store authority: own attributes,
+/// recorded prototype edge and declared class chain. Unknown links have no
+/// answer here; the generic operation walks them without storing a verdict.
+#[inline]
+pub(crate) unsafe fn layout_store_may_intercept(
+    record: super::shapes::ShapeRecordRef,
+    obj: *const ObjectHeader,
+    name: &[u8],
+) -> Option<bool> {
+    if record.object_kind() != super::shapes::ShapeObjectKind::Ordinary {
+        return None;
+    }
+    if super::key_attrs::object_key_blocks_plain_store_from_record(obj, record, name) {
+        return Some(true);
+    }
+    match record.proto_id() {
+        super::shapes::PROTO_ID_NULL => Some(false),
+        super::shapes::PROTO_ID_DEFAULT => Some(object_proto_may_intercept_name(name)),
+        _ if name == b"__proto__" => None,
+        class
+            if (super::shapes::PROTO_ID_CLASS..super::shapes::PROTO_ID_MIXED).contains(&class) =>
+        {
+            declared_class_chain_blocks_store(class as u32, name)
+        }
+        _ => holder_word_blocks_store(record.prototype_word(), name),
+    }
+}
+
+/// A class-instance family names its declared prototype set in its layout.
+pub(crate) unsafe fn declared_class_layout_blocks_store(
+    obj_addr: usize,
+    name: &[u8],
+) -> Option<bool> {
+    let obj = obj_addr as *const ObjectHeader;
+    let record = super::shapes::object_shape_record(obj)?;
+    let proto = record.proto_id();
+    if !(super::shapes::PROTO_ID_CLASS..super::shapes::PROTO_ID_MIXED).contains(&proto) {
+        return None;
+    }
+    declared_class_chain_blocks_store(proto as u32, name)
+}
+
+/// The declaration's immutable layouts answer without materializing a chain.
+/// A materialized holder must still carry that exact declared layout. Changed
+/// variants, relinks or unknown/native declarations use the generic operation.
+pub(crate) unsafe fn declared_class_chain_blocks_store(
+    mut class: u32,
+    name: &[u8],
+) -> Option<bool> {
+    for _ in 0..64 {
+        class = super::class_generic_origin(class).unwrap_or(class);
+        let id = class_registry::declarations::class_birth_shape(class);
+        let record = super::shapes::shape_record_by_id(id)?;
+        let holder = class_registry::class_decl_prototype_object(class);
+        if !holder.is_null() {
+            if (*holder).parent_class_id != id {
+                return None;
+            }
+            let meta = (*holder).meta;
+            let recorded = if meta.is_null() { 0 } else { (*meta).prototype };
+            if recorded != 0 {
+                let parent_agrees = if record.proto_id() == super::shapes::PROTO_ID_NULL {
+                    recorded == crate::value::TAG_NULL
+                } else {
+                    super::shapes::declaration_parent_identity(holder, recorded)
+                        == Some(record.proto_id())
+                };
+                if !parent_agrees {
+                    return None;
+                }
+            }
+        }
+        if record.summary() & super::key_attrs::SUMMARY_BLOCKS_STORE != 0 {
+            if holder.is_null() {
+                return None;
+            }
+            if super::key_attrs::object_key_blocks_plain_store_from_record(holder, record, name) {
+                return Some(true);
+            }
+        }
+        match record.proto_id() {
+            super::shapes::PROTO_ID_NULL => return Some(false),
+            super::shapes::PROTO_ID_DEFAULT => return Some(object_proto_may_intercept_name(name)),
+            parent
+                if (super::shapes::PROTO_ID_CLASS..super::shapes::PROTO_ID_MIXED)
+                    .contains(&parent) =>
+            {
+                class = parent as u32;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(crate) unsafe fn plain_custom_prototype_may_intercept(obj_addr: usize, key: f64) -> bool {
     const CUSTOM_PROTO_WALK_LIMIT: u32 = 8;
     let mut name_buf = [0u8; crate::value::SHORT_STRING_MAX_LEN];
@@ -410,6 +612,12 @@ pub(crate) unsafe fn plain_custom_prototype_may_intercept(obj_addr: usize, key: 
     if name == "__proto__" {
         return true;
     }
+    // Object model step 3: `Object.create(P)` with `P` an ordinary object of
+    // a known layout (a prototype literal, a class instance) answers from
+    // `P`'s layout and `P`'s own link, with no chain walk.
+    if let Some(blocked) = holder_layout_blocks_store(obj_addr, key, name.as_bytes()) {
+        return blocked;
+    }
     let mut proto = js_object_get_prototype_of(crate::value::js_nanbox_pointer(obj_addr as i64));
     let mut depth = 0u32;
     loop {
@@ -426,9 +634,6 @@ pub(crate) unsafe fn plain_custom_prototype_may_intercept(obj_addr: usize, key: 
             let p = (bits & crate::value::POINTER_MASK) as usize;
             if p == 0 {
                 return false;
-            }
-            if crate::value::addr_class::is_small_handle(p) {
-                return true;
             }
             p
         } else if top16 == 0 && bits >= (crate::gc::GC_HEADER_SIZE as u64) + 0x1000 {
@@ -469,7 +674,8 @@ pub(crate) unsafe fn plain_custom_prototype_may_intercept(obj_addr: usize, key: 
         if class_id == crate::object::NATIVE_MODULE_CLASS_ID {
             return true;
         }
-        if super::key_attrs::attrs_live_in_keys(p) {
+        // The walk holds the prototype's word: a tagged one is honest.
+        if super::key_attrs::attrs_live_in_keys_of_bits(bits) {
             if super::key_attrs::object_key_blocks_plain_store(proto_obj, name.as_bytes()) {
                 return true;
             }
@@ -539,6 +745,23 @@ pub(crate) fn owner_may_have_descriptor_entries(owner: usize, accessor: bool) ->
 /// `caller` must have already established that `addr` is a `GC_TYPE_OBJECT`
 /// whose frozen/sealed/non-extensible flags are clear.
 pub(crate) unsafe fn plain_data_write_may_intercept(addr: usize, class_id: u32, key: f64) -> bool {
+    // A live ordinary layout already proves receiver admission. Consume
+    // that proof before the general typed/exotic admission and key walk.
+    if let Some(record) = super::shapes::object_shape_record(addr as *const ObjectHeader) {
+        if record.object_kind() == super::shapes::ShapeObjectKind::Ordinary {
+            let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+            if let Some(name) = crate::string::js_string_key_bytes(
+                crate::JSValue::from_bits(key.to_bits()),
+                &mut scratch,
+            ) {
+                if let Some(blocked) =
+                    layout_store_may_intercept(record, addr as *const ObjectHeader, name)
+                {
+                    return blocked;
+                }
+            }
+        }
+    }
     // The own holder shape first proves whether this key is ordinary data.
     if object_has_descriptors(addr) && !own_descriptors_skip_key(addr, key) {
         return true;
@@ -579,6 +802,7 @@ pub(crate) unsafe fn plain_data_write_may_intercept(addr: usize, class_id: u32, 
 
 /// Store a property descriptor for (obj, key).
 pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    super::builtin_proto::note_write_addr(obj, "descriptor");
     let byte_edit = HolderEdit::new(obj);
     let obj = byte_edit.as_ref().map_or(obj, |edit| edit.bag as usize);
     crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
@@ -599,6 +823,7 @@ pub(crate) fn set_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) 
 /// Each key updates the holder shape and the existing prototype guards.
 #[cfg(test)]
 pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAttrs)]) {
+    super::builtin_proto::note_write_addr(obj, "descriptor");
     for (key, _) in entries {
         crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
     }
@@ -616,6 +841,7 @@ pub(crate) fn set_property_attrs_batch(obj: usize, entries: &[(&str, PropertyAtt
 /// Remove a customized property descriptor for (obj, key), restoring default
 /// data-property attributes for subsequent writes and reflection.
 pub(crate) fn clear_property_attrs(obj: usize, key: &str) {
+    super::builtin_proto::note_write_addr(obj, "descriptor");
     let bag = unsafe { descriptor_holder(obj) };
     if bag.is_null()
         || unsafe { super::key_attrs::object_key_entry(bag, key.as_bytes()) }
@@ -637,12 +863,16 @@ pub(crate) fn clear_property_attrs(obj: usize, key: &str) {
 
 /// Look up the accessor descriptor (get/set) for (obj, key).
 pub(crate) fn get_accessor_descriptor(obj: usize, key: &str) -> Option<AccessorDescriptor> {
+    get_accessor_descriptor_bytes(obj, key.as_bytes())
+}
+
+pub(crate) fn get_accessor_descriptor_bytes(obj: usize, key: &[u8]) -> Option<AccessorDescriptor> {
     unsafe {
         let bag = descriptor_route(obj).bag;
         if bag.is_null() {
             return None;
         }
-        own_accessor(bag as usize, key.as_bytes()).map(descriptor_from)
+        own_accessor(bag as usize, key).map(descriptor_from)
     }
 }
 
@@ -824,6 +1054,7 @@ pub(crate) unsafe fn owner_key_is_accessor(owner: usize, key: &[u8]) -> bool {
 
 /// Store an accessor descriptor for (obj, key).
 pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDescriptor) {
+    super::builtin_proto::note_write_addr(obj, "descriptor");
     crate::typedarray_named::note_named_mutation(obj, key.as_bytes());
     crate::closure::shape::note_function_own_state_changed(obj);
     let function = HolderEdit::new(obj);
@@ -839,24 +1070,41 @@ pub(crate) fn set_accessor_descriptor(obj: usize, key: String, acc: AccessorDesc
     if in_keys {
         // Charter step 3: the pair lives in the key's slot.
         unsafe { store_own_accessor(obj, &key, Some(pair_from(&acc))) };
-        note_accessor_function_replaced(obj, &key, previous.map(descriptor_from), acc);
+        note_accessor_function_replaced(obj, &key, previous, pair_from(&acc));
         return;
     }
 }
 
 /// RULE 1 when an accessor's getter or setter is REPLACED under unchanged
 /// attributes: its keys (and so its ShapeId) did not change, but a cache
-/// keyed on the ShapeId may hold the old function.
+/// keyed on the ShapeId may hold the old function. Every function word of the
+/// pair counts, compiled entries included: a read site keeps the getter it
+/// primed on and validates only the holder's ShapeId and the pair's address,
+/// which a new pair could reuse once the old one dies (premise 5 of "Weak
+/// entries", `method_site/read_holder.rs`).
 fn note_accessor_function_replaced(
     obj: usize,
     key: &str,
-    previous: Option<AccessorDescriptor>,
-    now: AccessorDescriptor,
+    previous: Option<super::accessor_pair::Accessor>,
+    now: super::accessor_pair::Accessor,
+) {
+    note_accessor_function_replaced_bytes(obj, key.as_bytes(), previous, now);
+}
+
+fn note_accessor_function_replaced_bytes(
+    obj: usize,
+    key: &[u8],
+    previous: Option<super::accessor_pair::Accessor>,
+    now: super::accessor_pair::Accessor,
 ) {
     let Some(previous) = previous else {
         return;
     };
-    if previous.get == now.get && previous.set == now.set {
+    if previous == now {
+        return;
+    }
+    #[cfg(test)]
+    if accessor_replacement_sabotage::active() {
         return;
     }
     unsafe {
@@ -864,8 +1112,33 @@ fn note_accessor_function_replaced(
             let _no_move = crate::gc::GcSuppressScope::new();
             crate::object::shapes::transition_object_shape_accessor_replaced(
                 obj as *mut ObjectHeader,
-                key.as_bytes(),
+                key,
             );
+        }
+    }
+}
+
+/// Test-only: skip RULE 1's transition, to show the guarding test fails
+/// without it (`gc/tests/holder_memo.rs`).
+#[cfg(test)]
+pub(crate) mod accessor_replacement_sabotage {
+    use std::cell::Cell;
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(crate) fn active() -> bool {
+        ON.with(Cell::get)
+    }
+    pub(crate) struct Guard;
+    impl Guard {
+        pub(crate) fn new() -> Self {
+            ON.with(|c| c.set(true));
+            Guard
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ON.with(|c| c.set(false));
         }
     }
 }
@@ -903,6 +1176,7 @@ pub(crate) fn install_fresh_accessor_property(
 /// Remove an accessor descriptor for (obj, key), letting ordinary data-property
 /// reads and writes use the object's stored field again.
 pub(crate) fn clear_accessor_descriptor(obj: usize, key: &str) {
+    super::builtin_proto::note_write_addr(obj, "descriptor");
     let bag = unsafe { descriptor_holder(obj) };
     if bag.is_null()
         || unsafe { super::key_attrs::object_key_entry(bag, key.as_bytes()) }
@@ -941,6 +1215,15 @@ pub(crate) fn set_builtin_accessor_pair(
     pair: super::accessor_pair::Accessor,
     attrs: PropertyAttrs,
 ) {
+    set_builtin_accessor_pair_bytes(obj, key.as_bytes(), pair, attrs)
+}
+
+pub(crate) fn set_builtin_accessor_pair_bytes(
+    obj: usize,
+    key: &[u8],
+    pair: super::accessor_pair::Accessor,
+    attrs: PropertyAttrs,
+) {
     crate::closure::shape::note_function_own_state_changed(obj);
     let function = HolderEdit::new(obj);
     let obj = function.as_ref().map_or(obj, |edit| edit.bag as usize);
@@ -948,34 +1231,38 @@ pub(crate) fn set_builtin_accessor_pair(
     super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
     let in_keys = unsafe { super::key_attrs::attrs_live_in_keys_for_install(obj) };
     let previous = if in_keys {
-        unsafe { own_accessor(obj, key.as_bytes()) }
+        unsafe { own_accessor(obj, key) }
     } else {
         None
     };
     note_descriptor_target_edits(
         obj,
         &[
-            AttrsEdit::Accessor(key.as_bytes(), acc.get != 0, acc.set != 0),
-            AttrsEdit::Data(key.as_bytes(), attrs.bits),
+            AttrsEdit::Accessor(key, acc.get != 0, acc.set != 0),
+            AttrsEdit::Data(key, attrs.bits),
         ],
     );
     if in_keys {
         // Charter step 3: the pair lives in the key's slot.
-        unsafe { store_own_accessor(obj, &key, Some(pair)) };
-        note_accessor_function_replaced(obj, &key, previous.map(descriptor_from), acc);
+        unsafe { super::accessor_pair::store_own_accessor_bytes(obj, key, Some(pair)) };
+        note_accessor_function_replaced_bytes(obj, key, previous, pair);
         return;
     }
 }
 
 /// Record a built-in data property's attributes in its holder shape.
 pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: PropertyAttrs) {
+    set_builtin_property_attrs_bytes(obj, key.as_bytes(), attrs)
+}
+
+pub(crate) fn set_builtin_property_attrs_bytes(obj: usize, key: &[u8], attrs: PropertyAttrs) {
     // A function born with this key's attributes (its bag's key entry
     // already says so): nothing changes.
-    if unsafe { function_key_has_attrs(obj, &key, attrs) } {
+    if unsafe { function_key_has_attrs_bytes(obj, key, attrs) } {
         return;
     }
     super::prop_plan::prop_plan_epoch_bump_for_owner(obj);
-    note_descriptor_target_edits(obj, &[AttrsEdit::Data(key.as_bytes(), attrs.bits)]);
+    note_descriptor_target_edits(obj, &[AttrsEdit::Data(key, attrs.bits)]);
     if unsafe {
         crate::closure::is_closure_ptr(obj) || super::key_attrs::attrs_live_in_keys_for_install(obj)
     } {
@@ -988,15 +1275,15 @@ pub(crate) fn set_builtin_property_attrs(obj: usize, key: String, attrs: Propert
 ///
 /// # Safety
 /// `obj` is any address; only a proven closure's bag is read.
-unsafe fn function_key_has_attrs(obj: usize, key: &str, attrs: PropertyAttrs) -> bool {
+unsafe fn function_key_has_attrs_bytes(obj: usize, key: &[u8], attrs: PropertyAttrs) -> bool {
     let entry = super::key_attrs::attr_bits_to_entry(attrs.bits);
     if entry == 0 || !crate::closure::is_closure_ptr(obj) {
         return false;
     }
     let bag = crate::closure::props::bag_of(obj);
     !bag.is_null()
-        && super::key_attrs::object_key_entry(bag, key.as_bytes()) == entry
-        && crate::closure::props::bag_has_own(obj, key.as_bytes())
+        && super::key_attrs::object_key_entry(bag, key) == entry
+        && crate::closure::props::bag_has_own(obj, key)
 }
 
 /// Install a built-in data property WITH its attributes: `obj[key] = value`
@@ -1018,11 +1305,26 @@ pub(crate) fn define_builtin_data_property(
     name: String,
     attrs: PropertyAttrs,
 ) {
+    define_builtin_data_property_bytes(obj, key, value, name.as_bytes(), attrs)
+}
+
+pub(crate) fn define_builtin_data_property_bytes(
+    obj: *mut ObjectHeader,
+    key: *const crate::StringHeader,
+    value: f64,
+    name: &[u8],
+    attrs: PropertyAttrs,
+) {
     unsafe {
         if crate::closure::is_closure_ptr(obj as usize) {
             super::own_override::as_builtin_definition(|| {
                 super::own_override::note_exotic_named_prop_install(obj as usize);
-                crate::closure::closure_define_data_with_attrs(obj as usize, &name, value, attrs);
+                crate::closure::closure_define_data_with_attrs_bytes(
+                    obj as usize,
+                    name,
+                    value,
+                    attrs,
+                );
             });
             return;
         } else if super::key_attrs::attrs_live_in_keys_for_install(obj as usize) {
@@ -1038,7 +1340,7 @@ pub(crate) fn define_builtin_data_property(
             });
         }
     }
-    set_builtin_property_attrs(obj as usize, name, attrs);
+    set_builtin_property_attrs_bytes(obj as usize, name, attrs);
 }
 
 mod integrity;

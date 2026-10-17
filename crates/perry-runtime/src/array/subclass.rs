@@ -34,8 +34,8 @@ pub(crate) use loop_guard::{js_packed_arraylike_loop_guard, js_packed_ecs_u32_lo
 //     bit 0       native fallback after ordinary undefined
 //     bit 1       payload valid
 //     bit 2       compact nonnegative-int entity proof (mode 2)
-//     bit 3       user-origin prototype signal
-//     bit 4       class-evaluation prototype
+//     bit 3       sealed intrinsic prototype (#11915; family in bits 8..11)
+//     bit 4       free
 //     bit 5       object is a prototype
 //     bit 6       exotic read receiver
 //     bits 8..31  verified prefix bound (24 bits, max 16,000,000)
@@ -191,7 +191,7 @@ unsafe fn owner_cached_dense_layout(obj: *const ObjectHeader) -> Option<DenseSub
     if meta.is_null() {
         return None;
     }
-    let key = dense_cache_key((*obj).class_id, (*obj).parent_class_id);
+    let key = dense_cache_key((*obj).class_id, (*obj).shape_word());
     if key == 0 || (*meta).array_subclass_dense_key != key {
         return None;
     }
@@ -218,7 +218,7 @@ unsafe fn publish_owner_dense_layout(obj: *const ObjectHeader, layout: DenseSubc
         ((layout.length_slot as u64) << 32) | layout.element_base as u64;
     (*meta).array_subclass_dense_bounds =
         ((layout.live_inline_slots as u64) << 32) | layout.dense_prefix_len as u64;
-    (*meta).array_subclass_dense_key = dense_cache_key((*obj).class_id, (*obj).parent_class_id);
+    (*meta).array_subclass_dense_key = dense_cache_key((*obj).class_id, (*obj).shape_word());
 }
 
 fn decimal_u32<'a>(mut value: u32, buf: &'a mut [u8; 10]) -> &'a [u8] {
@@ -352,13 +352,20 @@ fn validated_object_receiver_for_value(value: f64) -> Option<ValidatedObjectRece
 /// descriptor, hole, or prototype case returns `None`.
 #[inline]
 fn dense_layout_for_validated_object(obj: *const ObjectHeader) -> Option<DenseSubclassLayout> {
+    // The dense layout is read off the receiver's layout alone. A receiver
+    // with an overflow (a delete of an element gives one) keeps that layout
+    // while its slots hold holes and its keys live in the overflow, so no
+    // layout proof applies to it (object model step 4).
+    if unsafe { crate::object::overflow::has_overflow(obj) } {
+        return None;
+    }
     // `Object.setPrototypeOf` moves the receiver to another ShapeId, so a
     // layout cached for the old one (owner word or `(class, ShapeId)` key)
     // cannot be borrowed afterwards.
     if let Some(layout) = unsafe { owner_cached_dense_layout(obj) } {
         return Some(layout);
     }
-    let (class_id, shape_id) = unsafe { ((*obj).class_id, (*obj).parent_class_id) };
+    let (class_id, shape_id) = unsafe { ((*obj).class_id, (*obj).shape_word()) };
     let key = dense_cache_key(class_id, shape_id);
     let layout = cached_dense_layout(key).or_else(|| {
         let layout = unsafe { build_dense_layout(obj) }?;
@@ -413,6 +420,7 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
     };
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+        || crate::object::overflow::has_overflow(obj)
     {
         return 0;
     }
@@ -442,7 +450,7 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
     let (element_base, dense_prefix_len, length_slot) = if elements_backed {
         (u32::MAX, 0, u32::MAX)
     } else {
-        let shape_id = (*obj).parent_class_id;
+        let shape_id = (*obj).shape_word();
         let cache_key = dense_cache_key(class_id, shape_id);
         let layout = cached_dense_layout(cache_key).or_else(|| {
             let layout = build_dense_layout(obj)?;
@@ -675,7 +683,8 @@ pub(crate) unsafe fn clear_packed_subclass_numeric_proof(obj: *mut ObjectHeader)
 pub(crate) unsafe fn drop_packed_subclass_numeric_proof_record(
     obj: *mut ObjectHeader,
 ) -> Option<u32> {
-    let header = crate::value::addr_class::try_read_gc_header(obj as usize)?;
+    // `obj` is a live GC object by contract: its header needs no admission.
+    let header = &*crate::gc::header_from_trusted_user_ptr(obj as *const u8);
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || crate::object::shapes::shape_object_kind_by_id(
             crate::object::shapes::object_shape_stamp(obj),
@@ -751,9 +760,6 @@ unsafe fn publish_subclass_numeric_prefix(
     if meta.is_null() || bound > 16_000_000 {
         return false;
     }
-    if crate::value::addr_class::try_read_gc_header(obj as usize).is_none() {
-        return false;
-    }
     let flags = (*meta).flags;
     // The payload's shape field names the UNPROVEN twin (`shape_id`, the
     // receiver's current `Ordinary` shape) that a retire stamps back.
@@ -797,7 +803,7 @@ unsafe fn ensure_subclass_numeric_prefix(
     if bound == 0 {
         return true;
     }
-    let shape_id = (*obj).parent_class_id;
+    let shape_id = (*obj).shape_word();
     if subclass_numeric_prefix_is_proven(obj, shape_id, bound, require_u32) {
         return true;
     }
@@ -869,7 +875,7 @@ unsafe fn ensure_subclass_numeric_prefix(
     // back to its unproven twin (charter step 3), so `shape_id` may name the
     // proof shape it no longer carries.
     let _ = shape_id;
-    publish_subclass_numeric_prefix(obj, (*obj).parent_class_id, bound, require_u32)
+    publish_subclass_numeric_prefix(obj, (*obj).shape_word(), bound, require_u32)
 }
 
 #[inline]
@@ -972,7 +978,7 @@ pub(crate) fn array_subclass_fast_length_with_ic(
             cache.write(if family_token != 0 {
                 family_token
             } else {
-                dense_cache_key((*obj).class_id, (*obj).parent_class_id)
+                dense_cache_key((*obj).class_id, (*obj).shape_word())
             });
         }
     }
@@ -1330,7 +1336,7 @@ fn array_subclass_fast_push_one_validated(
     // A numeric-proof sibling has no learned tail edge. Restore the ordinary
     // shape before the exact-shape transition lookup, including on a miss.
     unsafe { clear_packed_subclass_numeric_proof(obj as *mut ObjectHeader) };
-    let predecessor_shape_id = unsafe { (*obj).parent_class_id };
+    let predecessor_shape_id = unsafe { (*obj).shape_word() };
     let transition = crate::object::array_tail_transition::lookup_forward_for_owner(
         obj,
         predecessor_shape_id,
@@ -1461,7 +1467,7 @@ fn array_subclass_fast_pop_validated(receiver: ValidatedObjectReceiver) -> Optio
     if unsafe { clear_packed_subclass_numeric_proof(obj as *mut ObjectHeader) } {
         crate::object::prop_plan::prop_plan_epoch_bump();
     }
-    let successor_shape_id = unsafe { (*obj).parent_class_id };
+    let successor_shape_id = unsafe { (*obj).shape_word() };
     let transition =
         crate::object::array_tail_transition::lookup_reverse_for_owner(obj, successor_shape_id)?;
     if transition.array_index != index

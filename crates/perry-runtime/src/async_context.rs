@@ -16,6 +16,80 @@ pub struct AsyncContextSnapshot {
     entries: Vec<AsyncContextEntry>,
 }
 
+/// A native context vector in an ordinary young, movable GC holder. The
+/// holder has no root registry: a Promise/task/resource must own its edge. One
+/// that dies young releases its vector in the copying minor
+/// (`arena/owned_stores.rs`), an older one in the sweep's finalize hook.
+#[repr(C)]
+pub(crate) struct AsyncSnapshotHolder {
+    /// Reserved receiver word: +4 must stay below the ShapeId range (rule 3).
+    _receiver_word: u64,
+    pub(crate) snapshot: AsyncContextSnapshot,
+}
+
+pub(crate) fn alloc_snapshot_holder(snapshot: AsyncContextSnapshot) -> *mut AsyncSnapshotHolder {
+    alloc_snapshot_holder_in::<false>(snapshot)
+}
+
+/// `OLD` births a tenured holder, for fixtures that plant an old population.
+pub(crate) fn alloc_snapshot_holder_in<const OLD: bool>(
+    snapshot: AsyncContextSnapshot,
+) -> *mut AsyncSnapshotHolder {
+    // Callers publish under a no-move scope; the native input snapshot is not
+    // an independent registered root during this bounded native-only store.
+    let _no_move = crate::gc::GcSuppressScope::new();
+    let size = std::mem::size_of::<AsyncSnapshotHolder>();
+    let align = std::mem::align_of::<AsyncSnapshotHolder>();
+    let cell = if OLD {
+        crate::arena::arena_alloc_gc_old_born_tenured(
+            size,
+            align,
+            crate::gc::GC_TYPE_ASYNC_SNAPSHOT,
+        )
+    } else {
+        crate::arena::arena_alloc_gc(size, align, crate::gc::GC_TYPE_ASYNC_SNAPSHOT)
+    } as *mut AsyncSnapshotHolder;
+    crate::arena::note_young_owned_store(cell.cast());
+    unsafe {
+        std::ptr::write(
+            cell,
+            AsyncSnapshotHolder {
+                _receiver_word: 0,
+                snapshot,
+            },
+        );
+        for_each_snapshot_store_slot(&mut (*cell).snapshot, &mut |slot| {
+            crate::gc::runtime_write_barrier_external_slot(
+                cell as usize,
+                slot as usize,
+                (*slot).to_bits(),
+            );
+        });
+    }
+    cell
+}
+
+/// Move hook: the copy owns the native vector now; the abandoned original is
+/// left empty so no later sweep or exit walk releases it a second time. The
+/// forwarding word covers payload bytes 0..8 only (the reserved receiver word).
+pub(crate) unsafe fn snapshot_holder_moved_for_gc(old_user: usize, new_user: usize) {
+    if old_user == new_user {
+        return;
+    }
+    let old = old_user as *mut AsyncSnapshotHolder;
+    std::ptr::write(
+        std::ptr::addr_of_mut!((*old).snapshot),
+        AsyncContextSnapshot::default(),
+    );
+    crate::arena::note_owned_store_copied(new_user);
+}
+
+/// Sweep and thread exit share an idempotent release: swept headers can still
+/// be encountered in the arena's existing exit walk before their reuse.
+pub(crate) unsafe fn finalize_snapshot_holder(cell: *mut AsyncSnapshotHolder) {
+    drop(std::mem::take(&mut (*cell).snapshot));
+}
+
 impl AsyncContextSnapshot {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -82,8 +156,11 @@ pub fn token_from_storage_value(value: f64) -> Option<i64> {
     }
 }
 
+// Large operation callbacks are outlined explicitly at the affected access
+// sites: LocalKey::with can then specialize its small TLS getter instead of
+// retaining a call through LocalKey's accessor pointer in prod archives.
 thread_local! {
-    static ACTIVE_CONTEXT: RefCell<AsyncContextSnapshot> = RefCell::new(AsyncContextSnapshot::default());
+    static ACTIVE_CONTEXT: RefCell<AsyncContextSnapshot> = const { RefCell::new(AsyncContextSnapshot { entries: Vec::new() }) };
 }
 
 unsafe fn token_ref(token: i64) -> &'static AsyncLocalStorageTokenInner {
@@ -250,29 +327,32 @@ pub fn get_store(token: i64) -> Option<f64> {
 /// the pre-`run` value on exit (#788, differential case 21).
 pub fn set_store(token: i64, store: f64) {
     let generation = token_generation(token);
-    ACTIVE_CONTEXT.with(|ctx| {
-        let mut ctx = ctx.borrow_mut();
-        ctx.entries.retain(|entry| {
-            Arc::as_ptr(&entry.token) as i64 != token || entry.generation == generation
-        });
-        if let Some(entry) = ctx
-            .entries
-            .iter_mut()
-            .find(|entry| entry_matches(entry, token, generation))
-        {
-            if let Some(slot) = entry.stores.last_mut() {
-                *slot = store;
-            } else {
-                entry.stores.push(store);
-            }
-        } else {
-            ctx.entries.push(AsyncContextEntry {
-                token: unsafe { clone_token(token) },
-                generation,
-                stores: vec![store],
+    ACTIVE_CONTEXT.with(
+        #[inline(never)]
+        |ctx| {
+            let mut ctx = ctx.borrow_mut();
+            ctx.entries.retain(|entry| {
+                Arc::as_ptr(&entry.token) as i64 != token || entry.generation == generation
             });
-        }
-    });
+            if let Some(entry) = ctx
+                .entries
+                .iter_mut()
+                .find(|entry| entry_matches(entry, token, generation))
+            {
+                if let Some(slot) = entry.stores.last_mut() {
+                    *slot = store;
+                } else {
+                    entry.stores.push(store);
+                }
+            } else {
+                ctx.entries.push(AsyncContextEntry {
+                    token: unsafe { clone_token(token) },
+                    generation,
+                    stores: vec![store],
+                });
+            }
+        },
+    );
 }
 
 pub fn enter_with(token: i64, store: f64) {
@@ -281,10 +361,10 @@ pub fn enter_with(token: i64, store: f64) {
 
 /// Deferred context-restore action for a scope (`AsyncLocalStorage#run`/
 /// `#exit`, `AsyncResource#runInAsyncScope`) whose callback may throw.
-/// `js_throw` longjmps past the normal restore code, so each scope records
-/// its restore action here (tagged with the `try` depth at entry) and
-/// `js_throw` applies every action belonging to frames it is about to
-/// unwind past (#788, differential cases 10/25).
+/// A throw skips the normal restore code, so each scope records its restore
+/// action here (tagged with the frame mark of the scope's owner) and the
+/// catching landing pad applies every action belonging to frames the throw
+/// abandoned (#788, differential cases 10/25; `crate::exception::marks`).
 pub enum ContextGuardAction {
     /// `run()`: pop the one store slot the scope pushed for its handle.
     PopStore(AsyncLocalStoragePayload),
@@ -293,31 +373,43 @@ pub enum ContextGuardAction {
     /// `runInAsyncScope()` / snapshot trampoline: restore the full snapshot.
     RestoreSnapshot(AsyncContextSnapshot),
     /// Silently pop one async_hooks execution-id frame (no `after` hook
-    /// callbacks: arbitrary JS must not run mid-`js_throw`).
+    /// callbacks: arbitrary JS must not run in a landing pad).
     RestoreExecutionIds,
-}
-
-struct ContextGuard {
-    try_depth: usize,
-    action: ContextGuardAction,
+    /// Test witness: an action with no effect.
+    #[cfg(test)]
+    TestNoop,
 }
 
 thread_local! {
-    static CONTEXT_GUARDS: RefCell<Vec<ContextGuard>> = const { RefCell::new(Vec::new()) };
+    static CONTEXT_GUARDS: RefCell<crate::exception::CatchStack<ContextGuardAction>> =
+        const { RefCell::new(crate::exception::CatchStack::new()) };
 }
 
+/// Register `action` for the scope the calling frame owns (or, called from a
+/// helper the owner calls directly, the owner's: see
+/// `crate::exception::frame_mark`).
+#[inline(always)]
 pub fn push_context_guard(action: ContextGuardAction) {
-    let try_depth = crate::exception::current_try_depth();
+    push_context_guard_at(crate::exception::frame_mark(), action);
+}
+
+/// Register `action` for the scope owned by the frame `mark` names.
+pub fn push_context_guard_at(mark: usize, action: ContextGuardAction) {
     CONTEXT_GUARDS.with(|guards| {
-        guards.borrow_mut().push(ContextGuard { try_depth, action });
+        guards.borrow_mut().push(mark, action);
     });
+}
+
+#[cfg(test)]
+pub(crate) fn context_guard_depth() -> usize {
+    CONTEXT_GUARDS.with(|guards| guards.borrow().len())
 }
 
 /// Pop the most recent guard without applying it. The caller either applies
 /// it (normal scope exit) or discards it (the restore already happened by
 /// other means).
 pub fn pop_context_guard() -> Option<ContextGuardAction> {
-    CONTEXT_GUARDS.with(|guards| guards.borrow_mut().pop().map(|guard| guard.action))
+    CONTEXT_GUARDS.with(|guards| guards.borrow_mut().pop())
 }
 
 pub fn apply_context_guard(action: ContextGuardAction) {
@@ -326,24 +418,21 @@ pub fn apply_context_guard(action: ContextGuardAction) {
         ContextGuardAction::RestoreStores(lease, stores) => restore_store(lease.token(), stores),
         ContextGuardAction::RestoreSnapshot(snapshot) => restore_context(snapshot),
         ContextGuardAction::RestoreExecutionIds => crate::async_hooks::unwind_execution_scope(),
+        #[cfg(test)]
+        ContextGuardAction::TestNoop => {}
     }
 }
 
-/// Called from `js_throw` just before the longjmp: apply (newest-first) every
-/// guard registered at a `try` depth greater than the depth of the handler
-/// being jumped to — those scopes' normal restore code is being unwound past.
-/// Guards registered at or below the handler's depth belong to still-live
-/// scopes and stay.
-pub(crate) fn unwind_context_guards(target_try_depth: usize) {
+/// Called from a landing pad at stack pointer `sp`: apply (newest-first)
+/// every guard owned by a frame below `sp` — those scopes' normal restore
+/// code was abandoned by the throw. Guards of the catching frame and its
+/// callers belong to still-live scopes and stay.
+pub(crate) fn unwind_context_guards(sp: usize) {
     loop {
         let action = CONTEXT_GUARDS.with(|guards| {
             let mut guards = guards.borrow_mut();
-            match guards.last() {
-                Some(guard) if guard.try_depth > target_try_depth => {
-                    guards.pop().map(|guard| guard.action)
-                }
-                _ => None,
-            }
+            let keep = guards.unwound_len(sp);
+            (guards.len() > keep).then(|| guards.pop()).flatten()
         });
         match action {
             Some(action) => apply_context_guard(action),
@@ -352,11 +441,20 @@ pub(crate) fn unwind_context_guards(target_try_depth: usize) {
     }
 }
 
+pub(crate) fn check_context_guard_marks(sp: usize) {
+    CONTEXT_GUARDS.with(
+        #[inline(never)]
+        |guards| crate::exception::marks::check_marks(guards.borrow().marks(), sp, "async_context"),
+    );
+}
+
 fn scan_context_guard_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     CONTEXT_GUARDS.with(|guards| {
-        for guard in guards.borrow_mut().iter_mut() {
-            match &mut guard.action {
+        for action in guards.borrow_mut().iter_mut() {
+            match action {
                 ContextGuardAction::PopStore(_) | ContextGuardAction::RestoreExecutionIds => {}
+                #[cfg(test)]
+                ContextGuardAction::TestNoop => {}
                 ContextGuardAction::RestoreStores(_, stores) => {
                     if let Some((_, stores)) = stores {
                         for store in stores.iter_mut() {
@@ -384,9 +482,9 @@ pub fn clear_store(token: i64) {
             .iter()
             .any(|entry| Arc::as_ptr(&entry.token) as i64 == token)
     }) || CONTEXT_GUARDS.with(|guards| {
-        guards.borrow().iter().any(|guard| {
+        guards.borrow().iter().any(|action| {
             matches!(
-                &guard.action,
+                action,
                 ContextGuardAction::RestoreStores(saved_token, Some(_))
                     if saved_token.token() == token
             )
@@ -401,11 +499,14 @@ pub fn clear_store(token: i64) {
 }
 
 fn remove_store(token: i64) {
-    ACTIVE_CONTEXT.with(|ctx| {
-        ctx.borrow_mut()
-            .entries
-            .retain(|entry| Arc::as_ptr(&entry.token) as i64 != token);
-    });
+    ACTIVE_CONTEXT.with(
+        #[inline(never)]
+        |ctx| {
+            ctx.borrow_mut()
+                .entries
+                .retain(|entry| Arc::as_ptr(&entry.token) as i64 != token);
+        },
+    );
 }
 
 pub fn take_store(token: i64) -> Option<(u64, Vec<f64>)> {
@@ -446,6 +547,18 @@ pub fn scan_snapshot_roots(snapshot: &AsyncContextSnapshot, mark: &mut dyn FnMut
     for entry in &snapshot.entries {
         for &store in &entry.stores {
             mark(store);
+        }
+    }
+}
+
+/// The child-slot contract shared by root snapshots and owner-held snapshots.
+pub(crate) fn for_each_snapshot_store_slot(
+    snapshot: &mut AsyncContextSnapshot,
+    visit: &mut dyn FnMut(*mut f64),
+) {
+    for entry in &mut snapshot.entries {
+        for store in &mut entry.stores {
+            visit(store);
         }
     }
 }
@@ -548,6 +661,12 @@ pub(crate) fn test_snapshot_first_store(snapshot: &AsyncContextSnapshot) -> Opti
         .entries
         .first()
         .and_then(|entry| entry.stores.first().copied())
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot_token_lifetime(snapshot: &AsyncContextSnapshot) -> impl Fn() -> bool {
+    let token = Arc::downgrade(&snapshot.entries[0].token);
+    move || token.strong_count() != 0
 }
 
 #[cfg(test)]

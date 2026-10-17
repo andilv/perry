@@ -12,6 +12,9 @@ fn empty_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: false,
         non_entry_module_prefixes: Vec::new(),
@@ -182,7 +185,7 @@ fn any_call_result_trim_emits_string_tag_dispatch() {
         ir.contains("lshr i64")
             && ir.contains("32767")
             && ir.contains("32761")
-            && ir.contains("call i64 @js_string_trim"),
+            && ir.contains("call double @js_string_m_trim0("),
         "the string arm must be guarded by heap and short-string tags:\n{ir}"
     );
     assert!(

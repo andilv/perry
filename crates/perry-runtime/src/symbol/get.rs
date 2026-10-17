@@ -85,11 +85,7 @@ pub(crate) unsafe fn has_own_symbol_property(obj_f64: f64, sym_f64: f64) -> bool
     if crate::object::shaped_symbols::owner(obj_key).is_some() {
         return crate::object::shaped_symbols::get(obj_key, sym_key).is_some();
     }
-    let guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
-    match guard.as_ref().and_then(|map| map.get(&obj_key)) {
-        Some(entries) => entries.iter().any(|&(sk, _)| sk == sym_key),
-        None => false,
-    }
+    false
 }
 
 /// #1758: the OWN symbol-property lookup — the raw `SYMBOL_PROPERTIES`
@@ -143,173 +139,6 @@ mod generator;
 mod own;
 pub(crate) use own::own_symbol_slot;
 
-/// Words in a per-site Symbol-keyed read cache: `[epoch, obj_bits, sym_bits,
-/// packed_shape_and_slot]`. Word 0 is published last with release ordering and read
-/// first with acquire by the emitted hit path.
-pub const SYMBOL_PIC_WORDS: usize = 4;
-/// A per-site Symbol-keyed read cache, as the emitted slot resolves it.
-pub type SymbolPicCache = [u64; SYMBOL_PIC_WORDS];
-/// The emitted `@perry_ic_N = private global ptr null` for a Symbol site:
-/// null until the site's first priming miss (#9708).
-pub type SymbolPicCacheSlot = *mut SymbolPicCache;
-
-/// The cache a Symbol slot currently holds, without allocating: null for a
-/// site that has never primed.
-///
-/// # Safety
-/// `slot` must be null or a live Symbol cache slot.
-#[inline]
-unsafe fn symbol_cache_of(slot: *mut SymbolPicCacheSlot) -> *mut u64 {
-    crate::object::pic_slot_peek(slot) as *mut u64
-}
-
-/// Miss path for the generated weak own-Symbol-property IC.
-///
-/// Cache layout (all `u64`): epoch, receiver bits, symbol bits, packed shape/slot.
-/// The receiver is intentionally *not* a GC root. The process-wide
-/// epoch changes after every collection, so a moved/reclaimed address can
-/// never hit; it also changes after every Symbol-property mutation, so a data
-/// write, deletion, or data/accessor conversion cannot return a stale value.
-///
-/// Only an exact own DATA property on a real `ObjectHeader` is cacheable. All
-/// exotic receivers, accessors, inherited properties and misses retain the
-/// canonical resolver below, including Proxy traps and prototype semantics.
-///
-/// `cache_slot` is the site's [`SymbolPicCacheSlot`] address; the cache is
-/// allocated on the first successful prime (#9708).
-#[no_mangle]
-pub unsafe extern "C" fn js_object_get_symbol_property_ic_miss(
-    obj_f64: f64,
-    sym_f64: f64,
-    cache_slot: *mut SymbolPicCacheSlot,
-) -> f64 {
-    let obj_bits = obj_f64.to_bits();
-    if !cache_slot.is_null() && (obj_bits >> 48) == 0x7FFD {
-        let obj_key = (obj_bits & POINTER_MASK) as usize;
-        if let Some(header) = crate::value::addr_class::try_read_gc_header(obj_key) {
-            if header.obj_type == crate::gc::GC_TYPE_OBJECT {
-                let sym_key = sym_key_from_f64(sym_f64);
-                if sym_key != 0
-                    && accessors::symbol_accessor_property_by_key(obj_key, sym_key).is_none()
-                {
-                    let obj = obj_key as *mut crate::object::ObjectHeader;
-                    let slot = crate::object::shaped_symbols::position(obj, sym_key);
-                    let shape = crate::object::shapes::object_shape_stamp(obj);
-                    // The generated hit reads the inline slot directly, so only
-                    // a slot inside the published live inline bound may prime.
-                    let slot = slot.filter(|&index| {
-                        shape != 0 && index < crate::object::object_live_slot_count(obj)
-                    });
-                    let value_bits =
-                        slot.map(|index| crate::object::js_object_get_field(obj, index).bits());
-                    if let Some(value_bits) = value_bits {
-                        let epoch = PERRY_SYMBOL_PROPERTY_IC_EPOCH
-                            .load(std::sync::atomic::Ordering::Acquire);
-                        // #9708: the cache is allocated here, on the first
-                        // successful prime, never for a miss that cannot
-                        // prime.
-                        let cache = crate::object::pic_slot_resolve(cache_slot) as *mut u64;
-                        // Publish identity/layout first and epoch last. The
-                        // generated hit path acquire-loads this first word.
-                        *cache.add(1) = obj_bits;
-                        *cache.add(2) = sym_f64.to_bits();
-                        *cache.add(3) = ((shape as u64) << 32) | slot.unwrap() as u64;
-                        (&*(cache as *const std::sync::atomic::AtomicU64))
-                            .store(epoch, std::sync::atomic::Ordering::Release);
-                        return f64::from_bits(value_bits);
-                    }
-                }
-            }
-        }
-    }
-    js_object_get_symbol_property(obj_f64, sym_f64)
-}
-
-/// Miss path for a generated `owner[symbol].field` composed inline cache.
-///
-/// The first cache is the ordinary weak Symbol cache above. The second is the
-/// ordinary named-field [`crate::object::PicCache`]. Keeping their established
-/// miss handlers is important: accessors, prototypes, Proxies, primitive
-/// receivers, and nullish throws all retain the canonical property semantics.
-/// This helper merely publishes the Symbol cache as hit-eligible when the
-/// intermediate value also proved to be an exact, descriptor-free object with
-/// a cacheable inline field. The generated hit can then safely validate its
-/// live ShapeId and reload the field's current slot value directly.
-#[no_mangle]
-pub unsafe extern "C" fn js_object_get_symbol_then_field_ic_miss(
-    obj_f64: f64,
-    sym_f64: f64,
-    key: *const crate::StringHeader,
-    feedback_site_id: u64,
-    symbol_cache_slot: *mut SymbolPicCacheSlot,
-    field_cache_slot: *mut crate::object::PicCacheSlot,
-) -> f64 {
-    // #9708: both caches sit behind slots. Each is re-read after the miss
-    // that may allocate it; before that, a null cache is simply "not primed".
-    let symbol_cache = symbol_cache_of(symbol_cache_slot);
-    if key.is_null() {
-        if !symbol_cache.is_null() {
-            (&*(symbol_cache as *const std::sync::atomic::AtomicU64))
-                .store(0, std::sync::atomic::Ordering::Release);
-        }
-        return f64::from_bits(TAG_UNDEFINED);
-    }
-
-    // The pooled key is a moving StringHeader. Root it before the Symbol miss,
-    // whose accessor/prototype fallback may allocate before the named read.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let key_handle = scope.root_nanbox_f64(crate::value::js_nanbox_string(key as i64));
-    let intermediate = js_object_get_symbol_property_ic_miss(obj_f64, sym_f64, symbol_cache_slot);
-    let intermediate_handle = scope.root_nanbox_f64(intermediate);
-    let symbol_cache = symbol_cache_of(symbol_cache_slot);
-    let field_cache = crate::object::pic_slot_peek(field_cache_slot);
-
-    // Do not mistake an entry retained from the previously cached
-    // intermediate object for a prime performed by this miss.
-    if !field_cache.is_null() {
-        (*field_cache)[0] = 0;
-    }
-
-    let current = intermediate_handle.get_nanbox_f64();
-    let key_now_bits = key_handle.get_nanbox_u64();
-    let key_now = (key_now_bits & POINTER_MASK) as *const crate::StringHeader;
-    let (result, intermediate_after) = intermediate_handle.across_nanbox(|| {
-        crate::object::js_object_get_field_ic(
-            current.to_bits() as i64,
-            key_now,
-            feedback_site_id,
-            field_cache_slot,
-        )
-    });
-    // The named read may have been the site's first prime, which allocates.
-    let field_cache = crate::object::pic_slot_peek(field_cache_slot);
-
-    // `cache[3]` is dereferenced by generated code only after cache[0]'s
-    // acquire-load succeeds. Leave that epoch published solely when both miss
-    // handlers proved the exact composed fast path. A collection during the
-    // named read already makes the epoch unequal; the checks below also cover
-    // uncacheable primitives, inherited/accessor fields, and null caches.
-    let intermediate_bits = intermediate_after.to_bits();
-    let raw = (intermediate_bits & POINTER_MASK) as usize;
-    let is_plain_object = (intermediate_bits >> 48) == 0x7FFD
-        && crate::value::addr_class::try_read_gc_header(raw)
-            .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_OBJECT);
-    let field_primed = !field_cache.is_null()
-        && ((*field_cache)[0] as u64 & crate::object::shapes::PIC_ID_TOKEN_BIT) != 0;
-    let symbol_primed = !symbol_cache.is_null()
-        && *symbol_cache.add(1) == obj_f64.to_bits()
-        && *symbol_cache.add(2) == sym_f64.to_bits()
-        && (&*(symbol_cache as *const std::sync::atomic::AtomicU64))
-            .load(std::sync::atomic::Ordering::Acquire)
-            == PERRY_SYMBOL_PROPERTY_IC_EPOCH.load(std::sync::atomic::Ordering::Acquire);
-    if !(is_plain_object && field_primed && symbol_primed) && !symbol_cache.is_null() {
-        (&*(symbol_cache as *const std::sync::atomic::AtomicU64))
-            .store(0, std::sync::atomic::Ordering::Release);
-    }
-
-    result
-}
-
 /// #5437: resolve a symbol-keyed read against the underlying native handle a
 /// request wrapper aliases via its `_req` field. Returns `None` unless the
 /// receiver is a heap object whose `_req` is a small handle (POINTER-tagged,
@@ -356,17 +185,10 @@ unsafe fn req_handle_symbol_fallback(obj_f64: f64, sym_f64: f64) -> Option<f64> 
             as *const crate::object::ObjectHeader,
         kh as *const crate::StringHeader,
     );
-    let rbits = req.to_bits();
-    if (rbits >> 48) != 0x7FFD {
-        return None;
-    }
-    let rraw = (rbits & POINTER_MASK) as usize;
-    // The `_req` must be a small native handle, never another heap object — a
+    // The `_req` must be a native handle, never another heap object — a
     // heap `_req` would be served by its own normal symbol path, and recursing
     // into it risks loops.
-    if !crate::value::addr_class::is_small_handle(rraw)
-        || crate::object::is_valid_obj_ptr(rraw as *const u8)
-    {
+    if !crate::value::JSValue::from_bits(req.to_bits()).is_handle() {
         return None;
     }
     // Read only what the handle actually holds in the side table (no deref of
@@ -390,9 +212,7 @@ unsafe fn object_header_ptr_from_value_bits(bits: u64) -> Option<usize> {
 /// `GC_TYPE_OBJECT` before anything is dereferenced as one.
 unsafe fn receiver_ptr_from_value_bits(bits: u64) -> Option<usize> {
     let (raw, obj_type) = heap_ptr_and_type_from_value_bits(bits)?;
-    if obj_type == crate::gc::GC_TYPE_OBJECT
-        || crate::object::prototype_chain::residual_prototype_owner_type(obj_type)
-    {
+    if crate::object::prototype_chain::owned_prototype_receiver_type(obj_type) {
         Some(raw)
     } else {
         None
@@ -410,24 +230,8 @@ unsafe fn heap_ptr_and_type_from_value_bits(bits: u64) -> Option<(usize, u8)> {
     } else {
         return None;
     };
-    if raw < crate::gc::GC_HEADER_SIZE + 0x1000 {
-        return None;
-    }
-    let header_addr = raw - crate::gc::GC_HEADER_SIZE;
-    let gc_header = header_addr as *const crate::gc::GcHeader;
-    let tracked_malloc = crate::gc::gc_malloc_header_is_tracked(gc_header);
-    let arena_payload = !matches!(
-        crate::arena::classify_heap_space(raw),
-        crate::arena::HeapSpace::Unknown
-    );
-    let arena_header = !matches!(
-        crate::arena::classify_heap_space(header_addr),
-        crate::arena::HeapSpace::Unknown
-    );
-    if !tracked_malloc && !(arena_payload && arena_header) {
-        return None;
-    }
-    Some((raw, (*gc_header).obj_type))
+    let header = crate::value::addr_class::try_read_tracked_gc_header(raw)?;
+    Some((raw, header.as_ref().obj_type))
 }
 
 /// Walk the prototype chains to find an inherited symbol property. Used by
@@ -905,7 +709,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
     // Generic small-handle `Symbol.dispose` support. Subsystems that expose
     // a dispose method through HANDLE_PROPERTY_DISPATCH can bind it here
     // without adding a runtime-specific special case.
-    if (bits >> 48) == 0x7FFD {
+    if (bits >> 48) == (crate::value::HANDLE_TAG >> 48) {
         let id = (bits & 0x0000_FFFF_FFFF_FFFF) as i64;
         if crate::value::addr_class::is_small_handle(id as usize) {
             let dispose = well_known_symbol("dispose");
@@ -927,7 +731,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
     // Generic small-handle `Symbol.asyncDispose` support. This must run before
     // pointer-backed symbol property lookup so small native handles are not
     // interpreted as heap pointers when the dispatcher owns the method.
-    if (bits >> 48) == 0x7FFD {
+    if (bits >> 48) == (crate::value::HANDLE_TAG >> 48) {
         let id = (bits & 0x0000_FFFF_FFFF_FFFF) as i64;
         if crate::value::addr_class::is_small_handle(id as usize) {
             let async_dispose = well_known_symbol("asyncDispose");
@@ -954,7 +758,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
     // method (perry's http `IncomingMessage`) can expose it without a
     // runtime-specific special case. #6432 — `for await…of req` used to throw
     // `is not iterable`, so Next.js read an empty POST body → Auth.js MissingCSRF.
-    if (bits >> 48) == 0x7FFD {
+    if (bits >> 48) == (crate::value::HANDLE_TAG >> 48) {
         let id = (bits & 0x0000_FFFF_FFFF_FFFF) as i64;
         if crate::value::addr_class::is_small_handle(id as usize) {
             let async_iterator = well_known_symbol("asyncIterator");
@@ -979,7 +783,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
     // symbol resolver directly, bypassing the normal string-key handle
     // property dispatcher. Map the well-known symbol back to the dispatcher so
     // `Headers` can expose its `entries` method as the iterator function.
-    if (bits >> 48) == 0x7FFD {
+    if (bits >> 48) == (crate::value::HANDLE_TAG >> 48) {
         let id = (bits & 0x0000_FFFF_FFFF_FFFF) as i64;
         if crate::value::addr_class::is_small_handle(id as usize) {
             let iter_wk = well_known_symbol("iterator");
@@ -1008,7 +812,7 @@ pub(crate) unsafe fn js_object_get_symbol_property_with_receiver(
     // @hono/node-server reads symbols off the IncomingMessage handle while
     // adapting it to a web Request. Proxies share the small-id band
     // (0xF0000..0x100000) but have real symbol semantics, so exclude them.
-    if (bits >> 48) == 0x7FFD {
+    if (bits >> 48) == (crate::value::HANDLE_TAG >> 48) {
         let id = (bits & 0x0000_FFFF_FFFF_FFFF) as usize;
         // Only short-circuit values that are NOT real heap objects. A genuine
         // ObjectHeader can live at a low address in a small program, so gate on
@@ -1667,8 +1471,6 @@ mod handle_meta_share_tests {
     //! over an IncomingMessage), and must survive an `undefined` write-back.
     use super::*;
 
-    const POINTER_TAG_BITS: u64 = 0x7FFD_0000_0000_0000;
-
     // A registered `Symbol.for(key)` as a NaN-boxed f64.
     unsafe fn registered_symbol(key: &str) -> f64 {
         let kh = js_string_from_bytes(key.as_ptr(), key.len() as u32);
@@ -1683,20 +1485,15 @@ mod handle_meta_share_tests {
         registered_symbol("NextInternalRequestMeta")
     }
 
-    // A small native handle id NaN-boxed as POINTER (e.g. an IncomingMessage).
-    // MUST stay below 0x1000: `is_valid_obj_ptr` uses HEAP_MIN=0x1000 on Linux
-    // (0x200_0000_0000 on macOS), so an id >= 0x1000 is misclassified as a valid
-    // heap object ON LINUX — which breaks the handle-band gate and fails these
-    // tests in CI (they pass on macOS, where the id is far below HEAP_MIN). Real
-    // native handles are tiny, so a sub-0x1000 id faithfully models them.
-    fn handle_value(id: u64) -> f64 {
-        f64::from_bits(POINTER_TAG_BITS | id)
-    }
+    // Handle ids MUST stay below 0x1000: `is_valid_obj_ptr` uses
+    // HEAP_MIN=0x1000 on Linux, so a larger id is misclassified as a heap
+    // object and breaks the handle-band gate. Each test's id is backed by a
+    // real native owner record (the stdlib registry's shape), whose bag holds
+    // the handle's properties.
 
     // An IMMOVABLE metadata value: a plain NaN-boxed number. Unlike a heap
-    // object, a number is never a pointer, so the SYMBOL_PROPERTIES side-table
-    // scanner never rewrites it on a GC move — its bits are invariant across any
-    // collection. The #5437 fix logic (no-op on undefined, `_req` fallthrough)
+    // object, a number is never a pointer, so no GC move rewrites it — its
+    // bits are invariant across any collection. The #5437 fix logic (no-op on undefined, `_req` fallthrough)
     // is value-agnostic, so a number tests it faithfully without depending on
     // GC suppression to keep a heap `meta` from moving.
     fn immovable_meta() -> f64 {
@@ -1717,7 +1514,9 @@ mod handle_meta_share_tests {
             let sym = next_request_meta_symbol();
             // Pick a handle id well inside the small-handle band but unlikely to
             // collide with another test's side-table entry.
-            let handle = handle_value(0x321);
+            let owner =
+                crate::object::handle_expando::test_support::TestSmallHandleOwner::new(0x321);
+            let handle = owner.value();
 
             // The per-request metadata value lives on the handle. Use an
             // immovable number so a GC can't invalidate the comparison.
@@ -1756,7 +1555,9 @@ mod handle_meta_share_tests {
             // GC-invariant; `gc_suppress` is defensive only.
             crate::gc::gc_suppress();
             let sym = next_request_meta_symbol();
-            let handle = handle_value(0x654);
+            let owner =
+                crate::object::handle_expando::test_support::TestSmallHandleOwner::new(0x654);
+            let handle = owner.value();
             let meta = immovable_meta();
             super::properties::js_object_set_symbol_property(handle, sym, meta);
 
@@ -1804,7 +1605,9 @@ mod handle_meta_share_tests {
             crate::gc::gc_suppress();
             let sym = registered_symbol("someOtherHandleSym@@test_clear");
             // Distinct handle id so this doesn't alias the metadata tests.
-            let handle = handle_value(0x789);
+            let owner =
+                crate::object::handle_expando::test_support::TestSmallHandleOwner::new(0x789);
+            let handle = owner.value();
             let v = immovable_meta();
             super::properties::js_object_set_symbol_property(handle, sym, v);
 
@@ -1826,168 +1629,6 @@ mod handle_meta_share_tests {
                 TAG_UNDEFINED,
                 "a non-metadata symbol on a handle must be clearable with undefined"
             );
-        }
-    }
-}
-
-#[cfg(test)]
-mod own_data_ic_tests {
-    use super::*;
-    use std::sync::atomic::Ordering;
-
-    #[test]
-    fn own_data_miss_primes_cache_and_mutation_invalidates_epoch() {
-        let _global = crate::gc::global_side_table_test_lock();
-        unsafe {
-            let obj_ptr = crate::object::js_object_alloc(0, 0);
-            assert!(!obj_ptr.is_null());
-            let obj = crate::value::js_nanbox_pointer(obj_ptr as i64);
-            let sym = super::constructors::js_symbol_new_empty();
-            let first = 41.0_f64;
-            super::properties::js_object_set_symbol_property(obj, sym, first);
-
-            let mut cache: SymbolPicCache = [0; SYMBOL_PIC_WORDS];
-            let mut cache_slot: SymbolPicCacheSlot = &mut cache;
-            let got = js_object_get_symbol_property_ic_miss(obj, sym, &mut cache_slot);
-            assert_eq!(got.to_bits(), first.to_bits());
-            assert_eq!(cache[1], obj.to_bits());
-            assert_eq!(cache[2], sym.to_bits());
-            assert_eq!(
-                cache[3],
-                (crate::object::shapes::object_shape_stamp(obj_ptr) as u64) << 32
-            );
-            assert_eq!(
-                cache[0],
-                PERRY_SYMBOL_PROPERTY_IC_EPOCH.load(Ordering::Acquire)
-            );
-
-            let cached_epoch = cache[0];
-            let second = 99.0_f64;
-            super::properties::js_object_set_symbol_property(obj, sym, second);
-            assert_ne!(
-                cached_epoch,
-                PERRY_SYMBOL_PROPERTY_IC_EPOCH.load(Ordering::Acquire),
-                "a Symbol data write must make the generated hit guard fail"
-            );
-            let got = js_object_get_symbol_property_ic_miss(obj, sym, &mut cache_slot);
-            assert_eq!(got.to_bits(), second.to_bits());
-            assert_eq!(cache[3] as u32, 0);
-            assert_eq!(
-                crate::object::js_object_get_field(obj_ptr, cache[3] as u32).bits(),
-                second.to_bits()
-            );
-        }
-    }
-
-    #[test]
-    fn non_object_receiver_never_primes_own_data_cache() {
-        let _global = crate::gc::global_side_table_test_lock();
-        unsafe {
-            let sym = super::constructors::js_symbol_new_empty();
-            let mut cache: SymbolPicCache = [0; SYMBOL_PIC_WORDS];
-            let mut cache_slot: SymbolPicCacheSlot = &mut cache;
-            let got = js_object_get_symbol_property_ic_miss(7.0, sym, &mut cache_slot);
-            assert_eq!(got.to_bits(), TAG_UNDEFINED);
-            assert_eq!(cache, [0; SYMBOL_PIC_WORDS]);
-        }
-    }
-
-    #[test]
-    fn composed_symbol_field_cache_reloads_mutated_final_slot() {
-        crate::test_support::isolated_test(composed_symbol_field_cache_body);
-    }
-
-    fn composed_symbol_field_cache_body() {
-        let _global = crate::gc::global_side_table_test_lock();
-        unsafe {
-            crate::gc::gc_suppress();
-            let owner_ptr = crate::object::js_object_alloc(0, 0);
-            let metadata_ptr = crate::object::js_object_alloc(0, 0);
-            assert!(!owner_ptr.is_null() && !metadata_ptr.is_null());
-            let owner = crate::value::js_nanbox_pointer(owner_ptr as i64);
-            let metadata = crate::value::js_nanbox_pointer(metadata_ptr as i64);
-            let sym = super::constructors::js_symbol_new_empty();
-            let key = js_string_from_bytes(b"id".as_ptr(), 2);
-            crate::object::js_object_set_field_by_name(metadata_ptr, key, 41.0);
-            super::properties::js_object_set_symbol_property(owner, sym, metadata);
-
-            let mut symbol_cache: SymbolPicCache = [0; SYMBOL_PIC_WORDS];
-            let mut symbol_cache_slot: SymbolPicCacheSlot = &mut symbol_cache;
-            let mut field_cache: crate::object::PicCache = [0; crate::object::PIC_CACHE_WORDS];
-            let mut field_cache_slot: crate::object::PicCacheSlot = &mut field_cache;
-            let first = js_object_get_symbol_then_field_ic_miss(
-                owner,
-                sym,
-                key,
-                0,
-                &mut symbol_cache_slot,
-                &mut field_cache_slot,
-            );
-            let epoch_before_named_write = symbol_cache[0];
-            let slot = field_cache[1] as usize;
-            let token = field_cache[0] as u64;
-
-            // A write to the final named property must not require a Symbol
-            // epoch bump. The generated hit reloads this slot rather than
-            // caching `41`, so it must immediately observe `99`.
-            crate::object::js_object_set_field_by_name(metadata_ptr, key, 99.0);
-            let direct_after = *((metadata_ptr as *const u8)
-                .add(std::mem::size_of::<crate::object::ObjectHeader>() + slot * 8)
-                as *const f64);
-            let second = js_object_get_symbol_then_field_ic_miss(
-                owner,
-                sym,
-                key,
-                0,
-                &mut symbol_cache_slot,
-                &mut field_cache_slot,
-            );
-            let epoch_after_named_write = PERRY_SYMBOL_PROPERTY_IC_EPOCH.load(Ordering::Acquire);
-            crate::gc::gc_unsuppress();
-
-            assert_eq!(first.to_bits(), 41.0_f64.to_bits());
-            assert_ne!(epoch_before_named_write, 0);
-            assert_ne!(
-                token & crate::object::shapes::PIC_ID_TOKEN_BIT,
-                0,
-                "the named miss must publish an exact ShapeId token"
-            );
-            assert_eq!(epoch_before_named_write, epoch_after_named_write);
-            assert_eq!(direct_after.to_bits(), 99.0_f64.to_bits());
-            assert_eq!(second.to_bits(), 99.0_f64.to_bits());
-        }
-    }
-
-    #[test]
-    fn composed_cache_never_publishes_a_primitive_intermediate() {
-        let _global = crate::gc::global_side_table_test_lock();
-        unsafe {
-            crate::gc::gc_suppress();
-            let owner_ptr = crate::object::js_object_alloc(0, 0);
-            let owner = crate::value::js_nanbox_pointer(owner_ptr as i64);
-            let sym = super::constructors::js_symbol_new_empty();
-            let key = js_string_from_bytes(b"id".as_ptr(), 2);
-            super::properties::js_object_set_symbol_property(owner, sym, 7.0);
-            let mut symbol_cache: SymbolPicCache = [0; SYMBOL_PIC_WORDS];
-            let mut symbol_cache_slot: SymbolPicCacheSlot = &mut symbol_cache;
-            let mut field_cache: crate::object::PicCache = [0; crate::object::PIC_CACHE_WORDS];
-            let mut field_cache_slot: crate::object::PicCacheSlot = &mut field_cache;
-            let got = js_object_get_symbol_then_field_ic_miss(
-                owner,
-                sym,
-                key,
-                0,
-                &mut symbol_cache_slot,
-                &mut field_cache_slot,
-            );
-            crate::gc::gc_unsuppress();
-
-            assert_eq!(got.to_bits(), TAG_UNDEFINED);
-            assert_eq!(
-                symbol_cache[0], 0,
-                "generated code must never dereference a primitive cached value"
-            );
-            assert_eq!(field_cache[0], 0);
         }
     }
 }

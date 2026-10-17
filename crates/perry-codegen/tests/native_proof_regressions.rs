@@ -44,6 +44,9 @@ fn empty_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: false,
         non_entry_module_prefixes: Vec::new(),
@@ -13186,9 +13189,10 @@ fn typed_i1_method_clone_rejects_dynamic_receiver_call_site() {
         !non_wrapper_ir.contains(&format!("call i1 @{typed}(")),
         "dynamic receiver call must not use the direct typed-i1 method clone path:\n{ir}"
     );
+    // The generic arm of a class-dispatch site is the universal method site.
     assert!(
-        ir.contains("call double @js_native_call_method"),
-        "dynamic receiver call should dispatch through the generic method fallback:\n{ir}"
+        non_wrapper_ir.contains("call double @js_method_site_miss("),
+        "dynamic receiver call should dispatch through the generic method site:\n{ir}"
     );
 }
 
@@ -13376,15 +13380,12 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
     // about which emission shape carried it.
     let inline_probe = caller_ir.find("method_direct.inline_deref");
     let method_proof = inline_probe.map_or(method_guard, |p| p.min(method_guard));
-    // One-exit class-field GET: at a field-GET site the runtime guard is no
-    // longer CALLED -- it is the body of `js_class_field_get_ic`, the inline
-    // pre-check's single miss edge. Other lowerings (the method-override
-    // receiver-clone gate) still call the guard directly, so accept either
-    // witness; what this assertion is about is that a field proof exists and
-    // dominates the typed call, not which symbol carries it.
+    // The method-override receiver-clone gate calls the field guard
+    // directly; what this assertion is about is that a field proof exists and
+    // dominates the typed call. (A class-field READ is a shape-site read with
+    // no guard of its own, #12483.)
     let field_guard = caller_ir
-        .find("call double @js_class_field_get_ic")
-        .or_else(|| caller_ir.find("call i32 @js_typed_feedback_class_field_get_guard"))
+        .find("call i32 @js_typed_feedback_class_field_get_guard")
         .unwrap_or_else(|| panic!("caller should guard raw-f64 receiver fields:\n{caller_ir}"));
     // Same for the raw-f64 FIELD proof: one inline class-field precheck
     // (the field-GET sites' form, first mentioned by its `deref` block in the
@@ -16380,59 +16381,40 @@ fn sloppy_class_field_number_store_takes_the_inline_raw_store() {
         compile_ir_for_module_with_opts(module, empty_opts()).unwrap()
     }
 
-    let sloppy_module = ir_for(false);
-    let sloppy = probe_body(&sloppy_module);
-    assert!(
-        sloppy.contains("class_field_sloppy_set.fast"),
-        "a sloppy number-field store must reach the inline class-field raw \
-         store; the #6542 `!strict` bail was wider than the hazard it guarded \
-         (#7288):\n{sloppy}"
-    );
-    // The precheck that makes the fast arm mode-independent: it rejects a
-    // frozen receiver (OBJ_FLAG_FROZEN) and one carrying any property
-    // descriptor (OBJ_FLAG_HAS_DESCRIPTORS) — exactly the receivers whose
-    // store strict and sloppy disagree about.
-    assert!(
-        sloppy.contains("class_field_inline.deref"),
-        "the sloppy arm must be fronted by the #5093 shape/flags precheck, \
-         which is what makes the raw store safe in sloppy mode (#7288):\n{sloppy}"
-    );
-    // Miss arm: strict-aware runtime, strict = 0. Matched on the CALL, not the
-    // module's extern `declare` line — every runtime symbol is declared whether
-    // or not it is reached, so a `contains("@js_put_value_set")` would pass
-    // vacuously.
-    let miss_call = sloppy
-        .lines()
-        .find(|line| line.contains("call double @js_put_value_set("))
-        .unwrap_or_else(|| {
-            panic!("the sloppy arm's miss must CALL `js_put_value_set` (#7288):\n{sloppy}")
-        });
-    assert!(
-        miss_call.trim_end().ends_with("i32 0)"),
-        "the sloppy miss must pass strict = 0, so a rejected write is a silent \
-         no-op rather than a throw (#7288):\n  {miss_call}"
-    );
-    // The throwing strict fallback must not be reached on this arm.
-    assert!(
-        !sloppy.contains("call void @js_class_field_set_fallback"),
-        "the sloppy arm must not CALL `js_class_field_set_fallback`, whose \
-         `js_object_set_field_by_name` throws unconditionally on a \
-         non-writable slot (#7288):\n{sloppy}"
-    );
-
-    // Negative control: the strict arm is unchanged and keeps its own blocks,
-    // so the assertions above are testing the new path rather than a rename.
-    let strict_module = ir_for(true);
-    let strict = probe_body(&strict_module);
-    assert!(
-        !strict.contains("class_field_sloppy_set"),
-        "the strict arm must keep its existing lowering (#7288):\n{strict}"
-    );
-    assert!(
-        strict.contains("class_field_set.fast"),
-        "the strict arm must still take the class-field store fast path — if \
-         this fails the test is measuring nothing (#7288):\n{strict}"
-    );
+    // #12483: a class-field store is the static-key store site in BOTH
+    // modes, so sloppy code takes exactly the inline hit strict code takes:
+    // the shape compare against the site's word, then the store. Its one miss
+    // is the receiver-aware `[[Set]]` with the assignment's own `Throw` flag.
+    for strict in [false, true] {
+        let module = ir_for(strict);
+        let body = probe_body(&module);
+        assert!(
+            body.contains("put.pic.hit.store"),
+            "strict={strict}: a number-field store must reach the inline \
+             store; the #6542 `!strict` bail was wider than the hazard it \
+             guarded (#7288):\n{body}"
+        );
+        assert!(
+            !body.contains("class_field_sloppy_set") && !body.contains("class_field_set."),
+            "strict={strict}: no class store guard may be emitted (#12483):\n{body}"
+        );
+        // Matched on the CALL, not the module's extern `declare` line.
+        let miss_call = body
+            .lines()
+            .find(|line| line.contains("@js_put_value_set_packed_miss("))
+            .unwrap_or_else(|| panic!("strict={strict}: the store must CALL its miss:\n{body}"));
+        let flag = if strict { "i32 1," } else { "i32 0," };
+        assert!(
+            miss_call.contains(flag),
+            "strict={strict}: the miss must pass the assignment's own strictness, \
+             so a rejected sloppy write is a silent no-op (#7288):\n  {miss_call}"
+        );
+        assert!(
+            !body.contains("call void @js_class_field_set_fallback"),
+            "strict={strict}: the store must not CALL the throwing by-name \
+             fallback (#7288):\n{body}"
+        );
+    }
 }
 
 /// P1 (#5094): the sibling of the test above for a POINTER-typed field.
@@ -16491,50 +16473,38 @@ fn sloppy_class_field_pointer_store_takes_the_inline_boxed_store() {
         compile_ir_for_module_with_opts(module, empty_opts()).unwrap()
     }
 
-    let sloppy_module = ir_for(false);
-    let sloppy = probe_body(&sloppy_module);
-    assert!(
-        sloppy.contains("class_field_sloppy_set.boxed_fast"),
-        "a sloppy pointer-field store must reach the inline class-field boxed \
-         store (#5094 P1):\n{sloppy}"
-    );
-    assert!(
-        sloppy.contains("class_field_inline.deref"),
-        "the boxed arm must be fronted by the #5093 shape/flags precheck — it \
-         is what rejects the frozen / descriptor-bearing receivers sloppy and \
-         strict disagree about:\n{sloppy}"
-    );
-    let miss_call = sloppy
-        .lines()
-        .find(|line| line.contains("call double @js_put_value_set("))
-        .unwrap_or_else(|| {
-            panic!("the boxed arm's miss must CALL `js_put_value_set` (#5094):\n{sloppy}")
-        });
-    assert!(
-        miss_call.trim_end().ends_with("i32 0)"),
-        "the sloppy miss must pass strict = 0 (#5094):\n  {miss_call}"
-    );
-    // The GC half. An opaque parameter can carry a heap pointer, so the store
-    // must be followed by the pointer-tested bookkeeping block that reaches the
-    // remembered set. Without this assertion the test would pass just as
-    // happily on a lowering that dropped the barrier outright.
-    assert!(
-        sloppy.contains("class_field_set.gc_bookkeeping"),
-        "a boxed slot store of a possibly-pointer value must keep the \
-         pointer-tested write barrier / layout note (#5094):\n{sloppy}"
-    );
-    assert!(
-        !sloppy.contains("call void @js_class_field_set_fallback"),
-        "the sloppy arm must not CALL the throwing strict fallback:\n{sloppy}"
-    );
-
-    // Negative control: the strict arm keeps its own (unchanged) lowering.
-    let strict_module = ir_for(true);
-    let strict = probe_body(&strict_module);
-    assert!(
-        !strict.contains("class_field_sloppy_set"),
-        "the strict arm must keep its existing lowering:\n{strict}"
-    );
+    for strict in [false, true] {
+        let module = ir_for(strict);
+        let body = probe_body(&module);
+        assert!(
+            body.contains("put.pic.hit.store") && !body.contains("class_field_sloppy_set"),
+            "strict={strict}: a pointer-field store must reach the inline store \
+             site (#5094 P1, #12483):\n{body}"
+        );
+        let miss_call = body
+            .lines()
+            .find(|line| line.contains("@js_put_value_set_packed_miss("))
+            .unwrap_or_else(|| panic!("strict={strict}: the store must CALL its miss:\n{body}"));
+        let flag = if strict { "i32 1," } else { "i32 0," };
+        assert!(
+            miss_call.contains(flag),
+            "strict={strict}: the miss must pass the assignment's strictness:\n  {miss_call}"
+        );
+        // The GC half. An opaque parameter can carry a heap pointer, so the
+        // store must be followed by the pointer-tested bookkeeping block that
+        // reaches the remembered set. Without this assertion the test would
+        // pass just as happily on a lowering that dropped the barrier outright.
+        assert!(
+            body.contains("put.pic.gc_bookkeeping")
+                && body.contains("call void @js_write_barrier_slot_validated_parent"),
+            "strict={strict}: a boxed slot store of a possibly-pointer value must \
+             keep the pointer-tested write barrier (#5094):\n{body}"
+        );
+        assert!(
+            !body.contains("call void @js_class_field_set_fallback"),
+            "strict={strict}: the store must not CALL the throwing fallback:\n{body}"
+        );
+    }
 }
 
 #[path = "native_proof_regressions/invalidation.rs"]
@@ -16589,5 +16559,77 @@ fn packed_clone_reads_a_foreign_counter_without_the_feedback_call() {
     assert!(
         ir.contains("packed_f64_loop.foreign.inbounds"),
         "the foreign-counter read should take the bounds-checked clone load:\n{ir}"
+    );
+}
+#[test]
+fn static_method_certificate_retains_canonical_layout_clone() {
+    let mut fixture = typed_i32_method_clone_module("eligible");
+    fixture.name = "static_certificate.ts".to_string();
+    // Receiver-reading body: its exact layout clone must remain reachable.
+    fixture.classes[0].fields.push(ClassField {
+        name: "scale".to_string(),
+        ty: Type::Any,
+        init: None,
+        origin: perry_hir::ClassFieldOrigin::Definition,
+        key_expr: None,
+        is_private: false,
+        is_readonly: false,
+        decorators: Vec::new(),
+    });
+    fixture.classes[0].methods[0].body = vec![Stmt::Return(Some(Expr::Binary {
+        op: BinaryOp::Mul,
+        left: Box::new(Expr::PropertyGet {
+            byte_offset: 0,
+            object: Box::new(Expr::This),
+            property: "scale".to_string(),
+        }),
+        right: Box::new(local(21)),
+    }))];
+    fixture.classes[0].methods[0].return_type = Type::Number;
+    let mut derived = fixture.classes[0].clone();
+    derived.id = 206;
+    derived.name = "DerivedBits".to_string();
+    derived.extends_name = Some("Bits".to_string());
+    derived.fields.clear();
+    derived.methods[0].id = 231;
+    fixture.classes.push(derived);
+    let mut opts = empty_opts();
+    let incomplete = String::from_utf8(compile_module(&fixture, opts.clone()).unwrap()).unwrap();
+    let incomplete_caller = body_ir_section(&incomplete, "perry_fn_static_certificate_ts__probe");
+    assert!(
+        !incomplete_caller.contains("pconst."),
+        "incomplete prototypes acquired fast arms: {incomplete_caller}"
+    );
+    // Production compiles assign whole-program shapes before lowering sites.
+    let births = perry_codegen::module_birth_shapes(&fixture, opts.clone()).unwrap();
+    opts.static_shape_ids = perry_codegen::assign_static_shape_ids(births.iter().map(|b| &b.shape))
+        .into_iter()
+        .collect();
+    let ir = String::from_utf8(compile_module(&fixture, opts).unwrap()).unwrap();
+    let caller = body_ir_section(&ir, "perry_fn_static_certificate_ts__probe");
+    assert!(caller.contains("pconst.selected"), "{caller}");
+    assert!(
+        caller.contains(") noinline"),
+        "cold selected bodies must stay shared: {caller}"
+    );
+    assert!(
+        !caller.contains("@PERRY_PROTO_VALIDITY") && !caller.contains("certify"),
+        "{caller}"
+    );
+    assert!(
+        caller.contains("method_direct.layout") && caller.contains("$pshape"),
+        "{caller}"
+    );
+    assert!(
+        caller.contains("icmp eq i64"),
+        "canonical receiver-word compare missing: {caller}"
+    );
+    assert!(
+        !caller.contains("holder.") && !caller.contains("perry_class_value_dir_cell"),
+        "live holder walk returned: {caller}"
+    );
+    assert!(
+        !caller.contains("js_native_call_method_by_id_learn"),
+        "second learned memo returned: {caller}"
     );
 }

@@ -92,6 +92,7 @@ impl SH for Expr {
             Expr::PrivateLexicalBrandPush(value) => { tag(h, 12404); value.hash(h); }
             Expr::PrivateLexicalBrandPop => { tag(h, 12405); }
             Expr::NewTarget => { tag(h, 12301); }
+            Expr::ClassMethodHome { class_name, is_static } => { tag(h, 12513); class_name.hash(h); is_static.hash(h); }
             Expr::ClassRef(s) => { tag(h, 44); s.hash(h); }
             Expr::EnumMember { enum_name, member_name, } => { tag(h, 45); enum_name.hash(h); member_name.hash(h); }
             Expr::StaticFieldGet { class_name, field_name, } => { tag(h, 46); class_name.hash(h); field_name.hash(h); }
@@ -112,6 +113,7 @@ impl SH for Expr {
             Expr::ProcessEnv => tag(h, 55),
             Expr::GlobalThisExpr => tag(h, 474),
             Expr::ModuleTopThis => tag(h, 4741),
+            Expr::NamespacePatched(ns) => { tag(h, 4742); ns.hash(h); }
             Expr::ProcessUptime => tag(h, 56),
             Expr::ProcessCwd => tag(h, 57),
             Expr::ProcessArgv => tag(h, 58),
@@ -408,7 +410,7 @@ impl SH for Expr {
             Expr::ArrayEntries(e) => { tag(h, 279); e.as_ref().hash(h); }
             Expr::ArrayKeys(e) => { tag(h, 280); e.as_ref().hash(h); }
             Expr::ArrayValues(e) => { tag(h, 281); e.as_ref().hash(h); }
-            Expr::ArrayLikeMethod { method, receiver, args } => { tag(h, 12500); method.hash(h); receiver.as_ref().hash(h); args.hash(h); }
+            Expr::ArrayLikeMethod { method, receiver, args, source } => { tag(h, 12500); method.hash(h); receiver.as_ref().hash(h); args.hash(h); tag(h, *source as u16); }
             Expr::StringSplit(a, b) => { tag(h, 282); a.as_ref().hash(h); b.as_ref().hash(h); }
             Expr::StringFromCharCode(e) => { tag(h, 283); e.as_ref().hash(h); }
             Expr::StringFromCharCodeSpread(e) => { tag(h, 12045); e.as_ref().hash(h); }

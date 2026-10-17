@@ -489,6 +489,9 @@ pub(super) fn compile_closure(
     cross_module: &CrossModuleCtx,
     trusted_box_captures: bool,
     versioned_loop_callback: bool,
+    // fninfer slice 0: compile the `$tbody` clone whose parameter types are
+    // proofs (`codegen/typed_body.rs`).
+    typed_body: Option<&super::typed_body::TypedBodyPlan>,
 ) -> Result<()> {
     // Destructure the closure expression. We trust that the caller
     // passes only `Expr::Closure` here (from `collect_closures_*`).
@@ -563,7 +566,9 @@ pub(super) fn compile_closure(
     } else {
         public_llvm_name.clone()
     };
-    let llvm_name = if versioned_loop_callback {
+    let llvm_name = if typed_body.is_some() {
+        super::typed_body::typed_body_name(&public_llvm_name)
+    } else if versioned_loop_callback {
         format!("{ordinary_body_name}$trusted_boxes$versioned_loop")
     } else if trusted_box_captures {
         format!("{ordinary_body_name}$trusted_boxes")
@@ -589,7 +594,7 @@ pub(super) fn compile_closure(
     // indirect-call admission is computed correctly but never reaches
     // `new_site_is_in_loop` while the closure body is emitted.
     lf.alloc_hot = cross_module.alloc_hot_functions.contains(&func_id);
-    if typed_public_trampoline.is_some() || trusted_box_captures {
+    if typed_public_trampoline.is_some() || trusted_box_captures || typed_body.is_some() {
         lf.linkage = "internal".to_string();
     }
 
@@ -673,10 +678,27 @@ pub(super) fn compile_closure(
     let locals: HashMap<u32, String> = {
         let blk = lf.block_mut(0).unwrap();
         let mut map = HashMap::new();
+        // Closed World 5d: a parameter the typed body's entry check proved
+        // Number holds a plain double for the whole body
+        // (`typed_locals::number_proof_params`), so its slot is not bound as
+        // a root, exactly like a Number-by-construction body local. The
+        // body-local drop (`drop_number_local_root_slots`, which also removes
+        // this id from the map) runs only after these binds. A bound slot
+        // would make every read of the parameter a root reload whose word
+        // then flows into unrooted Number storage (a typed local copied from
+        // it) and across later safepoints. The map entry itself stays until
+        // that drop so `capture_root_base` below keeps the original count.
+        let number_params: HashSet<u32> = typed_body
+            .map(|plan| crate::collectors::typed_locals::number_proof_params(&plan.proofs).collect())
+            .unwrap_or_default();
         for p in params {
             let arg_name = format!("%arg{}", p.id);
             let slot = super::arguments::store_param_slot(blk, p, &closure_boxed_vars, &arg_name);
-            if let Some(slot_idx) = shadow_slot_map.get(&p.id).copied() {
+            if let Some(slot_idx) = shadow_slot_map
+                .get(&p.id)
+                .copied()
+                .filter(|_| !number_params.contains(&p.id))
+            {
                 blk.call_void(
                     "js_shadow_slot_bind",
                     &[(I32, &slot_idx.to_string()), (PTR, &slot)],
@@ -710,6 +732,14 @@ pub(super) fn compile_closure(
             local_types.entry(*id).or_insert_with(|| ty.clone());
         }
     }
+    // The body's one seed set: captured-local proofs (5d) met with the
+    // definite-assignment facts (`typed_locals::outer_proofs`).
+    let outer_proofs = crate::collectors::typed_locals::outer_proofs(
+        cross_module.capture_type_proofs.get(&func_id),
+        &cross_module.definite_init,
+        Some(func_id),
+    );
+    crate::collectors::typed_locals::seed_local_types(&outer_proofs, &mut local_types);
 
     // Build the capture map: each captured LocalId gets the index it
     // occupies in the closure's capture array. Identical logic to the
@@ -890,6 +920,20 @@ pub(super) fn compile_closure(
                 .extend(callback_shapes.clone());
         }
     }
+    // Closed World 5d: the most fixed type of every body local, by
+    // construction under this body's entry proofs (none for a generic
+    // body). Number locals join the by-construction set before any root
+    // slot is dropped for it.
+    let mut code_unit_locals = std::collections::HashSet::new();
+    let typed_locals = crate::collectors::typed_locals::apply(
+        body,
+        &typed_body.map(|p| p.proofs.clone()).unwrap_or_default(),
+        &outer_proofs,
+        &closure_boxed_vars,
+        module_globals,
+        &mut native_facts.representation.number_by_construction_locals,
+        &mut code_unit_locals,
+    );
     super::helpers::drop_number_local_root_slots(
         &mut shadow_slot_map,
         native_facts.number_by_construction_locals(),
@@ -1067,14 +1111,17 @@ pub(super) fn compile_closure(
         native_facts: &native_facts,
         locals,
         local_types,
-        proven_local_types: std::collections::HashMap::new(),
+        // A typed body's entry check (the public dispatcher) proved these.
+        proven_local_types: typed_body.map(|p| p.proofs.clone()).unwrap_or_default(),
+        typed_locals,
+        code_unit_locals,
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: std::collections::HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
         reassigned_locals,
-        index_alias_writers: crate::collectors::spec_abi_sites::index_alias_writers(
-            body, params,
-        ),
+        index_alias_writers: crate::collectors::spec_abi_sites::index_alias_writers(body, params),
         const_string_locals: std::collections::HashMap::new(),
         const_number_locals: std::collections::HashMap::new(),
         current_block: 0,
@@ -1089,6 +1136,22 @@ pub(super) fn compile_closure(
         pending_labels: Vec::new(),
         classes,
         class_hierarchy: &cross_module.class_hierarchy,
+        // A typed body's entry check proved its class parameters' class sets:
+        // they answer like whole-program receiver facts.
+        wpfacts: typed_body
+            .map(|p| p.receiver_facts(&cross_module.wpfacts))
+            .unwrap_or_else(|| cross_module.wpfacts.clone()),
+        program_layouts: cross_module.program_layouts.clone(),
+        wpfacts_sites: 0,
+        wpfacts_tested: Vec::new(),
+        wpfacts_this: if captures_this {
+            this_stack
+                .last()
+                .map(|s| vec![(s.clone(), func_id)])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         this_stack,
         new_target_stack,
         class_stack,
@@ -1100,16 +1163,33 @@ pub(super) fn compile_closure(
         in_static_member: false,
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: captures_this
-            && enclosing_class
-                .as_ref()
-                .and_then(|name| classes.get(name).copied())
-                .is_some_and(|class| {
-                    class.extends.is_some()
+        // Only an arrow written inside the derived CONSTRUCTOR (directly or
+        // through enclosing arrows) shares that constructor's uninitialized
+        // `this`. An arrow in a method of the same class has the method's
+        // receiver, which is initialized; checking the runtime binding stack
+        // there reads whichever derived constructor is running — e.g. a base
+        // constructor calling an overridden method (Next.js `NextNodeServer`
+        // during `super()`) — and threw "Must call super constructor".
+        // The class id names the constructor's activation together with the
+        // captured receiver: the runtime stack's top is whichever derived
+        // constructor is running, possibly another object's.
+        lexical_this_uses_derived_binding: enclosing_class
+            .as_ref()
+            .filter(|_| captures_this)
+            .filter(|name| {
+                classes.get(name.as_str()).copied().is_some_and(|class| {
+                    (class.extends.is_some()
                         || class.extends_name.is_some()
                         || class.native_extends.is_some()
-                        || class.extends_expr.is_some()
-                }),
+                        || class.extends_expr.is_some())
+                        && class.constructor.as_ref().is_some_and(|ctor| {
+                            crate::lower_call::ctor_body_lexically_contains_arrow(
+                                &ctor.body, func_id,
+                            )
+                        })
+                })
+            })
+            .map(|name| class_ids.get(name.as_str()).copied().unwrap_or(0)),
         inline_ctor_return: Vec::new(),
         methods,
         module_globals,
@@ -1171,6 +1251,7 @@ pub(super) fn compile_closure(
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
+        constructed_kind_locals: HashMap::new(),
         namespace_imports: &cross_module.namespace_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
         namespace_member_nested: &cross_module.namespace_member_nested,
@@ -1195,6 +1276,7 @@ pub(super) fn compile_closure(
         imported_class_original_names: &cross_module.imported_class_original_names,
         interfaces: &cross_module.interfaces,
         try_depth: 0,
+        derived_super_closes: Vec::new(),
         pending_declares: Vec::new(),
         pending_helpers: Vec::new(),
         array_record_length_local: None,
@@ -1249,6 +1331,8 @@ pub(super) fn compile_closure(
         spec_ta_ready: std::collections::HashSet::new(),
         spec_i32_params: std::collections::HashSet::new(),
         spec_bool_params: std::collections::HashSet::new(),
+        typed_element_locals: std::collections::HashSet::new(),
+        class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -1332,7 +1416,6 @@ pub(super) fn compile_closure(
         was_unrolled: false,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
-        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),
@@ -1456,6 +1539,7 @@ pub(super) fn compile_closure(
     let helpers = std::mem::take(&mut ctx.pending_helpers);
     let buffer_alias_used = ctx.buffer_data_slots.len() as u32;
     let native_rep_records = std::mem::take(&mut ctx.native_rep_records);
+    ctx.func.wpfacts_sites = ctx.wpfacts_sites;
     drop(ctx);
     llmod.ic_counter = ic_end;
     llmod.buffer_alias_counter += buffer_alias_used;

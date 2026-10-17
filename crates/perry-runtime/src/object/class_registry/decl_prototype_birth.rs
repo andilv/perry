@@ -45,7 +45,7 @@ pub(super) fn decl_prototype_born_final(class_id: u32, parent_bits: u64) -> Opti
     let requested = Some(super::declarations::class_birth_shape(class_id)).filter(|&id| id != 0);
     let members = class_prototype_member_names(class_id);
     if members.iter().any(|(name, accessor)| {
-        name == "constructor" || (!*accessor && class_method_entry(class_id, name).is_none())
+        name == b"constructor" || (!*accessor && class_method_entry_bytes(class_id, name).is_none())
     }) || !class_own_symbol_member_keys(class_id, false).is_empty()
     {
         return None;
@@ -84,16 +84,16 @@ pub(super) fn decl_prototype_born_final(class_id: u32, parent_bits: u64) -> Opti
         if *accessor {
             use crate::object::accessor_pair::{pair_new, Accessor};
             use crate::object::key_attrs as ka;
-            let (raw_get, raw_set) = class_own_accessor_ptrs(class_id, name)?;
-            let get = scope.root_nanbox_f64(class_accessor_function_value(
+            let (raw_get, raw_set) = class_own_accessor_ptrs_bytes(class_id, name)?;
+            let get = scope.root_nanbox_f64(class_accessor_function_value_bytes(
                 raw_get, false, false, name, None,
             ));
-            let set = scope.root_nanbox_f64(class_accessor_function_value(
+            let set = scope.root_nanbox_f64(class_accessor_function_value_bytes(
                 raw_set,
                 true,
                 false,
                 name,
-                class_own_setter_length(class_id, name, false),
+                class_own_setter_length_bytes(class_id, name, false),
             ));
             let pair = unsafe {
                 pair_new(Accessor {
@@ -114,7 +114,7 @@ pub(super) fn decl_prototype_born_final(class_id: u32, parent_bits: u64) -> Opti
             );
             continue;
         }
-        let f = class_prototype_method_value_for_name(class_id, name);
+        let f = class_prototype_method_value_for_name_bytes(class_id, name);
         if unsafe { crate::object::field_rep_store::constfn_store_info(f.to_bits()) }.is_none() {
             return None;
         }
@@ -126,8 +126,8 @@ pub(super) fn decl_prototype_born_final(class_id: u32, parent_bits: u64) -> Opti
     let proof = crate::object::canonical_keys::SharedLayout::shape_cache_entry();
     let list = scope.root_raw_mut_ptr::<crate::ArrayHeader>(std::ptr::null_mut());
     let mut count = 0u32;
-    for (name, entry) in std::iter::once("constructor")
-        .chain(members.iter().map(|(n, _)| n.as_str()))
+    for (name, entry) in std::iter::once(b"constructor".as_slice())
+        .chain(members.iter().map(|(n, _)| n.as_slice()))
         .zip(entries)
     {
         let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
@@ -150,7 +150,9 @@ pub(super) fn decl_prototype_born_final(class_id: u32, parent_bits: u64) -> Opti
     // fact of that shape (the identity names the parent); a fresh object has
     // no meta record to mirror it in. It is fresh and unobserved, so the link
     // is not prototype surgery and invalidates nothing.
-    let proto = scope.root_raw_mut_ptr(crate::object::js_object_alloc(class_id, count));
+    // Born old and never-move (O3): every site memo that answers from this
+    // holder is admitted from its first prime.
+    let proto = scope.root_raw_mut_ptr(crate::object::object_alloc_prototype_old(class_id, count));
     if proto.with_mut_ptr::<ObjectHeader, _>(|p| p.is_null()) {
         return None;
     }

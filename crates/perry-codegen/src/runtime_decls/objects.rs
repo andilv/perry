@@ -23,6 +23,7 @@ use super::*;
 /// The inline bump allocator now handles most object allocation directly;
 /// `js_object_alloc(0, N)` is the fallback for dynamic cases.
 pub fn declare_phase_b_objects(module: &mut LlModule) {
+    module.declare_function("js_class_method_home", DOUBLE, &[DOUBLE, I32]);
     module.declare_function("perry_class_value_dir_cell", PTR, &[]);
     // A class's instance members: its image declaration constant.
     module.declare_function(
@@ -59,14 +60,14 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // byte directly in the inline plain-array index guard.
     module.add_external_global("PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED", I8);
     // #7760: set when `Array.prototype[Symbol.iterator]` is replaced.
-    module.add_external_global("PERRY_ARRAY_ITERATION_NOT_PRISTINE", I8);
+
     // Process-wide count of threads with an active incremental marking
     // barrier. Persistent shadow-slot updates use zero as an authoritative
     // fast skip before calling the TLS-backed root barrier.
     module.add_external_global("PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT", I32);
-    // The key-add hit's chain-verdict generation and the store census
-    // (expr/put_value_store_ic.rs, expr/store_census.rs).
-    module.add_external_global("PERRY_PROTO_VALIDITY", I64);
+    // Object model step 3: the accessor of a builtin family's intrinsic
+    // prototype slot, for targets that cannot read the agent block inline.
+    module.declare_function("perry_intrinsic_proto", PTR, &[I32]);
     // Sticky worker-start gate for process-global method sites. After it
     // becomes nonzero, emitted sites use ordinary dispatch without touching
     // primary-heap holder entries.
@@ -103,6 +104,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.add_external_global("PERRY_TYPED_NAMED_PROPS_INVALIDATED", I8);
     module.declare_function("js_object_alloc", I64, &[I32, I32]);
     module.declare_function("js_object_alloc_plain", I64, &[I32]);
+    module.declare_function("js_object_literal_prototype_birth", DOUBLE, &[]);
     module.declare_function("js_event_target_subclass_init", DOUBLE, &[DOUBLE, I32]);
     // #3149: `Object(value)` plain-call coercion. Takes & returns a NaN-boxed
     // JSValue (DOUBLE): nullish/primitive -> fresh {}, object passes through.
@@ -227,66 +229,18 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         VOID,
         &[I64, I64, I64, DOUBLE],
     );
-    module.declare_function(
-        "js_typed_feedback_class_field_set_guard",
-        I32,
-        &[I64, DOUBLE, I32, I32, I64, I32, DOUBLE, I32],
-    );
-    // #5334 lever A: class-field-SET guard-MISS fallback, outlined. The cold arm
-    // of the default diamond collapses from two calls (record_fallback +
-    // set_field_by_name) to this one. Args: (site_id, obj_bits, key_raw, value).
+    // The class-field store's cold arm (a shape-proven raw-f64 store of a
+    // value that is not a plain finite number): record the fallback, then
+    // store by name. Args: (site_id, obj_bits, key_raw, value).
     module.declare_function(
         "js_class_field_set_fallback",
         VOID,
         &[I64, I64, I64, DOUBLE],
     );
-    // #5334 lever B: class-field-SET inline cache, FULLY outlined. For oversized
-    // modules the whole diamond (guard + fast store + fallback) collapses to one
-    // call. Args: (site_id, recv, expected_class_id, expected_shape_id, key,
-    // field_index, value, require_raw_f64). Same signature as the set guard.
-    module.declare_function(
-        "js_class_field_set_ic",
-        VOID,
-        &[I64, DOUBLE, I32, I32, I64, I32, DOUBLE, I32],
-    );
     module.declare_function(
         "js_typed_feedback_class_field_get_guard",
         I32,
         &[I64, DOUBLE, I32, I32, I64, I32, I32],
-    );
-    // #5391 path 2: class-field-GET inline cache, FULLY outlined. For oversized
-    // modules the whole get diamond collapses to one call returning the field
-    // value. Args: (site_id, recv, expected_class_id, expected_shape_id, key,
-    // field_index, require_raw_f64, per-site read cache). The get guard's
-    // operands plus the cache its miss reads from (+ f64 ret).
-    module.declare_function(
-        "js_class_field_get_ic",
-        DOUBLE,
-        &[I64, DOUBLE, I32, I32, I64, I32, I32, PTR],
-    );
-    // S2 (deferred-collection RFC): the two full-outline class-field ICs as a
-    // GC-leaf hit (`_fast`, same operands as the full helper) plus a
-    // collecting miss continuation (`_fast_miss`, the same operands; the SET
-    // miss takes the fast entry's status first).
-    module.declare_function(
-        "js_class_field_get_ic_fast",
-        DOUBLE,
-        &[I64, DOUBLE, I32, I32, I64, I32, I32, PTR],
-    );
-    module.declare_function(
-        "js_class_field_get_ic_fast_miss",
-        DOUBLE,
-        &[I64, DOUBLE, I32, I32, I64, I32, I32, PTR],
-    );
-    module.declare_function(
-        "js_class_field_set_ic_fast",
-        I32,
-        &[I64, DOUBLE, I32, I32, I64, I32, DOUBLE, I32],
-    );
-    module.declare_function(
-        "js_class_field_set_ic_fast_miss",
-        VOID,
-        &[I32, I64, DOUBLE, I32, I32, I64, I32, DOUBLE, I32],
     );
     module.declare_function(
         "js_typed_feedback_native_call_method",
@@ -312,6 +266,11 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_typed_feedback_method_direct_call_guard",
         I32,
         &[I64, DOUBLE, I32, I32, PTR, I64, PTR],
+    );
+    module.declare_function(
+        "js_class_accessor_shape_guard",
+        I32,
+        &[DOUBLE, I32, PTR, I64],
     );
     module.declare_function("js_method_direct_shape_guard", I32, &[DOUBLE, I32, I32]);
     module.declare_function("js_method_direct_shape_class", I32, &[DOUBLE, PTR]);
@@ -435,54 +394,23 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_nm_install_worker_threads", VOID, &[]);
     module.declare_function("js_nm_install_all", VOID, &[]);
     module.declare_function("js_nm_enable_install_all", VOID, &[]);
-    module.declare_function("js_object_get_field_ic_miss", DOUBLE, &[I64, I64, PTR]);
-    module.declare_function(
-        "js_object_get_field_ic_miss_packed",
-        DOUBLE,
-        &[I64, I64, PTR, PTR],
-    );
-    // #5391 path 3: full-outlined generic property GET. Collapses the inline
-    // receiver-routing + monomorphic-IC + feedback + nullish-throw diamond to a
-    // single call for oversized modules. Args: (obj_bits, key_handle, site_id,
-    // per-site IC cache global) -> field value.
-    module.declare_function("js_object_get_field_ic", DOUBLE, &[I64, I64, I64, PTR]);
-    // S2: its MRU hit as a GC-leaf call answering TAG_HOLE on a decline, and
-    // the collecting rest of the ladder. Same operands as the full helper.
-    module.declare_function("js_object_get_field_ic_fast", DOUBLE, &[I64, I64, I64, PTR]);
-    module.declare_function(
-        "js_object_get_field_ic_fast_miss",
-        DOUBLE,
-        &[I64, I64, I64, PTR],
-    );
-    // T1: the two exits of the inline generic-get tower. Every guard failure —
-    // SSO / INT32 class ref / nullish / non-object receiver / overflow slot /
-    // deleted slot / named prefix / miss+prime — branches to one of these
-    // instead of expanding its own arm and its own call.
-    //
-    // Non-pointer receiver (the emitted tag test failed): (obj_bits, key_handle,
-    // site_id) -> field value. No cache: none of its arms can prime one.
-    module.declare_function("js_object_get_field_ic_nonptr", DOUBLE, &[I64, I64, I64]);
-    // Heap-pointer receiver: (masked obj_handle, key_handle, per-site IC cache
-    // SLOT, per-site packed MRU word) -> field value.
-    module.declare_function("js_object_get_field_ic_slow", DOUBLE, &[I64, I64, PTR, PTR]);
-    module.declare_function("js_global_get_field_ic_slow", DOUBLE, &[I64, I64, PTR, PTR]);
-    // First-read D3: a generic read site's ShapeId miss asks this GC leaf
-    // first (the agent's shape-directory mirror or null, receiver payload,
-    // the key as its pool global holds it, the site's cache slot and compact
-    // word); `TAG_HOLE` = declined, and the site calls the slow entry.
-    // `perry_shape_dir_cell` is the directory's accessor where emitted code
-    // cannot read the agent's pointer block inline. Both GC leaves.
-    module.declare_function(
-        "js_object_get_field_ic_front",
-        DOUBLE,
-        &[PTR, I64, I64, PTR, PTR],
-    );
-    module.declare_function(
-        "js_object_get_own_field_ic_front",
-        DOUBLE,
-        &[PTR, I64, I64, PTR, PTR],
-    );
+    // The named read's entries behind the probe (`object/field_get_set/
+    // get_slow.rs`): the complete read of a heap receiver the probe declined
+    // (payload, key handle); the complete read of any value (bits, key handle,
+    // site id); the non-pointer tag ladder (bits, key handle, site id); and a
+    // global environment reference's binding read.
+    module.declare_function("js_object_get_field_slow", DOUBLE, &[I64, I64]);
+    module.declare_function("js_object_get_field_value", DOUBLE, &[I64, I64, I64]);
+    module.declare_function("js_object_get_field_nonptr", DOUBLE, &[I64, I64, I64]);
+    module.declare_function("js_global_get_field_slow", DOUBLE, &[I64, I64]);
     module.declare_function("perry_shape_dir_cell", PTR, &[]);
+    // Object model step 5: the unknown-receiver probe (agent directory,
+    // receiver payload minus the handle floor, key atom bits, atom hash).
+    // A GC leaf; `TAG_HOLE` = declined.
+    module.declare_function("perry_probe_get", DOUBLE, &[PTR, I64, I64, I64]);
+    module.declare_function("perry_probe_get_value", DOUBLE, &[PTR, I64, I64, I64]);
+    module.declare_function("perry_probe_get_binding", DOUBLE, &[PTR, I64, I64, I64]);
+    module.declare_function("perry_probe_get_keyed", DOUBLE, &[PTR, I64, I64]);
     // Object rest destructuring: copy all properties from src except excluded keys.
     // Takes a src object ptr and an array of NaN-boxed strings (the excluded keys),
     // returns a new object pointer.
@@ -710,6 +638,19 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     );
     // #11910: the split site's lookup half and its call half's runtime path.
     module.declare_function("js_method_site_prepare", DOUBLE, &[PTR, DOUBLE, I64, I64]);
+    // Object model step 3: the prototype-constant contract witness
+    // (`PERRY_CHECK_CONTRACTS` builds only).
+    module.declare_function(
+        "js_proto_constant_contract_check",
+        VOID,
+        &[DOUBLE, I64, I32, I64],
+    );
+    module.declare_function(
+        "js_proto_holder_contract_check",
+        VOID,
+        &[DOUBLE, DOUBLE, I64],
+    );
+    module.declare_function("js_proto_shadow_contract_check", VOID, &[I32, DOUBLE, I64]);
     module.declare_function(
         "js_method_site_lookup",
         DOUBLE,
@@ -749,17 +690,17 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, DOUBLE, PTR],
     );
+    module.declare_function("js_property_rmw_fast", DOUBLE, &[DOUBLE, DOUBLE, I32, PTR]);
+    module.declare_function(
+        "js_property_rmw",
+        DOUBLE,
+        &[DOUBLE, I64, DOUBLE, I32, PTR, PTR],
+    );
     // #9708: takes the site's cache SLOT plus the way index to prime.
     module.declare_function(
         "js_put_value_set_ic_miss",
         DOUBLE,
         &[DOUBLE, I64, DOUBLE, I32, PTR, I32],
-    );
-    // #9287: MRU-hit load for a get-IC slot word carrying the overflow bit.
-    module.declare_function(
-        "js_object_get_field_ic_overflow_load",
-        DOUBLE,
-        &[I64, I64, I32, PTR],
     );
     module.declare_function(
         "js_object_array_numeric_write_guard",

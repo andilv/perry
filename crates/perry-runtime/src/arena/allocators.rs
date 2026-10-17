@@ -263,6 +263,34 @@ pub(crate) fn arena_alloc_old_excluding_pages(
 /// so this is a bookkeeping change only. See the flush discipline in
 /// `arena/page_meta/`.
 pub fn arena_alloc_gc_old(size: usize, align: usize, obj_type: u8) -> *mut u8 {
+    arena_alloc_gc_old_registered(size, align, obj_type, |header, total| {
+        defer_old_object_page_registration(header, total)
+    })
+}
+
+/// [`arena_alloc_gc_old`] for the copying minor's promotion of a live young
+/// object: the deferred page registration also carries the object's live
+/// (and pinned) page accounting, so the flush applies both per page run
+/// instead of the move paying a page lookup of its own per object.
+#[inline]
+pub(crate) fn arena_alloc_gc_promoted(
+    size: usize,
+    align: usize,
+    obj_type: u8,
+    pinned: bool,
+) -> *mut u8 {
+    arena_alloc_gc_old_registered(size, align, obj_type, |header, total| {
+        defer_promoted_old_object_page_registration(header, total, pinned)
+    })
+}
+
+#[inline(always)]
+fn arena_alloc_gc_old_registered(
+    size: usize,
+    align: usize,
+    obj_type: u8,
+    register: impl FnOnce(usize, usize),
+) -> *mut u8 {
     use crate::gc::{GcHeader, GC_FLAG_ARENA, GC_HEADER_SIZE};
 
     // Same alignment-preservation rationale as `arena_alloc_gc`.
@@ -284,7 +312,7 @@ pub fn arena_alloc_gc_old(size: usize, align: usize, obj_type: u8) -> *mut u8 {
             (*header).size = crate::gc::gc_header_size_word(total);
         }
         record_arena_object_start(raw as usize, obj_type);
-        defer_old_object_page_registration(raw as usize, total);
+        register(raw as usize, total);
         return user_ptr as *mut u8;
     }
     let raw = arena_alloc_old(total, align);
@@ -298,9 +326,39 @@ pub fn arena_alloc_gc_old(size: usize, align: usize, obj_type: u8) -> *mut u8 {
         (*header).size = crate::gc::gc_header_size_word(total);
     }
     record_arena_object_start(raw as usize, obj_type);
-    defer_old_object_page_registration(raw as usize, total);
+    register(raw as usize, total);
 
     unsafe { raw.add(GC_HEADER_SIZE) }
+}
+
+/// O1 collecting-holder class: old from birth, never selected for relocation.
+/// A full trace reclaims it through the same ordinary object sweeper.
+pub(crate) fn arena_alloc_gc_collecting_holder(size: usize, align: usize, obj_type: u8) -> *mut u8 {
+    use crate::gc::{GcHeader, GC_HEADER_SIZE};
+    let pad = align.max(8);
+    let total = (GC_HEADER_SIZE + size + pad - 1) & !(pad - 1);
+    let user = if let Some(user) = crate::gc::old_free_take_exact_collecting_holder(total) {
+        OLD_ARENA.with(|a| unsafe { (&mut *a.get()).note_allocation(total, total >= 16 * 1024) });
+        user as *mut u8
+    } else {
+        OLD_ARENA.with(|a| unsafe {
+            super::block::arena_cell_alloc_collecting_holder(a.get(), total, align)
+                .add(GC_HEADER_SIZE)
+        })
+    };
+    unsafe {
+        let header = user.sub(GC_HEADER_SIZE).cast::<GcHeader>();
+        (*header).obj_type = obj_type;
+        (*header).gc_flags = crate::gc::GC_FLAG_ARENA
+            | crate::gc::GC_FLAG_TENURED
+            | crate::gc::gc_birth_extra_flags();
+        crate::gc::gc_note_black_birth(header);
+        (*header)._reserved = 0;
+        (*header).size = crate::gc::gc_header_size_word(total);
+        record_arena_object_start(header as usize, obj_type);
+        defer_old_object_page_registration(header as usize, total);
+    }
+    user
 }
 
 /// The old-gen + born-tenured shape `arena_alloc_gc` hands a LARGE object, for

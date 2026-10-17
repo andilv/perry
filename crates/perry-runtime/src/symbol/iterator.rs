@@ -22,10 +22,11 @@ pub unsafe extern "C" fn js_object_get_own_property_symbols(obj_f64: f64) -> i64
             .is_some_and(|header| (*header.as_ptr()).obj_type == crate::gc::GC_TYPE_OBJECT)
         {
             let object = addr as *const crate::object::ObjectHeader;
-            if crate::object::shapes::shape_record_by_id(crate::object::shapes::object_shape_stamp(
-                object,
-            ))
-            .is_some_and(|record| record.proves_no_symbols())
+            if !crate::object::overflow::shadowed(object)
+                && crate::object::shapes::shape_record_by_id(
+                    crate::object::shapes::object_shape_stamp(object),
+                )
+                .is_some_and(|record| record.proves_no_symbols())
             {
                 return crate::array::js_array_alloc(0) as i64;
             }
@@ -67,18 +68,7 @@ pub unsafe extern "C" fn js_object_get_own_property_symbols(obj_f64: f64) -> i64
     }
     let mut entries: Vec<(usize, u64)> = Vec::new();
 
-    let guard = crate::gc::lock_gc_root_registry(&SYMBOL_PROPERTIES);
-    let stored_entries = guard
-        .as_ref()
-        .and_then(|m| m.get(&obj_key))
-        .cloned()
-        .unwrap_or_default();
-    drop(guard);
-    let stored_entries = if crate::object::shaped_symbols::owner(obj_key).is_some() {
-        crate::object::shaped_symbols::entries(obj_key, false)
-    } else {
-        stored_entries
-    };
+    let stored_entries = crate::object::shaped_symbols::entries(obj_key, false);
     for entry in stored_entries {
         if !entries.iter().any(|(sym_key, _)| *sym_key == entry.0) {
             entries.push(entry);
@@ -87,7 +77,7 @@ pub unsafe extern "C" fn js_object_get_own_property_symbols(obj_f64: f64) -> i64
     // `entries` is the full own-symbol-key list in property-CREATION order:
     // data entries hold their value, accessor properties hold an
     // order-preserving placeholder written by `set_symbol_accessor_property`
-    // (the descriptor itself lives in `SYMBOL_ACCESSOR_PROPERTIES`). That
+    // (the descriptor itself lives in the owner's accessor-pair slots). That
     // placeholder is what keeps a data→accessor redefine at its original
     // position (test262 getOwnPropertySymbols/order-after-define-property)
     // and an interleaved `defineProperty(o, sym, {get})` between two data
@@ -124,12 +114,7 @@ pub unsafe extern "C" fn js_object_get_own_property_symbols(obj_f64: f64) -> i64
 }
 
 fn is_object_value(value: f64) -> bool {
-    let jv = crate::value::JSValue::from_bits(value.to_bits());
-    if !jv.is_pointer() {
-        return false;
-    }
-    let raw = crate::value::js_nanbox_get_pointer(value) as usize;
-    raw >= 0x10000 && !is_registered_symbol(raw)
+    crate::builtins::arithmetic::js_value_is_object(value)
 }
 
 #[cold]
@@ -378,7 +363,7 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
     let mut is_registered_class_ref = false;
     {
         let jsv = crate::value::JSValue::from_bits(value().to_bits());
-        if !jsv.is_pointer() && !jsv.is_any_string() {
+        if !jsv.is_reference() && !jsv.is_any_string() {
             is_registered_class_ref = crate::object::class_ref_id(value()).is_some();
             if !is_registered_class_ref {
                 throw_value_not_iterable(value());
@@ -420,10 +405,7 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
     // `js_object_get_symbol_property` above and already returned — only a
     // corrupt/non-iterable handle reaches this point.
     {
-        let jsv = crate::value::JSValue::from_bits(value().to_bits());
-        if jsv.is_pointer()
-            && crate::value::addr_class::is_handle_band(jsv.as_pointer::<u8>() as usize)
-        {
+        if crate::value::JSValue::from_bits(value().to_bits()).is_handle() {
             throw_value_not_iterable(value());
         }
     }
@@ -526,7 +508,7 @@ pub unsafe extern "C" fn js_to_primitive(value: f64, hint: i32) -> f64 {
     // Method must be a closure pointer.
     let method_bits = method.to_bits();
     let method_tag = method_bits & 0xFFFF_0000_0000_0000;
-    if method_tag != POINTER_TAG {
+    if !crate::value::is_reference_bits(method_tag) {
         return value_handle.get_nanbox_f64();
     }
     let method_handle = scope.root_nanbox_f64(method);
@@ -625,6 +607,48 @@ mod not_iterable_message_tests {
             assert!(!not_iterable_label(f64::from_bits(bits)).is_empty());
         }
         assert!(!not_iterable_label(0.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_handle_to_primitive_tests {
+    use super::*;
+
+    extern "C" fn returns_native_handle(
+        _closure: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
+        _hint: f64,
+    ) -> f64 {
+        f64::from_bits(
+            crate::value::JSValue::handle(crate::value::addr_class::FETCH_HANDLE_BAND_START).bits(),
+        )
+    }
+
+    #[test]
+    fn symbol_to_primitive_cannot_return_a_native_handle() {
+        let _global = crate::gc::global_side_table_test_lock();
+        unsafe {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let obj_ptr = crate::object::js_object_alloc(0, 0);
+            let obj = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(obj_ptr as i64));
+            let to_primitive = well_known_symbol("toPrimitive");
+            let symbol =
+                f64::from_bits(crate::value::JSValue::pointer(to_primitive as *const u8).bits());
+            let closure = crate::closure::js_closure_alloc(
+                crate::fn_info!(returns_native_handle, 1; with_declared(1)),
+                0,
+            );
+            let method = crate::value::js_nanbox_pointer(closure as i64);
+            crate::symbol::js_object_set_symbol_property(obj.get_nanbox_f64(), symbol, method);
+
+            let result = crate::exception::catch_js_throw(|| {
+                crate::value::js_dynamic_string_or_number_add(obj.get_nanbox_f64(), 1.0)
+            });
+            assert!(
+                result.is_err(),
+                "a handle result is an object and must throw"
+            );
+        }
     }
 }
 

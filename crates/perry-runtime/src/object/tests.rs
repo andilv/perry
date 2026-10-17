@@ -5,19 +5,20 @@ use super::*;
 
 #[test]
 fn call_method_depth_drop_is_idempotent_after_exception_restore() {
-    let base = call_method_depth_savepoint();
+    let base = call_method_depth();
+    let here = crate::exception::frame_mark();
     let outer = CallMethodDepthGuard::enter("outer").unwrap();
     let inner = CallMethodDepthGuard::enter("inner").unwrap();
-    assert_eq!(call_method_depth_savepoint(), base + 2);
+    assert_eq!(call_method_depth(), base + 2);
 
-    // Generated exceptions restore at throw time because the fast transport
-    // skips cleanup frames. Its system-unwinder fallback then drops the Rust
-    // guards as well; those drops must not decrement below the savepoint.
-    call_method_depth_restore(base);
+    // A landing pad in this frame's caller pops both levels. A system-unwinder
+    // fallback may then drop the Rust guards as well; those drops must not
+    // decrement below the restored depth.
+    call_method_depth_unwind_to(here + 1);
     drop(inner);
     drop(outer);
 
-    assert_eq!(call_method_depth_savepoint(), base);
+    assert_eq!(call_method_depth(), base);
 }
 
 fn test_global_this_builtin_constructor_value(name: &str) -> f64 {
@@ -330,7 +331,6 @@ fn closure_name_and_length_ignore_plain_assignment() {
     // and this test's own populate-then-assert must not be wiped by the gc
     // test guards' state reset (#6965). Hold the global side-table lock.
     let _global = crate::gc::global_side_table_test_lock();
-    crate::closure::test_clear_closure_side_tables();
     {
         let closure = crate::closure::js_closure_alloc(
             crate::fn_info!(crate::object::global_this_builtin_noop_thunk, 1; with_declared(0)),
@@ -367,7 +367,6 @@ fn closure_name_can_be_redefined_with_define_property() {
     // See closure_name_and_length_ignore_plain_assignment: the clear and the
     // populate-then-assert both need the global side-table lock (#6965).
     let _global = crate::gc::global_side_table_test_lock();
-    crate::closure::test_clear_closure_side_tables();
     {
         let closure = crate::closure::js_closure_alloc(
             crate::fn_info!(crate::object::global_this_builtin_noop_thunk, 1; with_declared(0)),
@@ -439,7 +438,6 @@ fn closure_name_can_be_redefined_with_define_property() {
 #[test]
 fn builtin_constructor_name_and_length_are_own_runtime_properties() {
     let _global = crate::gc::global_side_table_test_lock();
-    crate::closure::test_clear_closure_side_tables();
     let global_ptr = js_object_alloc(0, 0);
     super::global_this::populate_global_this_builtins(global_ptr);
 
@@ -450,14 +448,7 @@ fn builtin_constructor_name_and_length_are_own_runtime_properties() {
         let value = f64::from_bits(js_object_get_field_by_name(global_ptr, ctor_key).bits());
         let key = crate::string::js_string_from_bytes(key_name.as_ptr(), key_name.len() as u32);
         let key_value = f64::from_bits(JSValue::string_ptr(key).bits());
-        let mut global_slot: crate::object::PicCacheSlot = std::ptr::null_mut();
-        let packed = std::sync::atomic::AtomicU64::new(u64::from(u32::MAX));
-        let ic_value = crate::object::field_get_set::js_object_get_field_ic_slow(
-            global_ptr as i64,
-            ctor_key,
-            &mut global_slot,
-            &packed,
-        );
+        let ic_value = crate::object::js_object_get_field_slow(global_ptr as i64, ctor_key);
         assert_eq!(
             crate::object::js_object_has_own(ic_value, key_value).to_bits(),
             crate::value::TAG_TRUE,
@@ -512,7 +503,6 @@ fn closure_accessor_define_property_is_own_and_invoked() {
     // See closure_name_and_length_ignore_plain_assignment: the clear and the
     // populate-then-assert both need the global side-table lock (#6965).
     let _global = crate::gc::global_side_table_test_lock();
-    crate::closure::test_clear_closure_side_tables();
     let closure = crate::closure::js_closure_alloc(
         crate::fn_info!(crate::object::global_this_builtin_noop_thunk, 1; with_declared(0)),
         0,
@@ -568,7 +558,6 @@ fn symbol_define_property_attrs_round_trip_descriptor() {
     // The symbol side tables are PROCESS-global: the clear below and the
     // populate-then-assert both need the global side-table lock (#6965).
     let _global = crate::gc::global_side_table_test_lock();
-    crate::symbol::test_clear_symbol_side_table_roots();
     unsafe {
         let obj = js_object_alloc(0, 0);
         assert!(!obj.is_null());
@@ -662,7 +651,6 @@ fn symbol_keys_keep_creation_order_across_accessor_redefine() {
     // position — both rest on the order-preserving placeholder that
     // `set_symbol_accessor_property` leaves in `SYMBOL_PROPERTIES`.
     let _global = crate::gc::global_side_table_test_lock();
-    crate::symbol::test_clear_symbol_side_table_roots();
     unsafe {
         let own_symbol_order = |obj_value: f64| -> Vec<usize> {
             let arr = crate::symbol::js_object_get_own_property_symbols(obj_value)
@@ -736,7 +724,6 @@ fn symbol_keys_keep_creation_order_across_accessor_redefine() {
 #[test]
 fn undefined_symbol_value_still_counts_as_an_own_property() {
     let _global = crate::gc::global_side_table_test_lock();
-    crate::symbol::test_clear_symbol_side_table_roots();
     unsafe {
         let obj = js_object_alloc(0, 0);
         assert!(!obj.is_null());
@@ -876,8 +863,9 @@ fn spill_layout_matches_codegen() {
     );
     assert_eq!(
         std::mem::size_of::<crate::array::ArrayHeader>(),
-        8,
-        "perry-codegen's ARRAY_HEADER_SIZE_BYTES is 8; update both sides together"
+        16,
+        "perry-codegen's ARRAY_HEADER_SIZE_BYTES is 16 (length, capacity, named); \
+         update both sides together"
     );
 }
 
@@ -1014,28 +1002,134 @@ fn navigator_global_constructor_identity_shape() {
         // side-table lock across the populate-then-assert.
         let _global = crate::gc::global_side_table_test_lock();
         let ctor_raw = test_global_this_builtin_constructor_value("Navigator");
-        let ctor = JSValue::from_bits(ctor_raw.to_bits());
-        assert!(ctor.is_pointer());
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let ctor = scope.root_nanbox_f64(ctor_raw);
+        assert!(JSValue::from_bits(ctor.get_nanbox_u64()).is_pointer());
 
-        let navigator_raw = crate::navigator::test_navigator_object_with_constructor(ctor_raw);
-        let navigator = JSValue::from_bits(navigator_raw.to_bits());
-        assert!(navigator.is_pointer());
-        let navigator_ptr = navigator.as_pointer::<ObjectHeader>();
+        let prototype_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+            b"prototype".as_ptr(),
+            9,
+        ));
+        let original_prototype = JSValue::from_bits(prototype_key.with_const_ptr(|key| {
+            js_object_get_field_by_name(
+                JSValue::from_bits(ctor.get_nanbox_u64())
+                    .as_pointer::<crate::closure::ClosureHeader>()
+                    as *const ObjectHeader,
+                key,
+            )
+            .bits()
+        }));
+        assert!(original_prototype.is_pointer());
+        let original_prototype = scope.root_nanbox_f64(f64::from_bits(original_prototype.bits()));
+
+        // Use a custom prototype to prove the builder follows the constructor
+        // passed to it instead of only relying on Navigator's class-id fallback.
+        let custom_prototype = scope.root_raw_mut_ptr(js_object_alloc(0, 0));
+        let constructor_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+            b"constructor".as_ptr(),
+            11,
+        ));
+        let marker_key = scope.root_string_ptr(crate::string::js_string_from_bytes(
+            b"navigatorMarker".as_ptr(),
+            15,
+        ));
+        let marker = crate::value::JSValue::number(1234.0);
+        custom_prototype.with_mut_ptr::<ObjectHeader, _>(|prototype_ptr| {
+            constructor_key.with_const_ptr(|key| {
+                crate::object::js_object_set_field_by_name(
+                    prototype_ptr,
+                    key,
+                    ctor.get_nanbox_f64(),
+                );
+            });
+            marker_key.with_const_ptr(|key| {
+                crate::object::js_object_set_field_by_name(
+                    prototype_ptr,
+                    key,
+                    f64::from_bits(marker.bits()),
+                );
+            });
+        });
+        prototype_key.with_const_ptr(|key| {
+            crate::object::js_object_set_field_by_name(
+                JSValue::from_bits(ctor.get_nanbox_u64())
+                    .as_pointer::<crate::closure::ClosureHeader>()
+                    .cast_mut()
+                    .cast::<ObjectHeader>(),
+                key,
+                crate::value::js_nanbox_pointer(
+                    custom_prototype.with_mut_ptr::<ObjectHeader, _>(|ptr| ptr as i64),
+                ),
+            );
+        });
+
+        let navigator_raw =
+            crate::navigator::test_navigator_object_with_constructor(ctor.get_nanbox_f64());
+        let navigator = scope.root_nanbox_f64(navigator_raw);
+        // Restore the process-global constructor after constructing the object.
+        prototype_key.with_const_ptr(|key| {
+            crate::object::js_object_set_field_by_name(
+                JSValue::from_bits(ctor.get_nanbox_u64())
+                    .as_pointer::<crate::closure::ClosureHeader>()
+                    .cast_mut()
+                    .cast::<ObjectHeader>(),
+                key,
+                original_prototype.get_nanbox_f64(),
+            );
+        });
+
+        let navigator_value = JSValue::from_bits(navigator.get_nanbox_u64());
+        assert!(navigator_value.is_pointer());
+        let navigator_ptr = navigator_value.as_pointer::<ObjectHeader>();
         assert_eq!(
             js_object_get_class_id(navigator_ptr),
             crate::navigator::NAVIGATOR_CLASS_ID
         );
 
-        let constructor_key = crate::string::js_string_from_bytes(b"constructor".as_ptr(), 11);
-        let actual = js_object_get_field_by_name(navigator_ptr, constructor_key);
-        assert_eq!(actual.bits(), ctor.bits());
-
-        let prototype_key = crate::string::js_string_from_bytes(b"prototype".as_ptr(), 9);
-        let prototype = js_object_get_field_by_name(
-            ctor.as_pointer::<crate::closure::ClosureHeader>() as *const ObjectHeader,
-            prototype_key,
+        let navigator_f64 = navigator.get_nanbox_f64();
+        let prototype_f64 = crate::value::js_nanbox_pointer(
+            custom_prototype.with_mut_ptr::<ObjectHeader, _>(|ptr| ptr as i64),
         );
-        assert!(prototype.is_pointer());
+        let navigator_prototype = crate::object::js_object_get_prototype_of(navigator_f64);
+        assert_eq!(
+            navigator_prototype.to_bits(),
+            prototype_f64.to_bits(),
+            "navigator should inherit from Navigator.prototype"
+        );
+        assert_eq!(
+            constructor_key.with_const_ptr(|key| {
+                js_object_get_field_by_name(
+                    custom_prototype.with_const_ptr::<ObjectHeader, _>(|ptr| ptr),
+                    key,
+                )
+                .bits()
+            }),
+            ctor.get_nanbox_u64(),
+            "Navigator.prototype should point back to its constructor"
+        );
+        assert_eq!(
+            constructor_key
+                .with_const_ptr(|key| { js_object_get_field_by_name(navigator_ptr, key).bits() }),
+            ctor.get_nanbox_u64(),
+            "navigator should inherit its constructor"
+        );
+        assert_eq!(
+            crate::value::js_is_truthy(crate::object::js_object_has_own(
+                navigator_f64,
+                f64::from_bits(
+                    crate::value::js_nanbox_string(
+                        constructor_key
+                            .with_const_ptr::<crate::string::StringHeader, _>(|key| key as i64),
+                    )
+                    .to_bits()
+                ),
+            )),
+            0,
+            "navigator constructor should not be an own property"
+        );
+        let inherited_marker =
+            marker_key.with_const_ptr(|key| js_object_get_field_by_name(navigator_ptr, key));
+        assert_eq!(inherited_marker.as_number(), marker.as_number());
     }
 }
 

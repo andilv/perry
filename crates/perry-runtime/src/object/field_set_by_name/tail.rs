@@ -106,7 +106,6 @@ pub(crate) fn set_field_by_name_object_tail(
                 arr
             };
             let obj = arr.cast::<ObjectHeader>();
-            let flags = crate::array::array_object_flags_resolved(arr);
             // Own-accessor short-circuit — an Array can carry a named accessor
             // property installed via `Object.defineProperty(arr, k, {get,set})`.
             // A `[[Set]]` on such a property must invoke the setter (a
@@ -116,15 +115,13 @@ pub(crate) fn set_field_by_name_object_tail(
             // ran the setter (test262 Object/defineProperty + defineProperties
             // accessor-on-Array cases, e.g. 15.2.3.6-4-278).
             //
-            // Gated on the per-array `OBJ_FLAG_ARRAY_DESCRIPTORS` flag (the
-            // ArrayHeader analogue of `object_has_descriptors` — the ObjectHeader
-            // `OBJ_FLAG_HAS_DESCRIPTORS` is never set for an ArrayHeader). The
-            // flag is set unconditionally by `define_array_property` whenever any
-            // descriptor is installed on the array and travels with it across
+            // Gated on the array's named layout (`ArrayHeader.named`, object
+            // model §6a): every descriptor `define_array_property` installs is a
+            // key of that object, which travels with the array across
             // evacuation and growth. The array's traced property bag owns
             // accessor facts in its shape and getter/setter pairs in its slots;
             // resolving a growth alias reaches that same holder.
-            if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+            if crate::array::array_has_named_layout(obj as *const crate::array::ArrayHeader) {
                 if let Some(acc) = get_accessor_descriptor(obj as usize, name) {
                     if acc.set != 0 {
                         let closure = (acc.set & crate::value::POINTER_MASK)
@@ -256,27 +253,13 @@ pub(crate) fn set_field_by_name_object_tail(
         let interned_key_handle = scope.root_string_ptr(interned_key);
         interned_key = interned_key_handle.get_raw_const_ptr::<crate::StringHeader>();
 
-        // Store-plan fast gate (`object::prop_plan`): a recorded verdict means
-        // the full interception vet below (class vtable setter walk, URL-shape
-        // probe, `plain_data_write_may_intercept`) proved a store of this key
-        // to this class cannot be intercepted, and no invalidation (vtable /
-        // descriptor / prototype mutation, GC) happened since. Per-OBJECT
-        // conditions stay outside the verdict: frozen/sealed/own-descriptor
-        // flags are checked below as always, and an instance whose chain
-        // diverges from its class chain (per-instance `setPrototypeOf`
-        // override, null-proto) never records or honors a plan.
-        // Flags that make an object ineligible for class-keyed plans: a
-        // diverging chain (per-instance proto override / null proto).
-        //
-        // Own descriptors used to be a wholesale disqualifier here for a real
-        // reason — an own accessor must dispatch through the short-circuit
-        // below, which a plan hit skips. But that is a per-KEY fact, not a
-        // per-receiver one (#10287). zod puts `_zod` on every schema object,
-        // so the object-level flag denied a plan to every one of them and made
-        // each store re-run the whole interception vet: the chain walk, the
-        // class-registry lookups and the `Object.prototype` probe. The plan is
-        // now denied only for the keys an own descriptor can actually cover,
-        // which `own_descriptors_skip_key` decides exactly.
+        // A shape-keyed store verdict proves that the full interception vet
+        // (class setters, native probes, actual prototype chain) found no
+        // interceptor for this key. Kind and per-key descriptor checks stay
+        // outside the verdict, as do immutable/null-prototype receiver flags.
+        // Own descriptors are per-key: a descriptor on another key does not
+        // disqualify this store, but an accessor on this key must reach the
+        // short-circuit below.
         const PLAN_BLOCKING_FLAGS: u16 = crate::gc::OBJ_FLAG_NULL_PROTO;
         let obj_class_id = (*obj).class_id;
         // #6595: class objects are excluded by their authoritative ShapeId
@@ -285,7 +268,6 @@ pub(crate) fn set_field_by_name_object_tail(
         // completions, and their cid is shared with their instances so a
         // plan keyed on it conflates two different prototype chains.
         let plan_eligible = !key.is_null()
-            && obj_class_id != 0
             && obj_class_id != NATIVE_MODULE_CLASS_ID
             && crate::object::object_is_regular(obj)
             && (*gc_header)._reserved & PLAN_BLOCKING_FLAGS == 0
@@ -298,13 +280,12 @@ pub(crate) fn set_field_by_name_object_tail(
                     f64::from_bits(JSValue::string_ptr(key as *mut _).bits()),
                 ));
         // No per-receiver prototype gate: the plan key carries the receiver's
-        // prototype (`receiver_proto_bits`, a fact of its shape), so a
+        // shape, including its actual prototype edge, so a
         // receiver on another chain can only meet another plan.
         let plan_fast = plan_eligible
             && super::prop_plan::store_plan_check(
-                obj_class_id,
+                super::shapes::object_shape_stamp(obj),
                 interned_key as usize,
-                super::prop_plan::receiver_proto_bits(obj),
             );
 
         // A per-evaluation class object carries dynamically installed static
@@ -318,17 +299,15 @@ pub(crate) fn set_field_by_name_object_tail(
         {
             let name_ptr = crate::string::string_data(key);
             let name_len = (*key).byte_len as usize;
-            if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len)) {
-                let receiver =
-                    f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
-                if super::class_registry::class_static_accessor_setter_apply(
-                    obj_class_id,
-                    name,
-                    receiver,
-                    value,
-                ) {
-                    return;
-                }
+            let name = std::slice::from_raw_parts(name_ptr, name_len);
+            let receiver = f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
+            if super::class_registry::class_static_accessor_setter_apply_bytes(
+                obj_class_id,
+                name,
+                receiver,
+                value,
+            ) {
+                return;
             }
         }
 
@@ -359,32 +338,33 @@ pub(crate) fn set_field_by_name_object_tail(
                 let key_bytes = {
                     let name_ptr =
                         (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                    std::slice::from_raw_parts(name_ptr, (*key).byte_len as usize)
+                    std::slice::from_raw_parts(name_ptr, (*key).byte_len as usize).to_vec()
                 };
-                if let Ok(name) = std::str::from_utf8(key_bytes) {
-                    // Class accessors are properties of the class prototype
-                    // chain (charter step 3). A getter-only accessor refuses
-                    // the write: no data property is created.
-                    let this_f64: f64 =
-                        f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
-                    let throw_getter_only = || {
-                        let class_name = super::class_registry::class_name_for_id(class_id)
-                            .unwrap_or_else(|| "Object".to_string());
-                        crate::collection_iter::throw_type_error(&format!(
-                            "Cannot set property {name} of #<{class_name}> which has only a getter"
-                        ));
-                    };
-                    // #11499: the receiver carrying a `class_id` may be the
-                    // CLASS OBJECT itself, not an instance of that class. The
-                    // vtable accessors below live on `C.prototype`, which is
-                    // NOT on the constructor's own prototype chain
-                    // (`VR8 -> XX -> Error -> Function.prototype`), so a
-                    // static write must resolve against the STATIC accessor
-                    // chain. cc 2.1.112 hits this with
-                    // `class XX extends Error { get errorCode(){…} }` plus
-                    // `VR8.errorCode = "invalid_request"`: the instance getter
-                    // was found for a static write and refused it.
-                    if crate::object::is_class_object_ptr(obj.cast()) {
+                // Class accessors are properties of the class prototype chain
+                // (charter step 3). Keep the owned bytes across prototype
+                // materialization and possible user code in the setter.
+                let name = std::str::from_utf8(&key_bytes).ok();
+                let this_f64: f64 =
+                    f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
+                let throw_getter_only = || {
+                    let class_name = super::class_registry::class_name_for_id(class_id)
+                        .unwrap_or_else(|| "Object".to_string());
+                    let display_name = String::from_utf8_lossy(&key_bytes);
+                    crate::collection_iter::throw_type_error(&format!(
+                        "Cannot set property {display_name} of #<{class_name}> which has only a getter"
+                    ));
+                };
+                // #11499: the receiver carrying a `class_id` may be the
+                // CLASS OBJECT itself, not an instance of that class. The
+                // vtable accessors below live on `C.prototype`, which is
+                // NOT on the constructor's own prototype chain
+                // (`VR8 -> XX -> Error -> Function.prototype`), so a
+                // static write must resolve against the STATIC accessor
+                // chain. The byte-aware class-object path above handles
+                // non-UTF8 static keys; retain this string path for private
+                // names and existing diagnostic behavior.
+                if crate::object::is_class_object_ptr(obj.cast()) {
+                    if let Some(name) = name {
                         if super::class_registry::static_accessor_in_chain(class_id, name) {
                             // A real `static set name(v)` (own or inherited
                             // through `extends`) must still fire.
@@ -397,20 +377,20 @@ pub(crate) fn set_field_by_name_object_tail(
                             // refusal the instance side gives.
                             throw_getter_only();
                         }
-                        // No static accessor of this name: fall through to the
-                        // ordinary own-property store below.
-                    } else {
-                        match super::class_registry::instance_chain_setter_apply(
-                            obj, name, this_f64, value,
-                        ) {
-                            Some(true) => return,
-                            // This entry point is the strict one (issue #615:
-                            // strict is the TS default; sloppy writes reach
-                            // `js_put_value_set` with `strict = 0`, whose
-                            // OrdinarySet walk refuses the same write silently).
-                            Some(false) => throw_getter_only(),
-                            None => {}
-                        }
+                    }
+                    // No static accessor of this name: fall through to the
+                    // ordinary own-property store below.
+                } else {
+                    match super::class_registry::instance_chain_setter_apply_bytes(
+                        obj, &key_bytes, this_f64, value,
+                    ) {
+                        Some(true) => return,
+                        // This entry point is the strict one (issue #615:
+                        // strict is the TS default; sloppy writes reach
+                        // `js_put_value_set` with `strict = 0`, whose
+                        // OrdinarySet walk refuses the same write silently).
+                        Some(false) => throw_getter_only(),
+                        None => {}
                     }
                 }
             }
@@ -547,6 +527,7 @@ pub(crate) fn set_field_by_name_object_tail(
         if !key.is_null()
             && !is_frozen
             && !is_sealed_or_no_extend
+            && !crate::object::overflow::has_overflow(obj)
             // #10287: per-KEY, not per receiver — see `own_descriptors_skip_key`.
             && desc_gate_ok
             && (plan_fast
@@ -557,13 +538,12 @@ pub(crate) fn set_field_by_name_object_tail(
                 ))
         {
             // The full interception vet just returned negative for this
-            // (class, key) — the vtable setter walk above found nothing, the
+            // (shape, key) — the vtable setter walk above found nothing, the
             // URL-shape probe fell through, and `plain_data_write_may_intercept`
             // cleared the chain. Record the verdict so the next store skips
             // the vet (`plan_fast` above). Eligibility is re-derived from the
             // freshly read `obj_flags`, not the pre-vet read.
-            let record_plan_eligible = obj_class_id != 0
-                && obj_class_id != NATIVE_MODULE_CLASS_ID
+            let record_plan_eligible = obj_class_id != NATIVE_MODULE_CLASS_ID
                 && crate::object::object_is_regular(obj)
                 && obj_flags & PLAN_BLOCKING_FLAGS == 0
                 // `desc_gate_ok` above already proved this key is uncovered on
@@ -571,9 +551,8 @@ pub(crate) fn set_field_by_name_object_tail(
                 && desc_gate_ok;
             if !plan_fast && record_plan_eligible {
                 super::prop_plan::store_plan_record(
-                    obj_class_id,
+                    super::shapes::object_shape_stamp(obj),
                     interned_key as usize,
-                    super::prop_plan::receiver_proto_bits(obj),
                 );
             }
             let lane_probe = transition_cache_lookup(prev_shape_id, interned_key).and_then(|hit| {
@@ -594,18 +573,18 @@ pub(crate) fn set_field_by_name_object_tail(
                 } else {
                     vbits
                 };
-                if !super::shapes::install_cached_object_shape_transition(
+                if !super::shapes::install_cached_object_shape_key_add(
                     obj,
                     prev_shape_id,
                     target_shape_id,
                     next_keys,
+                    interned_key,
                 ) {
                     set_object_keys(obj, next_keys);
                 }
                 // #8113: one bound probe, reused.
                 let live_slots = crate::object::object_live_slot_count(obj);
-                let alloc_limit =
-                    std::cmp::max(live_slots, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+                let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
                 if (slot_idx as usize) < alloc_limit {
                     // Inline the field write — `obj` has already been
                     // validated (GC header read, type check, closure
@@ -665,26 +644,19 @@ pub(crate) fn set_field_by_name_object_tail(
             // reaches the SAME array — which is the whole of the mint fix at
             // this site, because a fresh 4-slot allocation per receiver was a
             // fresh identity per receiver.
-            let new_keys = match crate::object::canonical_keys::SharedLayout::of_receiver(obj) {
-                Some(proof) => crate::object::canonical_keys::extend_key(
-                    &proof,
-                    crate::object::canonical_keys::CanonicalKeys::EMPTY,
-                    key,
-                )
-                .view(),
-                // A latched receiver owns its list from its first key.
-                None => {
-                    let fresh = crate::array::js_array_alloc(4);
-                    refresh_roots_after_alloc!();
-                    let grown =
-                        crate::array::js_array_push(fresh, JSValue::string_ptr(key as *mut _));
-                    crate::object::ObjectKeys::owned(grown)
-                }
-            };
+            let proof = crate::object::canonical_keys::SharedLayout::of_receiver(obj)
+                .expect("an object with an overflow appends through it, never here");
+            let new_keys = crate::object::canonical_keys::extend_key(
+                &proof,
+                crate::object::canonical_keys::CanonicalKeys::EMPTY,
+                key,
+            )
+            .view();
             refresh_roots_after_alloc!();
 
-            // Reallocate fields to hold at least one value
-            // Note: We assume the object has enough field slots pre-allocated
+            // The first key follows the same allocation-capacity rule as
+            // every later key; a zero-slot layout begins in overflow.
+            let inline = crate::object::object_inline_capacity(obj) != 0;
             // #7154 publication order: `gc_field_slot_range` bounds the
             // collector's view of the payload by `field_count`, so a slot at an
             // index the count does not yet cover is invisible to BOTH tracing
@@ -700,23 +672,24 @@ pub(crate) fn set_field_by_name_object_tail(
                 super::field_rep_store::shape_rep(prev_shape_id),
                 0,
                 Some(value.to_bits()),
-                true,
+                inline,
             );
             refresh_roots_after_alloc!();
-            js_object_set_field(obj, 0, JSValue::from_bits(value.to_bits()));
+            if inline {
+                js_object_set_field(obj, 0, JSValue::from_bits(value.to_bits()));
+            } else {
+                let bits = overflow_store_bits(value, obj, 0);
+                overflow_set(obj as usize, 0, bits);
+            }
             refresh_roots_after_alloc!();
             mirror_class_object_static_write(obj, key, value);
             // Record the null→single-key transition so the next object
             // that starts with `{}` and sets the same first key hits the
             // fast path above instead of allocating a fresh 4-elem
             // keys_array here.
-            // #10868 step 2.5 stage 1: a dictionary receiver's keys array is PRIVATE,
-            // and `transition_cache_insert` stamps `GC_FLAG_SHAPE_SHARED` on whatever
-            // it caches — which makes the very next append clone the array instead of
-            // extending it, i.e. O(k) copying per append, the cost this mode exists to
-            // remove. A dictionary receiver publishes no shape transitions, so the
-            // entry could never be hit by anyone else either.
-            if !crate::object::dictionary::is_dictionary(obj) {
+            // An object whose overflow took over at this append (the unique-run
+            // limit) records no edge: its later keys go to the overflow.
+            if !crate::object::overflow::has_overflow(obj) {
                 transition_cache_insert(
                     if record_array_tail {
                         obj as *const ObjectHeader
@@ -735,9 +708,7 @@ pub(crate) fn set_field_by_name_object_tail(
             // #6759 C3 rung 1: no `class_id == 0` gate — a keyless class
             // instance gaining its first by-name property is stamped like
             // any other receiver.
-            // #10868 step 2.5 stage 1: same un-latch hazard as the read
-            // path's field-cache stamp — this publishes an explicit keys edge.
-            if !crate::object::dictionary::is_dictionary(obj)
+            if !crate::object::overflow::has_overflow(obj)
                 && !super::shapes::shape_descriptor_by_id(super::shapes::object_shape_stamp(obj))
                     .is_some_and(|d| d.special_constfn_mask != 0)
             {
@@ -812,12 +783,35 @@ pub(crate) fn set_field_by_name_object_tail(
             }
         }
 
+        // An object with an overflow (§3.4) is its own order authority:
+        // every write, of a new key or an old one, goes through the routed
+        // writer, which meets the layout's slot or the overflow entry.
+        if crate::object::overflow::has_overflow(obj) {
+            let own = super::object_ops::own_key_present(obj, key);
+            if own || is_frozen || is_sealed_or_no_extend {
+                let name = key_to_str_for_diag(key);
+                if own {
+                    if is_frozen {
+                        crate::error::throw_frozen_write(obj, &name);
+                    }
+                    if let Some(attrs) = get_property_attrs(obj as usize, &name) {
+                        if !attrs.writable() {
+                            crate::error::throw_immutable_write(0, &name);
+                        }
+                    }
+                } else {
+                    crate::error::throw_immutable_write(1, &name);
+                }
+            }
+            super::super::overflow::store_routed(obj, key, value);
+            refresh_roots_after_alloc!();
+            mirror_class_object_static_write(obj, key, value);
+            return;
+        }
+
         // Search through the keys array for a match
         let key_count = keys_view.count() as usize;
-        let alloc_limit = std::cmp::max(
-            crate::object::object_live_slot_count(obj),
-            crate::object::INLINE_SLOT_FLOOR as u32,
-        ) as usize;
+        let alloc_limit = crate::object::object_inline_capacity(obj) as usize;
 
         // Sidecar O(1) lookup when keys_array has grown past the
         // linear-scan break-even. Without this, the build-then-fill
@@ -833,7 +827,7 @@ pub(crate) fn set_field_by_name_object_tail(
             let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
             let key_hash = key_bytes_hash(name_ptr, name_len);
             if let Some(i) = keys_index_lookup_property(obj, keys_view, name_bytes, key_hash) {
-                let i = i as usize;
+                let i = keys_view.storage_slot(i) as usize;
                 if is_frozen {
                     let key_str = key_to_str_for_diag(key);
                     crate::error::throw_frozen_write(obj, &key_str);
@@ -880,34 +874,17 @@ pub(crate) fn set_field_by_name_object_tail(
             // owned any more, so the arm it served does not exist rather than
             // being guarded (L8.3.15c).
             let new_index = key_count;
-            // #10868 step 2.5: TWO MODES, chosen by a fact on the shape —
-            // which is what dictionary mode IS. This is not a fast path
-            // beside a slow one inside one mode; an ordinary receiver's key
-            // list is a SHARED LAYOUT and interns, a latched receiver's list
-            // is its OWN and appends in place. `SharedLayout::of_receiver` is
-            // the kind check, and `canonicalize`/`extend_key` cannot be
-            // called without what it returns.
-            let new_keys = match crate::object::canonical_keys::SharedLayout::of_receiver(obj) {
-                Some(proof) => {
-                    let canonical_parent =
-                        crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
-                    refresh_roots_after_alloc!();
-                    crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view()
-                }
-                None => {
-                    // The parent's owned arm, unchanged: a dictionary's array
-                    // carries no `GC_FLAG_SHAPE_SHARED`, so this is the
-                    // in-place O(1)-amortized append that mode exists for.
-                    let owned = scope.root_raw_mut_ptr(keys);
-                    let grown =
-                        crate::array::js_array_push(keys, JSValue::string_ptr(key as *mut _));
-                    let _ = owned.get_raw_mut_ptr::<ArrayHeader>();
-                    // Its attributes, if it carries any, grow with it.
-                    let grown =
-                        crate::object::key_attrs::owned_note_append(grown, key_count as u32, 0);
-                    crate::object::ObjectKeys::owned(grown)
-                }
-            };
+            // A layout's key list is a SHARED LAYOUT and interns; an object
+            // with an overflow never reaches here (it appends through the
+            // overflow above). `canonicalize`/`extend_key` cannot be called
+            // without the `SharedLayout` proof.
+            let proof = crate::object::canonical_keys::SharedLayout::of_receiver(obj)
+                .expect("an object with an overflow appends through it, never here");
+            let canonical_parent =
+                crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
+            refresh_roots_after_alloc!();
+            let new_keys =
+                crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view();
             refresh_roots_after_alloc!();
             if new_index >= alloc_limit {
                 // Charter step 5 (T2): carry the predecessor's lanes; an overflow
@@ -927,13 +904,9 @@ pub(crate) fn set_field_by_name_object_tail(
                 overflow_set(obj as usize, new_index, vbits);
                 refresh_roots_after_alloc!();
                 mirror_class_object_static_write(obj, key, value);
-                // #10868 step 2.5 stage 1: a dictionary receiver's keys array is PRIVATE,
-                // and `transition_cache_insert` stamps `GC_FLAG_SHAPE_SHARED` on whatever
-                // it caches — which makes the very next append clone the array instead of
-                // extending it, i.e. O(k) copying per append, the cost this mode exists to
-                // remove. A dictionary receiver publishes no shape transitions, so the
-                // entry could never be hit by anyone else either.
-                if !crate::object::dictionary::is_dictionary(obj) {
+                // An object whose overflow took over at this append (the unique-run
+                // limit) records no edge: its later keys go to the overflow.
+                if !crate::object::overflow::has_overflow(obj) {
                     transition_cache_insert(
                         if record_array_tail {
                             obj as *const ObjectHeader
@@ -975,13 +948,9 @@ pub(crate) fn set_field_by_name_object_tail(
             js_object_set_field(obj, new_index as u32, JSValue::from_bits(value.to_bits()));
             refresh_roots_after_alloc!();
             mirror_class_object_static_write(obj, key, value);
-            // #10868 step 2.5 stage 1: a dictionary receiver's keys array is PRIVATE,
-            // and `transition_cache_insert` stamps `GC_FLAG_SHAPE_SHARED` on whatever
-            // it caches — which makes the very next append clone the array instead of
-            // extending it, i.e. O(k) copying per append, the cost this mode exists to
-            // remove. A dictionary receiver publishes no shape transitions, so the
-            // entry could never be hit by anyone else either.
-            if !crate::object::dictionary::is_dictionary(obj) {
+            // An object whose overflow took over at this append (the unique-run
+            // limit) records no edge: its later keys go to the overflow.
+            if !crate::object::overflow::has_overflow(obj) {
                 transition_cache_insert(
                     if record_array_tail {
                         obj as *const ObjectHeader
@@ -1053,6 +1022,7 @@ pub(crate) fn set_field_by_name_object_tail(
                         }
                     }
                 }
+                let i = crate::object::key_attrs::key_storage_slot(keys, i as u32) as usize;
                 if i < alloc_limit {
                     js_object_set_field(obj, i as u32, JSValue::from_bits(value.to_bits()));
                 } else {
@@ -1096,23 +1066,13 @@ pub(crate) fn set_field_by_name_object_tail(
         // tail.rs:1044/1102 `key_count` 3,676 + 5,416. `keys_shared` is not
         // tested because it is now true of every keys array by construction.
         let new_index = key_count;
-        // Two modes, as above the linear scan.
-        let new_keys = match crate::object::canonical_keys::SharedLayout::of_receiver(obj) {
-            Some(proof) => {
-                let canonical_parent =
-                    crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
-                refresh_roots_after_alloc!();
-                crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view()
-            }
-            None => {
-                let owned = scope.root_raw_mut_ptr(keys);
-                let grown = crate::array::js_array_push(keys, JSValue::string_ptr(key as *mut _));
-                let _ = owned.get_raw_mut_ptr::<ArrayHeader>();
-                // Its attributes, if it carries any, grow with it.
-                let grown = crate::object::key_attrs::owned_note_append(grown, key_count as u32, 0);
-                crate::object::ObjectKeys::owned(grown)
-            }
-        };
+        let proof = crate::object::canonical_keys::SharedLayout::of_receiver(obj)
+            .expect("an object with an overflow appends through it, never here");
+        let canonical_parent =
+            crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
+        refresh_roots_after_alloc!();
+        let new_keys =
+            crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view();
         refresh_roots_after_alloc!();
 
         // Check if we have a spare physical slot (js_object_alloc_with_shape allocates max(N,8) slots).
@@ -1160,13 +1120,9 @@ pub(crate) fn set_field_by_name_object_tail(
             // The cached target is stamped `GC_FLAG_SHAPE_SHARED` by
             // `transition_cache_insert`, which triggers clone-on-extend
             // on either object if someone later appends past this key.
-            // #10868 step 2.5 stage 1: a dictionary receiver's keys array is PRIVATE,
-            // and `transition_cache_insert` stamps `GC_FLAG_SHAPE_SHARED` on whatever
-            // it caches — which makes the very next append clone the array instead of
-            // extending it, i.e. O(k) copying per append, the cost this mode exists to
-            // remove. A dictionary receiver publishes no shape transitions, so the
-            // entry could never be hit by anyone else either.
-            if !crate::object::dictionary::is_dictionary(obj) {
+            // An object whose overflow took over at this append (the unique-run
+            // limit) records no edge: its later keys go to the overflow.
+            if !crate::object::overflow::has_overflow(obj) {
                 transition_cache_insert(
                     if record_array_tail {
                         obj as *const ObjectHeader
@@ -1207,13 +1163,9 @@ pub(crate) fn set_field_by_name_object_tail(
         refresh_roots_after_alloc!();
         mirror_class_object_static_write(obj, key, value);
         // Record the shape transition — see above for semantics.
-        // #10868 step 2.5 stage 1: a dictionary receiver's keys array is PRIVATE,
-        // and `transition_cache_insert` stamps `GC_FLAG_SHAPE_SHARED` on whatever
-        // it caches — which makes the very next append clone the array instead of
-        // extending it, i.e. O(k) copying per append, the cost this mode exists to
-        // remove. A dictionary receiver publishes no shape transitions, so the
-        // entry could never be hit by anyone else either.
-        if !crate::object::dictionary::is_dictionary(obj) {
+        // An object whose overflow took over at this append (the unique-run
+        // limit) records no edge: its later keys go to the overflow.
+        if !crate::object::overflow::has_overflow(obj) {
             transition_cache_insert(
                 if record_array_tail {
                     obj as *const ObjectHeader

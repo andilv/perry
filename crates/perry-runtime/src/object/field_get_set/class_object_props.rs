@@ -190,9 +190,17 @@ pub(crate) unsafe fn finish_class_evaluation_prototype(
     }
 
     // Inline room for `constructor` and every declared member (see
-    // `class_decl_prototype_value`).
+    // `class_decl_prototype_value`). Born old and never-move like a declared
+    // class prototype (O3, `gc::never_move`): this is a class expression's
+    // FIRST evaluation, once per class id. Born young, every site memo that
+    // answers through it is refused until a copying minor promotes it, and a
+    // program with no minor after that point reads through it on the slow
+    // path for the rest of its run.
     let members = super::super::class_registry::class_prototype_member_names(class_id).len() as u32;
-    let proto = scope.root_raw_mut_ptr(js_object_alloc(class_id, members + 1));
+    let proto = scope.root_raw_mut_ptr(crate::object::object_alloc_prototype_old(
+        class_id,
+        members + 1,
+    ));
     CLASS_EVALUATION_PROTOTYPES_MATERIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // Symbol aliases resolve method values lazily. Their lexical evaluation
@@ -225,7 +233,7 @@ pub(crate) unsafe fn finish_class_evaluation_prototype(
         if is_accessor {
             // S2: an accessor is a real accessor property of this prototype.
             proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
-                super::super::class_registry::install_decl_prototype_accessor(
+                super::super::class_registry::install_decl_prototype_accessor_bytes(
                     proto, class_id, &name,
                 )
             });
@@ -238,22 +246,25 @@ pub(crate) unsafe fn finish_class_evaluation_prototype(
         // The evaluation's own function object for the method: its entry runs
         // the method at home in this evaluation (`<method>__eclo`). A template
         // compiled without entries keeps the by-name method value.
-        let method =
-            super::class_object_template::evaluation_method_value(class_id, &name, class_value)
-                .unwrap_or_else(|| {
-                    super::super::native_module::class_evaluation_method_value_for_name(
-                        class_id,
-                        &name,
-                        class_value,
-                    )
-                });
+        let method = super::class_object_template::evaluation_method_value_bytes(
+            class_id,
+            &name,
+            class_value,
+        )
+        .unwrap_or_else(|| {
+            super::super::native_module::class_evaluation_method_value_for_name_bytes(
+                class_id,
+                &name,
+                class_value,
+            )
+        });
         proto.with_mut_ptr::<ObjectHeader, _>(|proto| {
             key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                define_builtin_data_property(
+                crate::object::descriptor_state::define_builtin_data_property_bytes(
                     proto,
                     key,
                     method,
-                    name,
+                    &name,
                     PropertyAttrs::new(true, false, true),
                 )
             });
@@ -328,22 +339,23 @@ pub(crate) unsafe fn define_class_object_own_properties(
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let class = scope.root_raw_mut_ptr(obj);
-    let define = |name: &str, value: f64, attrs: (bool, bool, bool)| {
+    let define_bytes = |name: &[u8], value: f64, attrs: (bool, bool, bool)| {
         let value = scope.root_nanbox_f64(value);
         let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
         let key = scope.root_string_ptr(key);
         class.with_mut_ptr::<ObjectHeader, _>(|class| {
             key.with_const_ptr::<crate::StringHeader, _>(|key| {
-                define_builtin_data_property(
+                crate::object::descriptor_state::define_builtin_data_property_bytes(
                     class,
                     key,
                     value.get_nanbox_f64(),
-                    name.to_string(),
+                    name,
                     PropertyAttrs::new(attrs.0, attrs.1, attrs.2),
                 )
             })
         });
     };
+    let define = |name: &str, value: f64, attrs| define_bytes(name.as_bytes(), value, attrs);
     for (bit, key) in [(1, "length"), (2, "name")] {
         // A static method of this name replaces the value (and the attributes)
         // in the same position, below; a static accessor leaves nothing here.
@@ -374,7 +386,9 @@ pub(crate) unsafe fn define_class_object_own_properties(
         // it is called (`js_static_method_entry_enter_home`). An accessor has
         // no entry.
         let Some(code) =
-            super::super::class_registry::class_own_static_method_code(class_id, &name)
+            super::super::class_registry::parent_static::class_own_static_method_code_bytes(
+                class_id, &name,
+            )
         else {
             continue;
         };
@@ -382,15 +396,27 @@ pub(crate) unsafe fn define_class_object_own_properties(
         if f.is_null() {
             continue;
         }
-        class.with_mut_ptr::<ObjectHeader, _>(|class| {
-            super::class_object_template::set_static_method_home(
-                f,
-                crate::value::js_nanbox_pointer(class as i64),
-            )
+        let f = scope.root_raw_mut_ptr(f);
+        f.with_mut_ptr::<crate::closure::ClosureHeader, _>(|f| {
+            class.with_mut_ptr::<ObjectHeader, _>(|class| {
+                super::class_object_template::set_static_method_home(
+                    f,
+                    crate::value::js_nanbox_pointer(class as i64),
+                )
+            })
         });
-        define(
+        // After the home: the name gives the closure its own-property bag,
+        // which ends its pointer-free birth state, and the home install is
+        // for a fresh birth only.
+        let f_value = f.with_const_ptr::<crate::closure::ClosureHeader, _>(|f| {
+            crate::value::js_nanbox_pointer(f as i64)
+        });
+        crate::object::native_module::set_function_name_bytes(f_value, &name);
+        define_bytes(
             &name,
-            crate::value::js_nanbox_pointer(f as i64),
+            f.with_const_ptr::<crate::closure::ClosureHeader, _>(|f| {
+                crate::value::js_nanbox_pointer(f as i64)
+            }),
             (true, false, true),
         );
     }
@@ -645,12 +671,9 @@ pub(super) unsafe fn instance_constructor_value(
     if class_id != 0 && is_anon_shape_class_id(class_id) {
         return None;
     }
-    if let Some(func_value) = super::super::class_registry::function_value_for_class_id(class_id) {
-        return Some(JSValue::from_bits(func_value.to_bits()));
-    }
     // #10478: an `Object.create(proto)` result is stamped with a synthetic
     // class id that only indexes its prototype object
-    // (`CLASS_PROTOTYPE_OBJECTS`); unlike the function ids above it names no
+    // (`CLASS_PROTOTYPE_OBJECTS`); it names no
     // class VALUE. Its `constructor` is the inherited `proto.constructor`, so
     // read it off that chain. The INT32 synthesis below minted a ClassRef for
     // the synthetic id itself (`0x7FFE_0000_8000_0000`): unequal to `Object` /

@@ -52,6 +52,9 @@ pub(crate) unsafe fn value_is_object_like(value: f64) -> bool {
         return true;
     }
     let jv = crate::value::JSValue::from_bits(value.to_bits());
+    if jv.is_handle() {
+        return true;
+    }
     if !jv.is_pointer() {
         // Module-level raw-I64 object pointers (top16 == 0) — accept if it
         // resolves to a real heap object.
@@ -567,8 +570,9 @@ pub(crate) unsafe fn try_decode_descriptor<'scope>(
                         view.present[fi] = true;
                         // Root the field value: the caller reads it back long
                         // after several allocating calls (#7963).
-                        view.handles[fi] =
-                            Some(scope.root_nanbox_u64(js_object_get_field(obj, i as u32).bits()));
+                        view.handles[fi] = Some(scope.root_nanbox_u64(
+                            crate::object::js_object_get_key_field(obj, i as u32).bits(),
+                        ));
                     }
                 }
             }
@@ -958,8 +962,8 @@ pub(crate) unsafe fn define_property_force_store_value(
                     crate::object::key_attrs::keys_entry(keys, i as u32),
                 )
             {
-                let live_slots = crate::object::object_live_slot_count(obj) as usize;
-                let inline_limit = live_slots.max(crate::object::INLINE_SLOT_FLOOR);
+                let i = crate::object::key_attrs::key_storage_slot(keys, i as u32) as usize;
+                let inline_limit = crate::object::object_inline_capacity(obj) as usize;
                 if i < inline_limit {
                     js_object_set_field(
                         obj,

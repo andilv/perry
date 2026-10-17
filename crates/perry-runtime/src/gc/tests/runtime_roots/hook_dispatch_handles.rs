@@ -4,7 +4,7 @@ extern "C" fn test_current_async_id(
     _closure: *const crate::closure::ClosureHeader,
     _this: crate::closure::JsThis,
 ) -> f64 {
-    crate::async_hooks::execution_async_id_u64() as f64
+    crate::async_hooks::js_async_hooks_execution_async_id()
 }
 
 #[test]
@@ -523,6 +523,7 @@ fn test_set_materializers_runtime_handles_survive_copied_minor_gc() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
+    crate::gc::register_realm_prototype_scanners_for_tests();
 
     let value = test_string_value(b"set-value");
     let value_original = (value.to_bits() & POINTER_MASK) as usize;

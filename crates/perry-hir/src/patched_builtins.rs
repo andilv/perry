@@ -39,11 +39,42 @@ use std::sync::Arc;
 use swc_ecma_ast as ast;
 use swc_ecma_visit::{Visit, VisitWith};
 
+#[path = "proto_census.rs"]
+pub mod proto_census;
+
 /// Member wildcard: a dynamic-key write, or the whole namespace replaced.
 pub const ANY_MEMBER: &str = "*";
 
 /// The set of patched `(namespace, member)` pairs.
-pub type PatchedBuiltins = BTreeSet<(String, String)>;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PatchedBuiltins {
+    entries: BTreeSet<(String, String)>,
+    pub dynamic_code_reach: crate::dynamic_code::DynamicCodeReach,
+}
+impl PatchedBuiltins {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Is anything recorded: a program write, or dynamic code that can name
+    /// the global scope (whose writes the runtime reports: every builtin
+    /// prototype and namespace holder carries a shadow bit, and the direct
+    /// sites under such reach test it — `Pristine(family)` in perry-codegen
+    /// `builtin_proto`, and [`namespace_call_guarded`])?
+    pub fn is_inert(&self) -> bool {
+        self.entries.is_empty() && !self.dynamic_code_reach.disables_builtin_constants()
+    }
+}
+impl std::ops::Deref for PatchedBuiltins {
+    type Target = BTreeSet<(String, String)>;
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+impl std::ops::DerefMut for PatchedBuiltins {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
+}
 
 /// Global namespace objects whose direct member calls lowering devirtualizes.
 /// A patch to any other global object's member is already honored, because
@@ -68,7 +99,7 @@ pub fn is_builtin_namespace(name: &str) -> bool {
     BUILTIN_NAMESPACES.contains(&name)
 }
 
-fn peel(mut e: &ast::Expr) -> &ast::Expr {
+pub(crate) fn peel(mut e: &ast::Expr) -> &ast::Expr {
     loop {
         e = match e {
             ast::Expr::Paren(x) => &x.expr,
@@ -136,7 +167,7 @@ fn prop_name_key(p: &ast::PropName) -> Option<String> {
 }
 
 /// Static keys an object literal defines, or `None` if any key is dynamic.
-fn object_literal_keys(e: &ast::Expr) -> Option<Vec<String>> {
+pub(crate) fn object_literal_keys(e: &ast::Expr) -> Option<Vec<String>> {
     let ast::Expr::Object(obj) = peel(e) else {
         return None;
     };
@@ -164,7 +195,7 @@ fn is_index_key(key: &str) -> bool {
 
 /// A literal property key: a string, or an integer-valued number (`[7]`,
 /// `defineProperty(o, 7, …)` — an index, which no method call can name).
-fn str_arg(e: &ast::Expr) -> Option<String> {
+pub(crate) fn str_arg(e: &ast::Expr) -> Option<String> {
     match peel(e) {
         ast::Expr::Lit(ast::Lit::Str(s)) => s.value.as_str().map(str::to_string),
         ast::Expr::Lit(ast::Lit::Num(n))
@@ -235,6 +266,12 @@ impl Scanner<'_> {
 
     /// A write of property `member` (None = dynamic key) onto `target`.
     fn record_write(&mut self, target: &ast::Expr, member: Option<String>) {
+        // Array iteration reads one member (object model step 7): a write that
+        // may reach any `Symbol.iterator` (or re-parent an array) makes the
+        // program check it at run time.
+        if matches!(member.as_deref(), None | Some("@@iterator" | "__proto__")) {
+            self.out.insert((ARRAY_ITERATION.into(), "write".into()));
+        }
         if let Some(ns) = namespace_receiver(target).or_else(|| match peel(target) {
             ast::Expr::Ident(id) => self.ns_aliases.get(id.sym.as_ref()).cloned(),
             _ => None,
@@ -293,6 +330,53 @@ impl Scanner<'_> {
 }
 
 impl Visit for Scanner<'_> {
+    fn visit_ident(&mut self, id: &ast::Ident) {
+        // Dynamic code can obtain every writer, including through aliases.
+        if matches!(id.sym.as_ref(), "eval" | "Function") {
+            for fact in ["write", "proto", "elements"] {
+                self.out.insert((ARRAY_ITERATION.into(), fact.into()));
+            }
+        }
+    }
+
+    fn visit_member_expr(&mut self, m: &ast::MemberExpr) {
+        // Taking a descriptor-producing builtin as a value is enough: a
+        // call through any alias can install indexed accessors later.
+        if matches!(
+            static_member_name(&m.prop).as_deref(),
+            Some("defineProperty" | "defineProperties" | "__defineGetter__" | "__defineSetter__")
+        ) || static_member_name(&m.prop).is_none() && namespace_receiver(&m.obj).is_some()
+        {
+            self.out.insert((ARRAY_ITERATION.into(), "elements".into()));
+        }
+        let name = static_member_name(&m.prop);
+        if matches!(name.as_deref(), Some("getPrototypeOf")) {
+            self.out.insert((ARRAY_ITERATION.into(), "proto".into()));
+        }
+        if matches!(
+            name.as_deref(),
+            Some("setPrototypeOf" | "defineProperty" | "defineProperties" | "set" | "assign")
+        ) || name.is_none() && (namespace_receiver(&m.obj).is_some() || is_global_object(&m.obj))
+        {
+            self.out.insert((ARRAY_ITERATION.into(), "write".into()));
+        }
+        if name.is_none() && (namespace_receiver(&m.obj).is_some() || is_global_object(&m.obj)) {
+            self.out.insert((ARRAY_ITERATION.into(), "proto".into()));
+            self.out.insert((ARRAY_ITERATION.into(), "elements".into()));
+        }
+        m.visit_children_with(self);
+    }
+
+    fn visit_prop_name(&mut self, name: &ast::PropName) {
+        if let ast::PropName::Computed(key) = name {
+            let symbol = well_known_symbol_key(&ast::MemberProp::Computed(key.clone()));
+            if symbol.as_deref() == Some("@@iterator") || symbol.is_none() {
+                self.out.insert((ARRAY_ITERATION.into(), "write".into()));
+            }
+        }
+        name.visit_children_with(self);
+    }
+
     fn visit_assign_expr(&mut self, a: &ast::AssignExpr) {
         match &a.left {
             ast::AssignTarget::Simple(ast::SimpleAssignTarget::Member(m)) => {
@@ -349,6 +433,15 @@ impl Visit for Scanner<'_> {
             return;
         };
         match (owner.as_str(), method.as_str()) {
+            ("Object" | "Reflect", "setPrototypeOf") => {
+                self.out.insert((ARRAY_ITERATION.into(), "write".into()));
+            }
+            // The only way to name `%ArrayIteratorPrototype%` (and so to
+            // replace its `next`) is to ask an iterator for its prototype.
+            ("Object" | "Reflect", "getPrototypeOf") => {
+                self.out.insert((ARRAY_ITERATION.into(), "proto".into()));
+            }
+
             ("Object" | "Reflect", "defineProperty") | ("Reflect", "set") => {
                 let key = match arg(1) {
                     Some((false, k)) => str_arg(k),
@@ -394,6 +487,13 @@ pub fn scan_module(module: &ast::Module, out: &mut PatchedBuiltins) {
         proto_aliases,
         ns_aliases,
     });
+    // Constant `eval`/`Function` source (any spelling of the evaluator) is
+    // program code: its builtin writes are program writes.
+    for source in crate::dynamic_code::constant_source_bodies(module) {
+        if let Ok(parsed) = perry_parser::parse_typescript(&source, "<static source>.cjs") {
+            scan_module(&parsed, out);
+        }
+    }
 }
 
 thread_local! {
@@ -404,7 +504,7 @@ thread_local! {
 }
 
 pub fn set_patched_builtins(set: Arc<PatchedBuiltins>) {
-    PATCHED.with(|p| *p.borrow_mut() = if set.is_empty() { None } else { Some(set) });
+    PATCHED.with(|p| *p.borrow_mut() = if set.is_inert() { None } else { Some(set) });
 }
 
 pub fn clear_patched_builtins() {
@@ -415,13 +515,21 @@ fn with_set<R>(f: impl FnOnce(&PatchedBuiltins) -> R) -> Option<R> {
     PATCHED.with(|p| p.borrow().as_deref().map(f))
 }
 
-/// Was `ns.member` (for a builtin namespace `ns`) replaced anywhere?
+/// Was `ns.member` (for a builtin namespace `ns`) replaced by program code?
 pub fn namespace_member_patched(ns: &str, member: &str) -> bool {
     with_set(|s| {
         s.contains(&(ns.to_string(), member.to_string()))
             || s.contains(&(ns.to_string(), ANY_MEMBER.to_string()))
     })
     .unwrap_or(false)
+}
+
+/// May dynamic code replace a builtin namespace member or binding? Then a
+/// direct namespace call that binds its intrinsic is guarded by
+/// `Pristine(namespace)`, the shadow bit of the namespace's member holder
+/// (`Expr::NamespacePatched`), and takes the generic call when it is set.
+pub fn namespace_call_guarded() -> bool {
+    with_set(|s| s.dynamic_code_reach.disables_builtin_constants()).unwrap_or(false)
 }
 
 /// Was a method named `member` written onto the prototype of a builtin whose
@@ -436,6 +544,17 @@ pub fn prototype_method_patched(member: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// The scanner's pseudo-namespace for array-iteration facts.
+const ARRAY_ITERATION: &str = "$ArrayIteration";
+/// Reported by [`patched_prototype_methods`]: a write may reach a
+/// `Symbol.iterator` member (or re-parent an array).
+pub const ARRAY_ITERATOR_WRITABLE: &str = "$array_iterator_writable";
+/// Array elements may receive non-default property descriptors.
+pub const ARRAY_ELEMENT_DESCRIPTORS: &str = "$array_element_descriptors";
+/// Reported by [`patched_prototype_methods`]: `%ArrayIteratorPrototype%` may
+/// be named, so its `next` may be replaced.
+pub const ARRAY_ITERATOR_PROTO_REACHABLE: &str = "$array_iterator_proto_reachable";
+
 /// The method names [`prototype_method_patched`] answers for, as the sorted
 /// list codegen is handed ([`ANY_MEMBER`] when a write's key was dynamic).
 pub fn patched_prototype_methods(set: &PatchedBuiltins) -> Vec<String> {
@@ -444,7 +563,17 @@ pub fn patched_prototype_methods(set: &PatchedBuiltins) -> Vec<String> {
         .filter(|(ns, _)| ns.ends_with(PROTOTYPE_SUFFIX))
         .map(|(_, m)| m.as_str())
         .collect();
-    names.into_iter().map(str::to_string).collect()
+    let mut names: Vec<String> = names.into_iter().map(str::to_string).collect();
+    if set.contains(&(ARRAY_ITERATION.into(), "write".into())) {
+        names.push(ARRAY_ITERATOR_WRITABLE.into());
+    }
+    if set.contains(&(ARRAY_ITERATION.into(), "elements".into())) {
+        names.push(ARRAY_ELEMENT_DESCRIPTORS.into());
+    }
+    if set.contains(&(ARRAY_ITERATION.into(), "proto".into())) {
+        names.push(ARRAY_ITERATOR_PROTO_REACHABLE.into());
+    }
+    names
 }
 
 #[cfg(test)]

@@ -206,7 +206,7 @@ unsafe fn positional_assign_target_is_safe(
     target_is_array: bool,
     plan: PositionalPlan,
 ) -> bool {
-    if target_is_array {
+    if target_is_array || super::overflow::has_overflow(target) {
         return false;
     }
     let Some(header) = crate::value::addr_class::try_read_gc_header(target as usize) else {
@@ -298,9 +298,12 @@ unsafe fn positional_prototype_shape_keys(
         let Some(header) = crate::value::addr_class::try_read_gc_header(addr) else {
             return None;
         };
+        // A hop with an overflow holds keys and attributes its layout does
+        // not list (object model step 4): no positional proof.
         if header.obj_type != crate::gc::GC_TYPE_OBJECT
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
             || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
+            || super::overflow::has_overflow(addr as *const ObjectHeader)
         {
             return None;
         }
@@ -391,7 +394,7 @@ unsafe fn positional_source_plan(src: *const ObjectHeader) -> PositionalPlan {
     }
     let class_id = (*src).class_id;
     if (class_id != 0 && !super::class_registry::is_anon_shape_class_id(class_id))
-        || super::dictionary::is_dictionary(src)
+        || super::overflow::has_overflow(src)
         || super::string_wrapper::length(src_raw).is_some()
         || (class_id == 0 && crate::url::is_url_object_shape(src as *mut ObjectHeader))
     {
@@ -410,7 +413,8 @@ unsafe fn positional_source_plan(src: *const ObjectHeader) -> PositionalPlan {
         || super::key_attrs::object_summary(src)
             & (super::key_attrs::SUMMARY_ACCESSOR
                 | super::key_attrs::SUMMARY_NON_ENUMERABLE
-                | super::key_attrs::SUMMARY_PRIVATE)
+                | super::key_attrs::SUMMARY_PRIVATE
+                | super::key_attrs::SUMMARY_HOLES)
             != 0
     {
         return PositionalPlan::Refused;
@@ -446,14 +450,14 @@ unsafe fn positional_entry(
     // This is an internal key list, not a JavaScript array read: stores can
     // replace the source's list, but cannot edit this rooted snapshot.
     debug_assert!(i < key_count);
-    let key_val = crate::JSValue::from_bits(*crate::array::array_elements_ptr(keys).add(i));
+    let key_val = crate::object::ObjectKeys::new(keys.cast_mut(), key_count as u32).get(i as u32);
     if !key_val.is_any_string()
         || (hide_private && crate::object::field_get_set::own_slot_hidden(src, i as u32, key_val))
     {
         return None;
     }
-    let live = crate::object::object_live_slot_count(src) as usize;
-    let alloc_limit = std::cmp::max(live, crate::object::INLINE_SLOT_FLOOR);
+    let alloc_limit = crate::object::object_inline_capacity(src) as usize;
+    let i = crate::object::key_attrs::key_storage_slot(keys, i as u32) as usize;
     let value = if i < alloc_limit {
         std::ptr::read(
             (src as *const u8).add(std::mem::size_of::<ObjectHeader>() + i * 8) as *const f64,
@@ -641,6 +645,8 @@ unsafe fn object_assign_enumerated_source(
 /// properties (`Object.assign({}, "ab") -> {0:"a",1:"b"}`).
 #[no_mangle]
 pub unsafe extern "C" fn js_object_assign_one(target_f64: f64, source_f64: f64) -> f64 {
+    #[cfg(feature = "contract-checks")]
+    let _writer = crate::contracts::RuntimeWriter::enter("Object.assign");
     object_assign_one(target_f64, source_f64, false)
 }
 
@@ -667,7 +673,7 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
     // with `js_object_keys_value`, which *throws* on `null`/`undefined` instead
     // of skipping it as the spec requires.
     let target_value = JSValue::from_bits(target_f64.to_bits());
-    if !target_value.is_pointer() {
+    if !target_value.is_reference() {
         return target_f64;
     }
     // A proxy has no heap header. Feed it to the same descriptor-driven
@@ -761,11 +767,15 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
     // `{...blob}`/`{...hash}`.
     if !crate::value::addr_class::is_above_handle_band(src_raw)
         || !src_raw.is_multiple_of(8)
-        || crate::symbol::is_registered_symbol(src_raw)
+        || (crate::symbol::may_be_symbol_header(src_raw as *const u8)
+            && crate::symbol::is_registered_symbol(src_raw))
     {
         return target_f64;
     }
 
+    // The source is already a readable receiver at this boundary (the paths
+    // below inspect its header and payload). Its own Symbol magic word rules
+    // out ordinary objects before the allocator admission needed by Symbols.
     // Byte views have their own property surface. Use the existing
     // descriptor-driven copy, including symbols and accessors, instead of
     // a second string-only loop with a raw source address across stores.
@@ -903,7 +913,8 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
     };
     let strict_set_is_shape_equivalent =
         !define && positional_assign_target_is_safe(target, target_is_array, positional_plan);
-    if !define
+    if (!define
+        || (source_obj_type == crate::gc::GC_TYPE_OBJECT && super::overflow::has_overflow(src)))
         && !strict_set_is_shape_equivalent
         && matches!(
             source_obj_type,
@@ -916,7 +927,7 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
         // symbol keys before any string-keyed setter can change the source.
         let scope = crate::gc::RuntimeHandleScope::new();
         let tgt_h = scope.root_raw_mut_ptr(target);
-        object_assign_enumerated_source(false, target, target_is_array, source_f64);
+        object_assign_enumerated_source(define, target, target_is_array, source_f64);
         return tgt_h
             .with_mut_ptr::<ObjectHeader, _>(|t| crate::value::js_nanbox_pointer(t as i64));
     }
@@ -958,12 +969,13 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
         // trigger a GC that rekeys the side table to the moved array's new
         // address — after which a lookup by this (stale) address would miss
         // them. They sort AFTER the integer indices in [[OwnPropertyKeys]] order.
-        let expandos: Vec<(String, f64)> = crate::array::array_named_property_names(arr, true)
-            .into_iter()
-            .filter_map(|name| {
-                crate::array::array_named_property_get_by_name(arr, &name).map(|v| (name, v))
-            })
-            .collect();
+        let expandos: Vec<(String, f64)> =
+            crate::array::array_named_property_enumeration_names(arr, true, n)
+                .into_iter()
+                .filter_map(|name| {
+                    crate::array::array_named_property_get_by_name(arr, &name).map(|v| (name, v))
+                })
+                .collect();
         for i in 0..n {
             // Re-derive from the handle: `js_string_from_bytes` and the write
             // funnel both allocate, so the previous iteration may have moved the
@@ -1044,6 +1056,7 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
             // enumerability check below drops it with the shape's own
             // attributes; no other lookup is needed for it.
             let hide_internal = (*src).class_id != 0;
+            let holey = crate::object::key_view::object_may_have_holes(src);
             for i in 0..key_count {
                 // Re-derive every raw address from its handle at the top of the
                 // iteration: the PREVIOUS iteration's getter may have moved all
@@ -1053,6 +1066,10 @@ unsafe fn object_assign_one(target_f64: f64, source_f64: f64, define: bool) -> f
                 let src_raw = src as usize;
                 let key_val = crate::array::js_array_get(src_keys, i as u32);
                 if !key_val.is_any_string() {
+                    continue;
+                }
+                // An optional key whose slot holds the hole is absent.
+                if holey && crate::object::key_view::own_key_is_hole(src, key_val) {
                     continue;
                 }
                 if hide_internal {

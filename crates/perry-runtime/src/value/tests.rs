@@ -218,6 +218,37 @@ fn test_jsvalue_equals_numbers() {
 }
 
 #[test]
+fn strict_equality_rejects_equal_and_distinct_numeric_nan_payloads() {
+    let nans = [
+        0x7FF8_0000_0000_0000u64,
+        0x7FF8_0000_0000_0001,
+        0xFFF8_0000_0000_0000,
+        0xFFF8_0000_0000_0002,
+        0x7FF0_0000_0000_0001,
+    ];
+    let others = [
+        0.0,
+        -0.0,
+        1.0,
+        f64::from_bits(JSValue::int32(1).bits()),
+        f64::from_bits(TAG_UNDEFINED),
+        f64::from_bits(TAG_NULL),
+        f64::from_bits(TAG_TRUE),
+        f64::from_bits(JSValue::try_short_string(b"NaN").unwrap().bits()),
+    ];
+    for bits in nans {
+        let nan = f64::from_bits(bits);
+        assert!(JSValue::from_bits(bits).is_number());
+        assert!(nan.is_nan());
+        for other in nans.map(f64::from_bits).into_iter().chain(others) {
+            assert_eq!(js_jsvalue_equals(nan, other), 0);
+            assert_eq!(js_jsvalue_equals(other, nan), 0);
+        }
+        assert_eq!(js_jsvalue_same_value_zero(nan, nan), 1);
+    }
+}
+
+#[test]
 fn test_jsvalue_equals_distinct_box_allocated_registered_symbols() {
     let left_key = f64::from_bits(JSValue::try_short_string(b"eq_l").unwrap().bits());
     let right_key = f64::from_bits(JSValue::try_short_string(b"eq_r").unwrap().bits());
@@ -246,4 +277,54 @@ fn an_array_hole_stringifies_as_undefined() {
     assert_eq!(text(f64::NAN), "NaN");
     assert_eq!(text(f64::from_bits(TAG_UNDEFINED)), "undefined");
     assert_eq!(text(f64::from_bits(TAG_NULL)), "null");
+}
+
+#[test]
+fn native_handle_tag_is_distinct_from_heap_and_v8() {
+    use crate::value::addr_class::{
+        FETCH_HANDLE_BAND_START, HANDLE_BAND_MAX, PROXY_ID_BAND_START, STREAM_ID_BAND_START,
+    };
+    for id in [
+        1,
+        FETCH_HANDLE_BAND_START,
+        PROXY_ID_BAND_START + 1,
+        STREAM_ID_BAND_START,
+        HANDLE_BAND_MAX - 1,
+    ] {
+        let value = JSValue::handle(id);
+        assert!(value.is_handle());
+        assert!(!value.is_pointer());
+        assert!(!value.is_number());
+        assert_eq!(value.as_handle(), id);
+        assert_eq!(
+            js_nanbox_get_handle(f64::from_bits(value.bits())),
+            id as i64
+        );
+        assert_eq!(value.bits() & TAG_MASK, HANDLE_TAG);
+    }
+    assert_ne!(HANDLE_TAG, JS_HANDLE_TAG);
+    assert_ne!(HANDLE_TAG, POINTER_TAG);
+    assert_eq!(js_nanbox_get_handle(42.0), 0);
+    assert_eq!(js_nanbox_handle(0).to_bits(), TAG_NULL);
+}
+
+#[test]
+fn number_ingress_canonicalizes_every_nan_tag_and_sign() {
+    for top in [
+        0x7ff0_u64, 0x7ff8, 0x7ff9, 0x7ffd, 0x7fff, 0xfff0, 0xfff8, 0xfff9, 0xfffd, 0xffff,
+    ] {
+        for payload in [1, 0x12345678, POINTER_MASK] {
+            let raw = f64::from_bits((top << 48) | payload);
+            assert!(raw.is_nan());
+            // Raw-byte ingress canonicalizes; boxing is the bit pattern.
+            let value = JSValue::number(crate::array::canonical_raw_f64(raw));
+            assert!(value.is_number());
+            assert!(value.as_number().is_nan());
+            assert_eq!(value.bits(), f64::NAN.to_bits());
+            assert!(!value.is_handle());
+        }
+    }
+    for number in [0.0_f64, -0.0, f64::INFINITY, f64::NEG_INFINITY, 1.0] {
+        assert_eq!(JSValue::number(number).bits(), number.to_bits());
+    }
 }

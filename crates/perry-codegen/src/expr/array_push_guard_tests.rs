@@ -34,9 +34,7 @@ const NOTE_CALL: &str = "call void @js_gc_note_slot_layout(";
 const ADDREF_CALL: &str = "call void @js_string_addref_if_heap_string(";
 const NUMERIC_NOTE_CALL: &str = "call void @js_array_note_numeric_write(";
 /// `ARRAY_PUSH_NUMERIC_CLEAN_I16` as it appears in the `nofwd` admission test.
-const WIDENED_ADMISSION_MASK: &str = "15367";
-/// The historical integrity mask, which the numeric push must NOT still use.
-const NARROW_INTEGRITY_MASK: &str = ", 1031";
+const WIDENED_ADMISSION_MASK: &str = "14343";
 const POINTER_LAYOUT_BLOCK: &str = "apush.pointer_layout.bookkeeping";
 const POINTER_LAYOUT_MASK: &str = "63616";
 
@@ -44,6 +42,9 @@ fn ir_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: true,
         non_entry_module_prefixes: Vec::new(),
@@ -307,11 +308,12 @@ fn a_numeric_push_moves_its_gc_bookkeeping_behind_one_live_test() {
     // array would reach the inline store and silently skip the note it needs.
     assert!(
         ir.contains(WIDENED_ADMISSION_MASK),
-        "the nofwd admission mask did not widen to 0x3C07 for a numeric push:\n{ir}"
+        "the nofwd admission mask did not widen to 0x3807 for a numeric push:\n{ir}"
     );
     assert!(
-        !ir.contains(NARROW_INTEGRITY_MASK),
-        "a numeric push still admits on the narrow 0x0407 integrity mask, so \
+        !ir.lines()
+            .any(|l| l.contains("= and i16 ") && l.trim_end().ends_with(", 7")),
+        "a numeric push still admits on the bare 0x0007 integrity mask, so \
          the guard rests on nothing about the array:\n{ir}"
     );
 }
@@ -674,10 +676,11 @@ fn a_field_push_writes_the_field_back_on_a_handle_bits_change_behind_a_plain_obj
         deref.contains("icmp eq i8 %") && deref.contains(", 2\n"),
         "the gate must require a GC_TYPE_OBJECT receiver:\n{deref}"
     );
-    // The store arm is the ordinary class-field set: the inline IC store
-    // with its barrier, and the descriptor-aware runtime fallback behind it.
+    // The store arm is the ordinary class-field store, i.e. the static-key
+    // store site (#12483): its inline shape-checked store, and the
+    // descriptor-aware `[[Set]]` miss behind it.
     assert!(
-        body.contains("class_field_set.fast") && body.contains("@js_class_field_set_fallback("),
+        body.contains("put.pic.") && body.contains("@js_put_value_set_packed_miss("),
         "the write-back arm must be the class-field store:\n{body}"
     );
     // Between the header gate and the store: `this.items` is re-read and its
@@ -759,9 +762,8 @@ fn class_field_push_checks_method_before_shared_argument_and_calls_builtin() {
         .find("call double @js_process_memory_usage(")
         .expect("allocating argument");
     assert!(
-        slow.contains("@js_object_get_field_ic")
-            && slow[..arg].contains("phi double")
-            && slow[..arg].contains("pget.recv_merge"),
+        (slow.contains("@perry_probe_get") || slow.contains("@js_object_get_field_"))
+            && slow[..arg].contains("phi double"),
         "the argument block must receive the method read's merged value before evaluating the \
          argument:\n{slow}"
     );

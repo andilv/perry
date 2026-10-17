@@ -16,17 +16,15 @@ mod array_buffer;
 mod boxed_primitives;
 mod collection_equality;
 mod errors;
+#[cfg(test)]
+pub(crate) use boxed_primitives::test_boxed_primitive_allocation_count;
 pub(crate) use boxed_primitives::{
     boxed_primitive_json_value, boxed_primitive_payload, boxed_primitive_to_string_tag,
-    boxed_string_wrapper_utf16_len, prune_dead_boxed_primitive_payload_owners,
+    boxed_string_wrapper_utf16_len,
 };
 pub use boxed_primitives::{
     js_boxed_bigint_new, js_boxed_boolean_new, js_boxed_number_new, js_boxed_string_new,
-    js_boxed_symbol_new, scan_boxed_primitive_payload_roots_mut,
-};
-#[cfg(test)]
-pub(crate) use boxed_primitives::{
-    test_boxed_primitive_payload_count, test_seed_boxed_primitive_payload,
+    js_boxed_symbol_new,
 };
 mod collections;
 mod identity_equality;
@@ -625,8 +623,10 @@ pub(crate) fn format_jsvalue(value: f64, depth: usize) -> String {
                     format!("{}n", num_str)
                 }
             }
-        } else if jsval.is_pointer() {
-            let ptr: *const crate::array::ArrayHeader = jsval.as_pointer();
+        } else if jsval.is_reference() {
+            // A heap object or a native handle (#12540); the handle-band arm
+            // below keeps a handle id away from the GC-header dispatch.
+            let ptr = jsval.reference_payload() as *const crate::array::ArrayHeader;
             if ptr.is_null() {
                 "null".to_string()
             } else if crate::symbol::is_registered_symbol(ptr as usize) {
@@ -1227,6 +1227,8 @@ unsafe fn format_object_as_json(
         // non-enumerable JS properties, and these are runtime bookkeeping.
         if crate::object::is_internal_runtime_key(&key_str)
             || crate::object::key_attrs::object_key_is_private(obj_ptr, key_str.as_bytes())
+            // An optional key whose slot holds the hole is absent.
+            || crate::object::key_view::position_is_hole(obj_ptr, keys_array_view, i as u32)
         {
             continue;
         }
@@ -1267,13 +1269,15 @@ unsafe fn format_object_as_json(
             continue;
         }
 
-        let value_str =
-            if let Some(acc) = crate::object::get_accessor_descriptor(obj_addr, &key_str) {
-                format_accessor_property(acc, depth)
-            } else {
-                let value = crate::object::js_object_get_field_f64(obj_ptr, i as u32);
-                format_jsvalue_for_json(value, depth + 1)
-            };
+        let value_str = if let Some(acc) =
+            crate::object::get_accessor_descriptor(obj_addr, &key_str)
+        {
+            format_accessor_property(acc, depth)
+        } else {
+            let value =
+                f64::from_bits(crate::object::js_object_get_key_field(obj_ptr, i as u32).bits());
+            format_jsvalue_for_json(value, depth + 1)
+        };
 
         let display_key = format_inspect_property_key(&key_str);
         let rendered = if is_enumerable {
@@ -1428,8 +1432,10 @@ fn format_jsvalue_for_json(value: f64, depth: usize) -> String {
                     format!("{}n", num_str)
                 }
             }
-        } else if jsval.is_pointer() {
-            let ptr: *const crate::array::ArrayHeader = jsval.as_pointer();
+        } else if jsval.is_reference() {
+            // A heap object or a native handle (#12540); the handle-band arm
+            // below keeps a handle id away from the GC-header dispatch.
+            let ptr = jsval.reference_payload() as *const crate::array::ArrayHeader;
             if ptr.is_null() {
                 "null".to_string()
             } else {

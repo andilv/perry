@@ -27,8 +27,8 @@ pub(crate) unsafe fn custom_to_primitive(value: f64, hint: &[u8]) -> CustomToPri
         return CustomToPrimitiveOutcome::Absent;
     }
 
-    let method_bits = method.to_bits();
-    if (method_bits & 0xFFFF_0000_0000_0000) != POINTER_TAG {
+    let method_tag = method.to_bits() & 0xFFFF_0000_0000_0000;
+    if !crate::value::is_reference_bits(method_tag) {
         return CustomToPrimitiveOutcome::TypeError;
     }
     // #10510: `Date.prototype[Symbol.toPrimitive]` is `OrdinaryToPrimitive`

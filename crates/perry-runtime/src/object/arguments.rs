@@ -581,25 +581,29 @@ pub extern "C" fn js_arguments_bundle_index_get(raw_args: f64, key: f64) -> f64 
     if index as f64 != key {
         return not_own_element;
     }
-    let arr = crate::array::clean_arr_ptr(
-        crate::value::js_nanbox_get_pointer(raw_args) as *const ArrayHeader
-    );
+    let raw = crate::value::js_nanbox_get_pointer(raw_args) as *const ArrayHeader;
+    // Admit the snapshot once. Re-entering clean_arr_ptr and then
+    // array_receiver_gc_tag repeated ownership classification for every
+    // read, even though both establish the same live Array header fact.
+    // Forwarded or descriptor-bearing inputs keep the complete getter below.
+    unsafe {
+        if let Some(header) = crate::value::addr_class::try_read_gc_header(raw as usize) {
+            if header.obj_type == crate::gc::GC_TYPE_ARRAY
+                && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+                && !crate::array::array_has_element_descriptors_resolved(raw)
+                && (*raw).length <= (*raw).capacity
+                && (*raw).capacity as usize <= crate::array::array_physical_capacity(raw)
+            {
+                if index >= (*raw).length {
+                    return not_own_element;
+                }
+                return *(crate::array::array_elements_ptr(raw) as *const f64).add(index as usize);
+            }
+        }
+    }
+    let arr = crate::array::clean_arr_ptr(raw);
     if arr.is_null() {
         return not_own_element;
-    }
-    // A plain array without per-index descriptors holds each own element in
-    // its slot, which is what `js_array_get` returns for it. Anything else
-    // takes the accessors alloc itself uses.
-    let (obj_type, flags) = crate::array::array_receiver_gc_tag(arr);
-    if obj_type == crate::gc::GC_TYPE_ARRAY && flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0 {
-        // SAFETY: `clean_arr_ptr` resolved a live, non-forwarded array whose
-        // length it validated against its capacity.
-        unsafe {
-            if index >= (*arr).length {
-                return not_own_element;
-            }
-            return *(crate::array::array_elements_ptr(arr) as *const f64).add(index as usize);
-        }
     }
     if index >= crate::array::js_array_length(arr) {
         return not_own_element;
@@ -734,7 +738,7 @@ pub(crate) fn test_arguments_registry_probe_count() -> u64 {
 unsafe fn born_arguments_len(obj: *const ObjectHeader) -> Option<u32> {
     let tail = &*arguments_tail(obj);
     let born = tail.birth_shape;
-    (born != 0 && (*obj).parent_class_id == born).then_some(tail.len)
+    (born != 0 && (*obj).shape_word() == born).then_some(tail.len)
 }
 
 unsafe fn born_arguments_index(obj: *const ObjectHeader, index: u32) -> f64 {
@@ -1120,12 +1124,13 @@ pub unsafe extern "C-unwind" fn js_arguments_call_spread(
     let mut values = vec![receiver];
     let symbol = crate::symbol::well_known_symbol("iterator");
     let own_iterator = crate::symbol::js_object_has_own_symbol_property(
-        args.get_nanbox_f64(), crate::value::js_nanbox_pointer(symbol as i64),
+        args.get_nanbox_f64(),
+        crate::value::js_nanbox_pointer(symbol as i64),
     );
     // Ask the actual iterator method on mutated arguments (including a user
     // iterator getter) before falling back to their intrinsic array iterator.
-    let iter = crate::symbol::get_iterator_from_method(args.get_nanbox_f64())
-        .unwrap_or_else(|| {
+    let iter =
+        crate::symbol::get_iterator_from_method(args.get_nanbox_f64()).unwrap_or_else(|| {
             if own_iterator {
                 super::throw_object_type_error(b"Arguments iterator is not callable");
             }
@@ -1135,9 +1140,9 @@ pub unsafe extern "C-unwind" fn js_arguments_call_spread(
     let next = scope.root_nanbox_f64(crate::array::js_iterator_next_method(iter.get_nanbox_f64()));
     loop {
         let mut value = f64::from_bits(crate::value::TAG_UNDEFINED);
-        if crate::array::js_iterator_step(
-            iter.get_nanbox_f64(), next.get_nanbox_f64(), &mut value,
-        ) != 0 {
+        if crate::array::js_iterator_step(iter.get_nanbox_f64(), next.get_nanbox_f64(), &mut value)
+            != 0
+        {
             break;
         }
         values.push(scope.root_nanbox_f64(value));
@@ -1294,6 +1299,7 @@ unsafe fn read_ordinary_own_value(
     for i in 0..key_count {
         let key_val = crate::array::js_array_get(keys, i as u32);
         if crate::string::js_string_key_matches(key_val, key) {
+            let i = keys_view.storage_slot(i as u32) as usize;
             if i < alloc_limit {
                 return js_object_get_field(obj, i as u32);
             }
@@ -1320,6 +1326,7 @@ unsafe fn write_ordinary_own_value(
     for i in 0..key_count {
         let key_val = crate::array::js_array_get(keys, i as u32);
         if crate::string::js_string_key_matches(key_val, key) {
+            let i = keys_view.storage_slot(i as u32) as usize;
             if i < alloc_limit {
                 js_object_set_field(obj, i as u32, JSValue::from_bits(value.to_bits()));
             } else {

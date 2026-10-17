@@ -86,6 +86,7 @@ pub(super) unsafe fn alloc_old_test_promise() -> *mut crate::promise::Promise {
             async_id: 0,
             trigger_async_id: 0,
             meta: std::ptr::null_mut(),
+            callback_context: std::ptr::null_mut(),
         },
     );
     ptr
@@ -125,8 +126,6 @@ pub(super) unsafe fn alloc_old_test_set(
     ) as *mut crate::set::SetHeader;
     let layout = std::alloc::Layout::from_size_align((capacity as usize * 8).max(8), 8)
         .expect("valid set elements layout");
-    let elements = std::alloc::alloc_zeroed(layout) as *mut u64;
-    assert!(!elements.is_null());
     // #11362: the arena does not zero recycled holes; leaving `meta` (a
     // traced edge) or `used` (the scanned extent) as residue is the same bug
     // as the Map fixture's `store`. Zero the whole payload first.
@@ -136,7 +135,7 @@ pub(super) unsafe fn alloc_old_test_set(
         std::mem::size_of::<crate::set::SetHeader>(),
     );
     (*set).capacity = capacity;
-    (*set).elements = elements as *mut f64;
+    let elements = crate::set::test_init_owned_set_store(set, capacity as usize);
     (set, elements, layout)
 }
 
@@ -145,10 +144,18 @@ pub(super) unsafe fn retire_old_test_set(
     elements: *mut u64,
     layout: std::alloc::Layout,
 ) {
-    (*set).size = 0;
-    (*set).capacity = 0;
-    (*set).elements = std::ptr::null_mut();
-    std::alloc::dealloc(elements as *mut u8, layout);
+    let _ = (elements, layout);
+    crate::set::finalize_set_side_allocation_for_gc(set);
+}
+
+/// Return this thread's malloc registry to the lazy, inactive state of a
+/// thread that never asked for exact malloc-pointer validation.
+pub(super) fn deactivate_malloc_registry_for_tests() {
+    MALLOC_STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.set = crate::fast_hash::new_ptr_hash_set();
+        s.registry_state = crate::gc::malloc::MallocRegistryState::Inactive;
+    });
 }
 
 pub(super) fn activate_malloc_registry_for_tests() {
@@ -295,6 +302,7 @@ pub(super) struct ScopedRootScannerRegistryGuard {
     ffi_roots_len: usize,
     ffi_mutable_roots_len: usize,
     prev_auto_init_suppressed: bool,
+    prev_gc_init_done: bool,
     prev_conservative_override: Option<crate::gc::ConservativeStackScanMode>,
 }
 
@@ -316,6 +324,13 @@ impl ScopedRootScannerRegistryGuard {
         // state, not a root the test chose, so every window heals it exactly
         // as `gc_init` does.
         crate::gc::register_prototype_addr_cache_scanner();
+        // The property atom table is the same kind of runtime state: weak,
+        // address-keyed, filled by any key interned inside the window.
+        crate::gc::register_property_atom_scanner();
+        // An explicit gc_init inside the fixture must install the production
+        // scanner set into the newly empty registry. Restore the matching
+        // initialization state together with the saved registry on drop.
+        let prev_gc_init_done = GC_INIT_DONE.with(|done| done.replace(false));
         let prev_auto_init_suppressed = crate::gc::set_auto_gc_init_suppressed(true);
         // Opt out of the test build's full-conservative-scan default (see
         // `conservative_stack_scan_mode`): GC tests verify collection of objects
@@ -330,6 +345,7 @@ impl ScopedRootScannerRegistryGuard {
             ffi_roots_len,
             ffi_mutable_roots_len,
             prev_auto_init_suppressed,
+            prev_gc_init_done,
             prev_conservative_override,
         }
     }
@@ -347,12 +363,69 @@ impl Drop for ScopedRootScannerRegistryGuard {
         });
         crate::gc::set_conservative_stack_scan_override(self.prev_conservative_override);
         crate::gc::set_auto_gc_init_suppressed(self.prev_auto_init_suppressed);
+        GC_INIT_DONE.with(|done| done.set(self.prev_gc_init_done));
     }
 }
 
 pub(super) struct GcTestIsolationGuard {
     _scanner_guard: ScopedRootScannerRegistryGuard,
     _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Keep runtime startup metadata outside controlled GC page fixtures.
+/// The whole page is a valid initialized object, not opaque padding.
+fn isolate_runtime_layout_pages() {
+    let _ = crate::state::state();
+    unsafe {
+        let page = crate::arena::GENERATION_PAGE_SIZE;
+        let minimum = GC_HEADER_SIZE + std::mem::size_of::<crate::array::ArrayHeader>();
+        let total = crate::arena::OLD_ARENA.with(|cell| {
+            let arena = &*cell.get();
+            let block = &arena.blocks[arena.current];
+            let mut remaining = page - ((block.data as usize + block.offset) % page);
+            if remaining < minimum {
+                remaining += page;
+            }
+            remaining
+        });
+        // Consume the tail with a real object. Over-aligning an allocation
+        // leaves an unregistered gap and makes the sequential arena walk stop.
+        let raw = crate::arena::arena_alloc_gc_old(total - GC_HEADER_SIZE, 8, GC_TYPE_ARRAY);
+        let gc = crate::gc::header_from_trusted_user_ptr(raw).cast_mut();
+        let payload = (*gc).size as usize - GC_HEADER_SIZE;
+        std::ptr::write_bytes(raw, 0, payload);
+        let arr = raw.cast::<crate::array::ArrayHeader>();
+        (*arr).length = 0;
+        (*arr).capacity = 0;
+        (*arr).named = std::ptr::null_mut();
+        crate::gc::layout_init_pointer_free(raw);
+    }
+}
+
+/// Compaction fixtures separate their objects from stationary metadata
+/// at block granularity because evacuation moves a whole source block.
+pub(super) fn isolate_runtime_layout_blocks() {
+    let _ = crate::state::state();
+    // The promotion allocator searches every old block with spare bump
+    // space. Merely opening another block still lets it return to the
+    // stationary metadata block after the fixture fills its current block.
+    // Close that tail with a real walkable object, not an alignment gap.
+    let remaining = crate::arena::OLD_ARENA.with(|cell| unsafe {
+        let arena = &*cell.get();
+        let block = &arena.blocks[arena.current];
+        block.size - block.offset
+    });
+    if remaining != 0 {
+        assert!(remaining >= GC_HEADER_SIZE + std::mem::size_of::<crate::array::ArrayHeader>());
+        let raw = crate::arena::arena_alloc_gc_old(remaining - GC_HEADER_SIZE, 8, GC_TYPE_ARRAY);
+        unsafe {
+            std::ptr::write_bytes(raw, 0, remaining - GC_HEADER_SIZE);
+            crate::gc::layout_init_pointer_free(raw);
+        }
+    }
+    crate::arena::OLD_ARENA.with(|cell| unsafe {
+        (&mut *cell.get()).install_fresh_block(crate::arena::BLOCK_SIZE);
+    });
 }
 
 impl GcTestIsolationGuard {
@@ -407,6 +480,7 @@ impl GcTestIsolationGuard {
                  move out of the window is still inside it"
             );
         }
+        isolate_runtime_layout_pages();
         let scanner_guard = ScopedRootScannerRegistryGuard::new();
         reset_copying_nursery_runtime_test_state();
         reset_shadow_stack();
@@ -460,7 +534,6 @@ pub(super) fn reset_copying_nursery_runtime_test_state() {
     crate::object::test_clear_object_cache_roots();
     crate::object::test_clear_class_side_table_roots();
     crate::object::test_clear_arguments_object_roots();
-    crate::symbol::test_clear_symbol_side_table_roots();
     crate::json::test_clear_parse_roots();
     crate::string::prune_dead_utf16_indexes(&|_| true);
     crate::string::trim_cache::test_clear_trim_cache();
@@ -468,12 +541,10 @@ pub(super) fn reset_copying_nursery_runtime_test_state() {
     crate::regex::perex_cache::clear_for_tests();
     #[cfg(feature = "regex-engine")]
     crate::regex::perex_cache::reset_registration_for_tests();
-    crate::set::test_clear_set_roots();
     crate::os::test_clear_process_event_listeners();
     crate::promise::test_clear_promise_scanner_roots();
     crate::timer::test_clear_all_timer_scanner_roots();
     crate::closure::test_clear_singleton_closure_caches();
-    crate::closure::test_clear_closure_side_tables();
     crate::builtins::test_set_console_log_singleton(0);
     crate::geisterhand_registry::test_clear_geisterhand_roots();
     crate::ui_text_registry::test_clear_ui_text_registry_roots();
@@ -489,6 +560,7 @@ pub(super) fn reset_copying_nursery_runtime_test_state() {
 impl CopyingNurseryTestGuard {
     pub(crate) fn new(slot_count: u32) -> Self {
         let lock = copying_nursery_isolation_lock();
+        isolate_runtime_layout_pages();
         let scanner_guard = ScopedRootScannerRegistryGuard::new();
         reset_copying_nursery_runtime_test_state();
         reset_shadow_stack();
@@ -843,6 +915,7 @@ pub(super) fn allocate_dead_malloc_churn_headers(per_type: usize) -> Vec<usize> 
                     async_id: 0,
                     trigger_async_id: 0,
                     meta: std::ptr::null_mut(),
+                    callback_context: std::ptr::null_mut(),
                 },
             );
             headers.push(header_from_user_ptr(ptr as *const u8) as usize);
@@ -961,7 +1034,7 @@ pub(super) unsafe fn alloc_nursery_test_symbol() -> usize {
     let ptr = crate::arena::arena_alloc_gc(
         std::mem::size_of::<crate::symbol::SymbolHeader>(),
         std::mem::align_of::<crate::symbol::SymbolHeader>(),
-        GC_TYPE_STRING,
+        GC_TYPE_SYMBOL,
     );
     init_test_symbol(ptr);
     ptr as usize
@@ -971,7 +1044,7 @@ pub(super) unsafe fn alloc_old_test_symbol() -> usize {
     let ptr = crate::arena::arena_alloc_gc_old(
         std::mem::size_of::<crate::symbol::SymbolHeader>(),
         std::mem::align_of::<crate::symbol::SymbolHeader>(),
-        GC_TYPE_STRING,
+        GC_TYPE_SYMBOL,
     );
     init_test_symbol(ptr);
     ptr as usize
@@ -980,7 +1053,7 @@ pub(super) unsafe fn alloc_old_test_symbol() -> usize {
 pub(super) fn alloc_tracked_test_symbol() -> *mut crate::symbol::SymbolHeader {
     let ptr = gc_malloc(
         std::mem::size_of::<crate::symbol::SymbolHeader>(),
-        GC_TYPE_STRING,
+        GC_TYPE_SYMBOL,
     );
     unsafe {
         init_test_symbol(ptr);
@@ -996,6 +1069,7 @@ pub(super) unsafe fn alloc_old_test_array(
         as *mut crate::array::ArrayHeader;
     (*arr).length = length;
     (*arr).capacity = length;
+    (*arr).named = std::ptr::null_mut();
     let elements =
         crate::array::array_elements_ptr(arr as *const crate::array::ArrayHeader) as *mut u64;
     for i in 0..length as usize {
@@ -1032,9 +1106,9 @@ pub(super) unsafe fn alloc_old_test_map(
     ) as *mut crate::map::MapHeader;
     let layout = std::alloc::Layout::from_size_align((capacity as usize * 16).max(8), 8)
         .expect("valid map entries layout");
-    let entries = std::alloc::alloc_zeroed(layout) as *mut u64;
-    assert!(!entries.is_null());
-    init_test_map_header(map, entries, capacity);
+    init_test_map_header(map, std::ptr::null_mut(), capacity);
+    crate::map::test_init_owned_map_store(map, capacity);
+    let entries = (*map).entries.cast::<u64>();
     (map, entries, layout)
 }
 
@@ -1058,14 +1132,10 @@ pub(super) unsafe fn init_test_map_header(
 
 pub(super) unsafe fn retire_old_test_map(
     map: *mut crate::map::MapHeader,
-    entries: *mut u64,
-    layout: std::alloc::Layout,
+    _entries: *mut u64,
+    _layout: std::alloc::Layout,
 ) {
-    (*map).size = 0;
-    (*map).used = 0;
-    (*map).capacity = 0;
-    (*map).entries = std::ptr::null_mut();
-    std::alloc::dealloc(entries as *mut u8, layout);
+    crate::map::finalize_map_side_allocation_for_gc(map);
 }
 
 /// Charter step 5: re-stamp `obj` with the shape that has its current facts

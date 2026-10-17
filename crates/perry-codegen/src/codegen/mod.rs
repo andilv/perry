@@ -193,6 +193,7 @@ mod closure_collect;
 mod constructor_contracts;
 #[cfg(test)]
 mod number_local_root_tests;
+mod shared_class_method_bodies;
 pub use constructor_contracts::{ConstructorContracts, ResolvedConstructorContracts};
 mod ctor_arity;
 pub use ctor_arity::{
@@ -232,7 +233,9 @@ mod tdz_names;
 pub(crate) mod helpers;
 // #10399: worker entries supplied before any module codegen runs.
 pub use helpers::{set_worker_entries, worker_entries};
+pub(crate) mod accessor_numeric;
 pub(crate) mod global_transfer;
+pub(crate) mod inherited_accessors;
 mod literal_constructor;
 mod method;
 mod method_registry;
@@ -243,6 +246,8 @@ mod native_namespace_exports;
 #[cfg(test)]
 mod number_exactness_tests;
 mod opts;
+mod program_facts_view;
+pub use program_facts_view::{ElisionFacts, FactsClass, FactsField, FactsRecv, ProgramFactsView};
 #[cfg(test)]
 mod ordinary_param_guard_tests;
 mod param_guard;
@@ -270,24 +275,31 @@ pub(crate) use static_shape_ids::{
 };
 mod class_declarations;
 mod string_pool;
+
+/// The image-string address expression of a pool entry (object model step 0's
+/// static atoms point at it).
+pub(crate) fn string_pool_image_pointer(entry: &crate::strings::StringEntry) -> String {
+    string_pool::image_pointer(entry)
+}
 #[cfg(test)]
 mod testing_feature_gate_tests;
 #[cfg(test)]
 mod trusted_box_callback_tests;
 mod typed_abi;
 mod typed_abi_opt_report;
+pub(crate) mod typed_body;
 mod typed_entry;
-pub(crate) use typed_entry::emit_plain_number_test;
+pub(crate) use typed_entry::{emit_plain_number_bits_test, emit_plain_number_test};
 #[cfg(test)]
 mod unknown_func_tests;
 
 pub(crate) use closure::emit_typed_capture_guard;
 pub(crate) use function::arena_threaded_function_body_name;
-pub use helpers::{resolve_target_triple, target_os_of, TARGET_NAMES};
 pub(crate) use helpers::{
     decide_codegen_units, decide_full_outline_ic, default_target_triple, full_outline_ic_enabled,
     module_callable_count, set_full_outline_ic, write_barriers_enabled,
 };
+pub use helpers::{resolve_target_triple, target_os_of, TARGET_NAMES};
 pub use opts::{
     namespace_member_class_key, namespace_member_func_key, namespace_member_var_key, AppMetadata,
     ClassAccessorNames, CompileOptions, ExportedObjectLiteralCapability, FpContractMode,
@@ -474,6 +486,10 @@ fn compile_module_impl(
     births: Option<&mut Vec<ModuleBirth>>,
 ) -> Result<Vec<u8>> {
     let collect_births = births.is_some();
+    // No family facts of a previous module on this thread reach this one's
+    // early analyses; this module's are installed once its births are known.
+    crate::layout_desc::set_module_families(Default::default(), Vec::new());
+    crate::layout_desc::create_families::clear();
     let (live_cjs_hir, cjs_property_exports) = cjs_exports::prepare(hir);
     let hir = live_cjs_hir.as_ref();
     // The driver supplies whole-program ownership in opts. Direct callers
@@ -546,6 +562,7 @@ fn compile_module_impl(
 
     let mut llmod = LlModule::new_with_fp_flags(&triple, fp_flags);
     llmod.program_has_worker = opts.program_has_worker;
+    llmod.set_gc_effects(std::sync::Arc::clone(&opts.gc_effects));
     runtime_decls::declare_phase1(&mut llmod);
 
     // Derive a per-module symbol prefix from the HIR module name:
@@ -564,6 +581,12 @@ fn compile_module_impl(
     // and their per-module counter would otherwise collide across modules
     // at the final link (GNU ld: `multiple definition of .str.N`).
     llmod.set_symbol_prefix(&module_prefix);
+    // wpfacts slice 1: contract builds only (empty otherwise).
+    program_facts_view::emit_contract_section(
+        &mut llmod,
+        &module_prefix,
+        &opts.program_facts.contract_section,
+    );
     // Null guard global: a zeroed i32 used as a safe dereference target
     // when a NaN-unboxed pointer is null/invalid. Prevents segfaults from
     // uninitialized locals or unhandled expressions producing 0.0/TAG_UNDEFINED.
@@ -2070,6 +2093,23 @@ fn compile_module_impl(
     // link).
     let receiver_class_table = &class_table;
     for class in &hir.classes {
+        for (prefix, accessors) in [("__get_", &class.getters), ("__set_", &class.setters)] {
+            for (property, method) in accessors {
+                if class.static_accessor_fn_ids.contains(&method.id) {
+                    continue;
+                }
+                let mut method = method.clone();
+                method.name = format!("{prefix}{property}");
+                if let Some(fact) = crate::collectors::accessor_proven_this(
+                    class,
+                    &method,
+                    receiver_class_table,
+                    &module_dispatch_facts,
+                ) {
+                    pshape_methods.insert((class.name.clone(), method.name), fact);
+                }
+            }
+        }
         for method in &class.methods {
             let source_function = format!("{}::{}", class.name, method.name);
             // Representation-selection Phase 5a: does this method admit a
@@ -2243,6 +2283,7 @@ fn compile_module_impl(
             pshape_methods.insert(
                 (effective_name.clone(), method.clone()),
                 crate::collectors::PtrShapeLocal {
+                    family: None,
                     class_name: effective_name.clone(),
                     numeric_fields: std::collections::HashSet::new(),
                     report_name: crate::opt_report::enabled()
@@ -2511,6 +2552,104 @@ fn compile_module_impl(
         }
         reps
     };
+    // Object model step 1: literal families born with the slot of their first
+    // added key (the capacity `anon_key_adds` reserves becomes a layout
+    // slot), and the carried descriptor of the state holding it.
+    {
+        let mut adds = std::collections::HashMap::new();
+        let mut layouts: Vec<crate::layout_desc::FamilyLayout> = Vec::new();
+        if crate::layout_desc::layouts_enabled(&opts.output_type, &triple) {
+            let mut by_global: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            let mut names: Vec<&String> = anon_key_adds.keys().collect();
+            names.sort();
+            for class_name in names {
+                let added = &anon_key_adds[class_name];
+                let (Some(first), Some(class), Some(keys_global)) = (
+                    added.iter().next(),
+                    class_table.get(class_name),
+                    class_keys_globals_map.get(class_name),
+                ) else {
+                    continue;
+                };
+                if !class_name.starts_with("__AnonShape_")
+                    || imported_stub_names.contains(class_name.as_str())
+                    || class.extends_name.is_some()
+                {
+                    continue;
+                }
+                let Some(&key_count) = class_field_counts_map.get(class_name) else {
+                    continue;
+                };
+                let Some(&(_, _, birth_live)) = class_header_image_inits.get(keys_global) else {
+                    continue;
+                };
+                let rep = class_birth_reps_map.get(keys_global).copied().unwrap_or(0);
+                let base: Vec<String> = class.fields.iter().map(|f| f.name.clone()).collect();
+                // Every lane a plain Any or F64 lane: a ConstFn or deprecated
+                // lane is a different family state.
+                let plain_rep = (0..32).all(|lane| matches!((rep >> (2 * lane)) & 3, 0 | 1));
+                let named_elsewhere = base.iter().any(|k| k == first)
+                    || class.methods.iter().any(|m| &m.name == first)
+                    || class
+                        .getters
+                        .iter()
+                        .chain(&class.setters)
+                        .any(|(k, _)| k == first);
+                if base.len() as u32 != key_count
+                    || birth_live <= key_count
+                    || !plain_rep
+                    || named_elsewhere
+                    || first == "__proto__"
+                    || !crate::layout_desc::key_is_atom(first)
+                    || !base.iter().all(|k| crate::layout_desc::key_is_atom(k))
+                {
+                    continue;
+                }
+                let suffix = keys_global
+                    .strip_prefix("perry_class_keys_")
+                    .unwrap_or(keys_global);
+                let desc_global = format!("perry_layout_fam_{suffix}");
+                if let std::collections::hash_map::Entry::Vacant(v) =
+                    by_global.entry(keys_global.clone())
+                {
+                    v.insert(first.clone());
+                    let mut keys = base.clone();
+                    keys.push(first.clone());
+                    layouts.push(crate::layout_desc::FamilyLayout {
+                        desc_global: desc_global.clone(),
+                        keys,
+                        slot_count: birth_live,
+                        rep,
+                        array_named: false,
+                    });
+                } else if by_global[keys_global] != *first {
+                    continue;
+                }
+                adds.insert(
+                    class_name.clone(),
+                    crate::layout_desc::FamilyAdd {
+                        key: first.clone(),
+                        slot: key_count,
+                        desc_global,
+                        birth_keys: key_count,
+                        birth_rep: rep,
+                    },
+                );
+            }
+        }
+        if crate::layout_desc::layouts_enabled(&opts.output_type, &triple) {
+            layouts.extend(crate::layout_desc::array_families::collect(
+                hir,
+                &module_prefix,
+            ));
+            crate::layout_desc::create_families::collect(hir, &module_prefix);
+        } else {
+            crate::layout_desc::array_families::clear();
+            crate::layout_desc::create_families::clear();
+        }
+        crate::layout_desc::set_module_families(adds, layouts);
+    }
     // Step 5C: a literal's method slot holding a module function's value is a
     // ConstFn lane too; births and lowering read the same admitted set.
     static_constfn::set_module_function_values(hir, &module_prefix);
@@ -2663,6 +2802,9 @@ fn compile_module_impl(
             .filter(|id| !funcs_reading_dynamic_this.contains(id))
             .collect();
     let mut cross_module = CrossModuleCtx {
+        wpfacts: opts.program_facts.elision.clone(),
+        capture_type_proofs: Default::default(),
+        program_layouts: Arc::clone(&opts.program_layouts),
         program_has_worker: opts.program_has_worker,
         program_has_thread_agents: thread_agents,
         class_hierarchy: class_hierarchy::ClassHierarchy::default(),
@@ -2828,6 +2970,7 @@ fn compile_module_impl(
         compiler_private_async_i1_control_locals,
         scope_map: Default::default(),
         string_accumulator_locals: Default::default(),
+        definite_init: Default::default(),
         disable_buffer_fast_path,
         program_shadows_buffer_read_method:
             crate::lower_call::buffer_intrinsic::module_shadows_buffer_read_method(hir),
@@ -3001,7 +3144,7 @@ fn compile_module_impl(
 
     // Method registry + cross-module method/getter/setter/ctor/static
     // extern declares. See `method_registry::build_method_names`.
-    let method_names = method_registry::build_method_names(
+    let mut method_names = method_registry::build_method_names(
         &mut llmod,
         hir,
         &opts.imported_classes,
@@ -3010,6 +3153,13 @@ fn compile_module_impl(
         &imported_class_prefix,
         &imported_class_source_name,
         &module_prefix,
+    );
+    inherited_accessors::register(
+        hir,
+        &class_table,
+        &class_ids,
+        &mut method_names,
+        &mut cross_module,
     );
     cross_module.class_hierarchy =
         class_hierarchy::ClassHierarchy::new(&class_table, &method_names);
@@ -3041,6 +3191,9 @@ fn compile_module_impl(
     cross_module.scope_map =
         crate::scope_env::ScopeMap::build(hir, &module_boxed_vars, &module_globals);
     cross_module.string_accumulator_locals = crate::collectors::string_accumulator_locals(hir);
+    cross_module.capture_type_proofs =
+        crate::collectors::typed_locals::capture_proofs(hir, &module_boxed_vars, &module_globals);
+    cross_module.definite_init = crate::collectors::definite_init::collect(hir);
     // #6369: the *receiver-type oracle* for closure bodies — every module-wide
     // `Stmt::Let` type, with NO representation-driven filtering. `FnCtx.
     // local_types` is what `static_type_of` / `is_array_expr` /
@@ -3419,6 +3572,18 @@ fn compile_module_impl(
             {
                 reject(
                     typed_abi::TypedCloneRejectionReason::SpecTypedCloneOverlap,
+                    &mut typed_clone_rejection_records,
+                );
+                continue;
+            }
+            // A specialized entry is a second full copy of the body. For a
+            // giant body (a generated straight-line driver, a 400-case
+            // switch) that doubles the dominant LLVM cost and its `.text`
+            // for entry-bound parameter facts that a body this size
+            // amortizes to nothing.
+            if spec_abi::spec_body_too_large(&f.body) {
+                reject(
+                    typed_abi::TypedCloneRejectionReason::SpecBodyTooLarge,
                     &mut typed_clone_rejection_records,
                 );
                 continue;
@@ -4008,6 +4173,32 @@ fn compile_module_impl(
             llmod.request_static_seed_body(info.strip_suffix("$info").expect("body info suffix"));
         }
     }
+    // Accessor capabilities are module-local and never registered as JS
+    // functions. Drop unused bodies before codegen units promote internals.
+    let accessor_bodies = cross_module
+        .pshape_methods
+        .keys()
+        .filter(|(_, member)| member.starts_with("__get_") || member.starts_with("__set_"))
+        .filter_map(|(receiver, member)| {
+            let public = method_names.get(&(receiver.clone(), member.clone()))?;
+            let setter = member.starts_with("__set_");
+            let property = &member[6..];
+            let (owner, _) = static_prototype::accessor_owner(
+                &class_table,
+                &class_ids,
+                receiver,
+                property,
+                setter,
+            )?;
+            let body = if owner == *receiver {
+                public.clone()
+            } else {
+                inherited_accessors::receiver_body_name(public, class_ids[receiver])
+            };
+            Some(crate::collectors::pshape_method_name(&body))
+        })
+        .collect();
+    llmod.prune_private_capabilities(&accessor_bodies);
     llmod.emit_fn_infos(constfn_body_metadata);
 
     // Emit the buffer alias-scope metadata once per module, covering every

@@ -80,15 +80,21 @@ unsafe fn try_data_lookup_key(
     let addr = object as usize;
     let mut first_shape = None;
     let mut own_absent = false;
-    if crate::value::addr_class::is_plausible_heap_addr(addr)
+    // A POINTER_TAG receiver names a GC-headed object (honest pointers).
+    if crate::value::addr_class::is_above_handle_band(addr)
         && addr.is_multiple_of(std::mem::align_of::<ObjectHeader>())
     {
-        let shape_id = (*object).parent_class_id;
+        // Bit 30 (`layout_desc::LAYOUT_SHADOW_BIT`) clear proves there is no
+        // overflow. With an overflow installed, it is the order authority and
+        // answers the own lookup; a bit set by a dynamic write or relink alone
+        // (object model step 3) leaves the layout complete for own keys.
+        let shadowed = !super::overflow::table(object).is_null();
+        let shape_id = super::layout_desc::layout_id_of_word((*object).parent_class_id);
         // Non-object cells, unstamped receivers and dictionary/exotic shapes
         // cannot supply this proof. Decline from the owner word before paying
         // for the agent directory; no registry determines this classification.
         let ordinary_id = shape_id.wrapping_sub(shapes::SHAPE_ID_BASE)
-            < shapes::DICTIONARY_SHAPE_ID_BASE - shapes::SHAPE_ID_BASE;
+            < shapes::SITE_SHAPE_ID_END - shapes::SHAPE_ID_BASE;
         if !ordinary_id {
             // The data walk needs an ordinary-band descriptor. Unstamped
             // cells have none; dictionary and function namespaces never
@@ -101,8 +107,43 @@ unsafe fn try_data_lookup_key(
             // still handles class getters and other special receiver reads.
             let shape = own_shape?;
             first_shape = Some(shape);
-            let lookup = shape.plain_lookup(key_bits, key);
-            own_absent = lookup == Some(None);
+            if shadowed {
+                let table = super::overflow::table(object);
+                if table.is_null() {
+                    return None;
+                }
+                // Every own key is an entry of the table, so a miss proves the
+                // key is not own: the prototype walk below continues from the
+                // receiver's link (object model §3.7 case 3).
+                if let Some(entry) = super::overflow::find_key(table, key_bits, key) {
+                    let attrs = *super::overflow::attrs_at(table, entry) as u8;
+                    let header = &*crate::gc::header_from_trusted_user_ptr(object.cast());
+                    let meta = (*object).meta;
+                    if attrs & super::key_attrs::ENTRY_ACCESSOR != 0
+                        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+                        || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
+                        || (*meta).elements != 0
+                    {
+                        return None;
+                    }
+                    let value =
+                        JSValue::from_bits(super::overflow::get_from(table, object, entry)?);
+                    if value.bits() == crate::value::TAG_HOLE
+                        || (value.is_undefined()
+                            && super::native_this_alias::object_alias(object).is_some())
+                    {
+                        return None;
+                    }
+                    return Some(Some(value));
+                }
+                own_absent = true;
+            }
+            let lookup = if shadowed {
+                None
+            } else {
+                shape.plain_lookup(key_bits, key)
+            };
+            own_absent |= lookup == Some(None);
             if let Some(Some((slot, live))) = lookup {
                 // The live shape proves a shaped ObjectHeader. Owner-local state
                 // still controls forwarding and indexed/exotic receiver layouts.
@@ -137,51 +178,49 @@ unsafe fn try_data_lookup_key(
     let mut inherited = false;
     for _ in 0..32 {
         let addr = object as usize;
-        let (header, keys, key_count, live, summary, dictionary, proto_id) = if let Some(shape) =
-            first_shape.take()
-        {
-            // The receiver's live ordinary shape already proved ObjectHeader
-            // layout. Reuse it on wide, semantic and absent-key reads too;
-            // these facts are consumed without allocation or user code.
-            (
-                &*crate::gc::header_from_trusted_user_ptr(object.cast()),
-                shape.keys,
-                shape.logical_key_count,
-                shape.live_inline_slot_count,
-                shape.summary,
-                false, // The retained proof came from the ordinary ShapeId band.
-                shape.proto_id,
-            )
-        } else {
-            // An inherited hop or unproved cell still needs positive arena
-            // membership before inspecting a possibly headerless handle.
-            if !crate::value::addr_class::is_plausible_heap_addr(addr)
-                || crate::arena::classify_heap_generation(addr)
-                    == crate::arena::HeapGeneration::Unknown
-            {
-                return None;
-            }
-            let header = crate::value::addr_class::try_read_gc_header_known_plausible(addr)?;
-            if header.obj_type != crate::gc::GC_TYPE_OBJECT
-                || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-                || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
-            {
-                return None;
-            }
-            let descriptor = shapes::object_shape_descriptor(object)?;
-            if !descriptor.object_kind.is_ordinary_layout() {
-                return None;
-            }
-            (
-                header,
-                descriptor.keys,
-                descriptor.logical_key_count,
-                descriptor.live_inline_slot_count,
-                descriptor.summary,
-                descriptor.semantic_generation & super::dictionary::DICTIONARY_GENERATION_TAG != 0,
-                descriptor.proto_id,
-            )
-        };
+        let (header, keys, key_count, live, summary, dictionary, proto_id) =
+            if let Some(shape) = first_shape.take() {
+                // The receiver's live ordinary shape already proved ObjectHeader
+                // layout. Reuse it on wide, semantic and absent-key reads too;
+                // these facts are consumed without allocation or user code.
+                (
+                    &*crate::gc::header_from_trusted_user_ptr(object.cast()),
+                    shape.keys,
+                    shape.logical_key_count,
+                    shape.live_inline_slot_count,
+                    shape.summary,
+                    false, // The retained proof came from the ordinary ShapeId band.
+                    shape.proto_id,
+                )
+            } else {
+                // The receiver and every hop are POINTER_TAG words or the realm's
+                // resolved prototype: honest pointers, so the header needs no
+                // admission. The arena flag keeps the malloc-backed exotics out.
+                if !crate::value::addr_class::is_above_handle_band(addr) {
+                    return None;
+                }
+                let header = &*crate::gc::header_from_trusted_user_ptr(addr as *const u8);
+                if header.gc_flags & crate::gc::GC_FLAG_ARENA == 0
+                    || header.obj_type != crate::gc::GC_TYPE_OBJECT
+                    || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+                    || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
+                {
+                    return None;
+                }
+                let descriptor = shapes::object_shape_descriptor(object)?;
+                if !descriptor.object_kind.is_ordinary_layout() {
+                    return None;
+                }
+                (
+                    header,
+                    descriptor.keys,
+                    descriptor.logical_key_count,
+                    descriptor.live_inline_slot_count,
+                    descriptor.summary,
+                    super::overflow::has_overflow(object),
+                    descriptor.proto_id,
+                )
+            };
         if header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
             || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
         {
@@ -207,7 +246,26 @@ unsafe fn try_data_lookup_key(
             // The positional shape lookup already proved absence. Do not
             // search the same key list again before following its link.
             own_absent = false;
-        } else if !super::key_attrs::object_key_is_accessor(object, key) {
+        } else if dictionary {
+            // A hop with an overflow: its table holds every own key (a fixed
+            // key as a slot reference), so one atom-keyed probe answers it.
+            let table = super::overflow::table(object);
+            if let Some(entry) = super::overflow::find_key(table, key_bits, key) {
+                let attrs = *super::overflow::attrs_at(table, entry) as u8;
+                if attrs & super::key_attrs::ENTRY_ACCESSOR != 0 {
+                    return None;
+                }
+                let value = JSValue::from_bits(super::overflow::get_from(table, object, entry)?);
+                if value.bits() == crate::value::TAG_HOLE
+                    || (inherited && (value.is_undefined() || value.is_null()))
+                    || (value.is_undefined()
+                        && super::native_this_alias::object_alias(object).is_some())
+                {
+                    return None;
+                }
+                return Some(Some(value));
+            }
+        } else {
             let keys = keys as usize as *const crate::array::ArrayHeader;
             if !keys.is_null() {
                 // Public reads skip intrinsic and class-private entries.
@@ -222,12 +280,22 @@ unsafe fn try_data_lookup_key(
                         keys, key_count, key, key_hash,
                     )
                 };
-                if let Some(slot) = slot {
+                if let Some(position) = slot {
+                    // The key's attribute word answers the accessor question
+                    // and holds its storage slot: one lookup, one load.
+                    let word = super::key_attrs::key_word(keys, position);
+                    if word as u8 & super::key_attrs::ENTRY_ACCESSOR != 0 {
+                        return None;
+                    }
+                    let slot = super::key_attrs::slot_of_word(word, position);
                     let value = super::field_get_set::object_field_at_with_live(object, slot, live);
                     // Legacy inherited resolution treats undefined/null as
                     // misses at some class edges. Preserve that fallback, and
                     // the f64 entry's native-handle alias on undefined reads.
-                    if (inherited && (value.is_undefined() || value.is_null()))
+                    // A slot holding the hole is an absent optional key
+                    // (`key_view`): the generic read continues the chain.
+                    if value.bits() == crate::value::TAG_HOLE
+                        || (inherited && (value.is_undefined() || value.is_null()))
                         || (value.is_undefined()
                             && super::native_this_alias::object_alias(object).is_some())
                     {
@@ -240,8 +308,6 @@ unsafe fn try_data_lookup_key(
                 // Its mutable list is read by the ordinary generic lookup.
                 return None;
             }
-        } else {
-            return None;
         }
         if proto_id == shapes::PROTO_ID_NULL {
             // The chain ends here, and no hop listed the key.

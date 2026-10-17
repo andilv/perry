@@ -97,7 +97,7 @@ fn js_bool(value: bool) -> f64 {
 }
 
 fn boxed_handle(handle: i64) -> f64 {
-    f64::from_bits(0x7FFD_0000_0000_0000 | (handle as u64 & 0x0000_FFFF_FFFF_FFFF))
+    f64::from_bits(perry_ffi::JsValue::from_object_ptr(handle as usize as *mut u8).bits())
 }
 
 fn handle_from_value(value: f64) -> Option<i64> {
@@ -559,10 +559,11 @@ pub extern "C" fn js_net_socket_address_to_json(handle: i64) -> f64 {
         )
         .bits(),
     ));
-    let keys = ["address", "port", "family", "flowlabel"];
-    let (packed, shape_id) = perry_ffi::build_object_shape(&keys);
+
     let object = scope.root_addr(unsafe {
-        perry_ffi::js_object_alloc_with_shape(shape_id, 4, packed.as_ptr(), packed.len() as u32)
+        perry_ffi::runtime_layouts::alloc_runtime_record(std::ptr::addr_of!(
+            perry_ffi::runtime_layouts::RECORD_F20_0
+        ))
     } as i64);
     for (i, value) in [
         address.get(),

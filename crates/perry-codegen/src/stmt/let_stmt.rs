@@ -89,6 +89,9 @@ pub(crate) fn lower_let(
             if crate::expr::ordinary_object_allocation(ctx, init_expr) {
                 ctx.object_literal_locals.insert(id);
             }
+            if let Some(kind) = crate::expr::collection_receiver::constructed_kind(ctx, init_expr) {
+                ctx.constructed_kind_locals.insert(id, kind);
+            }
         }
     }
     if let Some(init_expr) = init {
@@ -392,14 +395,7 @@ pub(crate) fn lower_let(
             ctx.tdz_boxes.remove(&id);
             let set = perry_hir::Expr::LocalSet(id, Box::new(init_expr.clone()));
             // A region's plan names the original initializer (step 4b).
-            let aliased = match &set {
-                perry_hir::Expr::LocalSet(_, v) => {
-                    crate::stmt::region_loop::alias_clone(ctx, init_expr, v)
-                }
-                _ => Vec::new(),
-            };
             let lowered = crate::expr::lower_expr(ctx, &set);
-            crate::stmt::region_loop::unalias_clone(ctx, aliased);
             lowered?;
             // #10488: a hoisted `var`'s real declaration reaches this branch
             // (#1803 predefine-then-declare) and returns before the

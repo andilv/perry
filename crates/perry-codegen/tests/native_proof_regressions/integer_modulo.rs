@@ -46,10 +46,38 @@ fn assert_integer_modulo_with_negative_zero_repair(ir: &str) {
 }
 
 fn assert_checked_modulo(ir: &str) {
+    // The fallback is the shared out-of-line `js_number_mod` helper (exact
+    // i53 remainder, else `fmod`), not an inline `frem` — `frem` was already a
+    // libm call, so the site keeps its size.
     assert!(
-        ir.contains("frem double"),
-        "runtime-checked modulo must retain the floating fallback:\n{ir}"
+        ir.contains("call double @js_number_mod("),
+        "runtime-checked modulo must fall back to the shared js_number_mod helper:\n{ir}"
     );
+    // Scope the "no frem" check to the checked path's own fallback blocks: a
+    // separate typed-f64 clone of a constant expression may still fold
+    // through `frem double <const>, <const>`, which is not this lowering.
+    let fallbacks: Vec<&str> = ir
+        .split("\nmod.f64.fallback")
+        .skip(1)
+        .map(|rest| {
+            rest.split("\n\n")
+                .next()
+                .unwrap_or(rest)
+                .split("\nmod.merge")
+                .next()
+                .unwrap_or(rest)
+        })
+        .collect();
+    assert!(
+        !fallbacks.is_empty(),
+        "checked modulo must emit a mod.f64.fallback block:\n{ir}"
+    );
+    for block in &fallbacks {
+        assert!(
+            block.contains("call double @js_number_mod(") && !block.contains("frem double"),
+            "the checked-modulo fallback must call js_number_mod, not frem:\n{block}"
+        );
+    }
     assert!(
         ir.contains("mod.i32.convert")
             && ir.contains("srem i32")
@@ -112,7 +140,8 @@ fn i32_counter_mod_unsafe_or_nonliteral_divisors_use_checked_path() {
         // fire and the checked path handles it at runtime.
         number(1000.0),
         // `srem(x, 0)` is UB in LLVM; JS `x % 0` is NaN. The static path
-        // excludes it, and the checked path branches to `frem` at runtime.
+        // excludes it, and the checked path branches to `js_number_mod`
+        // (NaN for a zero divisor) at runtime.
         int(0),
         // Fractional — `Expr::Number`, same as `integral_number` above.
         number(2.5),
@@ -143,7 +172,7 @@ fn i32_counter_mod_unsafe_or_nonliteral_divisors_use_checked_path() {
 }
 
 #[test]
-fn non_i32_left_operands_use_checked_path_with_frem_fallback() {
+fn non_i32_left_operands_use_checked_path_with_number_mod_fallback() {
     let f64_ir = compile_ir(
         "value_first_f64_modulo.ts",
         vec![

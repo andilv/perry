@@ -7,6 +7,16 @@
 
 use super::*;
 
+// #9202: `js_nm_install_stream` registers the `node:stream` dispatch bucket
+// and, with it, the attach hook that installs `Readable.prototype`'s methods.
+// `object/mod.rs` re-exports the installers submodule helpers delegate to, but
+// not this one, so the runtime ABI symbol is declared here — same shape as
+// `timer.rs`'s `js_stdlib_has_active_handles` and as the declaration codegen
+// emits into every generated module that calls it.
+extern "C" {
+    fn js_nm_install_stream();
+}
+
 #[derive(Clone, Copy)]
 enum RegisteredNode {
     Test(usize),
@@ -899,11 +909,35 @@ pub(crate) extern "C" fn thunk_test_run(
     _this: crate::closure::JsThis,
     _options: f64,
 ) -> f64 {
+    // #9202: `run()` hands the caller a `node:stream` `Readable`, whose
+    // methods (including `Symbol.asyncIterator`, the `for await` entry point)
+    // are installed on the prototype by `js_nm_install_stream()`'s attach
+    // hook. A program that imports `node:test` but never `node:stream` never
+    // calls that install, so the stream it gets back here has no methods at
+    // all and `for await (const e of run(...))` threw `value is not iterable`.
+    // Same idiom as `js_nm_install_fs` / `_http` / `_tls`, which install
+    // `stream` before handing out their stream objects.
+    unsafe {
+        js_nm_install_stream();
+    }
     let mut array = crate::array::js_array_alloc(0);
     for _ in 0..10 {
         array = crate::array::js_array_push_f64(array, undefined_value());
     }
     crate::node_stream::js_node_stream_readable_from(boxed_ptr(array))
+}
+
+/// #9202: the `node:test` `expectFailure(options)` named export. Perry's
+/// runner does not execute tests (`thunk_test_run` reports a fixed event
+/// stream), so there is nothing to mark and the call is a no-op returning
+/// `undefined` — the export exists so `typeof expectFailure` is `"function"`
+/// and the namespace shape matches Node's.
+pub(crate) extern "C" fn thunk_test_expect_failure(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    _options: f64,
+) -> f64 {
+    undefined_value()
 }
 
 #[no_mangle]
@@ -1043,5 +1077,36 @@ fn scan_result_roots(result: &mut TestResult, visitor: &mut crate::gc::RuntimeRo
     }
     for child in &mut result.children {
         scan_result_roots(child, visitor);
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    /// #9202: `node:test`'s `expectFailure` has to resolve through the export
+    /// table to a real callable. Pre-fix `find_export` had no entry for it, so
+    /// the shared export path handed back the TAG_TRUE "unlisted export"
+    /// sentinel and `typeof expectFailure` was `"boolean"` while the sibling
+    /// namespace read (a compile-time `typeof` fold) still printed `function`.
+    #[test]
+    fn expect_failure_exported_as_a_callable() {
+        crate::node_submodules::js_node_submod_install_test();
+        let value = crate::node_test::property("expectFailure")
+            .expect("node:test must list the expectFailure export");
+        assert!(
+            is_callable_value(value),
+            "expectFailure must be a callable, got {:#x}",
+            value.to_bits()
+        );
+        let called = thunk_test_expect_failure(
+            std::ptr::null(),
+            crate::closure::plain_call_receiver(),
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        );
+        assert!(
+            is_undefined_value(called),
+            "expectFailure() must return undefined from the stub runner"
+        );
     }
 }

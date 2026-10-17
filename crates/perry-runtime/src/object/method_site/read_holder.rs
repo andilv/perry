@@ -31,8 +31,56 @@
 //!
 //! The primary entry lives in `PicCache` words [`HOLDER_RECV`]..[`HOLDER_STATE`].
 //! Eight further complete answers belong to the same site's bounded record.
-//! Holders, hops and accessor pairs are strong roots, rewritten when they move
-//! ([`scan_read_holder_roots_mut`]).
+//!
+//! # Weak entries
+//!
+//! No entry word is a GC root, no site is registered, and no collection visits
+//! or rewrites an entry. The same holds for the class entries
+//! (`class_read.rs`), keyed entries' holders (`keyed.rs`; their KEYS are still
+//! rooted until keys are immortal atoms) and method-site entries and chain
+//! proofs (`method_site.rs`). Each premise below is enforced at publication
+//! and backed by a test (`gc/tests/holder_memo.rs`):
+//!
+//! 1. **Stable referents (I1).** Every object address an entry stores — a
+//!    holder, an intermediate hop, a terminal — is admitted by
+//!    `method_site::memo_referents_stable`: a `GC_TYPE_OBJECT` that is old and
+//!    never-move (`gc::never_move`). A minor never moves an old object, and
+//!    the only passes that move old objects (old-page defragmentation and
+//!    idle compaction) decline any block holding a never-move one. So while a
+//!    named object lives, it is at the stored address. A young candidate is
+//!    refused and marked; the next minor promotes it and the site primes again.
+//! 2. **ShapeIds are never reused** (`shapes.rs`), and a hit reads no entry
+//!    word before the live receiver's ShapeId equals the entry's token.
+//! 3. **A receiver ShapeId pins its [[Prototype]]**: a serial, default or
+//!    MIXED identity names one object, and the receiver (its meta record, or
+//!    the shape's identity word) references it, so a live receiver carrying
+//!    the token keeps that prototype alive. Each further hop is admitted only
+//!    if its own ShapeId pins its link (`hop_identity_pins_link`), and the hit
+//!    compares each hop's ShapeId before following it, so by induction every
+//!    named object is reachable from the receiver. A ShapeId whose objects
+//!    have all died can never be carried again (2), so an entry naming a dead
+//!    object can never pass its token compare.
+//! 4. **A bare CLASS identity** names the class's *current* prototype, which a
+//!    relink can displace while receivers of the token (or, for a declared
+//!    parent link, a hop carrying it) live on. Class entries and chain proofs
+//!    compare the live identity word before any holder. For every other
+//!    reader, publication flags each referent memo-named
+//!    (`gc::never_move::note_memo_named`) and the relink's retirement
+//!    (`class_registry::retire_displaced_decl_prototype`) pins a flagged
+//!    prototype, so the entry keeps reading that object, whose re-stamped
+//!    ShapeId no longer matches.
+//! 5. **Accessor pairs** are compared, never dereferenced before the compare:
+//!    the hit loads the holder's live lane and compares it with the primed
+//!    pair. A pair is reachable from its holder while it is in the lane.
+//!    Replacing a pair's getter or setter moves the holder to a fresh ShapeId
+//!    (`descriptor_state::note_accessor_function_replaced`), so a new pair
+//!    reusing a dead pair's address in the same lane matches an old entry
+//!    only if it holds the same functions — and then the entry's getter is
+//!    that pair's getter. A pair that moves only makes the entry miss and
+//!    re-prime.
+//!
+//! The worker gate is unchanged: once a worker starts, no agent reads an
+//! entry, so stale words are inert.
 //!
 //! # Emitted form
 //!
@@ -53,8 +101,7 @@
 //! is not own. Data and absent entries are recorded only after the generic
 //! getter's answer agrees with the shapes. An accessor is published only
 //! after its pair is validated, then its getter runs once. A worker
-//! agent's start gates all further
-//! holder hits and primes; stale entries stop being roots and can collect.
+//! agent's start gates all further holder hits and primes.
 //!
 //! A miss whose receiver a live entry already answers is served from the
 //! entry and primes nothing. Complete answers for other receiver shapes use
@@ -66,40 +113,16 @@ use crate::object::shapes::{
     object_shape_descriptor, object_shape_stamp, shape_proto_id, PIC_ID_TOKEN_BIT, PROTO_ID_CLASS,
     PROTO_ID_DEFAULT, PROTO_ID_MIXED, PROTO_ID_NULL, PROTO_ID_UNIQUE,
 };
-use crate::object::{ObjectHeader, PicCache, PicCacheSlot};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::object::ObjectHeader;
+use std::sync::atomic::Ordering;
 
-mod accessor_guard;
 mod accessor_path;
-mod entry_answer;
-mod function_own;
-#[cfg(any(test, feature = "regex-engine"))]
-use accessor_path::accessor_holder;
 pub(crate) use accessor_path::accessor_walk;
-use entry_answer::saved_entry_answer;
-pub(crate) use entry_answer::{entry_answer, primary_entry_answer};
-use function_own::HOLDER_FUNCTION_BAG;
-pub(crate) use function_own::{prime_alias, try_alias_cached_accessor};
-pub(crate) mod class_read;
-pub(crate) mod exotic_read;
+mod inspect;
+pub(crate) use inspect::shape_answer;
 pub(crate) mod keyed;
-mod runtime_chain;
 pub(crate) mod shared;
-pub(crate) use runtime_chain::read_runtime_chain;
-#[cfg(any(test, feature = "regex-engine"))]
-pub(crate) mod probe;
-use accessor_guard::validated_accessor;
 
-#[cfg(test)]
-mod memo_tests;
-
-/// The receiver's ShapeId as a PIC token (`ShapeId | PIC_ID_TOKEN_BIT`), or 0
-/// for an empty entry. A zeroed cache is therefore an empty one: no token is 0.
-pub const HOLDER_RECV: usize = crate::codegen_abi::PIC_HOLDER_RECV_WORD;
-/// The holder's (or, for an absent entry, the terminal object's) address.
-pub const HOLDER_OBJ: usize = crate::codegen_abi::PIC_HOLDER_OBJ_WORD;
-/// Low 32 bits: the holder's ShapeId. High 32 bits: the third hop's ShapeId.
-pub const HOLDER_SHAPE: usize = crate::codegen_abi::PIC_HOLDER_SHAPE_WORD;
 /// The answer's kind:
 ///
 /// | value | meaning |
@@ -120,49 +143,25 @@ pub const HOLDER_HOPS: usize = HOLDER_KIND + 1;
 /// (`accessor_pair::holder_closure_getter_entry`), which reads the closure
 /// from the pair at each hit; 0 for a setter-only pair or a deep chain
 /// that needs the collecting validator. A code address, never a GC pointer:
-/// the root scan never visits this word.
-/// The accessor's pair itself (its raw address) is in [`HOLDER_HOPS`], a
-/// strong root rewritten on move like the hop words it replaces.
+/// no GC pass reads this word.
+/// The accessor's pair itself (its raw address) is in [`HOLDER_HOPS`]: a
+/// compared word, never a root (see "Weak entries").
 pub const HOLDER_HOP_SHAPES: usize = HOLDER_HOPS + 3;
-/// The site's registration and bounded-record state.
+/// The site's bounded-record state.
 pub const HOLDER_STATE: usize = crate::codegen_abi::PIC_HOLDER_STATE_WORD;
-/// The cache is on the root list.
-const STATE_REGISTERED: i64 = 1;
 /// Legacy ABI bit: no new holder prime sets it.
 #[cfg(test)]
 const STATE_LATCHED: i64 = crate::codegen_abi::PIC_HOLDER_STATE_LATCHED;
 const _: () = assert!(HOLDER_STATE == HOLDER_HOP_SHAPES + 1);
 
-pub const HOLDER_ABSENT_DEPTH1: i64 = crate::codegen_abi::PIC_HOLDER_ABSENT_DEPTH1;
-pub const HOLDER_STUB: u64 = 1 << 63;
-const HOLDER_ABSENT_BIT: u64 = 1 << 62;
-/// A direct-prototype accessor. It can collect and therefore never answers
-/// from the GC-leaf front call: the emitted arm calls the getter, and the
-/// collecting slow call asks [`try_cached_accessor`] first.
-const HOLDER_ACCESSOR: u64 = crate::codegen_abi::PIC_HOLDER_ACCESSOR_BIT as u64;
 // Deep accessors use the collecting hit, with each intermediate ShapeId
 // checked in the same site's bounded class-read record. Getter word 0 keeps
 // the emitted direct-holder arm from answering without those checks.
-const HOLDER_ACCESSOR_DEEP: u64 = HOLDER_STUB;
 // The emitted accessor arm (`perry-codegen/src/expr/property_get/
 // accessor_arm.rs`) reads the pair and the getter from these words.
 const _: () = assert!(HOLDER_HOPS == crate::codegen_abi::PIC_HOLDER_PAIR_WORD);
 const _: () = assert!(HOLDER_HOP_SHAPES == crate::codegen_abi::PIC_HOLDER_GETTER_WORD);
-/// Depth-1 ABSENT entries can share one terminal holder across several
-/// receiver shapes. The spare hop words hold ShapeIds, never GC pointers.
-const HOLDER_MULTI_ABSENT: u64 = 1 << 60;
-const MULTI_ABSENT_EXTRA_IDS: usize = 9;
-const MULTI_ABSENT_NEXT_MASK: u64 = 0xf;
-/// A multi-shape DATA entry keeps its holder slot word above the next-way
-/// index.
-const MULTI_SLOT_SHIFT: u32 = 8;
 
-/// The holder slot word of a multi-shape data entry's kind.
-#[inline]
-fn multi_slot(kind: u64) -> u32 {
-    (kind >> MULTI_SLOT_SHIFT) as u32
-}
-const HOLDER_DEPTH_SHIFT: u32 = 32;
 /// A holder slot word with this bit set names the holder's SPILL position
 /// (the low bits), not an inline slot: a key past the holder's inline region,
 /// as `%Object.prototype%`'s `constructor` and keys added to a declared
@@ -173,211 +172,6 @@ const HOLDER_DEPTH_SHIFT: u32 = 32;
 /// common depth-1 inline hit stays one compare.
 pub(super) const HOLDER_SLOT_SPILL: u32 = crate::codegen_abi::PIC_HOLDER_SLOT_SPILL_BIT as u32;
 pub(crate) const HOLDER_MAX_DEPTH: usize = 4;
-
-/// A complete answer uses the eight existing holder words. Overflow entries
-/// retain no own-property PIC words or site metadata. The primary answer is
-/// viewed through this same layout, so both consumers use identical validators.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-struct HolderEntry([i64; HOLDER_STATE - HOLDER_RECV]);
-
-impl std::ops::Index<usize> for HolderEntry {
-    type Output = i64;
-    #[inline(always)]
-    fn index(&self, word: usize) -> &i64 {
-        &self.0[word - HOLDER_RECV]
-    }
-}
-impl std::ops::IndexMut<usize> for HolderEntry {
-    #[inline(always)]
-    fn index_mut(&mut self, word: usize) -> &mut i64 {
-        &mut self.0[word - HOLDER_RECV]
-    }
-}
-impl HolderEntry {
-    #[cfg(test)]
-    fn as_ptr(&self) -> *const i64 {
-        self.0.as_ptr()
-    }
-}
-
-#[inline(always)]
-fn holder_words(c: &PicCache) -> &HolderEntry {
-    // SAFETY: repr(transparent), identical i64 alignment, and the entire
-    // eight-word holder region is inside PicCache.
-    unsafe { &*(c.as_ptr().add(HOLDER_RECV) as *const HolderEntry) }
-}
-#[inline(always)]
-fn holder_words_mut(c: &mut PicCache) -> &mut HolderEntry {
-    unsafe { &mut *(c.as_mut_ptr().add(HOLDER_RECV) as *mut HolderEntry) }
-}
-
-/// Every cache that holds (or held) a holder entry, for the primary agent's
-/// root scan until a worker starts. The entries are in the per-site caches;
-/// this is only where the scan finds them.
-#[derive(Clone, Copy)]
-enum HolderSite {
-    Named(usize),
-    Keyed(usize),
-}
-
-static HOLDER_SITES: std::sync::Mutex<Vec<HolderSite>> = std::sync::Mutex::new(Vec::new());
-
-per_test_global! {
-    static PRIMES_HOLDER: AtomicU64 = AtomicU64::new(0);
-    static PRIMES_ABSENT: AtomicU64 = AtomicU64::new(0);
-    static REFUSED_HOLDER: AtomicU64 = AtomicU64::new(0);
-    static PRIMES_ACCESSOR: AtomicU64 = AtomicU64::new(0);
-    static HITS_ACCESSOR: AtomicU64 = AtomicU64::new(0);
-    static HOLDER_REWRITES: AtomicU64 = AtomicU64::new(0);
-    static ACCESSOR_REWRITES: AtomicU64 = AtomicU64::new(0);
-    static SAME_SHAPE_RELINKS: AtomicU64 = AtomicU64::new(0);
-    static CLASS_PRIMES: AtomicU64 = AtomicU64::new(0);
-}
-
-/// `(data primes, absent primes, refusals)`.
-pub fn read_holder_stats() -> (u64, u64, u64) {
-    (
-        PRIMES_HOLDER.load(Ordering::Relaxed),
-        PRIMES_ABSENT.load(Ordering::Relaxed),
-        REFUSED_HOLDER.load(Ordering::Relaxed),
-    )
-}
-
-pub fn read_accessor_stats() -> (u64, u64) {
-    (
-        PRIMES_ACCESSOR.load(Ordering::Relaxed),
-        HITS_ACCESSOR.load(Ordering::Relaxed),
-    )
-}
-
-pub fn class_read_stats() -> (u64, u64, u64) {
-    class_read::stats()
-}
-
-pub fn read_holder_rewrites() -> u64 {
-    HOLDER_REWRITES.load(Ordering::Relaxed)
-}
-
-pub fn read_accessor_rewrites() -> u64 {
-    ACCESSOR_REWRITES.load(Ordering::Relaxed)
-}
-
-pub fn read_accessor_same_shape_relinks() -> u64 {
-    SAME_SHAPE_RELINKS.load(Ordering::Relaxed)
-}
-
-pub fn read_accessor_class_primes() -> u64 {
-    CLASS_PRIMES.load(Ordering::Relaxed)
-}
-
-#[inline]
-fn refuse() {
-    REFUSED_HOLDER.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Expired shapes do not compete for bounded memo storage. This query is
-/// confined to publication; read fronts keep their per-use stamp checks.
-#[cold]
-#[inline(never)]
-unsafe fn holder_entry_retired(c: &HolderEntry) -> bool {
-    let retired = crate::object::shapes::shape_is_retired;
-    if retired(c[HOLDER_RECV] as u32) || retired(c[HOLDER_SHAPE] as u32) {
-        return true;
-    }
-    let kind = c[HOLDER_KIND] as u64;
-    if kind & (HOLDER_ACCESSOR | HOLDER_MULTI_ABSENT) != 0 || kind & HOLDER_STUB == 0 {
-        return false;
-    }
-    let depth = ((kind >> HOLDER_DEPTH_SHIFT) & 0xF) as usize;
-    let shapes = [
-        c[HOLDER_HOP_SHAPES] as u32,
-        (c[HOLDER_HOP_SHAPES] as u64 >> 32) as u32,
-        (c[HOLDER_SHAPE] as u64 >> 32) as u32,
-    ];
-    shapes[..depth.saturating_sub(1).min(HOLDER_MAX_DEPTH - 1)]
-        .iter()
-        .any(|&shape| retired(shape))
-}
-
-/// Spare depth-1 ABSENT words: the upper half of the holder-shape word and
-/// four words that otherwise hold intermediate hop addresses/shapes.
-/// The root scanner visits only HOLDER_OBJ for this entry kind.
-#[inline]
-fn multi_absent_id(c: &HolderEntry, i: usize) -> u32 {
-    debug_assert!(i < MULTI_ABSENT_EXTRA_IDS);
-    if i == 0 {
-        (c[HOLDER_SHAPE] as u64 >> 32) as u32
-    } else {
-        let word = HOLDER_HOPS + (i - 1) / 2;
-        (c[word] as u64 >> (32 * ((i - 1) % 2))) as u32
-    }
-}
-
-#[inline]
-fn set_multi_absent_id(c: &mut HolderEntry, i: usize, id: u32) {
-    debug_assert!(i < MULTI_ABSENT_EXTRA_IDS);
-    if i == 0 {
-        c[HOLDER_SHAPE] =
-            ((c[HOLDER_SHAPE] as u64 & u64::from(u32::MAX)) | (u64::from(id) << 32)) as i64;
-    } else {
-        let word = HOLDER_HOPS + (i - 1) / 2;
-        let shift = 32 * ((i - 1) % 2);
-        let mask = u64::from(u32::MAX) << shift;
-        c[word] = ((c[word] as u64 & !mask) | (u64::from(id) << shift)) as i64;
-    }
-}
-
-/// The site's class and saved ordinary entries for `recv`, from the GC-leaf
-/// read front, asked after [`entry_answer`] declined: a class instance's
-/// inherited data or absent key, proved by the receiver's ShapeId and class
-/// id, its identity word (its direct link) and the hop and
-/// holder ShapeIds. Loads and compares only; declines with `TAG_HOLE`.
-///
-/// # Safety
-/// `c` is a live site cache; `recv` an object whose ShapeId `token` carries.
-#[inline]
-pub(crate) unsafe fn class_entry_answer(
-    c: &PicCache,
-    recv: *const ObjectHeader,
-    token: i64,
-) -> u64 {
-    if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 || token == 0 {
-        return crate::value::TAG_HOLE;
-    }
-    if (token as u32) >= crate::object::shapes::EXOTIC_SHAPE_ID_BASE {
-        return function_own::answer_or_class(c, recv, token).to_bits();
-    }
-    class_read::leaf_bits(c, recv, token)
-}
-
-/// The site's holder entry asked for `handle`, without priming: what the
-/// emitted tower's holder check answers, for a runtime caller that asks the
-/// site's words itself (`typed_feedback::guards`' class-field miss arm).
-///
-/// # Safety
-/// `handle` is a pointer above the handle band; `cache_slot` null or the
-/// site's live read cache slot.
-#[inline(always)]
-pub(crate) unsafe fn read_holder_hit(
-    handle: *const ObjectHeader,
-    cache_slot: *mut PicCacheSlot,
-) -> Option<f64> {
-    let cache = crate::object::field_get_set::pic_slot_peek::<PicCache>(cache_slot);
-    if cache.is_null() {
-        return None;
-    }
-    let stamp = object_shape_stamp(handle);
-    if stamp == 0 {
-        return None;
-    }
-    entry_answer(&*cache, (u64::from(stamp) | PIC_ID_TOKEN_BIT) as i64).map(f64::from_bits)
-}
-
-#[inline]
-unsafe fn shape_word(addr: usize) -> u32 {
-    object_shape_stamp(addr as *const ObjectHeader)
-}
 
 /// The value a holder slot word names on `addr` (see [`HOLDER_SLOT_SPILL`]),
 /// or `None` when it must not be answered from the entry. An inline slot is
@@ -404,7 +198,13 @@ unsafe fn holder_spill_value(addr: usize, index: u32) -> Option<u64> {
 /// getter takes it as found ([`holder_slot_value`]). `None` refuses the walk
 /// (a legacy side-table overflow slot, spill disabled, or a value the getter
 /// would read past).
-unsafe fn holder_slot_word(addr: usize, s: u32, inline: u32) -> Option<u32> {
+unsafe fn holder_slot_word(
+    addr: usize,
+    keys: *const crate::ArrayHeader,
+    position: u32,
+    inline: u32,
+) -> Option<u32> {
+    let s = crate::object::key_attrs::key_storage_slot(keys, position);
     if s < inline {
         return Some(s);
     }
@@ -431,56 +231,9 @@ fn holder_name_admitted(name: &[u8]) -> bool {
     !super::name_refused(name) && name != b"__proto__" && !name.iter().all(u8::is_ascii_digit)
 }
 
-/// A declared-class instance whose class's prototype object does not exist
-/// yet: materialize it, as any `C.prototype` read does, so the walk below has
-/// the object the class's prototype members (and `C.prototype.k = v` values,
-/// which `js_register_prototype_method` records before the object exists) are
-/// read from. Without it the site walks the class registry by name on every
-/// read.
-///
-/// The materialization allocates with collection SUPPRESSED: the miss
-/// handler holds the receiver and key raw and takes the generic getter with
-/// them when the prime declines, so nothing may move here. It installs only
-/// the class's own declared members; no user code runs.
-///
-/// # Safety
-/// `obj` is the miss handler's object receiver.
-unsafe fn materialize_class_prototype(obj: *const ObjectHeader) {
-    if ordinary_receiver(obj as usize).is_none() {
-        return;
-    }
-    let class_id = (*obj).class_id;
-    let is_bare_class = shape_proto_id(object_shape_stamp(obj))
-        .is_some_and(|pid| (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&pid));
-    if !is_bare_class || !crate::object::class_decl_prototype_object(class_id).is_null() {
-        return;
-    }
-    let _no_move = crate::gc::GcSuppressScope::new();
-    crate::object::class_registry::class_decl_prototype_value(class_id);
-}
-
-/// Accessor identity is a fact of the holder shape. Changing the entry
-/// publishes a new ShapeId and retires every memo of the previous holder.
-unsafe fn key_may_be_accessor(obj: *const ObjectHeader, name: &[u8]) -> bool {
-    crate::object::key_attrs::object_key_is_accessor(obj, name)
-}
-
-/// [`holder_name_admitted`] for an ordinary read site's receiver. The
-/// method-site name refusals cover `constructor` because a CLASS instance's
-/// `constructor` is synthesized from the class registry (`instance_constructor_value`)
-/// rather than read off its chain. Default and ordinary serial links have
-/// no declared class prototype to synthesize from: their constructor is the
-/// chain's data slot like any other key.
-unsafe fn read_name_admitted(recv: *const ObjectHeader, name: &[u8]) -> bool {
-    if name == b"constructor" {
-        return admitted_proto_id(recv).is_some_and(|id| id < PROTO_ID_CLASS);
-    }
-    holder_name_admitted(name)
-}
-
 /// The most intermediate hops a walk records: a class entry (`class_read`)
 /// describes a deeper chain than the site's own holder entry has words for.
-const WALK_HOPS: usize = class_read::CLASS_READ_MAX_DEPTH - 1;
+const WALK_HOPS: usize = 15;
 
 /// An intermediate hop: its address and the ShapeId it had when proved.
 type Hop = (usize, u32);
@@ -497,9 +250,6 @@ struct Walk {
     slot: Option<u32>,
     hops: [Hop; WALK_HOPS],
     depth: usize,
-    /// An accessor entry's getter word (see [`HOLDER_HOP_SHAPES`]); 0 for
-    /// data/absence. Its pair is `hops[0].0`.
-    getter: usize,
 }
 
 /// A hop the entry may name: an ordinary, shaped, non-exotic object whose
@@ -517,8 +267,7 @@ unsafe fn hop_admitted(addr: usize) -> bool {
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
-        || crate::closure::is_closure_ptr(addr)
-        || crate::object::dictionary::is_dictionary(obj)
+        || crate::object::overflow::has_overflow(obj)
     {
         return false;
     }
@@ -681,136 +430,6 @@ pub(crate) struct HolderAccessor {
     pub(crate) shape: u32,
     /// The lane's holder slot word ([`HOLDER_SLOT_SPILL`] for a spill lane).
     pub(crate) slot: u32,
-    /// The pair's raw address: the value the holder's lane holds.
-    pub(crate) pair: usize,
-    /// How the hit calls the getter ([`HOLDER_HOP_SHAPES`]).
-    getter: usize,
-}
-
-/// Call the getter an accessor entry names with `recv` as `this`: a compiled
-/// class getter through its code address, a function object (read from
-/// `pair`, the primed pair the caller has just compared with the lane)
-/// through the closure-getter entry. The receiver is the call's argument and
-/// nothing reads it afterwards, so nothing is rooted here: the getter's own
-/// frame roots its receiver.
-#[inline]
-unsafe fn invoke_getter(
-    recv: *const ObjectHeader,
-    getter: usize,
-    pair: usize,
-) -> crate::value::JSValue {
-    let this = crate::value::js_nanbox_pointer(recv as i64);
-    if getter == crate::object::accessor_pair::holder_closure_getter_entry() {
-        let result = crate::object::accessor_pair::holder_closure_getter(this, pair as i64);
-        return crate::value::JSValue::from_bits(result.to_bits());
-    }
-    if getter == 0 {
-        return crate::value::JSValue::from_bits(crate::value::TAG_UNDEFINED);
-    }
-    let f = crate::closure::body_call::js_method_body_fn!(getter as *const u8;);
-    crate::value::JSValue::from_bits(f(this).to_bits())
-}
-
-/// Collecting-path class and saved ordinary answers, including getters.
-pub(crate) unsafe fn try_cached_class_read(
-    recv: *const ObjectHeader,
-    cache_slot: *mut PicCacheSlot,
-) -> Option<crate::value::JSValue> {
-    class_read::try_hit(recv, cache_slot)
-}
-
-/// Primary collecting accessor answer. The miss handler asks saved ordinary
-/// answers through `try_cached_class_read` first; the leaf declines getters.
-///
-/// Every fact is a shape fact or the lane's own value:
-/// * the receiver's ShapeId (the token) proves the key is not own and names
-///   the receiver's prototype identity, hence the holder (a serial, or a
-///   bare class whose registry link retires the holder's ShapeId if it ever
-///   changes);
-/// * the holder's ShapeId proves the slot is still an accessor lane;
-/// * the lane's value is the primed pair, so the getter it names is the one
-///   `[[Get]]` would call.
-///
-/// The getter is called with the ORIGINAL receiver as `this`.
-#[inline]
-pub(crate) unsafe fn try_cached_accessor(
-    recv: *const ObjectHeader,
-    cache_slot: *mut PicCacheSlot,
-) -> Option<crate::value::JSValue> {
-    let cache = crate::object::field_get_set::pic_slot_peek::<PicCache>(cache_slot);
-    if cache.is_null() {
-        return None;
-    }
-    let c = &*cache;
-    if c[HOLDER_KIND] as u64 & HOLDER_ACCESSOR == 0 {
-        return None;
-    }
-    accessor_entry_hit(recv, c)
-}
-
-/// Validate the accessor pair without invoking observable user code.
-#[inline]
-unsafe fn accessor_entry_pair(recv: *const ObjectHeader, c: &PicCache) -> Option<usize> {
-    let kind = c[HOLDER_KIND] as u64;
-    if kind & HOLDER_ACCESSOR == 0 || WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
-        return None;
-    }
-    if kind & HOLDER_ACCESSOR_DEEP != 0 && !class_read::accessor_hops_match(c) {
-        return None;
-    }
-    let token = (u64::from(object_shape_stamp(recv)) | PIC_ID_TOKEN_BIT) as i64;
-    accessor_guard::with_answer::<false, _>(holder_words(c), token, kind, |_, pair| pair)
-}
-
-// Keep main's kind admission inline and the collecting hit out of line.
-// The caller proved accessor kind, with no collecting/reentrant edge since.
-#[inline(never)]
-unsafe fn accessor_entry_hit(
-    recv: *const ObjectHeader,
-    c: &PicCache,
-) -> Option<crate::value::JSValue> {
-    let kind = c[HOLDER_KIND] as u64;
-    if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
-        return None;
-    }
-    if kind & HOLDER_ACCESSOR_DEEP != 0 && !class_read::accessor_hops_match(c) {
-        return None;
-    }
-    let token = (u64::from(object_shape_stamp(recv)) | PIC_ID_TOKEN_BIT) as i64;
-    accessor_guard::with_answer::<false, _>(holder_words(c), token, kind, |getter, pair| {
-        HITS_ACCESSOR.fetch_add(1, Ordering::Relaxed);
-        invoke_getter(recv, getter, pair)
-    })
-}
-
-/// Test the shared runtime backend on primary and saved inline-eligible
-/// answers. Emitted primary guards expand directly from the same program.
-///
-/// # Safety
-/// The emitted receiver test established an object address above the handle
-/// band. `cache_slot` is the site's live slot, or null.
-#[cfg(test)]
-pub(crate) unsafe fn test_accessor_entry(
-    recv: *const ObjectHeader,
-    cache_slot: *mut PicCacheSlot,
-) -> *const i64 {
-    if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
-        return std::ptr::null();
-    }
-    let cache = crate::object::field_get_set::pic_slot_peek::<PicCache>(cache_slot);
-    if cache.is_null() {
-        return std::ptr::null();
-    }
-    let c = &*cache;
-    let token = (u64::from(object_shape_stamp(recv)) | PIC_ID_TOKEN_BIT) as i64;
-    let entry = if validated_accessor::<true>(holder_words(c), token).is_some() {
-        holder_words(c)
-    } else if let Some((entry, _, _)) = class_read::holder_accessor::<true>(c, token) {
-        entry
-    } else {
-        return std::ptr::null();
-    };
-    entry.as_ptr()
 }
 
 /// [`walk_to`] bounded by the site's own holder entry.
@@ -879,6 +498,12 @@ pub(crate) unsafe fn dynamic_own_or_absent(
         return None;
     }
     let recv = ordinary_receiver(obj as usize)?;
+    // The verdicts below read the layout alone. A receiver with an overflow
+    // holds own keys the layout does not list, and holes where it deleted
+    // listed ones (object model step 4): the complete read decides.
+    if crate::object::overflow::has_overflow(recv) {
+        return None;
+    }
     let shape = object_shape_descriptor(recv)?;
     if shape.object_kind == crate::object::shapes::ShapeObjectKind::OrdinaryNativeAlias {
         return None;
@@ -919,839 +544,5 @@ pub(crate) unsafe fn dynamic_absent_terminal(obj: *const ObjectHeader, name: &[u
     match dynamic_own_or_absent(obj, name)? {
         DynamicKeyVerdict::Absent(terminal) => Some(terminal),
         DynamicKeyVerdict::Own { .. } => None,
-    }
-}
-
-/// The walk for a FUNCTION receiver (#10497): `f.k` on a plain function on
-/// its base shape, whose ShapeId (`closure::shape`) pins that its own keys are
-/// exactly the intrinsic `name`, `length` and `prototype` and that its
-/// [[Prototype]] is the realm's `%Function.prototype%` (any own-key install,
-/// delete, descriptor or `setPrototypeOf` moves it to the FunctionDictionary
-/// shape). The chain from `%Function.prototype%` on is an ordinary [`walk`],
-/// with `%Function.prototype%` as the entry's first hop. The intrinsic names
-/// and the function methods the getter synthesizes are refused, so only a
-/// key that genuinely lives on (or is absent from) the prototype objects is
-/// described. Allocation-free.
-unsafe fn function_walk(closure: usize, name: &[u8]) -> Option<Walk> {
-    if !holder_name_admitted(name)
-        || matches!(
-            name,
-            b"name"
-                | b"length"
-                | b"prototype"
-                | b"caller"
-                | b"arguments"
-                | b"call"
-                | b"apply"
-                | b"bind"
-        )
-        || std::str::from_utf8(name)
-            .ok()
-            .is_none_or(|n| crate::object::reified_function_method_name(n).is_some())
-    {
-        return None;
-    }
-    let header = crate::value::addr_class::try_read_gc_header(closure)?;
-    if header.obj_type != crate::gc::GC_TYPE_CLOSURE
-        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-        || !super::address_is_prime_stable(closure)
-    {
-        return None;
-    }
-    if !exotic_read::function_inherits(closure, name) {
-        return None;
-    }
-    let fp = crate::array::function_prototype_addr_if_resolved();
-    if fp == 0 || !hop_admitted(fp) {
-        return None;
-    }
-    exotic_read::on_prototype(fp as *const ObjectHeader, name)
-}
-
-/// [`prime_read_holder`] for a function receiver (`f.k`, #10497): the site's
-/// holder entry, keyed by the function's base ShapeId, for a key
-/// [`function_walk`] describes. Returns the answer when it ran the read here
-/// (the getter, then the confirmation and the publish); `None`, having
-/// allocated nothing, when the caller's own path must answer.
-///
-/// # Safety
-/// `closure` is the miss handler's receiver address, `key` its key.
-pub(crate) unsafe fn prime_function_read(
-    closure: usize,
-    key: *const crate::StringHeader,
-    cache_slot: *mut PicCacheSlot,
-) -> Option<f64> {
-    if cache_slot.is_null()
-        || key.is_null()
-        || WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0
-        || crate::agent::current_agent() != crate::agent::PRIMARY_AGENT
-    {
-        return None;
-    }
-    let existing = crate::object::field_get_set::pic_slot_peek::<PicCache>(cache_slot);
-    let stamp = object_shape_stamp(closure as *const ObjectHeader);
-    if stamp == 0 {
-        return None;
-    }
-    let token = (u64::from(stamp) | PIC_ID_TOKEN_BIT) as i64;
-    if !existing.is_null() {
-        if let Some(bits) = primary_entry_answer(&*existing, token, closure as *const ObjectHeader)
-            .or_else(|| exotic_read::function_answer(&*existing, closure as *const ObjectHeader))
-        {
-            return Some(f64::from_bits(bits));
-        }
-    }
-    let name = crate::string::header_str_checked(key)?.as_bytes();
-    if let Some(value) = function_own::prime(closure, name, cache_slot) {
-        return Some(value);
-    }
-    function_walk(closure, name)?;
-    // The answer, from the path the miss handler takes for a function
-    // receiver. It can run user code and collect: root across it.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let handle = scope.root_raw_mut_ptr(closure as *mut ObjectHeader);
-    let key_handle = scope.root_string_ptr(key);
-    let (value, closure) = handle.across_mut::<ObjectHeader, _>(|| {
-        crate::object::field_get_set::closure_dynamic_prop_by_key(closure, key).unwrap_or_else(
-            || {
-                f64::from_bits(
-                    crate::object::field_get_set::get_field_by_name_after_site_miss(
-                        closure as *const ObjectHeader,
-                        key,
-                    )
-                    .bits(),
-                )
-            },
-        )
-    });
-    if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
-        return Some(value);
-    }
-    let cache = crate::object::field_get_set::pic_slot_resolve::<PicCache>(cache_slot);
-    key_handle.with_const_ptr::<crate::StringHeader, _>(|key| {
-        let Some(name) = crate::string::header_str_checked(key).map(str::as_bytes) else {
-            return Some(value);
-        };
-        let Some(w) = function_walk(closure as usize, name) else {
-            refuse();
-            return Some(value);
-        };
-        let bits = value.to_bits();
-        let confirmed = match w.slot {
-            None => bits == crate::value::TAG_UNDEFINED,
-            Some(s) => {
-                holder_slot_value(w.holder, s) == Some(bits) && bits != crate::value::TAG_HOLE
-            }
-        };
-        if !confirmed {
-            refuse();
-        } else if !cache.is_null() {
-            let token = exotic_read::function_token(closure as usize).unwrap_or_else(|| {
-                (u64::from(object_shape_stamp(closure)) | PIC_ID_TOKEN_BIT) as i64
-            });
-            publish_token(cache, closure, &w, false, token);
-        }
-        Some(value)
-    })
-}
-
-/// Prime `cache_slot`'s holder entry for `obj.key`, whose key the caller has
-/// proved is not own. Returns the answer (from the generic getter) when the
-/// receiver took the generic read here; `None` when it did not, and the caller
-/// reads as before.
-///
-/// # Safety
-/// `obj` is a live `GC_TYPE_OBJECT` receiver; `key` a live string header.
-pub(crate) unsafe fn prime_read_holder(
-    obj: *const ObjectHeader,
-    key: *const crate::StringHeader,
-    cache_slot: *mut PicCacheSlot,
-) -> Option<crate::value::JSValue> {
-    if cache_slot.is_null()
-        || key.is_null()
-        || WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0
-        || crate::agent::current_agent() != crate::agent::PRIMARY_AGENT
-    {
-        return None;
-    }
-    // A receiver any live answer describes is served without re-priming.
-    let existing = crate::object::field_get_set::pic_slot_peek::<PicCache>(cache_slot);
-    if !existing.is_null() {
-        let stamp = object_shape_stamp(obj);
-        if stamp != 0 {
-            let token = (u64::from(stamp) | PIC_ID_TOKEN_BIT) as i64;
-            if let Some(bits) = entry_answer(&*existing, token) {
-                return Some(crate::value::JSValue::from_bits(bits));
-            }
-        }
-    }
-    materialize_class_prototype(obj);
-    let name = crate::string::header_str_checked(key)?.as_bytes();
-    let recv = ordinary_receiver(obj as usize)?;
-    // The class lane already proves data or absence through holder shapes.
-    // Let it answer before doing a second walk looking for an accessor;
-    // its pre-walk declines accessor lanes without running their getters.
-    if let Some(value) = class_read::prime(recv, key, cache_slot, name) {
-        return Some(value);
-    }
-    let acc = accessor_walk(recv, name);
-    if let Some(acc) = acc {
-        let cache = crate::object::field_get_set::pic_slot_resolve::<PicCache>(cache_slot);
-        if !cache.is_null() {
-            let mut hops = NO_HOPS;
-            hops[0].0 = acc.pair;
-            let w = Walk {
-                holder: acc.holder,
-                holder_shape: acc.shape,
-                slot: Some(acc.slot),
-                hops,
-                depth: 1,
-                getter: acc.getter,
-            };
-            publish(cache, recv, &w, true);
-            if acc.depth > 1 {
-                class_read::publish_accessor_hops(cache, &acc.hops, acc.depth - 1);
-                (*cache)[HOLDER_KIND] |= HOLDER_ACCESSOR_DEEP as i64;
-                (*cache)[HOLDER_HOP_SHAPES] = 0;
-            }
-        }
-        return Some(invoke_getter(recv, acc.getter, acc.pair));
-    }
-    // Cheap pre-walk: a receiver the entry could never describe keeps the
-    // caller's path and pays nothing for the getter below. A site with no
-    // cache yet stays without one and uses the generic getter.
-    //
-    // A walk that ends at the default link needs `%Object.prototype%`, which
-    // is materialized lazily: while it is unresolved the walk cannot pin it,
-    // and refusing here would leave the site on the generic path (the getter
-    // below is what resolves it). So an unresolved realm
-    // does not decide the pre-walk; the walk after the getter does.
-    let realm_pending = crate::array::object_prototype_addr_if_resolved() == 0;
-    if !read_name_admitted(recv, name)
-        || key_may_be_accessor(recv, name)
-        || (walk(recv, name, false).is_none() && !realm_pending)
-    {
-        refuse();
-        return None;
-    }
-
-    // The answer, from the generic getter. It can run user code and collect,
-    // so the receiver is rooted across it and everything is re-read after.
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let handle = scope.root_raw_mut_ptr(obj as *mut ObjectHeader);
-    let key_handle = scope.root_string_ptr(key);
-    let (value, obj) = handle.across_mut::<ObjectHeader, _>(|| {
-        crate::object::field_get_set::get_field_by_name_after_site_miss(obj, key)
-    });
-    if WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0 {
-        return Some(value);
-    }
-    // Re-read every fact after the generic getter before publishing an answer.
-    let cache = crate::object::field_get_set::pic_slot_resolve::<PicCache>(cache_slot);
-    key_handle.with_const_ptr::<crate::StringHeader, _>(|key| {
-        let name = crate::string::header_str_checked(key)?.as_bytes();
-        let Some(recv) = ordinary_receiver(obj as usize) else {
-            refuse();
-            return Some(value);
-        };
-        let Some(w) = walk(recv, name, false) else {
-            refuse();
-            return Some(value);
-        };
-        // This scoped key pointer is used only by the non-collecting walk
-        // and confirmation. The generic getter has already returned.
-        let bits = value.bits();
-        let confirmed = match w.slot {
-            None => bits == crate::value::TAG_UNDEFINED,
-            Some(s) => {
-                holder_slot_value(w.holder, s) == Some(bits) && bits != crate::value::TAG_HOLE
-            }
-        };
-        if !confirmed {
-            refuse();
-            return Some(value);
-        }
-        if !cache.is_null() {
-            publish(cache, recv, &w, false);
-        }
-        Some(value)
-    })
-}
-
-unsafe fn publish(cache: *mut PicCache, recv: *const ObjectHeader, w: &Walk, accessor: bool) {
-    let token = (u64::from(object_shape_stamp(recv)) | PIC_ID_TOKEN_BIT) as i64;
-    publish_token(cache, recv, w, accessor, token);
-}
-
-unsafe fn publish_token(
-    cache: *mut PicCache,
-    recv: *const ObjectHeader,
-    w: &Walk,
-    accessor: bool,
-    token: i64,
-) {
-    let c = &mut *cache;
-    // A default-prototype optional field is often absent from many receiver
-    // shapes at ONE read site (TypeScript AST's `.name` is the canonical
-    // case). Keep the already-confirmed receiver shapes in this site's spare
-    // words when they all share the same terminal object and terminal shape.
-    // Every new token is admitted only after the caller's generic getter
-    // returned `undefined` and `walk` proved the complete chain absent.
-    //
-    // The same holds for an inherited DATA key read off several receiver
-    // shapes that all reach it on the same holder (`o.constructor` on plain
-    // objects of many shapes): the holder, its ShapeId and the slot word are
-    // shared, only the receiver token differs.
-    let old_kind = c[HOLDER_KIND] as u64;
-    let old_multi =
-        old_kind & (HOLDER_MULTI_ABSENT | HOLDER_ACCESSOR | HOLDER_STUB) == HOLDER_MULTI_ABSENT;
-    let same_answer = match w.slot {
-        None => {
-            old_kind == HOLDER_ABSENT_DEPTH1 as u64
-                || (old_multi && old_kind & HOLDER_ABSENT_BIT != 0)
-        }
-        Some(s) => {
-            old_kind == u64::from(s)
-                || (old_multi && old_kind & HOLDER_ABSENT_BIT == 0 && multi_slot(old_kind) == s)
-        }
-    };
-    if !accessor
-        && token as u64 == (PIC_ID_TOKEN_BIT | u64::from(token as u32))
-        && c[HOLDER_RECV] as u64 == (PIC_ID_TOKEN_BIT | u64::from(c[HOLDER_RECV] as u32))
-        && w.depth == 1
-        && same_answer
-        && c[HOLDER_RECV] != 0
-        && c[HOLDER_RECV] != token
-        && c[HOLDER_OBJ] as usize == w.holder
-        && c[HOLDER_SHAPE] as u32 == w.holder_shape
-        && !holder_entry_retired(holder_words(c))
-    {
-        let next = if old_kind & HOLDER_MULTI_ABSENT == 0 {
-            0
-        } else {
-            (old_kind & MULTI_ABSENT_NEXT_MASK) as usize
-        };
-        debug_assert!(next < MULTI_ABSENT_EXTRA_IDS);
-        let previous = c[HOLDER_RECV] as u32;
-        c[HOLDER_RECV] = 0;
-        set_multi_absent_id(holder_words_mut(c), next, previous);
-        let answer = match w.slot {
-            None => HOLDER_ABSENT_BIT,
-            Some(s) => u64::from(s) << MULTI_SLOT_SHIFT,
-        };
-        c[HOLDER_KIND] =
-            (answer | HOLDER_MULTI_ABSENT | ((next + 1) % MULTI_ABSENT_EXTRA_IDS) as u64) as i64;
-        c[HOLDER_RECV] = token;
-        if w.slot.is_some() {
-            PRIMES_HOLDER.fetch_add(1, Ordering::Relaxed);
-        } else {
-            PRIMES_ABSENT.fetch_add(1, Ordering::Relaxed);
-        }
-        super::stats_report_enabled();
-        return;
-    }
-    if c[HOLDER_RECV] != 0 && c[HOLDER_RECV] != token {
-        class_read::retain_holder(c as *mut PicCache);
-    }
-    if accessor
-        && c[HOLDER_RECV] != 0
-        && c[HOLDER_KIND] as u64 & HOLDER_ACCESSOR != 0
-        && c[HOLDER_OBJ] as usize != w.holder
-        && c[HOLDER_SHAPE] as u32 == w.holder_shape
-    {
-        SAME_SHAPE_RELINKS.fetch_add(1, Ordering::Relaxed);
-    }
-    class_read::clear_accessor_hops(c);
-    c[HOLDER_RECV] = 0;
-    c[HOLDER_OBJ] = w.holder as i64;
-    c[HOLDER_SHAPE] = (u64::from(w.holder_shape) | u64::from(w.hops[2].1) << 32) as i64;
-    c[HOLDER_KIND] = if accessor {
-        (HOLDER_ACCESSOR | u64::from(w.slot.expect("accessor has slot"))) as i64
-    } else {
-        match (w.depth, w.slot) {
-            (1, Some(s)) => i64::from(s),
-            (1, None) => HOLDER_ABSENT_DEPTH1,
-            (d, s) => {
-                (HOLDER_STUB
-                    | if s.is_none() { HOLDER_ABSENT_BIT } else { 0 }
-                    | (d as u64) << HOLDER_DEPTH_SHIFT
-                    | u64::from(s.unwrap_or(0))) as i64
-            }
-        }
-    };
-    for i in 0..HOLDER_MAX_DEPTH - 1 {
-        c[HOLDER_HOPS + i] = w.hops[i].0 as i64;
-    }
-    // Accessor pairs are immutable. The second hop word is unused by an
-    // accessor (deep hops have class_read storage), so retain its native
-    // getter code alongside the pair. Replacing the lane invalidates both.
-    #[cfg(any(test, feature = "regex-engine"))]
-    if accessor {
-        let pair = w.hops[0].0 as *const crate::array::ArrayHeader;
-        let words = crate::array::array_elements_ptr(pair);
-        c[HOLDER_HOPS + 1] =
-            probe::getter_code(*words.add(crate::object::accessor_pair::PAIR_GET)) as i64;
-    }
-    c[HOLDER_HOP_SHAPES] = if accessor {
-        // The slot word distinguishes inline and spill storage. Both retain
-        // the immutable pair's getter; replacing its lane invalidates it.
-        w.getter as i64
-    } else {
-        (u64::from(w.hops[0].1) | u64::from(w.hops[1].1) << 32) as i64
-    };
-    if c[HOLDER_STATE] & STATE_REGISTERED == 0 {
-        c[HOLDER_STATE] |= STATE_REGISTERED;
-        if let Ok(mut sites) = HOLDER_SITES.lock() {
-            sites.push(HolderSite::Named(cache as usize));
-        }
-    }
-    // Last: the entry is live only once every other word is written.
-    c[HOLDER_RECV] = token;
-    if accessor {
-        PRIMES_ACCESSOR.fetch_add(1, Ordering::Relaxed);
-        if shape_proto_id(object_shape_stamp(recv))
-            .is_some_and(|pid| (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&pid))
-        {
-            CLASS_PRIMES.fetch_add(1, Ordering::Relaxed);
-        }
-    } else if w.slot.is_some() {
-        PRIMES_HOLDER.fetch_add(1, Ordering::Relaxed);
-    } else {
-        PRIMES_ABSENT.fetch_add(1, Ordering::Relaxed);
-    }
-    super::stats_report_enabled();
-}
-
-/// The primary and overflow answers use exactly the same root traversal.
-fn scan_entry_roots(c: &mut HolderEntry, visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    if c[HOLDER_RECV] != 0 {
-        if visitor.visit_i64_slot(&mut c[HOLDER_OBJ]) {
-            HOLDER_REWRITES.fetch_add(1, Ordering::Relaxed);
-            if c[HOLDER_KIND] as u64 & HOLDER_ACCESSOR != 0 {
-                ACCESSOR_REWRITES.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if c[HOLDER_KIND] as u64 & HOLDER_MULTI_ABSENT == 0 {
-            // Only the accessor pair is managed; the next word is native code.
-            let count = if c[HOLDER_KIND] as u64 & HOLDER_ACCESSOR != 0 {
-                1
-            } else {
-                HOLDER_MAX_DEPTH - 1
-            };
-            for i in 0..count {
-                visitor.visit_i64_slot(&mut c[HOLDER_HOPS + i]);
-            }
-        }
-    }
-}
-
-/// Root scan: live entries are primary roots only until a worker starts. Once
-/// the sticky gate is set, `entry_answer` declines before touching any entry
-/// word, and no agent needs to retain the old primary objects.
-pub(crate) fn scan_read_holder_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    if crate::agent::current_agent() != crate::agent::PRIMARY_AGENT
-        || WORKER_AGENTS_EXIST.load(Ordering::SeqCst) != 0
-    {
-        return;
-    }
-    let Ok(sites) = HOLDER_SITES.lock() else {
-        return;
-    };
-    for &site in sites.iter() {
-        let site = match site {
-            HolderSite::Named(site) => site,
-            HolderSite::Keyed(site) => {
-                unsafe { keyed::scan_roots(site, visitor) };
-                continue;
-            }
-        };
-        // SAFETY: registered caches are PIC-arena allocations
-        // (`pic_arena_alloc`), which are never freed.
-        let c = unsafe { &mut *(site as *mut PicCache) };
-        scan_entry_roots(holder_words_mut(c), visitor);
-        class_read::scan_roots(c, visitor);
-    }
-}
-
-/// Populate the real site storage for collector-contract tests. Each object
-/// and lane is built by the GC test; this helper supplies only the site proof.
-#[cfg(test)]
-pub(crate) unsafe fn test_publish_holder_answer(
-    cache: *mut PicCache,
-    receiver_shape: u32,
-    holder: *const ObjectHeader,
-    hop: Option<*const ObjectHeader>,
-    accessor: bool,
-) {
-    let recv = ObjectHeader {
-        class_id: 0,
-        parent_class_id: receiver_shape,
-        meta: std::ptr::null_mut(),
-    };
-    let mut hops = NO_HOPS;
-    let mut getter = 0;
-    if accessor {
-        let lane = slot_bits(holder as usize, 0);
-        hops[0].0 = (lane & crate::value::POINTER_MASK) as usize;
-        getter =
-            crate::object::accessor_pair::site_getter_word_of_value(lane).expect("accessor lane");
-    } else if let Some(hop) = hop {
-        hops[0] = (hop as usize, object_shape_stamp(hop));
-    }
-    let w = Walk {
-        holder: holder as usize,
-        holder_shape: object_shape_stamp(holder),
-        slot: Some(0),
-        hops,
-        depth: if hop.is_some() { 2 } else { 1 },
-        getter,
-    };
-    publish(cache, &recv, &w, accessor);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shared_link_admission_keeps_registry_and_unproved_links_out() {
-        for pid in [
-            PROTO_ID_DEFAULT,
-            PROTO_ID_NULL,
-            1,
-            PROTO_ID_CLASS - 1,
-            PROTO_ID_MIXED | 1,
-            PROTO_ID_UNIQUE - 1,
-        ] {
-            assert!(hop_identity_pins_link(pid), "pinning identity {pid:#x}");
-        }
-        for pid in [
-            PROTO_ID_CLASS,
-            PROTO_ID_MIXED - 1,
-            PROTO_ID_UNIQUE,
-            PROTO_ID_UNIQUE | 1,
-        ] {
-            assert!(!hop_identity_pins_link(pid), "unproved identity {pid:#x}");
-        }
-    }
-
-    extern "C" fn getter_two(_this: f64) -> f64 {
-        2.0
-    }
-    extern "C" fn getter_eight(_this: f64) -> f64 {
-        8.0
-    }
-
-    /// The entry an accessor prime publishes for `acc`.
-    fn accessor_entry(acc: &HolderAccessor) -> Walk {
-        let mut hops = NO_HOPS;
-        hops[0].0 = acc.pair;
-        Walk {
-            holder: acc.holder,
-            holder_shape: acc.shape,
-            slot: Some(acc.slot),
-            hops,
-            depth: 1,
-            getter: acc.getter,
-        }
-    }
-
-    #[test]
-    fn inherited_accessor_rechecks_intermediate_shapes() {
-        if !crate::object::method_site::run_with_fresh_worker_gate(
-            "inherited_accessor_rechecks_intermediate_shapes",
-        ) {
-            return;
-        }
-        let _lock = crate::gc::global_side_table_test_lock();
-        let _no_move = crate::gc::GcSuppressScope::new();
-        unsafe {
-            let holder = crate::object::js_object_alloc(0, 0);
-            let middle = crate::object::js_object_alloc(0x0C3C_79A6, 0);
-            let receiver = crate::object::js_object_alloc(0, 0);
-            let value = |p| crate::value::js_nanbox_pointer(p as i64);
-            crate::object::js_object_set_prototype_of(
-                value(holder),
-                f64::from_bits(crate::value::TAG_NULL),
-            );
-            crate::object::js_object_set_prototype_of(value(middle), value(holder));
-            crate::object::js_object_set_prototype_of(value(receiver), value(middle));
-            assert!(
-                shape_proto_id(object_shape_stamp(middle))
-                    .is_some_and(|pid| (PROTO_ID_MIXED..PROTO_ID_UNIQUE).contains(&pid)),
-                "the intermediate class prototype must exercise a MIXED link"
-            );
-            let install = |obj: *mut ObjectHeader, raw_get| {
-                crate::object::set_builtin_accessor_pair(
-                    obj as usize,
-                    "path".to_string(),
-                    crate::object::accessor_pair::Accessor {
-                        raw_get,
-                        ..Default::default()
-                    },
-                    crate::object::PropertyAttrs::new(true, false, true),
-                );
-            };
-            install(holder, getter_two as *const () as usize);
-            let key = crate::string::js_string_from_bytes(b"path".as_ptr(), 4);
-            let mut slot = std::ptr::null_mut();
-            assert_eq!(
-                prime_read_holder(receiver, key, &mut slot).map(|v| v.as_number()),
-                Some(2.0)
-            );
-            assert!(!slot.is_null(), "the inherited accessor must prime a site");
-            assert_ne!((*slot)[HOLDER_KIND] as u64 & HOLDER_ACCESSOR_DEEP, 0);
-            assert_eq!(
-                try_cached_accessor(receiver, &mut slot).map(|v| v.as_number()),
-                Some(2.0)
-            );
-            install(middle, getter_eight as *const () as usize);
-            assert!(
-                try_cached_accessor(receiver, &mut slot).is_none(),
-                "a nearer accessor invalidates the deep entry"
-            );
-            assert_eq!(
-                prime_read_holder(receiver, key, &mut slot).map(|v| v.as_number()),
-                Some(8.0)
-            );
-            assert_eq!(
-                try_cached_accessor(receiver, &mut slot).map(|v| v.as_number()),
-                Some(8.0)
-            );
-        }
-    }
-
-    /// Two holders with exactly one ShapeId but different compiled getters.
-    /// Replacing a declared class's registry pointer leaves the receiver's
-    /// bare CLASS ShapeId unchanged. The replacement must retire the old
-    /// holder's ShapeId, so the hit's holder compare refuses the stale entry
-    /// with no global word to consult.
-    #[test]
-    fn class_accessor_rechecks_same_shape_holder_link() {
-        if !crate::object::method_site::run_with_fresh_worker_gate(
-            "class_accessor_rechecks_same_shape_holder_link",
-        ) {
-            return;
-        }
-        let _lock = crate::gc::global_side_table_test_lock();
-        const CID: u32 = 0x0C3C_79A3;
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let p1 = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 2));
-        let p2 = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 2));
-        for (holder, raw_get) in [
-            (&p1, getter_two as *const () as usize),
-            (&p2, getter_eight as *const () as usize),
-        ] {
-            holder.with_mut_ptr::<ObjectHeader, _>(|ptr| {
-                crate::object::set_builtin_accessor_pair(
-                    ptr as usize,
-                    "path".to_owned(),
-                    crate::object::accessor_pair::Accessor {
-                        raw_get,
-                        ..Default::default()
-                    },
-                    crate::object::PropertyAttrs::new(true, false, true),
-                );
-            });
-        }
-        p1.with_const_ptr::<ObjectHeader, _>(|first| {
-            p2.with_const_ptr::<ObjectHeader, _>(|second| {
-                assert_ne!(first, second);
-                assert_eq!(unsafe { object_shape_stamp(first) }, unsafe {
-                    object_shape_stamp(second)
-                });
-            });
-        });
-
-        let packed = b"holder_class_key";
-        let keys = crate::object::js_build_class_keys_array(
-            CID,
-            1,
-            packed.as_ptr(),
-            packed.len() as u32,
-            0,
-        );
-        let recv_shape = crate::object::shapes::js_object_shape_id_for_class_keys(
-            keys as usize as u64,
-            1,
-            CID,
-            0,
-        );
-        let recv = crate::object::js_object_alloc_class_inline_keys_stamped(
-            CID, 0, 1, keys, recv_shape, 0,
-        );
-        let recv = scope.root_raw_mut_ptr(recv);
-        recv.with_const_ptr::<ObjectHeader, _>(|receiver| {
-            assert_eq!(
-                unsafe { shape_proto_id(object_shape_stamp(receiver)) },
-                Some(PROTO_ID_CLASS | u64::from(CID))
-            );
-
-            p1.with_const_ptr::<ObjectHeader, _>(|ptr| {
-                crate::object::test_seed_class_decl_prototype_object_root(CID, ptr as usize);
-            });
-            let first = unsafe { accessor_walk(receiver, b"path") }.expect("first accessor");
-            let cache: &'static mut PicCache =
-                Box::leak(Box::new([0; crate::codegen_abi::PIC_CACHE_WORDS]));
-            let mut slot: PicCacheSlot = cache;
-            unsafe { publish(cache, receiver, &accessor_entry(&first), true) };
-            assert_eq!(
-                cache[HOLDER_HOP_SHAPES] as usize,
-                getter_two as *const () as usize
-            );
-            assert_eq!(cache[HOLDER_HOPS] as usize, first.pair);
-            assert_eq!(
-                unsafe { try_cached_accessor(receiver, &mut slot) }.map(|v| v.as_number()),
-                Some(2.0)
-            );
-
-            let old_relinks = read_accessor_same_shape_relinks();
-            p2.with_const_ptr::<ObjectHeader, _>(|ptr| {
-                crate::object::test_seed_class_decl_prototype_object_root(CID, ptr as usize);
-            });
-            assert_eq!(unsafe { object_shape_stamp(receiver) }, recv_shape);
-            // The relink is seen through the old holder's ShapeId alone.
-            p1.with_const_ptr::<ObjectHeader, _>(|old| {
-                assert_ne!(unsafe { object_shape_stamp(old) }, first.shape);
-                assert_ne!(unsafe { object_shape_stamp(old) }, 0);
-            });
-            assert!(
-                unsafe { try_cached_accessor(receiver, &mut slot) }.is_none(),
-                "stale getter was served after registry replacement"
-            );
-            let second = unsafe { accessor_walk(receiver, b"path") }.expect("second accessor");
-            unsafe { publish(cache, receiver, &accessor_entry(&second), true) };
-            assert!(read_accessor_same_shape_relinks() > old_relinks);
-            assert_eq!(
-                unsafe { try_cached_accessor(receiver, &mut slot) }.map(|v| v.as_number()),
-                Some(8.0)
-            );
-            // A getter replacement may retain a compiled setter. Neither a
-            // new prime nor an existing hit may mistake it for setter-only.
-            // Keep the deliberate same-shape slot replacement noncollecting.
-            let _no_gc = crate::gc::GcSuppressScope::new();
-            extern "C" fn closure_getter(
-                _closure: *const crate::closure::ClosureHeader,
-                _this: crate::closure::JsThis,
-            ) -> f64 {
-                9.0
-            }
-            let closure = crate::closure::js_closure_alloc(crate::fn_info!(closure_getter, 0), 0);
-            let pair = unsafe {
-                crate::object::accessor_pair::pair_new(crate::object::accessor_pair::Accessor {
-                    get: crate::value::js_nanbox_pointer(closure as i64).to_bits(),
-                    raw_set: getter_eight as *const () as usize,
-                    ..Default::default()
-                })
-            };
-            p2.with_mut_ptr::<ObjectHeader, _>(|holder| unsafe {
-                crate::object::slot_store::store_object_field_slot(
-                    holder,
-                    second.slot as usize,
-                    crate::value::js_nanbox_pointer(pair as i64).to_bits(),
-                );
-                assert_eq!(object_shape_stamp(holder), second.shape);
-            });
-            // The replaced lane misses the primed pair, with no ShapeId
-            // transition to see it by.
-            assert!(unsafe { try_cached_accessor(receiver, &mut slot) }.is_none());
-            // A function-object getter re-primes with the closure-ABI word
-            // and is called with the receiver as `this`.
-            let third = unsafe { accessor_walk(receiver, b"path") }.expect("closure accessor");
-            assert_eq!(
-                third.getter,
-                crate::object::accessor_pair::holder_closure_getter_entry()
-            );
-            assert_eq!(third.pair, pair as usize);
-            unsafe { publish(cache, receiver, &accessor_entry(&third), true) };
-            assert_eq!(
-                unsafe { try_cached_accessor(receiver, &mut slot) }.map(|v| v.as_number()),
-                Some(9.0)
-            );
-        });
-    }
-
-    /// A class instance has a valid, stamped ShapeId, but its prototype is
-    /// resolved through the class vtable. The holder walk must refuse it even
-    /// when the shape and the object's current prototype id agree.
-    #[test]
-    fn class_prototype_identity_is_refused_by_read_holder() {
-        let _lock = crate::gc::global_side_table_test_lock();
-        const CID: u32 = 0x0C3C_79A2;
-        let packed = b"holder_class_key";
-        let keys = crate::object::js_build_class_keys_array(
-            CID,
-            1,
-            packed.as_ptr(),
-            packed.len() as u32,
-            0,
-        );
-        let shape_id = crate::object::shapes::js_object_shape_id_for_class_keys(
-            keys as usize as u64,
-            1,
-            CID,
-            0,
-        );
-        let obj =
-            crate::object::js_object_alloc_class_inline_keys_stamped(CID, 0, 1, keys, shape_id, 0);
-        let claimed = shape_proto_id(shape_id).expect("class shape must be stamped");
-        assert_eq!(claimed, crate::object::shapes::class_proto_id(CID));
-        assert_eq!(
-            unsafe { crate::object::shapes::object_proto_id(obj) },
-            claimed
-        );
-        assert!(claimed >= crate::object::shapes::PROTO_ID_CLASS);
-        assert_eq!(unsafe { admitted_proto_id(obj) }, None);
-    }
-
-    #[test]
-    fn static_declaration_parent_walk_can_publish_and_hit_an_absent_read() {
-        // Priming is declined once any worker agent exists, and that gate is
-        // sticky for the process; run in a fresh process so test order cannot
-        // decide it.
-        if !crate::object::method_site::run_with_fresh_worker_gate(
-            "static_declaration_parent_walk_can_publish_and_hit_an_absent_read",
-        ) {
-            return;
-        }
-        let _lock = crate::gc::global_side_table_test_lock();
-        let _no_move = crate::gc::GcSuppressScope::new();
-        const BASE: u32 = 0x6E91;
-        const CHILD: u32 = 0x6E92;
-        unsafe {
-            for (cid, name) in [
-                (BASE, b"FixedReadBase".as_slice()),
-                (CHILD, b"FixedReadChild"),
-            ] {
-                crate::object::js_register_class_name(cid, name.as_ptr(), name.len() as u32);
-            }
-            crate::object::js_register_class_parent(CHILD, BASE);
-            for (cid, offset) in [(BASE, 989), (CHILD, 990)] {
-                crate::object::class_registry::declarations::test_declare_birth_shape(
-                    cid,
-                    crate::object::shapes::SHAPE_ID_BASE + offset,
-                );
-            }
-            let _ = crate::object::class_registry::class_decl_prototype_value(CHILD);
-            let recv = crate::object::js_object_alloc(CHILD, 0);
-            let name = b"absent_from_fixed_chain";
-            let key = crate::string::canonical_key(name);
-            let mut slot: PicCacheSlot = std::ptr::null_mut();
-            assert_eq!(
-                class_read::prime(recv, key, &mut slot, name).map(|v| v.bits()),
-                Some(crate::value::TAG_UNDEFINED)
-            );
-            assert_eq!(
-                class_read::try_hit(recv, &mut slot).map(|v| v.bits()),
-                Some(crate::value::TAG_UNDEFINED)
-            );
-            let holder = crate::object::class_decl_prototype_object(CHILD);
-            let target = crate::object::js_object_alloc(0, 0);
-            crate::object::js_object_set_prototype_of(
-                crate::value::js_nanbox_pointer(holder as i64),
-                crate::value::js_nanbox_pointer(target as i64),
-            );
-            assert!(class_read::try_hit(recv, &mut slot).is_none());
-        }
     }
 }

@@ -295,7 +295,8 @@ unsafe fn stringify_object_walk(
         && crate::object::key_attrs::object_summary(obj) == 0
         && !inherited_to_json_possible
         // A private field (#11791) is an own key no template may emit.
-        && crate::object::key_attrs::object_summary(obj) & crate::object::key_attrs::SUMMARY_PRIVATE
+        && crate::object::key_attrs::object_summary(obj)
+            & (crate::object::key_attrs::SUMMARY_PRIVATE | crate::object::key_attrs::SUMMARY_HOLES)
             == 0
     {
         if let Some(tmpl_ptr) = shape_template_for(ptr) {
@@ -347,10 +348,10 @@ unsafe fn stringify_object_walk(
     // it moves, and user code can move the object to another shape).
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj_handle = scope.root_raw_const_ptr(obj);
-    let current_key_slots = || -> *const f64 {
+    let current_key_slots = || -> crate::object::KeySlots {
         obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
             let keys_arr = crate::object::object_keys(obj).arr();
-            crate::array::array_elements_ptr(keys_arr as *const crate::ArrayHeader) as *const f64
+            crate::object::keys_array_dense_slots(keys_arr).0
         })
     };
     // Closes #307: iterate up to keys_len, not min(num_fields, keys_len).
@@ -365,9 +366,16 @@ unsafe fn stringify_object_walk(
     // returned false, so `JSON.stringify` emitted the literal string "null"
     // for any parsed object with ≥9 fields.
     let alloc_limit = std::cmp::max(num_fields, crate::object::INLINE_SLOT_FLOOR as u32);
+    // A layout that keeps its own storage slots reads each key through them.
+    let slotted = crate::object::key_attrs::keys_have_slots(keys_view.arr(), keys_len);
+    if !slotted {
+        crate::object::key_attrs::debug_assert_positional(keys_view.arr(), keys_len);
+    }
     let read_field_bits = |f: u32| -> u64 {
         obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
-            if f < alloc_limit {
+            if slotted {
+                crate::object::field_get_set::js_object_get_key_field(obj, f).bits()
+            } else if f < alloc_limit {
                 let fields_ptr = (obj as *const u8).add(std::mem::size_of::<crate::ObjectHeader>())
                     as *const f64;
                 (*fields_ptr.add(f as usize)).to_bits()
@@ -393,7 +401,8 @@ unsafe fn stringify_object_walk(
         && !inherited_to_json_possible
         && !crate::object::object_has_descriptors(ptr as usize)
         // A private field (#11791) is an own key the raw walk would emit.
-        && crate::object::key_attrs::object_summary(obj) & crate::object::key_attrs::SUMMARY_PRIVATE
+        && crate::object::key_attrs::object_summary(obj)
+            & (crate::object::key_attrs::SUMMARY_PRIVATE | crate::object::key_attrs::SUMMARY_HOLES)
             == 0
         && super::stringify_primitive_object::try_emit(obj, keys_view, buf)
     {
@@ -505,9 +514,7 @@ unsafe fn stringify_object_walk(
         keys_stale = true;
     }
     // Only dereferenced once the loop has refreshed it, if `keys_stale`.
-    let mut key_slots =
-        crate::array::array_elements_ptr(keys_view.arr() as *const crate::ArrayHeader)
-            as *const f64;
+    let mut key_slots = crate::object::keys_array_dense_slots(keys_view.arr()).0;
 
     // Only own ENUMERABLE keys are serialized; gated on the process-wide
     // atomic AND the per-object `OBJ_FLAG_HAS_DESCRIPTORS` header flag
@@ -617,7 +624,10 @@ unsafe fn stringify_object_walk(
         // its own property name; the synthetic `field{f}` fallback name is
         // unreadable, so pass "" as it did before.
         let mut member_probed = false;
-        if (field_bits & 0xFFFF_0000_0000_0000) == POINTER_TAG || is_raw_pointer(field_bits) {
+        if (field_bits & 0xFFFF_0000_0000_0000) == POINTER_TAG
+            || (field_bits & 0xFFFF_0000_0000_0000) == crate::value::HANDLE_TAG
+            || is_raw_pointer(field_bits)
+        {
             // Everything from here to the member's dispatch can run user code.
             *global_proof = false;
             let mut key_sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
@@ -680,7 +690,10 @@ unsafe fn stringify_object_walk(
             } else {
                 buf.push_str("null");
             }
-        } else if val_tag == POINTER_TAG || is_raw_pointer(field_bits) {
+        } else if val_tag == POINTER_TAG
+            || val_tag == crate::value::HANDLE_TAG
+            || is_raw_pointer(field_bits)
+        {
             // Nested object/array (or the object/array `toJSON` returned). The
             // `toJSON` key was recorded above; `member_probed` armed the guard.
             stringify_value_depth(field_val, TYPE_UNKNOWN, buf, depth + 1);

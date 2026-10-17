@@ -23,7 +23,7 @@ const MAX_DENSE_ARRAY_GROW_LENGTH: u32 = 1_000_000;
 
 #[inline]
 pub(crate) fn invalidate_array_index_fast_path() {
-    PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.store(1, Ordering::Relaxed);
+    PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED.fetch_or(super::INDEX_INVALIDATED, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -94,11 +94,9 @@ pub(crate) fn array_iteration_is_exotic(arr: *const ArrayHeader) -> bool {
     {
         return true;
     }
-    // SAFETY: the clean above resolved this exact live head, and the flag read
-    // precedes every operation that could allocate or safepoint. The
-    // compatible header-less receivers exited above.
-    let flags = unsafe { array_object_flags_resolved(arr) };
-    unsafe { array_iteration_is_exotic_resolved(arr, flags) }
+    // SAFETY: the clean above resolved this exact live head. The compatible
+    // header-less receivers exited above.
+    unsafe { array_iteration_is_exotic_resolved(arr) }
 }
 
 /// [`array_iteration_is_exotic`] for a caller holding a resolved head and its
@@ -118,17 +116,14 @@ pub(crate) fn array_iteration_is_exotic(arr: *const ArrayHeader) -> bool {
 /// # Safety
 ///
 /// `arr` and `flags` must satisfy [`array_object_flags_resolved`]'s contract.
-pub(crate) unsafe fn array_iteration_is_exotic_cleaned(
-    arr: *const ArrayHeader,
-    flags: u16,
-) -> bool {
+pub(crate) unsafe fn array_iteration_is_exotic_cleaned(arr: *const ArrayHeader) -> bool {
     if super::header::receiver_may_be_registered_exotic(arr as *const ArrayHeader)
         && (crate::buffer::is_registered_buffer(arr as usize)
             || crate::typedarray::lookup_typed_array_kind(arr as usize).is_some())
     {
         return true;
     }
-    unsafe { array_iteration_is_exotic_resolved(arr, flags) }
+    unsafe { array_iteration_is_exotic_resolved(arr) }
 }
 
 /// [`array_iteration_is_exotic`] for a caller that already resolved the live
@@ -139,11 +134,13 @@ pub(crate) unsafe fn array_iteration_is_exotic_cleaned(
 /// # Safety
 ///
 /// `arr` and `flags` must satisfy [`array_object_flags_resolved`]'s contract.
-pub(crate) unsafe fn array_iteration_is_exotic_resolved(
-    arr: *const ArrayHeader,
-    flags: u16,
-) -> bool {
-    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+pub(crate) unsafe fn array_iteration_is_exotic_resolved(arr: *const ArrayHeader) -> bool {
+    // A re-parented array's holes and missing indices read its own
+    // prototype chain, which the raw element loop never consults.
+    if array_object_flags_resolved(arr) & crate::gc::GC_ARRAY_CUSTOM_PROTO != 0 {
+        return true;
+    }
+    if array_has_element_descriptors_resolved(arr) {
         return true;
     }
     if ARRAY_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
@@ -166,7 +163,7 @@ pub(crate) unsafe fn array_has_own_index(arr: *const ArrayHeader, index: u32) ->
     // `descriptors_in_use()` — the global flag flips during builtin init, so
     // every array element probe paid an `index.to_string()` + accessor-map
     // String-key alloc for arrays that have no descriptors at all.
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_has_element_descriptors(arr) {
         let key = index.to_string();
         if crate::object::get_accessor_descriptor(arr as usize, &key).is_some() {
             return true;
@@ -233,16 +230,18 @@ static KEEP_ARRAY_LENGTH: extern "C" fn(*const ArrayHeader) -> u32 = js_array_le
 #[inline(always)]
 fn array_length_fast_lane(arr: *const ArrayHeader) -> Option<u32> {
     let bits = arr as u64;
-    let top16 = bits >> 48;
-    let raw = if top16 >= 0x7FF8 {
-        if top16 == (crate::value::POINTER_TAG >> 48) {
-            (bits & crate::value::POINTER_MASK) as usize
-        } else {
-            0
+    // A POINTER_TAG word names a GC-headed object (honest pointers): the
+    // header byte is the whole Arr proof.
+    if let Some(header) = crate::value::addr_class::pointer_value_header(bits) {
+        let raw = (bits & crate::value::POINTER_MASK) as *const ArrayHeader;
+        if crate::entry_contracts::Kind::Arr.holds_header(header)
+            && unsafe { (*raw).length <= (*raw).capacity }
+        {
+            return Some(js_array_length__Arr(raw));
         }
-    } else {
-        bits as usize
-    };
+        return None;
+    }
+    let raw = if bits >> 48 == 0 { bits as usize } else { 0 };
     if raw >= crate::gc::GC_HEADER_SIZE
         && raw % std::mem::align_of::<crate::gc::GcHeader>() == 0
         && crate::value::addr_class::is_plausible_heap_addr(raw)
@@ -254,18 +253,23 @@ fn array_length_fast_lane(arr: *const ArrayHeader) -> Option<u32> {
         // SAFETY: owned arena page, header-aligned; the header word
         // precedes every arena block.
         let header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        let (obj_type, gc_flags) = unsafe { ((*header).obj_type, (*header).gc_flags) };
-        if obj_type == crate::gc::GC_TYPE_ARRAY
-            && gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+        let gc_flags = unsafe { (*header).gc_flags };
+        if crate::entry_contracts::Kind::Arr.holds_header(unsafe { &*header })
             && gc_flags & crate::gc::GC_FLAG_ARENA != 0
         {
             let hdr = unsafe { &*(raw as *const ArrayHeader) };
             if hdr.length <= hdr.capacity {
-                return Some(hdr.length);
+                return Some(js_array_length__Arr(raw as *const ArrayHeader));
             }
         }
     }
     None
+}
+
+crate::entry_contracts::kind_entry! {
+    Arr, fn js_array_length__Arr(arr: *const ArrayHeader) -> u32 {
+        unsafe { (*arr).length }
+    }
 }
 
 /// Perry-GC leaf half of `.length` (#11522): the plain-array fast lane, or
@@ -451,10 +455,7 @@ pub extern "C" fn js_array_get_f64_unchecked(arr: *const ArrayHeader, index: u32
     let arr = cleaned;
     // Index accessors / custom attrs installed via `Object.defineProperty`
     // need the descriptor-aware getter.
-    // SAFETY: `clean_arr_ptr` returned this live head and no safepoint has
-    // intervened.
-    let flags = unsafe { array_object_flags_resolved(arr) };
-    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if unsafe { array_has_element_descriptors_resolved(arr) } {
         return js_array_get_f64(arr, index);
     }
     const TAG_UNDEFINED_F64: f64 = f64::from_bits(0x7FFC_0000_0000_0001u64);
@@ -501,7 +502,7 @@ pub extern "C" fn js_array_numeric_get_f64_unboxed(arr: *mut ArrayHeader, index:
     let flags = unsafe { array_object_flags_resolved(arr) };
     unsafe {
         if flags & crate::gc::GC_ARRAY_RAW_F64_LAYOUT != 0
-            && flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+            && !array_has_element_descriptors_resolved(arr)
             && index < (*arr).length
         {
             let elements_ptr =
@@ -521,6 +522,20 @@ pub extern "C" fn js_array_numeric_get_f64_unboxed(arr: *mut ArrayHeader, index:
 pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
     #[cfg(test)]
     ELEMENT_ACCESSOR_CALLS.with(|c| c.set(c.get().wrapping_add(1)));
+
+    // A POINTER_TAG receiver names a GC-headed object (honest pointers): a
+    // live dense array answers from its one header read, which the full
+    // path below would otherwise re-derive three times.
+    if let Some(header) = crate::value::addr_class::pointer_value_header(arr as u64) {
+        let raw = ((arr as u64) & crate::value::POINTER_MASK) as *const ArrayHeader;
+        if header.obj_type == crate::gc::GC_TYPE_ARRAY
+            && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+            && unsafe { (*raw).length <= (*raw).capacity }
+        {
+            // SAFETY: a live, unforwarded dense array; nothing intervened.
+            return unsafe { array_get_resolved(raw, index) };
+        }
+    }
 
     // Issue #179 Phase 5: lazy fast path — must run BEFORE
     // `clean_arr_ptr` because that helper force-materializes a lazy
@@ -556,6 +571,23 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
         if crate::value::addr_class::is_above_handle_band(raw_ptr as usize) {
             let gc_header =
                 (raw_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            if (*gc_header).obj_type == crate::gc::GC_TYPE_OVERFLOW {
+                // An object's overflow read as its key list: a tombstone (and
+                // an unnamed fixed slot of the prefix) is the hole marker,
+                // which reads back as undefined exactly as a key array's hole
+                // does (#323), so every key-list reader skips it.
+                let t = raw_ptr as *const crate::object::overflow::Table;
+                let key = if index < (*t).length {
+                    *crate::object::overflow::key_at(t, index)
+                } else {
+                    crate::value::TAG_UNDEFINED
+                };
+                return f64::from_bits(if key == crate::value::TAG_HOLE {
+                    crate::value::TAG_UNDEFINED
+                } else {
+                    key
+                });
+            }
             if (*gc_header).obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
                 let lazy = raw_ptr as *mut crate::json_tape::LazyArrayHeader;
                 if (*lazy).magic == crate::json_tape::LAZY_ARRAY_MAGIC {
@@ -682,17 +714,9 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
             return byte_val as f64;
         }
     }
-    // The usual case cleans to the same address, so reuse the header tag read
-    // above. A forwarded Array resolves to a different address and needs its
-    // live head's descriptor flags.
-    let receiver_tag = if arr == raw_ptr {
-        receiver_tag
-    } else {
-        array_receiver_gc_tag(arr)
-    };
     // SAFETY: the clean and exotic dispatch above resolved a live real
     // array, and no allocation or safepoint intervened.
-    unsafe { array_get_resolved(arr, index, array_object_flags_from_tag(receiver_tag)) }
+    unsafe { array_get_resolved(arr, index) }
 }
 
 /// The indexed Get implementation after the caller has resolved a real array.
@@ -705,12 +729,12 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
 /// between those reads and this call. Getter and prototype dispatch happen
 /// only after the last direct use of that pointer.
 #[inline]
-pub(super) unsafe fn array_get_resolved(arr: *const ArrayHeader, index: u32, flags: u16) -> f64 {
+pub(super) unsafe fn array_get_resolved(arr: *const ArrayHeader, index: u32) -> f64 {
     // #6748 grind: per-array flag, not the process-global gate (see
     // `array_has_own_index`) — this probe allocated two Strings on EVERY
     // checked element read once any descriptor existed process-wide, which
     // taxed every internal keys_array walk (`in`, defineProperty, Object.keys).
-    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_has_element_descriptors_resolved(arr) {
         if let Some(value) = proto_chain::array_index_accessor_get(
             arr,
             index,
@@ -783,7 +807,7 @@ pub extern "C" fn js_array_set_f64_unchecked(arr: *mut ArrayHeader, index: u32, 
         return;
     }
     // Index accessors / non-writable attrs need the descriptor-aware setter.
-    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_has_element_descriptors(arr) {
         js_array_set_f64_extend(arr, index, value);
         return;
     }
@@ -816,7 +840,9 @@ pub extern "C" fn js_array_numeric_set_f64_unboxed(
     // SAFETY: the clean above resolved this exact live head and no safepoint
     // has intervened.
     let flags = unsafe { array_object_flags_resolved(arr) };
-    if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0
+        || unsafe { array_has_element_descriptors_resolved(arr) }
+    {
         return 0;
     }
 
@@ -968,7 +994,7 @@ fn array_strict_index_write_guard_resolved(clean: *mut ArrayHeader, index: u32, 
     // let `js_array_set_f64_extend` invoke it. Every other rejected descriptor
     // must throw here because that lower-level helper deliberately retains a
     // silent contract for internal DefineOwnProperty callers.
-    if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_has_element_descriptors(clean) {
         let key = index.to_string();
         if let Some(accessor) = crate::object::get_accessor_descriptor(clean as usize, &key) {
             if accessor.set == 0 {
@@ -1040,7 +1066,6 @@ pub(crate) unsafe fn try_strict_dense_number_store(
     index: u32,
     value: f64,
 ) -> Option<*mut ArrayHeader> {
-    const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
     let value_bits = value.to_bits();
     // A plain double or an INT32 box (`value_bits_to_number` already refuses
     // the class-reference values that share that tag). NaN keeps the general
@@ -1051,28 +1076,7 @@ pub(crate) unsafe fn try_strict_dense_number_store(
     if number.is_nan() {
         return None;
     }
-    let bits = arr as u64;
-    let top16 = bits >> 48;
-    let raw = if top16 >= 0x7FF8 {
-        if top16 == 0x7FFC || bits & PAYLOAD_MASK == 0 {
-            return None;
-        }
-        (bits & PAYLOAD_MASK) as usize
-    } else {
-        bits as usize
-    };
-    if raw < crate::gc::GC_HEADER_SIZE
-        || raw % std::mem::align_of::<crate::gc::GcHeader>() != 0
-        || !crate::value::addr_class::is_plausible_heap_addr(raw)
-    {
-        return None;
-    }
-    if matches!(
-        crate::arena::classify_heap_generation(raw),
-        crate::arena::HeapGeneration::Unknown
-    ) {
-        return None;
-    }
+    let raw = super::honest_word::arena_object_of_word(arr as u64)?;
     let mut raw = raw;
     let mut header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
     if (*header).obj_type != crate::gc::GC_TYPE_ARRAY {
@@ -1108,10 +1112,9 @@ pub(crate) unsafe fn try_strict_dense_number_store(
     const REJECT: u16 = crate::gc::OBJ_FLAG_FROZEN
         | crate::gc::OBJ_FLAG_SEALED
         | crate::gc::OBJ_FLAG_NO_EXTEND
-        | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS
         | crate::gc::GC_ARRAY_ELEMENT_SHAPE
         | crate::gc::GC_LAYOUT_ALL_POINTERS;
-    if flags & REJECT != 0 {
+    if flags & REJECT != 0 || array_has_element_descriptors_resolved(raw as *const ArrayHeader) {
         return None;
     }
     let layout = flags & crate::gc::GC_LAYOUT_STATE_MASK;
@@ -1198,33 +1201,11 @@ pub(crate) unsafe fn try_strict_dense_pointer_overwrite(
     index: u32,
     value: f64,
 ) -> Option<*mut ArrayHeader> {
-    const PAYLOAD_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
     let value_bits = value.to_bits();
     if value_bits & crate::value::TAG_MASK != crate::value::POINTER_TAG {
         return None;
     }
-    let bits = arr as u64;
-    let top16 = bits >> 48;
-    let raw = if top16 >= 0x7FF8 {
-        if top16 == 0x7FFC || bits & PAYLOAD_MASK == 0 {
-            return None;
-        }
-        (bits & PAYLOAD_MASK) as usize
-    } else {
-        bits as usize
-    };
-    if raw < crate::gc::GC_HEADER_SIZE
-        || raw % std::mem::align_of::<crate::gc::GcHeader>() != 0
-        || !crate::value::addr_class::is_plausible_heap_addr(raw)
-    {
-        return None;
-    }
-    if matches!(
-        crate::arena::classify_heap_generation(raw),
-        crate::arena::HeapGeneration::Unknown
-    ) {
-        return None;
-    }
+    let raw = super::honest_word::arena_object_of_word(arr as u64)?;
     let header = (raw - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
     if (*header).obj_type != crate::gc::GC_TYPE_ARRAY
         || (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
@@ -1235,11 +1216,10 @@ pub(crate) unsafe fn try_strict_dense_pointer_overwrite(
     const REJECT: u16 = crate::gc::OBJ_FLAG_FROZEN
         | crate::gc::OBJ_FLAG_SEALED
         | crate::gc::OBJ_FLAG_NO_EXTEND
-        | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS
         | crate::gc::GC_ARRAY_ELEMENT_SHAPE
         | crate::gc::GC_ARRAY_RAW_F64_LAYOUT
         | crate::gc::GC_ARRAY_RAW_F64_HOLES;
-    if flags & REJECT != 0 {
+    if flags & REJECT != 0 || array_has_element_descriptors_resolved(raw as *const ArrayHeader) {
         return None;
     }
     if flags & crate::gc::GC_LAYOUT_STATE_MASK == crate::gc::GC_LAYOUT_POINTER_FREE {
@@ -1420,9 +1400,8 @@ pub(crate) fn try_strict_dense_index_set(
         {
             if header.obj_type == crate::gc::GC_TYPE_ARRAY
                 && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-                && header._reserved
-                    & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
-                    == 0
+                && header._reserved & crate::gc::OBJ_FLAG_FROZEN == 0
+                && !unsafe { array_has_element_descriptors_resolved(arr) }
                 && !super::array_index_fast_path_invalid_for(header._reserved)
             {
                 unsafe {
@@ -1463,7 +1442,9 @@ pub(crate) fn try_strict_dense_index_set(
         return None;
     }
     let flags = unsafe { array_object_flags_resolved(resolved) };
-    if flags & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS) != 0 {
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0
+        || unsafe { array_has_element_descriptors_resolved(resolved) }
+    {
         return None;
     }
     if super::array_index_fast_path_invalid_for(flags) {
@@ -1628,7 +1609,7 @@ unsafe fn js_array_set_f64_extend_resolved(
         // accessor setters and honor non-writable data attributes before the
         // dense-element store. Gated on the per-array descriptor flag so the
         // common fast path pays one header-flag test.
-        if flags & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+        if array_has_element_descriptors(arr) {
             let key = index.to_string();
             if let Some(acc) = crate::object::get_accessor_descriptor(arr as usize, &key) {
                 if acc.set != 0 {

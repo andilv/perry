@@ -11,6 +11,9 @@ fn ir_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
         program_class_shape_ids: Default::default(),
+        program_facts: Default::default(),
+        program_layouts: Default::default(),
+        gc_effects: Default::default(),
         target: None,
         is_entry_module: true,
         non_entry_module_prefixes: Vec::new(),
@@ -263,7 +266,7 @@ fn pointer_slot_store_keeps_barrier_without_layout_note() {
         "object store emitted a layout note:\n{ir}"
     );
     assert!(
-        ir.contains("class_field_set.barrier"),
+        ir.contains("put.pic.barrier"),
         "pointer store lost its barrier arm:\n{ir}"
     );
 }
@@ -278,7 +281,7 @@ fn dynamically_pointer_valued_scalar_slot_keeps_barrier_without_layout_note() {
         "object store emitted a layout note:\n{ir}"
     );
     assert!(
-        ir.contains("class_field_set.barrier"),
+        ir.contains("put.pic.barrier"),
         "dynamic pointer store lost its barrier arm:\n{ir}"
     );
 }

@@ -117,6 +117,16 @@ fn namespace_local_function_wrapper_symbol(module_name: &str, function_name: &st
     )
 }
 
+/// Design §4.4: a module's emitted registry symbols (or a cached object's
+/// manifest) must name only providers the HIR pass put in the link set.
+fn check_module_providers(
+    providers: &perry_codegen::ext_registry::ProviderSet,
+    module: &str,
+    symbols: &[&str],
+) -> Result<(), String> {
+    perry_codegen::ext_registry::check_emitted_providers(providers, module, symbols.iter().copied())
+}
+
 fn validate_module_ffi_symbols(
     routing: &perry_codegen::NativeRouting,
     module: &str,
@@ -666,12 +676,6 @@ pub fn run_with_parse_cache(
             },
         );
     }
-
-    // #835 + #846: clear the codegen-side FFI provenance set up-front
-    // so any leftover entries from a prior `perry dev` rebuild (or a
-    // failed-build early-return that skipped our drain below) don't
-    // bleed into this build's auto-link decisions.
-    let _ = perry_codegen::ext_registry::take_used_providers();
 
     // #1663: make `--debug-symbols` retain a symbol table on every native
     // target, not just emit a PDB on Windows. Previously the flag was a no-op
@@ -1303,8 +1307,16 @@ pub fn run_with_parse_cache(
     } else {
         Vec::new()
     };
+    // Object model step 3: prototype slots written once are constants.
+    if std::env::var_os("PERRY_PROTO_CENSUS_REPORT").is_some() {
+        eprintln!("{}", ctx.proto_census.summary());
+    }
+    perry_codegen::set_program_proto_census(Some(ctx.proto_census.clone()));
     // #11394: every method name the program writes onto a builtin prototype;
     // codegen routes those calls through a lookup-first runtime entry.
+    for site in &ctx.patched_builtins.dynamic_code_reach.sites {
+        eprintln!("perry: dynamic code {site}: builtin prototype/namespace members are treated as replaceable, and Object.prototype accessors disable the whole-program field facts{}", if site.contains("lexical") { "; the classes it names keep prototype lookups" } else { "" });
+    }
     perry_codegen::set_program_patched_proto_methods(perry_hir::patched_prototype_methods(
         &ctx.patched_builtins,
     ));
@@ -1716,6 +1728,9 @@ pub fn run_with_parse_cache(
         }
     }
 
+    // fninfer (decision 140): inferred parameter types as guarded
+    // annotations (`PERRY_FNINFER_APPLY`; off by default).
+    super::fn_infer::apply(&mut ctx.native_modules);
     // Collect all non-generic type aliases from all modules.
     // These are passed to each module's compiler so type_to_abi can resolve
     // Named("BlockTag") -> Union([...]) for correct ABI types in function signatures.
@@ -2864,14 +2879,8 @@ pub fn run_with_parse_cache(
         ))
     });
 
-    // Phase J: detect bitcode-link mode. The actual .bc paths aren't known
-    // yet (build_optimized_libs runs after compilation), but we decide the
-    // mode here so the per-module codegen can emit .ll instead of .o.
-    let bitcode_link = std::env::var("PERRY_LLVM_BITCODE_LINK").ok().as_deref() == Some("1");
-
     // V2.2: Per-module object cache at `<cache_dir>/objects/<target>/<key>.o`.
     // Disabled when the user passed `--no-cache`, when `PERRY_NO_CACHE=1`, or
-    // when we're in bitcode-link mode (the artifacts aren't object files), or
     // when native-region verification is enabled and lowering must run.
     // Key derivation: `compute_object_cache_key(opts, source_hash, perry_version)`.
     let cache_env_disabled = std::env::var("PERRY_NO_CACHE").ok().as_deref() == Some("1");
@@ -2883,11 +2892,8 @@ pub fn run_with_parse_cache(
             .ok()
             .as_deref()
             == Some("1");
-    let cache_enabled = !args.no_cache
-        && !cache_env_disabled
-        && !bitcode_link
-        && !verify_native_regions
-        && typed_feedback.is_none();
+    let cache_enabled =
+        !args.no_cache && !cache_env_disabled && !verify_native_regions && typed_feedback.is_none();
     // Target dir name for the cache layout. Using the resolved LLVM triple
     // keeps cross-compile caches from colliding with native-host caches.
     let cache_target_dir = target.as_deref().unwrap_or("host");
@@ -3469,6 +3475,9 @@ pub fn run_with_parse_cache(
         candidates.dedup_by(|a, b| a.class_id == b.class_id && a.target == b.target);
     }
     let short_spread_method_candidates = std::sync::Arc::new(short_spread_method_candidates);
+    // The runtime call-effect table, one per compilation: every module is
+    // lowered under it and its digest is in each module's object-cache key.
+    let gc_effects = std::sync::Arc::new(perry_codegen::GcEffects::from_committed());
     // #10498: the accessor names every compiled class declares decide which
     // sites carry a class-accessor arm.
     let program_class_accessor_names = std::sync::Arc::new(
@@ -3516,6 +3525,99 @@ pub fn run_with_parse_cache(
         });
     }
     let object_literal_method_candidates = std::sync::Arc::new(object_literal_method_candidates);
+    // Design GC_EFFECTS_AT_BUILD §4.4 (slice 4): the runtime provider set is
+    // computed from HIR here, before codegen, and the link set (the
+    // auto-optimize runtime/stdlib build or the prebuilt archives) is resolved
+    // from it. Codegen does not add providers: every registry symbol a module
+    // emits is checked against this set (`check_emitted_providers`), on a
+    // fresh compile and on an object-cache hit alike. Order: HIR → features +
+    // providers → link set → (GC effects table, slice 5) → codegen → link.
+    //
+    // Compiled-package code can call provider FFI without any matching
+    // import in `ctx.native_module_imports` (Effect's `Stream` lowers to
+    // `js_readable_stream_*`, Express's server to
+    // `js_node_http_create_server`), so the import-driven flips alone miss
+    // them; the HIR pass sees the native surfaces themselves.
+    //
+    // Codegen still sees `needs_stdlib` as feature detection left it: the
+    // entry module's event-loop shape keys on it, and folding the providers
+    // in first would change the emitted code (`codegen_needs_stdlib`).
+    let codegen_needs_stdlib = ctx.needs_stdlib;
+    let program_providers = perry_codegen::providers::program_providers(
+        ctx.native_modules.values(),
+        &perry_codegen::providers::ProviderInputs {
+            routing: &ctx.native_routing,
+            entry_install_hooks: &native_provider_installs,
+            uses_crypto_builtins: ctx.uses_crypto_builtins,
+        },
+    );
+    for owner in &program_providers {
+        use perry_codegen::ext_registry::OwnerKind;
+        match *owner {
+            OwnerKind::Stdlib { feature } => {
+                // The auto-optimize layer (`build_optimized_libs`) rebuilds
+                // perry-stdlib with only the features
+                // `compute_required_features` derives from
+                // `native_module_imports`; a provider reached without an
+                // import adds its feature here so the rebuild includes the
+                // providing module (#835/#846).
+                ctx.needs_stdlib = true;
+                if let Some(feat) = feature {
+                    ctx.extra_stdlib_features.insert(feat);
+                }
+            }
+            OwnerKind::WellKnown(key) => {
+                // Inserting into native_module_imports flips the well-known
+                // mechanism for this binding; `needs_stdlib` is what brings
+                // the well-known libs onto the link line.
+                ctx.native_module_imports.insert(key.to_string());
+                ctx.needs_stdlib = true;
+            }
+        }
+    }
+    let program_providers = std::sync::Arc::new(program_providers);
+
+    // A standalone WASI build links against the wasm32 runtime after
+    // codegen and has no native link set.
+    #[cfg(feature = "target-wasi")]
+    let native_link_set_skipped = target.as_deref() == Some("wasi");
+    #[cfg(not(feature = "target-wasi"))]
+    let native_link_set_skipped = false;
+
+    // Issue #76 — the wasmi host archive. A program that references
+    // `WebAssembly.*` sets `ctx.needs_wasm_runtime` (feature_detect.rs);
+    // `--enable-wasm-runtime` is an explicit override folded into the same
+    // flag, so every downstream step (the `wasm-host` install, the host's
+    // registration in the generated installer object, the library link and
+    // the symbol-stub scan) treats both alike. `libperry_wasm_host.a` is built
+    // with the runtime archives when perry is built; it is located here, never
+    // built.
+    if args.enable_wasm_runtime {
+        ctx.needs_wasm_runtime = true;
+    }
+    let use_wasm_host = ctx.needs_wasm_runtime;
+    let wasm_host_lib_resolved = if use_wasm_host && !native_link_set_skipped {
+        find_wasm_host_library(target.as_deref())
+    } else {
+        None
+    };
+
+    // Link the prebuilt runtime/stdlib/wrapper archives; the installer
+    // generated after codegen installs exactly the optional features this
+    // program needs, and the linker drops the rest. `--no-auto-optimize` and
+    // the legacy `--minimal-stdlib` are accepted no-ops: nothing is rebuilt.
+    let _ = args.no_auto_optimize;
+    let optimized_libs: Option<OptimizedLibs> = if native_link_set_skipped {
+        None
+    } else {
+        Some(build_optimized_libs(
+            &ctx,
+            target.as_deref(),
+            &compiled_features,
+            format,
+            verbose,
+        ))
+    };
     let module_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(module_jobs)
         .thread_name(|index| format!("perry-module-{index}"))
@@ -5742,7 +5844,7 @@ pub fn run_with_parse_cache(
             namespace_v8_specifiers,
             namespace_member_prefixes,
             namespace_member_origin_names,
-            emit_ir_only: bitcode_link,
+            emit_ir_only: false,
             verify_native_regions,
             disable_buffer_fast_path,
             namespace_imports,
@@ -5752,6 +5854,9 @@ pub fn run_with_parse_cache(
             // Filled per module after the static-shape pre-pass.
             static_shape_ids: Vec::new(),
             program_class_shape_ids: Default::default(),
+            program_facts: Default::default(),
+            program_layouts: Default::default(),
+            gc_effects: std::sync::Arc::clone(&gc_effects),
             short_spread_method_candidates: std::sync::Arc::clone(&short_spread_method_candidates),
             program_class_accessor_names: Some(std::sync::Arc::clone(
                 &program_class_accessor_names,
@@ -5773,7 +5878,7 @@ pub fn run_with_parse_cache(
             disable_constfn_shapes: std::env::var("PERRY_CONSTFN_SHAPE").as_deref() == Ok("0"),
             program_has_worker,
             program_has_thread_agents,
-            needs_stdlib: ctx.needs_stdlib,
+            needs_stdlib: codegen_needs_stdlib,
             program_is_synchronous,
             needs_ui: ctx.needs_ui,
             needs_geisterhand: ctx.needs_geisterhand,
@@ -5948,6 +6053,36 @@ pub fn run_with_parse_cache(
         module_births.iter().flat_map(|(_, b)| b),
         &static_shape_ids,
     );
+    // fninfer (decision 140): per-function inferred signatures over the
+    // final HIR. Measurement dump only (`PERRY_FNINFER_DUMP=<path>`).
+    super::fn_infer::dump(&ctx.native_modules);
+    // wpfacts (whole-program invariance facts, slice 1): one more
+    // whole-program pre-pass over the final HIR. It removes no check yet:
+    // each module's codegen gets only the digest of the facts it can observe
+    // (object-cache key) and, in a contract build, the claims section the
+    // runtime checks. See `program_facts.rs` for the knobs.
+    let program_facts = super::program_facts::run(
+        &ctx.native_modules,
+        // The dyn-eval interpreter is installed (E14 possible): the same
+        // condition that selects `perry-runtime/dyn-eval` for the installer.
+        perry_hir::has_deferred_dynamic_code_sites()
+            || ctx.native_module_imports.contains("vm")
+            || ctx.uses_data_url_dynamic_import,
+        &ctx.patched_builtins.dynamic_code_reach,
+        &ctx.cjs_wrap_debug_sources,
+    );
+    // Step 5b: closure class parameters as typed-body receiver proofs, once
+    // the facts say some class's layout is stable.
+    let receiver_params = super::fn_infer::receiver_params(
+        &ctx.native_modules,
+        super::program_facts::has_stable_classes(&program_facts),
+    );
+    // Object model case 2c: the program's static class families and global
+    // key colouring, one value for every module (its digest keys the object
+    // cache). `PERRY_LAYOUT_REPORT=1` prints the colouring's slot cost.
+    let program_layouts = std::sync::Arc::new(perry_codegen::layout_families::compute(
+        ctx.native_modules.iter().map(|(_, m)| m),
+    ));
     #[allow(clippy::type_complexity)]
     let static_shape_ids_by_module: HashMap<
         &PathBuf,
@@ -6037,6 +6172,11 @@ pub fn run_with_parse_cache(
                 opts.program_class_shape_ids = program_class_shape_ids
                     .restricted_to(class_ids.iter().copied().chain(foreign));
             }
+            opts.program_facts =
+                super::program_facts::view_for(&program_facts, path, receiver_params.get(path));
+            opts.program_facts.dynamic_code_reach = ctx.patched_builtins.dynamic_code_reach.clone();
+            std::sync::Arc::make_mut(&mut opts.program_facts.elision).dynamic_code_reach = ctx.patched_builtins.dynamic_code_reach.clone();
+            opts.program_layouts = std::sync::Arc::clone(&program_layouts);
             // V2.2 + #686 object cache lookup. The key hashes every
             // codegen-affecting field of `opts` together with this
             // module's post-transform HIR fingerprint and the perry
@@ -6068,8 +6208,7 @@ pub fn run_with_parse_cache(
                 (None, None)
             };
             let obj_name = native_object_file_stem(&hir_module.name);
-            // In bitcode mode the bytes are .ll text; use .ll extension.
-            let ext = if bitcode_link { "ll" } else { "o" };
+            let ext = "o";
             // #7167: on `--no-link` the emitted object is the product, so it
             // is written where `-o` points (verbatim, for the single-module
             // case) rather than into a temp directory nobody deletes. When
@@ -6108,16 +6247,12 @@ pub fn run_with_parse_cache(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .extend(seeds);
-                // #6439: a hit skips `compile_module`, and `compile_module`
-                // is what populates the ext_registry (`record_ffi_call`
-                // fires from `LlBlock::call`). The registry drives
-                // `needs_stdlib` + the well-known flip further down, so
-                // without this replay the link line depends on whether the
-                // cache happened to be warm: `api.ts` (Effect) linked from
-                // cold and failed from warm with an undefined
-                // `_js_ws_connect_start`. Replaying the manifest makes a hit
-                // record exactly what the skipped codegen would have.
-                perry_codegen::ext_registry::replay_ffi_symbols(&ffi_symbols);
+                // #6439: a hit skips `compile_module`, so the manifest stored
+                // beside the `.o` stands in for its emissions and is checked
+                // against the providers computed from HIR, exactly as a fresh
+                // compile is: the same source links (or is refused) the same
+                // way cold and warm.
+                check_module_providers(&program_providers, &hir_module.name, &cached_symbols)?;
                 // #7167: `-o` must name the same file whether the object cache
                 // was warm or cold. A linking compile can hand the linker the
                 // cache path directly — the bytes are the bytes and nothing
@@ -6224,6 +6359,7 @@ pub fn run_with_parse_cache(
                 )
             })?;
             let emitted_ffi_symbols = perry_codegen::ext_registry::take_module_capture();
+            check_module_providers(&program_providers, &hir_module.name, &emitted_ffi_symbols)?;
             validate_module_ffi_symbols(
                 &ctx.native_routing,
                 &hir_module.name,
@@ -6623,57 +6759,6 @@ pub fn run_with_parse_cache(
         eprintln!("{rendered}");
     }
 
-    // #835 + #846: fold the codegen-side FFI provenance registry into
-    // ctx so the well-known flip and `needs_stdlib` decisions below see
-    // the symbols codegen actually emitted, not just the modules the
-    // user imported. Today, codegen for compiled-package code can emit
-    // (e.g.) `js_node_http_create_server` or `js_readable_stream_new`
-    // without any `import "node:http"` / `import "streams"` showing up
-    // in `ctx.native_module_imports` — Effect's `Stream`, Express's
-    // server, and similar shapes lower the FFI calls directly. The
-    // registry (`crates/perry-codegen/src/ext_registry.rs`) records
-    // every call-emission site against its providing crate; here we
-    // drain that record and route each entry through the existing
-    // `needs_stdlib` + `native_module_imports` machinery. Done before
-    // `build_optimized_libs` so `compute_required_features` and the
-    // well-known flip both see the augmented set.
-    {
-        use perry_codegen::ext_registry::{take_used_providers, OwnerKind};
-        let providers = take_used_providers();
-        for owner in providers {
-            match owner {
-                OwnerKind::Stdlib { feature } => {
-                    ctx.needs_stdlib = true;
-                    // Follow-up to #835/#846: codegen-emitted Stdlib
-                    // FFIs (Effect `Stream`, etc.) flip needs_stdlib
-                    // here, but the auto-optimize layer
-                    // (`build_optimized_libs`) rebuilds perry-stdlib
-                    // with only the features `compute_required_features`
-                    // derived from `native_module_imports` — which is
-                    // empty when no `import "streams"` appears in the
-                    // user TS. Without the feature, the symbol's
-                    // module is `#[cfg]`-gated out and the link fails
-                    // with "Undefined symbols: _js_readable_stream_…".
-                    // Inject the feature here so the rebuild includes
-                    // the providing module.
-                    if let Some(feat) = feature {
-                        ctx.extra_stdlib_features.insert(feat);
-                    }
-                }
-                OwnerKind::WellKnown(key) => {
-                    // Inserting into native_module_imports flips the
-                    // well-known mechanism for this binding. Also flip
-                    // `needs_stdlib` because the link step's
-                    // "Linking (with stdlib)..." vs "(runtime-only)"
-                    // gate is what brings the well-known libs onto the
-                    // command line (see link.rs:881-916).
-                    ctx.native_module_imports.insert(key.to_string());
-                    ctx.needs_stdlib = true;
-                }
-            }
-        }
-    }
-
     // Standalone WASI (#11379): link the wasm32 objects against the runtime
     // built for wasm32-wasip2 and stop; none of the native link machinery
     // below (auto-optimize, stdlib, stubs, link cache) applies.
@@ -6710,67 +6795,11 @@ pub fn run_with_parse_cache(
         });
     }
 
-    // Issue #76 follow-up — auto-provision the wasmi host staticlib. A
-    // program that references `WebAssembly.*` sets `ctx.needs_wasm_runtime`
-    // (feature_detect.rs), which links `libperry_wasm_host.a`. That archive
-    // lives in the standalone `perry-wasm-host` crate and is built by NOTHING
-    // in the normal compile path — not the auto-optimize runtime/stdlib
-    // rebuild, not codegen — so a bare `perry compile` used to die with
-    // `libperry_wasm_host.a not found` until a human ran
-    // `cargo build --release -p perry-wasm-host`. Build it on demand here so
-    // both the symbol-stub scan below and the final link resolve it. Cargo's
-    // freshness check makes this a no-op when it is already current; programs
-    // that do not use wasm skip the check entirely.
-    //
-    // `--enable-wasm-runtime` is an explicit override: fold it into
-    // `ctx.needs_wasm_runtime` so EVERY downstream path (the `wasm-host`
-    // cargo feature in `auto_optimized_cross_features`, the no-auto runtime
-    // rebuild, the library link, and the symbol-stub scan) treats it the
-    // same as auto-detected `WebAssembly.*` usage. Without this fold the
-    // flag only linked `libperry_wasm_host.a` but never enabled the
-    // `perry-runtime/wasm-host` cargo feature, so `js_webassembly_*`
-    // symbols stayed undefined in the runtime archive.
-    if args.enable_wasm_runtime {
-        ctx.needs_wasm_runtime = true;
-    }
-    let use_wasm_host = ctx.needs_wasm_runtime;
-    if use_wasm_host && find_perry_workspace_root().is_none() {
-        eprintln!(
-            "warning: WebAssembly runtime was requested, but Perry could not find its source workspace to build the required `perry-runtime/wasm-host` feature. The default prebuilt runtime lacks this feature, so linking may fail unless the selected runtime was built with it. Set `PERRY_WORKSPACE_ROOT` to a Perry source checkout (including `crates/perry-runtime` and `crates/perry-wasm-host`), or use a wasm-enabled runtime archive."
-        );
-    }
-    let wasm_host_lib_resolved = if use_wasm_host {
-        // Prefer a Cargo freshness check when workspace source is available.
-        // Merely finding an archive is insufficient after the host ABI grows:
-        // a stale libperry_wasm_host.a can exist while the freshly rebuilt
-        // runtime references newer symbols. Cargo is incremental here, so an
-        // up-to-date host is a cheap no-op. Installed/source-less builds fall
-        // back to their packaged archive.
-        build_wasm_host_library(target.as_deref(), format, verbose)
-            .or_else(|| find_wasm_host_library(target.as_deref()))
-    } else {
-        None
-    };
+    // Resolved before codegen (design §4.4); a WASI build returned above.
+    let optimized_libs: OptimizedLibs =
+        optimized_libs.expect("native link set is resolved before codegen");
 
-    // Auto-mode: pick the smallest matching (features, panic) profile
-    // for this binary and rebuild perry-runtime + perry-stdlib in a
-    // hash-keyed target dir. Both halves fall back to the prebuilt full
-    // libraries if the rebuild fails or the workspace source isn't on
-    // disk. `--no-auto-optimize` disables runtime/stdlib rebuilds but
-    // still resolves prebuilt well-known wrapper archives whose symbols
-    // are absent from the full stdlib.
-    //
-    // The legacy `--minimal-stdlib` flag is now a no-op alias for
-    // backward compat — auto-mode already does what it used to and more.
-    let optimized_libs: OptimizedLibs = if args.no_auto_optimize {
-        optimized_libs::resolve_no_auto_optimized_libs(&ctx, target.as_deref(), format, verbose)
-    } else {
-        build_optimized_libs(&ctx, target.as_deref(), &compiled_features, format, verbose)
-    };
-    let stdlib_lib_resolved: Option<PathBuf> = optimized_libs
-        .stdlib
-        .clone()
-        .or_else(|| find_stdlib_library(target.as_deref()));
+    let stdlib_lib_resolved: Option<PathBuf> = find_stdlib_library(target.as_deref());
 
     // Optional runtime features — and perry-stdlib's, when the stdlib is
     // linked — install through the installers this object registers (see
@@ -6791,9 +6820,18 @@ pub fn run_with_parse_cache(
                 eprintln!("  stdlib installs: {}", stdlib.join(", "));
             }
         }
+        // The wasm host registers its entry points with the runtime before
+        // `main` (`perry_abi::wasm_host`), so `js_runtime_install_wasm_host`
+        // finds them.
+        let registrations: Vec<String> = wasm_host_lib_resolved
+            .is_some()
+            .then(|| crate::commands::stdlib_installs::WASM_HOST_REGISTER_SYMBOL.to_string())
+            .into_iter()
+            .collect();
         let installer_bytes = perry_codegen::stubs::generate_feature_installer_object(
             &runtime_symbols,
             stdlib_symbols.as_deref(),
+            &registrations,
             target.as_deref(),
         )?;
         let installer_path = object_output_dir.join("_perry_feature_installs.o");
@@ -7034,112 +7072,6 @@ pub fn run_with_parse_cache(
             obj_fingerprints.push(None);
         }
     }
-
-    // Phase J: bitcode link — merge user .ll + runtime/stdlib .bc into one
-    // optimized object via llvm-link → opt → llc. This replaces both the
-    // per-module clang -c step AND the archive linking.
-    let _bitcode_linked = if bitcode_link && optimized_libs.runtime_bc.is_some() {
-        if matches!(format, OutputFormat::Text) {
-            println!("Using LLVM bitcode link (whole-program LTO)");
-        }
-        // Separate .ll files (user modules) from .o files (stubs)
-        let ll_files: Vec<PathBuf> = obj_paths
-            .iter()
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ll"))
-            .cloned()
-            .collect();
-        let stub_objs: Vec<PathBuf> = obj_paths
-            .iter()
-            .filter(|p| p.extension().and_then(|e| e.to_str()) != Some("ll"))
-            .cloned()
-            .collect();
-
-        if ll_files.is_empty() {
-            eprintln!("  bitcode-link: no .ll files produced, falling back to normal link");
-            false
-        } else {
-            let runtime_bc = optimized_libs.runtime_bc.as_ref().unwrap();
-            let stdlib_bc = optimized_libs.stdlib_bc.as_deref();
-
-            match perry_codegen::linker::bitcode_link_pipeline(
-                &ll_files,
-                runtime_bc,
-                stdlib_bc,
-                &optimized_libs.extra_bc,
-                target.as_deref(),
-            ) {
-                Ok(linked_obj) => {
-                    match format {
-                        OutputFormat::Text => {
-                            if let Ok(meta) = std::fs::metadata(&linked_obj) {
-                                println!(
-                                    "  bitcode-link: merged {} modules → {} ({:.1} MB)",
-                                    ll_files.len(),
-                                    linked_obj.display(),
-                                    meta.len() as f64 / (1024.0 * 1024.0)
-                                );
-                            }
-                        }
-                        OutputFormat::Json => {}
-                    }
-                    // Clean up intermediate .ll files unless the caller
-                    // explicitly requested debuggable compiler artifacts.
-                    if !args.keep_intermediates {
-                        for ll in &ll_files {
-                            let _ = fs::remove_file(ll);
-                        }
-                    }
-                    // Replace obj_paths with the merged .o + any stubs.
-                    // The merged object is derived after codegen-cache
-                    // materialization, so the original per-module cache
-                    // fingerprints are no longer a trusted proxy for these
-                    // bytes.
-                    obj_cleanup_paths.push(linked_obj.clone());
-                    let mut linked_obj_paths = vec![linked_obj];
-                    linked_obj_paths.extend(stub_objs);
-                    obj_fingerprints = vec![None; linked_obj_paths.len()];
-                    obj_paths = linked_obj_paths;
-                    true
-                }
-                Err(e) => {
-                    eprintln!(
-                        "  bitcode-link: pipeline failed ({}), falling back to normal link",
-                        e
-                    );
-                    false
-                }
-            }
-        }
-    } else if bitcode_link {
-        // bitcode_link was requested but runtime .bc wasn't produced.
-        // Fall back: compile any .ll files to .o via clang -c.
-        eprintln!("  bitcode-link: runtime .bc not available, falling back to normal link");
-        let mut new_obj_paths: Vec<PathBuf> = Vec::new();
-        let mut new_obj_fingerprints: Vec<Option<String>> = Vec::new();
-        for (idx, p) in obj_paths.iter().enumerate() {
-            if p.extension().and_then(|e| e.to_str()) == Some("ll") {
-                let ll_text = fs::read_to_string(p)?;
-                let obj_bytes =
-                    perry_codegen::linker::compile_ll_to_object(&ll_text, target.as_deref())?;
-                let obj_path = p.with_extension("o");
-                fs::write(&obj_path, &obj_bytes)?;
-                if !args.keep_intermediates {
-                    let _ = fs::remove_file(p);
-                }
-                obj_cleanup_paths.push(obj_path.clone());
-                new_obj_paths.push(obj_path);
-                new_obj_fingerprints.push(None);
-            } else {
-                new_obj_paths.push(p.clone());
-                new_obj_fingerprints.push(obj_fingerprints.get(idx).cloned().unwrap_or(None));
-            }
-        }
-        obj_paths = new_obj_paths;
-        obj_fingerprints = new_obj_fingerprints;
-        false
-    } else {
-        false
-    };
 
     // Generate JS bundle if needed
     let _js_bundle_path = if !ctx.js_modules.is_empty() {
@@ -7873,8 +7805,8 @@ pub fn run_with_parse_cache(
     };
     let runtime_lib = if let Some(ref libs) = geisterhand_libs {
         libs.runtime.clone()
-    } else if let Some(auto_rt) = optimized_libs.runtime.clone() {
-        auto_rt
+    } else if let Some(core) = optimized_libs.runtime.clone() {
+        core
     } else {
         find_runtime_library(target.as_deref())?
     };

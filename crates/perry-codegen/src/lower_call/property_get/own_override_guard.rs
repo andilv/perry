@@ -55,7 +55,7 @@ use super::helpers::is_date_receiver;
 use crate::expr::{lower_expr, FnCtx};
 use crate::rooting;
 use crate::type_analysis::{is_array_expr, is_declared_map_expr, is_map_expr, is_set_expr};
-use crate::types::{DOUBLE, I16, I32, I64, I8, PTR};
+use crate::types::{DOUBLE, I1, I32, I64, I8};
 
 /// Method names a specialised lowering can claim on one of the exotic kinds
 /// below. Over-approximating is safe — a name the chain declines simply makes
@@ -150,12 +150,16 @@ pub(super) fn guards(ctx: &FnCtx<'_>, object: &Expr, property: &str) -> bool {
 /// receiver (`object/own_override.rs`), and never answers "no" for anything it
 /// cannot prove: a wrong "no" is a silent wrong value, a wrong "yes" is only
 /// slower.
-/// `GC_ARRAY_NAMED_PROPS` (0x100) | `OBJ_FLAG_ARRAY_DESCRIPTORS` (0x400) in
-/// `GcHeader::_reserved`. Both clear is the runtime predicate's own proof that
-/// an array owns no named property: the bit is monotonic and set when an array
-/// takes one, and the fallback table is reachable only with the descriptor
-/// flag set (`named_props::fallback_possible`).
-const ARRAY_MAY_OWN_NAMED_MASK_I16: &str = "1280";
+/// An array owns a named property only in its named layout object
+/// (`ArrayHeader.named`, §6a): a null `named` is the absence proof. Plus
+/// `GC_ARRAY_CUSTOM_PROTO` (0x40 in `GcHeader::_reserved`, #11915): an array
+/// with its own `[[Prototype]]` does not read `%Array.prototype%`, and the
+/// predicate answers for it; and `GC_FLAG_FORWARDED` (0x80 in `gc_flags`): a
+/// pre-growth alias's `named` is not the live head's. As one i32 at -8
+/// (`obj_type`, `gc_flags`, `_reserved`): `0x80 << 8 | 0x40 << 16`.
+const ARRAY_NOT_DEFAULT_MASK_I32: &str = "4227072";
+/// `ArrayHeader.named`'s byte offset.
+const ARRAY_NAMED_OFFSET: &str = "8";
 /// `HANDLE_MASK_48` — the address bits of a NaN-boxed pointer.
 const HANDLE_MASK_48: &str = "281474976710655";
 
@@ -178,29 +182,54 @@ const HANDLE_MASK_48: &str = "281474976710655";
 /// This is a LIFT, not a new proof: both tests are the predicate's own first
 /// lines, so nothing is proven here that the runtime did not already prove,
 /// and no new install site has to be armed for it to be sound.
+///
+/// `Pristine` (#11915) costs the non-array guard nothing: every modification
+/// of a builtin prototype arms `PERRY_OWN_NAMED_PROP_INSTALLED`, and the
+/// predicate answers "may own" for a receiver whose prototype is not pristine
+/// (`builtin_proto::receiver_pristine`), so a modified prototype takes the
+/// same own arm — the generic path, which performs the real `Get` and call.
+/// An ARRAY answers from its own header, so `pristine` (`Some(Array)` for a
+/// site that proves it here) adds the one byte test to the branch the guard
+/// already has; its `GC_ARRAY_CUSTOM_PROTO` bit joins the header mask, and
+/// the predicate answers for it too.
 pub(crate) fn emit_own_override_branch(
     ctx: &mut FnCtx<'_>,
     property: &str,
     recv: &str,
     receiver_is_array: bool,
+    pristine: Option<crate::builtin_proto::BuiltinProto>,
     own_label: &str,
     builtin_label: &str,
 ) {
     let ask_idx = ctx.new_block("ownoverride.ask");
     let ask_label = ctx.block_label(ask_idx);
     {
-        let blk = ctx.block();
         if receiver_is_array {
-            // GcHeader precedes the object: `_reserved` @-6 (i16).
+            if let Some(family) = pristine {
+                // One compare and an unlikely branch to the ask arm, whose
+                // predicate answers for a modified prototype.
+                let patched = crate::builtin_proto::emit_patched_test(ctx, family);
+                let header_idx = ctx.new_block("ownoverride.header");
+                let header_label = ctx.block_label(header_idx);
+                ctx.block().cond_br(&patched, &ask_label, &header_label);
+                ctx.current_block = header_idx;
+            }
+            let blk = ctx.block();
             let bits = blk.bitcast_double_to_i64(recv);
             let handle = blk.and(I64, &bits, HANDLE_MASK_48);
             let obj_ptr = blk.inttoptr(I64, &handle);
-            let res_ptr = blk.gep(I8, &obj_ptr, &[(I64, "-6")]);
-            let reserved = blk.load(I16, &res_ptr);
-            let may = blk.and(I16, &reserved, ARRAY_MAY_OWN_NAMED_MASK_I16);
-            let maybe_owns = blk.icmp_ne(I16, &may, "0");
+            // GcHeader precedes the array: obj_type/gc_flags/_reserved @-8.
+            let hdr_ptr = blk.gep(I8, &obj_ptr, &[(I64, "-8")]);
+            let hdr = blk.load(I32, &hdr_ptr);
+            let odd = blk.and(I32, &hdr, ARRAY_NOT_DEFAULT_MASK_I32);
+            let not_default = blk.icmp_ne(I32, &odd, "0");
+            let named_ptr = blk.gep(I8, &obj_ptr, &[(I64, ARRAY_NAMED_OFFSET)]);
+            let named = blk.load(I64, &named_ptr);
+            let has_named = blk.icmp_ne(I64, &named, "0");
+            let maybe_owns = blk.or(I1, &not_default, &has_named);
             blk.cond_br(&maybe_owns, &ask_label, builtin_label);
         } else {
+            let blk = ctx.block();
             let installed = blk.load_atomic_monotonic(I32, "@PERRY_OWN_NAMED_PROP_INSTALLED", 4);
             let any_installed = blk.icmp_ne(I32, &installed, "0");
             blk.cond_br(&any_installed, &ask_label, builtin_label);
@@ -208,24 +237,43 @@ pub(crate) fn emit_own_override_branch(
     }
 
     ctx.current_block = ask_idx;
-    // The predicate takes the name as BYTES, not a dispatch id: it asks
-    // `Object.hasOwn`'s own predicate, which needs a real key.
-    let (name_bytes, name_len) = {
-        let idx = ctx.strings.intern(property);
-        let entry = ctx.strings.entry(idx);
-        (
-            format!("@{}", entry.bytes_global),
-            entry.byte_len.to_string(),
-        )
-    };
+    // The predicate takes the interned key value (not a dispatch id). The
+    // string-pool handle is already a rooted NaN-boxed string; passing it
+    // avoids rebuilding the same property key from raw bytes in the runtime.
+    let idx = ctx.strings.intern(property);
+    let key_handle = format!("@{}", ctx.strings.entry(idx).handle_global);
     let blk = ctx.block();
+    let key = blk.load(DOUBLE, &key_handle);
     let maybe = blk.call(
         I32,
         "js_receiver_may_own_named_method",
-        &[(DOUBLE, recv), (PTR, &name_bytes), (I64, &name_len)],
+        &[(DOUBLE, recv), (DOUBLE, &key)],
     );
     let may_own = blk.icmp_ne(I32, &maybe, "0");
     blk.cond_br(&may_own, own_label, builtin_label);
+}
+
+/// The `builtin_proto` family of a receiver whose kind
+/// [`kind_is_proven_exotic`] proved.
+pub(crate) fn proven_kind_family(
+    ctx: &FnCtx<'_>,
+    object: &Expr,
+    receiver_is_array: bool,
+) -> crate::builtin_proto::BuiltinProto {
+    use crate::builtin_proto::BuiltinProto;
+    if receiver_is_array || is_array_expr(ctx, object) {
+        BuiltinProto::Array
+    } else if is_map_expr(ctx, object) || is_declared_map_expr(ctx, object) {
+        BuiltinProto::Map
+    } else if is_set_expr(ctx, object) {
+        BuiltinProto::Set
+    } else if is_date_receiver(ctx, object) {
+        BuiltinProto::Date
+    } else {
+        // Unreachable for a proven exotic kind; `Object.prototype` withdraws
+        // every family, so its byte is the conservative answer.
+        BuiltinProto::Object
+    }
 }
 
 /// The universal dispatcher, which finds an own or inherited user method. It
@@ -240,17 +288,17 @@ fn emit_dispatcher(
     let mut operands: Vec<&Expr> = Vec::with_capacity(args.len() + 1);
     operands.push(object);
     operands.extend(args.iter());
+    // #11915: the shared generic path (see `builtin_proto::emit_generic_call`).
     rooting::with_operands_rooted(ctx, &operands, |ctx, values| {
         let (recv, arg_vals) = values.split_first().expect("the receiver is operand 0");
-        Ok(
-            super::super::console_promise::emit_native_method_str_dispatch_plain(
-                ctx,
-                property,
-                call_byte_offset,
-                recv,
-                arg_vals,
-            ),
-        )
+        crate::expr::calls::emit_call_location_at(ctx, call_byte_offset);
+        Ok(crate::builtin_proto::emit_generic_call(
+            ctx,
+            crate::builtin_proto::GenericRead::Receiver,
+            recv,
+            property,
+            arg_vals,
+        ))
     })
 }
 
@@ -292,6 +340,7 @@ pub(super) fn lower(
             property,
             &recv,
             receiver_is_array,
+            Some(proven_kind_family(ctx, object, receiver_is_array)),
             &own_label,
             &builtin_label,
         );
@@ -308,6 +357,8 @@ pub(super) fn lower(
         // declines (an over-approximated name) reaches the same dispatcher, so
         // the diamond is redundant rather than wrong.
         ctx.current_block = builtin_idx;
+        let family = proven_kind_family(ctx, object, receiver_is_array);
+        crate::builtin_proto::emit_contract_check(ctx.block(), &[family]);
         let builtin_value = match super::lower_method_call_chain(
             ctx,
             callee,

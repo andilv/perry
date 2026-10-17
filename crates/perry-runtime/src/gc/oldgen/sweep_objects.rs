@@ -15,7 +15,6 @@ pub(super) struct ArenaSweepObjectsState {
     block_has_live: Vec<bool>,
     resettable_general_n: usize,
     old_block_start: usize,
-    closure_externals_active: bool,
     do_age_bump: bool,
     reclaim_dead_old_blocks: bool,
     /// This sweep follows a MINOR trace, whose mark bits say nothing about the
@@ -94,9 +93,6 @@ impl ArenaSweepObjectsState {
             block_has_live: vec![false; n_blocks],
             resettable_general_n: crate::arena::general_block_count(),
             old_block_start: crate::arena::longlived_end(),
-            // Wave 2: also arms the closure dynamic-props dead-payload arm
-            // (one gate check per sweep-state build, not per object).
-            closure_externals_active: crate::closure::closure_dynamic_side_tables_nonempty(),
             do_age_bump,
             reclaim_dead_old_blocks,
             minor_sweep,
@@ -415,6 +411,9 @@ impl ArenaSweepObjectsState {
         live: bool,
         pinned: bool,
     ) {
+        // I1: a live never-move object holds its page like a pinned one
+        // (the one-by-one path below applies the same rule).
+        let pinned = pinned || (live && unsafe { crate::gc::never_move::is_never_move(header) });
         match crate::arena::old_object_single_page(header as usize, total_size) {
             Some(page) => {
                 if page != self.old_page_tally_page {
@@ -585,7 +584,10 @@ impl ArenaSweepObjectsState {
             }
         }
         if age_bump_this && flags & GC_FLAG_TENURED == 0 {
-            if flags & GC_FLAG_HAS_SURVIVED != 0 {
+            // I1: a never-move object tenures at its first survival here too.
+            if flags & GC_FLAG_HAS_SURVIVED != 0
+                || crate::gc::never_move::promotes_now((*header).obj_type, (*header)._reserved)
+            {
                 (*header).gc_flags =
                     (flags | GC_FLAG_TENURED) & !GC_FLAG_HAS_SURVIVED & !GC_FLAG_MARKED;
             } else {
@@ -633,9 +635,6 @@ impl ArenaSweepObjectsState {
         let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
         self.freed_bytes = self.freed_bytes.saturating_add(total_size as u64);
         layout_clear_for_ptr(user_ptr as usize);
-        if self.closure_externals_active {
-            gc_type_clear_dead_payload_side_tables((*header).obj_type, user_ptr as usize);
-        }
         if self.reclaim_dead_old_blocks && dead_old {
             self.note_invalidated(block_idx);
             self.defer_old_unregister(header, total_size);
@@ -658,12 +657,7 @@ impl ArenaSweepObjectsState {
         // This existing census vector is armed only by apply_block_skip in
         // the synchronous full sweep, after the dead-owner fan-out. Sliced
         // fulls and minors retain per-object table removal.
-        finalize_dead_arena_payload(
-            header,
-            user_ptr,
-            self.closure_externals_active,
-            !self.census_hole_free.is_empty(),
-        );
+        finalize_dead_arena_payload(header, user_ptr, !self.census_hole_free.is_empty());
         if crate::arena::old_sweep_quarantine_enabled() {
             self.quarantine_dead_object(header, total_size, block_idx, dead_old);
         }

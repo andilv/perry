@@ -14,11 +14,16 @@ use crate::rooting::{
     open_rooted_group, operand_may_collect, with_rooted_accumulator, with_rooted_group, Arg,
     EmittedValue, Repr, RootedGroup,
 };
-use crate::type_analysis::{is_string_expr, string_value_is_runtime_guaranteed};
+use crate::type_analysis::string_value_is_runtime_guaranteed;
 
 mod char_code_at;
+mod coerce;
 use crate::types::{DOUBLE, I1, I32, I64, PTR};
 use char_code_at::lower_char_code_at_inline;
+use coerce::{
+    dispatch_coercions_may_collect, later_coercion_may_collect, lower_coerced_args,
+    pre_coerce_index, pre_coerce_number, pre_coerce_string, StringCoercion,
+};
 
 fn regexp_search_method_id(property: &str) -> String {
     match property {
@@ -124,7 +129,40 @@ pub(crate) fn lower_string_method(
     }
 
     let recv_box = lower_expr(ctx, object)?;
-    lower_string_method_from_box(ctx, object, property, args, recv_box)
+    let proof = string_proof_for(ctx, property, args);
+    lower_string_method_from_box(ctx, object, property, args, recv_box, proof)
+}
+
+/// Where a string-method site proves `Pristine(String)` (#11915).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StringProof {
+    /// The callee proves it: the site calls the checked entry
+    /// `js_string_m_<method><argc>` (or, for `charCodeAt`, folds the byte into
+    /// its inline body's admission with that entry as the slow arm).
+    Entry,
+    /// The method has an entry, but an argument's evaluation could observe
+    /// WHEN the method is read (ECMA-262 reads it before them): the site
+    /// reads the byte before its arguments, evaluates them once, and calls
+    /// the unchecked body `js_string_b_<method><argc>` or the generic path.
+    EntryPreRead,
+    /// No entry for the method and arity: the site tests the byte before its
+    /// arguments and has a generic arm.
+    Guard,
+    /// The caller's branch already tested it.
+    Proven,
+}
+
+/// How a call with these arguments proves `Pristine(String)`: through the
+/// entry (`Entry` / `EntryPreRead`) when the method has one for this arity,
+/// else at the site (`Guard`).
+pub(crate) fn string_proof_for(ctx: &FnCtx<'_>, property: &str, args: &[Expr]) -> StringProof {
+    if crate::builtin_proto::string_entry(property, args.len()).is_none() {
+        StringProof::Guard
+    } else if crate::expr::method_site::args_may_observe_lookup(ctx, args) {
+        StringProof::EntryPreRead
+    } else {
+        StringProof::Entry
+    }
 }
 
 /// Lower a string method after a runtime tag guard has proved that the
@@ -139,8 +177,12 @@ pub(crate) fn lower_string_method_from_proven_box(
     property: &str,
     args: &[Expr],
     recv_box: String,
+    proof: StringProof,
 ) -> Result<String> {
-    lower_string_method_from_box(ctx, object, property, args, recv_box)
+    // `Proven`: the caller's tag guard already folded `Pristine(String)` into
+    // its test (#11915), so its generic arm is this call's generic path.
+    // `Entry`: the checked entry proves it.
+    lower_string_method_from_box(ctx, object, property, args, recv_box, proof)
 }
 
 fn lower_string_method_from_box(
@@ -149,6 +191,7 @@ fn lower_string_method_from_box(
     property: &str,
     args: &[Expr],
     recv_box: String,
+    proof: StringProof,
 ) -> Result<String> {
     // #6971: the receiver is lowered BEFORE the arguments, and an argument's
     // lowering can collect — `fresh(k).concat("|" + churn(N))` dropped the
@@ -162,7 +205,12 @@ fn lower_string_method_from_box(
         // coerced, so that coercion must be part of the receiver's window.
         args.iter().any(|a| concat_arg_may_collect(ctx, a))
     } else {
+        // A coercion the dispatch itself applies to an argument (`ToNumber`
+        // of an index, `ToString` of a search value or fill) runs while the
+        // receiver is held, exactly like an argument's own lowering: see
+        // `coerce.rs`.
         args.iter().any(|a| operand_may_collect(ctx, a))
+            || dispatch_coercions_may_collect(ctx, property, args)
     };
     // #7615 slice 8: the ESCAPING group form. The release has to post-dominate
     // ~60 return paths inside the dispatch, which no closure form can own
@@ -173,7 +221,35 @@ fn lower_string_method_from_box(
     // twice: it never sees an index.
     let mut group = open_rooted_group(1);
     let recv = group.adopt_emitted(ctx, Repr::Boxed, &recv_box, args_can_collect);
-    let result = lower_string_method_dispatch(ctx, object, property, args, &group, recv);
+    let result = match proof {
+        StringProof::Entry | StringProof::EntryPreRead => {
+            let patched_before = (proof == StringProof::EntryPreRead).then(|| {
+                crate::builtin_proto::emit_patched_test(
+                    ctx,
+                    crate::builtin_proto::BuiltinProto::String,
+                )
+            });
+            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
+            let recv_box = reread_recv(ctx, &group, recv);
+            let result = emit_string_entry_call(
+                ctx,
+                object,
+                property,
+                &recv_box,
+                &arg_values,
+                patched_before.as_deref(),
+                None,
+            );
+            arg_group.release(ctx);
+            result
+        }
+        StringProof::Guard => {
+            lower_string_method_pristine(ctx, object, property, args, &group, recv)
+        }
+        StringProof::Proven => {
+            lower_string_method_dispatch(ctx, object, property, args, &group, recv)
+        }
+    };
     // Released only after the dispatch's consuming runtime call has run: that
     // call allocates while it reads the receiver.
     //
@@ -204,6 +280,175 @@ fn lower_string_method_from_box(
         group.release(ctx);
     }
     result
+}
+
+/// #11915: a string receiver owns nothing, so the method it reads is
+/// `%String.prototype%`'s (or `%Object.prototype%`'s) while those are
+/// unmodified — `Pristine(String)`, one load and test before the arguments.
+/// A modified prototype takes the shared generic path with the same receiver
+/// and arguments; the direct dispatch below is emitted once, unchanged.
+fn lower_string_method_pristine(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    args: &[Expr],
+    group: &RootedGroup<'_>,
+    recv: EmittedValue,
+) -> Result<String> {
+    use crate::builtin_proto::{emit_patched_test, BuiltinProto};
+    let direct_idx = ctx.new_block("strpristine.direct");
+    let generic_idx = ctx.new_block("strpristine.generic");
+    let merge_idx = ctx.new_block("strpristine.merge");
+    let direct_label = ctx.block_label(direct_idx);
+    let generic_label = ctx.block_label(generic_idx);
+    let merge_label = ctx.block_label(merge_idx);
+    {
+        let patched = emit_patched_test(ctx, BuiltinProto::String);
+        ctx.block().cond_br(&patched, &generic_label, &direct_label);
+    }
+
+    ctx.current_block = generic_idx;
+    let (arg_vals, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
+    let generic_recv = reread_recv(ctx, group, recv);
+    let generic_value = crate::builtin_proto::emit_generic_call(
+        ctx,
+        crate::builtin_proto::GenericRead::Receiver,
+        &generic_recv,
+        property,
+        &arg_vals,
+    );
+    arg_group.release(ctx);
+    let generic_end = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = direct_idx;
+    crate::builtin_proto::emit_contract_check(ctx.block(), &[BuiltinProto::String]);
+    let direct_value = lower_string_method_dispatch(ctx, object, property, args, group, recv)?;
+    let mut incoming = vec![(generic_value, generic_end)];
+    if !ctx.block().is_terminated() {
+        let direct_end = ctx.block().label.clone();
+        ctx.block().br(&merge_label);
+        incoming.push((direct_value, direct_end));
+    }
+    ctx.current_block = merge_idx;
+    let pairs: Vec<(&str, &str)> = incoming
+        .iter()
+        .map(|(v, l)| (v.as_str(), l.as_str()))
+        .collect();
+    Ok(ctx.block().phi(DOUBLE, &pairs))
+}
+
+/// The string method through its entries (#11915), on operands the caller
+/// has evaluated (each rooted across the next) and re-read.
+///
+/// * `patched_before == None` (the arguments cannot observe the method
+///   read): ONE call to the checked entry `js_string_m_<method><argc>`, which
+///   proves `Pristine(String)` itself.
+/// * `Some(p)`: `p` is the byte the site read BEFORE the arguments; set, it
+///   takes the generic path — `generic_label` when the caller has one (the
+///   tag guard's dispatcher arm, which reads the same rooted operands), else
+///   one `js_builtin_proto_generic_call*`; clear, the unchecked body
+///   `js_string_b_<method><argc>`.
+///
+/// `charCodeAt` and `charAt` keep an inline body: the proof joins the index
+/// test the body already has, and the entry is its slow arm.
+pub(crate) fn emit_string_entry_call(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    recv_box: &str,
+    arg_values: &[String],
+    patched_before: Option<&str>,
+    generic_label: Option<&str>,
+) -> Result<String> {
+    let checked = crate::builtin_proto::string_entry(property, arg_values.len())
+        .expect("an entry proof is chosen only for a method with a checked entry");
+    let body = checked.replacen("js_string_m_", "js_string_b_", 1);
+    let callee = if patched_before.is_some() {
+        &body
+    } else {
+        &checked
+    };
+    let call = |ctx: &mut FnCtx<'_>| -> String {
+        if property == "charCodeAt" {
+            let idx_d = arg_values
+                .first()
+                .cloned()
+                .unwrap_or_else(|| crate::nanbox::double_literal(0.0));
+            if let Some(value) = char_code_at::lower_char_code_at_inline_entry(
+                ctx,
+                object,
+                recv_box,
+                &idx_d,
+                callee,
+                arg_values,
+                patched_before.is_none(),
+            ) {
+                return value;
+            }
+        }
+        if property == "charAt" {
+            let idx_d = arg_values
+                .first()
+                .cloned()
+                .unwrap_or_else(|| crate::nanbox::double_literal(0.0));
+            if let Some(value) = char_code_at::lower_char_at_inline_entry(
+                ctx,
+                object,
+                recv_box,
+                &idx_d,
+                callee,
+                arg_values,
+                patched_before.is_none(),
+            ) {
+                return value;
+            }
+        }
+        let mut operands: Vec<(crate::types::LlvmType, &str)> = vec![(DOUBLE, recv_box)];
+        operands.extend(arg_values.iter().map(|a| (DOUBLE, a.as_str())));
+        ctx.block().call(DOUBLE, callee, &operands)
+    };
+    let Some(patched) = patched_before else {
+        return Ok(call(ctx));
+    };
+    let direct_idx = ctx.new_block("strentry.direct");
+    let direct_label = ctx.block_label(direct_idx);
+    match generic_label {
+        Some(generic_label) => {
+            ctx.block().cond_br(patched, generic_label, &direct_label);
+            ctx.current_block = direct_idx;
+            Ok(call(ctx))
+        }
+        None => {
+            let generic_idx = ctx.new_block("strentry.generic");
+            let merge_idx = ctx.new_block("strentry.merge");
+            let generic_label = ctx.block_label(generic_idx);
+            let merge_label = ctx.block_label(merge_idx);
+            ctx.block().cond_br(patched, &generic_label, &direct_label);
+            ctx.current_block = generic_idx;
+            let generic_value = crate::builtin_proto::emit_generic_call(
+                ctx,
+                crate::builtin_proto::GenericRead::Receiver,
+                recv_box,
+                property,
+                arg_values,
+            );
+            let generic_end = ctx.block().label.clone();
+            ctx.block().br(&merge_label);
+            ctx.current_block = direct_idx;
+            let direct_value = call(ctx);
+            let direct_end = ctx.block().label.clone();
+            ctx.block().br(&merge_label);
+            ctx.current_block = merge_idx;
+            Ok(ctx.block().phi(
+                DOUBLE,
+                &[
+                    (generic_value.as_str(), generic_end.as_str()),
+                    (direct_value.as_str(), direct_end.as_str()),
+                ],
+            ))
+        }
+    }
 }
 
 /// Re-read the string-method receiver out of its temp root (#6971).
@@ -251,36 +496,27 @@ fn lower_string_method_dispatch(
     match property {
         "indexOf" => {
             // No `searchString` → `undefined`, which `js_string_coerce`
-            // stringifies to "undefined" (`"".indexOf()` === -1).
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let needle_box = if args.is_empty() {
-                ctx.block()
-                    .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64)
-            } else {
-                arg_values[0].clone()
-            };
-            // An object `searchString` must be `ToString`-coerced (running its
-            // user `toString`/`valueOf`) BEFORE `ToNumber(position)`, per
-            // ECMA-262 §22.1.3.8. A statically string-typed arg skips this.
-            let needle_is_str = !args.is_empty() && is_string_expr(ctx, &args[0]);
-            // Optional fromIndex.
-            let from_idx_double = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
+            // stringifies to "undefined" (`"".indexOf()` === -1). An object
+            // `searchString` is `ToString`-coerced (running its user
+            // `toString`/`valueOf`) BEFORE `ToNumber(position)`, per ECMA-262
+            // §22.1.3.8, and both run before the receiver is read (`coerce.rs`).
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let needle = pre_coerce_string(
+                ctx,
+                &mut arg_group,
+                args,
+                0,
+                StringCoercion::Plain,
+                later_coercion_may_collect(ctx, property, args, 0),
+            )?;
+            let from_i32 = pre_coerce_index(ctx, &arg_group, args, 1, false)?;
             let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let needle_handle = arg_group.reread_emitted(ctx, needle);
             let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
-            let needle_handle = if needle_is_str {
-                unbox_str_handle(blk, &needle_box)
-            } else {
-                blk.call(I64, "js_string_coerce", &[(DOUBLE, &needle_box)])
-            };
-            let result_i32 = if let Some(from_d) = from_idx_double {
-                // `ToIntegerOrInfinity(position)` via the runtime helper (runs
-                // user `valueOf`, handles ±Infinity/NaN), NOT a raw `fptosi`.
-                let from_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &from_d)]);
+            let result_i32 = if let Some(from_i32) = from_i32 {
+                // `ToIntegerOrInfinity(position)` via the runtime helper
+                // (handles ±Infinity/NaN), NOT a raw `fptosi`.
                 blk.call(
                     I32,
                     "js_string_index_of_from",
@@ -302,43 +538,16 @@ fn lower_string_method_dispatch(
             // Issue #316: 0-arg form is the spec'd "clone" idiom —
             // `s.slice()` ≡ `s.slice(0, length)`. Was rejected at
             // codegen with "expects 1 or 2 args, got 0" before this fix.
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let start_d = if args.is_empty() {
-                "0.0".to_string()
-            } else {
-                arg_values[0].clone()
-            };
-            // 2-arg form: explicit end (may be `undefined` → treated as `len`).
-            let end_d = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
+            // `ToNumber` of both indices runs before the receiver is read
+            // (`coerce.rs`); an `undefined` end survives as `undefined`.
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let start_i32 = pre_coerce_index(ctx, &arg_group, args, 0, false)?
+                .unwrap_or_else(|| "0".to_string());
+            let end_i32 = pre_coerce_index(ctx, &arg_group, args, 1, true)?
+                .unwrap_or_else(|| "2147483647".to_string());
             let recv_box = reread_recv(ctx, group, recv);
             let blk = ctx.block();
             let recv_handle = unbox_str_handle(blk, &recv_box);
-            // String length (i32 at header offset 0). Used as the default end
-            // (0/1-arg form, issue #316/#214) and the `undefined`-end fallback.
-            // Routed through SSO-safe unbox so SHORT_STRING_TAG receivers work.
-            let len_ptr = blk.inttoptr(I64, &recv_handle);
-            let len_i32 = blk.load(I32, &len_ptr);
-            // `ToIntegerOrInfinity` via the runtime helper, NOT a raw `fptosi`:
-            // `fptosi(±Infinity/NaN → i32)` is UB and on x86 yields the integer-
-            // indefinite `i32::MIN`, so `"abc".slice(Infinity)` / `.substring(
-            // Infinity, NaN)` clamped to the wrong end. The helper truncates and
-            // clamps ±Infinity to the i32 bounds (and runs ToNumber on a boxed
-            // arg), matching the char-access methods and the runtime dispatch arm.
-            let start_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &start_d)]);
-            // An explicit `undefined` end means `len` (not `ToInteger(undefined)
-            // === 0`), per spec — `s.substring(0, undefined) === s`.
-            let end_i32 = match &end_d {
-                Some(end_d) => blk.call(
-                    I32,
-                    "js_string_end_index_to_i32",
-                    &[(DOUBLE, end_d), (I32, &len_i32)],
-                ),
-                None => len_i32.clone(),
-            };
             let runtime_fn = if property == "slice" {
                 "js_string_slice"
             } else {
@@ -470,16 +679,14 @@ fn lower_string_method_dispatch(
         // Annex B §B.2.2 HTML wrappers that take an attribute value. A missing
         // arg coerces `undefined` -> "undefined" via `js_string_coerce`.
         "anchor" | "link" | "fontcolor" | "fontsize" => {
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let value_d = if args.is_empty() {
-                crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))
-            } else {
-                arg_values[0].clone()
-            };
+            // `ToString(value)` runs before the receiver is read (`coerce.rs`).
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let value =
+                pre_coerce_string(ctx, &mut arg_group, args, 0, StringCoercion::Plain, false)?;
             let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let value_handle = arg_group.reread_emitted(ctx, value);
             let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
-            let value_handle = blk.call(I64, "js_string_coerce", &[(DOUBLE, &value_d)]);
             let runtime_fn = match property {
                 "anchor" => "js_string_anchor",
                 "link" => "js_string_link",
@@ -503,16 +710,13 @@ fn lower_string_method_dispatch(
             // #3987: JS ignores extra args to `charAt` but still evaluates them
             // (left-to-right, for side effects). Use args[0] as the index and
             // lower the rest, discarding their values, instead of bailing.
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let idx_d = if args.is_empty() {
-                crate::nanbox::double_literal(0.0)
-            } else {
-                arg_values[0].clone()
-            };
+            // `ToNumber(index)` runs before the receiver is read (`coerce.rs`).
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let idx_i32 = pre_coerce_index(ctx, &arg_group, args, 0, false)?
+                .unwrap_or_else(|| "0".to_string());
             let recv_box = reread_recv(ctx, group, recv);
             let blk = ctx.block();
             let recv_handle = unbox_str_handle(blk, &recv_box);
-            let idx_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &idx_d)]);
             let result = blk.call(
                 I64,
                 "js_string_char_at",
@@ -529,8 +733,11 @@ fn lower_string_method_dispatch(
                     args.len()
                 );
             }
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let count_d = arg_values[0].clone();
+            // `ToNumber(count)` runs before the receiver is unboxed
+            // (`coerce.rs`): `js_string_repeat` takes the raw receiver.
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let count_d = pre_coerce_number(ctx, &arg_group, args, 0)?
+                .expect("repeat has at least one argument");
             let recv_box = reread_recv(ctx, group, recv);
             let blk = ctx.block();
             let recv_handle = unbox_str_handle(blk, &recv_box);
@@ -589,16 +796,13 @@ fn lower_string_method_dispatch(
             // #2787: missing index -> 0; JS index coercion (undefined/NaN -> 0).
             // `js_string_at` already resolves negative indices relative to len.
             // #3987: ignore extra args (still evaluate for side effects).
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let idx_d = if args.is_empty() {
-                crate::nanbox::double_literal(0.0)
-            } else {
-                arg_values[0].clone()
-            };
+            // `ToNumber(index)` runs before the receiver is read (`coerce.rs`).
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let idx_i32 = pre_coerce_index(ctx, &arg_group, args, 0, false)?
+                .unwrap_or_else(|| "0".to_string());
             let recv_box = reread_recv(ctx, group, recv);
             let recv_handle = str_operand_handle_tag_dispatched(ctx, object, &recv_box);
             let blk = ctx.block();
-            let idx_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &idx_d)]);
             // js_string_at returns a NaN-boxed string or undefined directly.
             let result = blk.call(
                 DOUBLE,
@@ -611,16 +815,13 @@ fn lower_string_method_dispatch(
         "codePointAt" => {
             // #2787: missing index -> 0; JS index coercion (undefined/NaN -> 0).
             // #3987: ignore extra args (still evaluate for side effects).
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let idx_d = if args.is_empty() {
-                crate::nanbox::double_literal(0.0)
-            } else {
-                arg_values[0].clone()
-            };
+            // `ToNumber(index)` runs before the receiver is read (`coerce.rs`).
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let idx_i32 = pre_coerce_index(ctx, &arg_group, args, 0, false)?
+                .unwrap_or_else(|| "0".to_string());
             let recv_box = reread_recv(ctx, group, recv);
             let recv_handle = str_operand_handle_tag_dispatched(ctx, object, &recv_box);
             let blk = ctx.block();
-            let idx_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &idx_d)]);
             // Returns NaN-boxed number or undefined directly.
             let result = blk.call(
                 DOUBLE,
@@ -631,14 +832,15 @@ fn lower_string_method_dispatch(
             Ok(result)
         }
         "charCodeAt" => {
+            // Keep the coerced number for the inline operation: it already
+            // checks and converts the index. An eager i32 conversion would
+            // add an opaque call (and a round trip) on every ASCII byte read.
             // #2787: missing index -> 0; JS index coercion (undefined/NaN -> 0).
             // #3987: ignore extra args (still evaluate for side effects).
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let idx_d = if args.is_empty() {
-                crate::nanbox::double_literal(0.0)
-            } else {
-                arg_values[0].clone()
-            };
+            // `ToNumber(index)` runs before the receiver is read (`coerce.rs`).
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let idx_d = pre_coerce_number(ctx, &arg_group, args, 0)?
+                .unwrap_or_else(|| crate::nanbox::double_literal(0.0));
             let recv_box = reread_recv(ctx, group, recv);
             if let Some(value) = lower_char_code_at_inline(ctx, object, &recv_box, &idx_d) {
                 let result = value;
@@ -647,7 +849,7 @@ fn lower_string_method_dispatch(
             }
             let recv_handle = str_operand_handle_tag_dispatched(ctx, object, &recv_box);
             let blk = ctx.block();
-            let idx_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &idx_d)]);
+            let idx_i32 = blk.call(I32, "js_string_number_index_to_i32", &[(DOUBLE, &idx_d)]);
             // js_string_char_code_at returns a plain f64 (NaN for OOB).
             let result = blk.call(
                 DOUBLE,
@@ -660,37 +862,30 @@ fn lower_string_method_dispatch(
         "lastIndexOf" => {
             // No `searchString` → `undefined` → "undefined"
             // (`"".lastIndexOf()` === -1).
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let needle_box = if args.is_empty() {
-                ctx.block()
-                    .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64)
-            } else {
-                arg_values[0].clone()
-            };
             // `ToString(searchString)` runs the arg's user `toString`/`valueOf`
             // (ECMA-262 §22.1.3.9) before `ToNumber(position)`; static strings
-            // skip the coercion.
-            let needle_is_str = !args.is_empty() && is_string_expr(ctx, &args[0]);
-            // Optional `position` (2nd arg). Without it, use the plain
-            // last-index-of (search to the end); with it, the position-aware
-            // variant. Mirrors the `indexOf` arm.
-            let pos_double = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
+            // skip the coercion. Both run before the receiver is read
+            // (`coerce.rs`). Optional `position` (2nd arg): without it, use the
+            // plain last-index-of (search to the end); with it, the
+            // position-aware variant. Mirrors the `indexOf` arm.
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let needle = pre_coerce_string(
+                ctx,
+                &mut arg_group,
+                args,
+                0,
+                StringCoercion::Plain,
+                later_coercion_may_collect(ctx, property, args, 0),
+            )?;
+            let pos_double = pre_coerce_number(ctx, &arg_group, args, 1)?;
             let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let needle_handle = arg_group.reread_emitted(ctx, needle);
             let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
-            let needle_handle = if needle_is_str {
-                unbox_str_handle(blk, &needle_box)
-            } else {
-                blk.call(I64, "js_string_coerce", &[(DOUBLE, &needle_box)])
-            };
-            let i32_v = if let Some(pos_d) = pos_double {
-                // `ToNumber(position)` (runs user `valueOf`, preserves NaN/±Inf
-                // for the helper's clamp), NOT the raw NaN-boxed bits.
-                let pos_num = blk.call(DOUBLE, "js_number_coerce", &[(DOUBLE, &pos_d)]);
+            let i32_v = if let Some(pos_num) = pos_double {
+                // `ToNumber(position)` already ran above (NaN/±Inf preserved
+                // for the helper's clamp; an `undefined` position is a NaN to
+                // `f64::is_nan` as well), NOT the raw NaN-boxed bits.
                 blk.call(
                     I32,
                     "js_string_last_index_of_from",
@@ -720,52 +915,49 @@ fn lower_string_method_dispatch(
                     args.len()
                 );
             }
-            // Not `lower_call_args_rooted`: the `maxLength` coercion below
-            // runs BEFORE the fill is consumed, so the fill is rooted across
-            // that user `valueOf` as well as across the arguments after it.
-            let mut arg_group = open_rooted_group(args.len());
-            for (i, arg) in args.iter().enumerate() {
-                let collects =
-                    i == 1 || crate::rooting::any_operand_may_collect(ctx, args[i + 1..].iter());
-                arg_group.lower(ctx, arg, collects)?;
-            }
-            let arg_values = arg_group.reread_all(ctx)?;
-            let len_d = arg_values[0].clone();
             // `ToLength(maxLength)` (ECMA-262 §22.1.3.16 `StringPad` step 1)
             // must run — including any `valueOf`/`toString` on an object
-            // `maxLength` — BEFORE `ToString(fillString)` below. Coercing
-            // eagerly here (rather than leaving the raw boxed value for the
-            // runtime `to_length` helper to interpret as a plain f64) also
-            // fixes a correctness bug: a non-number `maxLength` (e.g. an
-            // object) was previously read as garbage/NaN bit-pattern instead
-            // of running `ToNumber`.
-            let len_d = {
-                let blk = ctx.block();
-                blk.call(DOUBLE, "js_number_coerce", &[(DOUBLE, &len_d)])
-            };
+            // `maxLength` — BEFORE `ToString(fillString)`, and both before the
+            // receiver is read (`coerce.rs`): either can collect, and the
+            // receiver is a young string more often than not
+            // (`b.toString(16).padStart(2, "0")`). Coercing eagerly (rather
+            // than leaving the raw boxed value for the runtime `to_length`
+            // helper to interpret as a plain f64) is also what makes a
+            // non-number `maxLength` run `ToNumber` at all.
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let len_d = pre_coerce_number(ctx, &arg_group, args, 0)?
+                .expect("padStart/padEnd has at least one argument");
             // Optional pad string; defaults to " " when missing. A provided
             // fill is `ToString`-coerced (ECMA-262 §22.1.3.16) via
             // `js_string_pad_fill` — `undefined` → null handle (runtime falls
             // back to " "), otherwise ToString — so non-string fills (numbers,
             // booleans, `null`, `{ toString }`) render correctly instead of
             // being bit-cast and dropped.
-            let pad_handle = if args.len() >= 2 {
-                // Re-read below the maxLength coercion above: its user
-                // valueOf can collect, and the register read before it
-                // would name from-space.
-                let pad_box = arg_group.reread(ctx, 1)?;
-                let blk = ctx.block();
-                blk.call(I64, "js_string_pad_fill", &[(DOUBLE, &pad_box)])
+            let pad = if args.len() >= 2 {
+                Some(pre_coerce_string(
+                    ctx,
+                    &mut arg_group,
+                    args,
+                    1,
+                    StringCoercion::PadFill,
+                    false,
+                )?)
             } else {
-                let sp_idx = ctx.strings.intern(" ");
-                let sp_global = format!("@{}", ctx.strings.entry(sp_idx).handle_global);
-                let blk = ctx.block();
-                let sp_box = blk.load(DOUBLE, &sp_global);
-                unbox_str_handle(blk, &sp_box)
+                None
             };
             let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let pad_handle = match pad {
+                Some(pad) => arg_group.reread_emitted(ctx, pad),
+                None => {
+                    let sp_idx = ctx.strings.intern(" ");
+                    let sp_global = format!("@{}", ctx.strings.entry(sp_idx).handle_global);
+                    let blk = ctx.block();
+                    let sp_box = blk.load(DOUBLE, &sp_global);
+                    unbox_str_handle(blk, &sp_box)
+                }
+            };
             let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
             // Pass `target_length` as raw DOUBLE — the runtime does the
             // ToLength coercion (NaN/negative → 0, Infinity / huge values
             // clamped to a sane max). Pre-fix the codegen did
@@ -817,63 +1009,54 @@ fn lower_string_method_dispatch(
             // "undefined" (ECMA-262 §22.1.3.10: `ToString(that)`), so
             // `s.localeCompare()` === `s.localeCompare(undefined)` ===
             // `s.localeCompare("undefined")`.
-            let other_is_str = !args.is_empty() && is_string_expr(ctx, &args[0]);
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let other_box = if args.is_empty() {
-                ctx.block()
-                    .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64)
-            } else {
-                arg_values[0].clone()
-            };
-            // `options` is the 3rd arg; `locales` (2nd) is validated for its
-            // RangeError side effect (#2781) but collation ordering stays
-            // locale-neutral (full ICU deferred). With an options object
-            // present, route to the variant that honors `{ numeric: true }`.
-            let locales_box = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
-            let options_box = if args.len() >= 3 {
-                Some(arg_values[2].clone())
-            } else {
-                None
-            };
-            let blk = ctx.block();
-            if let Some(loc) = &locales_box {
-                // Validate `(locales, options)` exactly as `Construct(%Collator%,
-                // «locales, options»)` would — CanonicalizeLocaleList then the
-                // InitializeCollator GetOption reads — for the throwing side effect
-                // only; collation ordering stays locale-neutral (#2781, #5906).
-                let undef;
-                let opts_ref = match &options_box {
-                    Some(o) => o,
-                    None => {
-                        undef = blk.bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
-                        &undef
-                    }
+            //
+            // ECMA-402 order: `ToString(that)`, THEN `Construct(%Collator%,
+            // «locales, options»)`; both run before the receiver is read
+            // (`coerce.rs`), and the coerced `that` stays rooted across the
+            // collator validation's getters.
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let other = pre_coerce_string(
+                ctx,
+                &mut arg_group,
+                args,
+                0,
+                StringCoercion::Plain,
+                later_coercion_may_collect(ctx, property, args, 0),
+            )?;
+            // `(locales, options)` are resolved exactly as `Construct(%Collator%,
+            // «locales, options»)` would — CanonicalizeLocaleList then every
+            // InitializeCollator GetOption read, each option read ONCE — for the
+            // throwing side effects and the resolved `numeric` flag (#2781,
+            // #5906). Collation ordering otherwise stays locale-neutral (full
+            // ICU deferred). The comparison takes that flag and reads no JS
+            // value, so nothing runs user code once the string addresses are
+            // taken below (#12539).
+            let numeric = if args.len() >= 2 {
+                let loc = arg_group.reread(ctx, 1)?;
+                let opts = if args.len() >= 3 {
+                    arg_group.reread(ctx, 2)?
+                } else {
+                    ctx.block()
+                        .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64)
                 };
-                blk.call_void(
-                    "js_string_validate_collator_args",
-                    &[(DOUBLE, loc), (DOUBLE, opts_ref)],
-                );
-            }
-            let recv_box = reread_recv(ctx, group, recv);
-            let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
-            // A non-string `that` (undefined/number/object) must be
-            // `ToString`-coerced, not bit-cast as a string pointer.
-            let other_handle = if other_is_str {
-                unbox_str_handle(blk, &other_box)
+                Some(ctx.block().call(
+                    I32,
+                    "js_string_resolve_collator_args",
+                    &[(DOUBLE, &loc), (DOUBLE, &opts)],
+                ))
             } else {
-                blk.call(I64, "js_string_coerce", &[(DOUBLE, &other_box)])
+                None
             };
+            let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let other_handle = arg_group.reread_emitted(ctx, other);
+            let blk = ctx.block();
             // Returns a plain f64 (-1/0/1) — NOT NaN-tagged.
-            let result = if let Some(opts) = options_box {
+            let result = if let Some(numeric) = numeric {
                 Ok(blk.call(
                     DOUBLE,
-                    "js_string_locale_compare_opts",
-                    &[(I64, &recv_handle), (I64, &other_handle), (DOUBLE, &opts)],
+                    "js_string_locale_compare_resolved",
+                    &[(I64, &recv_handle), (I64, &other_handle), (I32, &numeric)],
                 ))
             } else {
                 Ok(blk.call(
@@ -1036,21 +1219,19 @@ fn lower_string_method_dispatch(
                     args.len()
                 );
             }
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let start_d = arg_values[0].clone();
-            let len_d = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
+            // `ToNumber` of both arguments (spec order, start first) runs before
+            // the receiver is unboxed (`coerce.rs`) — `js_string_substr` takes
+            // the raw receiver and would otherwise run a `{ valueOf }` with it
+            // held. What reaches it is a number, or `undefined`, from which it
+            // still decides "rest of string" itself; a `Symbol` still throws in
+            // the coercion, like Node.
+            let arg_group = lower_coerced_args(ctx, property, args)?;
+            let start_d = pre_coerce_number(ctx, &arg_group, args, 0)?
+                .expect("substr has at least one argument");
+            let len_d = pre_coerce_number(ctx, &arg_group, args, 1)?;
             let recv_box = reread_recv(ctx, group, recv);
             let blk = ctx.block();
             let recv_handle = unbox_str_handle(blk, &recv_box);
-            // Pass the raw NaN-boxed args straight through: `js_string_substr`
-            // runs `ToIntegerOrInfinity` on both (spec order, start first) so a
-            // boolean / `{ valueOf }` / `Symbol` coerces or throws like Node,
-            // and decides "rest of string" from an `undefined` length itself —
-            // a raw `fptosi` here would mis-truncate NaN and lose that signal.
             // An omitted length is the explicit `undefined` value.
             let length_d = match len_d {
                 Some(len_d) => len_d,
@@ -1072,34 +1253,27 @@ fn lower_string_method_dispatch(
             // turns into "undefined" (`"xundefined".endsWith()` is true). A
             // compile-time arity error here also rejected the string arm of
             // the tag guard for a user `endsWith()` on an `any` receiver.
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let other_box = if args.is_empty() {
-                ctx.block()
-                    .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64)
-            } else {
-                arg_values[0].clone()
-            };
-            let pos_d = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
-            let recv_box = reread_recv(ctx, group, recv);
-            let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
+            // `ToString(searchString)` (after the RegExp check) and
+            // `ToNumber(position)` run, in that order, before the receiver is
+            // read (`coerce.rs`).
             let method_id = regexp_search_method_id(property);
-            let other_handle = blk.call(
-                I64,
-                "js_string_search_value_to_string",
-                &[(DOUBLE, &other_box), (I32, &method_id)],
-            );
-            let result_i32 = if let Some(pos_d) = pos_d {
-                // ToIntegerOrInfinity(position): route through the runtime
-                // coercion (not a raw `fptosi` on the NaN-boxed value) so a
-                // boolean/numeric-string/`{valueOf}` coerces per spec and a
-                // Symbol position throws a TypeError (matches the dynamic
-                // dispatch path and the `includes` arm below).
-                let pos_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &pos_d)]);
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let other = pre_coerce_string(
+                ctx,
+                &mut arg_group,
+                args,
+                0,
+                StringCoercion::Search(&method_id),
+                later_coercion_may_collect(ctx, property, args, 0),
+            )?;
+            let pos_i32 = pre_coerce_index(ctx, &arg_group, args, 1, false)?;
+            let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let other_handle = arg_group.reread_emitted(ctx, other);
+            let blk = ctx.block();
+            let result_i32 = if let Some(pos_i32) = pos_i32 {
+                // ToIntegerOrInfinity(position) on the number coerced above:
+                // the runtime helper, not a raw `fptosi` (UB on NaN/±Inf).
                 let runtime_fn = if property == "startsWith" {
                     "js_string_starts_with_at"
                 } else {
@@ -1134,35 +1308,25 @@ fn lower_string_method_dispatch(
             // path. Negative/NaN clamp to 0 and Infinity saturates past the
             // end inside js_string_index_of_from.
             // #10476: an omitted searchString is `undefined` (see above).
-            let (arg_values, arg_group) = crate::lower_call::lower_call_args_rooted(ctx, args)?;
-            let needle_box = if args.is_empty() {
-                ctx.block()
-                    .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64)
-            } else {
-                arg_values[0].clone()
-            };
-            // Preserve evaluation of the second argument for side effects and
-            // use it as the start index when present.
-            let pos_d = if args.len() >= 2 {
-                Some(arg_values[1].clone())
-            } else {
-                None
-            };
-            let recv_box = reread_recv(ctx, group, recv);
-            let blk = ctx.block();
-            let recv_handle = unbox_str_handle(blk, &recv_box);
+            // Both coercions run before the receiver is read (`coerce.rs`); the
+            // second argument is evaluated for side effects either way and
+            // used as the start index when present.
             let method_id = regexp_search_method_id(property);
-            let needle_handle = blk.call(
-                I64,
-                "js_string_search_value_to_string",
-                &[(DOUBLE, &needle_box), (I32, &method_id)],
-            );
-            let from_i32 = match pos_d {
-                // Use the runtime ToIntegerOrInfinity helper rather than a raw
-                // `fptosi`, which is undefined for Infinity/NaN.
-                Some(pos_d) => blk.call(I32, "js_string_position_to_index", &[(DOUBLE, &pos_d)]),
-                None => "0".to_string(),
-            };
+            let mut arg_group = lower_coerced_args(ctx, property, args)?;
+            let needle = pre_coerce_string(
+                ctx,
+                &mut arg_group,
+                args,
+                0,
+                StringCoercion::Search(&method_id),
+                later_coercion_may_collect(ctx, property, args, 0),
+            )?;
+            let from_i32 = pre_coerce_index(ctx, &arg_group, args, 1, false)?
+                .unwrap_or_else(|| "0".to_string());
+            let recv_box = reread_recv(ctx, group, recv);
+            let recv_handle = unbox_str_handle(ctx.block(), &recv_box);
+            let needle_handle = arg_group.reread_emitted(ctx, needle);
+            let blk = ctx.block();
             let idx_i32 = blk.call(
                 I32,
                 "js_string_index_of_from",

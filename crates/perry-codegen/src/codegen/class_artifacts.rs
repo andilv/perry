@@ -85,6 +85,7 @@ pub(super) fn emit_class_artifacts(c: ClassArtifactsCtx<'_>) -> Result<()> {
     // this_box, arg0, arg1, ...) -> double`. Methods are emitted as
     // standalone LLVM functions; the dispatch in `lower_call` calls
     // them directly.
+    let fresh = super::fresh_class_templates::fresh_class_templates(hir);
     let classes_started = Instant::now();
     let class_progress_step = (hir.classes.len() / 20).max(1);
     for (class_index, class) in hir.classes.iter().enumerate() {
@@ -341,6 +342,77 @@ pub(super) fn emit_class_artifacts(c: ClassArtifactsCtx<'_>) -> Result<()> {
                 false,
             )
             .with_context(|| format!("lowering getter '{}::{}'", class.name, prop))?;
+            if let Some(fact) = cross_module
+                .pshape_methods
+                .get(&(class.name.clone(), renamed.name.clone()))
+            {
+                let mut fact = fact.clone();
+                if let Some(keys) = cross_module.class_keys_globals.get(&class.name) {
+                    fact.numeric_fields =
+                        super::accessor_numeric::fields(class, &renamed, class_table, keys);
+                }
+                let public_name = &method_names[&(class.name.clone(), renamed.name.clone())];
+                let clone_name = crate::collectors::pshape_method_name(public_name);
+                if !cross_module
+                    .class_keys_globals
+                    .get(&class.name)
+                    .is_some_and(|keys| {
+                        !super::accessor_numeric::fields(class, &renamed, class_table, keys)
+                            .is_empty()
+                    })
+                {
+                    compile_method(
+                        llmod,
+                        class,
+                        &renamed,
+                        func_names,
+                        strings,
+                        class_table,
+                        method_names,
+                        module_globals,
+                        module_global_types,
+                        opts.import_function_prefixes,
+                        enum_table,
+                        static_field_globals,
+                        class_ids,
+                        func_signatures,
+                        func_synthetic_arguments,
+                        module_boxed_vars,
+                        closure_rest_params,
+                        cross_module,
+                        None,
+                        false,
+                        Some(fact.clone()),
+                        None,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                    )
+                    .with_context(|| {
+                        format!("lowering proven-this getter '{}::{}'", class.name, prop)
+                    })?;
+                } else {
+                    super::accessor_numeric::compile_leaf(
+                        llmod,
+                        &clone_name,
+                        class,
+                        &renamed,
+                        class_table,
+                        &cross_module.class_keys_globals[&class.name],
+                    )?;
+                }
+                let public = method_names
+                    .get(&(class.name.clone(), renamed.name.clone()))
+                    .unwrap();
+                let clone_name = crate::collectors::pshape_method_name(public);
+                if let Some(body) = llmod.functions_mut().find(|f| f.name == clone_name) {
+                    // Accessor capabilities stay module-local; unused or fully
+                    // inlined bodies can disappear instead of growing text.
+                    body.linkage = "internal".into();
+                }
+            }
         }
         for (prop, setter_fn) in &class.setters {
             let mut renamed = setter_fn.clone();
@@ -401,6 +473,165 @@ pub(super) fn emit_class_artifacts(c: ClassArtifactsCtx<'_>) -> Result<()> {
                 false,
             )
             .with_context(|| format!("lowering setter '{}::{}'", class.name, prop))?;
+            // Direct accessor sites use the ordinary body. Give compact bodies
+            // the existing early-inline budget so LLVM can flatten the call
+            // before native statepoints are inserted, without a second body.
+            if let Some(fact) = cross_module
+                .pshape_methods
+                .get(&(class.name.clone(), renamed.name.clone()))
+            {
+                let mut fact = fact.clone();
+                if let Some(keys) = cross_module.class_keys_globals.get(&class.name) {
+                    fact.numeric_fields =
+                        super::accessor_numeric::fields(class, &renamed, class_table, keys);
+                }
+                compile_method(
+                    llmod,
+                    class,
+                    &renamed,
+                    func_names,
+                    strings,
+                    class_table,
+                    method_names,
+                    module_globals,
+                    module_global_types,
+                    opts.import_function_prefixes,
+                    enum_table,
+                    static_field_globals,
+                    class_ids,
+                    func_signatures,
+                    func_synthetic_arguments,
+                    module_boxed_vars,
+                    closure_rest_params,
+                    cross_module,
+                    None,
+                    false,
+                    Some(fact.clone()),
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .with_context(|| {
+                    format!("lowering proven-this setter '{}::{}'", class.name, prop)
+                })?;
+                let public = method_names
+                    .get(&(class.name.clone(), renamed.name.clone()))
+                    .unwrap();
+                let clone_name = crate::collectors::pshape_method_name(public);
+                if let Some(body) = llmod.functions_mut().find(|f| f.name == clone_name) {
+                    // Accessor capabilities stay module-local; unused or fully
+                    // inlined bodies can disappear instead of growing text.
+                    body.linkage = "internal".into();
+                }
+            }
+        }
+        // Inherited capabilities retain the declaration's lexical home. Only
+        // their receiver proof and reserved LLVM symbol differ.
+        let mut inherited: Vec<_> = cross_module
+            .pshape_methods
+            .iter()
+            .filter(|((receiver, _), _)| receiver == &class.name)
+            .collect();
+        inherited.sort_by(|a, b| a.0.cmp(b.0));
+        for ((_, member), fact) in inherited {
+            let (setter, property) = if let Some(p) = member.strip_prefix("__get_") {
+                (false, p)
+            } else if let Some(p) = member.strip_prefix("__set_") {
+                (true, p)
+            } else {
+                continue;
+            };
+            let Some((owner_name, _)) = super::static_prototype::accessor_owner(
+                class_table,
+                class_ids,
+                &class.name,
+                property,
+                setter,
+            ) else {
+                continue;
+            };
+            let owner = class_table[&owner_name];
+            if owner.name == class.name {
+                continue;
+            }
+            let accessors = if setter {
+                &owner.setters
+            } else {
+                &owner.getters
+            };
+            let (_, method) = accessors.iter().find(|(p, _)| p == property).unwrap();
+            let mut renamed = method.clone();
+            renamed.name = member.clone();
+            let public = &method_names[&(class.name.clone(), member.clone())];
+            let body =
+                super::inherited_accessors::receiver_body_name(public, class_ids[&class.name]);
+            let mut receiver_methods = method_names.clone();
+            receiver_methods.insert((owner.name.clone(), member.clone()), body.clone());
+            let mut fact = fact.clone();
+            if let Some(keys) = cross_module.class_keys_globals.get(&class.name) {
+                fact.numeric_fields =
+                    super::accessor_numeric::fields(class, &renamed, class_table, keys);
+            }
+            let clone_name = crate::collectors::pshape_method_name(&body);
+            if !cross_module
+                .class_keys_globals
+                .get(&class.name)
+                .is_some_and(|keys| {
+                    !super::accessor_numeric::fields(class, &renamed, class_table, keys).is_empty()
+                })
+            {
+                compile_method(
+                    llmod,
+                    owner,
+                    &renamed,
+                    func_names,
+                    strings,
+                    class_table,
+                    &receiver_methods,
+                    module_globals,
+                    module_global_types,
+                    opts.import_function_prefixes,
+                    enum_table,
+                    static_field_globals,
+                    class_ids,
+                    func_signatures,
+                    func_synthetic_arguments,
+                    module_boxed_vars,
+                    closure_rest_params,
+                    cross_module,
+                    None,
+                    false,
+                    Some(fact.clone()),
+                    None,
+                    false,
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+                .with_context(|| {
+                    format!(
+                        "lowering inherited accessor '{}::{}' on '{}'",
+                        owner.name, property, class.name
+                    )
+                })?;
+            } else {
+                super::accessor_numeric::compile_leaf(
+                    llmod,
+                    &clone_name,
+                    class,
+                    &renamed,
+                    class_table,
+                    &cross_module.class_keys_globals[&class.name],
+                )?;
+            }
+            let clone_name = crate::collectors::pshape_method_name(&body);
+            if let Some(body) = llmod.functions_mut().find(|f| f.name == clone_name) {
+                body.linkage = "internal".into();
+            }
         }
         // Emit standalone constructor for cross-module use.
         // Compiled like a method: takes (i64 this, double arg0, ...) → void.
@@ -565,8 +796,9 @@ pub(super) fn emit_class_artifacts(c: ClassArtifactsCtx<'_>) -> Result<()> {
                 )
             })?;
         }
-        // Only a generator's small birth factory needs the actual callable.
-        // The existing private resume body is emitted once, shared by entries.
+        // Emit an owner body only when the callable can name a distinct home
+        // or must retain its identity in generator state. Declarations share
+        // their direct body with the callable entry.
         for (method, is_static) in class
             .methods
             .iter()
@@ -578,7 +810,12 @@ pub(super) fn emit_class_artifacts(c: ClassArtifactsCtx<'_>) -> Result<()> {
                     .iter()
                     .map(|m| (&m.function, m.is_static)),
             )
-            .filter(|(f, _)| super::helpers::body_has_fixed_generator_state(&f.body))
+            .filter(|(f, _)| {
+                super::helpers::body_needs_explicit_method_owner(
+                    &f.body,
+                    fresh.contains(&class.name),
+                )
+            })
         {
             if is_static {
                 compile_static_method(
@@ -633,6 +870,31 @@ pub(super) fn emit_class_artifacts(c: ClassArtifactsCtx<'_>) -> Result<()> {
                     false,
                     true,
                 )?;
+            }
+            if fresh.contains(&class.name)
+                && !super::helpers::body_has_fixed_generator_state(&method.body)
+            {
+                let public = if is_static {
+                    super::helpers::scoped_static_method_name(
+                        module_prefix,
+                        class.id,
+                        &class.name,
+                        &method.name,
+                    )
+                } else {
+                    method_names
+                        .get(&(class.name.clone(), method.name.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            format!(
+                                "perry_method_{}__{}__{}",
+                                module_prefix,
+                                super::helpers::sanitize_member(&class.name),
+                                super::helpers::sanitize_member(&method.name)
+                            )
+                        })
+                };
+                super::shared_class_method_bodies::share(llmod, &public, class_ids[&class.name]);
             }
         }
         let done = class_index + 1;

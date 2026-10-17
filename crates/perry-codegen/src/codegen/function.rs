@@ -52,10 +52,19 @@ fn emit_public_arena_threaded_wrapper(
         .map(|p| (DOUBLE, format!("%arg{}", p.id)))
         .collect();
     let mut call_args: Vec<(LlvmType, String)> = params.clone();
+    let direct_tls = crate::expr::agent_ptr::executable_tls(&llmod.target_triple);
     let wrapper = llmod.define_function(public_name, DOUBLE, params);
     wrapper.force_inline = true;
-    let entry = wrapper.create_block("entry");
-    let arena_state = entry.call(PTR, "js_inline_arena_state", &[]);
+    wrapper.create_block("entry");
+    let arena_state = if direct_tls {
+        wrapper.entry_materialized_tls_address("PERRY_INLINE_ARENA_STATE")
+    } else {
+        wrapper
+            .block_mut(0)
+            .unwrap()
+            .call(PTR, "js_inline_arena_state", &[])
+    };
+    let entry = wrapper.block_mut(0).unwrap();
     call_args.push((PTR, arena_state));
     let call_args: Vec<(LlvmType, &str)> = call_args
         .iter()
@@ -917,6 +926,13 @@ pub(super) fn compile_function(
     for p in &f.params {
         local_types.insert(p.id, p.ty.clone());
     }
+    // The body's one seed set (`typed_locals::outer_proofs`); no captures.
+    let outer_proofs = crate::collectors::typed_locals::outer_proofs(
+        None,
+        &cross_module.definite_init,
+        Some(f.id),
+    );
+    crate::collectors::typed_locals::seed_local_types(&outer_proofs, &mut local_types);
     // Specialized entry: stamp the proven reps over the (usually `Any`)
     // declared types BEFORE the native-fact collectors run, so every type
     // predicate (int-valued locals, typed-array receiver classification,
@@ -1069,7 +1085,7 @@ pub(super) fn compile_function(
             .return_shape_class(f.id)
             .is_some(),
     );
-    let native_facts = crate::collectors::collect_native_region_fact_graph_with_spec_params(
+    let mut native_facts = crate::collectors::collect_native_region_fact_graph_with_spec_params(
         &f.body,
         &f.params,
         &flat_const_ids,
@@ -1092,6 +1108,22 @@ pub(super) fn compile_function(
         &cross_module.module_global_proven_types,
     );
 
+    // Closed World 5d: the body's typed locals under this variant's entry
+    // proofs (the spec clone's guarded parameters that are never rebound).
+    let mut code_unit_locals = std::collections::HashSet::new();
+    let typed_locals = crate::collectors::typed_locals::apply(
+        &f.body,
+        &crate::collectors::typed_locals::stable_param_proofs(
+            &spec_param_proofs,
+            &f.body,
+            &boxed_vars,
+        ),
+        &outer_proofs,
+        &boxed_vars,
+        module_globals,
+        &mut native_facts.representation.number_by_construction_locals,
+        &mut code_unit_locals,
+    );
     // A Number-by-construction local cannot ever hold a GC pointer, so it
     // must not pay the root-slot protocol on every assignment.  The shadow
     // map is initially conservative because it is built before the
@@ -1187,6 +1219,10 @@ pub(super) fn compile_function(
         locals,
         local_types,
         proven_local_types: spec_param_proofs,
+        typed_locals,
+        code_unit_locals,
+        confined_arrays: &cross_module.definite_init.confined,
+        confined_array_read: false,
         guarded_discriminant_aliases: HashMap::new(),
         module_global_proven_types: &cross_module.module_global_proven_types,
         module_global_transfers: &cross_module.module_global_transfers,
@@ -1208,10 +1244,18 @@ pub(super) fn compile_function(
         pending_labels: Vec::new(),
         classes,
         class_hierarchy: &cross_module.class_hierarchy,
+        wpfacts: cross_module.wpfacts.clone(),
+        program_layouts: cross_module.program_layouts.clone(),
+        wpfacts_sites: 0,
+        wpfacts_tested: Vec::new(),
+        wpfacts_this: this_stack
+            .last()
+            .map(|s| vec![(s.clone(), f.id)])
+            .unwrap_or_default(),
         this_stack,
         super_called_stack: Vec::new(),
         shared_super_scope_active: false,
-        lexical_this_uses_derived_binding: false,
+        lexical_this_uses_derived_binding: None,
         inline_ctor_return: Vec::new(),
         new_target_stack: Vec::new(),
         class_stack: Vec::new(),
@@ -1269,6 +1313,7 @@ pub(super) fn compile_function(
         local_func_ref_ids: HashMap::new(),
         option_object_locals: HashMap::new(),
         object_literal_locals: HashSet::new(),
+        constructed_kind_locals: HashMap::new(),
         namespace_imports: &cross_module.namespace_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
         namespace_member_nested: &cross_module.namespace_member_nested,
@@ -1293,6 +1338,7 @@ pub(super) fn compile_function(
         imported_class_original_names: &cross_module.imported_class_original_names,
         interfaces: &cross_module.interfaces,
         try_depth: 0,
+        derived_super_closes: Vec::new(),
         pending_declares: Vec::new(),
         pending_helpers: Vec::new(),
         array_record_length_local: None,
@@ -1350,6 +1396,8 @@ pub(super) fn compile_function(
         spec_ta_ready: std::collections::HashSet::new(),
         spec_i32_params: spec_i32_params.clone(),
         spec_bool_params,
+        typed_element_locals: HashSet::new(),
+        class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -1426,7 +1474,6 @@ pub(super) fn compile_function(
         was_unrolled: f.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
-        property_get_ic_override: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),

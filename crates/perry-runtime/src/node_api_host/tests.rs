@@ -1267,6 +1267,75 @@ fn external_buffer_finalizer_runs_once_after_the_owner_dies() {
 }
 
 #[test]
+fn object_finalizer_reference_is_weak_and_can_cancel_after_collection() {
+    unsafe extern "C" fn release(_env: NapiEnv, _data: *mut c_void, hint: *mut c_void) {
+        (*(hint as *const AtomicUsize)).fetch_add(1, Ordering::SeqCst);
+    }
+    let env = test_env();
+    let releases = AtomicUsize::new(0);
+    for cancel in [true, false] {
+        let mut scope = std::ptr::null_mut();
+        let mut owner = std::ptr::null_mut();
+        let mut reference = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { napi_open_handle_scope(env, &mut scope) },
+            NapiStatus::Ok
+        );
+        assert_eq!(
+            unsafe { napi_create_object(env, &mut owner) },
+            NapiStatus::Ok
+        );
+        assert_eq!(
+            unsafe {
+                napi_add_finalizer(
+                    env,
+                    owner,
+                    std::ptr::null_mut(),
+                    Some(release),
+                    (&releases as *const AtomicUsize).cast_mut().cast(),
+                    &mut reference,
+                )
+            },
+            NapiStatus::Ok
+        );
+        crate::gc::js_gc_collect();
+        super::metadata::drain_pending_finalizers();
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            0,
+            "live owner retains metadata"
+        );
+        if cancel {
+            assert_eq!(
+                unsafe { napi_delete_reference(env, reference) },
+                NapiStatus::Ok
+            );
+        }
+        assert_eq!(
+            unsafe { napi_close_handle_scope(env, scope) },
+            NapiStatus::Ok
+        );
+        crate::gc::js_gc_collect();
+        super::metadata::drain_pending_finalizers();
+        assert_eq!(
+            releases.load(Ordering::SeqCst),
+            usize::from(!cancel),
+            "a live reference must not retain the metadata or its owner"
+        );
+        if !cancel {
+            assert_eq!(
+                unsafe { napi_delete_reference(env, reference) },
+                NapiStatus::Ok
+            );
+        }
+    }
+    crate::gc::js_gc_collect();
+    super::metadata::drain_pending_finalizers();
+    assert_eq!(releases.load(Ordering::SeqCst), 1, "finalizer runs once");
+    super::shutdown_current_env();
+}
+
+#[test]
 fn external_buffer_arraybuffer_released_on_worker_retirement() {
     unsafe extern "C" fn release(_env: NapiEnv, data: *mut c_void, hint: *mut c_void) {
         drop(Box::from_raw(data as *mut [u8; 3]));
@@ -1316,4 +1385,33 @@ fn external_buffer_arraybuffer_released_on_worker_retirement() {
     .join()
     .unwrap();
     assert_eq!(releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn double_ingress_canonicalizes_negative_nan_payloads() {
+    let env = test_env();
+    for bits in [
+        0xfff9_0000_0000_0001_u64,
+        0xffff_0000_1234_5678,
+        0xfff1_0000_0000_0001,
+    ] {
+        let mut value = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { napi_create_double(env, f64::from_bits(bits), &mut value) },
+            NapiStatus::Ok
+        );
+        crate::gc::js_gc_collect();
+        let mut kind = NapiValueType::Undefined;
+        assert_eq!(
+            unsafe { napi_typeof(env, value, &mut kind) },
+            NapiStatus::Ok
+        );
+        assert_eq!(kind, NapiValueType::Number);
+        let mut number = 0.0;
+        assert_eq!(
+            unsafe { napi_get_value_double(env, value, &mut number) },
+            NapiStatus::Ok
+        );
+        assert_eq!(number.to_bits(), f64::NAN.to_bits());
+    }
 }

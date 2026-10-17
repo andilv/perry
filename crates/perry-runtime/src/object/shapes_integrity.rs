@@ -41,10 +41,7 @@ pub(crate) unsafe fn transition_object_integrity(
     obj: *mut crate::object::ObjectHeader,
     requested_flags: u16,
 ) -> bool {
-    if obj.is_null()
-        || !shape_word_is_writable(obj)
-        || crate::object::dictionary::is_dictionary(obj)
-    {
+    if obj.is_null() || !shape_word_is_writable(obj) || crate::object::overflow::has_overflow(obj) {
         return false;
     }
     let _no_move = crate::gc::GcSuppressScope::new();
@@ -215,6 +212,10 @@ mod tests {
 
     #[test]
     fn array_and_function_integrity_is_published_on_their_named_holder_shapes() {
+        // Array and function bags are born from registered runtime layouts,
+        // which the agent state registers when it is created (cfg(test)).
+        // Nothing before this body touches the state, so create it first.
+        let _agent = crate::state::state();
         let _global = crate::gc::global_side_table_test_lock();
         let _no_move = crate::gc::GcSuppressScope::new();
         unsafe {

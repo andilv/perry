@@ -151,10 +151,6 @@ pub extern "C" fn js_shape_seed_plain_constfn(
     ));
     // SAFETY: `id` was resolved from this agent's live slab record above.
     unsafe { shapes::note_external_shape_carrier(shapes::shape_descriptor_by_id(id)) };
-    if let Some(record) = shapes::shape_record_by_id(id) {
-        // Permanent image entries were checked above; no closure is retained.
-        unsafe { record.derive_constfn_birth_admission() };
-    }
     note_static_request("seed-constfn", requested, id);
     id
 }
@@ -686,6 +682,9 @@ pub extern "C" fn js_shape_register_static_seed(seed: extern "C" fn()) {
 /// facts under a counter id.
 #[no_mangle]
 pub extern "C" fn js_shape_run_static_seed() {
+    // Canonical image atoms must precede key-list construction by the legacy
+    // hash-band seeds. Descriptors still follow those seeds and share their ids.
+    super::layout_desc::seed_static_atoms();
     let seed = STATIC_SEED.load(std::sync::atomic::Ordering::Acquire);
     if seed != 0 {
         // SAFETY: only `js_shape_register_static_seed` stores a non-zero
@@ -693,6 +692,9 @@ pub extern "C" fn js_shape_run_static_seed() {
         let seed: extern "C" fn() = unsafe { std::mem::transmute::<usize, extern "C" fn()>(seed) };
         seed();
     }
+    // Object model step 0: atoms and compiler-owned layouts, after the
+    // hash-band seeds (a by-facts hit keeps their ids).
+    super::layout_desc::register_static_layouts();
 }
 
 /// The canonical keys node for `names`, built exactly as a class keys array

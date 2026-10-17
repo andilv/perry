@@ -1,0 +1,3 @@
+Fix ordinary function default prototypes retaining discarded functions through synthetic class roots. The function's own prototype property and each instance's actual shape prototype now own those edges, so discarded function/prototype cycles are collectible.
+
+Use the existing shape birth-width learner for ordinary compiled-function instances and key the existing property store verdict on receiver ShapeId. This removes the nonzero-class-id admission assumption and the verdict's redundant prototype word. Declared classes keep their class metadata; receiver-kind, descriptor, native-layout and GC invalidation checks remain in place. No replacement function registry or new cache is added.

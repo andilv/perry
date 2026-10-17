@@ -201,8 +201,15 @@ pub extern "C" fn js_nm_install_assert() {
 /// before ANY module-scope code observes it. (Divergence note: Node itself
 /// does not expose AsyncLocalStorage on globalThis; programs feature-detecting
 /// its absence will see it present under Perry.)
+///
+/// The seed mints the constructor before any module init, so before the
+/// `js_nm_install_async_hooks()` an `async_hooks` import emits: it arms that
+/// bucket itself, or the mint is published without its statics and prototype
+/// (`AsyncLocalStorage.snapshot()` threw "value is not a function", and
+/// `AsyncLocalStorage.bind` fell through to `Function.prototype.bind`).
 #[no_mangle]
 pub extern "C" fn js_globalthis_seed_async_local_storage() {
+    js_nm_install_async_hooks();
     // #7497 (same shape as the proven site in `js_get_global_this_builtin_value`):
     // both the export-value lookup and the key allocation below can collect, and
     // `global` is the RECEIVER of the store that follows. Root it and re-read the
@@ -955,6 +962,87 @@ mod tests {
             "buffer_constructor_value() must arm the buffer dispatch bucket: \
              its bound statics dispatch through nm_dispatch_lookup(\"buffer.Buffer\"), \
              and no import-emitted js_nm_install_buffer exists on the global-Buffer path"
+        );
+    }
+
+    /// The `globalThis.AsyncLocalStorage` seed runs at the top of a Next.js
+    /// program's `main`, before any module init — so before any import-emitted
+    /// `js_nm_install_async_hooks`. It must arm the `async_hooks` attach bucket
+    /// itself: the constructor it mints is the canonical one every later read
+    /// returns, and a mint made with the bucket empty is published without its
+    /// statics (`snapshot`/`bind`) and its prototype. Resets as in the buffer
+    /// test: the thread-local export cache, the bucket slot, and the `cfg(test)`
+    /// lazy install-all (RAII-suppressed), else the lookup self-heals.
+    #[test]
+    fn async_local_storage_seed_arms_the_async_hooks_attach_bucket() {
+        struct LazyInstallGuard;
+        impl Drop for LazyInstallGuard {
+            fn drop(&mut self) {
+                NM_TEST_DISABLE_LAZY_INSTALL.store(false, Ordering::Relaxed);
+            }
+        }
+        NM_TEST_DISABLE_LAZY_INSTALL.store(true, Ordering::Relaxed);
+        let _guard = LazyInstallGuard;
+
+        super::super::native_module::NATIVE_CALLABLE_EXPORTS
+            .with(|c| c.borrow_mut().remove("async_hooks\0AsyncLocalStorage"));
+        NM_ATTACH_REGISTRY[NmBucket::AsyncHooks as usize]
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
+
+        js_globalthis_seed_async_local_storage();
+
+        let ctor = super::super::native_module::bound_native_callable_export_value(
+            "async_hooks",
+            "AsyncLocalStorage",
+        );
+        let addr = crate::value::js_nanbox_get_pointer(ctor) as usize;
+        for method in ["snapshot", "bind"] {
+            assert!(
+                crate::closure::closure_get_own_dynamic_prop(addr, method).is_some(),
+                "the seeded AsyncLocalStorage must carry its own static `{method}`"
+            );
+        }
+    }
+
+    /// #9202: `node:test`'s `run()` hands the caller a `node:stream` Readable,
+    /// so the runner must arm the stream attach bucket ITSELF instead of
+    /// inheriting it from a `node:stream` import the program may never make.
+    /// Pre-fix nothing armed it on that path, so `Readable.prototype` was built
+    /// without its method set and `for await (const e of run({ files: [] }))`
+    /// threw `TypeError: value is not iterable`. The node-suite twin
+    /// (`test/runner/api/run-empty`) covers the program shape end to end; this
+    /// is the per-PR gate. The same two resets the sibling test needs apply:
+    /// the bucket slot, else another test's arming lingers, and the `cfg(test)`
+    /// lazy install-all (RAII-suppressed), else the `nm_attach_lookup` inside
+    /// the runner self-heals the registry and the assertion cannot fail.
+    #[cfg(feature = "mod-node-test")]
+    #[test]
+    fn node_test_run_arms_the_stream_attach_bucket_itself() {
+        struct LazyInstallGuard;
+        impl Drop for LazyInstallGuard {
+            fn drop(&mut self) {
+                NM_TEST_DISABLE_LAZY_INSTALL.store(false, Ordering::Relaxed);
+            }
+        }
+        NM_TEST_DISABLE_LAZY_INSTALL.store(true, Ordering::Relaxed);
+        let _guard = LazyInstallGuard;
+
+        NM_ATTACH_REGISTRY[NmBucket::Stream as usize]
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
+
+        let _stream = crate::node_submodules::test::runner::thunk_test_run(
+            std::ptr::null(),
+            crate::closure::plain_call_receiver(),
+            f64::from_bits(crate::value::TAG_UNDEFINED),
+        );
+
+        assert!(
+            !NM_ATTACH_REGISTRY[NmBucket::Stream as usize]
+                .load(Ordering::Relaxed)
+                .is_null(),
+            "thunk_test_run() must arm the node:stream attach bucket: it hands \
+             the caller a node:stream Readable, and a program that imports only \
+             node:test emits no js_nm_install_stream of its own"
         );
     }
 }

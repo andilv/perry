@@ -1,4 +1,4 @@
-use super::{new_extras, ConstFnSlotInfo, ShapeRecord, StoreChainFact};
+use super::{new_extras, ConstFnSlotInfo, ShapeRecord};
 
 /// Optional, record-owned extension. It has no keyed lookup: a method-site
 /// hit reads only the receiver's shape and current closure slot. The learned
@@ -21,20 +21,32 @@ pub(in crate::object) struct ShapeExtras {
     /// Weak keyless receiver-birth ShapeId of this prototype's shape.
     /// Revalidated at use; no identity, width or GC edge.
     pub(in crate::object) created_birth_shape: std::sync::atomic::AtomicU32,
+    /// Weak forward DefineField edge. The target owns the key and slot;
+    /// this scalar owns no GC pointer and is revalidated before use.
+    pub(in crate::object) field_define_target: u32,
     /// Weak integrity successors, validated against live shape facts at use.
     /// Scalar ShapeIds do not root targets and are never reused.
     pub(in crate::object) integrity_targets: [u32; 3],
     /// Exact immutable integrity identity, reached only behind its packed bit.
     pub(in crate::object) integrity_flags: u16,
-    /// Derived from immutable permanent-image body metadata at publication.
-    /// Fits extension padding; actual closure identities are checked per birth.
-    pub(in crate::object) constfn_birth_admitted: bool,
-    /// Per-key inherited [[Set]] facts of this shape. The existing prototype
-    /// validity word retires them after a descriptor or link mutation.
-    pub(in crate::object) store_chain: Option<Box<std::cell::RefCell<Vec<StoreChainFact>>>>,
 }
 
 impl ShapeRecord {
+    /// Native allocations owned by this record, observed only by the heap
+    /// census: `(records, bytes, store facts, store fact bytes)`. These are
+    /// outside the managed heap's live-byte count. Records own no store
+    /// facts (object model step 3 deleted the chain-verdict cache).
+    pub(crate) fn extension_census(&self) -> (usize, usize, usize, usize) {
+        if self.extras == 0 || self.extras & 1 != 0 {
+            return (0, 0, 0, 0);
+        }
+        let extras = unsafe { &*(self.extras as usize as *const ShapeExtras) };
+        let bytes = std::mem::size_of::<ShapeExtras>()
+            + std::mem::size_of_val(extras.constfn_infos.as_ref())
+            + std::mem::size_of_val(extras.brands.as_ref());
+        (1, bytes, 0, 0)
+    }
+
     #[inline]
     pub(in crate::object) fn created_birth_shape(&self) -> u32 {
         if !self.has_boxed_extras() {
@@ -61,38 +73,5 @@ impl ShapeRecord {
         unsafe { &*(self.extras as usize as *const ShapeExtras) }
             .created_birth_shape
             .store(birth, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-impl ShapeRecord {
-    #[inline]
-    pub(in crate::object) fn constfn_birth_admitted(&self) -> bool {
-        self.has_boxed_extras()
-            && unsafe { &*(self.extras as usize as *const ShapeExtras) }.constfn_birth_admitted
-    }
-}
-
-impl ShapeRecord {
-    /// Called by a permanent-image seed after validating its ABI entries.
-    /// Derive from this record's exact body list, including a by-facts alias.
-    pub(in crate::object) unsafe fn derive_constfn_birth_admission(&self) {
-        if !self.has_boxed_extras() {
-            return;
-        }
-        let extras = &mut *(self.extras as usize as *mut ShapeExtras);
-        extras.constfn_birth_admitted = !extras.constfn_infos.is_empty()
-            && extras.constfn_infos.iter().all(|entry| {
-                let info = &*(entry.info as usize as *const crate::closure::JsFunctionInfo);
-                info.flags
-                    & (crate::codegen_abi::FN_COMPILED_BODY
-                        | crate::codegen_abi::FN_PERMANENT_IMAGE)
-                    == (crate::codegen_abi::FN_COMPILED_BODY
-                        | crate::codegen_abi::FN_PERMANENT_IMAGE)
-                    && !info.code.is_null()
-                    && matches!(
-                        crate::closure::resolve_strategy(info).kind(),
-                        crate::closure::DispatchKind::Arity(_)
-                    )
-            });
     }
 }

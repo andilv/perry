@@ -99,6 +99,15 @@ pub(super) enum MallocRegistryState {
 }
 
 impl MallocState {
+    /// Keep the original first-allocation capacity without a lazy TLS
+    /// initializer. The Vec itself records whether backing storage exists.
+    #[inline]
+    fn reserve_initial_objects(&mut self) {
+        if self.objects.capacity() == 0 {
+            self.objects.reserve(MALLOC_STATE_INITIAL_CAPACITY);
+        }
+    }
+
     /// Reclaim every malloc-tracked object block this state still owns.
     ///
     /// Runs at thread exit via `Drop`. Returns the number of bytes freed
@@ -120,10 +129,10 @@ impl MallocState {
     ///   teardown, never mid-program, so this cannot yank live objects out from
     ///   under running code.
     ///
-    /// # Why finalizers are deliberately NOT run here (except native handles)
+    /// # Why general finalizers are deliberately NOT run here
     /// The sweep path pairs `dealloc` with `gc_type_finalize_unmarked_payload` /
     /// `layout_clear_for_ptr`, which reach into *other* thread-locals
-    /// (`MAP_REGISTRY`, `MAP_INDEX`, `PROMISE_CONTEXTS`, the async-hooks queues,
+    /// (the async-hooks queues,
     /// …). Thread-local destruction order is unspecified, so touching one of
     /// those during this Drop could hit an already-destroyed TLS and panic
     /// ("cannot access a Thread Local Storage value during or after
@@ -148,6 +157,7 @@ impl MallocState {
             unsafe {
                 if (*header).gc_flags & GC_FLAG_PINNED != 0
                     && (*header).obj_type != GC_TYPE_NATIVE_HANDLE
+                    && (*header).obj_type != GC_TYPE_INTERP_FUNCTION
                 {
                     continue;
                 }
@@ -168,6 +178,15 @@ impl MallocState {
                             as *mut crate::native_handle::NativeHandleHeader,
                     );
                 }
+                // Parsed-function cells own only a native Rc<AST>. Like the
+                // native-handle teardown above, its basic cleanup never uses
+                // TLS, collector bookkeeping, allocation or JS callbacks.
+                #[cfg(feature = "dyn-eval")]
+                if (*header).obj_type == GC_TYPE_INTERP_FUNCTION {
+                    crate::dyn_eval::function_cell::finalize(
+                        header.cast::<u8>().add(GC_HEADER_SIZE),
+                    );
+                }
                 let layout = Layout::from_size_align(total_size, 8).unwrap();
                 dealloc(header as *mut u8, layout);
                 freed_bytes = freed_bytes.saturating_add(total_size as u64);
@@ -186,9 +205,8 @@ impl Drop for MallocState {
         //
         // #11471: these blocks go back to the system allocator, so another
         // thread can be handed the same addresses. Process-global tables
-        // keyed by, or holding, a `gc_malloc` address (fresh `Symbol()`
-        // headers in `SYMBOL_POINTERS`, malloc'd strings and closures in
-        // listener tables) hear about it here, exactly as they do for arena
+        // keyed by, or holding, a `gc_malloc` address (malloc'd strings
+        // and closures in listener tables) hear about it here, as for arena
         // blocks in `Arena::drop`. Reported before the frees, so a hook still
         // sees mapped memory. Test builds skip it for the same reason
         // `Arena::drop` does: their side tables are per-thread.
@@ -238,8 +256,8 @@ pub(super) const MALLOC_STATE_HEAVY_LEN_THRESHOLD: usize = 64 * 1024;
 pub(super) const MALLOC_STATE_HEAVY_CAPACITY: usize = 256 * 1024;
 
 crate::perry_thread_local! {
-    pub(crate) static MALLOC_STATE: RefCell<MallocState> = RefCell::new(MallocState {
-        objects: Vec::with_capacity(MALLOC_STATE_INITIAL_CAPACITY),
+    pub(crate) static MALLOC_STATE: RefCell<MallocState> = const { RefCell::new(MallocState {
+        objects: Vec::new(),
         // Exact validation is lazy; its backing allocation must be lazy too.
         set: crate::fast_hash::new_ptr_hash_set(),
         realloc_forwarding: crate::fast_hash::new_ptr_hash_map(),
@@ -247,7 +265,7 @@ crate::perry_thread_local! {
         registry_state: MallocRegistryState::Inactive,
         heavy_capacity_reserved: false,
         kind_telemetry: [MallocKindTelemetry::zero(); MALLOC_KIND_BUCKET_COUNT],
-    });
+    }) };
 }
 
 // `ARENA_FREE_LIST` / `ARENA_FREE_LIST_NONEMPTY` stay raw: they are NAMED
@@ -311,6 +329,7 @@ pub fn gc_malloc(size: usize, obj_type: u8) -> *mut u8 {
         GC_FLAGS.with(|f| f.set(f.get() | GC_FLAG_IN_ALLOC));
         MALLOC_STATE.with(|s| {
             let mut s = s.borrow_mut();
+            s.reserve_initial_objects();
             s.objects.push(header);
             s.record_malloc_alloc(obj_type, 1, total as u64);
             if s.malloc_registry_available() {
@@ -369,6 +388,7 @@ pub fn gc_malloc_batch(sizes: &[usize], obj_type: u8) -> Vec<*mut u8> {
 
         MALLOC_STATE.with(|s| {
             let mut s = s.borrow_mut();
+            s.reserve_initial_objects();
             s.objects.extend_from_slice(&headers);
             s.record_malloc_alloc(obj_type, headers.len() as u64, allocated_bytes);
             if s.malloc_registry_available() {
@@ -725,6 +745,21 @@ pub fn gc_realloc(old_user_ptr: *mut u8, new_payload_size: usize) -> *mut u8 {
 
 #[cfg(test)]
 impl MallocState {
+    #[cfg(feature = "dyn-eval")]
+    pub(super) unsafe fn retire_interp_cell_via_teardown(user: *mut u8) {
+        let header = user.sub(GC_HEADER_SIZE).cast::<GcHeader>();
+        assert_eq!((*header).obj_type, GC_TYPE_INTERP_FUNCTION);
+        MALLOC_STATE.with(|current| {
+            let mut current = current.borrow_mut();
+            let index = current.objects.iter().position(|&p| p == header).unwrap();
+            current.objects.swap_remove(index);
+            current.set.remove(&(header as usize));
+        });
+        let mut exiting = Self::new_empty_for_test();
+        exiting.objects.push(header);
+        drop(exiting);
+    }
+
     /// Build an empty, TLS-independent `MallocState` for unit tests.
     fn new_empty_for_test() -> Self {
         MallocState {
@@ -764,6 +799,31 @@ impl MallocState {
 #[cfg(test)]
 mod drop_tests {
     use super::*;
+
+    #[test]
+    fn const_malloc_state_reserves_on_first_write_and_keeps_reclaim_semantics() {
+        std::thread::spawn(|| {
+            MALLOC_STATE.with(|cell| {
+                let mut state = cell.borrow_mut();
+                assert_eq!(state.objects.capacity(), 0);
+                assert_eq!(state.set.capacity(), 0);
+                assert_eq!(state.realloc_forwarding.capacity(), 0);
+                assert_eq!(state.realloc_snapshot_headers.capacity(), 0);
+                state.reserve_initial_objects();
+                assert_eq!(state.objects.capacity(), MALLOC_STATE_INITIAL_CAPACITY);
+                unsafe {
+                    state.push_test_object(4096, 0);
+                }
+                assert_eq!(
+                    state.free_all_tracked_objects(),
+                    (GC_HEADER_SIZE + 4096) as u64
+                );
+                assert_eq!(state.free_all_tracked_objects(), 0);
+            });
+        })
+        .join()
+        .expect("const-initialized malloc state must still tear down cleanly");
+    }
 
     /// `free_all_tracked_objects` (the body of `Drop for MallocState`) reclaims
     /// every tracked block and reports the exact byte total — the worker-exit
@@ -888,4 +948,17 @@ pub(super) fn malloc_resident_bytes() -> usize {
                 total.saturating_add(kind.survivor_bytes as usize)
             })
     })
+}
+
+/// Visit current malloc custody during native environment shutdown. The
+/// visitor may enqueue plain native finalizer records, but never collect or
+/// invoke JS. This does not alter incremental sweep snapshot/forwarding state.
+pub(crate) fn walk_malloc_headers_for_native_shutdown(visit: &mut dyn FnMut(*mut GcHeader)) {
+    let _no_move = super::GcSuppressScope::new();
+    let headers = MALLOC_STATE.with(|state| state.borrow().objects.clone());
+    for header in headers {
+        if !header.is_null() {
+            visit(header);
+        }
+    }
 }

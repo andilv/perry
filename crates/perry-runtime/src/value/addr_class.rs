@@ -22,7 +22,7 @@
 //! | `[0x40000, 0xE0000)`   | Web Fetch family (Request/Response/Headers/Blob), perry-stdlib   |
 //! |                        | `fetch/mod.rs` `FETCH_HANDLE_ID_{START,END}` (#3973/#3974/#4004) |
 //! | `[0xE0000, 0xF0000)`   | unallocated (former zlib ids, now ordinary payload objects)     |
-//! | `[0xF0000, 0x100000)`  | revocable Proxy ids, perry-runtime `proxy.rs` `PROXY_TAG_BASE`   |
+//! | `[0xF0000, 0x100000)`  | reserved former Proxy-id range, never a heap payload   |
 //! |                        | (#2846 crash cluster)                                            |
 //! | `[0x100000, 0x200000)` | Web Streams ids (perry-stdlib `streams.rs`), `POINTER_TAG`-boxed |
 //! |                        | like every other registry handle. They used to travel as raw     |
@@ -61,7 +61,7 @@ pub const FETCH_HANDLE_BAND_START: usize = 0x40000;
 pub const FETCH_HANDLE_BAND_END: usize = 0xE0000;
 
 /// Revocable Proxy id band `[PROXY_ID_BAND_START, PROXY_ID_BAND_END)`, owned by
-/// perry-runtime `proxy.rs` (`PROXY_TAG_BASE`). Kept at the top of the handle
+/// the former proxy registry. Kept reserved at the top of the handle
 /// band so fetch ids below never collide with a proxy id (#2846).
 pub const PROXY_ID_BAND_START: usize = 0xF0000;
 /// Exclusive end of the revocable Proxy id band; the Web Streams band follows.
@@ -108,12 +108,19 @@ pub fn is_above_handle_band(addr: usize) -> bool {
     addr >= HANDLE_BAND_MAX
 }
 
-/// True when `addr` is a revocable-Proxy id. Callers must still confirm
-/// registration via `proxy::js_proxy_is_proxy` before routing — a heap-free
-/// check, so do it before any dereference.
+/// True when `addr` is a Proxy cell. A Proxy is an ordinary nonmoving GC
+/// allocation of kind `GC_TYPE_PROXY`, boxed under `POINTER_TAG` like every
+/// other object, so the header byte decides (honest pointers: a
+/// `POINTER_TAG` payload or a raw receiver derived from one names a
+/// GC-headed object). Id-band and misaligned words are never Proxy cells and
+/// are rejected before the header load.
 #[inline(always)]
-pub fn is_proxy_id_band(addr: usize) -> bool {
-    (PROXY_ID_BAND_START..PROXY_ID_BAND_END).contains(&addr)
+pub fn is_proxy_cell(addr: usize) -> bool {
+    is_above_handle_band(addr)
+        && addr % std::mem::align_of::<GcHeader>() == 0
+        && addr as u64 <= crate::value::POINTER_MASK
+        // SAFETY: the honest-pointer invariant above.
+        && crate::proxy::is_proxy_header(unsafe { &*((addr - GC_HEADER_SIZE) as *const GcHeader) })
 }
 
 /// True when `id` is in the Web Streams sub-band of the handle band. Only a
@@ -288,6 +295,55 @@ pub(crate) unsafe fn try_read_gc_header_known_plausible(addr: usize) -> Option<&
     Some(&*((addr - GC_HEADER_SIZE) as *const GcHeader))
 }
 
+/// The GC header of a `POINTER_TAG` value, read without a provenance proof.
+///
+/// Honest-pointer invariant: every pointer constructor boxes an id-band
+/// payload under `HANDLE_TAG` (or null), so a `POINTER_TAG` word names a
+/// GC-headed object on this heap or in process-wide immortal space (image
+/// strings, leaked symbol cells). `PERRY_GC_VERIFY_MARK` checks every such
+/// word a collection scans. Raw untagged words keep [`try_read_tracked_gc_header`].
+///
+/// The tag test is the emitted receivers' fused compare (one subtract, one
+/// unsigned compare), so it also refuses a null `POINTER_TAG` word at no cost.
+#[inline(always)]
+pub(crate) fn pointer_value_header(bits: u64) -> Option<&'static GcHeader> {
+    const BIAS: u64 = crate::value::POINTER_TAG | HANDLE_BAND_MAX as u64;
+    const SPAN: u64 = (1u64 << 48) - HANDLE_BAND_MAX as u64;
+    if bits.wrapping_sub(BIAS) >= SPAN {
+        return None;
+    }
+    // SAFETY: the invariant above; the header precedes every GC allocation.
+    Some(unsafe { honest_header((bits & crate::value::POINTER_MASK) as usize) })
+}
+
+/// The GC header of an address that names a GC-headed object by
+/// construction: an honest `POINTER_TAG` payload, or a word a runtime
+/// structure or compiled code allocated itself (a shape's keys array, a
+/// compiled box cell). No admission: the construction is the proof.
+///
+/// # Safety
+/// `addr` must be the user address of a live GC allocation.
+#[inline(always)]
+pub(crate) unsafe fn honest_header(addr: usize) -> &'static GcHeader {
+    &*((addr - GC_HEADER_SIZE) as *const GcHeader)
+}
+
+/// [`try_read_tracked_gc_header`] for a receiver word that may be a JS value:
+/// a `POINTER_TAG` word answers from its header (honest pointers, no
+/// admission); a raw untagged word keeps the allocator proof; every other
+/// tag has no GC header here.
+#[inline(always)]
+pub(crate) fn tracked_header_of_bits(bits: u64) -> Option<std::ptr::NonNull<GcHeader>> {
+    if let Some(header) = pointer_value_header(bits) {
+        return Some(std::ptr::NonNull::from(header));
+    }
+    if bits >> 48 != 0 {
+        return None;
+    }
+    // SAFETY: the tracked reader admits the raw word before any load.
+    unsafe { try_read_tracked_gc_header(bits as usize) }
+}
+
 /// Candidate object address carried by a NaN-boxed JS value, decided by the
 /// value's TAG before any magnitude test (#10479).
 ///
@@ -369,6 +425,27 @@ fn classify_tracked_gc_header_with(
         .then_some((header_addr, TrackedGcStorage::Malloc))
 }
 
+/// Arena-only brands require an allocation-authored object start, not just
+/// range membership. Dead nursery starts disappear with their backing bitmap.
+/// No allocation or collection occurs; the pointer remains valid for this leaf.
+#[inline(never)]
+pub(crate) unsafe fn try_read_tracked_arena_header_of_type(
+    addr: usize,
+    kind: u8,
+) -> Option<std::ptr::NonNull<GcHeader>> {
+    if is_handle_band(addr) {
+        return None;
+    }
+    let header_addr = addr.checked_sub(GC_HEADER_SIZE)?;
+    let (_, base, bitmap) = crate::arena::classify_heap_space_in_range(addr)?;
+    if !crate::arena::arena_header_is_object_start(header_addr, base, bitmap) {
+        return None;
+    }
+    let header = std::ptr::NonNull::new(header_addr as *mut GcHeader)?;
+    let h = header.as_ref();
+    (h.obj_type == kind && h.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0).then_some(header)
+}
+
 /// Test-only count of tracked-resolver probes, so a fast path can pin that
 /// it answered without one.
 #[cfg(test)]
@@ -380,7 +457,7 @@ pub(crate) fn tracked_header_probe_count_for_tests() -> u64 {
 }
 
 /// Locate a `GcHeader` only after allocator-owned metadata proves that `addr`
-/// is a Perry GC allocation. Unlike [`try_read_gc_header`], this does not use
+/// is a Perry GC allocation or an immutable executable image string. Unlike [`try_read_gc_header`], this does not use
 /// an address-magnitude window as evidence of ownership: arena page membership
 /// or an exact malloc-registry hit is required before the first header byte is
 /// touched. The header's type, size, and arena flag are then validated.
@@ -395,6 +472,8 @@ pub(crate) fn tracked_header_probe_count_for_tests() -> u64 {
 /// allocation or collection safepoint. Returning a raw pointer is deliberate:
 /// some checked callers install forwarding metadata, so this gate must not
 /// manufacture a shared reference and then write through a cast of it.
+/// Image headers are read-only: a caller must honor their pinned/marked image
+/// representation and never mutate them or treat them as an arena allocation.
 ///
 /// Out of line, with the allocator lookup folded into its one body: the
 /// probe sits on generic receiver paths (`has_cell_type`, own-key and
@@ -420,6 +499,61 @@ pub(crate) unsafe fn try_read_tracked_gc_header_of_type(
     tracked_gc_header_admitting(addr, |obj_type| obj_type == kind)
 }
 
+/// Distinguish an owned cell of another kind from an address outside the
+/// tracked heap. Symbol's immortal fallback needs that distinction: ordinary
+/// receivers must reject the brand before any immortal-registry lookup.
+/// The allocator proof precedes every read; a negative kind needs no generic
+/// known-kind, size or arena-flag validation. No allocation occurs. This leaf
+/// folds into the one out-of-line Symbol admission helper, its sole caller.
+#[inline(always)]
+pub(crate) unsafe fn tracked_gc_type_matches(addr: usize, kind: u8) -> Option<bool> {
+    if is_handle_band(addr) {
+        return None;
+    }
+    let header_addr = addr.checked_sub(GC_HEADER_SIZE)?;
+    // One page classification serves both the range proof and the start
+    // bitmap: this is the Symbol brand on every pointer-tagged value probe.
+    if let Some((_, range_base, bitmap)) = crate::arena::classify_heap_space_in_range(addr) {
+        // The payload and its header must belong to the same registered
+        // range (#7742).
+        if header_addr < range_base {
+            return None;
+        }
+        if header_addr % std::mem::align_of::<GcHeader>() != 0 {
+            return Some(false);
+        }
+        let header = header_addr as *const GcHeader;
+        if (*header).obj_type != kind {
+            return Some(false);
+        }
+        // Matching payload bytes are not an allocation identity. Only
+        // positives need the start bitmap.
+        if !crate::arena::arena_header_is_object_start(header_addr, range_base, bitmap) {
+            return Some(false);
+        }
+        return Some(
+            (*header).size as usize >= GC_HEADER_SIZE
+                && (*header).gc_flags & crate::gc::GC_FLAG_ARENA != 0
+                && (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0,
+        );
+    }
+    if !crate::gc::gc_malloc_header_is_tracked(header_addr as *const GcHeader) {
+        return None;
+    }
+    if header_addr % std::mem::align_of::<GcHeader>() != 0 {
+        return Some(false);
+    }
+    let header = header_addr as *const GcHeader;
+    if (*header).obj_type != kind {
+        return Some(false);
+    }
+    Some(
+        (*header).size as usize >= GC_HEADER_SIZE
+            && (*header).gc_flags & crate::gc::GC_FLAG_ARENA == 0
+            && (*header).gc_flags & crate::gc::GC_FLAG_FORWARDED == 0,
+    )
+}
+
 #[inline(always)]
 unsafe fn tracked_gc_header_admitting(
     addr: usize,
@@ -427,11 +561,14 @@ unsafe fn tracked_gc_header_admitting(
 ) -> Option<std::ptr::NonNull<GcHeader>> {
     #[cfg(test)]
     TRACKED_HEADER_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (header_addr, storage) = classify_tracked_gc_header_with(
+    let Some((header_addr, storage)) = classify_tracked_gc_header_with(
         addr,
         |candidate| crate::arena::classify_heap_space_in_range(candidate).map(|(_, base, _)| base),
         crate::gc::gc_malloc_header_is_tracked,
-    )?;
+    ) else {
+        let header = image::header(addr)?;
+        return admit((*header.as_ptr()).obj_type).then_some(header);
+    };
     if header_addr % std::mem::align_of::<GcHeader>() != 0 {
         return None;
     }
@@ -470,9 +607,9 @@ mod tests {
         assert!(is_handle_band(0x40000));
         assert!(is_small_handle(0x40000));
         // Proxy ids (#2846), zlib (#1843), common registry, null.
-        assert!(is_proxy_id_band(0xF0000));
-        assert!(is_proxy_id_band(0xF_FFF8));
-        assert!(!is_proxy_id_band(0x40000));
+        assert!(!is_proxy_cell(0xF0000));
+        assert!(!is_proxy_cell(0xF_FFF8));
+        assert!(!is_proxy_cell(0x40000));
         assert!(is_handle_band(0xE0000));
         assert!(is_handle_band(1));
         assert!(is_handle_band(0));
@@ -666,7 +803,7 @@ mod tests {
         assert!(!is_stream_id_band(PROXY_ID_BAND_END - 1));
         assert!(is_handle_band(STREAM_ID_BAND_START));
         assert!(is_small_handle(STREAM_ID_BAND_START));
-        assert!(!is_proxy_id_band(STREAM_ID_BAND_START));
+        assert!(!is_proxy_cell(STREAM_ID_BAND_START));
     }
 
     #[cfg(target_os = "macos")]
@@ -746,4 +883,63 @@ mod known_plausible_alignment_tests {
         // SAFETY: as above.
         assert!(unsafe { try_read_gc_header(addr) }.is_none());
     }
+}
+
+#[cfg(test)]
+#[path = "addr_class/image_tests.rs"]
+mod image_tests;
+
+#[path = "addr_class/image.rs"]
+mod image;
+
+/// Validate the string layout after the canonical ownership/type admission.
+/// The empty singleton has no GC header and is admitted by exact identity.
+/// No allocation or collection may occur while the returned header is used.
+#[inline(never)]
+pub(crate) unsafe fn try_read_string_header<'a>(
+    ptr: *const crate::string::StringHeader,
+) -> Option<&'a crate::string::StringHeader> {
+    if ptr == crate::string::js_get_empty_string() {
+        return Some(&*ptr);
+    }
+    let gc = try_read_tracked_gc_header_of_type(ptr as usize, crate::gc::GC_TYPE_STRING)?;
+    let size = gc.as_ref().size as usize;
+    if size < GC_HEADER_SIZE + std::mem::size_of::<crate::string::StringHeader>() {
+        return None;
+    }
+    // Arena membership proves the GC header readable, but a forged interior
+    // address must not let the larger StringHeader or its bytes cross a block
+    // boundary. Image admission already checks its complete section extent;
+    // malloc admission is exact and its size is allocator-authored.
+    let arena_base = if gc.as_ref().gc_flags & crate::gc::GC_FLAG_ARENA != 0 {
+        let (_, base, _) = crate::arena::classify_heap_space_in_range(ptr as usize)?;
+        let last =
+            (ptr as usize).checked_add(std::mem::size_of::<crate::string::StringHeader>() - 1)?;
+        if crate::arena::classify_heap_space_in_range(last).map(|(_, base, _)| base) != Some(base) {
+            return None;
+        }
+        Some(base)
+    } else {
+        None
+    };
+    let string = &*ptr;
+    let storage = GC_HEADER_SIZE + std::mem::size_of::<crate::string::StringHeader>();
+    if string.byte_len > string.capacity || string.capacity as usize > size - storage {
+        return None;
+    }
+    if let Some(base) = arena_base {
+        let last = (ptr as usize)
+            .checked_add(std::mem::size_of::<crate::string::StringHeader>())?
+            .checked_add(string.capacity as usize)?
+            .checked_sub(1)?;
+        if crate::arena::classify_heap_space_in_range(last).map(|(_, base, _)| base) != Some(base) {
+            return None;
+        }
+    }
+    Some(string)
+}
+
+#[cfg(test)]
+pub(crate) fn image_string_for_tests() -> *const crate::string::StringHeader {
+    image_tests::image_string()
 }
