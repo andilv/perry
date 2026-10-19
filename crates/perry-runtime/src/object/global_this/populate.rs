@@ -22,14 +22,27 @@ fn finish_builtin_prototype(
     // object would. The declaration on the member decides, never the
     // prototype's name; a store or delete of the member revokes its
     // lane (a new ShapeId).
+    // A prototype born on its declared layout keeps that layout id: its
+    // members are its layout's slots, never lanes of a new id.
     // SAFETY: the live, just-populated prototype.
     unsafe {
-        crate::object::shapes::learn_object_constfn_lanes(proto_obj, |_, _| true);
+        let learn = |obj: *mut ObjectHeader| {
+            if !crate::object::runtime_layouts::on_declared_prototype_layout(obj) {
+                crate::object::shapes::learn_object_constfn_lanes(obj, |_, _| true);
+            }
+        };
+        if crate::value::addr_class::try_read_gc_header(proto_obj as usize)
+            .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
+        {
+            learn(proto_obj);
+        } else {
+            crate::object::shapes::learn_object_constfn_lanes(proto_obj, |_, _| true);
+        }
         // Some native prototypes own symbol slots through an ordinary
         // descriptor holder. Its members carry the same declarations.
         if let Some(holder) = crate::object::shaped_symbols::owner(proto_obj as usize) {
             if holder != proto_obj {
-                crate::object::shapes::learn_object_constfn_lanes(holder, |_, _| true);
+                learn(holder);
             }
         }
     }
@@ -796,23 +809,19 @@ fn populate_global_this_builtins_inner(singleton_at_entry: *mut ObjectHeader) {
             // richer install that also exposes per-method name/length descriptors.
             match name {
                 "Math" => {
-                    #[cfg(feature = "global-math")]
-                    install_math_namespace(ns_obj);
+                    super::web_hooks::math_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Math");
                 }
                 "JSON" => {
-                    #[cfg(feature = "global-json")]
-                    install_json_namespace_members(ns_obj);
+                    super::web_hooks::json_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "JSON");
                 }
                 "Reflect" => {
-                    #[cfg(feature = "global-reflect")]
-                    install_reflect_namespace_members(ns_obj);
+                    super::web_hooks::reflect_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Reflect");
                 }
                 "Atomics" => {
-                    #[cfg(feature = "global-atomics")]
-                    install_atomics_namespace_members(ns_obj);
+                    super::web_hooks::atomics_members(ns_obj);
                     set_intrinsic_to_string_tag(ns_obj, "Atomics");
                 }
                 "Intl" => crate::intl::install_intl_namespace(ns_obj),

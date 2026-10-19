@@ -54,6 +54,15 @@ pub fn closure_set_static_prototype(closure_ptr: usize, proto_bits: u64) {
     if closure_ptr == 0 || !is_closure_ptr(closure_ptr) {
         return;
     }
+    if unsafe { super::shape::is_class_info((*(closure_ptr as *const ClosureHeader)).info) } {
+        unsafe {
+            crate::object::class_value::constructor_parent_store(
+                closure_ptr as *mut ClosureHeader,
+                proto_bits,
+            );
+        }
+        return;
+    }
     unsafe { super::props::state_set_prototype(closure_ptr, proto_bits) };
     super::shape::note_function_own_state_changed(closure_ptr);
 }
@@ -62,6 +71,11 @@ pub fn closure_set_static_prototype(closure_ptr: usize, proto_bits: u64) {
 pub fn closure_static_prototype(closure_ptr: usize) -> Option<u64> {
     if closure_ptr == 0 || !is_closure_ptr(closure_ptr) {
         return None;
+    }
+    if unsafe { super::shape::is_class_info((*(closure_ptr as *const ClosureHeader)).info) } {
+        return Some(unsafe {
+            crate::object::class_value::constructor_parent_bits(closure_ptr as *mut ClosureHeader)
+        });
     }
     unsafe { super::props::state_prototype(closure_ptr) }
 }
@@ -206,7 +220,8 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
         if closure.is_null() {
             return f64::from_bits(crate::value::TAG_UNDEFINED);
         }
-        let receiver = crate::value::js_nanbox_pointer(ptr as i64);
+        let receiver = crate::object::field_get_set::accessor_receiver_override_take()
+            .unwrap_or_else(|| crate::value::js_nanbox_pointer(ptr as i64));
         return crate::closure::js_closure_call0(
             closure,
             crate::closure::JsThis::from_f64(receiver),
@@ -254,6 +269,12 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
     // Resolve its birth value before any inherited property lookup; once a
     // bag key exists, its value (including undefined) already won above.
     if prop == "name" && crate::object::has_own_helpers::closure_own_key_present(ptr, prop) {
+        // A compiled body's name is an image string: its own value, no copy.
+        if let Some(image) =
+            unsafe { crate::builtins::function_name_image((*(ptr as *const ClosureHeader)).info) }
+        {
+            return crate::value::js_nanbox_string(image as i64);
+        }
         let name =
             unsafe { crate::builtins::function_name_for_closure(ptr as *const ClosureHeader) }
                 .unwrap_or_default();
@@ -291,8 +312,10 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
                     return f64::from_bits(crate::value::TAG_UNDEFINED);
                 }
                 let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-                let receiver =
-                    this_scope.root_nanbox_f64(crate::value::js_nanbox_pointer(ptr as i64));
+                let receiver = this_scope.root_nanbox_f64(
+                    crate::object::field_get_set::accessor_receiver_override_take()
+                        .unwrap_or_else(|| crate::value::js_nanbox_pointer(ptr as i64)),
+                );
                 let getter_bits = clone_closure_rebind_this(acc.get, receiver.get_nanbox_f64());
                 let getter = (getter_bits & crate::value::POINTER_MASK)
                     as *const crate::closure::ClosureHeader;
@@ -322,7 +345,10 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
                 return f64::from_bits(crate::value::TAG_UNDEFINED);
             }
             let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-            let receiver = this_scope.root_nanbox_f64(crate::value::js_nanbox_pointer(ptr as i64));
+            let receiver = this_scope.root_nanbox_f64(
+                crate::object::field_get_set::accessor_receiver_override_take()
+                    .unwrap_or_else(|| crate::value::js_nanbox_pointer(ptr as i64)),
+            );
             let getter_bits = clone_closure_rebind_this(acc.get, receiver.get_nanbox_f64());
             let getter =
                 (getter_bits & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
@@ -370,6 +396,27 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
     // must be readable through any closure (`fn.property`, `boundFn.property`,
     // `Function.indicator`).
     let receiver = f64::from_bits(crate::value::js_nanbox_pointer(ptr as i64).to_bits());
+    // An async or generator function's [[Prototype]] is its kind's intrinsic
+    // (`%AsyncFunction.prototype%`, ...), whose chain reaches
+    // `%Function.prototype%`: the read is that object's [[Get]].
+    let kind_body = unsafe { (*(ptr as *const ClosureHeader)).info.as_ref() }.is_some_and(|info| {
+        info.flags & (crate::closure::FN_ASYNC | crate::closure::FN_GENERATOR) != 0
+    });
+    if kind_body
+        && crate::object::reified_function_method_name(prop).is_none()
+        && function_prototype_fallback_target(ptr, prop).is_some()
+    {
+        if let Some(kind_proto) = crate::object::generator_function_proto_of(ptr) {
+            if crate::value::js_nanbox_get_pointer(kind_proto) as usize != 0 {
+                let key = crate::string::canonical_key(prop.as_bytes());
+                return crate::proxy::js_reflect_get(
+                    kind_proto,
+                    crate::value::js_nanbox_string(key as i64),
+                    receiver,
+                );
+            }
+        }
+    }
     function_prototype_inherited_get(ptr, prop, receiver)
         .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED))
 }
@@ -387,6 +434,11 @@ pub(crate) fn function_prototype_inherited_get(
     prop: &str,
     receiver: f64,
 ) -> Option<f64> {
+    // `call` / `apply` / `bind` read as values reify on the receiver
+    // (`reify_function_method_value`), never here.
+    if crate::object::reified_function_method_name(prop).is_some() {
+        return None;
+    }
     let proto_ptr = function_prototype_fallback_target(self_ptr, prop)?;
     // A defineProperty accessor on Function.prototype
     // (`{ get: () => 12 }`) is invoked with the reading
@@ -422,30 +474,23 @@ pub(crate) fn function_prototype_inherited_get(
 
 /// Resolve the real, mutable `%Function.prototype%` object pointer for a
 /// closure-receiver fallback (GET or SET), or `None` if `prop` doesn't
-/// qualify — a synthesized own slot, a method handled by dedicated dispatch
-/// (the Function.prototype methods are resolved separately above), an
-/// array-index-shaped key, or Function.prototype itself. Shared by
+/// qualify — a synthesized own slot (`prototype`, `name`, `length`, the
+/// `caller` / `arguments` poison pill) or Function.prototype itself. Every
+/// other member (`constructor`, `call`, `toString`, and `valueOf` / `toLocaleString` /
+/// `isPrototypeOf` inherited from `%Object.prototype%`) is read off the real
+/// prototype like any property. Shared by
 /// [`closure_get_dynamic_prop`]'s expando/defineProperty walk and the
 /// closure SET path in `object::field_set_by_name`, so
 /// `Object.defineProperty(Function.prototype, k, {get,set})` round-trips
-/// through `boundFn.k = v` the same way it does through `boundFn.k`. A
+/// through `boundFn.k = v` the same way it does through `boundFn.k`.
 /// The intrinsic is published at realm bootstrap. Warm resolution is a root
 /// load; cold bootstrap reads only the constructor's `prototype` property,
 /// which this fallback excludes, so it cannot reenter the fallback.
 pub(crate) fn function_prototype_fallback_target(ptr: usize, prop: &str) -> Option<usize> {
     if matches!(
         prop,
-        "prototype" | "name" | "length" | "caller" | "arguments" | "constructor"
-        // Universal Object.prototype method names resolved through a
-        // dedicated native dispatch arm, not a literal field on the walked
-        // prototype object. Serving a generic-lookup result for one of these
-        // hijacked that dispatch with a same-named-but-wrong value (test262
-        // S15.2.4.3_A8 / S15.2.4.4_A8 / S15.2.4.7_A8). `hasOwnProperty` and
-        // `propertyIsEnumerable` are not listed: %Function.prototype% carries
-        // the real methods for them, so a read returns the method.
-        | "toString" | "valueOf" | "isPrototypeOf" | "toLocaleString"
-    ) || crate::object::reified_function_method_name(prop).is_some()
-    {
+        "prototype" | "name" | "length" | "caller" | "arguments"
+    ) {
         return None;
     }
     // THIS realm's %Function.prototype% (the memoized intrinsic), not whatever

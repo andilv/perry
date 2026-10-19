@@ -1,5 +1,7 @@
 //! Unit tests: small programs lowered from source, facts checked directly.
 
+mod super_heritage;
+
 use crate::{compute, FactsConfig, ProgramFacts, Verdict};
 
 fn facts(src: &str) -> ProgramFacts {
@@ -185,7 +187,6 @@ fn sabotage_plants_the_fact() {
             sabotage: Some("readonly:P.x".into()),
             dynamic_code: None,
             budget_secs: None,
-            whatif_no_e14: false,
             profile: false,
             max_pts: None,
             widen_k: None,
@@ -223,7 +224,6 @@ fn write_dump_for_checker() {
             sabotage: std::env::var("WPFACTS_TEST_SABOTAGE").ok(),
             dynamic_code: None,
             budget_secs: None,
-            whatif_no_e14: false,
             profile: false,
             max_pts: None,
             widen_k: None,
@@ -235,8 +235,11 @@ fn write_dump_for_checker() {
     std::fs::write(dir.join("t.facts.rel"), pf.relations_text().unwrap()).unwrap();
 }
 
+/// Decision 150: dynamic code naming the global scope is no kill. The class
+/// keeps its facts; the program's proofs are guarded by the runtime's
+/// interpreted-prototype-write word instead.
 #[test]
-fn dynamic_code_reach_kills_facts_without_an_unknown_call() {
+fn dynamic_code_reach_guards_instead_of_killing() {
     let mut reach = perry_hir::dynamic_code::DynamicCodeReach::default();
     reach.record_global("new Function(...) @ t.ts:4".into());
     let pf = facts_with(
@@ -249,9 +252,86 @@ fn dynamic_code_reach_kills_facts_without_an_unknown_call() {
     );
     assert!(pf.dynamic_code_reach.disables_builtin_constants());
     assert!(pf.relations_text().unwrap().contains("dynamicreach 1"));
-    assert!(pf.global.as_deref().unwrap().contains("dynamic_code_reach"));
-    assert!(!tmpl(&pf, "P").prefix_stable);
-    assert!(!field(tmpl(&pf, "P"), "x").readonly);
+    assert!(pf
+        .interp_guard
+        .as_deref()
+        .unwrap()
+        .contains("dynamic_code_reach"));
+    assert!(tmpl(&pf, "P").prefix_stable, "{}", pf.dump_text());
+    assert!(field(tmpl(&pf, "P"), "x").readonly);
+}
+
+fn interp_cfg() -> FactsConfig {
+    FactsConfig {
+        dynamic_code: Some("E14 test".into()),
+        ..Default::default()
+    }
+}
+
+/// Interpreted code is ONE summary node (⊤): what is passed to a function
+/// it made, and what such a function returns, escapes; a class whose
+/// instances never reach it keeps every fact. `this` and locals that can
+/// hold both get the class plus ⊤ (a checked proof in codegen).
+#[test]
+fn interpreted_function_is_a_summary_node() {
+    let pf = facts_with(
+        r#"
+        class Kept { x: number; constructor(x: number) { this.x = x; } }
+        class Given { y: number; constructor(y: number) { this.y = y; } }
+        const body = ["return o"].join("");
+        const f = new Function("o", body);
+        const back = f(new Given(2));
+        function rd(k: Kept) { return k.x; }
+        let either: any = new Kept(3);
+        if (back) either = back;
+        console.log(rd(new Kept(1)), back.y, either.x);
+        "#,
+        interp_cfg(),
+    );
+    assert!(pf.interp_guard.is_some(), "{}", pf.dump_text());
+    let kept = tmpl(&pf, "Kept");
+    assert!(
+        kept.prefix_stable && kept.fixed_layout,
+        "{}",
+        pf.dump_text()
+    );
+    assert!(field(kept, "x").readonly);
+    assert_eq!(field(kept, "x").kind.desc(), "num");
+    let given = tmpl(&pf, "Given");
+    assert!(!given.prefix_stable, "{}", pf.dump_text());
+    assert!(field(given, "y").kind.top);
+    // `either` holds Kept and ⊤ (the interpreted function's result).
+    let kept_id = kept.class_id.unwrap();
+    let mb = &pf.bindings[0];
+    assert!(
+        mb.locals
+            .iter()
+            .any(|(_, b)| b.other && b.class_ids == vec![kept_id]),
+        "{:?}",
+        mb.locals
+    );
+}
+
+/// A ⊤ callee that may be the Function constructor (tsc's 84k calls) only
+/// connects values that are already ⊤: an object that never reaches a ⊤
+/// call keeps its facts.
+#[test]
+fn top_call_connects_only_top_values() {
+    let pf = facts_with(
+        r#"
+        class Kept { x: number; constructor(x: number) { this.x = x; } }
+        const u: any = (globalThis as any).someUnknown;
+        const r = u("a", 1);
+        function rd(k: Kept) { return k.x; }
+        console.log(rd(new Kept(1)), r);
+        "#,
+        interp_cfg(),
+    );
+    assert!(pf.stats.top_calls > 0);
+    assert!(pf.interp_guard.is_some());
+    let kept = tmpl(&pf, "Kept");
+    assert!(kept.prefix_stable, "{}", pf.dump_text());
+    assert!(field(kept, "x").readonly);
 }
 
 /// The bounds hold from the first constraint. Generation solves online
@@ -287,4 +367,703 @@ fn bounds_hold_during_generation() {
         bounded.stats.nodes,
         full.stats.nodes
     );
+}
+
+/// Re-binding a bound function (`f = f.bind(x)` in a loop) and calling or
+/// constructing the result must reach a fixpoint: one bound value per bind
+/// site for bound targets, and one merged call per bound value for the
+/// calls the solver itself makes through a bound target.
+#[test]
+fn bind_chains_terminate() {
+    let src = r#"
+        let f: any = function (this: any, a: any) { return a; };
+        let g: any = function (this: any, a: any) { this.a = a; };
+        for (let i = 0; i < 3; i++) { f = f.bind(null, i); g = g.bind(null); }
+        console.log(f(1), new g(2));
+    "#;
+    let pf = facts_with(
+        src,
+        FactsConfig {
+            max_work: Some(2_000_000),
+            ..Default::default()
+        },
+    );
+    assert!(!pf.stats.aborted, "{}", pf.dump_text());
+}
+
+fn site<'a>(pf: &'a ProgramFacts, key: &str) -> &'a crate::SiteFacts {
+    pf.sites
+        .iter()
+        .find(|s| s.key == key)
+        .unwrap_or_else(|| panic!("site .{key} in\n{}", pf.dump_text()))
+}
+
+/// The iteration protocol written out by hand over builtin iterators
+/// (array, `values()`, Map entries, Set): `next().value` is the element,
+/// not a value from unmodeled code, and the source keeps its facts.
+#[test]
+fn builtin_iterator_next_yields_elements() {
+    let pf = facts(
+        r#"
+        class A { a: number; constructor(a: number) { this.a = a; } }
+        class B { b: number; constructor(b: number) { this.b = b; } }
+        class C { c: number; constructor(c: number) { this.c = c; } }
+        class D { d: number; constructor(d: number) { this.d = d; } }
+        const xs = [new A(1), new A(2)];
+        const it = xs[Symbol.iterator]();
+        let s = 0;
+        for (let r = it.next(); !r.done; r = it.next()) s += r.value.a;
+        const ys = [new B(1)];
+        const vi = ys.values();
+        const v = vi.next();
+        if (!v.done) s += v.value.b;
+        const mp = new Map([["k", new C(3)]]);
+        const ei = mp.entries();
+        const e = ei.next();
+        if (!e.done) s += e.value[1].c;
+        const st = new Set([new D(4)]);
+        const si = st.values();
+        const w = si.next();
+        if (!w.done) s += w.value.d;
+        console.log(s);
+        "#,
+    );
+    for k in ["a", "b", "c", "d"] {
+        let st = site(&pf, k);
+        assert!(!st.top, ".{k} receiver carries TOP\n{}", pf.dump_text());
+        assert!(
+            matches!(st.verdict, Verdict::T0Mono | Verdict::T0Set),
+            ".{k}: {:?}\n{}",
+            st.verdict,
+            pf.dump_text()
+        );
+    }
+}
+
+/// for-of, spread and destructuring over a hand-written iterable flow the
+/// user's `next().value` into the loop variable.
+#[test]
+fn user_iterable_flows_through_for_of_spread_destructuring() {
+    let pf = facts(
+        r#"
+        class P { p: number; constructor(p: number) { this.p = p; } }
+        class Bag {
+          items: P[];
+          constructor() { this.items = [new P(1), new P(2)]; }
+          [Symbol.iterator]() {
+            let i = 0;
+            const items = this.items;
+            return { next: () => i < items.length ? { value: items[i++], done: false } : { value: undefined, done: true } };
+          }
+        }
+        const bag = new Bag();
+        let s = 0;
+        for (const x of bag) s += x.p;
+        const [first] = bag;
+        if (first) s += first.p;
+        console.log(s + [...bag].length);
+        "#,
+    );
+    for st in pf.sites.iter().filter(|s| s.key == "p") {
+        assert!(!st.top, ".p receiver carries TOP\n{}", pf.dump_text());
+    }
+}
+
+/// `this.k = v` in a constructor function is a birth writer of `new f()`
+/// instances even when `this` already holds instances as the store is
+/// generated (a nested `new f()` earlier in the program): the site is
+/// marked construction-phase before its constraint applies.
+#[test]
+fn fn_instance_ctor_stores_are_birth_writers() {
+    let pf = facts(
+        r#"
+        function Vec(this: any, x: number, y: number) {
+          this.x = x;
+          this.y = y;
+        }
+        Vec.prototype.add = function (this: any, o: any) {
+          return new (Vec as any)(this.x + o.x, this.y + o.y);
+        };
+        const a = new (Vec as any)(1, 2);
+        const b = a.add(new (Vec as any)(3, 4));
+        console.log(b.x, b.y);
+        "#,
+    );
+    let v = pf
+        .templates
+        .iter()
+        .find(|t| t.display.ends_with(":Vec"))
+        .unwrap_or_else(|| panic!("Vec in\n{}", pf.dump_text()));
+    assert!(v.prefix_stable, "{}", pf.dump_text());
+    assert!(field(v, "x").readonly, "{}", pf.dump_text());
+    assert!(field(v, "y").readonly, "{}", pf.dump_text());
+}
+
+// Match the generator's reserved globals, so synthetic source node ids
+// cannot accidentally double as the canonical unmodeled-value node.
+fn copy_solver_model() -> crate::model::Model {
+    use crate::model::{prim, Model, TokKind, TOP};
+    let mut m = Model::default();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    m.top_tok_node = m.node_l("unmodeled");
+    m.add_tok(m.top_tok_node, TOP);
+    m.add_prim(m.top_tok_node, prim::ALL);
+    m.thrown = m.node_l("thrown");
+    m
+}
+
+#[test]
+fn widening_transfer_filters_noops_and_preserves_later_effects() {
+    use crate::model::{prim, BuiltinNs, TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    m.widen_k = 64;
+    let top = m.node_l("TOP");
+    m.top_tok_node = top;
+    m.add(top, &[TOP], prim::ALL);
+    let src = m.node_l("source");
+    let mut values: Vec<_> = (0..56).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    values.extend([
+        m.tok(TokKind::Builtin(BuiltinNs::Object)),
+        m.tok(TokKind::BuiltinFn),
+        m.tok(TokKind::ObjectProto),
+        m.tok(TokKind::NativeProto("EventEmitter".into())),
+    ]);
+    let filler: Vec<_> = (1000..1065).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    let reason = m.reason("test values already reached unknown code");
+    // The first source value still has a real escape effect. All other
+    // values either already escaped or belong to the runtime.
+    for &t in values.iter().skip(1).chain(&filler) {
+        m.escape(t, reason);
+    }
+    let mut uses = Vec::new();
+    for _ in 0..1000 {
+        let dst = m.node_l("use");
+        m.edge(src, dst);
+        // A different input widens each use before the source arrives.
+        m.add(dst, &filler, 0);
+        assert!(m.nodes[dst as usize].widened);
+        uses.push(dst);
+    }
+    m.add(src, &values, prim::NUM);
+    m.max_work = 30_000;
+    m.solve();
+    assert!(!m.aborted, "redundant widened copies used {} work", m.work);
+    assert!(m.is_escaped(values[0]));
+    for &dst in &uses {
+        assert!(m.nodes[dst as usize].pts.contains_tok(TOP));
+        assert_ne!(m.nodes[dst as usize].prim & prim::NUM, 0);
+    }
+    // Projected edges still carry later primitive kinds, and a newly
+    // seen value still escapes from the source.
+    m.add_prim(src, prim::STR);
+    let later = m.tok(TokKind::ModNs(2000));
+    m.add_tok(src, later);
+    m.solve();
+    assert!(!m.aborted);
+    assert!(m.is_escaped(later));
+    for &dst in &uses {
+        assert_ne!(m.nodes[dst as usize].prim & prim::STR, 0);
+    }
+}
+
+#[test]
+fn dense_prototype_copies_preserve_all_values_within_work_bound() {
+    use crate::model::{Key, TokKind, TOP};
+    // Abstract alternatives can form a cycle even though each concrete
+    // prototype chain is acyclic. Exercise both sorted and hashed sets.
+    for count in [40, 60] {
+        let mut m = copy_solver_model();
+        assert_eq!(m.tok(TokKind::Top), TOP);
+        m.widen_k = 64;
+        m.max_work = 500_000;
+        let root = m.tok(TokKind::ObjectProto);
+        let holders: Vec<_> = (0..24).map(|i| m.tok(TokKind::ModNs(i))).collect();
+        let values: Vec<_> = (100..100 + count)
+            .map(|i| m.tok(TokKind::ModNs(i)))
+            .collect();
+        let any = m.field_any(root);
+        m.add(any, &values, 0);
+        for &t in &holders {
+            let pn = m.proto_node(t);
+            m.add(pn, &holders, 0);
+            m.add_tok(pn, root);
+        }
+        let mut reads = Vec::new();
+        for i in 0..64 {
+            let key = Key::Named(m.atom(&format!("property{i}")));
+            for &t in &holders {
+                reads.push(m.cv(t, key));
+            }
+        }
+        m.solve();
+        assert!(
+            !m.aborted,
+            "{count}-value copies aborted at {} work",
+            m.work
+        );
+        for n in reads {
+            for &v in &values {
+                assert!(m.nodes[n as usize].pts.contains_tok(v));
+            }
+        }
+    }
+}
+
+#[test]
+fn copy_updates_keep_independent_members_across_storage_growth() {
+    use crate::model::{TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    let src = m.node_l("source");
+    let dst = m.node_l("destination");
+    for i in 0..40 {
+        let t = m.tok(TokKind::ModNs(i));
+        m.add_tok(src, t);
+    }
+    m.edge(src, dst);
+    m.solve();
+    let extra = m.tok(TokKind::ModNs(1000));
+    m.add_tok(dst, extra);
+    for i in 40..65 {
+        let t = m.tok(TokKind::ModNs(i));
+        m.add_tok(src, t);
+    }
+    m.solve();
+    assert!(m.nodes[dst as usize].pts.contains_tok(extra));
+    assert!(!m.nodes[src as usize].pts.contains_tok(extra));
+    assert_eq!(m.nodes[src as usize].pts.len(), 65);
+    assert_eq!(m.nodes[dst as usize].pts.len(), 66);
+}
+
+#[test]
+fn copying_a_base_into_a_superset_keeps_extra_values_and_primitives() {
+    use crate::model::{prim, TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    let src = m.node_l("source");
+    let dst = m.node_l("destination");
+    let values: Vec<_> = (0..40).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &values, 0);
+    let extra = m.tok(TokKind::ModNs(1000));
+    m.add_tok(dst, extra);
+    m.edge(src, dst);
+    m.add_prim(src, prim::NUM);
+    m.max_work = 100;
+    m.solve();
+    assert!(!m.aborted, "base copy used {} work", m.work);
+    for t in values {
+        assert!(m.nodes[dst as usize].pts.contains_tok(t));
+    }
+    assert!(m.nodes[dst as usize].pts.contains_tok(extra));
+    assert!(!m.nodes[src as usize].pts.contains_tok(extra));
+    assert_ne!(m.nodes[dst as usize].prim & prim::NUM, 0);
+    m.max_work = 0;
+    let later = m.tok(TokKind::ModNs(40));
+    m.add_tok(src, later);
+    m.add_prim(src, prim::STR);
+    m.solve();
+    assert!(m.nodes[dst as usize].pts.contains_tok(later));
+    assert!(m.nodes[dst as usize].pts.contains_tok(extra));
+    assert!(!m.nodes[src as usize].pts.contains_tok(extra));
+    assert_ne!(m.nodes[dst as usize].prim & prim::STR, 0);
+}
+
+#[test]
+fn set_snapshots_keep_sorted_members_across_copy_on_write_and_storage_growth() {
+    let mut current = crate::pts::Pts::default();
+    let mut snapshots = Vec::new();
+    for i in 0..160 {
+        snapshots.push(current.shared_clone());
+        assert!(current.insert(300 - i));
+    }
+    for (i, snapshot) in snapshots.iter().enumerate() {
+        let expected: Vec<_> = ((301 - i as u32)..=300).collect();
+        assert_eq!(snapshot.len(), i);
+        assert_eq!(snapshot.to_sorted(), expected);
+    }
+    assert_eq!(current.len(), 160);
+    assert!(!current.insert(200));
+}
+
+#[test]
+fn widened_sources_project_token_copies_but_keep_later_primitive_flow() {
+    use crate::model::{prim, TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    m.widen_k = 8;
+    let src = m.node_l("source");
+    let existing = m.node_l("existing destination");
+    let own = m.tok(TokKind::ModNs(1000));
+    m.add_tok(existing, own);
+    m.edge(src, existing);
+    let values: Vec<_> = (0..9).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &values, prim::NUM);
+    assert!(m.nodes[src as usize].widened);
+    m.solve();
+    assert_eq!(m.nodes[src as usize].prim, prim::NUM);
+    let mut destinations = vec![existing];
+    for _ in 0..1000 {
+        let dst = m.node_l("new destination");
+        m.edge(src, dst);
+        destinations.push(dst);
+    }
+    m.max_work = 512;
+    m.solve();
+    assert!(
+        !m.aborted,
+        "redundant widened-source copies used {} work",
+        m.work
+    );
+    for t in values {
+        assert!(m.is_escaped(t));
+    }
+    assert!(m.nodes[existing as usize].pts.contains_tok(own));
+    assert!(!m.is_escaped(own));
+    let later = m.tok(TokKind::ModNs(2000));
+    m.add(src, &[later], prim::STR);
+    m.solve();
+    assert!(!m.aborted);
+    assert!(m.is_escaped(later));
+    for dst in destinations {
+        let node = &m.nodes[dst as usize];
+        assert!(node.pts.contains_tok(TOP));
+        assert!(!node.pts.contains_tok(later));
+        assert_ne!(node.prim & prim::NUM, 0);
+        assert_ne!(node.prim & prim::STR, 0);
+    }
+}
+
+#[test]
+fn closed_widened_values_deliver_new_edges_and_rules_without_requeueing_them() {
+    use crate::model::{prim, Cons, TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    m.widen_k = 8;
+    let src = m.node_l("closed source");
+    let values: Vec<_> = (0..9).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    let old_copy = m.node_l("earlier copy");
+    m.edge(src, old_copy);
+    let old_rule = m.node_l("earlier rule");
+    m.cons(
+        src,
+        Cons::Arith {
+            dst: old_rule,
+            add: true,
+        },
+    );
+    m.add(src, &values, prim::ALL);
+    let mut copies = vec![old_copy];
+    let mut arithmetic = vec![old_rule];
+    for _ in 0..1000 {
+        let dst = m.node_l("literal destination");
+        m.edge(src, dst);
+        copies.push(dst);
+        let dst = m.node_l("arithmetic result");
+        m.cons(src, Cons::Arith { dst, add: true });
+        arithmetic.push(dst);
+    }
+    m.max_work = 512;
+    m.solve();
+    assert!(
+        !m.aborted,
+        "closed-value subscriptions used {} work",
+        m.work
+    );
+    let later = m.tok(TokKind::ModNs(2000));
+    m.add_tok(src, later);
+    m.solve();
+    assert!(m.is_escaped(later));
+    for dst in copies {
+        let n = &m.nodes[dst as usize];
+        assert!(n.pts.contains_tok(TOP));
+        assert!(!n.pts.contains_tok(later));
+        assert_eq!(n.prim, prim::ALL);
+    }
+    for dst in arithmetic {
+        assert_eq!(
+            m.nodes[dst as usize].prim,
+            prim::NUM | prim::BIGINT | prim::STR
+        );
+    }
+}
+
+#[test]
+fn singleton_inclusion_keeps_concrete_destination_values_and_later_updates() {
+    use crate::model::{prim, TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    let src = m.node_l("singleton source");
+    let dst = m.node_l("superset destination");
+    let own = m.tok(TokKind::ModNs(1));
+    m.add_tok(dst, own);
+    m.add_tok(src, TOP);
+    m.edge(src, dst);
+    m.add_prim(src, prim::NUM);
+    m.solve();
+    assert!(m.nodes[dst as usize].pts.contains_tok(own));
+    assert!(!m.nodes[src as usize].pts.contains_tok(own));
+    let later = m.tok(TokKind::ModNs(2));
+    m.add(src, &[later], prim::STR);
+    m.solve();
+    for t in [TOP, own, later] {
+        assert!(m.nodes[dst as usize].pts.contains_tok(t));
+    }
+    assert_eq!(m.nodes[dst as usize].prim, prim::NUM | prim::STR);
+    assert!(!m.aborted);
+}
+
+#[test]
+fn observed_bases_avoid_recopying_pending_prefixes_and_keep_independent_members() {
+    use crate::model::{prim, TokKind, TOP};
+    for own_members in [false, true] {
+        let mut m = copy_solver_model();
+        assert_eq!(m.tok(TokKind::Top), TOP);
+        let src = m.node_l("source with observed snapshot");
+        let values: Vec<_> = (0..40).map(|i| m.tok(TokKind::ModNs(i))).collect();
+        m.add(src, &values, prim::NUM);
+        let mut destinations = Vec::new();
+        let mut extras = Vec::new();
+        for i in 0..1000 {
+            let dst = m.node_l("snapshot destination");
+            m.edge(src, dst);
+            destinations.push(dst);
+            if own_members {
+                let own = m.tok(TokKind::ModNs(1000 + i));
+                m.add_tok(dst, own);
+                extras.push(own);
+            }
+        }
+        let later = m.tok(TokKind::ModNs(40));
+        m.add(src, &[later], prim::STR);
+        m.max_work = 6000;
+        m.solve();
+        assert!(
+            !m.aborted,
+            "observed-base copies used {} work (own={own_members})",
+            m.work
+        );
+        for (i, &dst) in destinations.iter().enumerate() {
+            let n = &m.nodes[dst as usize];
+            for &t in &values {
+                assert!(n.pts.contains_tok(t));
+            }
+            assert!(n.pts.contains_tok(later));
+            assert_eq!(n.prim, prim::NUM | prim::STR);
+            if own_members {
+                assert!(n.pts.contains_tok(extras[i]));
+                assert!(!m.nodes[src as usize].pts.contains_tok(extras[i]));
+            }
+        }
+    }
+}
+
+#[test]
+fn observed_relay_bases_share_new_batches_without_enumerating_each_transfer() {
+    use crate::model::{Cons, TokKind, TOP};
+    let mut m = copy_solver_model();
+    assert_eq!(m.tok(TokKind::Top), TOP);
+    let src = m.node_l("source relay");
+    m.nodes[src as usize].internal = true;
+    let first: Vec<_> = (0..40).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &first, 0);
+    let mut destinations = Vec::new();
+    for _ in 0..1000 {
+        let dst = m.node_l("destination relay");
+        m.nodes[dst as usize].internal = true;
+        m.edge(src, dst);
+        destinations.push(dst);
+    }
+    m.cons(destinations[0], Cons::ThisTo { origin: TOP });
+    let next: Vec<_> = (40..80).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &next, 0);
+    m.max_work = 5000;
+    m.solve();
+    assert!(!m.aborted, "batch sharing used {} work", m.work);
+    for dst in destinations {
+        for &t in first.iter().chain(&next) {
+            assert!(m.nodes[dst as usize].pts.contains_tok(t));
+        }
+    }
+}
+
+#[test]
+fn ordered_batches_keep_prefixes_and_detach_later_appends() {
+    use crate::delta::{Batch, Delta};
+    let a = Batch::new(vec![4, 1, 7]);
+    let b = Batch::new(vec![8, 2]);
+    let mut delta = Delta::default();
+    delta.push(9);
+    delta.append_batch(&a);
+    let mut saved = delta.clone();
+    delta.append_batch(&b);
+    delta.push(0);
+    assert_eq!(
+        delta.iter().copied().collect::<Vec<_>>(),
+        vec![9, 4, 1, 7, 8, 2, 0]
+    );
+    assert_eq!(saved.iter().copied().collect::<Vec<_>>(), vec![9, 4, 1, 7]);
+    delta.clear();
+    saved.push(3);
+    assert_eq!(
+        saved.iter().copied().collect::<Vec<_>>(),
+        vec![9, 4, 1, 7, 3]
+    );
+    assert_eq!(
+        a.tokens().iter().copied().collect::<Vec<_>>(),
+        vec![4, 1, 7]
+    );
+    assert!(delta.is_empty());
+}
+
+#[test]
+fn small_observed_sets_preserve_superset_members_without_recopying_values() {
+    use crate::model::{TokKind, TOP};
+    let mut m = copy_solver_model();
+    let src = m.node_l("small shared source");
+    let a = m.tok(TokKind::ModNs(1));
+    let b = m.tok(TokKind::ModNs(2));
+    m.add(src, &[a, b], 0);
+    let mut destinations = Vec::new();
+    let mut extras = Vec::new();
+    for i in 0..1000 {
+        let dst = m.node_l("small superset");
+        let extra = m.tok(TokKind::ModNs(1000 + i));
+        m.add_tok(dst, extra);
+        m.edge(src, dst);
+        destinations.push(dst);
+        extras.push(extra);
+    }
+    m.max_work = 1500;
+    m.solve();
+    assert!(!m.aborted, "small supersets used {} work", m.work);
+    for (i, dst) in destinations.into_iter().enumerate() {
+        for t in [a, b, extras[i]] {
+            assert!(m.nodes[dst as usize].pts.contains_tok(t));
+        }
+    }
+    assert!(!m.nodes[src as usize].pts.contains_tok(TOP));
+    assert!(extras
+        .into_iter()
+        .all(|t| !m.nodes[src as usize].pts.contains_tok(t)));
+}
+
+#[test]
+fn equal_snapshot_groups_keep_old_owners_covered_after_coalescing() {
+    use crate::model::TokKind;
+    let mut m = copy_solver_model();
+    let src = m.node_l("first group");
+    let values: Vec<_> = (0..40).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &values, 0);
+    let mut first = Vec::new();
+    for _ in 0..500 {
+        let dst = m.node_l("first owner");
+        m.edge(src, dst);
+        first.push(dst);
+    }
+    let other = m.node_l("larger equal group");
+    m.add(other, &values, 0);
+    let mut second = Vec::new();
+    for _ in 0..2000 {
+        let dst = m.node_l("second owner");
+        m.edge(other, dst);
+        second.push(dst);
+    }
+    m.edge(src, second[0]);
+    let added = m.tok(TokKind::ModNs(40));
+    m.add_tok(src, added);
+    m.max_work = 5000;
+    m.solve();
+    assert!(!m.aborted, "coalesced snapshots used {} work", m.work);
+    for dst in first {
+        assert!(m.nodes[dst as usize].pts.contains_tok(added));
+    }
+    for (i, dst) in second.into_iter().enumerate() {
+        assert_eq!(m.nodes[dst as usize].pts.contains_tok(added), i == 0);
+    }
+    assert!(!m.nodes[other as usize].pts.contains_tok(added));
+}
+
+#[test]
+fn delivered_cardinality_proves_batch_adoption_with_independent_storage() {
+    use crate::model::TokKind;
+    let mut m = copy_solver_model();
+    let src = m.node_l("source relay");
+    m.nodes[src as usize].internal = true;
+    let first: Vec<_> = (0..40).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &first, 0);
+    let mut destinations = Vec::new();
+    for _ in 0..1000 {
+        let dst = m.node_l("destination relay");
+        m.nodes[dst as usize].internal = true;
+        m.edge(src, dst);
+        destinations.push(dst);
+    }
+    m.solve();
+    assert!(!m.aborted);
+    // Preserve every value while giving each old destination its own
+    // allocation: the proof must not depend on accidental sharing.
+    for &dst in &destinations {
+        let mut pts = crate::pts::Pts::default();
+        for &t in &first {
+            pts.insert(t);
+        }
+        m.nodes[dst as usize].pts = pts;
+    }
+    let own = m.tok(TokKind::ModNs(1000));
+    m.add_tok(destinations[999], own);
+    let next: Vec<_> = (40..80).map(|i| m.tok(TokKind::ModNs(i))).collect();
+    m.add(src, &next, 0);
+    m.work = 0;
+    m.max_work = 2000;
+    m.solve();
+    assert!(!m.aborted, "cardinality batches used {} work", m.work);
+    for (i, dst) in destinations.into_iter().enumerate() {
+        let n = &m.nodes[dst as usize];
+        for &t in first.iter().chain(&next) {
+            assert!(n.pts.contains_tok(t));
+        }
+        assert_eq!(n.pts.contains_tok(own), i == 999);
+    }
+    assert!(!m.nodes[src as usize].pts.contains_tok(own));
+}
+
+#[test]
+fn new_subscribers_receive_current_values_once_and_then_later_deliveries() {
+    use crate::model::TokKind;
+    for group in [5, 20] {
+        let mut m = copy_solver_model();
+        let src = m.node_l("publisher");
+        let a = m.tok(TokKind::ModNs(1));
+        let b = m.tok(TokKind::ModNs(2));
+        let c = m.tok(TokKind::ModNs(3));
+        let mut destinations = Vec::new();
+        for token in [a, b, c] {
+            m.add_tok(src, token);
+            for _ in 0..group {
+                let dst = m.node_l("subscriber");
+                m.edge(src, dst);
+                destinations.push(dst);
+            }
+        }
+        m.max_work = group as u64 * 9;
+        m.solve();
+        assert!(!m.aborted, "late subscribers used {} work", m.work);
+        for &dst in &destinations {
+            for t in [a, b, c] {
+                assert!(m.nodes[dst as usize].pts.contains_tok(t));
+            }
+        }
+        let d = m.tok(TokKind::ModNs(4));
+        m.add_tok(src, d);
+        m.work = 0;
+        m.max_work = group as u64 * 4;
+        m.solve();
+        assert!(!m.aborted);
+        for dst in destinations {
+            for t in [a, b, c, d] {
+                assert!(m.nodes[dst as usize].pts.contains_tok(t));
+            }
+        }
+    }
 }

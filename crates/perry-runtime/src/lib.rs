@@ -117,12 +117,12 @@ pub mod collection_iter;
 pub mod collection_iter_object;
 pub mod collection_receiver;
 pub mod color_parse;
-#[cfg(feature = "contract-checks")]
+#[cfg(perry_contract_checks)]
 pub(crate) mod contracts;
 pub mod date;
-#[cfg(feature = "mod-dgram")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dgram;
-#[cfg(feature = "mod-dgram")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dgram_reactor;
 pub mod disposable;
 pub mod dns;
@@ -152,11 +152,13 @@ pub mod hot_diag;
 pub mod intl;
 pub mod iter_result;
 pub mod iterator_helpers;
+pub mod loop_interrupt;
 pub mod macos_bundle;
 pub mod map;
 pub mod math;
 pub mod messaging;
 pub mod mimalloc_os_tag;
+pub mod module_hooks;
 pub mod module_require;
 pub mod native_abi;
 pub mod native_arena;
@@ -177,10 +179,8 @@ mod startup_memory_profile;
 /// wpfacts slice 2: run-time witness of each elided field access.
 pub mod wpfacts_check;
 // #6468: the `node:http2` constant tables are only reachable through the
-// `http2` native-module namespace, so a program that never imports `node:http2`
-// links none of them. The auto-optimizer enables `mod-http2-constants` on an
-// `http2` import; every callsite has a benign `None`/no-op fallback when off.
-#[cfg(feature = "mod-http2-constants")]
+// `http2` native-module namespace (via `module_hooks`), so a program that never
+// imports `node:http2` links none of them.
 pub mod node_http2_constants;
 pub mod node_inspector;
 pub mod node_repl;
@@ -318,8 +318,7 @@ pub mod static_plugins;
 #[cfg(not(feature = "stdlib"))]
 pub mod stdlib_stubs;
 /// First-call runtime diagnostic for no-op FFI stubs (#464). Owns the
-/// `PERRY_STUB_DIAG` env-var policy and the auto-generated `STUB_MANIFEST`
-/// derived from `build.rs`'s dispatch-table walk.
+/// `PERRY_STUB_DIAG` env-var policy; the stub list is perry-runtime-manifest's.
 pub mod stub_diag;
 pub mod thread;
 pub mod tls;
@@ -859,8 +858,7 @@ pub(crate) mod stdlib_pump {
         // #4911: deliver queued UDP datagrams as `'message'` events. Lives in
         // perry-runtime so node:dgram works without perry-stdlib linked.
         // Zero-cost (one relaxed load) when no sockets are bound.
-        #[cfg(feature = "mod-dgram")]
-        crate::dgram_reactor::pump();
+        crate::module_hooks::dgram_pump();
         crate::process::js_process_ipc_drain();
         let f = STDLIB_PUMP_FN.load(Ordering::Acquire);
         if !f.is_null() {
@@ -925,8 +923,7 @@ pub(crate) mod stdlib_pump {
             return 1;
         }
         // #4911: a bound + `ref`'d node:dgram socket keeps the loop alive.
-        #[cfg(feature = "mod-dgram")]
-        if crate::dgram_reactor::has_active() {
+        if crate::module_hooks::dgram_has_active() {
             return 1;
         }
         // #9416: a `process.stdin` listener registered on the stdin OBJECT —

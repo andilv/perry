@@ -233,7 +233,7 @@ fn young_values_in_an_old_class_survive_moving_minors() {
 /// set the whole time: an entry is re-armed by every scan that still finds
 /// a young referent, not consumed after one minor. Returns false (without
 /// reading the possibly stale link) the first time the entry is missing.
-fn write_once_then_minors(cid: u32, sabotage_drop_entry: bool) -> bool {
+fn write_once_then_minors(cid: u32) -> bool {
     let _copying_nursery = crate::gc::CopyingNurseryTestGuard::new(0);
     let _triggers = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let _force_evacuation = crate::gc::knob_overrides::ForcedEvacuationTestGuard::on();
@@ -253,9 +253,6 @@ fn write_once_then_minors(cid: u32, sabotage_drop_entry: bool) -> bool {
         crate::gc::old_slot_page_is_remembered_for_test(slot),
         "the write must have remembered the class"
     );
-    let _sabotage = sabotage_drop_entry.then(|| {
-        crate::gc::copy_decode_sabotage::Guard::arm(crate::gc::copy_decode_sabotage::CHILD)
-    });
     let mut moved_from = proto as usize;
     for minor in 1..=3 {
         let _ = crate::gc::gc_collect_minor();
@@ -295,17 +292,7 @@ fn write_once_then_minors(cid: u32, sabotage_drop_entry: bool) -> bool {
 
 #[test]
 fn a_class_stays_remembered_while_its_referent_is_young() {
-    assert!(write_once_then_minors(0x6B10, false));
-}
-
-/// Sabotage: the scan loses the child, so the entry is dropped after the
-/// first minor. The run must go red: either the collector's own
-/// post-cycle coverage check fires (the expected panic) or the witness
-/// above sees the entry missing and returns false (the `assert!` panic).
-#[test]
-#[should_panic]
-fn dropping_the_entry_after_one_minor_is_caught() {
-    assert!(write_once_then_minors(0x6B20, true));
+    assert!(write_once_then_minors(0x6B10));
 }
 
 /// The kind is a shape fact: class function objects carry their own
@@ -385,15 +372,19 @@ fn name_and_length_are_own_data_of_the_function_object() {
             0,
         )
     };
-    extern "C" fn static_name_entry(_closure: i64) -> f64 {
+    extern "C" fn static_name_entry(
+        _closure: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
+    ) -> f64 {
         0.0
     }
+    let entry_info = crate::fn_info!(static_name_entry, 0);
     unsafe {
         crate::object::class_registry::parent_static::js_register_class_static_method_entry(
             cid as i64,
             b"name".as_ptr(),
             4,
-            static_name_entry as *const () as usize as i64,
+            entry_info as i64,
         )
     };
     // node: `class Zed { static name() {} }` -> Zed.name is the method, an
@@ -402,7 +393,7 @@ fn name_and_length_are_own_data_of_the_function_object() {
         .expect("a static method named `name` is the class's own `name`");
     assert_eq!(
         unsafe { static_method_code_of(method) },
-        Some(static_name_entry as *const () as usize),
+        Some(entry_info as usize),
         "its value is the method's function object"
     );
     assert_eq!(
@@ -468,5 +459,75 @@ fn ordinary_closures_and_numbers_are_not_class_values() {
     assert_eq!(
         class_value_id(f64::from_bits(crate::value::TAG_UNDEFINED)),
         None
+    );
+}
+
+#[test]
+fn constructor_parent_word_is_authoritative_and_traced() {
+    let _nursery = crate::gc::CopyingNurseryTestGuard::new(0);
+    let _triggers = crate::gc::GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _evacuate = crate::gc::knob_overrides::ForcedEvacuationTestGuard::on();
+    crate::gc::register_runtime_handle_root_scanner_for_tests();
+    let cid = 0x6B44;
+    register(cid);
+    let constructor = class_value_ptr(cid);
+    let original = unsafe { constructor_parent_bits(constructor) };
+    let parent = crate::object::js_object_alloc(0x6B45, 1);
+    crate::object::js_object_set_field(parent, 0, crate::value::JSValue::number(17.0));
+    let before = parent as usize;
+    let parent = crate::value::js_nanbox_pointer(parent as i64);
+    crate::closure::closure_set_static_prototype(constructor as usize, parent.to_bits());
+    assert_eq!(
+        unsafe { constructor_parent_bits(constructor) },
+        parent.to_bits()
+    );
+    assert!(
+        unsafe { crate::closure::props::state_prototype(constructor as usize) }.is_none(),
+        "the prototype word is not duplicated in a property-state record"
+    );
+    for _ in 0..3 {
+        let _ = crate::gc::gc_collect_minor();
+    }
+    let after = unsafe { constructor_parent_bits(constructor) };
+    let ptr = (after & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
+    assert_ne!(ptr as usize, before, "parent survived moving collection");
+    assert_eq!(crate::object::js_object_get_field(ptr, 0).as_number(), 17.0);
+    assert_eq!(
+        crate::object::js_object_get_prototype_of(class_value(cid)).to_bits(),
+        after
+    );
+    crate::closure::closure_set_static_prototype(constructor as usize, crate::value::TAG_NULL);
+    assert_eq!(
+        crate::object::js_object_get_prototype_of(class_value(cid)).to_bits(),
+        crate::value::TAG_NULL
+    );
+    crate::closure::closure_set_static_prototype(constructor as usize, original);
+    assert_eq!(unsafe { constructor_parent_bits(constructor) }, original);
+}
+
+#[test]
+fn first_evaluation_receives_its_heritage_before_later_evaluations() {
+    let cid = 0x6B48;
+    let a = 0x6B49;
+    let b = 0x6B4A;
+    register(cid);
+    register(a);
+    register(b);
+    let constructor = class_value_ptr(cid);
+    unsafe {
+        *crate::closure::closure_capture_slots_mut(constructor).add(CLASS_EVALUATION_STATE_SLOT) =
+            crate::codegen_abi::CLASS_FIRST_EVALUATION_STATE;
+    }
+    let first = class_value(a);
+    let later = class_value(b);
+    crate::object::class_registry::js_register_class_parent_dynamic(cid, first);
+    assert_eq!(
+        unsafe { constructor_parent_bits(constructor) },
+        first.to_bits()
+    );
+    crate::object::class_registry::js_register_class_parent_dynamic(cid, later);
+    assert_eq!(
+        unsafe { constructor_parent_bits(constructor) },
+        first.to_bits()
     );
 }

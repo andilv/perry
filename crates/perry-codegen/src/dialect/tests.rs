@@ -262,6 +262,23 @@ entry:
     assert_eq!(roundtrip_ir(ir, "acquire_load"), 2);
 }
 
+/// `blk.freeze` (typed-array element indices, `expr/typed_element.rs`) is a
+/// typed instruction, but a function body can also reach the reader as
+/// rendered text (Claude Code's `indexPath$generic`). Without a `freeze` arm
+/// the line fell through to the binary-op parser: "bad binary op `freeze`".
+#[test]
+fn freeze_text_line_round_trips_through_the_reader() {
+    let ir = r#"
+define i32 @frozen(i32 %x) {
+entry:
+  %f = freeze i32 %x
+  %g = freeze double 0x7FF8000000000000
+  ret i32 %f
+}
+"#;
+    assert_eq!(roundtrip_ir(ir, "freeze_text"), 3);
+}
+
 /// The `format!` templates `expr/channel.rs` emits for its `<4 x i32>` SIMD
 /// byte-channel reduction, in emission order. The fixture below is BUILT from
 /// these strings rather than duplicating them, and each is asserted to still
@@ -933,4 +950,23 @@ fn preserve_most_constructs_on_define_call_and_invoke() {
         1,
         "invoke site lost its calling convention:\n{printed}"
     );
+}
+
+/// The forms a birth table (`closure_births`) and a worker program's frame
+/// shape table (`expr::literal_descriptor`) emit construct natively: split
+/// modules take the reader, which no single-unit fixture reaches.
+#[test]
+fn birth_tables_and_frame_shape_tables_round_trip_through_the_reader() {
+    let run = crate::closure_births::tests::function_ir(&(1..=10).collect::<Vec<u32>>());
+    assert!(
+        run.contains("call void @js_closure_births_to_scope("),
+        "{run}"
+    );
+    assert!(roundtrip_ir(&run, "births_roundtrip") > 0);
+    let worker = crate::expr::literal_descriptor_worker_ir();
+    assert!(
+        worker.contains("@llvm.threadlocal.address.p0(ptr @perry_class_keys_"),
+        "{worker}"
+    );
+    assert!(roundtrip_ir(&worker, "frame_shapes_roundtrip") > 0);
 }

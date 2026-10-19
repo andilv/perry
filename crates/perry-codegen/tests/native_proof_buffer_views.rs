@@ -16,8 +16,7 @@ use perry_codegen::testing::NativeRootsPin;
 use perry_codegen::{compile_module, AppMetadata, CompileOptions};
 use perry_hir::types::{FunctionType, ObjectType, PropertyInfo, Type};
 use perry_hir::{
-    BinaryOp, Class, ClassField, CompareOp, Expr, Function, Module, ModuleInitKind, Param, Stmt,
-    UpdateOp,
+    BinaryOp, Class, ClassField, CompareOp, Expr, Function, Module, Param, Stmt, UpdateOp,
 };
 
 #[path = "native_proof_support/mod.rs"]
@@ -112,57 +111,25 @@ fn module_with_classes_and_params(
     return_type: Type,
     body: Vec<Stmt>,
 ) -> Module {
-    Module {
-        name: name.to_string(),
-        imports: Vec::new(),
-        exports: Vec::new(),
-        classes,
-        interfaces: Vec::new(),
-        type_aliases: Vec::new(),
-        enums: Vec::new(),
-        globals: Vec::new(),
-        functions: vec![Function {
-            id: 1,
-            name: "probe".to_string(),
-            type_params: Vec::new(),
-            params,
-            return_type,
-            body,
-            is_async: false,
-            is_generator: false,
-            is_strict: false,
-            is_exported: false,
-            captures: Vec::new(),
-            decorators: Vec::new(),
-            was_plain_async: false,
-            was_unrolled: false,
-        }],
-        init_is_strict: false,
-        init: Vec::new(),
-        classic_for_lexical_bindings: std::collections::HashSet::new(),
-        exported_native_instances: Vec::new(),
-        exported_func_return_native_instances: Vec::new(),
-        exported_objects: Vec::new(),
-        exported_functions: Vec::new(),
-        script_global_functions: Vec::new(),
-        references_global_this: false,
-        annexb_global_undefined_names: Vec::new(),
-        widgets: Vec::new(),
-        uses_fetch: false,
-        uses_webassembly: false,
-        extern_funcs: Vec::new(),
-        init_was_unrolled: false,
-        has_top_level_await: false,
-        init_kind: ModuleInitKind::Eager,
-        async_step_closures: std::collections::HashSet::new(),
-        closure_display_names: std::collections::HashMap::new(),
-        class_display_names: std::collections::HashMap::new(),
-        closure_source_text: std::collections::HashMap::new(),
-        class_source_text: std::collections::HashMap::new(),
-        async_generator_funcs: std::collections::HashSet::new(),
-        local_source_spans: std::collections::HashMap::new(),
-        gen_param_prologue_len: std::collections::HashMap::new(),
-    }
+    let mut module = Module::new(name);
+    module.classes = classes;
+    module.functions = vec![Function {
+        id: 1,
+        name: "probe".to_string(),
+        type_params: Vec::new(),
+        params,
+        return_type,
+        body,
+        is_async: false,
+        is_generator: false,
+        is_strict: false,
+        is_exported: false,
+        captures: Vec::new(),
+        decorators: Vec::new(),
+        was_plain_async: false,
+        was_unrolled: false,
+    }];
+    module
 }
 
 fn compile_ir(name: &str, body: Vec<Stmt>) -> String {
@@ -440,7 +407,7 @@ fn number_array_let(id: u32, name: &str, values: Vec<i64>) -> Stmt {
         name: name.to_string(),
         ty: Type::Array(Box::new(Type::Number)),
         mutable: true,
-        init: Some(Expr::Array(values.into_iter().map(int).collect())),
+        init: Some(Expr::Array(values.into_iter().map(int).collect(), None)),
     }
 }
 
@@ -1465,7 +1432,7 @@ fn native_owned_unknown_call_escape_inside_aggregate_invalidates_views() {
             ),
             Stmt::Expr(extern_call(
                 "unknown_nested_escape",
-                vec![Expr::Array(vec![local(2)])],
+                vec![Expr::Array(vec![local(2)], None)],
                 Type::Number,
             )),
             Stmt::Return(Some(index_get(2, int(0)))),
@@ -1495,7 +1462,10 @@ fn native_owned_call_spread_escape_invalidates_views() {
                     param_types: Vec::new(),
                     return_type: Type::Number,
                 }),
-                args: vec![perry_hir::CallArg::Spread(Expr::Array(vec![local(2)]))],
+                args: vec![perry_hir::CallArg::Spread(Expr::Array(
+                    vec![local(2)],
+                    None,
+                ))],
                 type_args: Vec::new(),
             }),
             Stmt::Return(Some(index_get(2, int(0)))),
@@ -1521,7 +1491,7 @@ fn native_owned_proxy_apply_escape_invalidates_views() {
             ),
             Stmt::Expr(Expr::ProxyApply {
                 proxy: Box::new(extern_func_ref("unknown_proxy_apply_escape", Type::Any)),
-                args: vec![Expr::Array(vec![local(2)])],
+                args: vec![Expr::Array(vec![local(2)], None)],
             }),
             Stmt::Return(Some(index_get(2, int(0)))),
         ],
@@ -1546,7 +1516,7 @@ fn native_owned_proxy_construct_escape_invalidates_views() {
             ),
             Stmt::Expr(Expr::ProxyConstruct {
                 proxy: Box::new(extern_func_ref("unknown_proxy_construct_escape", Type::Any)),
-                args: vec![Expr::Array(vec![local(2)])],
+                args: vec![Expr::Array(vec![local(2)], None)],
             }),
             Stmt::Return(Some(index_get(2, int(0)))),
         ],
@@ -1572,7 +1542,7 @@ fn native_owned_reflect_apply_escape_invalidates_views() {
             Stmt::Expr(Expr::ReflectApply {
                 func: Box::new(extern_func_ref("unknown_reflect_apply_escape", Type::Any)),
                 this_arg: Box::new(Expr::Undefined),
-                args: Box::new(Expr::Array(vec![local(2)])),
+                args: Box::new(Expr::Array(vec![local(2)], None)),
             }),
             Stmt::Return(Some(index_get(2, int(0)))),
         ],
@@ -1600,7 +1570,7 @@ fn native_owned_reflect_construct_escape_invalidates_views() {
                     "unknown_reflect_construct_escape",
                     Type::Any,
                 )),
-                args: Box::new(Expr::Array(vec![local(2)])),
+                args: Box::new(Expr::Array(vec![local(2)], None)),
                 new_target: Box::new(Expr::Undefined),
             }),
             Stmt::Return(Some(index_get(2, int(0)))),
@@ -1626,7 +1596,7 @@ fn native_owned_js_call_value_escape_invalidates_views() {
             ),
             Stmt::Expr(Expr::JsCallValue {
                 callee: Box::new(extern_func_ref("unknown_js_call_value_escape", Type::Any)),
-                args: vec![Expr::Array(vec![local(2)])],
+                args: vec![Expr::Array(vec![local(2)], None)],
             }),
             Stmt::Return(Some(index_get(2, int(0)))),
         ],
@@ -1657,7 +1627,7 @@ fn native_owned_static_method_v8_escape_invalidates_views() {
                 Stmt::Expr(Expr::StaticMethodCall {
                     class_name: "RemoteNs".to_string(),
                     method_name: "invoke".to_string(),
-                    args: vec![Expr::Array(vec![local(2)])],
+                    args: vec![Expr::Array(vec![local(2)], None)],
                 }),
                 Stmt::Return(Some(index_get(2, int(0)))),
             ],

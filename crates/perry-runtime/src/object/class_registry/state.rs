@@ -875,9 +875,11 @@ fn class_recorded_prototype_bits(class_id: u32) -> Option<u64> {
         return None;
     }
     let class_id = crate::object::class_generic_origin(class_id).unwrap_or(class_id);
-    crate::closure::closure_static_prototype(
-        crate::object::class_value::class_value_ptr(class_id) as usize
-    )
+    let actual = crate::closure::closure_static_prototype(
+        crate::object::class_value::class_value_ptr(class_id) as usize,
+    )?;
+    (actual != crate::object::class_value::definition_parent_value(class_id).to_bits())
+        .then_some(actual)
 }
 
 /// True when `Object.setPrototypeOf(Ctor, null)` explicitly severed the
@@ -1460,12 +1462,21 @@ pub(crate) fn reserved_native_parent_prototype_bits(parent_id: u32) -> Option<u6
     if let Some(name) = web {
         return class_parent_prototype_bits(super::super::builtin_prototype_value(name));
     }
+    let constructor = reserved_native_parent_constructor_value(parent_id)?;
+    let parent_proto = super::function_prototype::js_function_prototype_value_for_read(constructor);
+    class_parent_prototype_bits(parent_proto)
+}
+
+/// The existing reserved native parent image names its actual constructor,
+/// shared by constructor heritage and instance-prototype materialization.
+pub(crate) fn reserved_native_parent_constructor_value(parent_id: u32) -> Option<f64> {
     const CLASS_ID_EVENT_EMITTER: u32 = 0xFFFF0076;
     const CLASS_ID_EVENT_EMITTER_ASYNC_RESOURCE: u32 = 0xFFFF0077;
     let (module, symbol) = match parent_id {
         // G1: the classic stream bases (perry-codegen
         // `builtin_parent_reserved_class_id`), whose prototypes carry the
         // stream methods.
+        0xFFFF0070 => ("stream", "Stream"),
         0xFFFF0071 => ("stream", "Readable"),
         0xFFFF0072 => ("stream", "Writable"),
         0xFFFF0073 => ("stream", "Duplex"),
@@ -1488,10 +1499,7 @@ pub(crate) fn reserved_native_parent_prototype_bits(parent_id: u32) -> Option<u6
         crate::native_class_ids::ZSTD_DECOMPRESS => ("zlib", "ZstdDecompress"),
         _ => return None,
     };
-    let func_value =
-        super::super::native_module::bound_native_callable_export_value(module, symbol);
-    let parent_proto = super::function_prototype::js_function_prototype_value_for_read(func_value);
-    class_parent_prototype_bits(parent_proto)
+    Some(super::super::native_module::bound_native_callable_export_value(module, symbol))
 }
 
 /// `AsyncResource.prototype` as a NaN-boxed value, resolved exactly the way
@@ -1899,8 +1907,9 @@ mod class_parent_prototype_tests {
     /// link its declared prototype to EventEmitter's real, lazily-materialized
     /// prototype instead of throwing "Class extends value does not have valid
     /// prototype property". The raw `prototype` dynamic slot on the bound export
-    /// closure is still `undefined` here, so the resolution must fall through to
-    /// the same lazy materialization an ordinary `EE.prototype` read uses.
+    /// closure may be `undefined` (it is not any more: the slot already reads as
+    /// a pointer), so the resolution must work off the same value an
+    /// ordinary `EE.prototype` read uses.
     #[test]
     fn native_constructor_export_parent_links_declared_prototype() {
         const ISSUE_8760_CLASS_ID: u32 = 0x7d01_8760;
@@ -1910,15 +1919,11 @@ mod class_parent_prototype_tests {
         // `.prototype` object is materialized on demand, not at mint time.
         let ee_ctor = crate::object::bound_native_callable_export_value("events", "EventEmitter");
 
-        // Precondition: the raw dynamic `prototype` slot is undefined — the exact
-        // condition that made the dynamic-parent registration throw before the fix.
-        let ee_addr = (ee_ctor.to_bits() & crate::value::POINTER_MASK) as usize;
-        assert_eq!(
-            crate::closure::closure_get_dynamic_prop(ee_addr, "prototype").to_bits(),
-            crate::value::TAG_UNDEFINED,
-            "precondition: the bound export's raw prototype slot must be undefined"
-        );
-
+        // The raw dynamic `prototype` slot used to be undefined here, which is
+        // what made the dynamic-parent registration throw before the fix. The
+        // slot now already reads as a pointer, so that precondition no
+        // longer exists; the registration and the link below are what remain
+        // to guard, whichever way the prototype is produced.
         unsafe {
             js_register_class_name(
                 ISSUE_8760_CLASS_ID,

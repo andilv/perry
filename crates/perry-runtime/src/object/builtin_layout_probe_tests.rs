@@ -78,12 +78,26 @@ fn builtin_prototypes_are_born_on_their_static_layouts() {
         let (op, fp, ap) = realm();
         let holder = crate::array::array_property_bag(ap as *const crate::array::ArrayHeader);
         for (obj, desc) in [
-            (op as *const ObjectHeader, std::ptr::addr_of!(crate::object::runtime_layouts::OBJECT_PROTOTYPE)),
-            (fp as *const ObjectHeader, std::ptr::addr_of!(crate::object::runtime_layouts::FUNCTION_PROTOTYPE)),
-            (holder as *const ObjectHeader, std::ptr::addr_of!(crate::object::runtime_layouts::ARRAY_PROTOTYPE_NAMED)),
+            (
+                op as *const ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::OBJECT_PROTOTYPE),
+            ),
+            (
+                fp as *const ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::FUNCTION_PROTOTYPE),
+            ),
+            (
+                holder as *const ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::ARRAY_PROTOTYPE_NAMED),
+            ),
         ] {
             let r = record_of(test_dir(), (*obj).parent_class_id);
             assert!(!r.is_null());
+            // The runtime's own population is no program write: no shadow.
+            assert_eq!(
+                (*obj).parent_class_id & crate::object::overflow::SHADOW_BIT,
+                0
+            );
             let d = &*desc;
             let declared = record_of(test_dir(), d.layout_id);
             assert!(!declared.is_null(), "the layout is registered");
@@ -119,10 +133,8 @@ fn closure_and_array_reads_continue_through_the_builtin_prototypes() {
         assert_ne!(agrees(array_ctor, "isBuffer"), POINTER_TAG);
         // Inherited through %Function.prototype%.
         assert_ne!(agrees(object_ctor, "hasOwnProperty"), TAG_UNDEFINED);
-        // An own bag key is read; a name a function answers itself outside
-        // its bag is declined.
+        // An own key is read; an inherited accessor (`caller`) is declined.
         agrees(object_ctor, "name");
-        assert_eq!(probe(object_ctor, "call"), TAG_HOLE);
         assert_eq!(probe(object_ctor, "caller"), TAG_HOLE);
         // An array: %Array.prototype%'s holder, then %Object.prototype%.
         assert_eq!(agrees(arr, "constructor"), POINTER_TAG | array_ctor as u64);
@@ -192,7 +204,9 @@ fn a_relink_of_array_prototype_stops_the_holder_answering() {
         // The holder's shadow bit says every array's chain left its layout:
         // the probe declines, whatever the complete read answers.
         let holder = crate::array::array_property_bag(ap as *const crate::array::ArrayHeader);
-        assert!(crate::object::layout_desc::word_is_shadowed((*holder).parent_class_id));
+        assert!(crate::object::layout_desc::word_is_shadowed(
+            (*holder).parent_class_id
+        ));
         assert_eq!(probe(arr, "onObjectPrototype"), TAG_HOLE);
         assert_eq!(probe(arr, "viaP"), TAG_HOLE);
     });
@@ -205,7 +219,11 @@ fn a_deleted_and_readded_builtin_is_read_back() {
         let object_ctor = global("Object");
         let arr = crate::array::js_array_alloc(0) as usize;
         let o = crate::object::js_object_alloc(0, 1) as usize;
-        for (proto, key) in [(op, "toLocaleString"), (fp, "apply"), (op, "propertyIsEnumerable")] {
+        for (proto, key) in [
+            (op, "toLocaleString"),
+            (fp, "apply"),
+            (op, "propertyIsEnumerable"),
+        ] {
             crate::object::js_object_delete_field(
                 proto as *mut ObjectHeader,
                 (atom(key) & POINTER_MASK) as *const crate::StringHeader,
@@ -221,7 +239,14 @@ fn a_deleted_and_readded_builtin_is_read_back() {
             for obj in [o, arr, object_ctor] {
                 agrees(obj, key);
             }
-            assert_eq!(get(o, key), if proto == op { 11.0f64.to_bits() } else { get(o, key) });
+            assert_eq!(
+                get(o, key),
+                if proto == op {
+                    11.0f64.to_bits()
+                } else {
+                    get(o, key)
+                }
+            );
         }
         // After a delete the overflow is the order authority: a new key
         // lands there, off the layout, and the shadow bit sends the probe
@@ -235,5 +260,236 @@ fn a_deleted_and_readded_builtin_is_read_back() {
                 agrees(obj, key);
             }
         }
+    });
+}
+
+unsafe fn data_descriptor(value: u64, writable: bool, enumerable: bool, configurable: bool) -> f64 {
+    let bag = crate::object::js_object_alloc(0, 4) as usize;
+    let b = |v: bool| {
+        f64::from_bits(if v {
+            crate::value::TAG_TRUE
+        } else {
+            crate::value::TAG_FALSE
+        })
+    };
+    set(bag, "value", f64::from_bits(value));
+    set(bag, "writable", b(writable));
+    set(bag, "enumerable", b(enumerable));
+    set(bag, "configurable", b(configurable));
+    f64::from_bits(POINTER_TAG | bag as u64)
+}
+
+/// Population and no-op redefinitions (the same value and attributes) leave
+/// each builtin prototype on its declared layout: being a prototype is a fact
+/// of the layout every birth on it is marked with, not a private lineage.
+#[test]
+fn builtin_prototypes_stay_on_their_declared_layout_ids() {
+    on_a_fresh_thread(|| unsafe {
+        let (op, fp, ap) = realm();
+        let holder = crate::array::array_property_bag(ap as *const crate::array::ArrayHeader);
+        let cases = [
+            (
+                op,
+                op as *const ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::OBJECT_PROTOTYPE),
+                "toString",
+            ),
+            (
+                fp,
+                fp as *const ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::FUNCTION_PROTOTYPE),
+                "call",
+            ),
+            (
+                ap,
+                holder as *const ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::ARRAY_PROTOTYPE_NAMED),
+                "map",
+            ),
+        ];
+        for (_, obj, desc, _) in cases {
+            assert_eq!(
+                crate::object::layout_desc::layout_id_of_word((*obj).parent_class_id),
+                (*desc).layout_id,
+                "family {:#x} is on its declared layout after population",
+                (*desc).family
+            );
+        }
+        for (target, obj, desc, key) in cases {
+            let boxed = f64::from_bits(POINTER_TAG | target as u64);
+            let value = get(target, key);
+            crate::object::object_ops::js_object_define_property(
+                boxed,
+                f64::from_bits(atom(key)),
+                data_descriptor(value, true, false, true),
+            );
+            assert_eq!(get(target, key), value);
+            assert_eq!(
+                crate::object::layout_desc::layout_id_of_word((*obj).parent_class_id),
+                (*desc).layout_id,
+                "a no-op redefinition of {key} keeps family {:#x} on its layout",
+                (*desc).family
+            );
+        }
+    });
+}
+
+/// `URL.prototype`, `Timeout.prototype` and `Immediate.prototype` are sealed
+/// runtime prototypes: a compiled plain store (the named-store fast path)
+/// must not be admitted on them, so every write reaches the funnel that sets
+/// the prototype's shadow bit, and the probe from an object born on their
+/// layouts reads the write back (or declines).
+#[test]
+fn sealed_runtime_prototypes_take_the_store_funnel() {
+    on_a_fresh_thread(|| unsafe {
+        let _ = realm();
+        let url = (get(global("URL"), "prototype") & POINTER_MASK) as usize;
+        let [timeout, immediate] = crate::timer::timer_prototypes_for_tests();
+        for (name, proto, desc) in [
+            (
+                "URL",
+                url as *mut ObjectHeader,
+                std::ptr::addr_of!(crate::object::runtime_layouts::URL_COMPONENTS),
+            ),
+            (
+                "Timeout",
+                timeout,
+                std::ptr::addr_of!(crate::object::runtime_layouts::TIMEOUT),
+            ),
+            (
+                "Immediate",
+                immediate,
+                std::ptr::addr_of!(crate::object::runtime_layouts::IMMEDIATE),
+            ),
+        ] {
+            assert!(!proto.is_null());
+            let word = (*proto).parent_class_id;
+            assert!(
+                !crate::object::layout_desc::word_is_shadowed(word),
+                "{name}: pristine"
+            );
+            let kind = crate::object::shapes::shape_object_kind_by_id(
+                crate::object::layout_desc::layout_id_of_word(word),
+            );
+            eprintln!("{name}.prototype kind {kind:?}");
+            assert_ne!(
+                kind,
+                Some(crate::object::shapes::ShapeObjectKind::Ordinary),
+                "{name}.prototype admits no plain store"
+            );
+            let born = crate::object::layout_desc::perry_alloc_layout(desc) as usize;
+            let key = "addedByProgram";
+            let stored = crate::object::shape_store::try_store(
+                f64::from_bits(POINTER_TAG | proto as u64),
+                f64::from_bits(atom(key)),
+                13.0,
+            );
+            if stored.is_none() {
+                set(proto as usize, key, 13.0);
+            }
+            assert!(
+                crate::object::layout_desc::word_is_shadowed((*proto).parent_class_id),
+                "{name}: a store sets the shadow bit"
+            );
+            assert_eq!(get(proto as usize, key), 13.0f64.to_bits());
+            let p = probe(born, key);
+            assert!(
+                p == TAG_HOLE || p == 13.0f64.to_bits(),
+                "{name}: probe answered {p:#x}"
+            );
+        }
+    });
+}
+
+#[test]
+fn functions_answer_their_own_and_inherited_members_through_the_layouts() {
+    on_a_fresh_thread(|| unsafe {
+        let (op, fp, _ap) = realm();
+        // (`Object` owns non-spec `toString` / `valueOf` statics; `Function`
+        // owns only `length`, `name` and `prototype`.)
+        let ctor = global("Function");
+        // Own `length`, the function layout's own data: answered from the
+        // body of a function with no own-property bag, not from
+        // %Function.prototype%'s `length` (0).
+        let f = crate::closure::js_closure_alloc(
+            crate::fn_info!(two_parameters, 2; with_declared(2)),
+            0,
+        ) as usize;
+        assert!((*(f as *const crate::closure::ClosureHeader))
+            .props
+            .is_null());
+        assert_eq!(probe(f, "length"), 2.0f64.to_bits());
+        assert_eq!(get(f, "length"), 2.0f64.to_bits());
+        assert_eq!(agrees(ctor, "length"), get(ctor, "length"));
+        assert_ne!(get(ctor, "length"), get(fp, "length"));
+        let name = agrees(ctor, "name");
+        assert!(name == TAG_HOLE || name != get(fp, "name"));
+        // %Function.prototype%'s own members.
+        for k in ["constructor", "apply", "bind", "call", "toString"] {
+            let v = agrees(ctor, k);
+            assert_ne!(v, TAG_HOLE, "{k} is answered from %Function.prototype%");
+            assert_eq!(v, get(fp, k), "{k}");
+        }
+        // Inherited from %Object.prototype%: %Function.prototype% owns no copy.
+        for k in [
+            "valueOf",
+            "toLocaleString",
+            "isPrototypeOf",
+            "hasOwnProperty",
+        ] {
+            assert_eq!(agrees(ctor, k), get(op, k), "{k}");
+            assert_eq!(probe(fp, k), get(op, k), "{k} on %Function.prototype%");
+        }
+        // A write to %Function.prototype% is read back through every function,
+        // and an own write on the function shadows it.
+        set(fp, "toString", 7.0);
+        assert_eq!(agrees(ctor, "toString"), 7.0f64.to_bits());
+        set(fp, "valueOf", 8.0);
+        assert_eq!(agrees(ctor, "valueOf"), 8.0f64.to_bits());
+        assert_eq!(agrees(op, "valueOf"), get(op, "valueOf"));
+    });
+}
+
+extern "C" fn two_parameters(
+    _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    _a: f64,
+    _b: f64,
+) -> f64 {
+    0.0
+}
+
+#[test]
+fn array_intrinsic_length_precedes_named_bag_and_prototypes() {
+    on_a_fresh_thread(|| unsafe {
+        let _ = realm();
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let array = scope.root_raw_mut_ptr(crate::array::js_array_alloc(4));
+        let key = scope.root_nanbox_f64(f64::from_bits(atom("length")));
+        for length in 0..4 {
+            let arr = array.get_raw_mut_ptr::<crate::array::ArrayHeader>();
+            assert_eq!(agrees(arr as usize, "length"), (length as f64).to_bits());
+            // A freshly allocated non-atom key takes the same intrinsic read.
+            let dynamic = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
+            let dynamic = crate::value::js_nanbox_string(dynamic as i64);
+            let arr = array.get_raw_mut_ptr::<crate::array::ArrayHeader>();
+            assert_eq!(
+                perry_probe_get_keyed(test_dir(), POINTER_TAG | arr as u64, dynamic.to_bits()),
+                length as f64,
+            );
+            let next = crate::array::js_array_push_f64(arr, 10.0);
+            array.set_raw_mut_ptr(next);
+        }
+        let proxy = crate::proxy::js_proxy_new(
+            crate::value::js_nanbox_pointer(
+                array.get_raw_mut_ptr::<crate::array::ArrayHeader>() as i64
+            ),
+            crate::value::js_nanbox_pointer(crate::object::js_object_alloc(0, 0) as i64),
+        );
+        assert_eq!(
+            perry_probe_get_keyed(test_dir(), proxy.to_bits(), key.get_nanbox_f64().to_bits())
+                .to_bits(),
+            TAG_HOLE,
+        );
     });
 }

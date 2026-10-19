@@ -45,10 +45,6 @@ pub struct Gen<'a> {
     pub thrown: NodeId,
     pub cjs_registry: NodeId,
     pub read_sites: Vec<ReadSite>,
-    /// E14: the program may run interpreted code (non-constant
-    /// `new Function` / `eval` / `vm`): such code can patch
-    /// `Object.prototype`, so no template is prefix-stable.
-    pub global_hard: Option<String>,
     pub ctor_phase: FxHashMap<TmplId, CtorPhase>,
     pub fn_inst_of: FxHashMap<FnIdx, TmplId>,
     pub field_init_fn: FxHashMap<TmplId, FnIdx>,
@@ -140,7 +136,6 @@ impl<'a> Gen<'a> {
             thrown,
             cjs_registry,
             read_sites: Vec::new(),
-            global_hard: None,
             ctor_phase: FxHashMap::default(),
             fn_inst_of: FxHashMap::default(),
             field_init_fn: FxHashMap::default(),
@@ -355,6 +350,7 @@ impl<'a> Gen<'a> {
             this,
             ret,
             args_all,
+            has_arguments: params.iter().any(|p| p.arguments_object.is_some()),
             token: tok,
             ctor_of: None,
             lexical_this,
@@ -504,6 +500,7 @@ impl<'a> Gen<'a> {
             this,
             ret,
             args_all,
+            has_arguments: false,
             token: tok,
             ctor_of: None,
             lexical_this: false,
@@ -513,6 +510,14 @@ impl<'a> Gen<'a> {
 
     fn link_class(&mut self, mi: u32, c: &Class) {
         let tm = self.mods[mi as usize].classes[&c.name];
+        if let Some(origin) = c
+            .specialized_from
+            .as_deref()
+            .and_then(|name| self.resolve_class_name(mi, name))
+        {
+            self.m.constructor_origins.insert(tm, origin);
+            self.m.rel(|| format!("ctororigin {tm} {origin}"));
+        }
         let parent = c
             .extends_name
             .as_ref()

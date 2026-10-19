@@ -1,65 +1,11 @@
 //! Points-to sets: a sorted small vector that switches to a hash set above a
-//! threshold, plus a tiny Fx-style hasher (no external crate).
+//! threshold. The Fx hasher lives in `perry_hir::fx`.
 
-use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, Hasher};
+// Iteration order of the maps and sets that use it is never observable in
+// output: every dump sorts.
+pub use perry_hir::fx::{FxBuild, FxHashMap, FxHashSet, FxHasher};
 
-/// Fx hash (rustc's): fast and deterministic. Iteration order of the maps and
-/// sets that use it is never observable in output: every dump sorts.
-#[derive(Default, Clone, Copy)]
-pub struct FxHasher {
-    hash: u64,
-}
-
-const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-
-impl Hasher for FxHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        // Eight bytes per step (strings: atoms, reasons).
-        let mut chunks = bytes.chunks_exact(8);
-        for c in &mut chunks {
-            self.add(u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]));
-        }
-        let rest = chunks.remainder();
-        if !rest.is_empty() {
-            let mut w = [0u8; 8];
-            w[..rest.len()].copy_from_slice(rest);
-            self.add(u64::from_le_bytes(w) ^ ((rest.len() as u64) << 59));
-        }
-    }
-    #[inline]
-    fn write_u8(&mut self, i: u8) {
-        self.add(i as u64);
-    }
-    #[inline]
-    fn write_u32(&mut self, i: u32) {
-        self.add(i as u64);
-    }
-    #[inline]
-    fn write_u64(&mut self, i: u64) {
-        self.add(i);
-    }
-    #[inline]
-    fn write_usize(&mut self, i: usize) {
-        self.add(i as u64);
-    }
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.hash
-    }
-}
-
-impl FxHasher {
-    #[inline]
-    fn add(&mut self, i: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(SEED);
-    }
-}
-
-pub type FxBuild = BuildHasherDefault<FxHasher>;
-pub type FxHashMap<K, V> = std::collections::HashMap<K, V, FxBuild>;
-pub type FxHashSet<K> = HashSet<K, FxBuild>;
+use std::sync::Arc;
 
 const SMALL_MAX: usize = 48;
 
@@ -67,7 +13,8 @@ const SMALL_MAX: usize = 48;
 #[derive(Clone, Debug)]
 pub enum Pts {
     Small(Vec<u32>),
-    Big(FxHashSet<u32>),
+    Shared(Arc<Vec<u32>>),
+    Big(Arc<FxHashSet<u32>>),
 }
 
 impl Default for Pts {
@@ -80,8 +27,37 @@ impl Pts {
     pub fn contains_tok(&self, t: u32) -> bool {
         match self {
             Pts::Small(v) => v.binary_search(&t).is_ok(),
+            Pts::Shared(v) => v.binary_search(&t).is_ok(),
             Pts::Big(s) => s.contains(&t),
         }
+    }
+
+    /// Identity of immutable set storage proves equality.
+    pub(crate) fn covered_by(&self, other: &Self) -> bool {
+        if self.len() == 1 {
+            return other.contains_tok(self.to_sorted()[0]);
+        }
+        match (self, other) {
+            (Pts::Big(a), Pts::Big(b)) => Arc::ptr_eq(a, b),
+            (Pts::Shared(a), Pts::Shared(b)) => Arc::ptr_eq(a, b),
+            (Pts::Small(a), Pts::Small(b)) => a.len() == 1 && b.len() == 1 && a[0] == b[0],
+            _ => false,
+        }
+    }
+
+    pub(crate) fn shared_owners(&self) -> usize {
+        match self {
+            Pts::Big(s) => Arc::strong_count(s),
+            Pts::Shared(s) => Arc::strong_count(s),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn shared_clone(&mut self) -> Self {
+        if let Pts::Small(v) = self {
+            *self = Pts::Shared(Arc::new(std::mem::take(v)));
+        }
+        self.clone()
     }
 
     /// Insert; true when new.
@@ -94,18 +70,36 @@ impl Pts {
                     v.insert(at, t);
                     if v.len() > SMALL_MAX {
                         let s: FxHashSet<u32> = v.iter().copied().collect();
-                        *self = Pts::Big(s);
+                        *self = Pts::Big(Arc::new(s));
                     }
                     true
                 }
             },
-            Pts::Big(s) => s.insert(t),
+            Pts::Shared(v) => {
+                let Err(at) = v.binary_search(&t) else {
+                    return false;
+                };
+                let values = Arc::make_mut(v);
+                values.insert(at, t);
+                if values.len() > SMALL_MAX {
+                    *self = Pts::Big(Arc::new(values.iter().copied().collect()));
+                }
+                true
+            }
+            Pts::Big(s) => {
+                if s.contains(&t) {
+                    false
+                } else {
+                    Arc::make_mut(s).insert(t)
+                }
+            }
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
             Pts::Small(v) => v.len(),
+            Pts::Shared(v) => v.len(),
             Pts::Big(s) => s.len(),
         }
     }
@@ -118,6 +112,7 @@ impl Pts {
     pub(crate) fn sorted_into(&self, out: &mut Vec<u32>) {
         match self {
             Pts::Small(v) => out.extend_from_slice(v),
+            Pts::Shared(v) => out.extend_from_slice(v),
             Pts::Big(s) => {
                 let at = out.len();
                 out.extend(s.iter().copied());
@@ -130,6 +125,7 @@ impl Pts {
     pub(crate) fn to_sorted(&self) -> Vec<u32> {
         match self {
             Pts::Small(v) => v.clone(),
+            Pts::Shared(v) => v.as_ref().clone(),
             Pts::Big(s) => {
                 let mut v: Vec<u32> = s.iter().copied().collect();
                 v.sort_unstable();

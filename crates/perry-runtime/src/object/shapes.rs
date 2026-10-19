@@ -35,7 +35,9 @@ use crate::array::ArrayHeader;
 use std::cell::RefCell;
 #[path = "shapes_layout_registration.rs"]
 mod layout_registration;
-pub(crate) use layout_registration::{allocate_declared_layout_id, install_declared_layout};
+pub(crate) use layout_registration::{
+    allocate_declared_layout_id, fresh_semantic_generation, install_declared_layout,
+};
 
 #[path = "shapes_spread.rs"]
 mod shapes_spread;
@@ -46,7 +48,9 @@ pub(crate) use shapes_own_data::own_data_shape;
 
 #[path = "shapes_branded_birth.rs"]
 mod shapes_branded_birth;
-pub(crate) use shapes_branded_birth::branded_birth_layout;
+pub(crate) use shapes_branded_birth::{
+    branded_birth_layout, WEAKMAP_BIRTH_LAYOUT, WEAKSET_BIRTH_LAYOUT,
+};
 #[path = "shapes_birth_width.rs"]
 mod shapes_birth_width;
 #[path = "shapes_last_key_rollback.rs"]
@@ -64,9 +68,6 @@ pub(crate) use shapes_linked_birth::{
 };
 #[path = "layout_probe.rs"]
 pub(crate) mod layout_probe;
-#[cfg(all(test, feature = "regex-engine"))]
-#[path = "regex_direct_admission_tests.rs"]
-mod regex_direct_admission_tests;
 #[path = "shapes_evaluation_brand.rs"]
 mod shapes_evaluation_brand;
 #[path = "shapes_slot_list.rs"]
@@ -82,8 +83,8 @@ mod shapes_worker_seed;
 #[cfg(test)]
 pub(crate) use shapes_prototype::{clear_class_identity_words, scan_shape_prototype_words_mut};
 pub(crate) use shapes_prototype::{
-    identity_prototype_word, identity_word_slot, note_full_trace_begin, proto_id_carries_word,
-    prune_dead_shape_prototypes, shape_prototype_word, write_identity_word,
+    identity_prototype_word, identity_word_slot, identity_word_slot_in, note_full_trace_begin,
+    proto_id_carries_word, prune_dead_shape_prototypes, shape_prototype_word, write_identity_word,
 };
 #[path = "shapes_store_kind.rs"]
 pub(crate) mod store_kind;
@@ -760,91 +761,6 @@ pub(crate) unsafe fn plain_positional_key_words(
         PositionalKeys(r.keys as usize as *const ArrayHeader),
         r.position_bound_raw() as usize,
     ))
-}
-
-/// Own-key presence of the string key `key_bits` (whose bytes are `key`) on
-/// a receiver of shape `shape_id`, for `[[GetOwnProperty]]` existence
-/// (`Object.hasOwn`, `Object.prototype.hasOwnProperty`): `Some((present,
-/// kind))`, or `None` when the record does not answer for its receivers' own
-/// keys and the caller asks the object.
-///
-/// The record answers when [`plain_positional_key_words`] would: POSBOUND is
-/// nonzero (an ordinary layout with a canonical key list, no tombstone holes,
-/// no accessor keys, no descriptor generation) and the [[Prototype]] identity
-/// is not per-object (no `process.env`, arguments object or module
-/// namespace, whose own properties are not their key list). A shape carrying
-/// a private key also declines: a private entry sits in the list but is no
-/// property. What remains is a list whose first `logical_key_count` entries
-/// ARE the receiver's own string keys, so presence is membership.
-///
-/// Membership is decided in the list itself, never in a side table: the key
-/// word is compared first (a canonical list holds its text's atom, which is
-/// the very word a pooled key literal evaluates to), and only when no word
-/// matches are the texts compared, because a word mismatch proves nothing (a
-/// list written before its atom existed, an SSO slot, a key built at run
-/// time). A list at or past `KEYS_INDEX_THRESHOLD` asks the shape's key index
-/// instead, exactly as every by-name lookup does.
-///
-/// `kind` is the record's object kind, for a caller whose answer also depends
-/// on WHICH object a runtime-born receiver is (`%Function.prototype%`).
-///
-/// Allocation-free and GC-free.
-///
-/// # Safety
-/// As [`positional_key_words`]; `key` is the text of the string `key_bits`.
-#[inline]
-pub(crate) unsafe fn plain_own_key_present(
-    dir: *const u8,
-    shape_id: u32,
-    key_bits: u64,
-    key: &[u8],
-) -> Option<(bool, ShapeObjectKind)> {
-    let r = ShapeSlab::ordinary_record_in(dir, shape_id)?;
-    if r.position_bound_raw() == 0
-        || r.proto_id == PROTO_ID_PER_OBJECT
-        || r.summary()
-            & (crate::object::key_attrs::SUMMARY_PRIVATE | crate::object::key_attrs::SUMMARY_HOLES)
-            != 0
-    {
-        return None;
-    }
-    let kind = r.object_kind();
-    let keys = r.keys as usize as *const ArrayHeader;
-    let count = r.logical_key_count;
-    if count >= super::KEYS_INDEX_THRESHOLD {
-        return Some((
-            super::keys_find_slot_by_bytes(keys, count, key).is_some(),
-            kind,
-        ));
-    }
-    // A live descriptor's keys array is the resolved head (the collector
-    // rewrites it on move), holding at least `count` logical keys past its
-    // front offset; the min keeps a short array from being over-read anyway.
-    let n = (count as usize).min((*keys).length.min((*keys).capacity) as usize);
-    let words = crate::array::array_elements_ptr(keys) as *const u64;
-    for i in 0..n {
-        if *words.add(i) == key_bits {
-            return Some((true, kind));
-        }
-    }
-    let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-    for i in 0..n {
-        let stored = crate::JSValue::from_bits(*words.add(i));
-        if stored.is_string() {
-            let h = stored.as_string_ptr();
-            if !h.is_null()
-                && (*h).byte_len as usize == key.len()
-                && bytes_eq(super::string_header_payload(h), key.as_ptr(), key.len())
-            {
-                return Some((true, kind));
-            }
-        } else if let Some(text) = crate::string::js_string_key_bytes(stored, &mut sso) {
-            if text == key {
-                return Some((true, kind));
-            }
-        }
-    }
-    Some((false, kind))
 }
 
 /// A record's canonical keys array, for [`positional_key_words`]: its words
@@ -2520,6 +2436,12 @@ pub(crate) fn shape_live_inline_slot_count_by_id(shape_id: u32) -> Option<u32> {
     shape_descriptor_field_by_id(shape_id, |d| d.live_inline_slot_count)
 }
 
+/// The key list, logical key count and prototype identity of `shape_id`,
+/// without copying its descriptor.
+pub(crate) fn shape_keys_and_proto_by_id(shape_id: u32) -> Option<(u64, u32, u64)> {
+    shape_descriptor_field_by_id(shape_id, |d| (d.keys, d.logical_key_count, d.proto_id))
+}
+
 /// The descriptor named by `shape_id`, or `None` when the id names no
 /// descriptor in this agent.
 ///
@@ -3126,113 +3048,13 @@ pub const REGION_GUARD_WORD_EMPTY: u64 = 0xFFFF_FFFF;
 /// Most distinct keys one region word can carry (6 bits each above the id).
 pub const REGION_GUARD_MAX_KEYS: u32 = 5;
 const REGION_GUARD_SLOT_BITS: u32 = 6;
-const REGION_GUARD_SLOT_MAX: i32 = (1 << REGION_GUARD_SLOT_BITS) - 1;
-
-/// Step 4b: pack a region guard word — one ShapeId and the inline slot of each
-/// of the region's keys — or return [`REGION_GUARD_WORD_EMPTY`].
-///
-/// A read region compares the receiver's ShapeId against the low 32 bits ONCE
-/// and then loads every key's slot out of the high 32 bits, so the id and the
-/// slots must be published as a single atomic word. Two separately stored
-/// words could tear under a concurrent prime and pair one shape's id with
-/// another shape's slots — a wrong value, silently.
-///
-/// Each slot comes from [`js_shape_ordinary_inline_slot_for_key`], which
-/// answers only when slot k provably IS key position k (ordinary kind, no
-/// semantic generation, no tombstones, every key inline). Anything it refuses —
-/// an absent key, an inherited key, an accessor, a spilled key — makes the
-/// whole word empty, so the region never takes its fast copy for that shape
-/// and every read keeps its ordinary tower. Refusing is always correct.
-///
-/// `keys` are the whole NaN-boxed key values as codegen loaded them from the
-/// string pool, in the region's key order; `n` of them are meaningful.
-#[no_mangle]
-pub extern "C" fn js_region_guard_pack(
-    shape_id: u32,
-    n: u32,
-    k0: u64,
-    k1: u64,
-    k2: u64,
-    k3: u64,
-    k4: u64,
-) -> u64 {
-    // A region word is a site word: only an ORDINARY-band id may enter it
-    // (see `SITE_SHAPE_ID_END`).
-    if !is_site_matchable_shape_id(shape_id) || n == 0 || n > REGION_GUARD_MAX_KEYS {
-        return REGION_GUARD_WORD_EMPTY;
-    }
-    let keys = [k0, k1, k2, k3, k4];
-    let mut word = u64::from(shape_id);
-    for (i, &key) in keys.iter().enumerate().take(n as usize) {
-        let slot = js_shape_ordinary_inline_slot_for_key(shape_id, key);
-        if !(0..=REGION_GUARD_SLOT_MAX).contains(&slot) {
-            return REGION_GUARD_WORD_EMPTY;
-        }
-        word |= (slot as u64) << (32 + REGION_GUARD_SLOT_BITS * i as u32);
-    }
-    word
-}
-
-/// Compute a region's guard word and publish it, for a read region's miss
-/// path (#10884).
-///
-/// The store lives here rather than in emitted IR for the reason
-/// [`crate::object::field_get_set::ic_miss`]'s `prime_get` does it here: a
-/// cache word is published by the runtime, which owns its memory ordering.
-/// Relaxed is enough — this publishes a numeric layout fact, not an object —
-/// and the single word is what makes a concurrent prime unable to pair one
-/// shape's id with another shape's slots. (Emitting `store atomic` from
-/// codegen also does not survive perry's own native IR construction path,
-/// which real modules take.)
-///
-/// `word` is an aligned, live site word. A shape whose layout the region
-/// cannot encode publishes nothing, so the site keeps missing and the bounded
-/// attempt counter in the emitted code retires it.
-///
-/// # Safety
-///
-/// `word` must be null or point to a live, 8-byte-aligned `AtomicU64`.
-#[no_mangle]
-pub unsafe extern "C" fn js_region_guard_prime(
-    word: *const core::sync::atomic::AtomicU64,
-    shape_id: u32,
-    n: u32,
-    k0: u64,
-    k1: u64,
-    k2: u64,
-    k3: u64,
-    k4: u64,
-) -> u64 {
-    let packed = js_region_guard_pack(shape_id, n, k0, k1, k2, k3, k4);
-    if word.is_null() || packed == REGION_GUARD_WORD_EMPTY {
-        return REGION_GUARD_WORD_EMPTY;
-    }
-    (*word).store(packed, core::sync::atomic::Ordering::Relaxed);
-    packed
-}
-
-/// Keepalive anchor — `js_region_guard_prime` is called only from generated
-/// code (a read region's miss path), so the auto-optimize whole-program build
-/// would otherwise dead-strip it.
-#[cfg(feature = "keepalive-anchors")]
-#[used(compiler)]
-static KEEP_JS_REGION_GUARD_PRIME: unsafe extern "C" fn(
-    *const core::sync::atomic::AtomicU64,
-    u32,
-    u32,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-) -> u64 = js_region_guard_prime;
 
 /// Step 4b loop regions: pack a LOOP region's word, which licenses bare
 /// STORES as well as bare reads, or return [`REGION_GUARD_WORD_EMPTY`].
 ///
-/// [`js_region_guard_pack`] proves each key is an ordinary own inline slot of
-/// `shape_id` (ordinary kind, semantic generation 0, no tombstones, every key
-/// inline). A store additionally needs every covered key to be a WRITABLE DATA
+/// The loop guard proves each key is an ordinary own slot of `shape_id`
+/// (ordinary kind, semantic generation 0, no tombstones). A store additionally
+/// needs every covered key to be a WRITABLE DATA
 /// property, which is the shape's attribute summary: zero means every key the
 /// shape names carries default attributes (data, writable, enumerable,
 /// configurable). A nonzero summary refuses the whole word; the loop then runs
@@ -3451,7 +3273,7 @@ pub const REGION_LOOP_WORD_RETIRED: u64 = u64::MAX;
 pub const REGION_LOOP_WORD_VALUE_TEST: u64 = 1 << 63;
 
 /// Compute a loop region's word ([`js_region_loop_pack`]) and publish it; the
-/// store-side twin of [`js_region_guard_prime`], with its memory ordering.
+/// loop-region publisher, with a single atomic word for the id and slots.
 /// `last` is non-zero on the site's final bounded attempt: a refusal then
 /// publishes [`REGION_LOOP_WORD_RETIRED`].
 ///
@@ -3791,7 +3613,6 @@ pub(crate) unsafe fn stamp_object_shape(
         return 0;
     }
     let Some(lineage) = object_shape_descriptor(obj) else {
-        crate::array::clear_array_subclass_named_prefix_token(obj);
         let id = shape_descriptor_ensure_for_object(obj, keys, key_count, live_inline_slot_count)
             .unwrap_or_else(|error| shape_descriptor_error_abort(error));
         stamp_object_shape_id_with_carrier_note(obj, id);
@@ -3838,7 +3659,6 @@ pub(crate) unsafe fn stamp_object_shape(
         // field cache. Preserve a proved Array-subclass prefix when that call
         // merely republishes the exact current descriptor; retire it only for
         // an actual structural identity change.
-        crate::array::clear_array_subclass_named_prefix_token(obj);
     }
     stamp_object_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
@@ -4140,7 +3960,6 @@ pub(crate) unsafe fn publish_object_shape_from_rep(
     // Generic structural publication may add/delete/reorder a named field.
     // The learned exact numeric-tail installer has its own entry point and
     // intentionally preserves this Array-subclass family proof.
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     // The caller states the count: a keys array's header length is not a
     // receiver's key count (see `ObjectKeys`).
     let keys = keys_view.arr();
@@ -4328,7 +4147,6 @@ pub(crate) unsafe fn transition_object_shape_accessor_replaced(
     let Some(current) = object_shape_descriptor(obj) else {
         return transition_object_shape_semantics(obj);
     };
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let key_hash = crate::object::key_bytes_hash(key_bytes.as_ptr(), key_bytes.len());
     // SplitMix64 over (predecessor, key, a tag no other transition uses).
     // Bit 63 keeps it disjoint from the counter namespace (which aborts far
@@ -4367,7 +4185,6 @@ pub(crate) unsafe fn transition_object_shape_semantics(
     if obj.is_null() || !shape_word_is_writable(obj) {
         return 0;
     }
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let current = object_shape_descriptor(obj).unwrap_or_else(|| {
         synchronize_object_shape_descriptor(obj);
         object_shape_descriptor(obj).expect("shape synchronization must publish a descriptor")
@@ -4544,7 +4361,6 @@ pub(crate) unsafe fn transition_object_shape_semantics_keeping_constfn(
     let rep = infos.iter().fold(super::field_rep::REP_ANY, |rep, i| {
         super::field_rep::with_slot_rep(rep, u32::from(i.slot), super::field_rep::REP_SPECIAL)
     });
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let keys = current.keys as usize as *const ArrayHeader;
     let generation = SHAPE_SEMANTIC_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if generation == 0 {
@@ -4615,7 +4431,6 @@ pub(crate) unsafe fn transition_object_shape_prototype(
     if current.proto_id == proto_id {
         return object_shape_stamp(obj);
     }
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let generation = if crate::object::overflow::has_overflow(obj) {
         SHAPE_SEMANTIC_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     } else {
@@ -5239,7 +5054,6 @@ pub(crate) unsafe fn publish_callable_object_kind(
     if obj.is_null() || !shape_word_is_writable(obj) {
         return 0;
     }
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let current = object_shape_descriptor(obj).unwrap_or_else(|| {
         synchronize_object_shape_descriptor(obj);
         object_shape_descriptor(obj).expect("shape synchronization must publish a descriptor")
@@ -5299,7 +5113,6 @@ pub(crate) unsafe fn transition_object_shape_add_brand(
     if !changed {
         return false;
     }
-    crate::array::clear_array_subclass_named_prefix_token(obj);
     let kind = store_kind::mint_kind(current.object_kind, obj);
     let scope = crate::gc::RuntimeHandleScope::new();
     let handle = scope.root_raw_mut_ptr(obj);

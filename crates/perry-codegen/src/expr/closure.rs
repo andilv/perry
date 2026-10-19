@@ -23,7 +23,9 @@ use super::{lower_expr, nanbox_pointer_inline, FnCtx};
 /// wait for a full collection, even when no user closure can observe it. A
 /// cell from an ENCLOSING scope is not covered by that token (#10464: its
 /// owner frame now releases it at scope exit), so only these ids go uncounted.
-fn plain_async_step_release_ids(stmts: &[Stmt]) -> Option<std::collections::HashSet<u32>> {
+pub(crate) fn plain_async_step_release_ids(
+    stmts: &[Stmt],
+) -> Option<std::collections::HashSet<u32>> {
     fn walk(stmts: &[Stmt], out: &mut Option<std::collections::HashSet<u32>>) {
         for stmt in stmts {
             match stmt {
@@ -82,6 +84,61 @@ fn plain_async_step_release_ids(stmts: &[Stmt]) -> Option<std::collections::Hash
     let mut out = None;
     walk(stmts, &mut out);
     out
+}
+
+/// Push the word a fresh closure stores in the capture slot for `cap_id`:
+/// for a cell binding the cell (or scope object) pointer, otherwise the
+/// binding's current value. `closure_births` passes the same words for the
+/// closures it bears from a table.
+pub(crate) fn push_capture_word(
+    ctx: &mut FnCtx<'_>,
+    cap_id: u32,
+    birth: &mut crate::stmt::binding_cell::BirthWords,
+) -> Result<()> {
+    if ctx.boxed_vars.contains(&cap_id) {
+        // If the enclosing function has this id boxed,
+        // we want to forward the BOX POINTER through
+        // the capture slot as raw bits, not the value inside
+        // the box. Read the slot directly without
+        // going through the normal LocalGet path (which
+        // would deref via js_box_get).
+        if let Some(&_capture_idx) = ctx.closure_captures.get(&cap_id) {
+            // We're inside a closure and this id is a
+            // transitively-captured box. Read the
+            // capture slot RAW (it holds the box ptr
+            // bits) and propagate directly.
+            let closure_ptr = super::current_closure_ptr_value(ctx, "nested boxed capture")?;
+            let idx_str = _capture_idx.to_string();
+            let v = ctx.block().call(
+                I64,
+                "js_closure_get_capture_bits",
+                &[(I64, &closure_ptr), (I32, &idx_str)],
+            );
+            birth.push(v);
+        } else if let Some(slot) = ctx.locals.get(&cap_id).cloned() {
+            // Enclosing function owns the box: slot holds
+            // the raw box pointer as i64.
+            let box_ptr = ctx.block().load(I64, &slot);
+            let bits = ctx
+                .block()
+                .or(I64, &box_ptr, &crate::nanbox::POINTER_TAG.to_string());
+            birth.push(bits);
+        } else if let Some(global_name) = ctx.module_globals.get(&cap_id).cloned() {
+            // Global boxed var (rare).
+            let v = crate::codegen::global_transfer::load_module_global(ctx, cap_id, &global_name);
+            let v_bits = ctx.block().bitcast_double_to_i64(&v);
+            birth.push(v_bits);
+        } else {
+            // No storage for the binding in this context: the
+            // closure's own cell, minted above.
+            birth.push_minted();
+        }
+    } else {
+        let v = lower_expr(ctx, &Expr::LocalGet(cap_id))?;
+        let v_bits = ctx.block().bitcast_double_to_i64(&v);
+        birth.push(v_bits);
+    }
+    Ok(())
 }
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
@@ -167,56 +224,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let mut birth = crate::stmt::binding_cell::BirthWords::new(ctx, &auto_captures);
             let mut cell_capture_slots: Vec<usize> = Vec::new();
             for cap_id in &auto_captures {
-                if ctx.boxed_vars.contains(cap_id) {
-                    // If the enclosing function has this id boxed,
-                    // we want to forward the BOX POINTER through
-                    // the capture slot as raw bits, not the value inside
-                    // the box. Read the slot directly without
-                    // going through the normal LocalGet path (which
-                    // would deref via js_box_get).
-                    if let Some(&_capture_idx) = ctx.closure_captures.get(cap_id) {
-                        // We're inside a closure and this id is a
-                        // transitively-captured box. Read the
-                        // capture slot RAW (it holds the box ptr
-                        // bits) and propagate directly.
-                        let closure_ptr =
-                            super::current_closure_ptr_value(ctx, "nested boxed capture")?;
-                        let idx_str = _capture_idx.to_string();
-                        let v = ctx.block().call(
-                            I64,
-                            "js_closure_get_capture_bits",
-                            &[(I64, &closure_ptr), (I32, &idx_str)],
-                        );
-                        birth.push(v);
-                    } else if let Some(slot) = ctx.locals.get(cap_id).cloned() {
-                        // Enclosing function owns the box: slot holds
-                        // the raw box pointer as i64.
-                        let box_ptr = ctx.block().load(I64, &slot);
-                        let bits =
-                            ctx.block()
-                                .or(I64, &box_ptr, &crate::nanbox::POINTER_TAG.to_string());
-                        birth.push(bits);
-                    } else if let Some(global_name) = ctx.module_globals.get(cap_id).cloned() {
-                        // Global boxed var (rare).
-                        let v = crate::codegen::global_transfer::load_module_global(
-                            ctx,
-                            *cap_id,
-                            &global_name,
-                        );
-                        let v_bits = ctx.block().bitcast_double_to_i64(&v);
-                        birth.push(v_bits);
-                    } else {
-                        // No storage for the binding in this context: the
-                        // closure's own cell, minted above.
-                        birth.push_minted();
-                    }
-                    if !ctx.module_globals.contains_key(cap_id) {
-                        cell_capture_slots.push(birth.len() - 1);
-                    }
-                } else {
-                    let v = lower_expr(ctx, &Expr::LocalGet(*cap_id))?;
-                    let v_bits = ctx.block().bitcast_double_to_i64(&v);
-                    birth.push(v_bits);
+                push_capture_word(ctx, *cap_id, &mut birth)?;
+                if ctx.boxed_vars.contains(cap_id) && !ctx.module_globals.contains_key(cap_id) {
+                    cell_capture_slots.push(birth.len() - 1);
                 }
             }
             let captured_value_bits = birth.read(ctx);
@@ -489,62 +499,74 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_closure_alloc_with_captures_singleton",
                     &[(PTR, &info_ref), (I32, &cap_count), (PTR, &buf)],
                 )
-            } else if small_fresh_birth {
-                let words: Vec<&str> = (0..3)
+            } else {
+                let words: Vec<String> = (0..total_caps)
                     .map(|i| {
-                        captured_value_bits.get(i).map(String::as_str).unwrap_or(
-                            if i < total_caps {
-                                crate::nanbox::TAG_UNDEFINED_I64
-                            } else {
-                                "0"
-                            },
-                        )
+                        captured_value_bits
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| crate::nanbox::TAG_UNDEFINED_I64.to_string())
                     })
                     .collect();
-                ctx.block().call(
-                    I64,
-                    "js_closure_alloc_small",
-                    &[
-                        (PTR, &info_ref),
-                        (I64, &birth_header),
-                        (I64, words[0]),
-                        (I64, words[1]),
-                        (I64, words[2]),
-                    ],
-                )
-            } else if bulk_fresh_init {
-                // Fresh (identity-carrying) closure with bulk captures:
-                // ONE runtime call does allocation + slots + layout instead of
-                // `js_closure_alloc` plus a `js_closure_set_capture_bits` per
-                // capture (each re-resolving the header, forwarding, kind
-                // dispatch and the barrier's page classification). The reserved
-                // `this` / `new.target` slots are pre-filled with the pointer-free
-                // sentinel the per-slot path relied on `js_closure_alloc` writing;
-                // the post-create patch below fills them exactly as before.
-                let buf = ctx.func.alloca_entry_array(I64, total_caps);
-                {
-                    let blk = ctx.block();
-                    for i in 0..total_caps {
-                        let slot = blk.gep(I64, &buf, &[(I64, &format!("{}", i))]);
-                        match captured_value_bits.get(i) {
-                            Some(v_bits) => blk.store(I64, v_bits, &slot),
-                            None => blk.store(I64, crate::nanbox::TAG_UNDEFINED_I64, &slot),
+                super::inline_birth::closure(ctx, &info_ref, &birth_header, &words, |ctx| {
+                    if small_fresh_birth {
+                        let words: Vec<&str> = (0..3)
+                            .map(|i| {
+                                captured_value_bits.get(i).map(String::as_str).unwrap_or(
+                                    if i < total_caps {
+                                        crate::nanbox::TAG_UNDEFINED_I64
+                                    } else {
+                                        "0"
+                                    },
+                                )
+                            })
+                            .collect();
+                        ctx.block().call(
+                            I64,
+                            "js_closure_alloc_small",
+                            &[
+                                (PTR, &info_ref),
+                                (I64, &birth_header),
+                                (I64, words[0]),
+                                (I64, words[1]),
+                                (I64, words[2]),
+                            ],
+                        )
+                    } else if bulk_fresh_init {
+                        // Fresh (identity-carrying) closure with bulk captures:
+                        // ONE runtime call does allocation + slots + layout instead of
+                        // `js_closure_alloc` plus a `js_closure_set_capture_bits` per
+                        // capture (each re-resolving the header, forwarding, kind
+                        // dispatch and the barrier's page classification). The reserved
+                        // `this` / `new.target` slots are pre-filled with the pointer-free
+                        // sentinel the per-slot path relied on `js_closure_alloc` writing;
+                        // the post-create patch below fills them exactly as before.
+                        let buf = ctx.func.alloca_entry_array(I64, total_caps);
+                        {
+                            let blk = ctx.block();
+                            for i in 0..total_caps {
+                                let slot = blk.gep(I64, &buf, &[(I64, &format!("{}", i))]);
+                                match captured_value_bits.get(i) {
+                                    Some(v_bits) => blk.store(I64, v_bits, &slot),
+                                    None => blk.store(I64, crate::nanbox::TAG_UNDEFINED_I64, &slot),
+                                }
+                            }
                         }
+                        let blk = ctx.block();
+                        blk.call(
+                            I64,
+                            "js_closure_alloc_fixed",
+                            &[(PTR, &info_ref), (I64, &birth_header), (PTR, &buf)],
+                        )
+                    } else {
+                        let blk = ctx.block();
+                        blk.call(
+                            I64,
+                            "js_closure_alloc_empty",
+                            &[(PTR, &info_ref), (I32, &shape)],
+                        )
                     }
-                }
-                let blk = ctx.block();
-                blk.call(
-                    I64,
-                    "js_closure_alloc_fixed",
-                    &[(PTR, &info_ref), (I64, &birth_header), (PTR, &buf)],
-                )
-            } else {
-                let blk = ctx.block();
-                blk.call(
-                    I64,
-                    "js_closure_alloc_empty",
-                    &[(PTR, &info_ref), (I32, &shape)],
-                )
+                })
             };
 
             // The captured-singleton helper writes captures internally. Boxed

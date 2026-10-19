@@ -115,6 +115,9 @@ fn lower_expr_impl(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<Expr> 
         ast::Expr::Bin(bin) => lower_bin_expr(ctx, bin),
         ast::Expr::Unary(unary) => lower_unary_expr(ctx, unary),
         ast::Expr::Call(call) => {
+            if let Some(image) = enum_image::lower_enum_image(ctx, call)? {
+                return Ok(image);
+            }
             let call = expr_call::lower_call(ctx, call)?;
             Ok(crate::lower_decl::guard_shared_first_static_call(ctx, call))
         }
@@ -164,7 +167,7 @@ fn lower_expr_impl(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<Expr> 
                     .iter()
                     .map(|elem| lower_expr(ctx, &elem.as_ref().unwrap().expr))
                     .collect::<Result<Vec<_>>>()?;
-                Ok(Expr::Array(elements))
+                Ok(Expr::Array(elements, None))
             }
         }
         ast::Expr::Object(obj) => expr_object::lower_object(ctx, obj),

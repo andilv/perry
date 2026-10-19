@@ -910,6 +910,16 @@ pub(super) fn find_msvc_lib_paths(target: Option<&str>) -> Option<String> {
     Some(xwin_sysroot_lib_paths(&root, target_arch).join(";"))
 }
 
+/// A located archive: the path the linker gets, and the candidate path it was
+/// found at. They differ only for an npm `*.a.zst`, which links from its
+/// per-user decompression slot; files shipped beside the archive (its
+/// `.gc-effects` sidecar) sit beside the candidate, never in the slot.
+#[derive(Clone, Debug)]
+pub(super) struct LocatedLibrary {
+    pub link: PathBuf,
+    pub candidate: PathBuf,
+}
+
 /// Find a library by name, optionally searching cross-compilation target directories.
 ///
 /// Returns the located path, or a list of all searched candidate paths so the
@@ -918,10 +928,21 @@ pub(super) fn find_library_with_candidates(
     name: &str,
     target: Option<&str>,
 ) -> Result<PathBuf, Vec<PathBuf>> {
+    locate_library(name, target).map(|l| l.link)
+}
+
+/// [`find_library_with_candidates`], keeping the candidate path too.
+pub(super) fn locate_library(
+    name: &str,
+    target: Option<&str>,
+) -> Result<LocatedLibrary, Vec<PathBuf>> {
     let candidates = collect_library_candidates(name, target);
     for path in &candidates {
         if path.exists() {
-            return Ok(path.clone());
+            return Ok(LocatedLibrary {
+                link: path.clone(),
+                candidate: path.clone(),
+            });
         }
         // npm per-platform packages ship `*.a.zst` (the raw archives exceed
         // npm's tarball upload limit). When only the compressed sibling is
@@ -930,7 +951,12 @@ pub(super) fn find_library_with_candidates(
         if compressed.exists() {
             let lib_name = path.file_name().and_then(|s| s.to_str()).unwrap_or(name);
             match super::compressed_libs::decompressed_archive(&compressed, lib_name) {
-                Ok(decompressed) => return Ok(decompressed),
+                Ok(decompressed) => {
+                    return Ok(LocatedLibrary {
+                        link: decompressed,
+                        candidate: path.clone(),
+                    });
+                }
                 // A compressed archive is present but couldn't be expanded
                 // (corrupt download, out of disk, …). Surface the real cause
                 // loudly here — otherwise it's masked by the generic "library
@@ -1207,12 +1233,29 @@ pub(super) fn collect_library_candidates(name: &str, target: Option<&str>) -> Ve
 
 /// Find the runtime library for linking
 pub(super) fn find_runtime_library(target: Option<&str>) -> Result<PathBuf> {
-    let lib_name = if is_windows_target(target) {
+    locate_runtime_library(target).map(|l| l.link)
+}
+
+/// [`find_runtime_library`], keeping the candidate path (sidecar lookup).
+pub(super) fn locate_runtime_library(target: Option<&str>) -> Result<LocatedLibrary> {
+    let default_name = if is_windows_target(target) {
         "perry_runtime.lib"
     } else {
         "libperry_runtime.a"
     };
-    find_library_with_candidates(lib_name, target).map_err(|searched| {
+    // The instrumented variant (`libperry_runtime_instr.a`) when an instrument
+    // knob is set while compiling; see `instrumented_variant_requested`.
+    let lib_name_owned = super::optimized_libs::variant_archive_name(default_name);
+    let lib_name = lib_name_owned.as_str();
+    let instr_hint = if super::optimized_libs::instrumented_variant_requested() {
+        "\n- This compile sets a GC/diagnostic instrument knob (or PERRY_GC_TRACE / \
+         PERRY_CHECK_CONTRACTS), so it links the instrumented archives. Build them with \
+         scripts/build_instr_runtime.sh <target-triple> from the perry workspace, or unset \
+         the knob to link the default (instrument-free) archives."
+    } else {
+        ""
+    };
+    locate_library(lib_name, target).map_err(|searched| {
         let extra = if target.is_some() {
             format!(" (for target {:?})", target.unwrap())
         } else {
@@ -1230,9 +1273,11 @@ pub(super) fn find_runtime_library(target: Option<&str>) -> Result<PathBuf> {
             "Could not find {lib}{extra}.\n\
              Searched:\n{list}\n\n\
              Fixes:\n\
-             - From the perry workspace: cargo build --release -p perry-runtime-static{tf}\n\
+             - From the perry workspace: cargo build --release -p perry-runtime-static{tf}, then\n\
+               scripts/gc_call_effects/sidecars.sh <that target dir> (the GC effects sidecar)\n\
              - Out-of-tree install: set PERRY_RUNTIME_DIR to the directory containing {lib}\n\
-               (e.g. export PERRY_RUNTIME_DIR=/path/to/perry/target/release)",
+               (e.g. export PERRY_RUNTIME_DIR=/path/to/perry/target/release){hint}",
+            hint = instr_hint,
             lib = lib_name,
             extra = extra,
             list = searched_list,
@@ -1241,23 +1286,23 @@ pub(super) fn find_runtime_library(target: Option<&str>) -> Result<PathBuf> {
     })
 }
 
-/// Optional feature-trimmed runtime shipped for source-free Unix installs.
-/// The existing search also resolves `.a.zst` archives from npm packages.
-pub(super) fn find_runtime_core_library(target: Option<&str>) -> Option<PathBuf> {
-    if is_windows_target(target) {
-        return None;
-    }
-    find_library("libperry_runtime_core.a", target)
-}
-
 /// Find the stdlib library for linking (optional - only needed for native modules)
 pub(super) fn find_stdlib_library(target: Option<&str>) -> Option<PathBuf> {
+    locate_stdlib_library(target).map(|l| l.link)
+}
+
+/// [`find_stdlib_library`], keeping the candidate path (sidecar lookup).
+pub(super) fn locate_stdlib_library(target: Option<&str>) -> Option<LocatedLibrary> {
     let lib_name = if is_windows_target(target) {
         "perry_stdlib.lib"
     } else {
         "libperry_stdlib.a"
     };
-    find_library(lib_name, target)
+    locate_library(
+        &super::optimized_libs::variant_archive_name(lib_name),
+        target,
+    )
+    .ok()
 }
 
 /// Find the wasmi-based WebAssembly host library (optional — only needed

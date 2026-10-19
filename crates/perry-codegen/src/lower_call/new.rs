@@ -71,7 +71,7 @@ pub(crate) fn lower_new(
     // `new_site_args_carry_appended_caps` heuristic, which could misfire on a
     // forward-referenced capture class whose user args happened to equal its
     // captured locals).
-    lower_new_impl(ctx, class_name, args, cap_args_appended as usize)
+    lower_new_impl(ctx, class_name, args, cap_args_appended as usize, false)
 }
 
 /// Member-callee `new ns.C(...)` construct (#5437): the captures were NOT
@@ -83,7 +83,13 @@ pub(crate) fn lower_new_member_captured(
     class_name: &str,
     args: &[Expr],
 ) -> Result<String> {
-    lower_new_impl(ctx, class_name, args, 0)
+    lower_new_impl(ctx, class_name, args, 0, false)
+}
+
+/// Only the matching arm of checked_super may enter this direct lowering.
+/// The proof belongs to this operation; nested user code gets normal lowering.
+pub(crate) fn lower_new_checked(ctx: &mut FnCtx<'_>, name: &str, args: &[Expr]) -> Result<String> {
+    lower_new_impl(ctx, name, args, 0, true)
 }
 
 fn lower_new_impl(
@@ -91,7 +97,35 @@ fn lower_new_impl(
     class_name: &str,
     args: &[Expr],
     cap_args_appended: usize,
+    heritage_checked: bool,
 ) -> Result<String> {
+    if let Some(class) = ctx.classes.get(class_name).copied() {
+        let own_body = class.constructor.is_some()
+            || ctx
+                .imported_class_ctors
+                .get(class_name)
+                .is_some_and(|ctor| ctor.has_own_constructor);
+        if !own_body && crate::expr::super_constructor::default_body_is_active(ctx, class) {
+            return crate::expr::super_constructor::new(
+                ctx,
+                class_name,
+                &args[..args.len().saturating_sub(cap_args_appended)],
+            );
+        }
+        if !heritage_checked
+            && crate::expr::super_constructor::requires_live(ctx, class)
+            && !own_body
+        {
+            if let Some(plan) = crate::expr::checked_super::plan(ctx, class) {
+                return crate::expr::checked_super::new(ctx, class_name, args, &plan);
+            }
+            return crate::expr::super_constructor::new(
+                ctx,
+                class_name,
+                &args[..args.len().saturating_sub(cap_args_appended)],
+            );
+        }
+    }
     if cap_args_appended == 0 {
         let candidate = ctx
             .classes
@@ -138,7 +172,14 @@ fn lower_new_impl(
     // marker has no work left to do. One fewer slot and one fewer push per
     // `new` site that roots anything.
     let mut group = open_rooted_group(args.len() + 1);
-    let result = lower_new_impl_inner(ctx, class_name, args, cap_args_appended, &mut group);
+    let result = lower_new_impl_inner(
+        ctx,
+        class_name,
+        args,
+        cap_args_appended,
+        &mut group,
+        heritage_checked,
+    );
     let result = result.map(|boxed| {
         if ctx.block().is_terminated() || !crate::codegen::static_constfn::has_final_shapes() {
             return boxed;
@@ -155,6 +196,7 @@ fn lower_new_impl_inner<'a>(
     args: &'a [Expr],
     cap_args_appended: usize,
     group: &mut RootedGroup<'a>,
+    heritage_checked: bool,
 ) -> Result<String> {
     let caps_absent_from_args = cap_args_appended == 0;
     // Built-in Web classes that the runtime provides constructors for.
@@ -920,6 +962,8 @@ fn lower_new_impl_inner<'a>(
         this_slot.clone()
     });
     ctx.class_stack.push(class_name.to_string());
+    ctx.inline_new_leaf
+        .push((this_slot.clone(), class_name.to_string()));
 
     // #2768/new.target: `new C()` is fully inlined here, so the runtime
     // `js_new_target_*` cell is never set on this path. Bind `new.target`
@@ -984,6 +1028,8 @@ fn lower_new_impl_inner<'a>(
             || class.extends_name.is_some()
             || class.native_extends.is_some()
             || class.extends_expr.is_some(),
+        family_run: None,
+        bind_watch: None,
     });
 
     // Apply ANCESTOR field initializers — refs #420 / #631-followup.
@@ -1113,11 +1159,14 @@ fn lower_new_impl_inner<'a>(
         crate::expr::root_inlined_ctor_pointer_locals(ctx, &ctor.params, &ctor.body);
     }
 
-    super::defer_dynamic_derived_fields(ctx, class);
     // A dynamic parent constructor owns the fields above its registered edge.
     // Every local class from the edge owner through the leaf is derived, so
     // their fields run only after that runtime `super(...args)` returns.
-    if dynamic_parent_owner.is_none() {
+    if dynamic_parent_owner.is_none()
+        && !(has_own_ctor
+            && !heritage_checked
+            && crate::expr::super_constructor::requires_live(ctx, class))
+    {
         if let Some(stop_at) = inherited_ctor_class.clone() {
             apply_field_initializers_recursive(
                 ctx,
@@ -1268,6 +1317,8 @@ fn lower_new_impl_inner<'a>(
                         result_slot: parent_result_slot,
                         after_label: parent_after_label.clone(),
                         is_derived: parent_is_derived,
+                        family_run: None,
+                        bind_watch: None,
                     });
                     if parent_is_derived {
                         crate::expr::this_super_call::push_shared_super_called_slot(ctx);
@@ -1924,5 +1975,6 @@ fn lower_new_impl_inner<'a>(
         ctx.wpfacts_this.retain(|(s, _)| *s != slot);
     }
     ctx.class_stack.pop();
+    ctx.inline_new_leaf.pop();
     Ok(final_box)
 }

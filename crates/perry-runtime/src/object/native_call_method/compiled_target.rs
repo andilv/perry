@@ -73,6 +73,13 @@ pub(crate) unsafe fn compiled_target_call(
             ));
         }
     }
+    // A packed ordinary Array (or `null` / `undefined`): its Gets run no
+    // code, so the values are copied and the body entered with no
+    // collection between.
+    let mut packed = [f64::from_bits(crate::value::TAG_UNDEFINED); 6];
+    if let Some(n) = crate::closure::packed_apply_values(arg(1), &mut packed) {
+        return Some(enter_compiled_body(closure, info, this, packed.as_ptr(), n));
+    }
     // Mutated Arguments can run accessors in CreateListFromArrayLike.
     let scope = crate::gc::RuntimeHandleScope::new();
     let callee = scope.root_nanbox_f64(recv);
@@ -121,7 +128,7 @@ pub(crate) unsafe fn compiled_target_call(
 /// `closure` is a live closure on `info`, a compiled body; `args_ptr` holds
 /// `n` values.
 #[inline]
-unsafe fn enter_compiled_body(
+pub(crate) unsafe fn enter_compiled_body(
     closure: *const crate::closure::ClosureHeader,
     info: &'static crate::closure::JsFunctionInfo,
     this: crate::closure::JsThis,

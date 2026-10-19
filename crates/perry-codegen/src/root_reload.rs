@@ -204,15 +204,12 @@ const NON_COLLECTING: &[&str] = &[
     "js_gc_note_slot_layout_aware",
     "js_write_barrier",
     "js_write_barrier_root_nanbox",
-    "perry_transition_cache_base",
-    "js_transition_ic_note_hit",
     // Object model step 5: the unknown-receiver probe, proven `Leaf`.
+    "perry_probe_family_method",
     "perry_probe_get",
     "perry_probe_get_value",
     "perry_probe_get_binding",
     "perry_probe_get_keyed",
-    "js_put_value_set_packed_fast",
-    "js_transition_ic_spill_append",
     "js_write_barrier_slot",
     "js_write_barrier_slot_validated_parent",
     "js_gc_register_global_root",
@@ -233,7 +230,6 @@ const NON_COLLECTING: &[&str] = &[
     // inline-cache guards: pure reads
     "js_typed_feedback_closure_direct_call_guard",
     "js_closure_exact_func_guard",
-    "js_object_own_method_cache_miss",
     // verified non-allocating bookkeeping stores/reads
     "js_closure_set_capture_bits",
     "js_closure_set_box_capture_ptr",
@@ -297,10 +293,13 @@ const NON_COLLECTING: &[&str] = &[
 /// declined on a metric ~2.8x larger than the cost it was guarding.
 ///
 /// So the bound stays (a real pathological function must still be able to opt
-/// out), but it is measured against the walk's actual driver. A function that
-/// genuinely exceeds it still keeps today's IR and can still carry a stale
-/// register: the cap trades a compile-time cliff for a correctness risk, and
-/// that residual risk is why the number is generous rather than tight.
+/// out of the walk), but it is measured against the walk's actual driver. Past
+/// it, a root whose every store is in the entry block (a string-handle global,
+/// an entry-cached capture cell) is still reloaded at every use a collection
+/// may precede, without a walk; only a root the body stores to keeps its IR
+/// and can still carry a stale register. tsc's module-body closure is past the
+/// cap (79k blocks x 101k root loads): before that fallback every cached scope
+/// cell address in it named the pre-collection object.
 const MAX_BLOCK_LOAD_PRODUCT: usize = 8_000_000;
 
 /// How long a derivation may get before the pass declines to re-materialise it.
@@ -631,9 +630,15 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             .push(i);
     }
 
-    if blocks.len().saturating_mul(groups.len()) > MAX_BLOCK_LOAD_PRODUCT {
-        return 0;
-    }
+    // Past the cap the per-load walk does not run. A root whose every store
+    // sits in the entry block still gets the rule, by an answer that needs no
+    // walk: the entry block has no predecessor, so no path from a load below
+    // those stores to a use crosses one (a string-handle global has no store
+    // here, an entry-cached capture cell has its one binding store), and every
+    // use outside the load's own block is taken as reachable from a collection
+    // point. The over-approximation only adds reloads, which LLVM forwards away
+    // where no call intervenes. A root stored to anywhere else keeps its IR.
+    let entry_stores_only = blocks.len().saturating_mul(groups.len()) > MAX_BLOCK_LOAD_PRODUCT;
 
     let succs: Vec<Vec<usize>> = facts
         .iter()
@@ -748,6 +753,59 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             .iter()
             .map(|&m| (values[m].reg.as_str(), m))
             .collect();
+        // One instruction can read several values of the same root
+        // — `js_object_set_field_by_name(recv, key, …)` when both
+        // came out of one slot. Each gets its own recipe; the
+        // application phase renames every operand of an instruction
+        // before inserting any of them.
+        let push_rewrites = |rewrites: &mut Vec<Rewrite>, f: &Facts, ub: usize, ui: usize| {
+            let mut seen_here: Vec<&str> = Vec::new();
+            for u in &f.uses {
+                let m = match by_use.get(u.as_str()) {
+                    Some(&m) => m,
+                    None => continue,
+                };
+                if seen_here.contains(&u.as_str()) {
+                    continue;
+                }
+                seen_here.push(u.as_str());
+                let recipe: Vec<LlInst> = values[m]
+                    .recipe
+                    .iter()
+                    .map(|&(rb, ri)| blocks[rb].insts()[ri].clone())
+                    .collect();
+                rewrites.push(Rewrite {
+                    blk: ub,
+                    insn: ui,
+                    from: values[m].reg.clone(),
+                    recipe,
+                });
+            }
+        };
+        // Every instruction that reads a member, in (block, index) order —
+        // the order a whole-function scan would reach them in.
+        let mut sites: Vec<(usize, usize)> = members
+            .iter()
+            .filter_map(|&m| use_at.get(values[m].reg.as_str()))
+            .flatten()
+            .copied()
+            .collect();
+        sites.sort_unstable();
+        sites.dedup();
+        if entry_stores_only {
+            if !stores.iter().all(|&(b, i)| b == 0 && (lb > 0 || i < li)) {
+                continue;
+            }
+            for (ub, ui) in sites {
+                if ub == lb && (ui <= li || !any_collect(&collect_at, ub, li + 1, ui)) {
+                    continue;
+                }
+                if !facts[ub][ui].is_phi {
+                    push_rewrites(&mut rewrites, &facts[ub][ui], ub, ui);
+                }
+            }
+            continue;
+        }
         // Forward reachability from the root load, never re-entering its own
         // block: a back edge re-executes the load, so the value on the far side
         // is a different dynamic instance and not this one.
@@ -792,16 +850,6 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             }
         }
 
-        // Every instruction that reads a member, in (block, index) order —
-        // the order a whole-function scan would reach them in.
-        let mut sites: Vec<(usize, usize)> = members
-            .iter()
-            .filter_map(|&m| use_at.get(values[m].reg.as_str()))
-            .flatten()
-            .copied()
-            .collect();
-        sites.sort_unstable();
-        sites.dedup();
         for (ub, ui) in sites {
             // Only blocks the load can reach without re-entering its own block,
             // plus the load's own block below the load.
@@ -827,33 +875,7 @@ pub(crate) fn apply_to_function(func: &mut LlFunction) -> usize {
             };
             let f = &facts[ub][ui];
             if c && !s && !f.is_phi {
-                // One instruction can read several values of the same root
-                // — `js_object_set_field_by_name(recv, key, …)` when both
-                // came out of one slot. Each gets its own recipe; the
-                // application phase renames every operand of an instruction
-                // before inserting any of them.
-                let mut seen_here: Vec<&str> = Vec::new();
-                for u in &f.uses {
-                    let m = match by_use.get(u.as_str()) {
-                        Some(&m) => m,
-                        None => continue,
-                    };
-                    if seen_here.contains(&u.as_str()) {
-                        continue;
-                    }
-                    seen_here.push(u.as_str());
-                    let recipe: Vec<LlInst> = values[m]
-                        .recipe
-                        .iter()
-                        .map(|&(rb, ri)| blocks[rb].insts()[ri].clone())
-                        .collect();
-                    rewrites.push(Rewrite {
-                        blk: ub,
-                        insn: ui,
-                        from: values[m].reg.clone(),
-                        recipe,
-                    });
-                }
+                push_rewrites(&mut rewrites, f, ub, ui);
             }
         }
     }

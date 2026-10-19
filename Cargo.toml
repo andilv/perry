@@ -14,6 +14,7 @@ members = [
     "crates/perry-transform",
     "crates/perry-codegen",
     "crates/perry-dispatch",
+    "crates/perry-runtime-manifest",
     "crates/perry-abi",
     "crates/perry-runtime",
     "crates/perry-ffi",
@@ -69,6 +70,7 @@ members = [
     "crates/perry-ui-testkit",
     "crates/perry-doc-tests",
     "crates/perry-updater",
+    "crates/perry-update-manifest",
     "crates/perry-runtime-static",
     "crates/perry-stdlib-static",
     "docs/examples/_fixtures/native-libraries/my-bindings",
@@ -365,7 +367,7 @@ codegen-units = 1
 codegen-units = 1
 
 [workspace.package]
-version = "0.5.1659"
+version = "0.5.1662"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PerryTS/perry"
@@ -428,24 +430,13 @@ regex = "1.12"
 aho-corasick = "1.1"
 memchr = "2"
 # The single regular-expression engine, through crates/perry-perex.
-# 0.1.13 adds perex::dfa, a lazy deterministic automaton over host-owned cache
-# storage that answers whether and where a program matches without
-# backtracking (program format 15: word 7 bit 25 marks eligible programs;
-# release commit c13fdc92af, per the crate's .cargo_vcs_info.json). Perry keeps
-# one cache in each program cell (regex/perex_owner.rs) and asks it for a
-# match's bounds before the evaluator runs (regex/perex_runtime.rs). It is
-# younger than the 7-day `global-min-publish-age` soak (.cargo/config.toml), so
-# Cargo.lock was resolved once with CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow
-# under an owner-approved one-time publish-age override (2026-10-09), for this
-# version only; the window itself is unchanged. No public API change from
-# 0.1.12 beyond the program format.
-# sha256 cce9fa3a84ee8c8c49873b937167a284f5446a67ace8eeac986bf9a97592f01e — the
-# checksum Cargo.lock records, verified against
-# https://crates.io/api/v1/crates/perex/0.1.13. As with turnloop above, the
-# opt-out is a committed, reviewable change, never a silent one, and the lock
-# pins the exact artifact. The override lapses on its own on 2026-10-16, when
-# 0.1.13 clears the window.
-perex = "0.1.13"
+# 0.1.14 adds exact bounded start-anchored literal execution (format 16):
+# immutable program instructions are compared with the original subject,
+# without a DFA cache, matcher scratch, or generated per-pattern native code.
+# Resolved once on 2026-10-18 with CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow
+# before this release clears the 7-day publish-age window. Cargo.lock pins the
+# verified registry artifact; the global window is unchanged.
+perex = "0.1.14"
 # turnloop P0/P1: the per-agent event-loop wait driver and, since P1, Perry's
 # stream sockets (docs/turnloop/p0-report.md, crates/perry-runtime/src/turnloop_net).
 # 0.1.0-alpha.3 switched turnloop's own dependency requirements from exact pins
@@ -592,6 +583,7 @@ perry-wpfacts = { path = "crates/perry-wpfacts" }
 perry-transform = { path = "crates/perry-transform" }
 perry-codegen = { path = "crates/perry-codegen" }
 perry-dispatch = { path = "crates/perry-dispatch" }
+perry-runtime-manifest = { path = "crates/perry-runtime-manifest" }
 perry-abi = { path = "crates/perry-abi", version = "0.5.1654" }
 # #1112: `perry-ffi` is published for external native wrappers. Its optional
 # `runtime-link` edge supplies runtime symbols to in-tree adapter tests.
@@ -599,7 +591,7 @@ perry-abi = { path = "crates/perry-abi", version = "0.5.1654" }
 # runtime wrappers can share identities without depending on perry-ffi.
 # `default-features = false` so dependency EDGES (perry-stdlib, ext crates, the
 # perry binary) don't force perry-runtime's heavy default features (`full`,
-# `regex-engine`, `temporal`, `url-engine`, `string-normalize`, `intl-segmenter`)
+# `regex-engine`, `temporal`, `url-engine`)
 # back on. The auto-optimize build selects perry-runtime with
 # `--no-default-features` and re-adds only what a given program needs (see
 # optimized_libs.rs), so an edge requesting defaults would defeat that (cargo
@@ -640,6 +632,8 @@ perry-native-registration = { path = "crates/perry-native-registration", version
 perry-ext-bcrypt = { path = "crates/perry-ext-bcrypt" }
 perry-ext-argon2 = { path = "crates/perry-ext-argon2" }
 perry-perex = { path = "crates/perry-perex" }
+# The sidecar format only (no analyzer): see crates/perry-gc-effects/Cargo.toml.
+perry-gc-effects = { path = "crates/perry-gc-effects", default-features = false }
 perry-ext-better-sqlite3 = { path = "crates/perry-ext-better-sqlite3" }
 perry-ext-zlib = { path = "crates/perry-ext-zlib" }
 perry-ext-cheerio = { path = "crates/perry-ext-cheerio" }
@@ -668,6 +662,7 @@ perry-codegen-wasm = { path = "crates/perry-codegen-wasm" }
 perry-ui-testkit = { path = "crates/perry-ui-testkit" }
 perry-audio-miniaudio = { path = "crates/perry-audio-miniaudio" }
 perry-updater = { path = "crates/perry-updater" }
+perry-update-manifest = { path = "crates/perry-update-manifest" }
 
 # Release codegen with debug assertions ON, for the GC root-scanning guards
 # that only exist under `cfg(debug_assertions)` — above all

@@ -15,6 +15,11 @@ pub type Atom = u32;
 pub type CallId = u32;
 pub type SiteId = u32;
 
+/// The atom of the element key (`Model::elem_key`).
+pub const ELEM: &str = "#elem";
+/// The atom of the iteration key (`Model::iter_key`).
+pub const ITER_ELEM: &str = "#iter";
+
 /// Token 0 is ⊤: a value produced or touched by code the analysis does not
 /// model. Its presence in a node means "any escaped object or anything else".
 pub const TOP: Tok = 0;
@@ -69,6 +74,10 @@ pub enum BuiltinNs {
     String,
     Boolean,
     Function,
+    /// `Map` / `WeakMap`: `new` builds a collection of the entries' contents.
+    Map,
+    /// `Set` / `WeakSet`: `new` builds a collection of the values.
+    Set,
     Other,
 }
 
@@ -177,6 +186,10 @@ pub struct FuncInfo {
     pub ret: NodeId,
     /// Holds every argument (the `arguments` object's elements + extra args).
     pub args_all: NodeId,
+    /// The body has an `arguments` object, the only reader of `args_all`:
+    /// calls feed `args_all` only then (a node nobody reads must not widen
+    /// and escape the arguments of a helper called with many objects).
+    pub has_arguments: bool,
     pub token: Tok,
     /// This function is the constructor of that class template.
     pub ctor_of: Option<TmplId>,
@@ -305,6 +318,12 @@ pub enum Cons {
     /// The node is `this` of a constructor of `class`: run the parent
     /// constructor chain for each instance (`super(...)`).
     SuperCtor { class: TmplId, call: CallId },
+    /// A live constructor-prototype candidate runs on the same derived receiver.
+    SuperCtorParent {
+        class: TmplId,
+        call: CallId,
+        origin: Tok,
+    },
     /// The node holds method closures installed on `recv` (literal methods):
     /// their `this` is `recv`.
     ThisFrom { recv: NodeId },
@@ -361,9 +380,17 @@ pub enum Cons {
     /// The node is a lookup's pass-holder set: accessors there run for
     /// `origin` (and later ones replay through `visits`); ⊤ there is an
     /// unknown prototype.
-    VisitHolders { origin: Tok, key: Key, act: ChainAct },
+    VisitHolders {
+        origin: Tok,
+        key: Key,
+        act: ChainAct,
+    },
     /// The node is a lookup's stop-holder set: accessors there run.
-    VisitStop { origin: Tok, key: Key, act: ChainAct },
+    VisitStop {
+        origin: Tok,
+        key: Key,
+        act: ChainAct,
+    },
 }
 
 impl Cons {
@@ -388,6 +415,7 @@ impl Cons {
             Cons::StoreTopProto { .. } => "storetopproto",
             Cons::Super { .. } => "super",
             Cons::SuperCtor { .. } => "superctor",
+            Cons::SuperCtorParent { .. } => "superctorparent",
             Cons::ThisFrom { .. } => "thisfrom",
             Cons::Accessor { .. } => "accessor",
             Cons::AccessorInstall { .. } => "accinstall",
@@ -413,7 +441,7 @@ impl Cons {
 pub struct Node {
     pub pts: Pts,
     pub prim: u16,
-    pub delta: Vec<Tok>,
+    pub delta: crate::delta::Delta,
     pub dprim: u16,
     pub succ: Vec<NodeId>,
     pub cons: Vec<Cons>,
@@ -428,7 +456,7 @@ pub struct Node {
     /// Successor set, once the list is long (exact edge dedup for hubs: a
     /// function's return node can be offered the same edge millions of
     /// times).
-    pub succ_set: Option<Box<crate::pts::FxHashSet<NodeId>>>,
+    pub succ_set: Option<std::rc::Rc<crate::pts::FxHashSet<NodeId>>>,
     /// Some successor was widened: every token reaching this node escapes
     /// (what that successor did with it), and the edge to it carries only
     /// primitive kinds from then on (`prim_succ`).
@@ -574,12 +602,31 @@ pub struct Model {
     /// E14: interpreted code can run (and patch `Object.prototype`).
     pub dyn_eval: Option<String>,
     pub bound_index: FxHashMap<(CallId, Tok), u32>,
+    /// Calls the solver makes through a bound value's target (`call_bound`,
+    /// `construct`): a bound target reached by one of them goes through
+    /// that bound value's one merged call (`Model::bound_merged`).
+    pub bound_synth: crate::pts::FxHashSet<CallId>,
+    /// (bound value, `new`) → its merged call.
+    pub bound_merged: FxHashMap<(u32, bool), CallId>,
     /// Lookups that visited a holder token: replayed when an accessor is
     /// installed on it later.
     pub visits: FxHashMap<Tok, crate::pts::FxHashSet<(Tok, Key, ChainAct)>>,
     /// An accessor was installed on `Object.prototype` while solving: every
     /// lookup in the program may run it. Kills every fact (derive).
     pub objproto_accessor: bool,
+    /// Why `%Function.prototype%.bind` (or the `name`/`length` it reads off
+    /// its target) may not be the builtin's own data property: the first
+    /// store, accessor, definition or deletion under one of those keys (or a
+    /// computed key) whose target may be a builtin prototype (collapsed into
+    /// `ObjectProto`) or a value from unmodeled code, which may hold any of
+    /// them. `None` after the solve: compiled code never writes them
+    /// ([`Model::note_fnproto_write`]).
+    pub fnproto_write: Option<u32>,
+    /// Targets of a possible [[Prototype]] write (TOP included).
+    pub super_relink: crate::pts::FxHashSet<Tok>,
+    /// Source constructor of a type-specialized instance layout (compiler data).
+    pub constructor_origins: FxHashMap<TmplId, TmplId>,
+    pub constructor_this_done: crate::pts::FxHashSet<(CallId, TmplId, Tok)>,
     /// Wall-clock budget on generation and solve; when exceeded the pass
     /// stops and the program gets no facts at all (every fact off: the
     /// sound fallback).
@@ -636,6 +683,56 @@ pub const NO_NODE: NodeId = u32::MAX;
 pub const SUPER_BIT: Tok = 1 << 31;
 
 impl Model {
+    /// Record a write under `key` onto `t` that may reach
+    /// `%Function.prototype%`'s `bind`, `name` or `length`
+    /// ([`Model::fnproto_write`]). `key` `None`: an operation whose key the
+    /// model does not keep (a definition, a deletion).
+    pub fn note_fnproto_write(&mut self, t: Tok, key: Option<Key>, what: &str) {
+        if self.fnproto_write.is_some()
+            || !(t == TOP || matches!(self.toks[t as usize], TokKind::ObjectProto))
+        {
+            return;
+        }
+        let hits = match key {
+            None | Some(Key::Any) => true,
+            Some(Key::Named(a)) => matches!(
+                self.atoms[a as usize].as_str(),
+                "bind" | "name" | "length" | crate::STAR_KEY
+            ),
+        };
+        if hits {
+            let on = if t == TOP {
+                "a value from unmodeled code"
+            } else {
+                "a builtin prototype"
+            };
+            self.fnproto_write = Some(self.reason(&format!("{what} on {on}")));
+        }
+    }
+
+    /// The element key: an element read of an array-like (iteration, array
+    /// callbacks) sees its elements, not the builtin methods a computed key
+    /// could also name; on anything else it is a computed read (`Key::Any`).
+    pub fn elem_key(&mut self) -> Key {
+        Key::Named(self.atom(ELEM))
+    }
+
+    pub fn is_elem_key(&self, k: Key) -> bool {
+        matches!(k, Key::Named(a) if self.atoms[a as usize] == ELEM)
+    }
+
+    /// The iteration key: what iterating a value yields WITHOUT its
+    /// protocol (`Gen::iterate` models `[Symbol.iterator]().next().value`
+    /// beside it): an array-like's elements; a program object or function
+    /// yields nothing that way; a runtime object is a computed read.
+    pub fn iter_key(&mut self) -> Key {
+        Key::Named(self.atom(ITER_ELEM))
+    }
+
+    pub fn is_iter_key(&self, k: Key) -> bool {
+        matches!(k, Key::Named(a) if self.atoms[a as usize] == ITER_ELEM)
+    }
+
     pub fn atom(&mut self, s: &str) -> Atom {
         if let Some(&a) = self.atom_index.get(s) {
             return a;
@@ -666,6 +763,16 @@ impl Model {
         self.reasons.push(s.to_string());
         self.reason_index.insert(s.to_string(), r);
         r
+    }
+
+    pub fn constructor_origin(&self, mut class: TmplId) -> TmplId {
+        for _ in 0..self.constructor_origins.len() {
+            let Some(&origin) = self.constructor_origins.get(&class) else {
+                break;
+            };
+            class = origin;
+        }
+        class
     }
 
     pub fn tok(&mut self, k: TokKind) -> Tok {
@@ -818,11 +925,12 @@ impl Model {
         }
         for (i, f) in self.funcs.iter().enumerate() {
             out.push(format!(
-                "M func {i} tok={} this={} ret={} args={} rest={} lexical={} ctor_of={} params={}",
+                "M func {i} tok={} this={} ret={} args={} arguments={} rest={} lexical={} ctor_of={} params={}",
                 f.token,
                 f.this,
                 f.ret,
                 f.args_all,
+                f.has_arguments as u8,
                 f.rest.map(|r| r.to_string()).unwrap_or_else(|| "-".into()),
                 f.lexical_this as u8,
                 f.ctor_of

@@ -1,14 +1,11 @@
 //! AST to HIR module-declaration lowering, with topical helpers split into
 //! sibling modules.
-
+use super::*;
+use crate::ir::*;
 use crate::types::{LocalId, Type};
 use anyhow::Result;
 use swc_common::Spanned;
 use swc_ecma_ast as ast;
-
-use super::*;
-use crate::ir::*;
-
 mod default_export_binding;
 mod namespace;
 pub(super) mod native_default_import;
@@ -21,7 +18,7 @@ mod typescript;
 // resolving. `lower_namespace_as_class` is also called from `lower/stmt.rs`.
 use default_export_binding::default_export_function_binding;
 pub(super) use default_export_binding::mark_exported_function_bodies;
-pub(crate) use namespace::lower_namespace_as_class;
+pub(crate) use namespace::{lower_namespace, pre_register_module_namespaces};
 use native_default_import::{
     canonicalize_native_import_source, is_cjs_style_native_default_import,
     node_submodule_default_export_key,
@@ -330,7 +327,7 @@ pub(crate) fn lower_module_decl(
                                         .into_iter()
                                         .map(|member| EnumMember {
                                             name: member.name.to_string(),
-                                            value: EnumValue::Number(member.value),
+                                            value: EnumValue::Number(member.value as f64),
                                         })
                                         .collect();
                                     let member_values = members
@@ -1383,6 +1380,13 @@ pub(crate) fn lower_module_decl(
                 ast::Decl::TsEnum(enum_decl) => {
                     let en = lower_enum_decl(ctx, enum_decl, true)?;
                     let enum_name = en.name.clone();
+                    if !enum_decl.declare {
+                        if let Some((_, bind)) =
+                            crate::lower_decl::enum_value_binding(ctx, &enum_name, true, &en.members, enum_decl)?
+                        {
+                            module.init.push(bind);
+                        }
+                    }
                     module.enums.push(en);
                     module.exported_objects.push(enum_name.clone());
                     module.exports.push(Export::Named {
@@ -1408,26 +1412,8 @@ pub(crate) fn lower_module_decl(
                         exported: alias_name,
                     });
                 }
-                ast::Decl::TsModule(ts_module)
-                    // export namespace X { ... } — lower as a synthetic class with static members
-                    if !ts_module.declare => {
-                        if let Some(ref body) = ts_module.body {
-                            let ns_name = match &ts_module.id {
-                                ast::TsModuleName::Ident(ident) => ident.sym.to_string(),
-                                ast::TsModuleName::Str(s) => {
-                                    s.value.as_str().unwrap_or("").to_string()
-                                }
-                            };
-                            let class =
-                                lower_namespace_as_class(ctx, module, &ns_name, body, true)?;
-                            let class_name = class.name.clone();
-                            push_class_dedup(module, class);
-                            module.exports.push(Export::Named {
-                                local: class_name.clone(),
-                                exported: class_name,
-                            });
-                        }
-                    }
+                // export namespace X { ... } — a plain object, as tsc emits it
+                ast::Decl::TsModule(ts_module) => lower_namespace(ctx, module, ts_module, true)?,
                 _ => {}
             }
         }
@@ -1992,4 +1978,67 @@ pub(crate) fn lower_module_decl(
         }
     }
     Ok(())
+}
+
+/// `import G = Ns.Member` (an entity name, not `require`) is the declaration
+/// tsc emits for it: `var G = Ns.Member`, or `export var` for `export import`.
+/// A namespace is an ordinary object (#12775). Rewritten before any pass, so
+/// the hoisting pre-scan, export registration and lowering all see an
+/// ordinary `var`. `None` (no such alias) lowers the original with no clone.
+pub(crate) fn rewrite_import_equals_aliases(ast_module: &ast::Module) -> Option<ast::Module> {
+    let is_alias = |item: &ast::ModuleItem| {
+        matches!(
+            item,
+            ast::ModuleItem::ModuleDecl(ast::ModuleDecl::TsImportEquals(d))
+                if !d.is_type_only && matches!(d.module_ref, ast::TsModuleRef::TsEntityName(_))
+        )
+    };
+    if !ast_module.body.iter().any(is_alias) {
+        return None;
+    }
+    let mut out = ast_module.clone();
+    for item in &mut out.body {
+        let ast::ModuleItem::ModuleDecl(ast::ModuleDecl::TsImportEquals(d)) = item else {
+            continue;
+        };
+        let ast::TsModuleRef::TsEntityName(entity) = &d.module_ref else {
+            continue;
+        };
+        if d.is_type_only {
+            continue;
+        }
+        let var = ast::Decl::Var(Box::new(ast::VarDecl {
+            span: d.span,
+            ctxt: Default::default(),
+            kind: ast::VarDeclKind::Var,
+            declare: false,
+            decls: vec![ast::VarDeclarator {
+                span: d.span,
+                name: ast::Pat::Ident(d.id.clone().into()),
+                init: Some(Box::new(ts_entity_expr(entity))),
+                definite: false,
+            }],
+        }));
+        *item = if d.is_export {
+            ast::ModuleItem::ModuleDecl(ast::ModuleDecl::ExportDecl(ast::ExportDecl {
+                span: d.span,
+                decl: var,
+            }))
+        } else {
+            ast::ModuleItem::Stmt(ast::Stmt::Decl(var))
+        };
+    }
+    Some(out)
+}
+
+/// `A.B.C` of a TypeScript entity name as the member expression it reads.
+fn ts_entity_expr(entity: &ast::TsEntityName) -> ast::Expr {
+    match entity {
+        ast::TsEntityName::Ident(ident) => ast::Expr::Ident(ident.clone()),
+        ast::TsEntityName::TsQualifiedName(q) => ast::Expr::Member(ast::MemberExpr {
+            span: q.span,
+            obj: Box::new(ts_entity_expr(&q.left)),
+            prop: ast::MemberProp::Ident(q.right.clone()),
+        }),
+    }
 }

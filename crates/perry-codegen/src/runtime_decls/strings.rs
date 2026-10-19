@@ -218,6 +218,13 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_closure_alloc", I64, &[PTR, I32]);
     module.declare_function("js_closure_alloc_empty", I64, &[PTR, I32]);
     module.declare_function("js_closure_alloc_fixed", I64, &[PTR, I64, PTR]);
+    // A run of closure births walked from a rodata table into scope slots
+    // (`closure_births`).
+    module.declare_function(
+        "js_closure_births_to_scope",
+        VOID,
+        &[PTR, I32, PTR, I32, PTR, I32],
+    );
     module.declare_function("js_closure_alloc_init", I64, &[PTR, I32, PTR]);
     module.declare_function("js_closure_alloc_init_boxed", I64, &[PTR, I32, PTR]);
     module.declare_function("js_closure_alloc_small", I64, &[PTR, I64, I64, I64, I64]);
@@ -741,11 +748,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Array-subclass IC tower and the lazy-JSON-array probe, each of which was
     // an acceleration of a decision this helper already makes — and it is
     // handed the SAME site cache slot, so the primed words are unchanged.
-    module.declare_function(
-        "js_packed_arraylike_index_get",
-        DOUBLE,
-        &[DOUBLE, DOUBLE, PTR],
-    );
+    module.declare_function("js_packed_arraylike_index_get", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function(
         "js_packed_arraylike_loop_guard",
         I32,
@@ -1130,7 +1133,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function(
         "js_arguments_call_spread",
         DOUBLE,
-        &[DOUBLE, PTR, DOUBLE, I64, DOUBLE, DOUBLE],
+        &[DOUBLE, DOUBLE, I64, DOUBLE, DOUBLE],
     );
     module.declare_function(
         "js_arguments_forward_apply",
@@ -1208,13 +1211,6 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // element-shape loop clone's shape-keyed preheader resolves each tracked
     // property once against the shape the runtime just proved.
     module.declare_function("js_shape_ordinary_inline_slot_for_key", I32, &[I32, I64]);
-    // Step 4b stage 1: pack a read region's guard word (ShapeId + each key's
-    // inline slot) on a region miss. `(shape_id, n, k0..k4) -> word`.
-    module.declare_function(
-        "js_region_guard_prime",
-        I64,
-        &[PTR, I32, I32, I64, I64, I64, I64, I64],
-    );
     // Step 4b loop regions: the store-licensing twin (attribute summary 0).
     module.declare_function(
         "js_region_loop_prime",
@@ -1239,8 +1235,18 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[I64, I32, PTR, I32, I32, I32, I32, I64, PTR, I32],
     );
     module.declare_function("perry_alloc_layout", PTR, &[PTR]);
+    module.declare_function("perry_alloc_class_family", PTR, &[PTR, I32, I32]);
+    module.declare_function(
+        "perry_function_family_symbol_set",
+        DOUBLE,
+        &[PTR, I32, DOUBLE, DOUBLE, DOUBLE, I32],
+    );
     module.declare_function("perry_create_family", DOUBLE, &[PTR, DOUBLE]);
-    module.declare_function("perry_bind_family_prototype", VOID, &[PTR, DOUBLE]);
+    module.declare_function(
+        "perry_bind_family_prototype",
+        DOUBLE,
+        &[PTR, DOUBLE, PTR, PTR, I32],
+    );
     // `PERRY_CHECK_CONTRACTS` builds only.
     module.declare_function("js_create_family_contract_check", VOID, &[PTR, DOUBLE]);
     module.declare_function("js_shape_seed_plain", I32, &[I32, PTR, I32, I32, I32, I64]);
@@ -1555,6 +1561,12 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // at decl time, so `super()` resolves the parent from the module-init scope
     // instead of re-evaluating its extends expression in the constructor scope.
     module.declare_function("js_get_dynamic_parent_value", DOUBLE, &[I32]);
+    module.declare_function("js_class_super_parent", DOUBLE, &[I32]);
+    module.declare_function(
+        "js_class_super_construct_apply",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE],
+    );
     // Decl-site snapshot of a function-nested class's captured locals —
     // consumed by the dynamic-construction replay (`new mod.C()`).
     module.declare_function("js_class_register_capture_values", VOID, &[I32, PTR, I64]);

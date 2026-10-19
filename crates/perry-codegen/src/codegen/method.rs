@@ -628,6 +628,10 @@ pub(super) fn compile_method(
         program_layouts: cross_module.program_layouts.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
+        wpfacts_off: false,
+        inline_new_leaf: Vec::new(),
+        ctor_receiver: None,
+        ctor_receiver_selector: None,
         wpfacts_this: vec![(this_slot.clone(), method.id)],
         this_stack: vec![this_slot],
         super_called_stack: Vec::new(),
@@ -748,7 +752,6 @@ pub(super) fn compile_method(
         i32_counter_slots: index_i32_param_slots,
         record_packed_admissions: std::collections::HashMap::new(),
         numeric_accumulator_f64_slots: HashMap::new(),
-        transition_cache_base_slot: None,
         receiver_descriptors: Default::default(),
         poll_stride_counter_slot: None,
         deferred_integer_update_accumulators: HashSet::new(),
@@ -771,6 +774,7 @@ pub(super) fn compile_method(
         spec_i32_params: index_param_ids.clone(),
         spec_bool_params: std::collections::HashSet::new(),
         typed_element_locals: std::collections::HashSet::new(),
+        create_families: Default::default(),
         class_guard_window: None,
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
@@ -785,7 +789,6 @@ pub(super) fn compile_method(
         imported_vars: &cross_module.imported_vars,
         imported_object_literals: &cross_module.imported_object_literals,
         short_spread_method_candidates: &cross_module.short_spread_method_candidates,
-        program_class_accessor_names: cross_module.program_class_accessor_names.as_deref(),
         object_literal_method_candidates: &cross_module.object_literal_method_candidates,
         compile_time_constants: native_facts.compile_time_constants(),
         target_triple: &cross_module.target_triple,
@@ -859,6 +862,7 @@ pub(super) fn compile_method(
         was_unrolled: method.was_unrolled,
         ic_site_counter: ic_base,
         ic_globals: Vec::new(),
+        born_let: None,
         typed_parse_rodata: Vec::new(),
         buffer_data_slots: HashMap::new(),
         native_arena_owner_aliases: HashMap::new(),
@@ -946,9 +950,20 @@ pub(super) fn compile_method(
     // applies initializers against the imported class stub — which has none
     // — so without this, imported classes construct with all fields left
     // as uninitialized register values (read as NaN-boxed undefined).
+    if method.name == format!("{}_default_fields", class.name) {
+        crate::lower_call::apply_field_initializers_recursive(
+            &mut ctx,
+            &class.name,
+            crate::lower_call::FieldInitMode::SelfOnly,
+        )?;
+    }
     let is_constructor_method = method.name == format!("{}_constructor", class.name);
     if is_constructor_method {
-        crate::lower_call::defer_dynamic_derived_fields(&mut ctx, class);
+        ctx.ctor_receiver = ctx
+            .this_stack
+            .first()
+            .map(|slot| (slot.clone(), class.name.clone()));
+        let live_super = crate::expr::super_constructor::requires_live(&ctx, class);
         // #9043: a default-derived chain can reach a dynamic parent through a
         // constructor-free static ancestor (`Leaf -> Mid -> <captured Base>`).
         // Keep the owner of that dynamic edge so this standalone Leaf symbol
@@ -1007,7 +1022,7 @@ pub(super) fn compile_method(
         } else {
             None
         };
-        if dynamic_parent_owner.is_none() && local_parent_ctor.is_none() {
+        if !live_super && dynamic_parent_owner.is_none() && local_parent_ctor.is_none() {
             let init_mode = if class.extends_name.is_some() {
                 crate::lower_call::FieldInitMode::AncestorsOnly
             } else if class.extends_expr.is_some() {
@@ -1042,7 +1057,17 @@ pub(super) fn compile_method(
         // call to the parent's standalone ctor symbol here, forwarding all
         // args. The walk skips empty-bodied parents (matching the JS spec
         // chain semantics).
+        if class.constructor.is_none() && live_super {
+            let forwarded: Vec<perry_hir::Expr> = method
+                .params
+                .iter()
+                .filter(|p| !p.name.starts_with("__perry_cap_"))
+                .map(|p| perry_hir::Expr::LocalGet(p.id))
+                .collect();
+            crate::expr::checked_super::default_call(&mut ctx, class, &forwarded)?;
+        }
         if class.constructor.is_none()
+            && !live_super
             && (class.extends_name.is_some() || class.extends_expr.is_some())
         {
             let builtin_parent_runtime = builtin_stream_parent_runtime(class);
@@ -1572,6 +1597,8 @@ pub(super) fn compile_method(
                 || class.extends_name.is_some()
                 || class.native_extends.is_some()
                 || class.extends_expr.is_some(),
+            family_run: None,
+            bind_watch: None,
         };
         ctx.inline_ctor_return.push(target.clone());
         Some((target, after_idx))
@@ -1605,7 +1632,8 @@ pub(super) fn compile_method(
     // object" and handing back the value the caller already held. Publish only
     // when a replacement `this` can actually exist.
     let publishes_this = standalone_ctor_return.is_some()
-        && crate::lower_call::ctor_chain_can_replace_this(ctx.classes, &class.name);
+        && (crate::expr::super_constructor::requires_live(&ctx, class)
+            || crate::lower_call::ctor_chain_can_replace_this(ctx.classes, &class.name));
     if let Some((target, after_idx)) = standalone_ctor_return.as_ref() {
         let _ = ctx
             .inline_ctor_return

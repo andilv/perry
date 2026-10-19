@@ -1,9 +1,6 @@
-//! Generic monomorphic-IC property-get dispatch extracted from
-//! `property_get.rs`.
-//!
-//! Pure mechanical move — body is the verbatim tail of the general catch-all
-//! arm (the receiver-tag guard + SSO/class-ref/PIC/invalid diamond), lifted
-//! into its own function.
+//! Ordinary property-get dispatch: static family slots, coloured layout
+//! slots, then the receiver layout's probe and complete property semantics.
+//! These read paths allocate no learned per-site state.
 
 use super::*;
 
@@ -13,28 +10,6 @@ use perry_hir::Expr;
 use crate::nanbox::POINTER_MASK_I64;
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
-/// Words in a per-site property-read cache.
-///
-/// **Must equal `perry_runtime::object::field_get_set::PIC_CACHE_WORDS`.**
-/// Since #9708 codegen emits only the 8-byte slot (`@perry_ic_N = private
-/// global ptr null`) and the runtime allocates the words itself, sized from
-/// its own `PicCache` — so the constant is no longer an emission width, but
-/// the runtime's miss entry reads its ways at `PIC_WAY_BASE + PIC_WAYS * 2`
-/// words, which the pairing tests keep inside that allocation. perry-codegen does not depend on
-/// perry-runtime (the same reason `INLINE_SLOT_FLOOR` is duplicated in
-/// `target_layout`), so the pairing is held by `pic_cache_layout_matches_runtime`
-/// here and `pic_cache_words_match_codegen` in the runtime: change one and both
-/// fail.
-#[cfg(test)]
-pub(crate) const PIC_CACHE_WORDS: usize = 21;
-/// First word of the polymorphic way array (words 0..2 are the MRU entry and
-/// word 3 is the gate). Mirrors the runtime's `PIC_WAY_BASE`.
-#[cfg(test)]
-pub(crate) const PIC_WAY_BASE: usize = 4;
-/// `(token, slot)` ways beyond the MRU entry; a site resolves `PIC_WAYS + 1`
-/// shapes inline. Mirrors the runtime's `PIC_WAYS`.
-#[cfg(test)]
-pub(crate) const PIC_WAYS: usize = 4;
 /// A SPILL-located key publishes its ShapeId into the compact word with this
 /// bit flipped. **Must equal `PACKED_SPILL_FLIP` in the runtime.**
 ///
@@ -298,8 +273,7 @@ pub(crate) fn probe_then_value(
     )
 }
 
-/// The generic per-site monomorphic inline-cache dispatch for `obj.property`.
-/// This is the fall-through tail of the general catch-all arm: all earlier
+/// The ordinary layout-probe dispatch for `obj.property`, after earlier
 /// specializations have been ruled out.
 pub(crate) fn lower_generic_property_get(
     ctx: &mut FnCtx<'_>,
@@ -314,9 +288,8 @@ pub(crate) fn lower_generic_property_get(
 /// predicts (`class_field_predicted_shape`). The site is the property site
 /// with its word replaced by that ShapeId: the receiver test, the receiver's
 /// ShapeId against the class's, one load of the layout's slot. Everything
-/// else, any receiver not on that shape included, is one call of the complete
-/// site operation (`js_object_get_field_ic`, the same helper the outlined
-/// site calls). Inside a class-guard run (`class_guard_memo`) a read of a
+/// else, any receiver not on that shape included, takes the layout probe and
+/// complete property read. Inside a class-guard run (`class_guard_memo`) a read of a
 /// receiver whose proof an earlier site of the run set tests the run's flag
 /// first.
 pub(crate) fn lower_class_field_property_get(
@@ -335,6 +308,23 @@ pub(crate) fn lower_class_field_property_get(
     }
     crate::expr::note_site("case2-class");
     let obj_box = lower_expr(ctx, object)?;
+    let family = crate::expr::class_family_read::begin(ctx, object, property, &obj_box);
+    let value =
+        lower_predicted_class_field_get(ctx, object, property, byte_offset, predicted, obj_box)?;
+    Ok(match family {
+        Some(arm) => crate::expr::class_family_read::finish(ctx, arm, &value),
+        None => value,
+    })
+}
+
+fn lower_predicted_class_field_get(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    byte_offset: u32,
+    predicted: crate::expr::class_field_inline_guard::PredictedShape,
+    obj_box: String,
+) -> Result<String> {
     // Same location record as the generic site (see `lower_property_site`).
     crate::expr::calls::emit_call_location_at(ctx, byte_offset);
     let key_idx = ctx.strings.intern(property);
@@ -467,7 +457,7 @@ fn lower_property_site(
     let obj_box = lower_expr(ctx, object)?;
     // #5247: record this access's source location right after the receiver is
     // evaluated and before the nullish-receiver throw path (the inline diamond
-    // OR the full-outline `js_object_get_field_ic` helper — both throw "Cannot
+    // OR the outlined property helper — both throw "Cannot
     // read properties of null/undefined"). No-op unless compiled with
     // `--debug-symbols` (the offset resolves to `None` without the debug
     // context) or when `byte_offset` is 0 (a synthesized node). Emitted after
@@ -482,15 +472,29 @@ fn lower_property_site(
     // receiver tests the receiver layout's colour bit and loads the colour
     // slot (`expr/layout_read.rs`); everything else, and every miss, is the
     // site below.
+    let family = global_reference
+        .is_none()
+        .then(|| crate::expr::class_family_read::begin(ctx, object, property, &obj_box))
+        .flatten();
     let arm = if global_reference.is_none() {
         let bits = ctx.block().bitcast_double_to_i64(&obj_box);
         crate::expr::layout_read::begin(ctx, &bits, property)
     } else {
         None
     };
+    let _decision = arm.as_ref().map(|_| {
+        crate::fallback_diag::decision(
+            "receiver layout has no admitted colour/presence slot at runtime",
+            "layout-word/colour-mask/presence check",
+        )
+    });
     let value = lower_property_site_tail(ctx, object, property, global_reference, obj_box)?;
-    Ok(match arm {
+    let value = match arm {
         Some(arm) => crate::expr::layout_read::finish(ctx, arm, &value),
+        None => value,
+    };
+    Ok(match family {
+        Some(arm) => crate::expr::class_family_read::finish(ctx, arm, &value),
         None => value,
     })
 }
@@ -813,18 +817,14 @@ fn lower_property_site_tail(
 
     // §3.7 case 3: the receiver's own layout answers (`perry_probe_get`,
     // perry-runtime `object/layout_probe.rs`) from the key's atom and its
-    // compile-time hash. A `length` site passes the runtime's empty directory
-    // (an Array subclass serves `length` from its elements store, which no
-    // key list names), so its probe declines to the complete read.
-    let dir = if inline_string_length {
-        EMPTY_SHAPE_DIR.to_string()
-    } else {
-        crate::expr::agent_ptr::emit_agent_ptr_or(
-            ctx,
-            crate::runtime_abi::AGENT_PTR_SHAPE_DIR,
-            EMPTY_SHAPE_DIR,
-        )
-    };
+    // compile-time hash. A `length` site asks `perry_probe_get_length`,
+    // which declines an Array subclass instance (it serves `length` from its
+    // elements store, which no key list names) to the complete read.
+    let dir = crate::expr::agent_ptr::emit_agent_ptr_or(
+        ctx,
+        crate::runtime_abi::AGENT_PTR_SHAPE_DIR,
+        EMPTY_SHAPE_DIR,
+    );
     let probe_recv = match fused_recv.as_ref() {
         Some(f) => f.biased.clone(),
         None => ctx.block().sub(
@@ -836,15 +836,20 @@ fn lower_property_site_tail(
     let key_box = ctx.block().load(DOUBLE, &key_handle_global);
     let key_bits = ctx.block().bitcast_double_to_i64(&key_box);
     let hash = (crate::layout_desc::atom_hash(property) as i64).to_string();
-    // An array-index name may be an element key, which no layout lists: such
-    // a site takes only answers the probe finds, never absence.
+    // An array-index name may be an element key, which no layout lists, and a
+    // private name (`#x` after its brand guard) may be a method or accessor of
+    // the declaring ClassBody, which no layout lists either: such a site takes
+    // only answers the probe finds, never absence.
     let index_name = !property.is_empty() && property.bytes().all(|b| b.is_ascii_digit());
+    let private_name = property.starts_with('#');
     crate::expr::note_site("probe");
     let answered = ctx.block().call(
         DOUBLE,
         // A global binding must tell absent from `undefined`.
-        if global_binding || index_name {
+        if global_binding || index_name || private_name {
             "perry_probe_get_binding"
+        } else if inline_string_length {
+            "perry_probe_get_length"
         } else {
             "perry_probe_get"
         },

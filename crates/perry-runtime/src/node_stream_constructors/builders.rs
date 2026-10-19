@@ -110,11 +110,6 @@ pub extern "C" fn js_node_stream_readable_new(opts: f64) -> f64 {
         StreamInit::Direct,
         proof,
     );
-    super::birth_memo::remember_direct(
-        readable.get_nanbox_f64(),
-        proof,
-        super::birth::Kind::Readable,
-    );
     readable.get_nanbox_f64()
 }
 
@@ -286,7 +281,17 @@ pub extern "C" fn js_array_subclass_init(this: f64, n: f64) -> f64 {
     if unsafe { gc_type_for_ptr(raw) } != Some(crate::gc::GC_TYPE_OBJECT) {
         return this;
     }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let this_root = scope.root_nanbox_f64(this);
     let obj = raw as *mut ObjectHeader;
+    unsafe {
+        crate::object::shapes::transition_object_shape_add_brand(
+            obj,
+            crate::array::ARRAY_EXOTIC_BRAND,
+        );
+    }
+    let this = this_root.get_nanbox_f64();
+    let obj = raw_ptr_from_value(this) as *mut ObjectHeader;
     // ToLength(n): undefined / NaN / <= 0 → 0; +Infinity (and any value past the
     // max array length) clamps to 2^53 - 1; otherwise floor(n).
     let len = {
@@ -453,11 +458,6 @@ pub extern "C" fn js_node_stream_writable_new(opts: f64) -> f64 {
         opts.get_nanbox_f64(),
         StreamInit::Direct,
         proof,
-    );
-    super::birth_memo::remember_direct(
-        writable.get_nanbox_f64(),
-        proof,
-        super::birth::Kind::Writable,
     );
     writable.get_nanbox_f64()
 }
@@ -632,15 +632,6 @@ fn new_duplex_kind(opts: f64, kind: DuplexKind) -> f64 {
             proof,
         ),
     }
-    super::birth_memo::remember_direct(
-        stream.get_nanbox_f64(),
-        proof,
-        match kind {
-            DuplexKind::Duplex => super::birth::Kind::Duplex,
-            DuplexKind::Transform => super::birth::Kind::Transform,
-            DuplexKind::PassThrough => super::birth::Kind::PassThrough,
-        },
-    );
     stream.get_nanbox_f64()
 }
 
@@ -774,7 +765,8 @@ fn init_transform_kind(
                 let hook = scope.root_nanbox_f64(unsafe {
                     name.read_object(object_ptr_from_value(t()).unwrap())
                 });
-                if is_callable_value(hook.get_nanbox_f64()) {
+                // `Transform.prototype._final` is node's, not the binding's.
+                if crate::node_stream::user_hook_value(hook.get_nanbox_f64()).is_some() {
                     set_hidden_value(t(), slot, hook.get_nanbox_f64());
                 }
             }

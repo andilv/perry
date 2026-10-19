@@ -112,10 +112,10 @@ pub(crate) use mutation::{
     has_any_mutation,
 };
 pub(crate) use number_by_construction::collect_number_by_construction_locals;
-pub(crate) use object_create_proto::{
-    object_create_bindings, object_create_protos, ObjectCreateProtos,
+pub(crate) use object_create_proto::{object_create_protos, ObjectCreateProtos};
+pub(crate) use object_literal_exports::{
+    exported_object_literal_capabilities, object_literal_facts,
 };
-pub(crate) use object_literal_exports::exported_object_literal_capabilities;
 pub(crate) use param_ranges::{collect_param_int_ranges, ParamIntRanges};
 pub(crate) use pointer_locals::collect_pointer_typed_locals;
 pub(crate) use proven_args::{
@@ -161,4 +161,5 @@ pub(crate) use spec_abi_sites::{
 pub(crate) use straight_line_stores::count_straight_line_store_sites;
 pub(crate) use this_as_value::{
     class_chain_extends_builtin_error, class_chain_has_unmodeled_base, class_uses_this_as_value,
+    inlined_constructor,
 };

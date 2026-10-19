@@ -12,12 +12,12 @@ use super::CompilationContext;
 mod driver;
 mod features;
 mod paths;
-mod prebuilt_core;
 mod wrapper_libs;
 
 pub(crate) use driver::build_optimized_libs;
 pub(crate) use features::{
-    auto_optimized_cross_features, gc_instruments_requested, gc_trace_requested, hot_diag_requested,
+    auto_optimized_cross_features, gc_instruments_requested, gc_trace_requested,
+    hot_diag_requested, instrumented_variant_requested, variant_archive_name,
 };
 
 pub(crate) use paths::android_global_dynamic_tls_rustflag;
@@ -26,10 +26,6 @@ pub(crate) use paths::android_global_dynamic_tls_rustflag;
 mod tests;
 
 pub struct OptimizedLibs {
-    /// The runtime archive chosen for this program before codegen: the
-    /// packaged core archive (`prebuilt_core`) when one applies. `None` links
-    /// the default prebuilt `libperry_runtime.a` (or `perry_runtime.lib`).
-    pub runtime: Option<PathBuf>,
     /// The prebuilt wrapper archives (#466 Phase 4), one per well-known native
     /// binding the program's routed modules link.
     pub well_known_libs: Vec<PathBuf>,
@@ -41,15 +37,13 @@ pub struct OptimizedLibs {
     /// `perry_stdlib_feature_installer` calls (see `stdlib_installs.rs`).
     pub stdlib_installs: crate::commands::stdlib_installs::FeatureInstalls,
     /// Which runtime feature installs the generated installer calls; the
-    /// runtime counterpart of `stdlib_installs`. `Compiled` for the core
-    /// archive, which has no optional features to select.
+    /// runtime counterpart of `stdlib_installs`.
     pub runtime_installs: crate::commands::stdlib_installs::FeatureInstalls,
 }
 
 impl OptimizedLibs {
     pub(super) fn empty() -> Self {
         OptimizedLibs {
-            runtime: None,
             well_known_libs: Vec::new(),
             prefer_well_known_before_stdlib: false,
             stdlib_installs: crate::commands::stdlib_installs::FeatureInstalls::Compiled,
@@ -183,10 +177,10 @@ pub(crate) fn missing_ext_archive_diagnostics(
         let Some(binding) = super::well_known::lookup_well_known(owner) else {
             continue;
         };
-        let filename = super::well_known::ext_staticlib_filename(
+        let filename = variant_archive_name(&super::well_known::ext_staticlib_filename(
             &binding.lib,
             super::rust_target_triple(target),
-        );
+        ));
         if resolved_ext_libs
             .iter()
             .any(|path| path.file_name() == Some(OsStr::new(&filename)))

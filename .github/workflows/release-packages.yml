@@ -56,14 +56,6 @@ concurrency:
   group: release-packages-${{ github.event.release.tag_name || inputs.existing_tag || ((inputs.cut_release || inputs.nightly) && inputs.candidate_sha) || github.run_id }}
   cancel-in-progress: false
 
-# Shipped runtime archives carry no GC/diagnostic instruments: perry-runtime's
-# build script compiles them out when this is set (see its
-# `emit_instrument_cfgs`). Every cargo build in these jobs sees it, including
-# the per-ext-crate invocations that rebuild the runtime, so all shipped
-# archives share one feature set (#6303). The container builds pass it through.
-env:
-  PERRY_RELEASE_STRIP_INSTRUMENTS: "1"
-
 jobs:
   # ---------------------------------------------------------------------------
   # Resolve the run mode + release tag ONCE, up front. Every downstream job
@@ -824,10 +816,6 @@ jobs:
           cp "target-abort/${{ matrix.target }}/prod/libperry_runtime.a" \
              "target/${{ matrix.target }}/prod/libperry_runtime_abort.a"
 
-      - name: Build core runtime profile (Unix)
-        if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
-        run: bash scripts/build_core_runtime.sh '${{ matrix.target }}'
-
       - name: Build native ext libraries (Unix)
         # #2532 — the perry-ext-* wrapper crates ship the host functions for
         # node:http (server), ws, net, zlib, fastify, the db drivers, etc.
@@ -875,6 +863,12 @@ jobs:
             --tag perry-glibc-2.31-llvm22 \
             --file scripts/linux-glibc-2.31.Dockerfile \
             .
+          # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
+          # the runner (a static musl binary): hand the container that binary
+          # and its object store.
+          mbx_bin=$(command -v mbx)
+          mbx_cache=$(mbx cache dir)
+          mkdir -p "$mbx_cache"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --env HOME=/tmp/perry-home \
@@ -884,9 +878,11 @@ jobs:
             --env CARGO_TARGET_DIR=/work/target-glibc231 \
             --env PERRY_ABORT_TARGET_DIR=/work/target-glibc231-abort \
             --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
-            --env PERRY_RELEASE_STRIP_INSTRUMENTS \
             --volume "$HOME/.cargo:/tmp/cargo-home" \
             --volume "$HOME/.rustup:/tmp/rustup-home" \
+            --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
+            --env MBX_CACHE_DIR=/tmp/mbx-cache \
+            --volume "$mbx_cache:/tmp/mbx-cache" \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work \
             perry-glibc-2.31-llvm22 \
@@ -897,8 +893,8 @@ jobs:
           src="target-glibc231/$TARGET/prod"
           dst="target/$TARGET/prod"
           mkdir -p "$dst"
-          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_runtime_core.a libperry_stdlib.a \
-              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects libperry_runtime_core.a.gc-effects; do
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a \
+              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects; do
             test -s "$src/$artifact"
             cp "$src/$artifact" "$dst/$artifact"
           done
@@ -924,6 +920,12 @@ jobs:
             --tag perry-musl-llvm22 \
             --file scripts/linux-musl-llvm22.Dockerfile \
             .
+          # build_linux_*.sh build with mbx, which perry-mbx-cache installed on
+          # the runner (a static musl binary): hand the container that binary
+          # and its object store.
+          mbx_bin=$(command -v mbx)
+          mbx_cache=$(mbx cache dir)
+          mkdir -p "$mbx_cache"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
             --env HOME=/tmp/perry-home \
@@ -932,9 +934,11 @@ jobs:
             --env CARGO_TARGET_DIR=/work/target-musl \
             --env PERRY_ABORT_TARGET_DIR=/work/target-musl-abort \
             --env PERRY_CLI_UPDATE_PUBLIC_KEYS \
-            --env PERRY_RELEASE_STRIP_INSTRUMENTS \
             --volume "$HOME/.cargo:/tmp/cargo-home" \
             --volume "$HOME/.rustup:/tmp/rustup-home" \
+            --volume "$mbx_bin:/usr/local/bin/mbx:ro" \
+            --env MBX_CACHE_DIR=/tmp/mbx-cache \
+            --volume "$mbx_cache:/tmp/mbx-cache" \
             --volume "$GITHUB_WORKSPACE:/work" \
             --workdir /work \
             perry-musl-llvm22 \
@@ -945,8 +949,8 @@ jobs:
           src="target-musl/$TARGET/prod"
           dst="target/$TARGET/prod"
           mkdir -p "$dst"
-          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_runtime_core.a libperry_stdlib.a \
-              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects libperry_runtime_core.a.gc-effects \
+          for artifact in perry libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a \
+              libperry_runtime.a.gc-effects libperry_runtime_abort.a.gc-effects \
               libperry_wasm_host.a; do
             test -s "$src/$artifact"
             cp "$src/$artifact" "$dst/$artifact"
@@ -1067,7 +1071,7 @@ jobs:
       # A stale cached archive fails the release here instead of breaking
       # consumer links with `undefined symbol: _perry_macos_bundle_chdir`.
       # GC effects sidecars (design 4.3): one `<archive>.gc-effects` beside
-      # every runtime archive (default, _abort, _core, iOS, Android, ...),
+      # every runtime archive (default, _abort, iOS, Android, ...),
       # computed over the exact bytes staged below and after the last cargo
       # call. The rules the analyzer enforces make this the release gate for
       # the effects tables. The glibc 2.31 and musl legs run the same script
@@ -1081,7 +1085,8 @@ jobs:
             # The analyzer imports LLVM-C.dll.
             export PATH="$(cygpath -u "$LLVM_SYS_221_PREFIX")/bin:$PATH"
           fi
-          dirs=$(find target \( -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib" \) -exec dirname {} \; | sort -u)
+          # mbx makes target/ a symlink into its store: -H follows it.
+          dirs=$(find -H target \( -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib" \) -exec dirname {} \; | sort -u)
           if [ -z "$dirs" ]; then
             echo "::error::no built runtime archives found under target/ -- nothing to analyze"
             exit 1
@@ -1096,7 +1101,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          libs=$(find target -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib")
+          libs=$(find -H target -path "*/prod/libperry_runtime.a" -o -path "*/prod/perry_runtime.lib")
           if [ -z "$libs" ]; then
             echo "::error::no built runtime archives found under target/ — nothing to verify"
             exit 1
@@ -1110,7 +1115,7 @@ jobs:
           mkdir -p staging
           cp target/${{ matrix.target }}/prod/perry staging/
           # Include static libraries for linking (runtime, stdlib, UI)
-          for lib in libperry_runtime.a libperry_runtime_abort.a libperry_runtime_core.a libperry_stdlib.a libperry_wasm_host.a libperry_ui_macos.a libperry_ui_gtk4.a; do
+          for lib in libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a libperry_wasm_host.a libperry_ui_macos.a libperry_ui_gtk4.a; do
             if [ -f "target/${{ matrix.target }}/prod/$lib" ]; then
               cp "target/${{ matrix.target }}/prod/$lib" staging/
               # The GC effects sidecar travels beside its runtime archive.
@@ -1603,13 +1608,25 @@ jobs:
           fi
           # cc-rs lookup vars: `CC_<triple>` / `CXX_<triple>` / `AR_<triple>`
           # with `-` → `_`. The cargo-target linker var uses uppercase + `_`.
+          API=${CLANG##*/"$TRIPLE"}
+          API=${API%-clang}
           TRIPLE_UNDER=$(echo "$TRIPLE" | tr '-' '_')
           TRIPLE_UPPER=$(echo "$TRIPLE_UNDER" | tr '[:lower:]' '[:upper:]')
           {
             echo "CC_${TRIPLE_UNDER}=$CLANG"
             echo "CXX_${TRIPLE_UNDER}=$CLANGXX"
             echo "AR_${TRIPLE_UNDER}=$TOOLCHAIN/llvm-ar"
+            # NDK r23+ ships no <triple>-ranlib, the default cc-rs hands the
+            # vendored OpenSSL's `make install`.
+            echo "RANLIB_${TRIPLE_UNDER}=$TOOLCHAIN/llvm-ranlib"
             echo "CARGO_TARGET_${TRIPLE_UPPER}_LINKER=$CLANG"
+            # cc-rs adds `--target=<triple>` (no API level) to every C flag
+            # list. Under mbx, CMake gets mbx's compiler shim, not the NDK
+            # wrapper, so its Android support picks the NDK's bare clang and
+            # that flag overrides the API: no crtbegin_dynamic.o (libz-ng-sys).
+            # Name the wrapper's API level last.
+            echo "CFLAGS_${TRIPLE_UNDER}=--target=${TRIPLE}${API}"
+            echo "CXXFLAGS_${TRIPLE_UNDER}=--target=${TRIPLE}${API}"
           } >> "$GITHUB_ENV"
           echo "NDK wired for $TRIPLE: $CLANG"
 
@@ -1623,6 +1640,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # The vendored OpenSSL's Configure needs Locale::Maketext::Simple,
+            # which Git Bash's msys perl lacks, and Git's perl comes first on
+            # this shell's PATH (pwsh inherits it). Take the first perl on
+            # PATH, then Strawberry's, that loads the module.
+            OPENSSL_SRC_PERL=
+            while IFS= read -r perl_exe; do
+              perl_exe=${perl_exe%$'\r'}
+              [ -n "$perl_exe" ] || continue
+              if "$(cygpath -u "$perl_exe")" -MLocale::Maketext::Simple -e1 2>/dev/null; then
+                OPENSSL_SRC_PERL=$perl_exe
+                break
+              fi
+            done < <(where.exe perl 2>/dev/null; echo 'C:\Strawberry\perl\bin\perl.exe')
+            if [ -z "$OPENSSL_SRC_PERL" ]; then
+              echo "::error::no Windows perl with Locale::Maketext::Simple for the vendored OpenSSL Configure"
+              exit 1
+            fi
+            export OPENSSL_SRC_PERL
+            echo "OPENSSL_SRC_PERL=$OPENSSL_SRC_PERL"
+          fi
           ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
           ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
           # UI crate is matrix-driven. perry-ui-android needs the NDK env

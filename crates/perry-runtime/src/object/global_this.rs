@@ -1,20 +1,5 @@
 //! `globalThis` singleton plus built-in constructor/namespace population.
 
-#![cfg_attr(
-    not(any(
-        feature = "global-math",
-        feature = "global-json",
-        feature = "global-reflect",
-        feature = "global-atomics",
-        feature = "global-url",
-        feature = "global-text",
-        feature = "global-websocket",
-        feature = "global-webcrypto",
-        feature = "global-webfetch"
-    )),
-    allow(dead_code, unused_imports)
-)]
-
 use super::*;
 
 #[path = "global_this_webassembly.rs"]
@@ -55,6 +40,7 @@ mod populate;
 mod proto_methods;
 pub(crate) mod proto_room;
 mod typed_array;
+pub(crate) mod web_hooks;
 pub(crate) use typed_array::typed_array_uint8_intrinsic_prototype_value;
 
 /// Is `func` the body of `%Object.prototype%.valueOf`? The dispatcher's
@@ -172,16 +158,16 @@ pub use fetch_globals::{
 };
 #[cfg(test)]
 pub(crate) use generator::append_async_function_root_snapshot;
+pub(crate) use generator::function_kind_prototype_unwritten;
 pub(crate) use generator::{
     ensure_generator_intrinsics, generator_function_constructor_of, generator_function_proto_of,
-    generator_function_prototype_of, is_sync_generator_protocol_body,
-    proven_sync_generator_protocol_code, set_intrinsic_data_prop, set_intrinsic_to_string_tag,
+    generator_function_prototype_of, set_intrinsic_data_prop, set_intrinsic_to_string_tag,
     wire_function_intrinsic_parents,
 };
 pub use generator::{js_generator_attach_closure_prototype, js_generator_attach_prototype};
 pub(crate) use generator_state::{
-    call_generator_symbol_method, fixed_generator_state, install_evaluation_generator_symbols,
-    install_generator_symbol_method, GENERATOR_STATE_BRAND,
+    call_generator_symbol_method, fixed_generator_state, install_class_symbol_method,
+    install_evaluation_generator_symbols,
 };
 pub use generator_state::{js_generator_create, js_generator_result, js_generator_set_slot};
 pub use install_static::js_promise_static_function_value;

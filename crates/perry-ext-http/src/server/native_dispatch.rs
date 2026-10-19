@@ -148,6 +148,12 @@ pub unsafe extern "C" fn js_ext_http_native_dispatch(
     };
     let module = name(module_ptr, module_len);
     let method = name(method_ptr, method_len);
+    // Private cold protocol: select the body once while the runtime builds
+    // the sealed prototype. Calls themselves enter that body directly.
+    if module == "#http-prototype-method-info" {
+        return super::response_methods::info(method);
+    }
+
     let args = Args {
         ptr: args_ptr,
         len: if args_ptr.is_null() { 0 } else { args_len },
@@ -158,6 +164,25 @@ pub unsafe extern "C" fn js_ext_http_native_dispatch(
         ("http", "OutgoingMessage") => super::js_node_http_outgoing_message_new(),
         ("http", "IncomingMessage") => super::js_node_http_incoming_message_standalone_new(arg(0)),
         ("http", "ServerResponse") => super::js_node_http_server_response_standalone_new(arg(0)),
+        // `ServerResponse.call(this, req)` / `super(req)` (perry-runtime's
+        // native_this_alias): `this` becomes the response.
+        ("http", "#ServerResponse.call") => {
+            super::response::server_response_construct_this(arg(0), arg(1))
+        }
+        // `OutgoingMessage.call(this)` / `super()`: node's constructor on
+        // `this`, which carries no native state.
+        ("http", "#OutgoingMessage.call") => {
+            super::response::outgoing_message_construct_this(arg(0))
+        }
+        ("http", "#IncomingMessage.call") => {
+            extern "C" {
+                fn js_node_http_incoming_message_init(this: f64, socket: f64);
+            }
+            let scope = perry_ffi::TransientRootScope::enter();
+            let receiver = scope.root_nanbox(arg(0));
+            js_node_http_incoming_message_init(receiver.get(), arg(1));
+            (receiver.get().to_bits() & POINTER_MASK) as i64
+        }
         ("http" | "https", "get" | "request") => client_overload(module, method, args),
         ("http", "Agent") => crate::js_http_agent_new(arg(0)),
         ("https", "Agent") => crate::js_https_agent_new(arg(0)),

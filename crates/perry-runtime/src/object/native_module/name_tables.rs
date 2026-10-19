@@ -8,6 +8,7 @@ pub(crate) fn canonical_native_callable_property<'a>(
     property_name: &'a str,
 ) -> &'a str {
     match (module_name, property_name) {
+        ("domain", "create") => "createDomain",
         ("net", "Stream") => "Socket",
         ("fs", "FileReadStream") => "ReadStream",
         ("fs", "FileWriteStream") => "WriteStream",
@@ -59,6 +60,7 @@ pub(super) fn should_cache_native_module_namespace(module_name: &str) -> bool {
             | "cluster"
             | "cluster.default"
             | "dgram"
+            | "dgram.default"
             | "events"
             | "fs.constants"
             | "inspector"

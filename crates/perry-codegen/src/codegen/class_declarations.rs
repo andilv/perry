@@ -52,6 +52,7 @@ pub(super) fn class_declaration_globals(
     strings: &StringPool,
     module_prefix: &str,
     info_ref: &mut dyn FnMut(&str) -> String,
+    layouts: &crate::layout_families::ProgramLayouts,
 ) -> Vec<ClassDeclarationGlobal> {
     let mut out = Vec::new();
     for &(cid, class) in local_classes {
@@ -174,7 +175,30 @@ pub(super) fn class_declaration_globals(
         }
         let birth_shape =
             super::static_shape_ids::static_prototype_shape(cid).map_or(0, |(id, _)| id);
-        if members.is_empty() && birth_shape == 0 {
+        let layout = layouts
+            .families
+            .get(&cid)
+            .map_or("null".to_owned(), |_| format!("@perry_layout_class_{cid}"));
+        // The creation split's table (`layout_desc::emit_module_layouts`
+        // emits it beside the family's descriptors, in this module).
+        let variants = layouts
+            .families
+            .get(&cid)
+            .filter(|f| !f.variants.is_empty())
+            .map_or("null".to_owned(), |_| {
+                format!("@perry_family_variants_{cid}")
+            });
+        let default_derived = class.constructor.is_none()
+            && (class.extends_name.is_some()
+                || class.extends_expr.is_some()
+                || class.extends.is_some()
+                || class.native_extends.is_some());
+        let initializer = if default_derived {
+            format!("@{}__{}_default_fields", module_prefix, class.name)
+        } else {
+            "null".to_owned()
+        };
+        if members.is_empty() && birth_shape == 0 && layout == "null" && !default_derived {
             continue;
         }
         members.sort_by_key(|m| m.order);
@@ -208,7 +232,8 @@ pub(super) fn class_declaration_globals(
         };
         // Summary flags (runtime `CLASS_DECL_HAS_ACCESSORS` = 1,
         // `CLASS_DECL_HAS_COMPUTED` = 2).
-        let flags = u32::from(members.iter().any(|m| m.kind != KIND_METHOD))
+        let flags = if default_derived { 4 } else { 0 }
+            | u32::from(members.iter().any(|m| m.kind != KIND_METHOD))
             | if members
                 .iter()
                 .any(|m| m.name_len == 0 && m.name == "ptr null")
@@ -218,7 +243,7 @@ pub(super) fn class_declaration_globals(
                 0
             };
         let decl_global = format!(
-            "@{symbol} = private unnamed_addr constant {{ ptr, i32, i32, i32, i32 }} {{ ptr @{members_symbol}, i32 {}, i32 {birth_shape}, i32 {flags}, i32 0 }}",
+            "@{symbol} = private unnamed_addr constant {{ ptr, i32, i32, i32, i32, ptr, ptr, ptr }} {{ ptr @{members_symbol}, i32 {}, i32 {birth_shape}, i32 {flags}, i32 0, ptr {layout}, ptr {variants}, ptr {initializer} }}",
             members.len()
         );
         out.push(ClassDeclarationGlobal {

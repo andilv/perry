@@ -146,7 +146,7 @@ fn shadow_hygiene_module() -> Module {
                     name: "live".to_string(),
                     ty: Type::Any,
                     mutable: false,
-                    init: Some(Expr::Array(Vec::new())),
+                    init: Some(Expr::Array(Vec::new(), None)),
                 },
                 Stmt::Return(Some(Expr::LocalGet(3))),
             ],
@@ -181,6 +181,8 @@ fn shadow_hygiene_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -219,7 +221,7 @@ fn top_level_shadow_module(name: &str) -> Module {
                 name: "live".to_string(),
                 ty: Type::Any,
                 mutable: false,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
             Stmt::Expr(Expr::LocalGet(12)),
         ],
@@ -243,6 +245,8 @@ fn top_level_shadow_module(name: &str) -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -274,7 +278,7 @@ fn persistent_index_alias_shadow_module() -> Module {
             name: "items".to_string(),
             ty: Type::Array(Box::new(Type::Any)),
             mutable: false,
-            init: Some(Expr::Array(vec![Expr::MapNew])),
+            init: Some(Expr::Array(vec![Expr::MapNew], None)),
         },
         Stmt::For {
             init: None,
@@ -319,10 +323,13 @@ fn flat_const_row_alias_shadow_module() -> Module {
                 name: "kernel".to_string(),
                 ty: Type::Array(Box::new(Type::Array(Box::new(Type::Number)))),
                 mutable: false,
-                init: Some(Expr::Array(vec![
-                    Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)]),
-                    Expr::Array(vec![Expr::Integer(3), Expr::Integer(4)]),
-                ])),
+                init: Some(Expr::Array(
+                    vec![
+                        Expr::Array(vec![Expr::Integer(1), Expr::Integer(2)], None),
+                        Expr::Array(vec![Expr::Integer(3), Expr::Integer(4)], None),
+                    ],
+                    None,
+                )),
             },
             Stmt::Let {
                 id: 31,
@@ -366,6 +373,8 @@ fn flat_const_row_alias_shadow_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -396,7 +405,7 @@ fn reassigned_any_shadow_module() -> Module {
                     mutable: true,
                     init: Some(Expr::Number(0.0)),
                 },
-                Stmt::Expr(Expr::LocalSet(40, Box::new(Expr::Array(Vec::new())))),
+                Stmt::Expr(Expr::LocalSet(40, Box::new(Expr::Array(Vec::new(), None)))),
                 Stmt::Return(Some(Expr::LocalGet(40))),
             ],
             is_async: false,
@@ -430,6 +439,8 @@ fn reassigned_any_shadow_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -460,7 +471,7 @@ fn mixed_any_alias_shadow_module() -> Module {
                     mutable: true,
                     init: Some(Expr::Number(1.0)),
                 },
-                Stmt::Expr(Expr::LocalSet(60, Box::new(Expr::Array(Vec::new())))),
+                Stmt::Expr(Expr::LocalSet(60, Box::new(Expr::Array(Vec::new(), None)))),
                 Stmt::Let {
                     id: 61,
                     name: "alias".to_string(),
@@ -474,7 +485,7 @@ fn mixed_any_alias_shadow_module() -> Module {
                     name: "later".to_string(),
                     ty: Type::Any,
                     mutable: true,
-                    init: Some(Expr::Array(Vec::new())),
+                    init: Some(Expr::Array(Vec::new(), None)),
                 },
                 Stmt::Return(Some(Expr::LocalGet(61))),
             ],
@@ -509,6 +520,8 @@ fn mixed_any_alias_shadow_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -549,7 +562,7 @@ fn closure_captured_write_shadow_module() -> Module {
                         params: Vec::new(),
                         return_type: Type::Any,
                         body: vec![
-                            Stmt::Expr(Expr::LocalSet(50, Box::new(Expr::Array(Vec::new())))),
+                            Stmt::Expr(Expr::LocalSet(50, Box::new(Expr::Array(Vec::new(), None)))),
                             Stmt::Return(Some(Expr::LocalGet(50))),
                         ],
                         captures: vec![50],
@@ -596,6 +609,8 @@ fn closure_captured_write_shadow_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 
@@ -632,7 +647,7 @@ fn duplicate_var_decl_shadow_module() -> Module {
                 name: "later".to_string(),
                 ty: Type::Any,
                 mutable: false,
-                init: Some(Expr::Array(Vec::new())),
+                init: Some(Expr::Array(Vec::new(), None)),
             },
             Stmt::Return(Some(Expr::LocalGet(2))),
         ],
@@ -1205,6 +1220,8 @@ fn canonical_str_shadow_module() -> Module {
         async_generator_funcs: std::collections::HashSet::new(),
         local_source_spans: std::collections::HashMap::new(),
         gen_param_prologue_len: std::collections::HashMap::new(),
+        class_family_syntax: None,
+        requested_modules: Vec::new(),
     }
 }
 

@@ -154,6 +154,7 @@ macro_rules! runtime_layout {
             key_count: $name::SLOT_COUNT as u32,
             index_mask: (layout_index_size($name::SLOT_COUNT) - 1) as u32,
             index: $name::INDEX.as_ptr(),
+            class_id: 0, parent_class_id: 0, methods: std::ptr::null(),
         };
     };
 }
@@ -173,6 +174,7 @@ runtime_prototype_family!(
     WRITABLE_STATE_PROTO_FAMILY = INTRINSIC_SERIAL_WRITABLE_STATE,
     TIMEOUT_PROTO_FAMILY = INTRINSIC_SERIAL_TIMEOUT,
     IMMEDIATE_PROTO_FAMILY = INTRINSIC_SERIAL_IMMEDIATE,
+    URL_SEARCH_PARAMS_PROTO_FAMILY = INTRINSIC_SERIAL_URL_SEARCH_PARAMS,
 );
 
 include!("runtime_layouts/records.rs");
@@ -202,6 +204,8 @@ pub(crate) mod intrinsic_private_atoms {
     );
 }
 include!("runtime_layouts/builtin_prototypes.rs");
+include!("runtime_layouts/node_prototypes.rs");
+include!("runtime_layouts/node_prototype_birth.rs");
 
 /// `child_process.spawnSync`'s result. Node gives it `error` first, and only
 /// when the spawn failed: the key is an optional member (object model §3.2),
@@ -235,8 +239,8 @@ mod spawn_sync_result {
         pub(crate) const STDERR: u32 = 6;
     }
 }
-pub use spawn_sync_result::SPAWN_SYNC_RESULT;
 pub(crate) use spawn_sync_result::spawn_sync_slot;
+pub use spawn_sync_result::SPAWN_SYNC_RESULT;
 
 /// Allocate a fixed record with every declared property present, including undefined values.
 ///
@@ -725,16 +729,16 @@ static ATOM_10: StaticAtom = StaticAtom {
 };
 
 #[used(linker)]
-#[export_name = "perry_image_literal_0_5f656e7472696573"]
+#[export_name = "perry_image_literal_0_233c70657272793a75726c2d7365617263682d706172616d732d656e74726965733e"]
 #[cfg_attr(target_vendor = "apple", link_section = "__TEXT,__perry_strings")]
 #[cfg_attr(target_os = "windows", link_section = ".perrystr$m")]
 #[cfg_attr(
     not(any(target_vendor = "apple", target_os = "windows")),
     link_section = "perry_strings"
 )]
-static IMAGE_11: ImageString<9> = image(*b"_entries\0");
+static IMAGE_11: ImageString<35> = image(*b"#<perry:url-search-params-entries>\0");
 #[used(linker)]
-#[export_name = "perry_atom_5f656e7472696573"]
+#[export_name = "perry_atom_233c70657272793a75726c2d7365617263682d706172616d732d656e74726965733e"]
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_atoms")]
 #[cfg_attr(target_os = "windows", link_section = ".perryatm$m")]
 #[cfg_attr(
@@ -742,7 +746,7 @@ static IMAGE_11: ImageString<9> = image(*b"_entries\0");
     link_section = "perry_atoms"
 )]
 static ATOM_11: StaticAtom = StaticAtom {
-    hash: atom_hash(b"_entries"),
+    hash: atom_hash(b"#<perry:url-search-params-entries>"),
     string: std::ptr::addr_of!(IMAGE_11.string),
     kind: crate::codegen_abi::ATOM_KIND_STRING,
     _pad: [0; 3],
@@ -750,16 +754,16 @@ static ATOM_11: StaticAtom = StaticAtom {
 };
 
 #[used(linker)]
-#[export_name = "perry_image_literal_0_5f6f776e6572"]
+#[export_name = "perry_image_literal_0_233c70657272793a75726c2d7365617263682d706172616d732d6f776e65723e"]
 #[cfg_attr(target_vendor = "apple", link_section = "__TEXT,__perry_strings")]
 #[cfg_attr(target_os = "windows", link_section = ".perrystr$m")]
 #[cfg_attr(
     not(any(target_vendor = "apple", target_os = "windows")),
     link_section = "perry_strings"
 )]
-static IMAGE_12: ImageString<7> = image(*b"_owner\0");
+static IMAGE_12: ImageString<33> = image(*b"#<perry:url-search-params-owner>\0");
 #[used(linker)]
-#[export_name = "perry_atom_5f6f776e6572"]
+#[export_name = "perry_atom_233c70657272793a75726c2d7365617263682d706172616d732d6f776e65723e"]
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_atoms")]
 #[cfg_attr(target_os = "windows", link_section = ".perryatm$m")]
 #[cfg_attr(
@@ -767,7 +771,7 @@ static IMAGE_12: ImageString<7> = image(*b"_owner\0");
     link_section = "perry_atoms"
 )]
 static ATOM_12: StaticAtom = StaticAtom {
-    hash: atom_hash(b"_owner"),
+    hash: atom_hash(b"#<perry:url-search-params-owner>"),
     string: std::ptr::addr_of!(IMAGE_12.string),
     kind: crate::codegen_abi::ATOM_KIND_STRING,
     _pad: [0; 3],
@@ -1200,6 +1204,9 @@ pub(crate) static mut READABLE_STATE: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 6,
     index_mask: 15,
     index: READABLE_STATE_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static WRITABLE_STATE_KEYS: [PerryLayoutKey; 7] = [
@@ -1284,23 +1291,26 @@ pub(crate) static mut WRITABLE_STATE: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 7,
     index_mask: 15,
     index: WRITABLE_STATE_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static URL_SEARCH_PARAMS_KEYS: [PerryLayoutKey; 2] = [
     PerryLayoutKey {
         atom: std::ptr::addr_of!(ATOM_11),
         slot: 0,
-        attrs: 0,
+        attrs: 66,
         _pad: [0; 3],
     },
     PerryLayoutKey {
         atom: std::ptr::addr_of!(ATOM_12),
         slot: 1,
-        attrs: 0,
+        attrs: 66,
         _pad: [0; 3],
     },
 ];
-static URL_SEARCH_PARAMS_INDEX: [u32; 4] = [u32::MAX, 1, 0, u32::MAX];
+static URL_SEARCH_PARAMS_INDEX: [u32; 4] = [0, 1, u32::MAX, u32::MAX];
 #[used(linker)]
 #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_layouts")]
 #[cfg_attr(target_os = "windows", link_section = ".perrylay$m")]
@@ -1316,11 +1326,14 @@ pub(crate) static mut URL_SEARCH_PARAMS: PerryLayoutDesc = PerryLayoutDesc {
     slot_count: 2,
     layout_id: super::layout_desc::LAYOUT_ID_CARRIED,
     rep: 0,
-    proto: crate::object::layout_desc::LAYOUT_PROTO_OBJECT,
+    proto: &raw const URL_SEARCH_PARAMS_PROTO_FAMILY,
     keys: URL_SEARCH_PARAMS_KEYS.as_ptr(),
     key_count: 2,
     index_mask: 3,
     index: URL_SEARCH_PARAMS_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static URL_COMPONENTS_KEYS: [PerryLayoutKey; 12] = [
@@ -1451,6 +1464,9 @@ pub(crate) static mut URL_COMPONENTS: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 12,
     index_mask: 31,
     index: URL_COMPONENTS_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static ITERATOR_RESULT_KEYS: [PerryLayoutKey; 2] = [
@@ -1488,6 +1504,9 @@ pub(crate) static mut ITERATOR_RESULT: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 2,
     index_mask: 3,
     index: ITERATOR_RESULT_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static ITERATOR_RESULT_DONE_FIRST_KEYS: [PerryLayoutKey; 2] = [
@@ -1525,6 +1544,9 @@ pub(crate) static mut ITERATOR_RESULT_DONE_FIRST: PerryLayoutDesc = PerryLayoutD
     key_count: 2,
     index_mask: 3,
     index: ITERATOR_RESULT_DONE_FIRST_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static TIMEOUT_KEYS: [PerryLayoutKey; 0] = [];
@@ -1549,6 +1571,9 @@ pub(crate) static mut TIMEOUT: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 0,
     index_mask: 1,
     index: TIMEOUT_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 static IMMEDIATE_KEYS: [PerryLayoutKey; 0] = [];
@@ -1573,12 +1598,19 @@ pub(crate) static mut IMMEDIATE: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 0,
     index_mask: 1,
     index: IMMEDIATE_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 pub(crate) const URL_CLASS_ID: u32 = 0xFFFF0063;
 
 mod stream_prototypes;
 pub(crate) use stream_prototypes::*;
+mod stream_instances;
+pub(crate) use stream_instances::*;
+mod http_instances;
+pub(crate) use http_instances::*;
 #[used(linker)]
 #[export_name = "perry_image_literal_0_696e646578"]
 #[cfg_attr(target_vendor = "apple", link_section = "__TEXT,__perry_strings")]
@@ -1742,6 +1774,9 @@ pub(crate) static mut REGEX_EXEC_NAMED: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 4,
     index_mask: 7,
     index: REGEX_EXEC_NAMED_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 static REGEX_EXEC_INDICES_NAMED_KEYS: [PerryLayoutKey; 5] = [
     PerryLayoutKey {
@@ -1814,6 +1849,9 @@ pub(crate) static mut REGEX_EXEC_INDICES_NAMED: PerryLayoutDesc = PerryLayoutDes
     key_count: 5,
     index_mask: 15,
     index: REGEX_EXEC_INDICES_NAMED_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 static REGEX_INDICES_GROUPS_NAMED_KEYS: [PerryLayoutKey; 2] = [
     PerryLayoutKey {
@@ -1851,6 +1889,9 @@ pub(crate) static mut REGEX_INDICES_GROUPS_NAMED: PerryLayoutDesc = PerryLayoutD
     key_count: 2,
     index_mask: 3,
     index: REGEX_INDICES_GROUPS_NAMED_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 static ARRAY_NAMED_KEYS: [PerryLayoutKey; 1] = [PerryLayoutKey {
     atom: std::ptr::addr_of!(ATOM_SYMBOL_ITERATOR),
@@ -1880,6 +1921,9 @@ pub(crate) static mut ARRAY_NAMED: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 1,
     index_mask: 1,
     index: ARRAY_NAMED_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 // Fixed legacy SQLite column metadata; the five data properties are all present.
@@ -2073,6 +2117,9 @@ pub static mut SQLITE_COLUMN_METADATA: PerryLayoutDesc = PerryLayoutDesc {
     key_count: 5,
     index_mask: 15,
     index: SQLITE_COLUMN_INDEX.as_ptr(),
+    class_id: 0,
+    parent_class_id: 0,
+    methods: std::ptr::null(),
 };
 
 #[cfg(test)]

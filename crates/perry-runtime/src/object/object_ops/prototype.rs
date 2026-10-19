@@ -74,7 +74,7 @@ pub extern "C" fn js_get_global_this_builtin_value(name_ptr: *const u8, name_len
 /// Object.create(proto) — create an empty object with an owner-traced prototype.
 #[no_mangle]
 pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
-    #[cfg(feature = "contract-checks")]
+    #[cfg(perry_contract_checks)]
     crate::contracts::object_create(proto_value);
     let proto_value = unsafe { normalize_descriptor_operand(proto_value) };
     // #2816 prototype validation: only an object or `null` is permitted. A
@@ -501,6 +501,16 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             f64::from_bits(TAG_NULL)
         }
     };
+    // Class constructors own their actual parent edge. The definition-time
+    // native parent need not appear in the legacy override/parent tables.
+    if let Some(class_id) = crate::object::class_value::class_value_id(obj_value) {
+        let parent = crate::object::class_value::class_prototype_addr(class_id);
+        return if parent == 0 {
+            f64::from_bits(TAG_NULL)
+        } else {
+            crate::value::js_nanbox_pointer(parent as i64)
+        };
+    }
     if let Some(class_id) = crate::object::class_value::legacy_class_value_word(bits) {
         // An explicit `Object.setPrototypeOf(Ctor, obj)` wins over every
         // derived answer below — it IS the constructor's [[Prototype]].
