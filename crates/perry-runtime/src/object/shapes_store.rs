@@ -162,7 +162,16 @@ pub(crate) struct ShapeRecord {
     pub(super) proto_cell: u64,
     /// Element properties described by this immutable key prefix: 0 plain,
     /// 1 indexed/length descriptors, 2 a per-object mutable key list.
-    pub(super) element_kind: u64,
+    pub(super) element_kind: u32,
+    /// The class family layout (its ShapeId, `layout_desc`) this record is a
+    /// class evaluation's copy of: the family's keys, slots, holes, kind,
+    /// attributes and lanes at the identity `MIXED | class | serial` naming
+    /// that evaluation's prototype (`shapes::shape_is_evaluation_layout_of`),
+    /// or 0. Written once, by the prototype transition that reached the
+    /// record from the family layout, after checking those facts; a function
+    /// of the two records' immutable facts, never identity. Offset 76, in
+    /// what was the high half of `element_kind`.
+    pub(super) evaluation_layout_of: u32,
     /// The key index of this record's key list for the unknown-receiver
     /// probe (`object/layout_probe.rs`): 0 until the first probe derives it
     /// from the record's immutable key list, then `PROBE_*` bits plus the
@@ -176,8 +185,10 @@ pub(crate) struct ShapeRecord {
     /// site of a coloured key tests its bit and loads the slot. Offset 88.
     pub(crate) colour_mask: [u64; 2],
     /// The coloured keys a store may write at their colour slot: the read
-    /// bit, plus a writable `Any`-lane key of a store-admitted layout with no
-    /// integrity level. Offset 104.
+    /// bit, plus a writable `Any`- or `F64`-lane key of a store-admitted
+    /// layout with no integrity level (never a `Special` lane). A store into
+    /// an `F64` lane must be a plain double: the site tests the lane (`rep`,
+    /// offset 48) unless it is. Offset 104.
     pub(crate) colour_store_mask: [u64; 2],
 }
 
@@ -192,7 +203,7 @@ const RECORD_KIND_SHIFT: u32 = 8;
 const RECORD_KIND_MASK: u32 = 0xF << RECORD_KIND_SHIFT;
 /// The frequently decoded kind is one contiguous field.
 /// `kind_codes_round_trip` pins the encoding independently of record width.
-const RECORD_KIND_MAX_CODE: u32 = 11;
+const RECORD_KIND_MAX_CODE: u32 = 12;
 const _: () = assert!(RECORD_KIND_MAX_CODE <= 15);
 /// Charter step 3: the summary of the attributes the shape's keys carry —
 /// what the chain store check and every per-key reader ask FIRST, so a shape
@@ -250,6 +261,7 @@ const _: () = assert!(super::shapes_birth_width::TRACKING_BIRTHS <= RECORD_BIRTH
 
 const _: () = assert!(std::mem::size_of::<ShapeRecord>() == crate::codegen_abi::SHAPE_RECORD_SIZE);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, probe) == 80);
+const _: () = assert!(std::mem::offset_of!(ShapeRecord, evaluation_layout_of) == 76);
 const _: () = assert!(
     std::mem::offset_of!(ShapeRecord, colour_mask) == crate::codegen_abi::SHAPE_RECORD_COLOUR_MASK
 );
@@ -257,6 +269,9 @@ const _: () = assert!(
     std::mem::offset_of!(ShapeRecord, colour_store_mask)
         == crate::codegen_abi::SHAPE_RECORD_COLOUR_STORE_MASK
 );
+const _: () =
+    assert!(std::mem::offset_of!(ShapeRecord, rep) == crate::codegen_abi::SHAPE_RECORD_REP);
+const _: () = assert!(crate::object::field_rep::REP_SLOTS == crate::codegen_abi::SHAPE_REP_SLOTS);
 const _: () = assert!(std::mem::align_of::<ShapeRecord>() == 8);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, position_bound) == 40);
 const _: () = assert!(std::mem::offset_of!(ShapeRecord, special_constfn_mask) == 44);
@@ -279,6 +294,7 @@ impl ShapeRecord {
         extras: 0,
         proto_cell: 0,
         element_kind: 0,
+        evaluation_layout_of: 0,
         probe: 0,
         colour_mask: [0; 2],
         colour_store_mask: [0; 2],
@@ -402,6 +418,7 @@ impl ShapeRecord {
             extras: 0,
             proto_cell: 0,
             element_kind: 0,
+            evaluation_layout_of: 0,
             probe: 0,
             colour_mask: [0; 2],
             colour_store_mask: [0; 2],
@@ -1106,20 +1123,34 @@ fn locate(id: u32) -> (usize, usize) {
 #[repr(C, align(64))]
 pub(crate) struct BandDir {
     pages: std::cell::Cell<*const Page>,
+    #[cfg(target_pointer_width = "32")]
+    _pages_high: u32,
     len: std::cell::Cell<usize>,
+    #[cfg(target_pointer_width = "32")]
+    _len_high: u32,
     base_rel: u32,
+    #[cfg(target_pointer_width = "32")]
+    _base_rel_pad: u32,
     /// The ordinary band's records at fixed addresses (`flat.rs`): record
     /// `rel` is `flat_base + rel` for every `rel < flat_ids`; null and 0 for
     /// every other band, every target without the reservation, and a slab
     /// that publishes nothing. Offsets 24 and 32 (`FLAT_BASE_OFFSET`).
     flat_base: std::cell::Cell<*mut ShapeRecord>,
+    #[cfg(target_pointer_width = "32")]
+    _flat_base_high: u32,
     flat_ids: std::cell::Cell<usize>,
+    #[cfg(target_pointer_width = "32")]
+    _flat_ids_high: u32,
     /// This agent's `Object.prototype` cell (`array::prototype_addr`), for
     /// the probe's prototype walk; null when not published. Offset 40.
     pub(crate) proto_cell: std::cell::Cell<*const usize>,
+    #[cfg(target_pointer_width = "32")]
+    _proto_cell_high: u32,
     /// This agent's identity-word directory (`shapes_prototype`), for the
     /// probe's class-holder hop; null when not published. Offset 48.
     pub(crate) word_dir: std::cell::Cell<*const u8>,
+    #[cfg(target_pointer_width = "32")]
+    _word_dir_high: u32,
 }
 
 /// `BandDir.flat_base`'s offset; `flat_ids` follows at +8.
@@ -1133,12 +1164,26 @@ impl BandDir {
     const fn empty(band: usize) -> BandDir {
         BandDir {
             pages: std::cell::Cell::new(std::ptr::null()),
+            #[cfg(target_pointer_width = "32")]
+            _pages_high: 0,
             len: std::cell::Cell::new(0),
+            #[cfg(target_pointer_width = "32")]
+            _len_high: 0,
             base_rel: BAND_BASE_REL[band],
+            #[cfg(target_pointer_width = "32")]
+            _base_rel_pad: 0,
             flat_base: std::cell::Cell::new(std::ptr::null_mut()),
+            #[cfg(target_pointer_width = "32")]
+            _flat_base_high: 0,
             flat_ids: std::cell::Cell::new(0),
+            #[cfg(target_pointer_width = "32")]
+            _flat_ids_high: 0,
             proto_cell: std::cell::Cell::new(std::ptr::null()),
+            #[cfg(target_pointer_width = "32")]
+            _proto_cell_high: 0,
             word_dir: std::cell::Cell::new(std::ptr::null()),
+            #[cfg(target_pointer_width = "32")]
+            _word_dir_high: 0,
         }
     }
 }
@@ -1373,12 +1418,13 @@ impl ShapeSlab {
         assert!(band < 3, "ShapeSlab::insert: id outside the ShapeId range");
         // The id's identity kind is a fact the prototype readers trust
         // without reading this record (`shapes::SHAPE_ID_KIND_SHIFT`): a
-        // plain or null kind names exactly that identity. (The other kinds
-        // send a reader to this record.)
+        // plain or null kind names exactly that identity, and a `MIXED`
+        // identity lives exactly under the mixed kind, which the family
+        // readers trust (`layout_desc::family_desc_of`). (The word kind
+        // sends a reader to this record.)
         let kind = super::shape_word_kind(id);
         assert!(
-            !matches!(kind, super::SHAPE_ID_KIND_PLAIN | super::SHAPE_ID_KIND_NULL)
-                || kind == super::proto_id_kind(record.proto_id),
+            super::shape_id_kind_admits(id, record.proto_id),
             "ShapeSlab::insert: identity {:#x} under ShapeId {id:#x} of kind {kind}",
             record.proto_id
         );

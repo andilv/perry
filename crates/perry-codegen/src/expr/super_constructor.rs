@@ -1,4 +1,8 @@
 //! Constructor super lowering when the live heritage can change.
+#[cfg(test)]
+#[path = "super_constructor_no_heritage_tests.rs"]
+mod no_heritage_tests;
+
 use super::{lower_expr, FnCtx};
 use crate::types::{DOUBLE, I32, I64, PTR};
 use anyhow::Result;
@@ -26,6 +30,19 @@ pub(crate) fn lexical_class_id(ctx: &FnCtx<'_>, class: &Class) -> u32 {
 /// constructor has a whole-program no-relink proof. An own body handles its
 /// next edge itself, so it terminates this walk.
 pub(crate) fn requires_live(ctx: &FnCtx<'_>, class: &Class) -> bool {
+    // A class with no heritage has no super constructor, so nothing about a
+    // live-changing parent applies. The lookups below are keyed on a bare
+    // class name, and a type-only import cycle can register an entry under
+    // the name of a class this module DECLARES (#12889), which made an
+    // undeclared parent look live and emitted a super-construct that throws
+    // `Super constructor is not a constructor` at run time.
+    if class.extends_name.is_none()
+        && class.extends_expr.is_none()
+        && class.extends.is_none()
+        && class.native_extends.is_none()
+    {
+        return false;
+    }
     if ctx
         .imported_class_ctors
         .get(&class.name)
@@ -49,6 +66,12 @@ pub(crate) fn requires_live(ctx: &FnCtx<'_>, class: &Class) -> bool {
         if !derived {
             return false;
         }
+        // A WHATWG stream base has no constructible parent VALUE: its state is
+        // installed on `this` by the dedicated `super(...)` init
+        // (`lower_stream_super_init`), and that edge is the construction.
+        if web_stream_parent(owner) {
+            return false;
+        }
         if !crate::proto_constants::heritage_is_unrelinked(ctx, lexical_class_id(ctx, owner)) {
             return true;
         }
@@ -70,6 +93,16 @@ pub(crate) fn requires_live(ctx: &FnCtx<'_>, class: &Class) -> bool {
         owner = parent;
     }
     true
+}
+
+/// `class X extends ReadableStream / WritableStream / TransformStream`.
+fn web_stream_parent(class: &Class) -> bool {
+    class.native_extends.as_ref().is_some_and(|(module, _)| {
+        matches!(
+            module.as_str(),
+            "readable_stream" | "writable_stream" | "transform_stream"
+        )
+    })
 }
 
 /// A default descendant must not inline an ancestor body already being lowered.
@@ -118,7 +151,6 @@ pub(crate) fn call_live(ctx: &mut FnCtx<'_>, class: &Class, args: &[Expr]) -> Re
             &[(I32, &lexical_id.to_string())],
         );
         let parent = group.adopt_emitted(ctx, crate::rooting::Repr::Boxed, &parent, true);
-        crate::lower_call::defer_dynamic_derived_fields(ctx, class);
         // Preparation can collect: only now reread and pack rooted arguments.
         let values = ids
             .into_iter()

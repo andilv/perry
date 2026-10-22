@@ -59,6 +59,8 @@ pub struct LlModule {
     functions: Vec<LlFunction>,
     defined_names: HashSet<String>,
     globals: Vec<String>,
+    /// Globals whose same-named definitions own one linker COMDAT.
+    comdat_globals: HashSet<String>,
     string_constants: Vec<String>,
     string_counter: u32,
     /// Module symbol prefix folded into every anonymous rodata constant this
@@ -133,6 +135,16 @@ impl LlModule {
             .map(|(name, line)| (name.as_str(), line.as_str()))
     }
 
+    /// Generated data definitions are authoritative for declarations in every
+    /// unit, including the complete declaration stream used by native emission.
+    pub(crate) fn global_definition_lines(&self) -> impl Iterator<Item = &str> {
+        self.string_constants
+            .iter()
+            .chain(&self.globals)
+            .map(String::as_str)
+            .filter(|line| !is_external_global(line))
+    }
+
     /// #10399: names of the globals this module DEFINES thread-local.
     ///
     /// The TLS specifier is part of a symbol's identity. A stale non-TLS
@@ -162,6 +174,7 @@ impl LlModule {
             functions: Vec::new(),
             defined_names: HashSet::new(),
             globals: Vec::new(),
+            comdat_globals: HashSet::new(),
             string_constants: Vec::new(),
             string_counter: 0,
             symbol_prefix: String::new(),
@@ -174,6 +187,15 @@ impl LlModule {
             fn_infos: Rc::new(RefCell::new(crate::fn_info::FnInfoState::default())),
             gc_effects: None,
             local_exec_tls: false,
+        }
+    }
+
+    /// An executable's generated data cannot be preempted. Encode that in
+    /// its definitions before splitting; library output keeps exported data
+    /// visible. Private/internal definitions stay local until unit promotion.
+    pub(crate) fn bind_generated_globals_to_image(&mut self) {
+        for line in self.string_constants.iter_mut().chain(&mut self.globals) {
+            *line = hidden_global_definition(line);
         }
     }
 
@@ -443,11 +465,16 @@ impl LlModule {
     /// static info. Raw method/accessor ABIs deliberately decline: their
     /// reflected function objects run shared runtime thunks and still use the
     /// copying/borrowing registry path in `string_pool`.
+    pub(crate) fn can_attach_fn_source(&self, body: &str) -> bool {
+        self.function_named(body).is_some_and(is_js_body)
+    }
+
     pub(crate) fn attach_fn_source(
         &self,
         body: &str,
         global: &str,
         offset: usize,
+        decoded_offset: Option<usize>,
         byte_len: usize,
         is_non_strict_ordinary: bool,
     ) -> bool {
@@ -463,6 +490,7 @@ impl LlModule {
             .set_source(crate::fn_info::RetainedSource {
                 global: global.to_string(),
                 offset,
+                decoded_offset,
                 byte_len,
                 is_non_strict_ordinary,
             });
@@ -479,6 +507,25 @@ impl LlModule {
     /// may allocate; an `external` declaration for every allocated body
     /// another module defines. Runs once, after every function exists.
     pub(crate) fn emit_fn_infos(&mut self, permanent_image: bool) {
+        let exported: Vec<String> = self
+            .functions
+            .iter()
+            .filter(|f| {
+                f.linkage.is_empty() && f.name.starts_with("__perry_wrap_") && is_js_body(f)
+            })
+            .map(|f| f.name.clone())
+            .collect();
+        let entries = self.fn_infos.borrow().entry_bodies(&exported);
+        for body in entries {
+            let Some(function) = self.function_named(&body).filter(|f| has_js_call_abi(f)) else {
+                continue;
+            };
+            let params = function.params.len() - 2;
+            let facts = self.fn_infos.borrow().facts(&body);
+            let entry = crate::call_entry::emit(self, &body, params, &facts);
+            let ilp32 = crate::target_layout::target_is_ilp32(&self.target_triple);
+            self.note_fn_info(&body, |facts| facts.set_call_entry(entry, ilp32));
+        }
         let lines = {
             let functions = &self.functions;
             let by_name: std::collections::HashMap<&str, &LlFunction> =
@@ -533,6 +580,14 @@ impl LlModule {
     /// and the in-process constructor (`for_each_final_line`) are separate
     /// consumers, so a pass living inside one of them would silently not apply
     /// to the other.
+    pub(crate) fn diagnostic_functions(&self) -> impl Iterator<Item = &LlFunction> {
+        self.functions.iter()
+    }
+
+    pub(crate) fn diagnostic_globals(&self) -> impl Iterator<Item = &str> {
+        self.globals.iter().map(String::as_str)
+    }
+
     pub(crate) fn functions_mut(&mut self) -> impl Iterator<Item = &mut LlFunction> {
         self.functions.iter_mut()
     }
@@ -600,25 +655,6 @@ impl LlModule {
             .retain(|f| !candidates.contains(&f.name) || live.contains(&f.name));
         self.defined_names
             .retain(|name| !candidates.contains(name) || live.contains(name));
-    }
-
-    /// Drop the function defined at `idx` when it is `name` (an unreferenced
-    /// typed-body clone that was not installed). Helpers it published stay:
-    /// they are shared by name.
-    pub(crate) fn remove_defined_function(&mut self, idx: usize, name: &str) {
-        if self.functions.get(idx).is_some_and(|f| f.name == name) {
-            self.functions.remove(idx);
-            self.defined_names.remove(name);
-        }
-    }
-
-    /// Rename the function defined at `idx` (typed-body dispatch: the generic
-    /// body moves off the public symbol, which the dispatcher then defines).
-    pub(crate) fn rename_defined_function(&mut self, idx: usize, new_name: &str) {
-        if let Some(f) = self.functions.get_mut(idx) {
-            f.name = new_name.to_string();
-            self.defined_names.insert(new_name.to_string());
-        }
     }
 
     /// Number of functions defined so far. Used to recover the index of a
@@ -762,6 +798,38 @@ impl LlModule {
         self.globals.push(line);
     }
 
+    /// Fold the entire same-named weak data definition, including its section
+    /// bytes. Mach-O already coalesces weak symbols at subsection boundaries;
+    /// Wasm uses its separate image inventory. ELF and COFF need a COMDAT.
+    pub(crate) fn add_coalesced_global(&mut self, name: &str, mut line: String) {
+        if !self.target_triple.contains("apple") && !self.target_triple.contains("wasm") {
+            self.comdat_globals.insert(format!("@{name}"));
+            line.push_str(&format!(", comdat(${name})"));
+        }
+        self.add_raw_global(line);
+    }
+
+    fn push_global_definition(&self, ir: &mut String, line: &str) {
+        if let Some((name, rhs)) = line.split_once(" = ") {
+            if self.comdat_globals.contains(name) && !rhs.starts_with("external ") {
+                ir.push_str(&format!("${} = comdat any\n", &name[1..]));
+                // COFF section bounds do not retain unreferenced COMDATs.
+                // Atom iteration is a real use: retain one resolved symbol
+                // with a linker directive, without adding runtime data.
+                if self.target_triple.contains("windows") && rhs.starts_with("weak_odr global ") {
+                    ir.push_str(&format!(
+                        concat!(
+                            "module asm \".section .drectve,\\22yni\\22\\0A.ascii ",
+                            "\\22 /INCLUDE:{}\\22\\0A.text\"\n"
+                        ),
+                        &name[1..]
+                    ));
+                }
+            }
+        }
+        ir.push_str(line);
+    }
+
     /// Add a string constant with a caller-controlled name. Used by the
     /// `StringPool` so that emission order matches the pool's interned
     /// indices and the bytes globals can be referenced by name from
@@ -781,12 +849,21 @@ impl LlModule {
     /// literal pages. This is a byte blob, not a C string: every consumer
     /// carries an explicit byte length, so no terminator is emitted.
     pub fn add_retained_source_constant(&mut self, value: &str) -> (String, usize) {
+        self.add_retained_source_bytes(value.as_bytes(), "")
+    }
+
+    pub fn add_compressed_retained_source_constant(&mut self, value: &[u8]) -> (String, usize) {
+        self.add_retained_source_bytes(value, ".deflate")
+    }
+
+    fn add_retained_source_bytes(&mut self, value: &[u8], suffix: &str) -> (String, usize) {
         let name = if self.symbol_prefix.is_empty() {
             ".perry.retained_source".to_string()
         } else {
             format!("{}_.perry.retained_source", self.symbol_prefix)
         };
-        let bytes = value.as_bytes();
+        let name = format!("{name}{suffix}");
+        let bytes = value;
         let mut lit = String::with_capacity(bytes.len() + 8);
         lit.push_str("c\"");
         for &byte in bytes {
@@ -902,7 +979,7 @@ impl LlModule {
         }
         ir.push('\n');
         for g in &self.globals {
-            ir.push_str(g);
+            self.push_global_definition(&mut ir, g);
             ir.push('\n');
         }
         ir.push('\n');
@@ -951,7 +1028,7 @@ impl LlModule {
         ir.push('\n');
 
         for g in &self.globals {
-            ir.push_str(g);
+            self.push_global_definition(&mut ir, g);
             ir.push('\n');
         }
         ir.push('\n');
@@ -1246,8 +1323,8 @@ impl LlModule {
         // which is how three prettier plugins stopped compiling. Synthesize
         // the declaration from the definition, exactly as the function arm
         // does, so the two always agree.
-        for def in &shared_globals {
-            if def.contains(" = external ") {
+        for def in shared_strings.iter().chain(&shared_globals) {
+            if is_external_global(def) {
                 continue;
             }
             let Some(sym) = global_symbol_name(def) else {
@@ -1370,22 +1447,16 @@ impl LlModule {
             })
             .collect();
         let replicate_globals = self.target_triple.contains("apple");
-        // An alias must name a DEFINITION in its own object ("Alias must
-        // point to a definition"), so with one owner per global it is owned
-        // by its aliasee's owner. Owning it by its own first reference put a
-        // layout id alias (`@perry_array_layout_*_id`, which nothing loads,
-        // so unit 0 kept it) beside a mere declaration of its descriptor,
-        // defined in the unit that attaches the layout; three Next.js
-        // bundles failed to compile that way. Other units that name the
-        // alias declare it like any global (`external_decl_for_global`).
-        // Under replication every unit emitting the alias also emits the
-        // aliasee (the reference closure above), so Mach-O needs nothing.
-        if !replicate_globals {
-            for gi in 0..all_globals.len() {
-                if let Some(aliasee) = alias_target(all_globals[gi]) {
-                    if let Some(&ai) = global_index.get(aliasee) {
-                        global_owners[gi] = global_owners[ai];
-                    }
+        // An alias must name a definition in its own object, so its owner
+        // follows the aliasee. This applies to Mach-O too: LLVM emits hidden
+        // offset aliases as strong symbols even with linkonce_odr linkage;
+        // replicating them makes ld -r reject duplicate .fnname symbols.
+        // Other units declare the alias; the aliasee may still be replicated
+        // under Mach-O's dead-strip policy.
+        for gi in 0..all_globals.len() {
+            if let Some(aliasee) = alias_target(all_globals[gi]) {
+                if let Some(&ai) = global_index.get(aliasee) {
+                    global_owners[gi] = global_owners[ai];
                 }
             }
         }
@@ -1432,7 +1503,9 @@ impl LlModule {
         if replicate_globals {
             for need in &bucket_needs {
                 for &gi in need {
-                    defining_unit_count[gi] += 1;
+                    if alias_target(all_globals[gi]).is_none() {
+                        defining_unit_count[gi] += 1;
+                    }
                 }
             }
         }
@@ -1467,19 +1540,23 @@ impl LlModule {
                 // Unreferenced globals (anchors, `llvm.*`, appending lists)
                 // keep a home in unit 0 so nothing is lost.
                 let owns = global_owners[gi] == bi;
-                if (replicate_globals && referenced) || owns {
-                    if replicate_globals {
+                let replicated = replicate_globals && alias_target(def).is_none();
+                if (replicated && referenced) || owns {
+                    if replicated {
                         if !has_local_linkage(def) {
                             // External: another object may name it, so it must
                             // coalesce without ever being discarded.
-                            pre.push_str(&promote_external_global_for_units(def));
+                            self.push_global_definition(
+                                &mut pre,
+                                &promote_external_global_for_units(def),
+                            );
                         } else if defining_unit_count[gi] > 1 {
-                            pre.push_str(&promote_global_for_units(def));
+                            self.push_global_definition(&mut pre, &promote_global_for_units(def));
                         } else {
-                            pre.push_str(def);
+                            self.push_global_definition(&mut pre, def);
                         }
                     } else {
-                        pre.push_str(&make_unique_owner_global(def));
+                        self.push_global_definition(&mut pre, &make_unique_owner_global(def));
                     }
                     pre.push('\n');
                 } else if referenced {
@@ -1519,7 +1596,9 @@ impl LlModule {
                 // initializer still requires a cross-unit function declare.
                 // Merely external declarations in non-owning COFF units have
                 // no initializer, so they contribute no symbol references.
-                let emits_definition = (replicate_globals && referenced) || owns;
+                let emits_definition =
+                    (replicate_globals && referenced && alias_target(all_globals[gi]).is_none())
+                        || owns;
                 if !emits_definition {
                     continue;
                 }
@@ -1528,7 +1607,10 @@ impl LlModule {
                 }
             }
             for (name, decl) in &decl_by_name {
-                if defined.contains(name.as_str()) || !needed.contains(name.as_str()) {
+                if defined.contains(name.as_str())
+                    || !needed.contains(name.as_str())
+                    || global_index.contains_key(format!("@{name}").as_str())
+                {
                     continue;
                 }
                 pre.push_str(decl);
@@ -1660,3 +1742,17 @@ fn is_js_body(f: &LlFunction) -> bool {
 
 #[cfg(test)]
 mod text_stream_tests;
+
+/// Function-info ownership proves this is a callable operation. Check its
+/// ABI types rather than parameter spelling: class method function objects
+/// use `callee`/`this`, ordinary closures use `this_closure`/`js_this`.
+fn has_js_call_abi(function: &LlFunction) -> bool {
+    function.return_type == crate::types::DOUBLE
+        && function.params.len() >= 2
+        && function.params[..2]
+            .iter()
+            .all(|(ty, _)| *ty == crate::types::I64)
+        && function.params[2..]
+            .iter()
+            .all(|(ty, _)| *ty == crate::types::DOUBLE)
+}

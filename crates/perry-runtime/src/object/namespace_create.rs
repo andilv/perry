@@ -94,6 +94,116 @@ pub extern "C" fn js_create_namespace(
     values: *const f64,
     live_flags: *const u8,
 ) -> f64 {
+    js_finalize_namespace(build_namespace_object(
+        n, keys, key_lens, values, live_flags,
+    ))
+}
+
+/// The namespace of a CommonJS module under Bun's interop: the static
+/// entries (the lexer-detected names, `default`, `module.exports`), plus
+/// every other own enumerable string key of the evaluated `module.exports`
+/// object. Bun exposes all of them on `import * as ns`; the static lexer
+/// cannot see names that only exist at run time (a UMD factory's return
+/// value, `module.exports = make()`), so they are read here, once, after
+/// the module body ran. Values are a snapshot, like Node's detected names.
+/// `default` already holds the exports object and `__esModule` is interop
+/// metadata, so neither is copied.
+#[no_mangle]
+pub extern "C" fn js_create_cjs_namespace(
+    n: i32,
+    keys: *const *const u8,
+    key_lens: *const i32,
+    values: *const f64,
+    live_flags: *const u8,
+) -> f64 {
+    let ns = build_namespace_object(n, keys, key_lens, values, live_flags);
+    js_finalize_namespace(js_namespace_adopt_cjs_exports(ns))
+}
+
+/// The consumer-side twin of [`js_create_cjs_namespace`]: an `import * as ns`
+/// of a CommonJS module read as a whole value is materialized from the
+/// importer's member list, then takes the run-time `module.exports` keys here
+/// before it is finalized. Returns the (possibly relocated) namespace.
+#[no_mangle]
+pub extern "C" fn js_namespace_adopt_cjs_exports(ns: f64) -> f64 {
+    unsafe { adopt_cjs_exports(ns) }
+}
+
+/// Copy the own enumerable string keys of `ns.default` (the evaluated
+/// `module.exports`) that `ns` does not already own. `ns` is not finalized
+/// yet, so it is still extensible. Everything that can allocate keeps the
+/// namespace, the copy, and the current key rooted.
+unsafe fn adopt_cjs_exports(ns: f64) -> f64 {
+    let ns_v = JSValue::from_bits(ns.to_bits());
+    if !ns_v.is_pointer() {
+        return ns;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let ns_h = scope.root_raw_mut_ptr(ns_v.as_pointer::<ObjectHeader>() as *mut ObjectHeader);
+    let default_key = crate::string::js_string_from_bytes(b"default".as_ptr(), 7);
+    let exports = ns_h
+        .with_mut_ptr::<ObjectHeader, _>(|obj| js_object_get_field_by_name_f64(obj, default_key));
+    let current = |h: &crate::gc::RuntimeHandle<'_>| {
+        h.with_mut_ptr::<ObjectHeader, _>(|o| crate::value::js_nanbox_pointer(o as i64))
+    };
+    if !JSValue::from_bits(exports.to_bits()).is_reference() {
+        return current(&ns_h);
+    }
+    let exports_h = scope.root_nanbox_f64(exports);
+    // CopyDataProperties of the exports value (objects, functions and
+    // proxies alike) into a plain object, then move the missing keys over.
+    let staging_obj = js_object_alloc(0, 0);
+    let staging_h = scope.root_raw_mut_ptr(staging_obj);
+    let staging_v =
+        staging_h.with_mut_ptr::<ObjectHeader, _>(|o| crate::value::js_nanbox_pointer(o as i64));
+    super::assign::js_object_literal_spread(staging_v, exports_h.get_nanbox_f64());
+    let staging_v =
+        staging_h.with_mut_ptr::<ObjectHeader, _>(|o| crate::value::js_nanbox_pointer(o as i64));
+    let names = js_object_keys_value(staging_v);
+    let names_h = scope.root_raw_mut_ptr(names);
+    let len = crate::array::js_array_length(names);
+    for i in 0..len {
+        let iter_scope = crate::gc::RuntimeHandleScope::new();
+        let key_v = names_h
+            .with_mut_ptr::<crate::array::ArrayHeader, _>(|a| crate::array::js_array_get_f64(a, i));
+        let key_ptr =
+            crate::value::js_get_string_pointer_unified(key_v) as *const crate::StringHeader;
+        if key_ptr.is_null() {
+            continue;
+        }
+        match super::has_own_helpers::str_from_string_header(key_ptr) {
+            Some("default") | Some("__esModule") | None => continue,
+            Some(_) => {}
+        }
+        let key_h = iter_scope.root_string_ptr(key_ptr);
+        let ns_value =
+            ns_h.with_mut_ptr::<ObjectHeader, _>(|o| crate::value::js_nanbox_pointer(o as i64));
+        let key_value = key_h
+            .with_const_ptr::<crate::StringHeader, _>(|k| crate::value::js_nanbox_string(k as i64));
+        if crate::value::js_is_truthy(js_object_has_own(ns_value, key_value)) != 0 {
+            continue;
+        }
+        let value = staging_h.with_mut_ptr::<ObjectHeader, _>(|o| {
+            key_h
+                .with_const_ptr::<crate::StringHeader, _>(|k| js_object_get_field_by_name_f64(o, k))
+        });
+        let value_h = iter_scope.root_nanbox_f64(value);
+        ns_h.with_mut_ptr::<ObjectHeader, _>(|o| {
+            key_h.with_const_ptr::<crate::StringHeader, _>(|k| {
+                js_object_set_field_by_name(o, k, value_h.get_nanbox_f64())
+            })
+        });
+    }
+    current(&ns_h)
+}
+
+fn build_namespace_object(
+    n: i32,
+    keys: *const *const u8,
+    key_lens: *const i32,
+    values: *const f64,
+    live_flags: *const u8,
+) -> f64 {
     let count = if n < 0 { 0 } else { n as usize };
     unsafe {
         // Export values arrive in a caller stack buffer, which is not part of
@@ -173,9 +283,130 @@ pub extern "C" fn js_create_namespace(
         // NaN-box POINTER_TAG and return.
         obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
         let bits = (obj as u64) | 0x7FFD_0000_0000_0000;
-        js_finalize_namespace(f64::from_bits(bits))
+        f64::from_bits(bits)
     }
 }
+
+/// A module namespace born in its compiler-owned final layout: `desc` is the
+/// module's namespace descriptor (`perry-codegen` `layout_desc::
+/// namespace_layout`): its export names in sorted order (ECMA-262 10.4.6,
+/// [[OwnPropertyKeys]]), slot = position, each key's attributes (a live
+/// binding is an accessor whose getter reads the binding; every other export
+/// a data property), then `@@toStringTag`, a `null` [[Prototype]], and born
+/// non-extensible. So the
+/// object carries its final shape from its first instruction: no key-add,
+/// attribute, prototype or integrity transition, and no shape is minted.
+///
+/// `values` holds one NaN-boxed value per key, in key order: the getter
+/// closure of an accessor key, the value of a data key, and last the
+/// `@@toStringTag` value "Module".
+///
+/// # Safety
+/// `desc` is a registered namespace descriptor of this program and `values`
+/// points at `desc.key_count` values.
+#[no_mangle]
+pub unsafe extern "C" fn js_create_namespace_layout(
+    desc: *const super::layout_desc::PerryLayoutDesc,
+    values: *const f64,
+) -> f64 {
+    use super::key_attrs::ENTRY_ACCESSOR;
+    let d = &*desc;
+    let count = d.key_count as usize;
+    let keys = if count == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(d.keys, count)
+    };
+    if super::layout_desc::register_namespace_layout(desc).is_none() {
+        // This runtime could not register the layout: the same namespace,
+        // built key by key from the descriptor's own names and attributes.
+        return namespace_from_unregistered_layout(keys, values);
+    }
+    // The values arrive in a caller stack buffer the collector does not
+    // scan, and each accessor's pair allocation can collect: root them all,
+    // then each pair, before the object exists.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let raw: Vec<f64> = if count == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(values, count).to_vec()
+    };
+    let value_handles = scope.root_nanbox_f64_slice(&raw);
+    let mut words = Vec::with_capacity(count);
+    for (key, value) in keys.iter().zip(value_handles.iter()) {
+        if key.attrs & ENTRY_ACCESSOR != 0 {
+            let pair = super::accessor_pair::pair_new(super::accessor_pair::Accessor {
+                get: value.get_nanbox_u64(),
+                ..Default::default()
+            });
+            words.push(Some(scope.root_nanbox_u64(
+                crate::value::js_nanbox_pointer(pair as i64).to_bits(),
+            )));
+        } else {
+            words.push(None);
+        }
+    }
+    // Nothing below collects: the birth and its slot stores are one step.
+    let _no_gc = crate::gc::GcSuppressScope::new();
+    let obj = super::layout_desc::perry_alloc_layout(desc);
+    (*obj).class_id = MODULE_NAMESPACE_CLASS_ID;
+    let fields = obj
+        .cast::<u8>()
+        .add(std::mem::size_of::<ObjectHeader>())
+        .cast::<u64>();
+    let old = crate::arena::pointer_in_old_gen(obj as usize);
+    for (i, key) in keys.iter().enumerate() {
+        let bits = match &words[i] {
+            Some(pair) => pair.get_nanbox_u64(),
+            None => value_handles[i].get_nanbox_u64(),
+        };
+        let slot = fields.add(key.slot as usize);
+        // GC_STORE_AUDIT(INIT): a declared slot of the unpublished birth.
+        *slot = bits;
+        if old {
+            crate::gc::runtime_write_barrier_slot(obj as usize, slot as usize, bits);
+        }
+    }
+    crate::value::js_nanbox_pointer(obj as i64)
+}
+
+/// [`js_create_namespace_layout`] for a descriptor this runtime did not
+/// register: the generic per-key construction, from the descriptor's export
+/// names (its string atoms) and accessor bits.
+#[cold]
+unsafe fn namespace_from_unregistered_layout(
+    keys: &[super::layout_desc::PerryLayoutKey],
+    values: *const f64,
+) -> f64 {
+    let mut names = Vec::with_capacity(keys.len());
+    let mut lens = Vec::with_capacity(keys.len());
+    let mut live = Vec::with_capacity(keys.len());
+    let mut ordered = Vec::with_capacity(keys.len());
+    debug_assert!(keys.iter().enumerate().all(|(i, k)| k.slot as usize == i));
+    for (i, key) in keys.iter().enumerate() {
+        // `@@toStringTag` is the generic construction's own business.
+        if (*key.atom).kind != crate::codegen_abi::ATOM_KIND_STRING {
+            continue;
+        }
+        let s = (*key.atom).string;
+        names.push(crate::string::string_data(s));
+        lens.push((*s).byte_len as i32);
+        live.push(u8::from(key.attrs & super::key_attrs::ENTRY_ACCESSOR != 0));
+        ordered.push(*values.add(i));
+    }
+    js_create_namespace(
+        names.len() as i32,
+        names.as_ptr(),
+        lens.as_ptr(),
+        ordered.as_ptr(),
+        live.as_ptr(),
+    )
+}
+
+// The namespace descriptor's integrity byte is the runtime's flag.
+const _: () = assert!(
+    crate::codegen_abi::LAYOUT_INTEGRITY_NON_EXTENSIBLE as u16 == crate::gc::OBJ_FLAG_NO_EXTEND
+);
 
 #[cfg(test)]
 mod sso_tests_1781 {

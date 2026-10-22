@@ -20,6 +20,12 @@ pub const STATIC_SHAPE_ID_COUNT: u32 = 1 << 20;
 /// dictionary and exotic words lie at or above it. The site test of a
 /// prototype constant or a known-holder read is one unsigned compare.
 pub const UNSHADOWED_WORD_END: u32 = 0xB000_0000;
+/// `object::shapes::SHAPE_ID_KIND_MASK`: a ShapeId's identity-kind bits.
+/// All set on the mixed kind (`SHAPE_ID_KIND_MIXED`, a class instance linked
+/// to a recorded prototype), the only kind a class evaluation's copy of a
+/// family layout carries, whose instances a constructor store run asks the
+/// runtime about (`perry_family_run_admits`).
+pub const SHAPE_ID_KIND_MASK: u32 = 3 << 20;
 /// `object::shapes::WEAKMAP_BIRTH_LAYOUT` / `WEAKSET_BIRTH_LAYOUT`: the
 /// declared layout every `new WeakMap()` / `new WeakSet()` is born on (the
 /// brand, no key, the family's intrinsic as `[[Prototype]]`). An own key, a
@@ -47,6 +53,17 @@ pub const LAYOUT_KEY_NON_CONFIGURABLE: u8 = 0x04;
 pub const LAYOUT_KEY_ACCESSOR: u8 = 0x08;
 pub const LAYOUT_KEY_HAS_GET: u8 = 0x10;
 pub const LAYOUT_KEY_HAS_SET: u8 = 0x20;
+/// `PerryLayoutDesc.integrity` of a layout born non-extensible (the runtime's
+/// `gc::OBJ_FLAG_NO_EXTEND`, pinned there): a module namespace object
+/// (ECMA-262 10.4.6) is born on such a layout, so no later
+/// `preventExtensions` transition mints a further shape.
+pub const LAYOUT_INTEGRITY_NON_EXTENSIBLE: u8 = 0x04;
+/// `PerryLayoutKey.attrs` of a private field's element (the runtime's
+/// `key_attrs::PRIVATE_FIELD_ENTRY`: `ENTRY_PRIVATE | ENTRY_NON_ENUMERABLE`):
+/// the key is the field's qualified private name, never a property. A class
+/// family emits it with [`LAYOUT_KEY_OPTIONAL`]: the element is absent until
+/// the field's definition fills its slot.
+pub const LAYOUT_KEY_PRIVATE_FIELD: u8 = 0x42;
 
 /// `StaticAtom.kind` (OBJECT_MODEL_2026-10-13.md §6a): a string key.
 pub const ATOM_KIND_STRING: u8 = 0;
@@ -73,6 +90,10 @@ pub const ATOM_KIND_BINDING_SYMBOL: u8 = 4;
 pub const LAYOUT_VARIANT_PROTOTYPE_IMAGE: u16 = 1;
 /// Ordinary function constructor family, with a live per-object prototype.
 pub const LAYOUT_VARIANT_FUNCTION_CONSTRUCTOR: u16 = 2;
+/// A module namespace object's layout. Startup only reserves its id; the
+/// namespace's birth installs it, so a module whose namespace is never built
+/// costs no key list and no shape.
+pub const LAYOUT_VARIANT_NAMESPACE: u16 = 3;
 /// The well-known symbols by number (`StaticAtom.index` of a kind-1 atom),
 /// spelled as `Symbol.<name>`.
 pub const WELL_KNOWN_SYMBOLS: [&str; 15] = [
@@ -170,8 +191,15 @@ pub const SHAPE_RECORD_SIZE: usize = 120;
 /// data at its colour slot).
 pub const SHAPE_RECORD_COLOUR_MASK: usize = 88;
 /// Offset of a record's two-word coloured-key store mask (the key is also a
-/// plain writable `Any`-lane slot of a store-admitted, non-frozen layout).
+/// plain writable `Any`- or `F64`-lane slot of a store-admitted, non-frozen
+/// layout; an `F64` lane takes only a plain double, so a site tests the lane
+/// when its value may be anything else).
 pub const SHAPE_RECORD_COLOUR_STORE_MASK: usize = 104;
+/// Offset of a record's per-slot representation word (two bits per inline
+/// slot 0..32, `Any` = 0; a slot at or past 32 is `Any`).
+pub const SHAPE_RECORD_REP: usize = 48;
+/// The number of inline slots a record's `rep` word describes.
+pub const SHAPE_REP_SLOTS: u32 = 32;
 /// Offset of the flat record base in the agent's shape directory.
 pub const SHAPE_DIR_FLAT_BASE: usize = 24;
 /// The layout word's shadow bit (`perry-runtime` `layout_desc.rs`).
@@ -513,15 +541,16 @@ pub struct JsFunctionInfo {
     /// `code`, once, when the info is born: codegen renders it for each body
     /// it emits, and every info the runtime or an addon builds is
     /// zero. A call passing at least the decoded count jumps to
-    /// `code` with its registers untouched (`js_closure_call{N}`); any other
-    /// call takes the dispatcher. Private, so an info can only be built
+    /// `code` with its registers untouched (`js_closure_call{N}`). Other compiled
+    /// calls enter `call_entry`; legacy/native records take the dispatcher. Private, so an info can only be built
     /// through [`JsFunctionInfo::of`] (typed) or the `unsafe`
     /// [`JsFunctionInfo::from_code`], and made plain only by
     /// [`JsFunctionInfo::plain`].
     plain_params: u16,
     /// The versioned-loop clone's boxed-capture mask. When
     /// [`FN_HAS_SOURCE`] is set and `versioned_code` is null, this otherwise
-    /// idle word instead carries the signed 64-bit source displacement.
+    /// idle word instead carries the signed 64-bit raw-source displacement,
+    /// or the two 32-bit source-block parts licensed by FN_SOURCE_BLOCKS.
     pub versioned_boxed_mask: u64,
 }
 
@@ -567,6 +596,11 @@ pub const FN_REST_MASK: u32 =
 /// The body must not keep the pointer, store it anywhere, or let it escape the
 /// call.
 pub type JsNativeArgsBody<C> = unsafe extern "C" fn(*const C, JsThis, *const f64, usize) -> f64;
+/// The generic entry of a compiled function. Argument cells belong to the
+/// caller and may be rewritten by moving GC; the callee roots these cells in
+/// place before allocating and never retains their addresses after returning.
+pub type JsCallEntry<C> =
+    unsafe extern "C" fn(*const C, JsThis, *const core::cell::UnsafeCell<f64>, usize) -> f64;
 /// `length` is valid.
 pub const FN_HAS_LENGTH: u32 = 1 << 3;
 /// An arrow function: lexical `this`, not constructable.
@@ -599,7 +633,8 @@ pub const FN_COMPILED_BODY: u32 = 1 << 13;
 /// A compiler-emitted info carries retained source. When `versioned_code` is
 /// null, its otherwise idle versioned-captures fields carry byte length and
 /// signed displacement; an info that also has a versioned clone is followed
-/// by two `i32`s. Runtime/native infos stay [`JS_FUNCTION_INFO_SIZE`] bytes.
+/// by two `i32`s (four with FN_SOURCE_BLOCKS). Runtime/native infos stay
+/// [`JS_FUNCTION_INFO_SIZE`] bytes.
 pub const FN_HAS_SOURCE: u32 = 1 << 14;
 /// The retained source describes an ordinary non-strict function. Methods,
 /// arrows and strict ordinary functions leave this clear.
@@ -613,6 +648,34 @@ pub const FN_HAS_NAME: u32 = 1 << 21;
 pub const FN_NAME_IMAGE: u32 = 1 << 22;
 /// An immutable constructor-layout record follows source/name tails.
 pub const FN_HAS_CONSTRUCTOR_LAYOUT: u32 = 1 << 23;
+/// With FN_HAS_SOURCE: the range names independent raw-DEFLATE frames.
+/// The idle mask contains `{ i32 block displacement, u32 decoded offset }`;
+/// versioned_captures remains the source length. A live versioned clone uses
+/// an optional `{ i32 displacement, u32 offset, u32 length, u32 reserved }` tail.
+/// This is an immutable representation discriminator, not a validity bit.
+pub const FN_SOURCE_BLOCKS: u32 = 1 << 24;
+/// Independent retained-source frames bound uncached small-range decoding.
+pub const RETAINED_SOURCE_BLOCK_BYTES: usize = 4096;
+/// A function whose own source is at most this long keeps a raw copy that its
+/// info names directly; longer sources are read from the frames.
+pub const RETAINED_SOURCE_RAW_MAX_BYTES: usize = 512;
+
+/// Size of the optional source tail; the common source uses idle base fields.
+#[inline(always)]
+pub fn function_source_tail_size(info: &JsFunctionInfo) -> usize {
+    if info.flags & FN_HAS_SOURCE == 0 || info.versioned_code.is_null() {
+        0
+    } else if info.flags & FN_SOURCE_BLOCKS != 0 {
+        16
+    } else {
+        8
+    }
+}
+
+/// The top nibble holds the generic-entry word's offset in eight-byte units.
+/// Zero means absent. The record describes its own layout: admission and the
+/// entry load need no source/name/constructor-tail decoding.
+pub const FN_CALL_ENTRY_SHIFT: u32 = 28;
 
 /// Byte offsets of the fields codegen emits and emitted code reads.
 pub const JS_FUNCTION_INFO_CODE_OFFSET: usize = 0;
@@ -627,6 +690,25 @@ pub const JS_FUNCTION_INFO_PLAIN_PARAMS_OFFSET: usize =
 pub const NOT_PLAIN: u16 = u16::MAX;
 
 impl JsFunctionInfo {
+    /// The callee's argument-vector entry, directly in this immutable record.
+    /// Runtime-native records omit it. Source, name and constructor operands
+    /// retain their established offsets; the entry is the final optional word.
+    #[inline(always)]
+    pub fn call_entry(&self) -> Option<*const u8> {
+        let words = self.flags >> FN_CALL_ENTRY_SHIFT;
+        if words == 0 {
+            return None;
+        }
+        // SAFETY: codegen publishes this offset with the immutable entry word.
+        Some(unsafe {
+            (self as *const Self)
+                .cast::<u8>()
+                .add(words as usize * 8)
+                .cast::<*const u8>()
+                .read()
+        })
+    }
+
     /// The info of the body at `code` declaring `params` JS parameters, with
     /// no other facts.
     ///
@@ -889,6 +971,8 @@ pub const BYTES_RESIZABLE: u16 = 1 << 8;
 pub const BYTES_DETACHED: u16 = 1 << 14;
 pub const BYTES_ELEMENT_SHIFT: [u8; 19] = [0, 0, 0, 1, 1, 2, 2, 1, 2, 3, 3, 3, 0, 0, 0, 0, 0, 0, 0];
 
+pub mod component_guest;
+pub mod component_host;
 pub mod native_class_ids;
 pub mod wasm_host;
 
@@ -937,3 +1021,71 @@ pub const NANBOX_OPERANDS: [u64; 26] = [
     0x7FFC_0000_0000_0002, // TAG_NULL
     0x7FFC_0000_0000_0000, // TAG_MARKER
 ];
+
+pub mod wasi;
+
+#[cfg(test)]
+mod call_entry_layout_tests {
+    use super::*;
+
+    extern "C" fn operation(_: *const (), _: JsThis) -> f64 {
+        0.0
+    }
+    extern "C" fn entry(
+        _: *const (),
+        _: JsThis,
+        _: *const core::cell::UnsafeCell<f64>,
+        _: usize,
+    ) -> f64 {
+        0.0
+    }
+
+    #[repr(C)]
+    struct EntryOnly {
+        info: JsFunctionInfo,
+        entry: JsCallEntry<()>,
+    }
+    #[repr(C)]
+    struct EntryWithTails {
+        info: JsFunctionInfo,
+        source: [u32; 2],
+        name: [u32; 2],
+        constructor: (*const u8, *const u8, u32, u32),
+        entry: JsCallEntry<()>,
+    }
+
+    #[test]
+    fn the_entry_word_follows_existing_optional_metadata() {
+        let info = JsFunctionInfo::of(operation as JsBody0<()>);
+        assert!(info.call_entry().is_none());
+        let plain = EntryOnly {
+            info: info.with_flags(
+                ((core::mem::offset_of!(EntryOnly, entry) / 8) as u32) << FN_CALL_ENTRY_SHIFT,
+            ),
+            entry,
+        };
+        assert_eq!(plain.info.call_entry(), Some(entry as *const u8));
+        // Keep a live clone so source uses the optional range, rather than
+        // its packed representation in the otherwise idle clone fields.
+        let with_tails = EntryWithTails {
+            info: info
+                .with_flags(
+                    (((core::mem::offset_of!(EntryWithTails, entry) / 8) as u32)
+                        << FN_CALL_ENTRY_SHIFT)
+                        | FN_HAS_SOURCE
+                        | FN_HAS_NAME
+                        | FN_HAS_CONSTRUCTOR_LAYOUT,
+                )
+                .with_versioned_loop(operation as *const u8, 0, 0),
+            source: [0; 2],
+            name: [0; 2],
+            constructor: (core::ptr::null(), core::ptr::null(), 0, 0),
+            entry,
+        };
+        assert_eq!(with_tails.info.call_entry(), Some(entry as *const u8));
+        assert_eq!(
+            core::mem::size_of::<JsFunctionInfo>(),
+            JS_FUNCTION_INFO_SIZE
+        );
+    }
+}

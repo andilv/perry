@@ -579,10 +579,21 @@ fn materialize_compiled_namespace(ctx: &mut FnCtx<'_>, name: &str) -> Result<Opt
             Ok(())
         },
         |ctx, object| {
+            // A CommonJS namespace under Bun interop also carries the
+            // run-time keys of its evaluated `module.exports`.
+            let object = if ctx.cjs_interop_namespaces.contains(name) {
+                ctx.block().call(
+                    DOUBLE,
+                    "js_namespace_adopt_cjs_exports",
+                    &[(DOUBLE, object)],
+                )
+            } else {
+                object.to_string()
+            };
             Ok(Some(ctx.block().call(
                 DOUBLE,
                 "js_finalize_namespace",
-                &[(DOUBLE, object)],
+                &[(DOUBLE, &object)],
             )))
         },
     )
@@ -991,7 +1002,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // wrapped as closures. Without this, `let v = HONE_VERSION`
                 // creates a closure wrapper instead of the actual string.
                 if ctx.imported_vars.contains(name) {
-                    let fname = format!("perry_fn_{}__{}", source_prefix, origin_suffix);
+                    let fname = crate::symbol_names::function(&source_prefix, &origin_suffix);
                     ctx.pending_declares.push((fname.clone(), DOUBLE, vec![]));
                     return Ok(ctx.block().call(DOUBLE, &fname, &[]));
                 }
@@ -1024,7 +1035,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // `__perry_extern_closure_<src>__<name>` global is no
                 // longer referenced and link-time DCE strips it.
                 // Refs #645 deeper followup / #488 drizzle-sqlite.
-                let target_name = format!("perry_fn_{}__{}", source_prefix, origin_suffix);
+                let target_name = crate::symbol_names::function(&source_prefix, &origin_suffix);
                 let wrap_name = format!("__perry_wrap_{}", target_name);
                 // Declare the source's wrapper so LLVM accepts the
                 // `@<wrap_name>` reference. Signature mirrors the

@@ -10,31 +10,42 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Monotonic invalidation epoch for cached store plans. Bumped by descriptor
-/// installs/clears, prototype recording, and every GC collection (intern-table
-/// scan + dead-owner prune). Entries recorded under an older epoch never
-/// match.
-static PROP_PLAN_EPOCH: AtomicU64 = AtomicU64::new(1);
+// Monotonic invalidation epoch for cached store plans. Bumped by descriptor
+// installs/clears, prototype recording, and every GC collection (intern-table
+// scan + dead-owner prune). Entries recorded under an older epoch never
+// match.
+//
+// `per_test_global!`: the plan caches below are per-thread, and any test that
+// bumps the epoch (every `delete`, every prototype relink, every collection)
+// would otherwise invalidate the caches of every OTHER concurrently running
+// test, so a test that records a plan and checks it moments later saw a miss.
+// In a test build each test thread has its own epoch beside its own caches;
+// outside a test build this is the plain `static`.
+per_test_global! {
+    static PROP_PLAN_EPOCH: AtomicU64 = AtomicU64::new(1);
+}
 
-/// The SEMANTIC half of [`PROP_PLAN_EPOCH`]: bumped by exactly the events that
-/// change what a property lookup would ANSWER — descriptor installs and clears,
-/// `delete`, per-instance prototype recording, class-prototype-object
-/// registration, parent-static linking. Deliberately NOT bumped by garbage
-/// collection.
-///
-/// The store/read-plan caches need the GC bump because they memoize a
-/// (keys_array address, interned key pointer) → slot mapping, and a collection
-/// can relocate either identity. A cache that instead re-derives its addresses
-/// from live objects on every lookup — and only COMPARES them against what it
-/// recorded — does not: a relocation shows up as an address mismatch, which is
-/// a miss, and GC never adds or removes a property. Keying such a cache on the
-/// full epoch is not merely wasteful, it is a performance CLIFF: the
-/// incremental collector's root scan bumps the epoch at loop-poll cadence, so
-/// the entry is invalid on essentially every lookup and the "cache" degrades
-/// into an unconditional recompute. Measured on `gc-handoff/apps/asyncpipe.ts`:
-/// +35 % instructions versus baseline, against −24.6 % with the recompute
-/// eliminated (#7910).
-static PROP_PLAN_SEMANTIC_EPOCH: AtomicU64 = AtomicU64::new(1);
+// The SEMANTIC half of [`PROP_PLAN_EPOCH`]: bumped by exactly the events that
+// change what a property lookup would ANSWER — descriptor installs and clears,
+// `delete`, per-instance prototype recording, class-prototype-object
+// registration, parent-static linking. Deliberately NOT bumped by garbage
+// collection.
+//
+// The store/read-plan caches need the GC bump because they memoize a
+// (keys_array address, interned key pointer) → slot mapping, and a collection
+// can relocate either identity. A cache that instead re-derives its addresses
+// from live objects on every lookup — and only COMPARES them against what it
+// recorded — does not: a relocation shows up as an address mismatch, which is
+// a miss, and GC never adds or removes a property. Keying such a cache on the
+// full epoch is not merely wasteful, it is a performance CLIFF: the
+// incremental collector's root scan bumps the epoch at loop-poll cadence, so
+// the entry is invalid on essentially every lookup and the "cache" degrades
+// into an unconditional recompute. Measured on `gc-handoff/apps/asyncpipe.ts`:
+// +35 % instructions versus baseline, against −24.6 % with the recompute
+// eliminated (#7910).
+per_test_global! {
+    static PROP_PLAN_SEMANTIC_EPOCH: AtomicU64 = AtomicU64::new(1);
+}
 
 /// Invalidate every cached store plan. Cheap (two relaxed adds); callers are
 /// rare, cold paths by construction.
@@ -97,9 +108,10 @@ crate::perry_thread_local! {
 
 #[inline(always)]
 fn plan_slot(shape_id: u32, key_ptr: usize) -> usize {
-    // Fibonacci mix of the two identities; low bits of interned pointers are
-    // alignment zeros, so fold the middle bits down first.
-    let h = ((key_ptr >> 4) as u64 ^ ((shape_id as u64) << 17)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // Slot placement uses content and ShapeId, while the entry retains the
+    // canonical pointer and epoch identity checks below.
+    let h = (super::interned_key_slot_hash(key_ptr) ^ ((shape_id as u64) << 17))
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 40) as usize & PLAN_CACHE_MASK
 }
 
@@ -198,24 +210,31 @@ crate::perry_thread_local! {
 }
 
 #[inline(always)]
-fn read_plan_slot(keys_id: usize, key_ptr: usize) -> usize {
-    let h = ((keys_id >> 4) as u64 ^ ((key_ptr >> 3) as u64).rotate_left(21))
+fn read_plan_slot(shape_id: u32, key_ptr: usize) -> usize {
+    let h = (u64::from(shape_id) ^ super::interned_key_slot_hash(key_ptr).rotate_left(21))
         .wrapping_mul(0x9E37_79B9_7F4A_7C15);
     (h >> 40) as usize & READ_PLAN_MASK
 }
 
 /// Look up the cached own-field index for (keys_array, interned key).
+/// Slot placement uses receiver ShapeId and key content; entry identity
+/// still compares the keys-array and canonical key pointers.
 ///
 /// `key_count` is the receiver's key count from its shape. A plan is keyed by
 /// the keys ARRAY, which the lists on one growth chain share, so a slot that
 /// was learned on a longer list answers only when it is below this
 /// receiver's count.
 #[inline]
-pub(crate) fn read_plan_lookup(keys_id: usize, key_ptr: usize, key_count: u32) -> Option<u32> {
+pub(crate) fn read_plan_lookup(
+    shape_id: u32,
+    keys_id: usize,
+    key_ptr: usize,
+    key_count: u32,
+) -> Option<u32> {
     if keys_id == 0 || key_ptr == 0 {
         return None;
     }
-    let slot = read_plan_slot(keys_id, key_ptr);
+    let slot = read_plan_slot(shape_id, key_ptr);
     READ_PLAN_CACHE.with(|c| unsafe {
         let e = (*c.get())[slot];
         if e.keys_id == keys_id
@@ -232,11 +251,11 @@ pub(crate) fn read_plan_lookup(keys_id: usize, key_ptr: usize, key_count: u32) -
 
 /// Record an own-field index resolved by a validated keys-array scan.
 #[inline]
-pub(crate) fn read_plan_record(keys_id: usize, key_ptr: usize, field_idx: u32) {
+pub(crate) fn read_plan_record(shape_id: u32, keys_id: usize, key_ptr: usize, field_idx: u32) {
     if keys_id == 0 || key_ptr == 0 {
         return;
     }
-    let slot = read_plan_slot(keys_id, key_ptr);
+    let slot = read_plan_slot(shape_id, key_ptr);
     READ_PLAN_CACHE.with(|c| unsafe {
         (*c.get())[slot] = ReadPlanEntry {
             keys_id,
@@ -270,11 +289,12 @@ mod tests {
 
     #[test]
     fn record_then_check_hits_and_epoch_bump_invalidates() {
-        let key = 0xDEAD_BEE0usize;
+        let key = crate::string::canonical_key(b"plan-key") as usize;
+        let other = crate::string::canonical_key(b"other-key") as usize;
         assert!(store_plan_records_and_hits(7, key));
         // Different shape or key misses.
         assert!(!store_plan_check(8, key));
-        assert!(!store_plan_check(7, key + 16));
+        assert!(!store_plan_check(7, other));
         // Epoch bump invalidates.
         prop_plan_epoch_bump();
         assert!(!store_plan_check(7, key));
@@ -284,7 +304,7 @@ mod tests {
 
     #[test]
     fn a_verdict_for_one_prototype_shape_does_not_serve_another() {
-        let key = 0xFACE_0100usize;
+        let key = crate::string::canonical_key(b"prototype-key") as usize;
         assert!(store_plan_records_and_hits(11, key));
         assert!(!store_plan_check(12, key));
         assert!(!store_plan_check(0, key));
@@ -293,22 +313,37 @@ mod tests {
     #[test]
     fn read_plan_roundtrip_and_epoch_flush() {
         let keys = 0xAAAA_0040usize;
-        let key = 0xBBBB_0080usize;
+        let key = crate::string::canonical_key(b"read-key") as usize;
+        let other = crate::string::canonical_key(b"other-key") as usize;
         // Same order-dependence as the store-plan tests: a concurrent global
         // epoch bump between record and lookup flushes the thread-local
         // entry, so retry the roundtrip.
         assert!((0..64).any(|_| {
-            read_plan_record(keys, key, 21);
-            read_plan_lookup(keys, key, u32::MAX) == Some(21)
+            read_plan_record(17, keys, key, 21);
+            read_plan_lookup(17, keys, key, u32::MAX) == Some(21)
         }));
-        assert_eq!(read_plan_lookup(keys, key + 8, u32::MAX), None);
+        assert_eq!(read_plan_lookup(17, keys, other, u32::MAX), None);
         // A shorter list on the same array does not see a slot past its count.
         assert!((0..64).any(|_| {
-            read_plan_record(keys, key, 21);
-            read_plan_lookup(keys, key, 21).is_none() && read_plan_lookup(keys, key, 22) == Some(21)
+            read_plan_record(17, keys, key, 21);
+            read_plan_lookup(17, keys, key, 21).is_none()
+                && read_plan_lookup(17, keys, key, 22) == Some(21)
         }));
         prop_plan_epoch_bump();
-        assert_eq!(read_plan_lookup(keys, key, u32::MAX), None);
+        assert_eq!(read_plan_lookup(17, keys, key, u32::MAX), None);
+    }
+
+    #[test]
+    fn plan_slots_follow_content_when_interned_addresses_change() {
+        let (_storage, a, b) = super::super::address_free_slots_tests::relocated_keys(
+            b"same-property",
+            b"same-property",
+        );
+        assert_eq!(plan_slot(0x8000_0042, a), plan_slot(0x8000_0042, b));
+        assert_eq!(
+            read_plan_slot(0x8000_0042, a),
+            read_plan_slot(0x8000_0042, b)
+        );
     }
 
     #[test]

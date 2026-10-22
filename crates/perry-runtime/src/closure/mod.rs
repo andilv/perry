@@ -11,6 +11,7 @@ pub(crate) mod body_call;
 mod dispatch;
 pub(crate) use dispatch::bound_intrinsic::{packed_apply_values, try_native_apply};
 mod dynamic_props;
+mod entry_bundle;
 pub(crate) mod native_constructor;
 pub(crate) mod props;
 mod registry;
@@ -25,6 +26,8 @@ mod receiver_param_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use alloc::closure_allocs_on_this_thread;
 pub use alloc::{
     closure_alloc_storage, closure_capture_slots_mut, closure_payload_size, js_closure_alloc,
     js_closure_alloc_empty, js_closure_alloc_fixed, js_closure_alloc_init,
@@ -69,9 +72,7 @@ pub(crate) use dispatch::{
     bound_method_source_func_ptr, coerce_call_this, reify_function_method_value,
     reset_throw_not_callable_counter,
 };
-pub(crate) use dispatch::{
-    call_compiled_body_this, call_compiled_closure_this, native_call_value_this,
-};
+pub(crate) use dispatch::{call_compiled_body_this, native_call_value_this};
 pub(crate) use dispatch::{
     call_with_explicit_this, forward_with_explicit_this, receiver_may_box, ReceiverBinding,
 };

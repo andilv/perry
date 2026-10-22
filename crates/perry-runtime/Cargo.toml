@@ -298,6 +298,7 @@ perex = { workspace = true, optional = true }
 # Taffy — flexbox / grid layout engine for the perry/tui module
 # (#358 Phase 3). Same crate Bevy and Dioxus use; pure Rust, no FFI.
 taffy = { version = "0.13", default-features = false, features = ["std", "flexbox", "taffy_tree"] }
+miniz_oxide = "=0.9.1"
 itoa.workspace = true
 ryu.workspace = true
 # ECMAScript shortest-number spelling into a stack buffer (JSON hot path).
@@ -489,3 +490,7 @@ turnloop.workspace = true
 # target), so `js_os_hostname` answers "localhost" there (#11377).
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
 hostname = { version = "0.4", optional = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# Constructor-based enumeration of relocated image records in linear memory.
+inventory = "=0.3.21"

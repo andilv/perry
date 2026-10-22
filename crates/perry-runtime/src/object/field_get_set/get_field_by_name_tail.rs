@@ -1239,16 +1239,6 @@ pub(crate) fn get_field_by_name_object_tail(
             }
         }
 
-        if (*obj).class_id == crate::tty::CLASS_ID_TTY_WRITE_STREAM && !key.is_null() {
-            let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-            let key_len = (*key).byte_len as usize;
-            let property_name =
-                std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)).unwrap_or("");
-            if let Some(value) = crate::tty::tty_write_stream_dimension(property_name) {
-                return JSValue::from_bits(value.to_bits());
-            }
-        }
-
         // Refs #420 / #618 followup: `instance.constructor` returns the
         // class ref. Pre-fix this fell through to the keys_array lookup
         // which never finds "constructor" (the class itself isn't stored
@@ -1506,9 +1496,10 @@ pub(crate) fn get_field_by_name_object_tail(
         // #6759 C3c: prefer the header-stamped stable shape id as the cache
         // key — it survives owned grow-reallocs AND GC moves of the keys
         // array, both of which change `keys_id` and orphaned the entry.
-        // Unstamped objects keep the address key; either way every hit below
-        // re-validates the stored key, so a colliding or foreign key can only
-        // miss, never mis-resolve.
+        // Unstamped objects retain the address as ENTRY IDENTITY. Slot
+        // placement uses only the stamp (including 0) and content hash, so
+        // loading the same executable elsewhere cannot change its collisions.
+        // Every hit below still re-validates the stored key.
         //
         // #6759 C3 rung 1: `object_shape_stamp` has no `class_id` gate, so a
         // stamped CLASS INSTANCE keys on its id here too — which is the point
@@ -1534,7 +1525,7 @@ pub(crate) fn get_field_by_name_object_tail(
         // nursery reset can reuse a keys-array address, so cache hits still
         // validate the key slot before returning a field.
         let st = crate::state::state();
-        let cache_idx = (shape_key.wrapping_add(key_hash as usize)) % super::FIELD_CACHE_SIZE;
+        let cache_idx = (stamp as usize).wrapping_add(key_hash as usize) % super::FIELD_CACHE_SIZE;
         let cached = if table_owned {
             None
         } else {
@@ -1636,7 +1627,7 @@ pub(crate) fn get_field_by_name_object_tail(
                     };
                     let store_key = if id != 0 { id as usize } else { keys_id };
                     let store_idx =
-                        (store_key.wrapping_add(key_hash as usize)) % super::FIELD_CACHE_SIZE;
+                        (id as usize).wrapping_add(key_hash as usize) % super::FIELD_CACHE_SIZE;
                     let cache = &mut *st.field_lookup.field_cache.get();
                     cache[store_idx] = (store_key, key_hash, i as u32);
                 }

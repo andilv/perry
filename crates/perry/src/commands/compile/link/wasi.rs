@@ -1,6 +1,7 @@
 //! `--target wasi` link (#11379): the program's wasm32 objects plus the
 //! runtime built for `wasm32-wasip2`, linked by wasi-sdk into a WASI 0.2
-//! component that runs under any WASI host (`wasmtime run app.wasm`).
+//! component. The pinned SDK emits WASI 0.2.12 imports; the host must provide
+//! those interfaces and Wasm EH (tested with Wasmtime 48).
 //!
 //! Deliberately separate from the native link path: no auto-optimize runtime
 //! rebuild, no stdlib, no link cache. Only compiled with the off-by-default
@@ -66,7 +67,71 @@ pub(super) fn link_args(
     args
 }
 
-/// Link `objects` into the WASI component at `output`.
+/// WASI uses the same feature selection and constructor registration as
+/// native links. Omitting this object silently leaves optional runtime hooks
+/// empty (for example Unicode normalization and URL prototype accessors).
+pub(crate) fn feature_installer(
+    ctx: &super::super::CompilationContext,
+    cli_features: &[String],
+    directory: &Path,
+) -> Result<PathBuf> {
+    use crate::commands::stdlib_installs::{runtime_installer_callees, FeatureInstalls};
+    let selected = super::super::optimized_libs::auto_optimized_cross_features(
+        ctx,
+        &std::collections::BTreeSet::new(),
+        cli_features,
+    )
+    .into_iter()
+    .filter_map(|feature| feature.strip_prefix("perry-runtime/").map(str::to_string))
+    .collect();
+    let symbols = runtime_installer_callees(&FeatureInstalls::Selected(selected));
+    let bytes =
+        perry_codegen::stubs::generate_feature_installer_object(&symbols, None, &[], Some("wasi"))?;
+    let path = directory.join("_perry_feature_installs.o");
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// Archive the reusable library objects for a separate canonical adapter link.
+pub(crate) fn archive_library(
+    objects: &[PathBuf],
+    runtime: &Path,
+    output: &Path,
+    verbose: u8,
+) -> Result<()> {
+    let sdk = wasi_sdk()?;
+    let archiver = sdk.join("bin").join(if cfg!(windows) {
+        "llvm-ar.exe"
+    } else {
+        "llvm-ar"
+    });
+    // Use LLVM's Wasm-aware indexer, including on hosts whose system ar only
+    // recognizes native objects. Recreate so removed modules cannot linger.
+    if output.exists() {
+        std::fs::remove_file(output)?;
+    }
+    let mut command = Command::new(&archiver);
+    command.arg("crs").arg(output).args(objects);
+    let status = super::super::tool_output::run_internal_tool(&mut command, verbose)?;
+    if !status.success() {
+        bail!("WASI static archive creation failed");
+    }
+    let manifest = serde_json::json!({
+        "version": 1,
+        "archive": output.canonicalize()?.display().to_string(),
+        "entry_symbol": "perry_module_init",
+        "target": "wasi",
+        "link_archives": [{"role": "runtime", "path": runtime.canonicalize()?.display().to_string()}],
+        "system_libraries": ["setjmp"]
+    });
+    std::fs::write(
+        output.with_extension("linkdeps.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    Ok(())
+}
+
+/// Link `objects` into the WASI command component at `output`.
 pub(crate) fn link_wasi(
     objects: &[PathBuf],
     runtime: &Path,
@@ -87,7 +152,7 @@ pub(crate) fn link_wasi(
         let stderr = String::from_utf8_lossy(&out.stderr);
         let hint = if stderr.contains("undefined symbol") {
             "\n\nA symbol the runtime does not provide on WASI yet: most Node \
-             APIs beyond the core runtime (net, http, fetch, zlib, …) live in \
+             APIs beyond the core runtime (http, fetch, zlib, …) live in \
              perry-stdlib, which is not available for --target wasi (#11377)."
         } else {
             ""

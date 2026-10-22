@@ -19,7 +19,7 @@ use super::ctor_arity::synthesized_ctor_param_count;
 use super::entry::compile_module_entry;
 use super::export_value_wrappers::{emit_export_value_wrappers, ExportValueWrapperCtx};
 use super::helpers::{
-    function_body_returns_generator_object, namespace_live_getter_wrapper_symbol, sanitize,
+    function_body_returns_generator_object, namespace_live_getter_wrapper_symbol,
     unknown_func_wrapper_name,
 };
 use super::native_namespace_exports::emit_native_namespace_reexport_getters;
@@ -106,14 +106,14 @@ pub(super) fn emit_module_artifacts(
         // Await lowering rewrites the body and clears Expr::Closure.is_async;
         // its retained source-kind set still describes the function object.
         if hir.async_step_closures.contains(fid) {
-            llmod.note_fn_info(&format!("perry_closure_{module_prefix}__{fid}"), |info| {
+            llmod.note_fn_info(&crate::symbol_names::closure(&module_prefix, fid), |info| {
                 info.set_async();
             });
         }
         if let perry_hir::Expr::Closure { params, body, .. } = expr {
             let flags = super::arguments::arguments_object_flags(params, body);
             if flags != 0 {
-                llmod.note_fn_info(&format!("perry_closure_{module_prefix}__{fid}"), |info| {
+                llmod.note_fn_info(&crate::symbol_names::closure(&module_prefix, fid), |info| {
                     info.flags |= flags
                 });
             }
@@ -142,7 +142,7 @@ pub(super) fn emit_module_artifacts(
         std::env::var("PERRY_CALL_DEVIRT").as_deref(),
         Ok("0") | Ok("off") | Ok("false")
     );
-    let immutable_closure_bindings: std::collections::HashMap<u32, (u32, usize)> =
+    let immutable_closure_bindings: std::collections::HashMap<u32, (u32, usize, bool)> =
         crate::collectors::spec_abi_sites::single_binding_closure_locals(hir)
             .into_iter()
             // A closure with a trusted-box clone is better served by the
@@ -157,21 +157,26 @@ pub(super) fn emit_module_artifacts(
             .filter_map(|(id, func_id)| {
                 closure_param_counts
                     .get(&func_id)
-                    .map(|count| (id, (func_id, *count)))
+                    .map(|count| (id, (func_id, *count, true)))
             })
             .collect();
+    // `var f = function () {}` bindings: the same known entry, but the binding
+    // can still hold `undefined` when called early, so the identity check stays.
+    let mut immutable_closure_bindings = immutable_closure_bindings;
+    if call_devirt_enabled {
+        for (id, func_id) in crate::collectors::spec_abi_sites::hoisted_var_closure_locals(hir) {
+            if trusted_box_closures.contains_key(&func_id) {
+                continue;
+            }
+            if let Some(count) = closure_param_counts.get(&func_id) {
+                immutable_closure_bindings
+                    .entry(id)
+                    .or_insert((func_id, *count, false));
+            }
+        }
+    }
     progress.checkpoint("reassigned-local analysis");
 
-    // Step 5d: fninfer's parameter types for this module's closures,
-    // candidates their typed bodies entry-check.
-    let (inferred_param_types, directly_invoked) = if super::typed_body::typed_bodies_enabled() {
-        (
-            super::typed_body::inferred_param_types(hir),
-            super::typed_body::closures_without_typed_body(hir),
-        )
-    } else {
-        Default::default()
-    };
     let closure_started = Instant::now();
     let closure_progress_step = (closures.len() / 20).max(1);
     for (closure_index, (func_id, closure_expr)) in closures.iter().enumerate() {
@@ -215,29 +220,6 @@ pub(super) fn emit_module_artifacts(
             )
             .with_context(|| format!("lowering typed-string closure clone func_id={}", func_id))?;
         }
-        let typed_body_plan = if super::typed_body::typed_bodies_enabled()
-            && !cross_module.typed_f64_closures.contains(func_id)
-            && !cross_module.typed_i1_closures.contains(func_id)
-            && !cross_module.typed_i32_closures.contains(func_id)
-            && !cross_module.typed_string_closures.contains(func_id)
-            && !trusted_box_closures.contains_key(func_id)
-            && !versioned_loop_callbacks.contains(func_id)
-            && !directly_invoked.contains(func_id)
-        {
-            super::typed_body::plan_for_closure_expr(
-                closure_expr,
-                func_synthetic_arguments.contains(func_id),
-                module_boxed_vars,
-                &module_reassigned_locals,
-                class_ids,
-                &cross_module.wpfacts,
-                &inferred_param_types,
-                module_globals,
-            )
-        } else {
-            None
-        };
-        let generic_index = llmod.function_count();
         compile_closure(
             llmod,
             *func_id,
@@ -262,47 +244,8 @@ pub(super) fn emit_module_artifacts(
             cross_module,
             false,
             false,
-            None,
         )
         .with_context(|| format!("lowering closure func_id={}", func_id))?;
-        // fninfer slice 0: a typed body behind an entry check.
-        if let Some(plan) = typed_body_plan.as_ref() {
-            let tbody_index = llmod.function_count();
-            compile_closure(
-                llmod,
-                *func_id,
-                closure_expr,
-                func_names,
-                strings,
-                class_table,
-                method_names,
-                module_globals,
-                opts.import_function_prefixes,
-                enum_table,
-                static_field_globals,
-                class_ids,
-                func_signatures,
-                func_synthetic_arguments,
-                module_prefix,
-                module_boxed_vars,
-                module_receiver_types,
-                &module_reassigned_locals,
-                &immutable_closure_bindings,
-                closure_rest_params,
-                cross_module,
-                false,
-                false,
-                Some(plan),
-            )
-            .with_context(|| format!("lowering typed closure body func_id={}", func_id))?;
-            super::typed_body::install_closure_dispatch(
-                llmod,
-                generic_index,
-                tbody_index,
-                closure_expr,
-                plan,
-            );
-        }
         if trusted_box_closures.contains_key(func_id) {
             compile_closure(
                 llmod,
@@ -328,7 +271,6 @@ pub(super) fn emit_module_artifacts(
                 cross_module,
                 true,
                 false,
-                None,
             )
             .with_context(|| format!("lowering trusted-box closure func_id={}", func_id))?;
         }
@@ -357,7 +299,6 @@ pub(super) fn emit_module_artifacts(
                 cross_module,
                 true,
                 true,
-                None,
             )
             .with_context(|| format!("lowering versioned-loop closure func_id={}", func_id))?;
         }
@@ -582,7 +523,7 @@ pub(super) fn emit_module_artifacts(
                 } => {
                     // Producers emit raw local-name getter aliases. Sanitizing
                     // `$item` here would call an unrelated `_item` function.
-                    format!("perry_fn_{}__{}", source_prefix, source_local)
+                    crate::symbol_names::function(&source_prefix, &source_local)
                 }
                 _ => continue,
             };
@@ -738,6 +679,8 @@ pub(super) fn emit_module_artifacts(
         output_type,
         &cross_module.program_layouts,
         is_entry_module,
+        &cross_module.namespace_entries,
+        cross_module.namespace_adopts_cjs_exports,
     );
     // Object model step 3 (§3.6): publish the program's shadow names.
     if opts.is_entry_module {
@@ -838,11 +781,7 @@ pub(super) fn emit_module_artifacts(
             let Some(f) = func_by_local_name.get(local.as_str()) else {
                 continue;
             };
-            let alias_wrap = format!(
-                "__perry_wrap_perry_fn_{}__{}",
-                module_prefix,
-                sanitize(exported)
-            );
+            let alias_wrap = crate::symbol_names::function_wrapper(&module_prefix, &exported);
             // The fact recorder (`string_pool.rs`) iterates
             // `user_fn_wrapper_rest`; the synthetic/rest_and_arguments sets only
             // *refine* which rest kind each entry gets. So the alias must be
@@ -926,7 +865,7 @@ pub(super) fn emit_module_artifacts(
         if let perry_hir::Expr::Closure { body, is_async, .. } = expr {
             if !*is_async && function_body_returns_generator_object(body) {
                 user_fn_wrapper_generator
-                    .insert(format!("perry_closure_{}__{}", module_prefix, func_id));
+                    .insert(crate::symbol_names::closure(&module_prefix, func_id));
             }
         }
     }
@@ -948,7 +887,7 @@ pub(super) fn emit_module_artifacts(
         if let perry_hir::Expr::Closure { is_strict, .. } = expr {
             if *is_strict {
                 user_fn_wrapper_strict
-                    .insert(format!("perry_closure_{}__{}", module_prefix, func_id));
+                    .insert(crate::symbol_names::closure(&module_prefix, func_id));
             }
         }
     }
@@ -972,7 +911,7 @@ pub(super) fn emit_module_artifacts(
     for (func_id, _expr) in closures {
         if hir.async_generator_funcs.contains(func_id) {
             user_fn_wrapper_async_generator
-                .insert(format!("perry_closure_{}__{}", module_prefix, func_id));
+                .insert(crate::symbol_names::closure(&module_prefix, func_id));
         }
     }
 
@@ -1034,7 +973,7 @@ pub(super) fn emit_module_artifacts(
                     .get(func_id)
                     .cloned()
                     .unwrap_or_else(|| name.clone());
-                let sym = format!("perry_closure_{}__{}", module_prefix, func_id);
+                let sym = crate::symbol_names::closure(&module_prefix, func_id);
                 user_fn_display_names.push((sym, display));
                 named_inline_closure_ids.insert(*func_id);
             }
@@ -1081,7 +1020,7 @@ pub(super) fn emit_module_artifacts(
         .collect();
     materialized_closure_display.sort_by_key(|(func_id, _)| **func_id);
     for (func_id, display) in materialized_closure_display {
-        let sym = format!("perry_closure_{}__{}", module_prefix, func_id);
+        let sym = crate::symbol_names::closure(&module_prefix, func_id);
         user_fn_display_names.push((sym, display.clone()));
     }
 

@@ -57,6 +57,7 @@ fn empty_opts() -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
@@ -64,7 +65,7 @@ fn empty_opts() -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -91,9 +92,10 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        namespace_adopts_cjs_exports: false,
         debug_locations: false,
         module_source: None,
         debug_source_line_offset: 0,
@@ -106,6 +108,11 @@ fn entry_opts() -> CompileOptions {
         ..empty_opts()
     }
 }
+
+/// Where an array literal's birth begins in the emitted IR. A literal is born
+/// by the inline nursery bump (the `arrlit.fast`/`arrlit.slow` diamond, its
+/// outlined arm `js_inline_arena_slow_alloc`), not by a `js_array_alloc` call.
+const ARRAY_BIRTH: &str = "label %arrlit.fast.";
 
 fn shadow_hygiene_module() -> Module {
     Module {
@@ -718,9 +725,9 @@ fn function_shadow_slots_clear_dead_values_and_skip_numeric_roots() {
         .map(|offset| dead_write + offset)
         .expect("dead shadow slot should be cleared after its last top-level statement");
     let live_alloc = ir[dead_clear..]
-        .find("call i64 @js_array_alloc")
+        .find(ARRAY_BIRTH)
         .map(|offset| dead_clear + offset)
-        .expect("later allocation should remain after dead slot clear");
+        .unwrap_or_else(|| panic!("later allocation should remain after dead slot clear:\n{ir}"));
 
     assert!(dead_write < dead_clear);
     assert!(dead_clear < live_alloc);
@@ -836,9 +843,9 @@ fn entry_module_top_level_shadow_slots_update_and_clear() {
         .map(|offset| dead_write + offset)
         .expect("top-level dead shadow slot should be cleared after last use");
     let later_alloc = main_ir[dead_clear..]
-        .find("call i64 @js_array_alloc")
+        .find(ARRAY_BIRTH)
         .map(|offset| dead_clear + offset)
-        .expect("later allocation should remain after dead slot clear");
+        .unwrap_or_else(|| panic!("later allocation should remain after dead slot clear:\n{ir}"));
 
     assert!(dead_write < dead_clear);
     assert!(dead_clear < later_alloc);
@@ -1038,8 +1045,8 @@ fn reassigned_any_from_number_to_pointer_reserves_and_updates_shadow_slot() {
         "Any local with a later pointer write must reserve a shadow slot"
     );
     let array_alloc = fn_ir
-        .find("call i64 @js_array_alloc")
-        .expect("pointer reassignment should allocate an array");
+        .find(ARRAY_BIRTH)
+        .unwrap_or_else(|| panic!("pointer reassignment should allocate an array:\n{ir}"));
     let slot_update = fn_ir[array_alloc..]
         .find("call void @js_shadow_slot_bind(i32 0, ptr %")
         .map(|offset| array_alloc + offset)

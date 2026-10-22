@@ -214,8 +214,9 @@ mod class_object_template;
 #[cfg(test)]
 pub(crate) use class_object_template::js_class_evaluation_object;
 pub(crate) use class_object_template::{
-    class_object_add_internal_for, class_object_template_cell, record_instance_link,
-    template_instance, InternalKey, TemplateCell, TemplateInstance, CLASS_TEMPLATE_KEY,
+    class_object_add_internal_for, class_object_set_instance_layout, class_object_template_cell,
+    evaluation_instance_layout, record_instance_link, template_instance, InternalKey, TemplateCell,
+    TemplateInstance, CLASS_TEMPLATE_KEY,
 };
 mod crypto_key;
 pub(crate) mod entries_shape;
@@ -317,7 +318,6 @@ pub use field_ops::{
 };
 pub use for_in_stable::js_for_in_keys_stable_value;
 pub(crate) use get_field_by_name::class_value_get_field;
-pub(crate) use get_field_by_name::get_field_by_name_after_site_miss;
 pub use get_field_by_name::js_object_get_field_by_name;
 pub(crate) use get_field_by_name_tail::get_field_by_name_object_tail;
 pub(super) use has_property::native_module_own_field_by_key;
@@ -333,6 +333,8 @@ pub(crate) use ic_miss::intrinsic_private_add;
 #[cfg(feature = "regex-engine")]
 pub(crate) use ic_miss::intrinsic_private_set;
 #[cfg(test)]
+pub(crate) use ic_miss::private_lexical_brand_depth;
+#[cfg(test)]
 pub(crate) use ic_miss::private_member_access_hints_depth;
 pub(crate) use ic_miss::{
     bind_primitive_proto_method_static, cannot_be_private_member_name, class_evaluation_of,
@@ -342,9 +344,10 @@ pub(crate) use ic_miss::{
     private_lexical_brand_push_at, private_lexical_brand_unwind_to,
     private_member_access_hints_check_marks, private_member_access_hints_unwind_to,
     private_member_call_by_name, private_member_get_by_name, private_member_set_by_name,
-    scan_private_lexical_brand_roots_mut, stamp_private_birth_evaluation_brand,
-    stamp_private_evaluation_brand, take_private_method_call_hint, take_private_method_owner_hint,
-    IntrinsicPrivateReadSite, PrivateHintBrandScope,
+    private_namespace_bytes, scan_private_lexical_brand_roots_mut,
+    stamp_private_birth_evaluation_brand, stamp_private_evaluation_brand,
+    take_private_method_call_hint, take_private_method_owner_hint, IntrinsicPrivateReadSite,
+    PrivateHintBrandScope,
 };
 pub use ic_miss::{
     js_class_field_add, js_object_get_field_by_name_f64, js_object_get_field_by_property_id_f64,
@@ -352,7 +355,6 @@ pub use ic_miss::{
     js_private_field_add, js_private_guard, js_private_guard_site, js_private_method_call,
     js_private_method_guard,
 };
-pub(crate) use ic_miss::{private_lexical_brand_depth, private_lexical_brand_truncate};
 // The read path's spill flip, shared with the static-key store IC's ways
 // (`proxy/put_value/packed_set.rs`): one encoding for both compact words.
 pub(crate) use ic_miss::PACKED_SPILL_FLIP;

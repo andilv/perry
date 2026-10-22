@@ -16,6 +16,20 @@ use super::opts::{NamespaceEntry, NamespaceEntryKind};
 // existing `helpers::init_static_fields_*` paths keep resolving.
 pub(super) use super::static_fields::{init_static_fields_early, init_static_fields_late};
 
+/// A sync generator wrapper: its body returns the fixed-state birth, which
+/// links the instance to the function's prototype itself.
+pub(crate) fn function_body_is_fixed_state_generator(body: &[perry_hir::Stmt]) -> bool {
+    body.iter().any(|stmt| {
+        matches!(
+            stmt,
+            perry_hir::Stmt::Return(Some(perry_hir::Expr::LinkGeneratorPrototype {
+                fixed_state: true,
+                ..
+            }))
+        )
+    })
+}
+
 pub(crate) fn function_body_returns_generator_object(body: &[perry_hir::Stmt]) -> bool {
     let has_gen_state = body
         .iter()
@@ -633,16 +647,10 @@ mod codegen_unit_tests {
     }
 }
 
-pub(super) fn scoped_fn_name(module_prefix: &str, hir_name: &str) -> String {
-    // Use the INJECTIVE sanitizer (same as scoped_static_method_name): plain
-    // `sanitize` maps every non-`[A-Za-z0-9_]` char to `_`, so distinct minified
-    // function names like `$Z5` and `_Z5` both became `perry_fn_<mod>___Z5` and
-    // clang rejected the module with "invalid redefinition of function". `func_names`
-    // is keyed by func id and every reference resolves through it, so changing the
-    // mangling here keeps all local-function call sites consistent. Byte-identical
-    // to `sanitize` for plain `[A-Za-z0-9_]` names (the overwhelming common case).
-    format!("perry_fn_{}__{}", module_prefix, sanitize_member(hir_name))
-}
+pub(crate) use crate::symbol_names::{
+    function as scoped_fn_name, method as scoped_method_name, module_prefix as sanitize,
+    static_method as scoped_static_method_name,
+};
 
 /// Stable, module-scoped sentinel used when a [`perry_hir::Expr::FuncRef`]
 /// cannot be resolved in the module's function registry.
@@ -657,21 +665,6 @@ pub(crate) fn unknown_func_name(module_prefix: &str) -> String {
 
 pub(crate) fn unknown_func_wrapper_name(module_prefix: &str) -> String {
     format!("__perry_wrap_{}", unknown_func_name(module_prefix))
-}
-
-pub(super) fn scoped_static_method_name(
-    module_prefix: &str,
-    class_id: u32,
-    class_name: &str,
-    method_name: &str,
-) -> String {
-    format!(
-        "perry_static_{}__{}__c{}__{}",
-        module_prefix,
-        sanitize_member(class_name),
-        class_id,
-        sanitize_member(method_name)
-    )
 }
 
 pub(super) fn node_stream_parent_kind(
@@ -827,107 +820,6 @@ pub(super) fn collect_return_class(
     }
 }
 
-/// Mangle a class method name into an LLVM symbol, scoped by module
-/// prefix and class name.
-///
-/// `perry_method_<modprefix>__<class>__<method>`.
-pub(super) fn scoped_method_name(
-    module_prefix: &str,
-    class_name: &str,
-    method_name: &str,
-) -> String {
-    format!(
-        "perry_method_{}__{}__{}",
-        module_prefix,
-        sanitize_member(class_name),
-        sanitize_member(method_name)
-    )
-}
-
-/// Sanitize a name for use in an LLVM symbol — replace anything that isn't
-/// `[A-Za-z0-9_]` with an underscore. LLVM IR identifiers cannot start with
-/// a digit, so prefix with `_` if the first character would be one (this
-/// happens with module names like `05_fibonacci.ts`).
-///
-/// The output alphabet being strictly `[A-Za-z0-9_]` is a load-bearing
-/// invariant (issue #6927): `$` is reserved for compiler-generated clone /
-/// uniquifier suffixes (`$generic`, `$typed_*`, `$dupN`, the spec-ABI and
-/// proven-`this` suffixes), so a user-derived symbol component can never
-/// forge a generated symbol. Never emit `$` from this function or from
-/// [`sanitize_member`].
-///
-/// NOTE: this mapping is *lossy* — every special character collapses to `_`,
-/// so distinct inputs can share an output. That is fine for the module-prefix
-/// and static-field components (whose values are recorded once and re-derived
-/// identically at every reference site), but NOT for class/method name
-/// components, where distinct private names like `#$`, `#_`, `#℘` would all
-/// collapse to the same `perry_method_…` symbol and clang would reject the
-/// module with `invalid redefinition of function`. Those components use the
-/// injective [`sanitize_member`] instead. Keep `sanitize` byte-for-byte stable:
-/// changing it desyncs cross-module symbol references (a module's prefix is
-/// `sanitize(module_name)` at the definition site and must match the prefix the
-/// importing module re-derives).
-pub(crate) fn sanitize(name: &str) -> String {
-    let mut s: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if s.chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        s.insert(0, '_');
-    }
-    s
-}
-
-/// Injective variant of [`sanitize`] for the class-name and method-name
-/// components of `perry_method_*` / `perry_static_*` symbols.
-///
-/// Names made up entirely of `[A-Za-z0-9_]` are returned IDENTICAL to what
-/// `sanitize` produces (only a leading digit is `_`-prefixed), so every
-/// ordinary method/class symbol is byte-for-byte unchanged. Names containing
-/// any character outside `[A-Za-z0-9_]` — chiefly private member names (`#$`,
-/// `#℘`, `#\u{6F}`, ZWJ/ZWNJ escapes) — are escaped to an unambiguous form
-/// (`u_` tag + `_<hex>_` per non-alphanumeric character) so distinct source
-/// names always yield distinct symbols. `sanitize` collapsed all of these to a
-/// single `_`, so `#$`, `#_` and `#℘` mangled to the same symbol and clang
-/// rejected the module with `invalid redefinition of function`.
-///
-/// Must be applied at BOTH the definition site and every reference site for a
-/// given symbol component, or the symbols desync and the linker fails.
-///
-/// Like [`sanitize`], the output is strictly `[A-Za-z0-9_]` — `$` is reserved
-/// for generated suffixes and must never appear here (issue #6927).
-pub(super) fn sanitize_member(name: &str) -> String {
-    let is_plain = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if is_plain {
-        // Byte-identical to `sanitize` for plain names (incl. leading-digit fix).
-        return sanitize(name);
-    }
-    // A plain (pure-`[A-Za-z0-9_]`) name never reaches this branch, so it can
-    // never collide with an escaped name: every escaped name carries a
-    // `_<hex>_` group a plain name cannot reproduce.
-    let mut s = String::from("u_");
-    for c in name.chars() {
-        if c.is_ascii_alphanumeric() {
-            s.push(c);
-        } else {
-            s.push('_');
-            s.push_str(&format!("{:x}", c as u32));
-            s.push('_');
-        }
-    }
-    s
-}
-
 /// Reserve the keys-global symbol for one source class. Keep this single
 /// implementation shared by capability harvesting and module emission: both
 /// passes must assign collision suffixes in the same source order or a
@@ -937,11 +829,7 @@ pub(crate) fn unique_class_keys_global(
     class_name: &str,
     used: &mut std::collections::HashSet<String>,
 ) -> String {
-    let base = format!(
-        "perry_class_keys_{}__{}",
-        module_prefix,
-        sanitize(class_name)
-    );
+    let base = crate::symbol_names::class_keys(module_prefix, class_name);
     if used.insert(base.clone()) {
         return base;
     }
@@ -1359,7 +1247,10 @@ pub(super) fn emit_namespace_populator(
     entries: &[NamespaceEntry],
     key_globals: &[(String, usize)],
     module_prefix: &str,
+    output_type: &str,
+    adopt_cjs_exports: bool,
 ) {
+    let reach_before = super::reach_report::namespace_begin(ctx.func);
     debug_assert_eq!(entries.len(), key_globals.len());
     // Issue #842: side-effect-only dynamic-import targets land here
     // with `entries.is_empty()`. The runtime `js_create_namespace`
@@ -1370,12 +1261,25 @@ pub(super) fn emit_namespace_populator(
     // per-entry loop simply doesn't execute.
     let n = entries.len();
     let buf_len = n.max(1);
+    // The namespace's compiler-owned layout, when it has one: the object is
+    // born in its final shape and only the values are passed.
+    let layout = crate::layout_desc::namespace_layout(
+        entries,
+        module_prefix,
+        output_type,
+        ctx.target_triple,
+        adopt_cjs_exports,
+    )
+    .is_some();
 
     // Alloca the four parallel buffers — in the entry block, like every
     // alloca (#10463).
     let keys_buf = ctx.func.alloca_entry_array(PTR, buf_len);
     let lens_buf = ctx.func.alloca_entry_array(I32, buf_len);
-    let vals_buf = ctx.func.alloca_entry_array(DOUBLE, buf_len);
+    // A layout's last slot is `@@toStringTag`'s value.
+    let vals_buf = ctx
+        .func
+        .alloca_entry_array(DOUBLE, buf_len + usize::from(layout));
     let live_buf = ctx.func.alloca_entry_array(I8, buf_len);
 
     // #7210 (2): `vals_buf` is a plain stack alloca, not a shadow slot the
@@ -1398,13 +1302,17 @@ pub(super) fn emit_namespace_populator(
             let idx_str = format!("{}", i);
             let blk = ctx.block();
 
-            // keys[i] = @<key_global> as ptr
-            let key_slot = blk.gep(PTR, &keys_buf, &[(I64, &idx_str)]);
-            blk.store(PTR, &format!("@{}", key_global), &key_slot);
+            // The generic construction takes each key's name and length; a
+            // layout names them itself.
+            if !layout {
+                // keys[i] = @<key_global> as ptr
+                let key_slot = blk.gep(PTR, &keys_buf, &[(I64, &idx_str)]);
+                blk.store(PTR, &format!("@{}", key_global), &key_slot);
 
-            // key_lens[i] = byte_len
-            let len_slot = blk.gep(I32, &lens_buf, &[(I64, &idx_str)]);
-            blk.store(I32, &format!("{}", key_len), &len_slot);
+                // key_lens[i] = byte_len
+                let len_slot = blk.gep(I32, &lens_buf, &[(I64, &idx_str)]);
+                blk.store(I32, &format!("{}", key_len), &len_slot);
+            }
 
             // #10160: `export * as Self from "./self"` — this module's own
             // `@__perry_ns_<prefix>` is only stored after `js_create_namespace`
@@ -1416,13 +1324,12 @@ pub(super) fn emit_namespace_populator(
                 &entry.kind,
                 NamespaceEntryKind::NestedNamespace { source_prefix } if source_prefix == module_prefix
             );
-            let is_live_binding = is_self_namespace
-                || matches!(
-                    entry.kind,
-                    NamespaceEntryKind::LocalVar { .. } | NamespaceEntryKind::ForeignVar { .. }
-                );
-            let live_slot = blk.gep(I8, &live_buf, &[(I64, &idx_str)]);
-            blk.store(I8, if is_live_binding { "1" } else { "0" }, &live_slot);
+            if !layout {
+                let is_live_binding =
+                    crate::layout_desc::namespace_entry_is_live(entry, module_prefix);
+                let live_slot = blk.gep(I8, &live_buf, &[(I64, &idx_str)]);
+                blk.store(I8, if is_live_binding { "1" } else { "0" }, &live_slot);
+            }
 
             // Materialise the value per kind. We drop the `blk` borrow so
             // each sub-emission can re-borrow ctx mutably for runtime calls
@@ -1455,15 +1362,7 @@ pub(super) fn emit_namespace_populator(
                     // Source modules emit `__perry_wrap_perry_fn_<src>__<name>`
                     // for every user function; hand that wrapper to the same
                     // singleton allocator used by local function exports.
-                    let wrapper_name = format!(
-                        "__perry_wrap_perry_fn_{}__{}",
-                        source_prefix,
-                        // Function bodies and their closure wrappers use the
-                        // injective function-name mangler. Plain names are
-                        // unchanged; `$constructor` and similar exports must
-                        // not be collapsed to `_constructor` here (#7964).
-                        sanitize_member(source_local)
-                    );
+                    let wrapper_name = crate::symbol_names::function_wrapper(&source_prefix, &source_local);
                     let arity = *param_count;
                     let wrapper_params = crate::expr::body_call::js_body_param_types(arity);
                     ctx.pending_declares
@@ -1525,30 +1424,64 @@ pub(super) fn emit_namespace_populator(
     // aren't in `module_globals`. Register the address as a root here
     // so the object survives subsequent GC cycles.
     let n_str = format!("{}", n);
+    let tag = if layout {
+        let idx = ctx.strings.intern(crate::layout_desc::NAMESPACE_TAG);
+        Some(format!("@{}", ctx.strings.entry(idx).handle_global))
+    } else {
+        None
+    };
     let blk = ctx.block();
-    let result = blk.call(
-        DOUBLE,
-        "js_create_namespace",
-        &[
-            (I32, &n_str),
-            (PTR, &keys_buf),
-            (PTR, &lens_buf),
-            (PTR, &vals_buf),
-            (PTR, &live_buf),
-        ],
-    );
+    // A CommonJS namespace that adopts run-time `module.exports` keys has no
+    // fixed key set, so it is never born on a layout (`namespace_layout`).
+    let create = if adopt_cjs_exports {
+        "js_create_cjs_namespace"
+    } else {
+        "js_create_namespace"
+    };
+    let result = if let Some(tag) = tag {
+        // The interned tag string: no call runs between this load and the
+        // birth that reads it.
+        let tag_value = blk.load(DOUBLE, &tag);
+        let tag_slot = blk.gep(DOUBLE, &vals_buf, &[(I64, &n_str)]);
+        blk.store(DOUBLE, &tag_value, &tag_slot);
+        let desc = format!(
+            "@{}",
+            crate::layout_desc::namespace_desc_symbol(module_prefix)
+        );
+        blk.call(
+            DOUBLE,
+            "js_create_namespace_layout",
+            &[(PTR, &desc), (PTR, &vals_buf)],
+        )
+    } else {
+        blk.call(
+            DOUBLE,
+            create,
+            &[
+                (I32, &n_str),
+                (PTR, &keys_buf),
+                (PTR, &lens_buf),
+                (PTR, &vals_buf),
+                (PTR, &live_buf),
+            ],
+        )
+    };
     let ns_name = format!("__perry_ns_{}", module_prefix);
     crate::expr::emit_root_nanbox_store_on_block(blk, &result, &format!("@{}", ns_name));
     let addr_i64 = blk.ptrtoint(&format!("@{}", ns_name), I64);
     blk.call_void("js_gc_register_global_root", &[(I64, &addr_i64)]);
+    if let Some(before) = reach_before {
+        super::reach_report::namespace_end(ctx.func, module_prefix, before);
+    }
 }
 
 #[cfg(test)]
 mod sanitize_tests {
-    use super::{sanitize, sanitize_member, scoped_fn_name, scoped_method_name};
+    use super::{sanitize, scoped_fn_name, scoped_method_name};
+    use crate::symbol_names::encode_identifier;
 
     /// Issue #6927: the generated-clone namespace (`{public}$<suffix>`) is
-    /// unforgeable ONLY because these two functions never emit `$`. If either
+    /// unforgeable because user-name encodings never emit `$`. If either
     /// ever lets a `$` through, a user member could compose a public symbol
     /// equal to a generated clone symbol and silently usurp it
     /// (`deduped_function_refs` keeps the first definition).
@@ -1568,9 +1501,9 @@ mod sanitize_tests {
                 sanitize(hostile)
             );
             assert!(
-                !sanitize_member(hostile).contains('$'),
-                "sanitize_member({hostile:?}) leaked a `$`: {:?}",
-                sanitize_member(hostile)
+                !encode_identifier(hostile).contains('$'),
+                "encode_identifier({hostile:?}) leaked a `$`: {:?}",
+                encode_identifier(hostile)
             );
         }
         // And therefore no composed public symbol contains one either.

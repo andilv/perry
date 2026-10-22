@@ -57,6 +57,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_FACTS_MAX_WORK",
     "PERRY_FACTS_SABOTAGE",
     "PERRY_FACTS_WIDEN",
+    "PERRY_FAMILY_SLOT_SABOTAGE",
     "PERRY_FAST_MATH",
     "PERRY_FIELD_REPR_VERIFY",
     "PERRY_FNINFER_APPLY",
@@ -144,6 +145,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_PACKED_LOOP_ABRUPT",
     "PERRY_PACKED_LOOP_NUMERIC_ACCUMULATOR",
     "PERRY_PRECOMPILE_CAPTURE",
+    "PERRY_PROBE_VERIFY",
     "PERRY_PROGRAM_FACTS",
     "PERRY_PROP_CSE",
     "PERRY_PTR_NUMARRAY_LOCALS",
@@ -186,7 +188,6 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_TREE_SHAKE",
     "PERRY_TVOS_SYSROOT",
     "PERRY_TYPED_ARRAY_RMW",
-    "PERRY_TYPED_BODIES",
     "PERRY_TYPED_FEEDBACK",
     "PERRY_TYPED_FEEDBACK_TRACE",
     "PERRY_TYPED_LOCALS",
@@ -221,6 +222,7 @@ pub(super) fn compile_env_value(name: &str) -> Option<String> {
 
 #[cfg(test)]
 const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
+    ("PERRY_REACH_REPORT", "Compiler-only diagnostic; bypasses object caches and does not change emitted code."),
     ("PERRY_ENUM_IMAGE_CENSUS", "Prints enum-image census diagnostics only; no lowering decision depends on this report."),
     ("PERRY_FALLBACK_DIAG", "Opt-in sidecar labels; all caches are bypassed while enabled. Off leaves emitted code and cache identity unchanged."),
     (
@@ -662,10 +664,6 @@ const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "PERRY_TREE_SHAKE_DIAG",
         "Prints lowering diagnostics; no emitted instructions depend on the report.",
-    ),
-    (
-        "PERRY_TYPED_BODIES_LOG",
-        "Writes the typed-body clone log; no emitted instructions depend on the log.",
     ),
     (
         "PERRY_TYPED_ELEMENT_SABOTAGE",

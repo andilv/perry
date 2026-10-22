@@ -86,6 +86,7 @@ pub(super) fn ir_opts() -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
@@ -93,7 +94,7 @@ pub(super) fn ir_opts() -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -119,9 +120,10 @@ pub(super) fn ir_opts() -> CompileOptions {
         app_metadata: AppMetadata::default(),
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        namespace_adopts_cjs_exports: false,
         debug_locations: false,
         module_source: None,
         debug_source_line_offset: 0,
@@ -279,6 +281,13 @@ pub(super) fn ir() -> String {
 
 /// Five boxed fields exceed the compact birth budget. Their constructor-free
 /// stores must still exercise the ordinary value/generation barrier tier.
+///
+/// The barrier-bearing prologue is the FAMILY birth's: a class born on its
+/// program family layout (`class_born_on_family`, which production compiles
+/// always have) whose complete prologue the emitted birth image cannot hold
+/// stores its fields from the `new` site with the barrier. The fixture
+/// therefore compiles with the program's real family layouts; a fresh
+/// nursery-bump birth (what an options-default compile gives) omits the barrier.
 pub(super) fn wide_prologue_ir() -> String {
     let mut module = probe_module();
     let class = &mut module.classes[0];
@@ -296,8 +305,15 @@ pub(super) fn wide_prologue_ir() -> String {
                 value: Box::new(Expr::LocalGet(PARAM_ID)),
             }));
     }
-    String::from_utf8(compile_module(&module, ir_opts()).expect("wide module compiles"))
-        .expect("LLVM IR should be UTF-8")
+    let mut opts = ir_opts();
+    opts.program_layouts = std::sync::Arc::new(crate::layout_families::compute(
+        [(module.name.as_str(), &module)],
+        true,
+        &Default::default(),
+    ));
+    let ir = String::from_utf8(compile_module(&module, opts).expect("wide module compiles"))
+        .expect("LLVM IR should be UTF-8");
+    ir
 }
 
 /// A class-field store is the static-key store site (#12483): the constructor's

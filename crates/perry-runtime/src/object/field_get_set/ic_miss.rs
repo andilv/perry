@@ -680,7 +680,10 @@ include!("ic_miss/private_member_access.rs");
 include!("ic_miss/private_guard_fast.rs");
 
 /// The object that holds `value`'s private elements (#11791): `value`
-/// itself when it is a shaped object, or its own bag when it is a function.
+/// itself when it is a shaped object, or its own property bag when it is a
+/// function, an exotic cell (Map, Set, Date, Error, Promise, Temporal — the
+/// instances `class X extends Map { #k = ... }` constructs) or a native
+/// handle (the instance `class X extends http.Agent { #m() {} }` constructs).
 /// A Proxy holds none of its target's private elements, and a primitive holds
 /// none at all.
 ///
@@ -688,6 +691,10 @@ include!("ic_miss/private_guard_fast.rs");
 /// Reads only headers; `value` may be any NaN-boxed value.
 unsafe fn private_element_holder(value: f64) -> Option<*mut ObjectHeader> {
     let value = JSValue::from_bits(value.to_bits());
+    if value.is_handle() {
+        let bag = crate::object::handle_expando::handle_property_bag(value.as_handle() as i64);
+        return (!bag.is_null()).then_some(bag);
+    }
     if !value.is_pointer() {
         return None;
     }
@@ -697,9 +704,41 @@ unsafe fn private_element_holder(value: f64) -> Option<*mut ObjectHeader> {
         let bag = crate::closure::props::bag_of(object as usize);
         return (!bag.is_null()).then_some(bag);
     }
+    if crate::object::exotic_expando::exotic_kind_of_gc_type(header.obj_type).is_some() {
+        let bag = crate::object::exotic_expando::property_bag(object as usize);
+        return (!bag.is_null()).then_some(bag);
+    }
     (crate::value::addr_class::is_plausible_heap_addr(object as usize)
         && crate::object::object_is_shaped(object))
     .then_some(object)
+}
+
+/// [`private_element_holder`] for a definition (a private field, or the
+/// class brand of its private methods): a function, exotic cell or native
+/// handle gets its property bag allocated on the first private element, as
+/// on the first named property. May allocate; callers root `value` and read the holder
+/// only after this returns.
+///
+/// # Safety
+/// As [`private_element_holder`].
+unsafe fn private_element_holder_for_definition(value: f64) -> Option<*mut ObjectHeader> {
+    let boxed = JSValue::from_bits(value.to_bits());
+    if boxed.is_handle() {
+        let handle = boxed.as_handle() as i64;
+        // Only a live native owner record has a bag word; any other handle
+        // holds no private elements, and the definition throws below.
+        if crate::object::class_handles::native_property_bag_access(handle, 0, 0).is_some() {
+            crate::object::handle_expando::handle_property_bag_ensure(handle);
+        }
+    } else if boxed.is_pointer() {
+        let addr = boxed.as_pointer::<ObjectHeader>() as usize;
+        if crate::closure::is_closure_ptr(addr) {
+            crate::closure::props::bag_ensure(addr);
+        } else if crate::object::exotic_expando::exotic_expando_kind(addr).is_some() {
+            crate::object::exotic_expando::property_bag_ensure(addr);
+        }
+    }
+    private_element_holder(value)
 }
 
 // Instance evaluation brands never grant access to static private elements.
@@ -781,7 +820,8 @@ pub extern "C" fn js_private_brand_add(obj: f64, declaring_class_id: u32) -> f64
     let evaluation_id =
         private_storage_evaluation_id(declaring_class_id, Some(obj.get_nanbox_f64()), None);
     let brand = private_brand_id(declaring_class_id, evaluation_id);
-    let Some(holder) = (unsafe { private_element_holder(obj.get_nanbox_f64()) }) else {
+    let Some(holder) = (unsafe { private_element_holder_for_definition(obj.get_nanbox_f64()) })
+    else {
         throw_private_type_error(&format!(
             "Cannot initialize private methods of class {} on this object",
             private_class_display_name(declaring_class_id)
@@ -831,9 +871,15 @@ pub extern "C" fn js_private_field_add(
             "Cannot initialize {field_name} twice on the same object"
         ));
     }
-    let Some(holder) = (unsafe { private_element_holder(obj.get_nanbox_f64()) }) else {
+    let Some(holder) = (unsafe { private_element_holder_for_definition(obj.get_nanbox_f64()) })
+    else {
         throw_private_type_error(&format!("Cannot initialize {field_name} on this object"));
     };
+    // A class family's layout lists the element (`ENTRY_OPTIONAL`): the
+    // definition fills its slot. Allocation-free.
+    if storage.fill_optional(obj.get_nanbox_f64(), value.get_nanbox_f64()) {
+        return value.get_nanbox_f64();
+    }
     // The claim allocates the key (inside its own no-move window); the store
     // re-reads the holder from its handle.
     let pred_rep = crate::object::shapes::shape_rep_by_id(unsafe {
@@ -893,10 +939,33 @@ pub extern "C" fn js_private_field_add(
 /// receivers observe `defineProperty`, not `set`.
 #[no_mangle]
 pub extern "C" fn js_class_field_add(receiver: f64, key: f64, value: f64) -> f64 {
+    if unsafe { crate::object::layout_desc::family_define_field(receiver, key, value) } {
+        return family_holder_built(receiver, value);
+    }
     if unsafe { class_field_chain::try_define(receiver, key, value) } {
         return value;
     }
     class_field_add_slow(receiver, key, value)
+}
+
+/// After a family object's field definition: a family constructor's run
+/// proves its stores from the prototype chain's holders
+/// (`layout_probe::perry_family_run_admits`), and a declared class's holder
+/// is built on its first ordinary lookup, which a `[[Set]]` makes and
+/// DefineField never does. Build the receiver's class holder when its word
+/// still names the unbuilt surface, once per class, so the next run's chain
+/// is readable. Returns `value`, which the build may move.
+fn family_holder_built(receiver: f64, value: f64) -> f64 {
+    let obj = (receiver.to_bits() & crate::value::POINTER_MASK) as *const crate::ObjectHeader;
+    // SAFETY: `family_define_field` admitted `receiver` as a live family object.
+    let class_id = unsafe { (*obj).class_id };
+    if crate::object::class_registry::class_holder_word(class_id) != crate::value::TAG_UNDEFINED {
+        return value;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let value = scope.root_nanbox_f64(value);
+    crate::object::class_registry::class_decl_prototype_value(class_id);
+    value.get_nanbox_f64()
 }
 
 #[inline(never)]
@@ -937,7 +1006,9 @@ fn class_field_add_slow(receiver: f64, key: f64, value: f64) -> f64 {
 }
 
 /// Brand + kind/op guard for a private member access `obj.#name`. Returns
-/// `obj` unchanged when the access is legal; otherwise throws a `TypeError`.
+/// the object the access reads or writes when it is legal (`obj` itself, or
+/// for an instance FIELD of a native handle its property bag, which holds the
+/// field: [`private_field_access_object`]); otherwise throws a `TypeError`.
 ///
 /// The enclosing `PropertyGet` / `PropertySet` / method-call lowering operates
 /// on the returned receiver, so this helper only enforces the two access
@@ -1028,7 +1099,7 @@ fn private_guard_checked(
                 record_hints,
                 mark,
             );
-            return obj;
+            return private_field_access_object(obj, kind, is_static);
         }
     }
     // Interning also makes the name independent of the caller's buffer across
@@ -1113,7 +1184,23 @@ fn private_guard_checked(
         record_hints,
         mark,
     );
-    obj_root.get_nanbox_f64()
+    private_field_access_object(obj_root.get_nanbox_f64(), kind, is_static)
+}
+
+/// The object a legal private access reads or writes by its storage key. An
+/// instance field of a native handle (`class X extends http.Agent { #n }`)
+/// lives in the handle's property bag ([`private_element_holder`]), where its
+/// definition put it; a by-name access on the handle value itself never
+/// reaches that bag. Every other access, and every method or accessor (whose
+/// `this` is the receiver), keeps `obj`.
+fn private_field_access_object(obj: f64, kind: u32, is_static: bool) -> f64 {
+    if kind != 0 || is_static || !JSValue::from_bits(obj.to_bits()).is_handle() {
+        return obj;
+    }
+    match unsafe { private_element_holder(obj) } {
+        Some(bag) => crate::value::js_nanbox_pointer(bag as i64),
+        None => obj,
+    }
 }
 
 /// Throw node's TypeError for a private access whose receiver lacks the

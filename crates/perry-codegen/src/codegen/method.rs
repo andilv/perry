@@ -178,22 +178,8 @@ pub(super) fn compile_method(
                 if name == super::arguments::SYNTHETIC_ARGUMENTS_LENGTH_TYPE
         )
     });
-    if typed_public_trampoline.is_none()
-        && !force_generic_body
-        && proven_this.is_none()
-        && nonnegative_index_params.is_none()
-        && !fast_array_handle_clone
-        && !ptr_array_cache_clone
-        && !guarded_undefined_clone
-        && !pshape_arg_clone
-        && super::literal_constructor::try_compile(
-            llmod,
-            class,
-            method,
-            &public_llvm_name,
-            cross_module.class_keys_globals.get(&class.name),
-        )
-    {
+    // A wide literal shape has no constructor function (nor clones of one).
+    if super::literal_constructor::try_compile(class, method) {
         return Ok(());
     }
     // Representation-selection Phase 5a: the proven-`this` clone is a SECOND,
@@ -615,6 +601,7 @@ pub(super) fn compile_method(
         current_block: 0,
         discard_expr_value: false,
         discard_this_expr: false,
+        literal_chunk_fill: false,
         truthy_call_result_requested: false,
         pending_truthy_call_result: None,
         func_names,
@@ -698,10 +685,12 @@ pub(super) fn compile_method(
         namespace_imports: &cross_module.namespace_imports,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
         namespace_member_nested: &cross_module.namespace_member_nested,
+        cjs_interop_namespaces: &cross_module.cjs_interop_namespaces,
         namespace_member_origin_names: &cross_module.namespace_member_origin_names,
         imported_async_funcs: &cross_module.imported_async_funcs,
         local_async_funcs: &cross_module.local_async_funcs,
         local_generator_funcs: &cross_module.local_generator_funcs,
+        fixed_generator_funcs: &cross_module.fixed_generator_funcs,
         async_step_closures: &cross_module.async_step_closures,
         funcs_reading_dynamic_this: &cross_module.funcs_reading_dynamic_this,
         type_aliases: &cross_module.type_aliases,
@@ -1126,7 +1115,8 @@ pub(super) fn compile_method(
                             // Local class with own ctor — use the per-module-prefix
                             // standalone symbol, same one compile_method emits.
                             let module_prefix = ctx.strings.module_prefix().to_string();
-                            let sym = format!("{}__{}_constructor", module_prefix, pname_owned);
+                            let sym =
+                                crate::symbol_names::constructor(&module_prefix, &pname_owned);
                             let pcount = pclass
                                 .constructor
                                 .as_ref()

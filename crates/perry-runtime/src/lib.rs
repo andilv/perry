@@ -81,6 +81,9 @@ static GLOBAL: alloc_census::CensusAlloc<std::alloc::System> =
 #[macro_use]
 pub mod per_test_global;
 
+#[macro_use]
+mod wasm_image;
+
 pub mod abi_trampoline;
 pub mod agent;
 #[cfg(test)]
@@ -105,6 +108,7 @@ pub mod feature_hooks;
 pub use perry_abi as codegen_abi;
 pub(crate) mod cold_sort;
 pub(crate) mod once_init;
+mod source_read_count;
 pub use build_stamp::{PERRY_RUNTIME_BUILD_ID, PERRY_RUNTIME_BUILD_STAMP};
 pub mod builtins;
 pub mod bun_compat;
@@ -273,6 +277,7 @@ pub mod turnloop_pool;
 // thread that could not get a loop of its own uses INSTEAD of keeping a tokio
 // driver alive — the single decline reason behind most of the remaining tokio
 // edges in the binding crates.
+pub mod component;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod turnloop_post;
 pub mod url;
@@ -399,10 +404,11 @@ pub use array::{
 pub use bigint::js_bigint_from_string;
 pub use object::js_object_set_field_by_name;
 pub use object::{
-    js_object_alloc, js_object_alloc_null_proto, js_object_alloc_with_shape, js_object_entries,
-    js_object_get_field, js_object_get_field_by_name, js_object_get_field_by_name_f64,
-    js_object_get_own_field_or_undef, js_object_keys, js_object_set_field, js_object_set_field_f64,
-    js_object_set_keys, js_object_values,
+    js_object_alloc, js_object_alloc_null_proto, js_object_alloc_null_proto_ordinary,
+    js_object_alloc_with_shape, js_object_entries, js_object_get_field,
+    js_object_get_field_by_name, js_object_get_field_by_name_f64, js_object_get_own_field_or_undef,
+    js_object_keys, js_object_set_field, js_object_set_field_f64, js_object_set_keys,
+    js_object_values,
 };
 pub use promise::{js_is_promise, js_promise_run_microtasks, js_promise_state, js_promise_value};
 pub use promise::{
@@ -457,7 +463,6 @@ mod ext_pump {
 // Stdlib pump registration — allows perry-ui-macos pump timer to call
 // js_stdlib_process_pending without a hard link dependency on perry-stdlib.
 pub(crate) mod stdlib_pump {
-    use std::cell::Cell;
     use std::ptr::null_mut;
     use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -692,10 +697,13 @@ pub(crate) mod stdlib_pump {
         }
     }
 
-    /// Run the per-agent auxiliary pumps on this thread: a worker's loop
-    /// calls this to deliver its own extension events (zlib streams, …).
+    /// Run the per-agent pumps on this thread: a worker's loop calls this to
+    /// deliver its own events. That is the runtime reactors (its child
+    /// processes, ptys and fs watchers — each delivers only what this agent
+    /// created) and the per-agent auxiliary pumps (zlib streams, …).
     #[no_mangle]
     pub extern "C" fn js_run_agent_pumps() -> i32 {
+        run_runtime_pumps();
         let fns: Vec<extern "C" fn() -> i32> = match AUX_AGENT_PUMPS.lock() {
             Ok(g) => g.clone(),
             Err(_) => return 0,
@@ -1010,6 +1018,12 @@ pub(crate) mod stdlib_pump {
 
         #[test]
         fn overlapping_outer_guards_share_a_tick_and_restore_one_contribution() {
+            // `ACTIVE_OUTER_PUMPS` counts the outer pumps of every thread in the
+            // process, so "exactly this test's two contributions" can only be
+            // asserted by a process that owns it.
+            let Some(_isolated) = crate::test_support::isolated_process_guard() else {
+                return;
+            };
             use std::sync::mpsc;
             use std::time::Duration;
 

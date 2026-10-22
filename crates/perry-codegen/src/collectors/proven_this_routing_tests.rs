@@ -62,6 +62,7 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
@@ -69,7 +70,7 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -95,9 +96,10 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         app_metadata: AppMetadata::default(),
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        namespace_adopts_cjs_exports: false,
         debug_locations: false,
         module_source: None,
         debug_source_line_offset: 0,
@@ -1957,14 +1959,24 @@ fn tower_selects_by_prototype_constant() {
     assert!(!site.contains("call void @js_proto_constant_contract_check("));
 }
 
-/// A census that writes the method name withdraws the constant: the tower
-/// keeps no compiled case and every receiver takes the generic site.
+/// A program with a dynamic write may write any prototype slot: the tower
+/// keeps its compiled cases, each behind its holders' shadow bits
+/// (`proto_constants::holder_constant`), so a written holder selects nothing
+/// and its receivers take the generic site.
 #[test]
-fn a_written_method_name_is_not_a_prototype_constant() {
+fn a_dynamic_write_cases_behind_the_holder_shadow_bits() {
     let mut census = perry_hir::ProtoCensus::default();
     census.dynamic_write = true;
     let ir = crate::proto_constants::with_test_census(census, || {
         emit_static(&tower_site_module(), false)
     });
-    assert!(!ir.contains("pconst.case"), "{ir}");
+    let site = ir
+        .split("\ndefine ")
+        .find(|f| f.contains("pconst.selected"))
+        .expect("the function holding the selecting site");
+    assert!(site.contains("pconst.case"), "{site}");
+    assert!(site.contains("holder.page"), "{site}");
+    // Without the dynamic write the slots are constants: no holder test.
+    let ir = emit_static(&tower_site_module(), false);
+    assert!(!ir.contains("holder.page"), "{ir}");
 }

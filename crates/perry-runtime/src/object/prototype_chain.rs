@@ -312,30 +312,30 @@ pub(crate) fn object_link_class_default_prototype(obj_ptr: usize, proto_bits: u6
 /// evaluation, but not with other evaluations of the same template (#9502).
 /// Preserve that distinction for property/method lookup and class-keyed caches.
 pub(crate) fn object_link_class_evaluation_prototype(obj_ptr: usize, proto_bits: u64) {
-    unsafe {
-        let obj = obj_ptr as *mut super::ObjectHeader;
-        if !obj.is_null() && super::layout_desc::is_family_layout_word((*obj).parent_class_id) {
-            let scope = crate::gc::RuntimeHandleScope::new();
-            let receiver = scope.root_raw_mut_ptr(obj);
-            let prototype = scope.root_nanbox_u64(proto_bits);
-            let value = crate::JSValue::from_bits(prototype.get_nanbox_u64());
-            if value.is_pointer() {
-                let pointer = value.as_pointer::<super::ObjectHeader>();
-                super::proto_validity::mark_object_as_prototype(pointer as usize);
-            }
-            let obj = receiver.get_raw_mut_ptr::<super::ObjectHeader>();
-            let (meta, _) =
-                receiver.across_mut::<super::ObjectHeader, _>(|| super::object_meta_ensure(obj));
-            (*meta).prototype = prototype.get_nanbox_u64();
-            crate::gc::runtime_write_barrier_slot(
-                meta as usize,
-                std::ptr::addr_of!((*meta).prototype) as usize,
-                (*meta).prototype,
-            );
-            return;
-        }
-    }
+    // A family instance moves, like every receiver, to the shape naming the
+    // link: the evaluation's copy of its family layout (the same keys and
+    // slots at `MIXED | class | serial`, `layout_desc::family_desc_of`), so
+    // shape-proved readers answer from the evaluation's prototype.
     object_set_static_prototype_impl(obj_ptr, proto_bits, PrototypeLinkKind::ClassEvaluation)
+}
+
+/// [`object_link_class_evaluation_prototype`] of a class evaluation's fresh
+/// instance that also takes the evaluation's holder brand `holder_brand`
+/// (`shapes::prepare_evaluation_holder`) in the same shape transition. A
+/// receiver whose prototype is no shape fact takes the link alone; the
+/// caller then stamps the brand as usual (`shapes::stamp_evaluation_holder`,
+/// a no-op on a receiver that has it).
+pub(crate) fn object_link_class_evaluation_prototype_branded(
+    obj_ptr: usize,
+    proto_bits: u64,
+    holder_brand: u64,
+) {
+    object_set_static_prototype_impl_with(
+        obj_ptr,
+        proto_bits,
+        PrototypeLinkKind::ClassEvaluation,
+        holder_brand,
+    )
 }
 
 /// Install Object.create's individual chain before the object escapes. It
@@ -346,6 +346,17 @@ pub(crate) fn object_link_created_prototype(obj_ptr: usize, proto_bits: u64) {
 }
 
 fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: PrototypeLinkKind) {
+    object_set_static_prototype_impl_with(obj_ptr, proto_bits, link_kind, 0)
+}
+
+/// [`object_set_static_prototype_impl`] whose shape transition also gives the
+/// receiver evaluation holder brand `holder_brand` (0: none).
+fn object_set_static_prototype_impl_with(
+    obj_ptr: usize,
+    proto_bits: u64,
+    link_kind: PrototypeLinkKind,
+    holder_brand: u64,
+) {
     let user_override = matches!(
         link_kind,
         PrototypeLinkKind::UserOverride | PrototypeLinkKind::FreshObject
@@ -527,7 +538,12 @@ fn object_set_static_prototype_impl(obj_ptr: usize, proto_bits: u64, link_kind: 
                     proto_bits,
                 );
             }
-            crate::object::shapes::transition_object_shape_prototype(obj, proto_id, proto_bits);
+            crate::object::shapes::transition_object_shape_prototype_with_holder(
+                obj,
+                proto_id,
+                proto_bits,
+                holder_brand,
+            );
             // The receiver may already be traced by an incremental mark; its
             // new edge lives in its shape record, outside the heap.
             crate::gc::runtime_shade_external_edge(proto_bits);
@@ -1248,7 +1264,7 @@ mod readpath_null_tests {
             "the live null edge must be authoritative even for a synthetic class"
         );
         let key = crate::string::js_string_from_bytes(b"k".as_ptr(), 1);
-        unsafe {
+        {
             object::js_object_set_field_by_name(prototype, key, 42.0);
             assert!(object::js_object_get_field_by_name(instance, key).is_undefined());
         }

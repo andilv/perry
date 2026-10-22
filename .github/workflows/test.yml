@@ -249,6 +249,8 @@ jobs:
     # downloading the MSVC sysroot and checking cold; main caches the sysroot.
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      formatting: ${{ steps.formatting.outputs.result }}
     steps:
       - name: Checkout repository (inline git)
         shell: bash
@@ -334,6 +336,8 @@ jobs:
 
       - name: Install Rust toolchain
         run: rustup toolchain install nightly-2026-10-04 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
       - uses: ./.github/actions/setup-llvm22
 
       - uses: ./.github/actions/perry/Swatinem/rust-cache # v2
@@ -374,6 +378,34 @@ jobs:
         run: |
           rustup target add x86_64-pc-windows-msvc
           export PATH="$LLVM_SYS_221_PREFIX/bin:$PATH"
+          # cc-rs archives the Windows C objects with `llvm-lib` (cargo-xwin
+          # sets AR to it) and resolves it through PATH. Fail here, naming the
+          # directory, rather than inside psm/ring/zstd-sys's build scripts.
+          if ! command -v llvm-lib >/dev/null; then
+            echo "::error::llvm-lib is not on PATH (LLVM_SYS_221_PREFIX=${LLVM_SYS_221_PREFIX:-unset})"
+            ls -1 "${LLVM_SYS_221_PREFIX:-/usr/lib/llvm-22}/bin"
+            exit 1
+          fi
+          # perry-stdlib's `crypto` feature pulls openssl-sys, whose vendored
+          # build cannot configure OpenSSL for windows-msvc on a Linux host.
+          # `check` only needs headers and import libraries to exist, so point
+          # the build at the host headers and an empty COFF archive; nothing
+          # links it.
+          stub="$RUNNER_TEMP/openssl-stub"
+          mkdir -p "$stub/include/openssl" "$stub/lib"
+          cp /usr/include/openssl/*.h "$stub/include/openssl/"
+          if [ -d /usr/include/x86_64-linux-gnu/openssl ]; then
+            cp /usr/include/x86_64-linux-gnu/openssl/*.h "$stub/include/openssl/"
+          fi
+          echo 'int perry_openssl_stub;' > "$stub/stub.c"
+          clang --target=x86_64-pc-windows-msvc -c "$stub/stub.c" -o "$stub/stub.obj"
+          llvm-lib "/out:$stub/lib/libssl.lib" "$stub/stub.obj"
+          cp "$stub/lib/libssl.lib" "$stub/lib/libcrypto.lib"
+          export OPENSSL_NO_VENDOR=1
+          export X86_64_PC_WINDOWS_MSVC_OPENSSL_DIR="$stub"
+          export X86_64_PC_WINDOWS_MSVC_OPENSSL_LIB_DIR="$stub/lib"
+          export X86_64_PC_WINDOWS_MSVC_OPENSSL_INCLUDE_DIR="$stub/include"
+          export X86_64_PC_WINDOWS_MSVC_OPENSSL_LIBS=libssl:libcrypto
           cargo xwin check -p perry-runtime -p perry-stdlib --target x86_64-pc-windows-msvc
 
       - name: Save cargo-xwin MSVC sysroot (main-line runs only)
@@ -382,10 +414,6 @@ jobs:
         with:
           path: ~/.cache/cargo-xwin
           key: cargo-xwin-${{ runner.os }}-0.23.0
-
-      - name: Check formatting
-        if: ${{ !cancelled() }}
-        run: cargo fmt --all -- --check
 
       # The CI tier policy (scripts/ci_plan.py) is code; its self-test asserts
       # the invariants CLAUDE.md cares about (gc-stress main-line reachable,
@@ -402,6 +430,7 @@ jobs:
           python3 scripts/ci_plan.py --self-test
           python3 scripts/ci_pr_files.py --self-test
           python3 scripts/test_actions_plan.py
+          python3 scripts/test_component_network_peer.py
           python3 scripts/test_delete_retired_workflow_runs.py
           python3 scripts/check_actions_topology.py
           python3 scripts/test_release_gate_runs.py
@@ -3681,9 +3710,14 @@ jobs:
   # Linux reuses gap-suite-build's archives; in the full tier, where
   # gap-suite-build does not run, it builds them.
   gc-call-effects-linux:
-    needs: [plan, gap-suite-build]
+    needs: [plan, gap-suite-build, lint]
     if: >-
       always() && needs.plan.result == 'success' &&
+      (needs.lint.result == 'success' ||
+       (needs.lint.result == 'failure' &&
+        fromJSON(needs.plan.outputs.plan).jobs.gap_suite &&
+        fromJSON(needs.plan.outputs.plan).gap.mode == 'fast' &&
+        needs.lint.outputs.formatting == 'failure')) &&
       fromJSON(needs.plan.outputs.plan).jobs.gc_call_effects &&
       (needs.gap-suite-build.result == 'success' || needs.gap-suite-build.result == 'skipped')
     runs-on: ubuntu-latest
@@ -3713,7 +3747,7 @@ jobs:
           fi
       - uses: ./.github/actions/setup-llvm22
       - name: Download the shared fast-mode build
-        if: fromJSON(needs.plan.outputs.plan).gap.mode == 'fast'
+        if: fromJSON(needs.plan.outputs.plan).gap.mode == 'fast' && needs.lint.result == 'success'
         uses: ./.github/actions/perry/actions/download-artifact # v8
         with:
           name: gap-suite-fast-build
@@ -3727,7 +3761,7 @@ jobs:
           shared-key: "${{ runner.os }}-perry"
           save-if: false
       - name: Build runtime archives (no shared build in this tier)
-        if: fromJSON(needs.plan.outputs.plan).gap.mode != 'fast'
+        if: fromJSON(needs.plan.outputs.plan).gap.mode != 'fast' || needs.lint.result == 'failure'
         run: |
           cargo build-perry --release
           scripts/gc_call_effects/sidecars.sh target/release
@@ -3742,8 +3776,14 @@ jobs:
   # with cargo-xwin on Linux (the same toolchain lint's Windows type-check
   # uses). Each leg writes its own sidecars and checks the pinned facts.
   gc-call-effects:
-    needs: plan
-    if: fromJSON(needs.plan.outputs.plan).jobs.gc_call_effects
+    needs: [plan, lint]
+    if: >-
+      fromJSON(needs.plan.outputs.plan).jobs.gc_call_effects &&
+      (needs.lint.result == 'success' ||
+       (needs.lint.result == 'failure' &&
+        fromJSON(needs.plan.outputs.plan).jobs.gap_suite &&
+        fromJSON(needs.plan.outputs.plan).gap.mode == 'fast' &&
+        needs.lint.outputs.formatting == 'failure'))
     strategy:
       fail-fast: false
       matrix:
@@ -3797,6 +3837,9 @@ jobs:
           echo "$RUNNER_TEMP/cargo-xwin-bin" >> "$GITHUB_PATH"
           echo "$LLVM_SYS_221_PREFIX/bin" >> "$GITHUB_PATH"
           rustup target add x86_64-pc-windows-msvc
+      - name: Install Windows cross-build tools
+        if: matrix.target == 'windows-x86_64'
+        uses: ./.github/actions/setup-llvm22
       - name: Install Perl for the vendored OpenSSL cross-build
         if: matrix.target == 'windows-x86_64'
         run: |
@@ -3815,6 +3858,9 @@ jobs:
         env:
           CONFIGURE_INSIST: ${{ matrix.target == 'windows-x86_64' && '1' || '' }}
         run: |
+          if [[ "${{ matrix.target }}" == windows-x86_64 ]]; then
+            rustup target add x86_64-pc-windows-msvc
+          fi
           unset RUSTFLAGS
           if [[ "${{ matrix.target }}" == windows-x86_64 ]]; then
             cargo xwin build --release --target x86_64-pc-windows-msvc -p perry-runtime-static -p perry-stdlib-static
@@ -5216,6 +5262,91 @@ jobs:
   # introduce a new advisory, and the weekly schedule in that workflow catches
   # advisory-database updates on their own. Sweep and full tiers always run it.
   # ---------------------------------------------------------------------------
+  # Linux command profile has a demonstrated green baseline (run39574495557).
+  wasi-execution:
+    name: wasi-execution
+    permissions:
+      contents: read
+    needs: plan
+    if: needs.plan.result == 'success' && fromJSON(needs.plan.outputs.plan).jobs.wasi_execution
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+    - name: Checkout repository (inline git)
+      shell: bash
+      env:
+        CHECKOUT_REF: ${{ github.sha }}
+        CHECKOUT_DEPTH: '1'
+        CHECKOUT_TOKEN: ${{ github.token }}
+        CHECKOUT_PERSIST_CREDENTIALS: 'false'
+      run: |
+        set -euo pipefail
+        git init
+        git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+        auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\n')"
+        if [[ "$CHECKOUT_DEPTH" == "0" ]]; then
+          git -c http.https://github.com/.extraheader="$auth_header" fetch --force --tags origin
+          git checkout --force --detach "$CHECKOUT_REF"
+        else
+          git -c http.https://github.com/.extraheader="$auth_header" fetch --no-tags --force --depth "$CHECKOUT_DEPTH" origin "$CHECKOUT_REF"
+          git checkout --force --detach FETCH_HEAD
+        fi
+        if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
+          git config http.https://github.com/.extraheader "$auth_header"
+        fi
+    - name: Install Rust toolchain with the WASI target
+      run: rustup toolchain install nightly-2026-10-04 --profile minimal --target wasm32-wasip2
+    - uses: ./.github/actions/setup-llvm22
+    - uses: ./.github/actions/perry/Swatinem/rust-cache
+      with:
+        shared-key: Linux-wasi-codegen
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+    - name: Install pinned Node oracle for WASI compatibility tests
+      uses: ./.github/actions/perry/actions/setup-node
+      with:
+        node-version-file: .node-version
+    - name: Build perry with the WASI target
+      run: cargo build --locked --profile perry-dev -p perry --features target-wasi
+    - name: wasm32 IR matches the runtime ABI
+      run: ./scripts/wasi_ir_check.sh target/perry-dev/perry
+    - name: Install the WASI toolchain
+      shell: bash
+      run: |
+        toolchain_env="$(./scripts/wasi_toolchain.sh "$RUNNER_TEMP/wasi")"
+        eval "$toolchain_env"
+        for key in WASI_SDK_PATH WASMTIME CC_wasm32_wasip2 AR_wasm32_wasip2 CFLAGS_wasm32_wasip2 CC_SHELL_ESCAPED_FLAGS; do
+          printf '%s=%s\n' "$key" "${!key}" >> "$GITHUB_ENV"
+        done
+    - name: Build the runtime for wasm32-wasip2
+      run: python scripts/wasi_build_runtime.py
+    - name: WASI smoke and complete issue 11375 acceptance
+      shell: bash
+      run: |
+        compiler=target/perry-dev/perry
+        python scripts/wasi_run.py "$compiler" --suite smoke --output target/wasi-validation/smoke --keep-intermediates
+        python scripts/wasi_run.py "$compiler" --suite acceptance --output target/wasi-validation/acceptance --keep-intermediates
+    - name: All WASI gap probes match the pinned Node oracle
+      shell: bash
+      run: |
+        compiler=target/perry-dev/perry
+        python scripts/wasi_run.py "$compiler" --suite gap --output target/wasi-validation/gap --keep-intermediates
+    - name: Typed components, resources, moving GC and cross-language composition
+      run: ./scripts/component_check.sh
+    - name: Retain WASI and component execution evidence
+      uses: ./.github/actions/perry/actions/upload-artifact
+      with:
+        name: wasi-required-${{ github.sha }}
+        retention-days: '7'
+        path: |
+          target/wasi-validation/
+          target/component-validation/**/*.log
+          target/component-validation/**/results.json
+          target/component-validation/**/*.component.wasm
+          target/component-validation/source-revision.txt
+      if: always()
   gate:
     name: ${{ github.event_name == 'pull_request' && 'pr-gate' || (needs.plan.outputs.tier == 'full' && 'full-suite-gate' || 'main-gate') }}
     if: always() && (github.event_name == 'pull_request' || needs.route.outputs.run_core == 'true')
@@ -5247,6 +5378,7 @@ jobs:
       - doc-tests
       - binary-size
       - security-audit
+      - wasi-execution
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -5266,6 +5398,12 @@ jobs:
           fi
           if [ "$plan_result" != "success" ]; then
             echo "::error::the plan job did not succeed ($plan_result); nothing below it ran, so this is a red run, not a green one."
+            exit 1
+          fi
+          wasi_planned="$(echo "$NEEDS" | jq -r '.plan.outputs.plan | fromjson | .jobs.wasi_execution')"
+          wasi_result="$(echo "$NEEDS" | jq -r '.["wasi-execution"].result')"
+          if [ "$wasi_planned" = "true" ] && [ "$wasi_result" != "success" ]; then
+            echo "::error::planned WASI execution did not pass ($wasi_result)."
             exit 1
           fi
           bad="$(echo "$NEEDS" | jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key')"
@@ -5428,12 +5566,18 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
         run: |
+          # 0378 and 0379 are fixed in wasmtime 48.0.7, which the workspace's
+          # 7-day minimum publish age keeps out of Cargo.lock until 2026-10-27;
+          # 0379 only affects aarch64 Cranelift output. Drop both ignores with
+          # the 48.0.7 bump.
           cargo audit \
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2026-0118 \
             --ignore RUSTSEC-2026-0119 \
             --ignore RUSTSEC-2026-0187 \
-            --ignore RUSTSEC-2026-0235
+            --ignore RUSTSEC-2026-0235 \
+            --ignore RUSTSEC-2026-0378 \
+            --ignore RUSTSEC-2026-0379
       - name: Install cargo-deny
         run: which cargo-deny || cargo install cargo-deny --locked
       - name: Run cargo deny
@@ -5649,12 +5793,18 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Run cargo audit
         run: |
+          # 0378 and 0379 are fixed in wasmtime 48.0.7, which the workspace's
+          # 7-day minimum publish age keeps out of Cargo.lock until 2026-10-27;
+          # 0379 only affects aarch64 Cranelift output. Drop both ignores with
+          # the 48.0.7 bump.
           cargo audit \
             --ignore RUSTSEC-2023-0071 \
             --ignore RUSTSEC-2026-0118 \
             --ignore RUSTSEC-2026-0119 \
             --ignore RUSTSEC-2026-0187 \
-            --ignore RUSTSEC-2026-0235
+            --ignore RUSTSEC-2026-0235 \
+            --ignore RUSTSEC-2026-0378 \
+            --ignore RUSTSEC-2026-0379
       - name: Install cargo-deny
         run: which cargo-deny || cargo install cargo-deny --locked
       - name: Run cargo deny

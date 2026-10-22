@@ -2219,9 +2219,8 @@ pub(super) fn copied_minor_promotable_active_survivor_bytes() -> usize {
     // order with the same global block-index bases, so the filter is exactly
     // equivalent to the previous in-callback range check.
     let active_range = crate::arena::active_survivor_block_index_range();
-    // Snapshot the same effective (including saturated env pins) threshold as
-    // CopyingNurseryCollector::new, once for this pacing estimate.
-    let promotion_threshold = tenuring_survivals();
+    // Match the per-type, per-cycle policy the copier will snapshot.
+    let promotion_policy = super::tenuring::PromotionPolicy::snapshot();
     let mut promotable = 0usize;
     crate::arena::arena_walk_objects_filtered(
         |block_idx| active_range.contains(&block_idx),
@@ -2237,7 +2236,8 @@ pub(super) fn copied_minor_promotable_active_survivor_bytes() -> usize {
                 // Mirror move_young's promotion predicate, including the
                 // adaptive threshold (gc/tenuring.rs), so this pacing estimate
                 // matches what the next copying minor will actually promote.
-                if flags & GC_FLAG_TENURED != 0 || next_age >= promotion_threshold {
+                let threshold = promotion_policy.for_type((*header).obj_type);
+                if flags & GC_FLAG_TENURED != 0 || next_age >= threshold {
                     promotable = promotable.saturating_add((*header).size as usize);
                 }
             }
@@ -4759,6 +4759,22 @@ fn gc_budgeted_step_work_units_inner_with_progress(
         return gc_budgeted_status_result();
     }
 
+    // "Nothing due" is the allocation point's question too, and is answered
+    // the same way (#10698): from the watermark the last evaluation published,
+    // while none of its inputs has changed (an active cycle retires it). Asked
+    // before the guard, whose entry checkpoint samples the arena: a runtime
+    // poll (each regex capture copy, the microtask pump) paid that sample and
+    // the whole ladder, ~800 instructions, to learn nothing was due. A
+    // reentrant step still reports the skip below.
+    if !GC_BUDGETED_STEP_ACTIVE.with(Cell::get) && super::trigger_watermark::nothing_due() {
+        #[cfg(test)]
+        super::trigger_watermark::verify_nothing_due();
+        super::instruments::note_budgeted_step_skip(
+            super::instruments::BudgetedStepSkip::NoTrigger,
+        );
+        return gc_idle_step_result();
+    }
+
     let Some(_guard) = BudgetedGcStepGuard::enter() else {
         super::instruments::note_budgeted_step_skip(
             super::instruments::BudgetedStepSkip::Reentrant,
@@ -4773,7 +4789,14 @@ fn gc_budgeted_step_work_units_inner_with_progress(
     let due = if gc_budgeted_cycle_active() {
         None
     } else {
-        let Some(due) = gc_budgeted_due_trigger() else {
+        let (due, _, watermark) = gc_budgeted_due_trigger_probe();
+        // A "nothing due" answers the next poll (above) and the next
+        // allocation point, published under the conditions
+        // `gc_check_trigger` publishes under: no cycle active, no root lock.
+        if due.is_none() && !gc_root_lock_held() {
+            super::trigger_watermark::publish_trigger_watermark(watermark);
+        }
+        let Some(due) = due else {
             super::instruments::note_budgeted_step_skip(
                 super::instruments::BudgetedStepSkip::NoTrigger,
             );

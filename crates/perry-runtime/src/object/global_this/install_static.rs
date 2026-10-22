@@ -855,6 +855,27 @@ pub(crate) fn install_proto_method(
     install_proto_method_with_key(proto_obj, method_name, info, arity, std::ptr::null())
 }
 
+/// Allocate the same builtin function for individual installs and bulk births.
+/// Keep the individual installer's allocation/boxing order and inlined body.
+#[inline(always)]
+pub(super) fn create_builtin_method(
+    method_name: &str,
+    info: *const crate::closure::JsFunctionInfo,
+    arity: u32,
+) -> *mut crate::closure::ClosureHeader {
+    let closure = crate::closure::js_closure_alloc(info, 0);
+    if closure.is_null() {
+        return closure;
+    }
+    super::super::native_module::set_bound_native_closure_metadata(closure, method_name, arity);
+    // The allocation's body record already owns this immutable capability.
+    // Shared bodies without the bit still need an instance-specific entry.
+    if info.is_null() || unsafe { (*info).flags & crate::closure::FN_NON_CONSTRUCTOR == 0 } {
+        super::super::native_module::set_builtin_closure_non_constructable(closure as usize);
+    }
+    closure
+}
+
 /// Install through the same attributed store with an already owned key atom.
 pub(crate) fn install_proto_method_with_key(
     proto_obj: *mut ObjectHeader,
@@ -863,15 +884,9 @@ pub(crate) fn install_proto_method_with_key(
     arity: u32,
     key: *const crate::StringHeader,
 ) -> f64 {
-    let closure = crate::closure::js_closure_alloc(info, 0);
+    let closure = create_builtin_method(method_name, info, arity);
     if closure.is_null() {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
-    }
-    super::super::native_module::set_bound_native_closure_metadata(closure, method_name, arity);
-    // The allocation's body record already owns this immutable capability.
-    // Shared bodies without the bit still need an instance-specific entry.
-    if info.is_null() || unsafe { (*info).flags & crate::closure::FN_NON_CONSTRUCTOR == 0 } {
-        super::super::native_module::set_builtin_closure_non_constructable(closure as usize);
     }
     let key = if key.is_null() {
         crate::string::js_string_from_bytes(method_name.as_ptr(), method_name.len() as u32)
@@ -961,117 +976,6 @@ pub(crate) fn install_proto_method_rest_with_length(
         super::super::PropertyAttrs::new(true, false, true),
     );
     value
-}
-
-/// #4139/#4437: reify the `JSON` namespace's own methods for reflection parity
-/// and detached value calls. Direct call sites are still codegen intrinsics.
-pub(crate) fn install_json_namespace_members(ns_obj: *mut ObjectHeader) {
-    const METHODS: &[(&str, *const crate::closure::JsFunctionInfo, u32)] = &[
-        (
-            "parse",
-            crate::fn_info!(json_parse_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-        (
-            "stringify",
-            crate::fn_info!(json_stringify_thunk, 3; with_declared(3), with_flags(crate::closure::FN_BUILTIN)),
-            3,
-        ),
-        (
-            "rawJSON",
-            crate::fn_info!(json_raw_json_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
-            1,
-        ),
-        (
-            "isRawJSON",
-            crate::fn_info!(json_is_raw_json_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
-            1,
-        ),
-    ];
-    for (name, info, arity) in METHODS.iter().copied() {
-        install_proto_method(ns_obj, name, info, arity);
-    }
-}
-
-/// #4139: reify the `Reflect` namespace's own methods for reflection parity.
-/// See `install_math_namespace` for the rationale.
-pub(crate) fn install_reflect_namespace_members(ns_obj: *mut ObjectHeader) {
-    // Every member is REAL as a value (#5989 for `construct`, then the rest):
-    // primordials-style captures (`const ReflectOwnKeys = Reflect.ownKeys`)
-    // call these through stored bindings, and a noop stub silently returned
-    // `undefined` — a hardened-primordials library's `recursiveFreeze` walked
-    // `Reflect.ownKeys(obj)` at class-static-init time and threw on
-    // destructuring the stub's `undefined` result.
-    let methods = [
-        (
-            "defineProperty",
-            crate::fn_info!(reflect_define_property_thunk, 3; with_declared(3), with_flags(crate::closure::FN_BUILTIN)),
-            3,
-        ),
-        (
-            "deleteProperty",
-            crate::fn_info!(reflect_delete_property_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-        (
-            "apply",
-            crate::fn_info!(reflect_apply_thunk, 3; with_declared(3), with_flags(crate::closure::FN_BUILTIN)),
-            3,
-        ),
-        (
-            "construct",
-            crate::fn_info!(reflect_construct_thunk, 3; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-        (
-            "get",
-            crate::fn_info!(reflect_get_thunk, 3; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-        (
-            "getOwnPropertyDescriptor",
-            crate::fn_info!(reflect_get_own_property_descriptor_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-        (
-            "getPrototypeOf",
-            crate::fn_info!(reflect_get_prototype_of_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
-            1,
-        ),
-        (
-            "has",
-            crate::fn_info!(reflect_has_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-        (
-            "isExtensible",
-            crate::fn_info!(reflect_is_extensible_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
-            1,
-        ),
-        (
-            "ownKeys",
-            crate::fn_info!(reflect_own_keys_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
-            1,
-        ),
-        (
-            "preventExtensions",
-            crate::fn_info!(reflect_prevent_extensions_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
-            1,
-        ),
-        (
-            "set",
-            crate::fn_info!(reflect_set_thunk, 4; with_declared(3), with_flags(crate::closure::FN_BUILTIN)),
-            3,
-        ),
-        (
-            "setPrototypeOf",
-            crate::fn_info!(reflect_set_prototype_of_thunk, 2; with_declared(2), with_flags(crate::closure::FN_BUILTIN)),
-            2,
-        ),
-    ];
-    for (name, info, arity) in methods {
-        install_proto_method(ns_obj, name, info, arity);
-    }
 }
 
 pub(crate) fn install_atomics_namespace_members(ns_obj: *mut ObjectHeader) {

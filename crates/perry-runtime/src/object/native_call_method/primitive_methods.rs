@@ -532,6 +532,22 @@ pub(super) unsafe fn dispatch_primitive(
         }
     }
 
+    // A method the `class … extends Promise` instance's class declares
+    // (`async withResponse() {…}`): the prototype chain answers it, not the
+    // intrinsic promise methods below.
+    if !matches!(method_name, "then" | "catch" | "finally")
+        && crate::promise::js_value_is_promise(object_handle.get_nanbox_f64()) != 0
+    {
+        if let Some(result) = super::collection_methods::call_inherited_user_method(
+            root_scope,
+            object_handle.get_nanbox_f64(),
+            method_name,
+            refreshed_args,
+        ) {
+            return Some(result);
+        }
+    }
+
     // Issue #489 followup: Promise's `then` / `catch` / `finally` are
     // intrinsic — when the dynamic dispatch path lands a `.then(cb)` on
     // a Promise (drizzle's `mysql-proxy/session.js`:
@@ -546,6 +562,16 @@ pub(super) unsafe fn dispatch_primitive(
         && crate::promise::js_value_is_promise(object_handle.get_nanbox_f64()) != 0
     {
         let promise_val = object_handle.get_nanbox_f64();
+        // A `class X extends Promise` override of then/catch/finally is what
+        // `x.then(...)` calls, not the intrinsic.
+        if let Some(result) = super::collection_methods::call_inherited_user_method(
+            root_scope,
+            promise_val,
+            method_name,
+            refreshed_args,
+        ) {
+            return Some(result);
+        }
         let promise_ptr = (promise_val.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *mut crate::Promise;
         let promise_handle = root_scope.root_raw_mut_ptr(promise_ptr);
 
@@ -715,15 +741,18 @@ pub(super) unsafe fn dispatch_primitive(
                 return Some(result);
             }
         }
-        let ctor = crate::object::js_get_global_this_builtin_value(b"Date".as_ptr(), 4);
-        let ctor_ptr = crate::value::js_nanbox_get_pointer(ctor) as usize;
-        if ctor_ptr != 0 {
-            let proto = crate::closure::closure_get_dynamic_prop(ctor_ptr, "prototype");
-            if let Some(proto_ptr) = object_ptr_from_value(proto) {
-                let key = crate::string::js_string_from_bytes(
-                    method_name_ptr as *const u8,
-                    method_name_len as u32,
-                );
+        // The cell's own [[Prototype]], not the realm's `Date.prototype`: an
+        // instance of `class D extends Date` links `D.prototype`, whose methods
+        // override the intrinsic ones (`get` walks on to `Date.prototype`).
+        let proto = crate::date::date_cell_prototype(object_handle.get_nanbox_f64());
+        let proto_handle = root_scope.root_nanbox_f64(proto);
+        if object_ptr_from_value(proto).is_some() {
+            let key = crate::string::js_string_from_bytes(
+                method_name_ptr as *const u8,
+                method_name_len as u32,
+            );
+            // Re-read: the key allocation can move the prototype.
+            if let Some(proto_ptr) = object_ptr_from_value(proto_handle.get_nanbox_f64()) {
                 let value = crate::object::js_object_get_field_by_name(proto_ptr, key);
                 if !value.is_undefined() {
                     let value_f64 = f64::from_bits(value.bits());

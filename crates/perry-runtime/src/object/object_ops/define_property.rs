@@ -260,6 +260,12 @@ pub(crate) unsafe fn define_own_property_decoded(
     {
         return true;
     }
+    // A new key on a plain ordinary object: claimed with its attributes in
+    // one step (`define_own_data::define_fresh_own_from_shape`).
+    if super::super::define_own_data::define_fresh_own_from_shape(scope, receiver, key, descriptor)
+    {
+        return true;
+    }
     super::super::reflect_support::reflect_define_property_decoded(scope, receiver, key, descriptor)
 }
 
@@ -777,6 +783,20 @@ pub(crate) unsafe fn apply_property_descriptor(
             };
             let Some(key_rust) = key_rust else {
                 return true;
+            };
+            // A generator function declares `prototype`, so a define finds
+            // the existing slot with its attributes: an unmaterialized slot
+            // is born with the function's bag first (allocates).
+            let closure_ptr = if key_rust == "prototype"
+                && crate::closure::props::closure_has_generator_body(
+                    closure_ptr as *const crate::closure::ClosureHeader,
+                )
+                && crate::closure::props::bag_of(closure_ptr).is_null()
+            {
+                let _ = crate::object::generator_function_prototype_of(closure_ptr);
+                closure_handle.get_raw_mut_ptr::<u8>() as usize
+            } else {
+                closure_ptr
             };
 
             // Spec retention: redefining an existing own property keeps the

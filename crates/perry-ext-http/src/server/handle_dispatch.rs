@@ -124,6 +124,8 @@ extern "C" {
     fn js_node_http_im_resume(handle: i64);
     fn js_node_http_im_destroy(handle: i64);
     fn js_node_http_im_on(handle: i64, event_name_ptr: *const StringHeader, callback: i64) -> f64;
+    fn js_node_http_im_once(handle: i64, event_name_ptr: *const StringHeader, callback: i64)
+        -> f64;
     fn js_node_http_im_set_encoding(handle: i64, encoding_ptr: *const StringHeader) -> i64;
     fn js_node_http_im_set_timeout(handle: i64, msecs: f64, callback: i64) -> i64;
     fn js_node_http_im_read(handle: i64) -> f64;
@@ -134,12 +136,12 @@ extern "C" {
     fn js_node_http_res_get_header(handle: i64, name_ptr: *const StringHeader) -> f64;
     fn js_node_http_res_remove_header(handle: i64, name_ptr: *const StringHeader);
     fn js_node_http_res_has_header(handle: i64, name_ptr: *const StringHeader) -> i32;
-    fn js_node_http_res_get_headers_json(handle: i64) -> *mut StringHeader;
-    fn js_node_http_res_get_header_names_json(handle: i64) -> *mut StringHeader;
+    fn js_node_http_res_get_headers(handle: i64) -> f64;
+    fn js_node_http_res_get_header_names(handle: i64) -> f64;
     fn js_node_http_res_append_header(
         handle: i64,
         name_ptr: *const StringHeader,
-        value_ptr: *const StringHeader,
+        value: f64,
     ) -> i64;
     fn js_node_http_res_set_headers(handle: i64, headers_value: f64) -> i64;
     fn js_node_http_res_get_status_message(handle: i64) -> f64;
@@ -759,6 +761,14 @@ pub unsafe extern "C" fn js_ext_http_incoming_message_dispatch_method(
             js_node_http_im_on(handle, event_ptr, closure_arg(Some(args[1])));
             self_ref
         }
+        "once" | "prependOnceListener" if args.len() >= 2 => {
+            let event_ptr = string_arg(args[0]);
+            if event_ptr.is_null() {
+                return self_ref;
+            }
+            js_node_http_im_once(handle, event_ptr, closure_arg(Some(args[1])));
+            self_ref
+        }
         // #6432: `for await (const chunk of req)` — reads the buffered request
         // body. Perry delivers the whole body as one buffer (its `.on('data')`
         // emits `body_bytes` in a single shot), so a one-shot async iterator over
@@ -880,7 +890,7 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_method(
     }
 
     let result = match method.as_str() {
-        "setHeader" if args.len() >= 2 => {
+        "setHeader" if !args.is_empty() => {
             super::response_methods::set_header(response_root.get(), args)
         }
         "getHeader" if !args.is_empty() => {
@@ -904,18 +914,13 @@ pub unsafe extern "C" fn js_ext_http_server_response_dispatch_method(
                 !name.is_null() && js_node_http_res_has_header(response_root.get(), name) != 0,
             )
         }
-        "getHeaders" => json_string_value(js_node_http_res_get_headers_json(response_root.get())),
-        "getHeaderNames" => {
-            json_string_value(js_node_http_res_get_header_names_json(response_root.get()))
-        }
-        "appendHeader" if args.len() >= 2 => {
+        "getHeaders" => js_node_http_res_get_headers(response_root.get()),
+        "getHeaderNames" => js_node_http_res_get_header_names(response_root.get()),
+        "appendHeader" if !args.is_empty() => {
+            let value = response_scope.root_nanbox(args.get(1).copied().unwrap_or(undef));
             let name = string_value_arg(args[0]);
             if !name.is_null() {
-                js_node_http_res_append_header(
-                    response_root.get(),
-                    name,
-                    string_value_arg(args[1]),
-                );
+                js_node_http_res_append_header(response_root.get(), name, value.get());
             }
             handle_to_pointer_f64(response_root.get())
         }
@@ -1392,6 +1397,7 @@ mod response_socket_tests {
 
     #[test]
     fn response_socket_retains_initial_socket_after_request_reassignment() {
+        perry_ffi::initialize_runtime_fixture();
         let scope = perry_ffi::TransientRootScope::enter();
         let socket = scope.root_nanbox(perry_ext_net::native_transport::new_socket(
             0,
@@ -1531,6 +1537,8 @@ fn incoming_method_bytes(name: &str) -> Option<&'static [u8]> {
     match name {
         "on" => Some(b"on"),
         "addListener" => Some(b"addListener"),
+        "once" => Some(b"once"),
+        "prependOnceListener" => Some(b"prependOnceListener"),
         "setEncoding" => Some(b"setEncoding"),
         "setTimeout" => Some(b"setTimeout"),
         "pause" => Some(b"pause"),

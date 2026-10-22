@@ -75,6 +75,7 @@ fn build_dispatch_while_body(
     state_id: LocalId,
     done_id: LocalId,
     sent_id: LocalId,
+    step_id: Option<LocalId>,
 ) -> Vec<Stmt> {
     let mut while_body: Vec<Stmt> = Vec::new();
     let mut cases = Vec::new();
@@ -82,7 +83,11 @@ fn build_dispatch_while_body(
         let num = state.num;
         let mut case_body = state.body.clone();
         match &state.exit {
-            StateExit::Yield { value, next_state } => {
+            StateExit::Yield {
+                value,
+                next_state,
+                passthrough,
+            } => {
                 if body_contains_return(&case_body) {
                     prepend_done_before_returns(&mut case_body, done_id);
                     rewrite_returns_as_done(&mut case_body);
@@ -91,7 +96,19 @@ fn build_dispatch_while_body(
                     state_id,
                     Box::new(Expr::Number(*next_state as f64)),
                 )));
-                case_body.push(Stmt::Return(Some(make_iter_result(value.clone(), false))));
+                if let Some(kind_id) = passthrough {
+                    // A sync `yield*` re-yields what its pull returned: a raw
+                    // value from a fixed-state delegate, or its inner result
+                    // object. The pull's kind is this step's kind.
+                    let step_id = step_id.expect("passthrough yields are fixed-state");
+                    case_body.push(Stmt::Expr(Expr::LocalSet(
+                        step_id,
+                        Box::new(Expr::LocalGet(*kind_id)),
+                    )));
+                    case_body.push(Stmt::Return(Some(value.clone())));
+                } else {
+                    case_body.push(Stmt::Return(Some(make_iter_result(value.clone(), false))));
+                }
             }
             StateExit::Await { value, next_state } => {
                 // A user `return X` can sit in a yield/await-free control-flow
@@ -416,6 +433,14 @@ pub fn transform_generator_function_with_extra_captures(
     let done_id = alloc_local(next_local_id);
     let sent_id = alloc_local(next_local_id); // value passed by caller via next(val)
     let executing_id = alloc_local(next_local_id);
+    // A fixed-state record's fifth control: the kind of the step its resume
+    // body returns (see `fixed_state::record_step_kinds`).
+    let step_id = fixed_state.then(|| alloc_local(next_local_id));
+    // Its sixth control: the instance's [[Prototype]] holder, written only by
+    // the runtime at the birth (`js_generator_create`) and never read by the
+    // body: the prototype object, or the owner function while its original
+    // prototype is unmaterialized.
+    let proto_ctl_id = fixed_state.then(|| alloc_local(next_local_id));
     // #4438 B2-finally: pending abrupt-completion record for routing through a
     // YIELDING finally. `pending_type`: 0 = none, 1 = throw, 2 = return.
     // `pending_value`: the thrown error / returned value. Set when abrupt
@@ -586,6 +611,7 @@ pub fn transform_generator_function_with_extra_captures(
         state_id,
         done_id,
         sent_id,
+        step_id,
     );
 
     // The next() closure parameter — receives the value from next(val) calls
@@ -817,6 +843,24 @@ pub fn transform_generator_function_with_extra_captures(
         mutable: true,
         init: Some(Expr::Bool(false)),
     });
+    if let Some(step_id) = step_id {
+        new_body.push(Stmt::Let {
+            id: step_id,
+            name: "__gen_step".to_string(),
+            ty: Type::Number,
+            mutable: true,
+            init: Some(Expr::Number(0.0)),
+        });
+    }
+    if let Some(proto_ctl_id) = proto_ctl_id {
+        new_body.push(Stmt::Let {
+            id: proto_ctl_id,
+            name: "__gen_proto".to_string(),
+            ty: Type::Any,
+            mutable: true,
+            init: Some(Expr::Undefined),
+        });
+    }
 
     // #4438 B2-finally: let __pending_type = 0; let __pending_value = undefined
     if has_yielding_finally {
@@ -884,6 +928,8 @@ pub fn transform_generator_function_with_extra_captures(
     let mut captures = vec![state_id, done_id, sent_id, executing_id];
     captures.extend(private_brand_id);
     let mut mutable_captures = vec![state_id, done_id, sent_id, executing_id];
+    mutable_captures.extend(step_id);
+    mutable_captures.extend(proto_ctl_id);
     // #4438 B2-finally: the pending-completion record is read/written across the
     // next/throw/return closures, so capture it by reference like the other
     // state-machine internals (only when a yielding finally uses it).
@@ -923,10 +969,17 @@ pub fn transform_generator_function_with_extra_captures(
     }
     captures.sort();
     captures.dedup();
-    if fixed_state {
-        // The shared resume boundary owns these four controls. User captures
+    if let (Some(step_id), Some(proto_ctl_id)) = (step_id, proto_ctl_id) {
+        // The shared resume boundary owns these six controls. User captures
         // follow them; codegen preserves explicit capture order.
-        let controls = [state_id, done_id, sent_id, executing_id];
+        let controls = [
+            state_id,
+            done_id,
+            sent_id,
+            executing_id,
+            step_id,
+            proto_ctl_id,
+        ];
         captures.retain(|id| !controls.contains(id));
         captures.splice(0..0, controls);
     }
@@ -1598,7 +1651,7 @@ pub fn transform_generator_function_with_extra_captures(
             if next_only {
                 params.remove(0);
             }
-            let body = if next_only {
+            let mut body = if next_only {
                 dispatch
             } else {
                 vec![Stmt::While {
@@ -1606,6 +1659,7 @@ pub fn transform_generator_function_with_extra_captures(
                     body: dispatch,
                 }]
             };
+            fixed_state::record_step_kinds(&mut body, step_id.expect("fixed-state record"));
             Expr::Closure {
                 func_id: next_func_id_val,
                 params,
@@ -1643,7 +1697,7 @@ pub fn transform_generator_function_with_extra_captures(
                 // The private protocol ABI supplies only 0/1/2 here; an
                 // abrupt continuation writes 0. This parameter is compiler
                 // machinery, not a value justified by a source annotation.
-                let mut ids = vec![state_id, resume_op_id.unwrap()];
+                let mut ids = vec![state_id, resume_op_id.unwrap(), step_id.unwrap()];
                 if has_yielding_finally {
                     ids.push(pending_type_id);
                 }

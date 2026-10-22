@@ -30,6 +30,9 @@ use std::sync::Mutex;
 // Calls that allocate or mutate runtime-owned values must cross the stable C ABI. A shared stdlib still contains fallback Rust runtime glue for generic
 // monomorphizations; direct Rust calls would allocate into that image's arena
 // instead of the process-wide runtime provider.
+// `Promise` crosses this boundary by pointer only: both sides are this workspace's
+// Rust and never read its fields through the declaration.
+#[allow(improper_ctypes)]
 extern "C" {
     #[link_name = "js_array_alloc"]
     fn provider_js_array_alloc(capacity: u32) -> *mut ArrayHeader;
@@ -2786,6 +2789,7 @@ mod handle_boundary_tests {
 
     #[test]
     fn raw_and_tagged_typed_receivers_store_stream_expandos() {
+        crate::test_runtime::initialize();
         unsafe {
             let stream = js_readable_stream_new(
                 f64::from_bits(TAG_UNDEFINED),
@@ -2803,11 +2807,17 @@ mod handle_boundary_tests {
             {
                 let key =
                     perry_runtime::js_string_from_bytes(key_name.as_ptr(), key_name.len() as u32);
-                perry_runtime::object::js_object_set_field_by_name(
-                    receiver as *mut perry_runtime::object::ObjectHeader,
-                    key,
-                    value,
-                );
+                if receiver == id as u64 {
+                    perry_runtime::object::js_object_set_field_by_name(
+                        receiver as *mut perry_runtime::object::ObjectHeader,
+                        key,
+                        value,
+                    );
+                } else {
+                    let object = f64::from_bits(receiver);
+                    let property = perry_runtime::value::js_nanbox_string(key as i64);
+                    perry_runtime::proxy::js_put_value_set(object, property, value, object, 0);
+                }
                 assert_eq!(stream_expando_get(id, key_name), Some(value));
             }
         }

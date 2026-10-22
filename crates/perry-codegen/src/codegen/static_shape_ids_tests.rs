@@ -47,8 +47,11 @@ fn the_band_is_the_next_power_of_two_of_four_per_content() {
     assert_eq!(static_band_size(512), 2048);
     assert_eq!(static_band_size(513), 4096);
     assert_eq!(static_band_size(5000), 32768);
-    assert_eq!(static_band_size(1 << 18), STATIC_SHAPE_ID_COUNT);
-    assert_eq!(static_band_size(usize::MAX), STATIC_SHAPE_ID_COUNT);
+    // The upper half of the static ids holds the section-ordered layout ids
+    // (object model step 0): the band stops at the lower half.
+    assert_eq!(static_band_size(1 << 17), STATIC_SHAPE_ID_COUNT / 2);
+    assert_eq!(static_band_size(1 << 18), STATIC_SHAPE_ID_COUNT / 2);
+    assert_eq!(static_band_size(usize::MAX), STATIC_SHAPE_ID_COUNT / 2);
 }
 
 #[test]
@@ -390,6 +393,36 @@ fn class_birth_reads_the_birth_rep_of_its_keys_global() {
         &ClassIdsByKeysName::new(&class_ids),
     );
     assert_eq!(b.shape.unwrap().rep, 0);
+}
+
+#[test]
+fn unicode_symbol_names_class_keys_keep_exact_owner_ids() {
+    let names = [
+        "Étage",
+        "$Étage",
+        "$",
+        "_",
+        "u__24_",
+        "\0perry_namespace_class\0zmod\0ZodObject",
+    ];
+    let class_ids: HashMap<String, u32> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.to_string(), 57 + i as u32))
+        .collect();
+    let index = ClassIdsByKeysName::new(&class_ids);
+    for (name, &id) in &class_ids {
+        let entry: ClassKeysInit = (
+            crate::symbol_names::class_keys("m", name),
+            "value\0".into(),
+            1,
+            vec![],
+            vec![],
+        );
+        let birth = class_birth("m", &entry, &HashMap::new(), &HashMap::new(), &index);
+        assert_eq!(birth.class_id, id, "class owner for {name:?}");
+        assert_eq!(birth.shape.unwrap().proto, BirthProto::Class(id));
+    }
 }
 
 #[test]

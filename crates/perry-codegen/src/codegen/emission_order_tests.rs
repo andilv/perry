@@ -92,6 +92,7 @@ fn ir_opts() -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
@@ -99,7 +100,7 @@ fn ir_opts() -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -125,9 +126,10 @@ fn ir_opts() -> CompileOptions {
         app_metadata: AppMetadata::default(),
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        namespace_adopts_cjs_exports: false,
         debug_locations: false,
         module_source: None,
         debug_source_line_offset: 0,
@@ -618,12 +620,12 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
             module.closure_source_text.insert(
                 id,
                 perry_hir::FunctionSourceMetadata {
-                    text: source.to_owned(),
+                    text: source.into(),
                     is_non_strict_ordinary: flag,
                 },
             );
         }
-        module.class_source_text.insert(3, class.clone());
+        module.class_source_text.insert(3, class.clone().into());
         module
     };
     for output_type in ["executable", "dylib", "staticlib"] {
@@ -635,22 +637,25 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
         );
         let source_globals: Vec<_> = emitted
             .lines()
-            .filter(|line| {
-                line.starts_with('@') && line.contains("constant") && line.contains(inner)
-            })
+            .filter(|line| line.starts_with('@') && line.contains(".perry.retained_source ="))
             .collect();
         assert_eq!(
             source_globals.len(),
             1,
-            "all retained text must share one physical module blob"
+            "legacy raw text must share one physical module blob"
         );
         assert!(
             source_globals[0].contains("perry_src"),
             "retained text must live outside the ordinary literal section"
         );
         let base = source_globals[0].split_whitespace().next().unwrap();
+        let raw_blob = if output_type == "executable" {
+            format!("{inner}{method}{class}")
+        } else {
+            outer.clone()
+        };
         let pointer = |source: &str| {
-            let offset = outer.find(source).unwrap();
+            let offset = raw_blob.find(source).unwrap();
             if offset == 0 {
                 return base.to_owned();
             }
@@ -689,7 +694,25 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
                 "raw method source metadata changed: {}",
                 entries[0]
             );
-            for (symbol, source) in [("__outer$info", outer.as_str()), ("__inner$info", inner)] {
+            // outer is long: frames. inner is short: a raw copy named directly.
+            for (symbol, source, global_suffix, info_type) in [
+                (
+                    "__outer$info",
+                    outer.as_str(),
+                    ".perry.retained_source.deflate",
+                    crate::fn_info::INFO_TYPE
+                        .strip_suffix("i64 }")
+                        .unwrap()
+                        .to_string()
+                        + "{ i32, i32 } }",
+                ),
+                (
+                    "__inner$info",
+                    inner,
+                    ".perry.retained_source",
+                    crate::fn_info::INFO_TYPE.to_string(),
+                ),
+            ] {
                 let info = emitted
                     .lines()
                     .find(|line| line.starts_with('@') && line.contains(symbol))
@@ -703,8 +726,12 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
                     "source length must reuse the idle versioned-captures field: {info}"
                 );
                 assert!(
-                    info.contains(&format!("constant {{ {}, i32, i32 }}", crate::fn_info::INFO_TYPE)),
+                    info.contains(&format!("constant {{ {info_type}, i32, i32 }}")),
                     "ordinary source must reuse the base fields; only the name range follows: {info}"
+                );
+                assert!(
+                    info.contains(&format!("{global_suffix} to i64")),
+                    "source must live in the expected pool: {info}"
                 );
             }
         } else {
@@ -768,7 +795,7 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
              contract: {}",
             class_calls[0]
         );
-        let class_offset = outer.find(class.as_str()).unwrap();
+        let class_offset = raw_blob.find(class.as_str()).unwrap();
         let class_pointer = if class_offset == 0 {
             base.to_owned()
         } else {
@@ -795,6 +822,48 @@ fn retained_source_ranges_preserve_registrations_and_ownership() {
             class_calls[0]
         );
     }
+}
+
+/// The raw cutoff is on a function's own source length: 512 bytes stay raw,
+/// 513 go to the frames.
+#[test]
+fn retained_source_raw_cutoff_is_the_functions_own_length() {
+    let pad = |n: usize| format!("function f() {{ /*{}*/ }}", "x".repeat(n - 21));
+    let (short, long) = (
+        pad(perry_abi::RETAINED_SOURCE_RAW_MAX_BYTES),
+        pad(perry_abi::RETAINED_SOURCE_RAW_MAX_BYTES + 1),
+    );
+    assert_eq!((short.len(), long.len()), (512, 513));
+    let mut module = empty_module("retained_source_cutoff.ts");
+    module.functions.push(method_fn(100, "short"));
+    module.functions.push(method_fn(101, "long"));
+    for (id, source) in [(100, short.as_str()), (101, long.as_str())] {
+        module.closure_source_text.insert(
+            id,
+            perry_hir::FunctionSourceMetadata {
+                text: source.into(),
+                is_non_strict_ordinary: false,
+            },
+        );
+    }
+    let emitted = ir_for_output_type(&module, "executable");
+    let info = |symbol: &str| {
+        emitted
+            .lines()
+            .find(|line| line.starts_with('@') && line.contains(symbol))
+            .expect("info definition")
+            .to_owned()
+    };
+    let raw = info("__short$info");
+    let framed = info("__long$info");
+    assert!(
+        raw.contains(".perry.retained_source to i64") && raw.contains("i32 512, i16"),
+        "{raw}"
+    );
+    assert!(
+        framed.contains(".perry.retained_source.deflate to i64") && framed.contains("i32 513, i16"),
+        "{framed}"
+    );
 }
 
 /// #10574 Part 2: `--function-source=header` must drop the body and keep the
@@ -828,7 +897,7 @@ fn header_mode_replaces_bodies_with_a_di_header() {
     module.closure_source_text.insert(
         100,
         perry_hir::FunctionSourceMetadata {
-            text: "function foo(a, b) {\n  return 'DISTINCTIVE_BODY_10574';\n}".to_string(),
+            text: "function foo(a, b) {\n  return 'DISTINCTIVE_BODY_10574';\n}".into(),
             is_non_strict_ordinary: true,
         },
     );
@@ -838,13 +907,13 @@ fn header_mode_replaces_bodies_with_a_di_header() {
     module.closure_source_text.insert(
         200,
         perry_hir::FunctionSourceMetadata {
-            text: "m() { return 'METHOD_BODY_10574'; }".to_string(),
+            text: "m() { return 'METHOD_BODY_10574'; }".into(),
             is_non_strict_ordinary: false,
         },
     );
     module.class_source_text.insert(
         3,
-        "class Envelope { m() { return 'METHOD_BODY_10574'; } }".to_string(),
+        "class Envelope { m() { return 'METHOD_BODY_10574'; } }".into(),
     );
     let emitted = ir(&module);
     assert!(
@@ -867,4 +936,21 @@ fn header_mode_replaces_bodies_with_a_di_header() {
         emitted.contains("class Envelope"),
         "class toString header must keep the class name"
     );
+}
+
+#[test]
+fn comdat_function_names_reference_images_without_local_aliases() {
+    let mut opts = ir_opts();
+    opts.target = Some("x86_64-unknown-linux-gnu".to_string());
+    let llvm = String::from_utf8(compile_module(&closure_display_module(), opts).unwrap()).unwrap();
+    assert!(!llvm.contains(" = internal alias i8, getelementptr"));
+    let table = llvm
+        .lines()
+        .find(|line| line.starts_with("@__perry_function_name_descriptors_"))
+        .unwrap();
+    assert!(table.contains(
+        "ptrtoint (ptr getelementptr (i8, ptr getelementptr (i8, ptr @perry_image_literal_"
+    ));
+    let info = llvm.lines().find(|line| line.contains("$info =") && line.contains("ptrtoint (ptr getelementptr (i8, ptr getelementptr (i8, ptr @perry_image_literal_")).expect("function info name points directly at its COMDAT image");
+    assert!(info.contains("i64 20)"));
 }

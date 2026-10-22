@@ -324,6 +324,11 @@ pub struct CompileOptions {
     /// dynamic `import()` of it would hand back — with the prefix coming from
     /// `namespace_member_prefixes` under the same key.
     pub namespace_member_nested: Vec<(String, String)>,
+    /// Namespace-import locals whose target is a CommonJS (or JSON) module under
+    /// `--platform bun`: a member the export lexer did not see reads the
+    /// evaluated `module.exports` (Bun interop), and the whole namespace value
+    /// carries its run-time keys.
+    pub cjs_interop_namespaces: Vec<String>,
     /// Imported class definitions from other native modules, keyed by
     /// the local alias (or original name when no alias). Each entry
     /// carries the class HIR, the module prefix of its origin, and an
@@ -361,7 +366,7 @@ pub struct CompileOptions {
     pub imported_async_funcs: std::collections::HashSet<String>,
     /// Type alias map (name → Type) aggregated from all modules. Codegen
     /// uses this to resolve `Named` types in function signatures.
-    pub type_aliases: std::collections::HashMap<String, perry_hir::types::Type>,
+    pub type_aliases: std::sync::Arc<std::collections::HashMap<String, perry_hir::types::Type>>,
     /// Imported function parameter counts, keyed by function name.
     pub imported_func_param_counts: std::collections::HashMap<String, usize>,
     /// Issue #608 — imported function names whose source-side signature
@@ -521,7 +526,7 @@ pub struct CompileOptions {
     /// module's `main` filters this set out of `non_entry_module_prefixes`
     /// when emitting the eager init call sequence. Empty when no module
     /// in the program is deferred.
-    pub deferred_module_prefixes: std::collections::HashSet<String>,
+    pub deferred_module_prefixes: std::sync::Arc<std::collections::HashSet<String>>,
 
     /// Issue #753: sanitized prefixes of THIS module's static-import +
     /// re-export source modules (non-entry only — the entry has no
@@ -545,6 +550,10 @@ pub struct CompileOptions {
     /// Without this, side-effect-only dynamic-import targets fail at
     /// link with `Undefined symbols: ___perry_ns_<prefix>`.
     pub is_dynamic_import_target: bool,
+    /// This module is CommonJS compiled for `--platform bun`: its namespace
+    /// also carries every own enumerable key of the evaluated
+    /// `module.exports` (Bun interop), built by `js_create_cjs_namespace`.
+    pub namespace_adopts_cjs_exports: bool,
 
     /// #5247: emit source-location tracking for the dynamic call-dispatch
     /// throw path (`X is not a function`). Gated by the CLI `--debug-symbols`
@@ -948,6 +957,8 @@ pub(crate) struct CrossModuleCtx {
     /// dynamic `import()` of it would hand back — with the prefix coming from
     /// `namespace_member_prefixes` under the same key.
     pub namespace_member_nested: std::collections::HashSet<(String, String)>,
+    /// See `CompileOptions::cjs_interop_namespaces`.
+    pub cjs_interop_namespaces: std::collections::HashSet<String>,
     /// Issue #680: per-namespace member resolution. See doc on
     /// `CompileOptions::namespace_member_prefixes`.
     pub namespace_member_prefixes: std::collections::HashMap<(String, String), String>,
@@ -959,8 +970,6 @@ pub(crate) struct CrossModuleCtx {
         std::sync::Arc<std::collections::HashMap<String, Vec<ShortSpreadMethodCandidate>>>,
     pub object_literal_method_candidates:
         std::sync::Arc<std::collections::HashMap<String, Vec<ObjectLiteralMethodCandidate>>>,
-    /// See `CompileOptions::program_class_accessor_names`.
-    pub program_class_accessor_names: Option<std::sync::Arc<ClassAccessorNames>>,
     /// FuncIds of locally-defined async functions in this module. Populated
     /// from `hir.functions.is_async`. Used by `is_promise_expr` to refine
     /// `let p = asyncFn();` to `Promise(_)` so subsequent `p.then(cb)`
@@ -971,6 +980,9 @@ pub(crate) struct CrossModuleCtx {
     /// from the lowered iterator-return body shape and used by call lowering
     /// to attach instances to the closure-owned `g.prototype`.
     pub local_generator_funcs: std::collections::HashSet<u32>,
+    /// Sync (fixed-state) members of `local_generator_funcs`; their birth
+    /// links the prototype, so call sites emit no relink.
+    pub fixed_generator_funcs: std::collections::HashSet<u32>,
     /// FuncIds of closures that were `async` in the source and got CPS-
     /// rewritten into async-step state machines. The rewrite clears
     /// `Expr::Closure.is_async`, so the flag alone can't identify them at
@@ -1000,7 +1012,7 @@ pub(crate) struct CrossModuleCtx {
     /// class for `this` in that method body (see
     /// `collectors::literal_method_home_classes`), never a receiver proof.
     pub literal_method_home_classes: std::collections::HashMap<u32, String>,
-    pub type_aliases: std::collections::HashMap<String, perry_hir::types::Type>,
+    pub type_aliases: std::sync::Arc<std::collections::HashMap<String, perry_hir::types::Type>>,
     pub imported_func_param_counts: std::collections::HashMap<String, usize>,
     /// Issue #678: see `CompileOptions::import_function_origin_names`.
     /// Cloned from the same field so codegen helpers reachable via
@@ -1408,7 +1420,7 @@ pub(crate) struct CrossModuleCtx {
     /// dynamic `import()` edges. Their `<prefix>__init` is excluded
     /// from the entry-main eager init call sequence and fires lazily
     /// from each `Expr::DynamicImport` dispatch site.
-    pub deferred_module_prefixes: std::collections::HashSet<String>,
+    pub deferred_module_prefixes: std::sync::Arc<std::collections::HashSet<String>>,
     /// Issue #753: this module's static-import + re-export source
     /// prefixes (non-entry only). Consumed by `compile_module_entry`
     /// when emitting the wrapper for `<prefix>__init` so dep init
@@ -1420,6 +1432,10 @@ pub(crate) struct CrossModuleCtx {
     /// `@__perry_ns_<prefix>` + populator even when `namespace_entries`
     /// is empty (side-effect-only modules with no `export`s).
     pub is_dynamic_import_target: bool,
+    /// This module is CommonJS compiled for `--platform bun`: its namespace
+    /// also carries every own enumerable key of the evaluated
+    /// `module.exports` (Bun interop), built by `js_create_cjs_namespace`.
+    pub namespace_adopts_cjs_exports: bool,
     /// Inline-hot-small pre-pass result: `FuncId`s in THIS module that have
     /// ≥1 direct call site inside a loop (`for`/`while`/`do-while`). Consumed
     /// by `compile_function` to decide whether a small callee earns LLVM's

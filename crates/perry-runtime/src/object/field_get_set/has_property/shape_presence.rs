@@ -29,10 +29,8 @@ pub(crate) unsafe fn own_position(
     }
     let table_owned = crate::object::overflow::has_overflow(obj);
     if (!table_owned && !shape.object_kind.is_ordinary_layout())
-        || matches!(
-            shape.object_kind,
-            ShapeObjectKind::NativeNamespace | ShapeObjectKind::OrdinaryNativeAlias
-        )
+        || shape.object_kind == ShapeObjectKind::NativeNamespace
+        || shape.object_kind.is_native_alias()
         || shape.proto_id == shapes::PROTO_ID_PER_OBJECT
     {
         return None;
@@ -163,7 +161,12 @@ pub(crate) unsafe fn first_possible_holder(
             let Some(record) = shapes::shape_record_by_id(shapes::object_shape_stamp(obj)) else {
                 return ChainHolder::At(obj);
             };
-            let prototype = JSValue::from_bits(record.prototype_word());
+            // A generator instance's record holds its link.
+            let prototype = JSValue::from_bits(if pid == shapes::PROTO_ID_RECORD_HELD {
+                shapes::object_prototype_word(obj)
+            } else {
+                record.prototype_word()
+            });
             if !prototype.is_pointer() {
                 return ChainHolder::At(obj);
             }

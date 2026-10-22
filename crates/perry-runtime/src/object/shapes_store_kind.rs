@@ -24,6 +24,7 @@
 //! | `OrdinaryNumericProof` | admitted | set |
 //! | `NativeNamespace` | not admitted | clear |
 //! | `OrdinaryNativeAlias` | admitted | clear |
+//! | `OrdinaryUnmarkedNativeAlias` | refused | clear |
 //!
 //! Ordinary and OrdinaryNativeAlias shapes admit stores. The native alias
 //! affects read fallback; its writable own slots follow the same store rules.
@@ -98,9 +99,15 @@ pub(crate) unsafe fn receiver_ordinary_kind(obj: *const ObjectHeader) -> ShapeOb
         ShapeObjectKind::NativeNamespace
     } else if !(*obj).meta.is_null()
         && (*(*obj).meta).flags & crate::object::OBJECT_META_FLAG_NATIVE_ALIAS != 0
-        && receiver_admits_plain_store(obj)
     {
-        ShapeObjectKind::OrdinaryNativeAlias
+        // Read forwarding is independent of plain-store admission. Runtime
+        // births need a distinct kind too: an unmarked shape can otherwise
+        // prove absence and skip the native fallback entirely.
+        if receiver_admits_plain_store(obj) {
+            ShapeObjectKind::OrdinaryNativeAlias
+        } else {
+            ShapeObjectKind::OrdinaryUnmarkedNativeAlias
+        }
     } else if receiver_admits_plain_store(obj) {
         ShapeObjectKind::Ordinary
     } else {
@@ -285,6 +292,50 @@ pub(crate) unsafe fn mark_plain_ordinary(obj: *mut ObjectHeader) {
 #[inline]
 pub(crate) unsafe fn premark_plain_ordinary(obj: *mut ObjectHeader) {
     (*gc_header(obj))._reserved |= crate::gc::OBJ_FLAG_PLAIN_ORDINARY;
+}
+
+/// Does the shape `shape_id` prove an ordinary data receiver with no
+/// [[Prototype]]: the `Ordinary` kind (stores admitted, F-A) and the null
+/// identity? Such a receiver has no chain, so no inherited setter,
+/// non-writable property or `__proto__` accessor can meet a store; its own
+/// key attributes are its descriptor bit's concern. The born-null header bit
+/// alone proves nothing (it is sticky across a relink, and an unmarked
+/// runtime record carries it too); the shape answers.
+#[inline]
+pub(crate) fn shape_proves_ordinary_null_proto(shape_id: u32) -> bool {
+    super::shape_record_by_id(shape_id).is_some_and(|record| {
+        record.object_kind() == ShapeObjectKind::Ordinary
+            && record.proto_id() == super::PROTO_ID_NULL
+    })
+}
+
+/// The born-null gate of the shape-keyed store lanes and plans: a receiver
+/// whose header `reserved` word carries no born-null bit passes (its shape
+/// already keys the plan), and a born-null one passes only when its shape
+/// proves it ordinary with the null identity
+/// ([`shape_proves_ordinary_null_proto`]).
+///
+/// # Safety
+/// `obj` is a live `GC_TYPE_OBJECT` `ObjectHeader` and `reserved` is its
+/// header's `_reserved` word.
+#[inline(always)]
+pub(crate) unsafe fn born_null_admits_lane(obj: *const ObjectHeader, reserved: u16) -> bool {
+    reserved & crate::gc::OBJ_FLAG_NULL_PROTO == 0 || born_null_shape_proven(obj, reserved)
+}
+
+/// A born-null receiver's shape proves it ordinary with the null identity
+/// ([`shape_proves_ordinary_null_proto`]). A class-less receiver reaches the
+/// `Ordinary` kind only through its plain-ordinary mark (R1, R6), so an
+/// unmarked runtime record (a scope, namespace or resource) is answered from
+/// its header word with no shape-record read.
+///
+/// # Safety
+/// `obj` is a live `GC_TYPE_OBJECT` `ObjectHeader` and `reserved` is its
+/// header's `_reserved` word.
+#[inline(always)]
+pub(crate) unsafe fn born_null_shape_proven(obj: *const ObjectHeader, reserved: u16) -> bool {
+    reserved & crate::gc::OBJ_FLAG_PLAIN_ORDINARY != 0
+        && shape_proves_ordinary_null_proto(object_shape_stamp(obj))
 }
 
 /// R5, publish: move a receiver whose proof payload was just written to the

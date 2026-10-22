@@ -127,7 +127,13 @@ struct PrivateShapeProof {
     name: &'static str,
     /// A field (kind 0) or the class brand (methods and accessors).
     is_field: bool,
+    /// `NO_ELEMENT_SLOT`, or the slot of a field the shape lists as optional
+    /// (a class family's): present only while this object's slot holds no
+    /// hole, which every hit reads.
+    element_slot: u32,
 }
+
+const NO_ELEMENT_SLOT: u32 = u32::MAX;
 
 impl PrivateShapeProof {
     const EMPTY: Self = Self {
@@ -136,6 +142,7 @@ impl PrivateShapeProof {
         site_name: 0,
         name: "",
         is_field: false,
+        element_slot: NO_ELEMENT_SLOT,
     };
 }
 
@@ -272,8 +279,16 @@ fn private_instance_access_is_proven(
             .matches(shape_id, class_id, name, is_field)
             .then_some(second)
     });
-    if cached.is_some() {
-        return cached;
+    if let Some(proof) = cached {
+        return (proof.element_slot == NO_ELEMENT_SLOT
+            || unsafe {
+                crate::object::key_attrs::private_element_present(
+                    object,
+                    crate::object::key_attrs::ENTRY_OPTIONAL,
+                    proof.element_slot,
+                )
+            })
+        .then_some(proof);
     }
     private_shape_proof_learn(object, shape_id, class_id, name, is_field, set)
 }
@@ -300,9 +315,17 @@ fn private_shape_proof_learn(
     }
     // The template namespace: the callers established that no fresh
     // evaluation is involved.
+    let mut element_slot = NO_ELEMENT_SLOT;
     let present = if is_field {
         let storage = private_storage_key_by_id(class_id, PRIVATE_TEMPLATE_EVALUATION_ID, interned);
+        // A layout's optional element (a class family's) is present per
+        // object: the proof names its slot.
         unsafe {
+            if let Some(slot) =
+                crate::object::key_attrs::object_optional_private_slot(object, storage.as_bytes())
+            {
+                element_slot = slot;
+            }
             crate::object::key_attrs::object_key_has_private_entry(object, storage.as_bytes())
         }
     } else {
@@ -322,6 +345,7 @@ fn private_shape_proof_learn(
         site_name: name.as_ptr() as usize,
         name: interned,
         is_field,
+        element_slot,
     };
     PRIVATE_PROOF_CACHE.with(|cache| {
         let [first, second] = &cache[cache_set];
@@ -529,7 +553,24 @@ pub extern "C" fn js_private_field_site_get(
     );
     let key_ptr = crate::value::js_get_string_pointer_unified(key.get_nanbox_f64())
         as *const crate::StringHeader;
+    if let Some(holder) = unsafe { native_handle_private_holder(obj.get_nanbox_f64()) } {
+        return js_object_get_field_by_name_f64(holder, key_ptr);
+    }
     js_object_get_field_by_name_boxed(obj.get_nanbox_f64(), key_ptr)
+}
+
+/// The property bag holding a native handle receiver's private elements
+/// ([`private_element_holder`]). A handle is not a heap object, so a by-name
+/// access on the handle value never reaches its bag; the field's storage key
+/// is read and written on the bag itself, where its definition put it.
+///
+/// # Safety
+/// `obj` may be any NaN-boxed value.
+unsafe fn native_handle_private_holder(obj: f64) -> Option<*mut ObjectHeader> {
+    if !JSValue::from_bits(obj.to_bits()).is_handle() {
+        return None;
+    }
+    private_element_holder(obj)
 }
 
 /// Miss of a compiled `recv.#x = value` whose hit is the inline slot store
@@ -560,6 +601,12 @@ pub extern "C" fn js_private_field_site_set(
         1,
         site,
     );
+    if let Some(holder) = unsafe { native_handle_private_holder(obj.get_nanbox_f64()) } {
+        let key_ptr = crate::value::js_get_string_pointer_unified(key.get_nanbox_f64())
+            as *const crate::StringHeader;
+        js_object_set_field_by_name(holder, key_ptr, value.get_nanbox_f64());
+        return value.get_nanbox_f64();
+    }
     crate::proxy::js_put_value_set(
         obj.get_nanbox_f64(),
         key.get_nanbox_f64(),

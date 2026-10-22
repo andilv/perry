@@ -126,7 +126,7 @@ mod namespace_local_function_symbol_tests {
         let dollar = namespace_local_function_wrapper_symbol("chunk.js", "$a");
         let underscore = namespace_local_function_wrapper_symbol("chunk.js", "_a");
 
-        assert_eq!(dollar, "__perry_wrap_perry_fn_chunk_js__u__24_a");
+        assert_eq!(dollar, "__perry_wrap_perry_fn_chunk_js__.u24a");
         assert_eq!(underscore, "__perry_wrap_perry_fn_chunk_js___a");
         assert_ne!(dollar, underscore);
     }
@@ -897,6 +897,7 @@ pub fn run_with_parse_cache(
     // `opencode-web-ui.gen.ts`) after upstream preparation has populated the
     // asset directory and before the import graph is resolved.
     asset_modules::generate(&args.asset_module, &mut ctx, format)?;
+    module_aliases::register(&args.module_alias, &mut ctx)?;
 
     // #1681 (Phase 3 of #1677): self-hosted build-time `precompile(...)`.
     // If this is the capture subprocess, enter capture mode; otherwise, when
@@ -970,6 +971,10 @@ pub fn run_with_parse_cache(
         prepared_sources,
     )?;
 
+    if let Some(cache) = parse_cache.as_deref_mut() {
+        cache.finish_lowering();
+    }
+
     collect_modules::collect_declared_addons(&mut ctx, args.target.as_deref())?;
 
     // "Just works" transparency (#466 follow-up): when perry auto-preferred a
@@ -992,6 +997,11 @@ pub fn run_with_parse_cache(
 
     collect_modules::reexport_prune::finish(&mut ctx);
     run_post_collect_preflight(&args, &mut ctx, format)?;
+    // Every module of the program is lowered and named (the preflight
+    // re-derives names from the final project root): give modules whose
+    // sanitized names collide distinct symbol prefixes before any prefix is
+    // derived.
+    module_prefixes::disambiguate(&mut ctx)?;
     if std::env::var("PERRY_COLLECT_ONLY").ok().as_deref() == Some("1") {
         collect_modules::reexport_prune::write_graph(&mut ctx, &args.input.canonicalize()?)?;
         return Ok(CompileResult {
@@ -1149,27 +1159,7 @@ pub fn run_with_parse_cache(
 
     classify_eager_modules(&mut ctx, &entry_path);
 
-    let sanitize_name = |s: &str| -> String {
-        let mut out: String = s
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if out
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            out.insert(0, '_');
-        }
-        out
-    };
+    let sanitize_name = perry_codegen::symbol_names::module_prefix;
 
     // #10399: whole-program Worker detection, before ANY module codegen runs.
     //
@@ -1248,6 +1238,11 @@ pub fn run_with_parse_cache(
         perry_codegen::set_program_proto_exports(Some(perry_codegen::program_proto_exports(
             &modules,
         )));
+    }
+    // A class field whose computed key names a string constant is that named
+    // field (one key list for every consumer of class keys).
+    for hir_module in ctx.native_modules.values_mut() {
+        perry_codegen::name_computed_class_fields(hir_module);
     }
     // #11394: every method name the program writes onto a builtin prototype;
     // codegen routes those calls through a lookup-first runtime entry.
@@ -1687,6 +1682,12 @@ pub fn run_with_parse_cache(
             }
         }
     }
+    // One map for the program, shared by every module's options: all modules'
+    // options are prepared before codegen starts, so a copy per module held
+    // the whole program's aliases once per module.
+    let all_type_aliases: std::sync::Arc<
+        std::collections::HashMap<String, perry_hir::types::Type>,
+    > = std::sync::Arc::new(all_type_aliases.into_iter().collect());
 
     // Build a map of all exported classes from all modules
     // Key: (resolved_path, class_name) -> Class reference
@@ -2900,7 +2901,8 @@ pub fn run_with_parse_cache(
             .ok()
             .as_deref()
             == Some("1");
-    let cache_enabled = !args.no_cache
+    let cache_enabled = std::env::var_os("PERRY_REACH_REPORT").is_none()
+        && !args.no_cache
         && !cache_env_disabled
         && !verify_native_regions
         && typed_feedback.is_none()
@@ -2931,27 +2933,7 @@ pub fn run_with_parse_cache(
     //     `Expr::DynamicImport` sites, the map from path-arg string
     //     to target sanitized prefix. Codegen at the dispatch site
     //     reads `@__perry_ns_<target_prefix>`.
-    let sanitize_module_name = |s: &str| -> String {
-        let mut out: String = s
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        if out
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            out.insert(0, '_');
-        }
-        out
-    };
+    let sanitize_module_name = perry_codegen::symbol_names::module_prefix;
     let mut path_to_module_name: HashMap<PathBuf, String> = HashMap::new();
     let mut module_name_to_path: HashMap<String, PathBuf> = HashMap::new();
     for (path, hir_module) in &ctx.native_modules {
@@ -2968,26 +2950,19 @@ pub fn run_with_parse_cache(
             .iter()
             .any(|stmt| matches!(stmt, perry_hir::Stmt::Let { name, .. } if name == "_cjs"))
     };
-    // Build a normalized HIR-by-name map for `flatten_exports`. Each
+    // Build normalized export views for `flatten_exports`. Each
     // module's `Export::ReExport::source`, `Export::ExportAll::source`,
     // and `Export::NamespaceReExport::source` strings hold the raw
     // specifier as written in source (`"./inner.ts"`); flatten_exports
     // keys its lookup on `Module::name`. Rewrite the source field of
     // every export to the target module's `Module::name` (via
     // `resolve_import` → `path_to_module_name`) so the cross-module
-    // lookup resolves the right HIR.
-    let mut module_name_to_module: HashMap<String, perry_hir::Module> = HashMap::new();
+    // lookup resolves the right HIR. Borrow declarations instead of cloning
+    // every module's function bodies and retained source text.
+    let mut module_name_to_module: HashMap<String, super::export_analysis::ExportAnalysis<'_>> =
+        HashMap::new();
     for (path, hir_module) in &ctx.native_modules {
-        let mut rewritten = hir_module.clone();
-        // This map is an analysis-only view. Entry outlining moves module
-        // declarations into compiler-owned functions; flatten_exports must
-        // still see those bindings or an imported variable falls back to a
-        // getter on its barrel (which does not own the value). Reconstruct
-        // only the logical entry stream, never arbitrary function locals.
-        rewritten.init = perry_codegen::codegen::entry_outline::logical_entry_stmts(hir_module)
-            .into_iter()
-            .cloned()
-            .collect();
+        let mut rewritten = super::export_analysis::ExportAnalysis::new(hir_module);
         for export in rewritten.exports.iter_mut() {
             match export {
                 perry_hir::Export::ReExport { source, .. }
@@ -3091,6 +3066,10 @@ pub fn run_with_parse_cache(
     // Per-module precomputed namespace_entries (keyed by path).
     let mut per_module_namespace_entries: HashMap<PathBuf, Vec<perry_codegen::NamespaceEntry>> =
         HashMap::new();
+    // CommonJS (and JSON) namespaces that also take the evaluated
+    // `module.exports` keys at run time: Bun's interop exposes them all, and
+    // the static lexer only sees the literal shapes.
+    let mut cjs_namespace_paths: HashSet<PathBuf> = HashSet::new();
     for target_path in &dyn_target_paths {
         let target_hir = match ctx.native_modules.get(target_path) {
             Some(m) => m,
@@ -3102,7 +3081,9 @@ pub fn run_with_parse_cache(
         let mut entries: Vec<perry_codegen::NamespaceEntry> = Vec::new();
         for fe in flat {
             // Locate source module's HIR (where the binding lives).
-            let source_mod = module_name_to_module.get(&fe.source_module);
+            let source_mod = module_name_to_module
+                .get(&fe.source_module)
+                .map(|view| view.module);
             // `flatten_exports` intentionally retains interfaces and aliases
             // so the type resolver can follow their barrel chains. A dynamic
             // import or nested namespace re-export is a JavaScript object,
@@ -3128,7 +3109,7 @@ pub fn run_with_parse_cache(
                 } else {
                     let nested_prefix = module_name_to_module
                         .get(nested)
-                        .map(|m| sanitize_module_name(&m.name))
+                        .map(|view| sanitize_module_name(&view.module.name))
                         .unwrap_or_else(|| sanitize_module_name(nested));
                     perry_codegen::NamespaceEntryKind::NestedNamespace {
                         source_prefix: nested_prefix,
@@ -3249,6 +3230,9 @@ pub fn run_with_parse_cache(
         // A JSON module is `module.exports` too: `require("./x.json")` is the
         // parsed value.
         if is_wrapped_cjs(target_hir) || target_path.extension().is_some_and(|ext| ext == "json") {
+            if ctx.bun_platform {
+                cjs_namespace_paths.insert(target_path.clone());
+            }
             // Node's CJS namespace has two aliases for the exact evaluated
             // `module.exports` object. Do not clone/project it: identity with
             // require(), the default import, and shared nested values matters.
@@ -3273,10 +3257,12 @@ pub fn run_with_parse_cache(
                 });
             }
         }
+        // ECMA-262 10.4.6: a namespace's string keys are its export names
+        // in code-unit order; the namespace layout is that sequence.
+        entries.sort_by(|a, b| a.name.encode_utf16().cmp(b.name.encode_utf16()));
         per_module_namespace_entries.insert(target_path.clone(), entries);
     }
-    // The rewritten export-analysis graph duplicates the full HIR. Namespace
-    // entries own the result; no later phase needs that analysis input.
+    // Namespace entries own their results; release the normalized edge views.
     drop(module_name_to_module);
     // For each consumer module, map every `Expr::DynamicImport` arg-path
     // string (as resolved in `collect_modules`) to the target's
@@ -3494,7 +3480,11 @@ pub fn run_with_parse_cache(
         .keys()
         .map(|path| {
             (
-                compute_module_prefix(&path.to_string_lossy(), &ctx.project_root),
+                compute_module_prefix(
+                    &path.to_string_lossy(),
+                    &ctx.project_root,
+                    &ctx.module_prefix_overrides,
+                ),
                 path.clone(),
             )
         })
@@ -3547,7 +3537,8 @@ pub fn run_with_parse_cache(
         if capability.final_shape.is_some() {
             continue;
         }
-        let source_prefix = compute_module_prefix(source_path, &ctx.project_root);
+        let source_prefix =
+            compute_module_prefix(source_path, &ctx.project_root, &ctx.module_prefix_overrides);
         for method in &capability.methods {
             object_literal_method_candidates
                 .entry(method.name.clone())
@@ -3660,7 +3651,7 @@ pub fn run_with_parse_cache(
     // program needs, and the linker drops the rest. `--no-auto-optimize` and
     // the legacy `--minimal-stdlib` are accepted no-ops: nothing is rebuilt.
     let _ = args.no_auto_optimize;
-    let optimized_libs: Option<OptimizedLibs> = if native_link_set_skipped {
+    let mut optimized_libs: Option<OptimizedLibs> = if native_link_set_skipped {
         None
     } else {
         Some(build_optimized_libs(
@@ -3671,6 +3662,12 @@ pub fn run_with_parse_cache(
             verbose,
         ))
     };
+    let component_host_lib = super::component_host::library(&ctx, target.as_deref())?;
+    if let (Some(libs), Some(component)) = (&mut optimized_libs, &component_host_lib) {
+        // Reuse the optional-archive path: symbol scanning, deduplication,
+        // link grouping and cache fingerprints must all see this archive.
+        libs.well_known_libs.push(component.clone());
+    }
     // The runtime call-effect table, one per compilation (GC effects design
     // §4.3, slice 6): read from the sidecar of the archives the link set just
     // resolved, before codegen. Every module is lowered under it and its digest
@@ -3705,6 +3702,15 @@ pub fn run_with_parse_cache(
         .thread_name(|index| format!("perry-module-{index}"))
         .build()
         .map_err(|error| anyhow!("failed to create module codegen pool: {error}"))?;
+    // One set for the program; every module's options share it.
+    let program_deferred_module_prefixes: std::sync::Arc<std::collections::HashSet<String>> =
+        std::sync::Arc::new(
+            ctx.native_modules
+                .iter()
+                .filter(|(_, m)| m.init_kind == perry_hir::ModuleInitKind::Deferred)
+                .map(|(_, m)| sanitize_name(&m.name))
+                .collect(),
+        );
     // Reuse the exact import-route preparation in both passes. The contract
     // pass releases each module's metadata before visiting the next module;
     // the second pass prepares owned options before releasing the HIR graph.
@@ -3750,12 +3756,7 @@ pub fn run_with_parse_cache(
         // out of its eager init call sequence; non-entry modules
         // ignore it. Empty when no module in the program is
         // Deferred (i.e. no dynamic `import()` sites).
-        let deferred_module_prefixes: std::collections::HashSet<String> = ctx
-            .native_modules
-            .iter()
-            .filter(|(_, m)| m.init_kind == perry_hir::ModuleInitKind::Deferred)
-            .map(|(_, m)| sanitize_name(&m.name))
-            .collect();
+        let deferred_module_prefixes = std::sync::Arc::clone(&program_deferred_module_prefixes);
         // Next.js wall 54 (part 2): `(absolute_path, prefix)` for every
         // `.next/server/**` runtime module so the entry's `main` can record
         // its `__init` address by path (`js_register_path_init`). Only the
@@ -3982,6 +3983,7 @@ pub fn run_with_parse_cache(
         // module. They resolve to `@__perry_ns_<target>` rather than to a
         // `perry_fn_<mod>__<name>` symbol, because no such symbol exists —
         // the member is a whole module, not a binding in one.
+        let mut cjs_interop_namespaces: HashSet<String> = HashSet::new();
         let mut namespace_member_nested: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
         let mut imported_classes: Vec<perry_codegen::ImportedClass> = Vec::new();
@@ -4028,14 +4030,29 @@ pub fn run_with_parse_cache(
         // bar }`) is still handled because the same import has
         // value specifiers; the whole-decl flag is the one that
         // makes the entire import a no-op.
+        // Names this module binds by a named or default import. A bare call
+        // of one of them means that import, so a namespace import's member of
+        // the same name must not enter the flat maps below: effect's
+        // Schema.ts imports `{ format }` from Formatter.ts (2 params) and
+        // `* as Duration_` (whose `format` takes 1); the member's flat entry
+        // overwrote the arity and `format(source)` lost its `undefined`
+        // padding, so `options` read a stale register.
+        let mut bound_import_locals: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         for import in &hir_module.imports {
             if import.type_only || import.runtime_erased {
                 continue;
             }
             for spec in &import.specifiers {
-                if let perry_hir::ImportSpecifier::Namespace { local } = spec {
-                    if !namespace_imports.contains(local) {
-                        namespace_imports.push(local.clone());
+                match spec {
+                    perry_hir::ImportSpecifier::Namespace { local } => {
+                        if !namespace_imports.contains(local) {
+                            namespace_imports.push(local.clone());
+                        }
+                    }
+                    perry_hir::ImportSpecifier::Named { local, .. }
+                    | perry_hir::ImportSpecifier::Default { local } => {
+                        bound_import_locals.insert(local.as_str());
                     }
                 }
             }
@@ -4082,7 +4099,11 @@ pub fn run_with_parse_cache(
                         .cloned()
                         .unwrap_or_else(|| resolved_path_str.clone());
                     let effective_prefix = if origin_path != resolved_path_str {
-                        compute_module_prefix(&origin_path, &ctx.project_root)
+                        compute_module_prefix(
+                            &origin_path,
+                            &ctx.project_root,
+                            &ctx.module_prefix_overrides,
+                        )
                     } else {
                         source_prefix.clone()
                     };
@@ -4090,6 +4111,7 @@ pub fn run_with_parse_cache(
                         class,
                         &class_canonical_path,
                         &ctx.project_root,
+                        &ctx.module_prefix_overrides,
                         &effective_prefix,
                     );
                     let local_alias = (local != &class.name).then(|| local.clone());
@@ -4189,8 +4211,11 @@ pub fn run_with_parse_cache(
                             .and_then(|exports| exports.get("default"))
                             .cloned()
                         {
-                            let default_prefix =
-                                compute_module_prefix(&default_origin_path, &ctx.project_root);
+                            let default_prefix = compute_module_prefix(
+                                &default_origin_path,
+                                &ctx.project_root,
+                                &ctx.module_prefix_overrides,
+                            );
                             let default_suffix = all_module_export_origin_names
                                 .get(&resolved_path_str)
                                 .and_then(|m| m.get("default"))
@@ -4257,6 +4282,7 @@ pub fn run_with_parse_cache(
                                     class,
                                     &class_canonical_path,
                                     &ctx.project_root,
+                                    &ctx.module_prefix_overrides,
                                     &default_prefix,
                                 );
                                 imported_classes.push(imported_class_from_hir(
@@ -4281,8 +4307,11 @@ pub fn run_with_parse_cache(
                     // Register all exports from the source module
                     if let Some(exports) = all_module_exports.get(&resolved_path_str) {
                         for (export_name, origin_path) in exports {
-                            let origin_prefix =
-                                compute_module_prefix(origin_path, &ctx.project_root);
+                            let origin_prefix = compute_module_prefix(
+                                origin_path,
+                                &ctx.project_root,
+                                &ctx.module_prefix_overrides,
+                            );
                             // #10945: a namespace member enters the FLAT maps below only as a
                             // best-effort fallback for a bare-name call (#5927). A bare name that is a
                             // global intrinsic (`Array`, `Map`, `Request`, ...) never means the member in
@@ -4293,7 +4322,8 @@ pub fn run_with_parse_cache(
                             // registered classes. The per-namespace entries are kept, so `ns.Array`
                             // still resolves.
                             let flat =
-                                !perry_hir::analysis::is_global_intrinsic_value_name(export_name);
+                                !perry_hir::analysis::is_global_intrinsic_value_name(export_name)
+                                    && !bound_import_locals.contains(export_name.as_str());
                             // Issue #5927: namespace members are a
                             // best-effort fallback in the flat
                             // `import_function_prefixes` map — the
@@ -4457,6 +4487,7 @@ pub fn run_with_parse_cache(
                                     class,
                                     &class_canonical_path,
                                     &ctx.project_root,
+                                    &ctx.module_prefix_overrides,
                                     &origin_prefix,
                                 );
                                 let local_alias = if export_name == &class.name {
@@ -4485,9 +4516,8 @@ pub fn run_with_parse_cache(
                                 imported_class.namespace = Some(local.clone());
                                 imported_classes.push(imported_class);
                             }
-                            if let Some(members) = exported_enums.get(&key) {
-                                imported_enums.push((export_name.clone(), members.clone()));
-                            }
+                            // Enums likewise: `local.Kind.Value` is a runtime
+                            // property read, so no `Kind` enum binding (#13030).
                         }
                     }
                     // Namespace aliases also participate in
@@ -4499,6 +4529,7 @@ pub fn run_with_parse_cache(
                             let target_prefix = compute_module_prefix(
                                 &target_path.to_string_lossy(),
                                 &ctx.project_root,
+                                &ctx.module_prefix_overrides,
                             );
                             namespace_member_prefixes
                                 .insert((local.clone(), alias.clone()), target_prefix);
@@ -4506,8 +4537,14 @@ pub fn run_with_parse_cache(
                         }
                     }
                     if source_module.is_some_and(|module| is_wrapped_cjs(module)) {
-                        let default_prefix =
-                            compute_module_prefix(&resolved_path_str, &ctx.project_root);
+                        if ctx.bun_platform {
+                            cjs_interop_namespaces.insert(local.clone());
+                        }
+                        let default_prefix = compute_module_prefix(
+                            &resolved_path_str,
+                            &ctx.project_root,
+                            &ctx.module_prefix_overrides,
+                        );
                         let default_is_var = all_module_exports
                             .get(&resolved_path_str)
                             .and_then(|exports| exports.get("default"))
@@ -4748,8 +4785,11 @@ pub fn run_with_parse_cache(
                             // getter; classify this named import as a var so
                             // consumer code calls that getter.
                             if perry_hir::is_native_module_specifier(ns_src) {
-                                let declaring_prefix =
-                                    compute_module_prefix(&ns_scan_path, &ctx.project_root);
+                                let declaring_prefix = compute_module_prefix(
+                                    &ns_scan_path,
+                                    &ctx.project_root,
+                                    &ctx.module_prefix_overrides,
+                                );
                                 import_function_prefixes
                                     .insert(local_name.clone(), declaring_prefix);
                                 if local_name != ns_scan_name {
@@ -4773,8 +4813,11 @@ pub fn run_with_parse_cache(
                             };
                             namespace_imports.push(local_name.clone());
                             for (export_name, origin_path) in target_exports {
-                                let origin_prefix =
-                                    compute_module_prefix(origin_path, &ctx.project_root);
+                                let origin_prefix = compute_module_prefix(
+                                    origin_path,
+                                    &ctx.project_root,
+                                    &ctx.module_prefix_overrides,
+                                );
                                 // #10945: a namespace member enters the FLAT maps below only as a
                                 // best-effort fallback for a bare-name call (#5927). A bare name that is a
                                 // global intrinsic (`Array`, `Map`, `Request`, ...) never means the member in
@@ -4786,7 +4829,7 @@ pub fn run_with_parse_cache(
                                 // still resolves.
                                 let flat = !perry_hir::analysis::is_global_intrinsic_value_name(
                                     export_name,
-                                );
+                                ) && !bound_import_locals.contains(export_name.as_str());
                                 // Issue #5927: `or_insert` — see the
                                 // matching rationale on the
                                 // `namespace_like_local` branch above.
@@ -4945,6 +4988,7 @@ pub fn run_with_parse_cache(
                                         class,
                                         &class_canonical_path,
                                         &ctx.project_root,
+                                        &ctx.module_prefix_overrides,
                                         &origin_prefix,
                                     );
                                     let local_alias = if export_name == &class.name {
@@ -4968,9 +5012,6 @@ pub fn run_with_parse_cache(
                                     imported_class.namespace = Some(local_name.clone());
                                     imported_classes.push(imported_class);
                                 }
-                                if let Some(members) = exported_enums.get(&key) {
-                                    imported_enums.push((export_name.clone(), members.clone()));
-                                }
                             }
                             // A named namespace re-export can itself expose
                             // nested namespace aliases (Zod's `z.core`,
@@ -4984,6 +5025,7 @@ pub fn run_with_parse_cache(
                                     let target_prefix = compute_module_prefix(
                                         &target_path.to_string_lossy(),
                                         &ctx.project_root,
+                                        &ctx.module_prefix_overrides,
                                     );
                                     namespace_member_prefixes
                                         .insert((local_name.clone(), alias.clone()), target_prefix);
@@ -5023,7 +5065,11 @@ pub fn run_with_parse_cache(
 
                 // Resolve effective prefix (follow re-exports)
                 let effective_prefix = if origin_path != resolved_path_str {
-                    compute_module_prefix(&origin_path, &ctx.project_root)
+                    compute_module_prefix(
+                        &origin_path,
+                        &ctx.project_root,
+                        &ctx.module_prefix_overrides,
+                    )
                 } else {
                     source_prefix.clone()
                 };
@@ -5212,6 +5258,7 @@ pub fn run_with_parse_cache(
                         class,
                         &class_canonical_path,
                         &ctx.project_root,
+                        &ctx.module_prefix_overrides,
                         &effective_prefix,
                     );
                     // Issue #665: when the user wrote `import X from "pkg"`
@@ -5310,8 +5357,11 @@ pub fn run_with_parse_cache(
                     {
                         Some(index) => index,
                         None => {
-                            let class_prefix =
-                                compute_module_prefix(&origin_path, &ctx.project_root);
+                            let class_prefix = compute_module_prefix(
+                                &origin_path,
+                                &ctx.project_root,
+                                &ctx.module_prefix_overrides,
+                            );
                             imported_classes.push(imported_class_from_hir(
                                 class,
                                 class_prefix,
@@ -5418,7 +5468,11 @@ pub fn run_with_parse_cache(
                     if imported_classes.iter().any(|c| c.name == class.name) {
                         continue;
                     }
-                    let class_prefix = compute_module_prefix(&src_path, &ctx.project_root);
+                    let class_prefix = compute_module_prefix(
+                        &src_path,
+                        &ctx.project_root,
+                        &ctx.module_prefix_overrides,
+                    );
                     imported_classes.push(imported_class_from_hir(
                         class,
                         class_prefix,
@@ -5645,6 +5699,26 @@ pub fn run_with_parse_cache(
             let parent_name_clone = imported_classes[idx].parent_name.clone();
             let child_source_prefix = imported_classes[idx].source_prefix.clone();
             let child_src_path = native_module_paths_by_prefix.get(&child_source_prefix);
+            // A member heritage (`class X extends ns.Base`) names a property,
+            // so its trailing name may be any module's class; a bare name
+            // resolves in the child's own scope. A bare global (`extends
+            // Error`) lowers to a read of the global object, like
+            // `globalThis.Error`, and both mean the global.
+            let child_heritage_is_member = child_src_path
+                .and_then(|path| ctx.native_modules.get(path))
+                .and_then(|module| {
+                    module
+                        .classes
+                        .iter()
+                        .find(|class| class.name == imported_classes[idx].name)
+                })
+                .is_some_and(|class| match class.extends_expr.as_deref() {
+                    Some(
+                        perry_hir::Expr::PropertyGet { object, .. }
+                        | perry_hir::Expr::IndexGet { object, .. },
+                    ) => !matches!(object.as_ref(), perry_hir::Expr::GlobalGet(_)),
+                    _ => false,
+                });
             // Issue #485: include the class's parent in the transitive
             // closure too. Without this, `import { Sub } from 'pkg'` where
             // `Sub extends Base` (and Base lives in another file inside
@@ -5766,7 +5840,18 @@ pub fn run_with_parse_cache(
                 //
                 // Issue #26: for a parent ref, prefer the same-named class
                 // in the CHILD's own source module before any global match.
+                // A bare parent named like a global that the child's module
+                // neither declares nor imports IS that global
+                // (`class MissingCredentialError extends Error`). Binding it
+                // by name to another module's exported `class Error` made
+                // `super(message)` run that class's constructor.
+                let global_parent = is_parent_ref
+                    && !child_heritage_is_member
+                    && perry_hir::analysis::is_global_intrinsic_value_name(&ref_name);
                 let found = scoped_found.or_else(|| {
+                    if global_parent {
+                        return None;
+                    }
                     exported_classes
                         .iter()
                         .find(|((path, cname), class)| {
@@ -5798,7 +5883,11 @@ pub fn run_with_parse_cache(
                 // imported; all other refs key on name only (legacy).
                 if is_parent_ref {
                     if let Some((src_path, class)) = &found {
-                        let source_prefix = compute_module_prefix(src_path, &ctx.project_root);
+                        let source_prefix = compute_module_prefix(
+                            src_path,
+                            &ctx.project_root,
+                            &ctx.module_prefix_overrides,
+                        );
                         let effective_name = if ref_name != class.name {
                             ref_name.as_str()
                         } else {
@@ -5834,7 +5923,11 @@ pub fn run_with_parse_cache(
                     continue;
                 }
                 if let Some((src_path, class)) = found {
-                    let class_prefix = compute_module_prefix(&src_path, &ctx.project_root);
+                    let class_prefix = compute_module_prefix(
+                        &src_path,
+                        &ctx.project_root,
+                        &ctx.module_prefix_overrides,
+                    );
                     // Issue #485: when the child's `parent_name` doesn't
                     // match the source class's `class.name` (because the
                     // parent was imported via a rename — `import { Base
@@ -5874,11 +5967,7 @@ pub fn run_with_parse_cache(
         }
 
         // Type aliases from all modules
-        let type_alias_map: std::collections::HashMap<String, perry_hir::types::Type> =
-            all_type_aliases
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+        let type_alias_map = std::sync::Arc::clone(&all_type_aliases);
 
         // Resolve the CLI's short target name (ios/android/etc.) to
         // an LLVM triple. `None` falls through to the host default
@@ -5896,8 +5985,11 @@ pub fn run_with_parse_cache(
             bundled_extensions
                 .iter()
                 .map(|(ext_path, _plugin_id)| {
-                    let ext_prefix =
-                        compute_module_prefix(&ext_path.to_string_lossy(), &ctx.project_root);
+                    let ext_prefix = compute_module_prefix(
+                        &ext_path.to_string_lossy(),
+                        &ctx.project_root,
+                        &ctx.module_prefix_overrides,
+                    );
                     (ext_path.to_string_lossy().to_string(), ext_prefix)
                 })
                 .collect()
@@ -5930,6 +6022,7 @@ pub fn run_with_parse_cache(
             disable_buffer_fast_path,
             namespace_imports,
             namespace_member_nested: namespace_member_nested.into_iter().collect(),
+            cjs_interop_namespaces: cjs_interop_namespaces.into_iter().collect(),
             imported_classes,
             constructor_param_counts: Default::default(),
             // Filled per module after the static-shape pre-pass.
@@ -6008,6 +6101,7 @@ pub fn run_with_parse_cache(
             // alone is insufficient because it's empty when the
             // target has no `export` statements.
             is_dynamic_import_target: dyn_target_paths.contains(path),
+            namespace_adopts_cjs_exports: cjs_namespace_paths.contains(path),
             // #5247: source-location tracking for the dynamic call-dispatch
             // throw path. Gated by `--debug-symbols` so the default build is
             // unchanged (no source read, no per-call emission). When on, read
@@ -6061,7 +6155,11 @@ pub fn run_with_parse_cache(
         if module.classes.is_empty() {
             continue;
         }
-        let prefix = compute_module_prefix(&path.to_string_lossy(), &ctx.project_root);
+        let prefix = compute_module_prefix(
+            &path.to_string_lossy(),
+            &ctx.project_root,
+            &ctx.module_prefix_overrides,
+        );
         if module
             .classes
             .iter()
@@ -6110,6 +6208,26 @@ pub fn run_with_parse_cache(
     // collision. A module then embeds the ids of its own contents; nothing
     // is keyed by class name.
     let static_shape_started = Instant::now();
+    // The whole-program steps between the front end and module codegen can
+    // run for minutes on a large graph. Each names itself when it starts and
+    // ends, with its time and resident memory, so a stalled or growing step
+    // shows in the log.
+    let program_step = |label: &str, started: Option<Instant>| {
+        if !codegen_progress_enabled {
+            return;
+        }
+        let resident = perry_codegen::workers::resident_bytes()
+            .map(|(rss, _)| format!(" (resident {:.0} MiB)", rss as f64 / 1_048_576.0))
+            .unwrap_or_default();
+        match started {
+            None => eprintln!("[perry] codegen: {label}{resident}"),
+            Some(started) => eprintln!(
+                "[perry] codegen: {label} done in {:.1}s{resident}",
+                started.elapsed().as_secs_f64()
+            ),
+        }
+    };
+    program_step("births pre-pass", None);
     let module_births: Vec<(&PathBuf, Vec<perry_codegen::ModuleBirth>)> = module_pool
         .install(|| {
             ctx.native_modules
@@ -6125,7 +6243,11 @@ pub fn run_with_parse_cache(
                     }
                     let mut opts = prepare_module(path, hir_module, false)?;
                     constructor_contracts.apply(
-                        &compute_module_prefix(&path.to_string_lossy(), &ctx.project_root),
+                        &compute_module_prefix(
+                            &path.to_string_lossy(),
+                            &ctx.project_root,
+                            &ctx.module_prefix_overrides,
+                        ),
                         hir_module,
                         &mut opts,
                     );
@@ -6137,6 +6259,7 @@ pub fn run_with_parse_cache(
                 .collect::<Result<Vec<_>, String>>()
         })
         .map_err(|error| anyhow!(error))?;
+    program_step("births pre-pass", Some(static_shape_started));
     let static_shape_ids = perry_codegen::assign_static_shape_ids(
         module_births
             .iter()
@@ -6172,6 +6295,7 @@ pub fn run_with_parse_cache(
         module_births.iter().flat_map(|(_, b)| b),
         &static_shape_ids,
     );
+    let reach_report = super::reach_report::start(&ctx, args.output_type != "executable")?;
     // fninfer (decision 140): per-function inferred signatures over the
     // final HIR. Measurement dump only (`PERRY_FNINFER_DUMP=<path>`).
     super::fn_infer::dump(&ctx.native_modules);
@@ -6180,6 +6304,8 @@ pub fn run_with_parse_cache(
     // each module's codegen gets only the digest of the facts it can observe
     // (object-cache key) and, in a contract build, the claims section the
     // runtime checks. See `program_facts.rs` for the knobs.
+    let facts_started = Instant::now();
+    program_step("whole-program facts", None);
     let program_facts = super::program_facts::run(
         &ctx.native_modules,
         // The dyn-eval interpreter is installed (E14 possible): the same
@@ -6190,12 +6316,7 @@ pub fn run_with_parse_cache(
         &ctx.patched_builtins.dynamic_code_reach,
         &ctx.cjs_wrap_debug_sources,
     );
-    // Step 5b: closure class parameters as typed-body receiver proofs, once
-    // the facts say some class's layout is stable.
-    let receiver_params = super::fn_infer::receiver_params(
-        &ctx.native_modules,
-        super::program_facts::has_stable_classes(&program_facts),
-    );
+    program_step("whole-program facts", Some(facts_started));
     #[allow(clippy::type_complexity)]
     let static_shape_ids_by_module: HashMap<
         PathBuf,
@@ -6261,6 +6382,32 @@ pub fn run_with_parse_cache(
     // Finish cross-module option preparation while the complete HIR graph is
     // available. Jobs then own their input, so lowering can release each HIR
     // before LLVM starts. The link phase needs only names and export metadata.
+    let options_started = Instant::now();
+    program_step("module options", None);
+    // A module's static shape ids and class shape slice are taken when its
+    // job starts, not here: the slice includes the producer classes of every
+    // short-spread candidate, so prepared for all modules at once it held
+    // the program's class shapes once per module.
+    let slice_shape_ids = |path: &PathBuf, opts: &mut perry_codegen::CompileOptions| {
+        if let Some((ids, class_ids)) = static_shape_ids_by_module.get(path) {
+            opts.static_shape_ids = ids.clone();
+            let foreign: BTreeSet<u32> = opts
+                .short_spread_method_candidates
+                .values()
+                .flatten()
+                .map(|c| c.class_id)
+                .collect();
+            for cid in class_ids.iter().chain(foreign.iter()) {
+                if let Some(finals) = class_final_shapes.get(cid) {
+                    opts.static_shape_ids.extend(finals.iter().cloned());
+                }
+            }
+            opts.static_shape_ids.sort();
+            opts.static_shape_ids.dedup();
+            opts.program_class_shape_ids =
+                program_class_shape_ids.restricted_to(class_ids.iter().copied().chain(foreign));
+        }
+    };
     let prepared_options: Vec<_> = module_pool.install(|| {
         codegen_modules
             .par_iter()
@@ -6268,30 +6415,15 @@ pub fn run_with_parse_cache(
                 let hir_module = &ctx.native_modules[path];
                 let mut opts = prepare_module(path, hir_module, false)?;
                 constructor_contracts.apply(
-                    &compute_module_prefix(&path.to_string_lossy(), &ctx.project_root),
+                    &compute_module_prefix(
+                        &path.to_string_lossy(),
+                        &ctx.project_root,
+                        &ctx.module_prefix_overrides,
+                    ),
                     hir_module,
                     &mut opts,
                 );
-                if let Some((ids, class_ids)) = static_shape_ids_by_module.get(path) {
-                    opts.static_shape_ids = ids.clone();
-                    let foreign: BTreeSet<u32> = opts
-                        .short_spread_method_candidates
-                        .values()
-                        .flatten()
-                        .map(|c| c.class_id)
-                        .collect();
-                    for cid in class_ids.iter().chain(foreign.iter()) {
-                        if let Some(finals) = class_final_shapes.get(cid) {
-                            opts.static_shape_ids.extend(finals.iter().cloned());
-                        }
-                    }
-                    opts.static_shape_ids.sort();
-                    opts.static_shape_ids.dedup();
-                    opts.program_class_shape_ids = program_class_shape_ids
-                        .restricted_to(class_ids.iter().copied().chain(foreign));
-                }
-                opts.program_facts =
-                    super::program_facts::view_for(&program_facts, path, receiver_params.get(path));
+                opts.program_facts = super::program_facts::view_for(&program_facts, path);
                 opts.program_facts.dynamic_code_reach =
                     ctx.patched_builtins.dynamic_code_reach.clone();
                 std::sync::Arc::make_mut(&mut opts.program_facts.elision).dynamic_code_reach =
@@ -6301,6 +6433,7 @@ pub fn run_with_parse_cache(
             })
             .collect::<Vec<_>>()
     });
+    program_step("module options", Some(options_started));
     // Per-module options now own the facts needed by lowering. Release the
     // program's preparation inputs before any LLVM worker starts.
     drop((
@@ -6309,12 +6442,8 @@ pub fn run_with_parse_cache(
         class_canonical_path,
         exported_object_literals,
         program_facts,
-        receiver_params,
         program_layouts,
         constructor_contracts,
-        static_shape_ids_by_module,
-        class_final_shapes,
-        program_class_shape_ids,
         static_shape_ids,
         short_spread_method_candidates,
         program_class_accessor_names,
@@ -6648,11 +6777,14 @@ pub fn run_with_parse_cache(
             &module_memory_estimates,
             |index| {
                 let path = &codegen_modules[index];
-                let (hir_module, opts) = module_inputs[index]
+                let (hir_module, mut opts) = module_inputs[index]
                     .lock()
                     .expect("module input poisoned")
                     .take()
                     .expect("module job runs exactly once");
+                if let Ok(opts) = &mut opts {
+                    slice_shape_ids(path, opts);
+                }
                 let module_name = hir_module.name.clone();
                 let callable_count = module_codegen_callable_count(&hir_module);
                 let memory_trace = perry_codegen::workers::memory_trace_enabled();
@@ -7012,31 +7144,52 @@ pub fn run_with_parse_cache(
     // below (auto-optimize, stdlib, stubs, link cache) applies.
     #[cfg(feature = "target-wasi")]
     if target.as_deref() == Some("wasi") {
+        if args.output_type == "dylib" {
+            return Err(anyhow!(
+                "WASI library components use --output-type staticlib and a canonical WIT adapter"
+            ));
+        }
+        let is_staticlib = args.output_type == "staticlib";
         let stem = args
             .input
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("output");
         let stem = super::super::sanitize::sanitize_for_linker_argv(stem);
-        let exe_path = args
-            .output
-            .clone()
-            .unwrap_or_else(|| output_path::default_output_path(false, false, Some("wasi"), &stem));
+        let exe_path = args.output.clone().unwrap_or_else(|| {
+            output_path::default_output_path(false, is_staticlib, Some("wasi"), &stem)
+        });
         // `--no-link`: the objects, already written where `-o` points
         // (#7167), are the product. Linking would read that object and
         // overwrite it with the component.
         if !args.no_link {
             let runtime_lib = find_runtime_library(Some("wasi"))?;
-            super::link::wasi::link_wasi(&obj_paths, &runtime_lib, &exe_path, verbose)?;
+            let installer =
+                super::link::wasi::feature_installer(&ctx, &compiled_features, &object_output_dir)?;
+            obj_cleanup_paths.push(installer.clone());
+            obj_paths.push(installer);
+            if is_staticlib {
+                super::link::wasi::archive_library(&obj_paths, &runtime_lib, &exe_path, verbose)?;
+            } else {
+                super::link::wasi::link_wasi(&obj_paths, &runtime_lib, &exe_path, verbose)?;
+            }
             if let OutputFormat::Text = format {
-                println!("Wrote WASI component: {}", exe_path.display());
+                println!(
+                    "Wrote WASI {}: {}",
+                    if is_staticlib {
+                        "static archive"
+                    } else {
+                        "component"
+                    },
+                    exe_path.display()
+                );
             }
         }
         return Ok(CompileResult {
             output_path: exe_path,
             target: "wasi".to_string(),
             bundle_id: None,
-            is_dylib: false,
+            is_dylib: is_staticlib,
             codegen_cache_stats: None,
             link_cache_stats: None,
             build_cache_stats: None,
@@ -7071,11 +7224,14 @@ pub fn run_with_parse_cache(
         // The wasm host registers its entry points with the runtime before
         // `main` (`perry_abi::wasm_host`), so `js_runtime_install_wasm_host`
         // finds them.
-        let registrations: Vec<String> = wasm_host_lib_resolved
+        let mut registrations: Vec<String> = wasm_host_lib_resolved
             .is_some()
             .then(|| crate::commands::stdlib_installs::WASM_HOST_REGISTER_SYMBOL.to_string())
             .into_iter()
             .collect();
+        if component_host_lib.is_some() {
+            registrations.push(super::component_host::REGISTER.to_string());
+        }
         let installer_bytes = perry_codegen::stubs::generate_feature_installer_object(
             &runtime_symbols,
             stdlib_symbols.as_deref(),
@@ -7455,22 +7611,7 @@ pub fn run_with_parse_cache(
         // module-failure: the binary still links, the stubbed module
         // body is inert, and any actual call into the missing exports
         // remains the symptom that surfaces the real bug.
-        let sanitize_module_name = |m: &str| -> String {
-            let mut out: String = m
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '_' {
-                        c
-                    } else {
-                        '_'
-                    }
-                })
-                .collect();
-            if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                out.insert(0, '_');
-            }
-            out
-        };
+        let sanitize_module_name = perry_codegen::symbol_names::module_prefix;
         let stub_init_names: Vec<String> = failed_modules
             .iter()
             .map(|m| format!("{}__init", sanitize_module_name(m)))
@@ -7512,20 +7653,10 @@ pub fn run_with_parse_cache(
             };
             for export in &hir.exports {
                 if let perry_hir::Export::Named { exported, .. } = export {
-                    let sanitized_exp = exported
-                        .chars()
-                        .map(|c| {
-                            if c.is_ascii_alphanumeric() || c == '_' {
-                                c
-                            } else {
-                                '_'
-                            }
-                        })
-                        .collect::<String>();
                     // Closure-wrapper form: consumer reads the import
                     // as a function value (`js_closure_alloc_singleton(
                     // @__perry_wrap_perry_fn_<src>__<name>)`).
-                    let wrap_sym = format!("__perry_wrap_perry_fn_{}__{}", prefix, sanitized_exp);
+                    let wrap_sym = perry_codegen::symbol_names::function_wrapper(&prefix, exported);
                     stub_wrapper_names.push(wrap_sym);
                     // Direct-call form: consumer invokes the import
                     // by name (`perry_fn_<src>__<name>(args…)`). For
@@ -7537,7 +7668,7 @@ pub fn run_with_parse_cache(
                     // pushed — the body just discards them and
                     // returns undefined. Same fallback shape the
                     // empty `<prefix>__init` stub uses.
-                    let direct_sym = format!("perry_fn_{}__{}", prefix, sanitized_exp);
+                    let direct_sym = perry_codegen::symbol_names::function(&prefix, exported);
                     stub_func_names.push(direct_sym);
                 }
             }
@@ -8096,6 +8227,10 @@ pub fn run_with_parse_cache(
 
     // Build & run the per-platform link command. Tier 2.1 final extraction
     // (v0.5.342) — see crates/perry/src/commands/compile/link.rs.
+    if let Some(report) = &reach_report {
+        report.check()?;
+    }
+
     let link_cache_status = build_and_run_link(
         &args.input,
         &ctx,
@@ -8251,6 +8386,10 @@ pub fn run_with_parse_cache(
                 }
             }
         }
+    }
+
+    if let Some(report) = &reach_report {
+        report.finish(&exe_path)?;
     }
 
     // Finish editing the executable before copying/sealing an app bundle.

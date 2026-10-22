@@ -84,6 +84,20 @@ class CategoryRoutingTests(unittest.TestCase):
         self.assertIn("gc-ratchet",selected_ids)
         self.assertEqual(selected("gc","pull_request",{"action":"labeled","label":{"name":"skip-changelog"},"pull_request":{"base":{"ref":"main"},"labels":[{"name":"run-extended-tests"}]}},paths=["crates/perry-runtime/src/gc/mod.rs"]),[])
 
+    def test_component_and_wasi_evidence_changes_select_wasi_suite(self):
+        event = {"action": "synchronize", "pull_request": {
+            "base": {"ref": "main"}, "labels": [{"name": "run-extended-tests"}]}}
+        for path in ["crates/perry-wit/src/guest_c.rs",
+                     "crates/perry-component-host/src/resources.rs",
+                     "crates/perry-abi/src/component_guest.rs",
+                     "test-wasi/components/values/world.wit",
+                     "scripts/component_check.sh",
+                     "scripts/component_guest_acceptance.py",
+                     "scripts/wasi_run.py", "scripts/test_wasi_run.py",
+                     "scripts/wasi_acceptance/tcp.ts"]:
+            with self.subTest(path=path):
+                self.assertIn("wasi-check", selected("compatibility", "pull_request", event, paths=[path]))
+
     def test_cc_parity_uses_its_separate_label(self):
         event={"action":"synchronize","pull_request":{"base":{"ref":"main"},"labels":[]}}
         paths=["crates/perry-codegen/src/lib.rs"]
@@ -129,6 +143,46 @@ class CategoryRoutingTests(unittest.TestCase):
             "npm-launcher": "npm-launcher / suite result",
         }.items():
             self.assertEqual(jobs[module]["name"], display_name)
+
+    def test_required_wasi_job_executes_all_command_suites(self):
+        from pathlib import Path
+        import yaml
+        workflow = yaml.load(Path(".github/workflows/test.yml").read_text(), Loader=yaml.BaseLoader)
+        jobs = workflow["jobs"]
+        job = jobs["wasi-execution"]
+        self.assertIn("wasi-execution", jobs["gate"]["needs"])
+        self.assertEqual(job["needs"], "plan")
+        self.assertEqual(job["if"], "needs.plan.result == 'success' && fromJSON(needs.plan.outputs.plan).jobs.wasi_execution")
+        self.assertNotIn("continue-on-error", job)
+        for step in job["steps"]:
+            self.assertNotIn("continue-on-error", step)
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        for suite in ["smoke", "acceptance", "gap"]:
+            self.assertIn("--suite " + suite, commands)
+        self.assertIn("wasi_build_runtime.py", commands)
+        self.assertIn("--features target-wasi", commands)
+        self.assertTrue(any(step.get("with", {}).get("node-version-file") == ".node-version" for step in job["steps"]))
+
+    def test_actual_pr_gate_rejects_skipped_or_missing_planned_wasi(self):
+        import os
+        from pathlib import Path
+        import subprocess
+        import yaml
+        workflow = yaml.load(Path(".github/workflows/test.yml").read_text(), Loader=yaml.BaseLoader)
+        command = workflow["jobs"]["gate"]["steps"][0]["run"]
+        for planned in [True, False]:
+            for outcome in ["success", "failure", "cancelled", "skipped", None]:
+                with self.subTest(planned=planned, outcome=outcome):
+                    needs = {
+                        "route": {"result": "success"},
+                        "plan": {"result": "success", "outputs": {"plan": json.dumps({"jobs": {"wasi_execution": planned}})}}
+                    }
+                    if outcome is not None:
+                        needs["wasi-execution"] = {"result": outcome}
+                    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                        env=dict(os.environ, NEEDS=json.dumps(needs), TIER="pr"))
+                    passes = outcome == "success" or (not planned and outcome in ["skipped", None])
+                    self.assertEqual(result.returncode == 0, passes, result.stdout + result.stderr)
 
     def test_auxiliary_ci_dispatch_does_not_run_core(self):
         result = select("ci", "workflow_dispatch", {"inputs":{"tier":"full"}}, suite="coverage", catalog=CATALOG)

@@ -29,8 +29,10 @@
 //! which no ShapeId carries (object model §3.6; set by `object::shadow`).
 
 use super::ObjectHeader;
+mod define_field;
 pub(crate) mod methods;
 use crate::string::StringHeader;
+pub(crate) use define_field::family_define_field;
 
 /// Bit 30 of the layout word: THE shadow bit (object model §3.6, §6a). One
 /// bit, one meaning, one stamping rule, shared by step 3 and step 4.
@@ -293,15 +295,64 @@ pub struct PerryLayoutDesc {
     pub methods: *const methods::PerryFamilyMethods,
 }
 
-const _: () = assert!(std::mem::size_of::<PerryLayoutDesc>() == 72);
-const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, class_id) == 56);
+const _: () = assert!(
+    std::mem::size_of::<PerryLayoutDesc>()
+        == if cfg!(target_pointer_width = "32") {
+            56
+        } else {
+            72
+        }
+);
+const _: () = assert!(
+    std::mem::offset_of!(PerryLayoutDesc, class_id)
+        == if cfg!(target_pointer_width = "32") {
+            44
+        } else {
+            56
+        }
+);
 const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, layout_id) == 12);
-const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, keys) == 32);
-const _: () = assert!(std::mem::offset_of!(PerryLayoutDesc, index) == 48);
-const _: () = assert!(std::mem::size_of::<PerryLayoutKey>() == 16);
+const _: () = assert!(
+    std::mem::offset_of!(PerryLayoutDesc, keys)
+        == if cfg!(target_pointer_width = "32") {
+            28
+        } else {
+            32
+        }
+);
+const _: () = assert!(
+    std::mem::offset_of!(PerryLayoutDesc, index)
+        == if cfg!(target_pointer_width = "32") {
+            40
+        } else {
+            48
+        }
+);
+const _: () = assert!(
+    std::mem::size_of::<PerryLayoutKey>()
+        == if cfg!(target_pointer_width = "32") {
+            12
+        } else {
+            16
+        }
+);
 const _: () = assert!(std::mem::size_of::<StaticAtom>() == 24);
-const _: () = assert!(std::mem::offset_of!(StaticAtom, kind) == 16);
-const _: () = assert!(std::mem::offset_of!(StaticAtom, index) == 20);
+const _: () = assert!(
+    std::mem::offset_of!(StaticAtom, kind)
+        == if cfg!(target_pointer_width = "32") {
+            12
+        } else {
+            16
+        }
+);
+const _: () = assert!(
+    std::mem::offset_of!(StaticAtom, index)
+        == if cfg!(target_pointer_width = "32") {
+            16
+        } else {
+            20
+        }
+);
 
 /// `PerryLayoutDesc.layout_id` as emitted for a layout some object carries:
 /// [`register_static_layouts`] replaces it with the registered id. Every other
@@ -310,6 +361,7 @@ pub const LAYOUT_ID_CARRIED: u32 = u32::MAX;
 // The descriptor word has exactly three states: 0 (static data), the carried
 // sentinel (not registered yet) and a registered ShapeId. The sentinel must
 // never read as a ShapeId, or registration would install it as one.
+#[allow(clippy::absurd_extreme_comparisons)] // the sentinel is u32::MAX today; the check guards a future change
 const _: () = assert!(LAYOUT_ID_CARRIED >= super::shapes::SHAPE_ID_END);
 const _: () = assert!(super::shapes::SHAPE_ID_BASE != 0);
 
@@ -529,7 +581,7 @@ unsafe fn atom_bytes<'a>(atom: *const StaticAtom) -> Option<&'a [u8]> {
 pub(crate) fn coloured_atoms() -> Vec<(&'static [u8], u64, u32, u32)> {
     let mut out = Vec::new();
     unsafe {
-        for atom in records::<StaticAtom>(atom_bounds()) {
+        for atom in image_atoms() {
             if (*atom)._pad[0] != 1 {
                 continue;
             }
@@ -581,9 +633,14 @@ pub(crate) unsafe fn atom_symbol(
 /// Pre-seed the agent's atom table, then register every layout. Runs once per
 /// agent from `js_shape_run_static_seed`, after the hash-band literal seeds.
 pub(crate) fn seed_static_atoms() {
+    #[cfg(target_family = "wasm")]
+    assert!(
+        image_atoms().next().is_some(),
+        "Wasm image constructors did not run"
+    );
     super::runtime_layouts::seed_ascii_char_atoms();
     unsafe {
-        for atom in records::<StaticAtom>(atom_bounds()) {
+        for atom in image_atoms() {
             if let Some(bytes) = atom_bytes(atom) {
                 crate::string::seed_static_atom(bytes, (*atom).hash, (*atom).string);
             }
@@ -593,8 +650,13 @@ pub(crate) fn seed_static_atoms() {
 }
 
 pub(crate) fn register_static_layouts() {
+    #[cfg(target_family = "wasm")]
+    assert!(
+        image_layouts().next().is_some(),
+        "Wasm layout constructors did not run"
+    );
     unsafe {
-        for (index, desc) in records::<PerryLayoutDesc>(layout_bounds()).enumerate() {
+        for (index, desc) in image_layouts().enumerate() {
             if (*desc).family == SENTINEL_FAMILY || (*desc).keys.is_null() && (*desc).key_count != 0
             {
                 continue;
@@ -605,12 +667,48 @@ pub(crate) fn register_static_layouts() {
             let Some(id) = layout_id_of_index(index as u32) else {
                 break;
             };
-            let got = register_one(desc, id);
+            let got = if (*desc).variant == crate::codegen_abi::LAYOUT_VARIANT_NAMESPACE {
+                reserve_namespace_layout(desc)
+            } else {
+                register_one(desc, id)
+            };
             // Every agent writes the same id (same seeds, same order).
             (*(std::ptr::addr_of_mut!((*desc).layout_id) as *const std::sync::atomic::AtomicU32))
                 .store(got, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// A module namespace layout's id, drawn at startup in section order (so
+/// every agent draws the same one) without building its key list or shape:
+/// [`register_namespace_layout`] installs them at the namespace's birth. Most
+/// compiled namespaces are never built.
+unsafe fn reserve_namespace_layout(desc: *const PerryLayoutDesc) -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let word = AtomicU32::from_ptr(std::ptr::addr_of!((*desc).layout_id).cast_mut());
+    if let Some(id) = registered_layout_id(word.load(Ordering::Acquire)) {
+        return id;
+    }
+    debug_assert_eq!((*desc).proto, LAYOUT_PROTO_NULL);
+    let proposed = super::shapes::allocate_declared_layout_id(super::shapes::PROTO_ID_NULL);
+    match word.compare_exchange(
+        LAYOUT_ID_CARRIED,
+        proposed,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => proposed,
+        Err(other) => registered_layout_id(other)
+            .expect("a carried layout word holds the sentinel or a ShapeId"),
+    }
+}
+
+/// The installed layout of module namespace descriptor `desc`, installing
+/// its key list and shape under the id startup reserved on the first birth
+/// in this agent; `None` when this runtime cannot represent it.
+pub(crate) unsafe fn register_namespace_layout(desc: *const PerryLayoutDesc) -> Option<u32> {
+    let id = register_one(desc, 0);
+    (id != 0).then_some(id)
 }
 
 /// The shape kind a descriptor's `kind` code declares, among the ordinary
@@ -808,6 +906,17 @@ unsafe fn register_bound(
     let _no_gc = crate::gc::GcSuppressScope::new();
     let list = if key_count == 0 {
         std::ptr::null_mut()
+    } else if let Some(canonical) = (!function)
+        .then(|| {
+            super::canonical_keys::from_static_layout(
+                &super::canonical_keys::SharedLayout::shape_cache_entry(),
+                keys,
+                mapped,
+            )
+        })
+        .flatten()
+    {
+        canonical.view().arr()
     } else {
         let list = super::key_attrs::alloc_canonical_key_list(
             key_count,
@@ -928,6 +1037,21 @@ pub unsafe extern "C" fn perry_alloc_layout(desc: *const PerryLayoutDesc) -> *mu
         std::process::abort();
     };
     alloc_layout_object(d, id)
+}
+
+/// Allocate an instance of class family layout `desc` born on `copy`, a class
+/// evaluation's copy of that layout (`shapes::evaluation_layout_family(copy)`
+/// names `desc`'s layout): the family's slots, all holes, under the ShapeId
+/// that names the evaluation's prototype and brand. The caller read `copy`
+/// from the evaluation's class object and checked it. Can collect.
+///
+/// # Safety
+/// `desc` is a registered class family descriptor of this program.
+pub(crate) unsafe fn alloc_family_layout_copy(
+    desc: *const PerryLayoutDesc,
+    copy: u32,
+) -> *mut ObjectHeader {
+    alloc_layout_object(&*desc, copy)
 }
 
 /// Allocate an object of the registered layout `id` of `d` (see
@@ -1336,6 +1460,7 @@ const _: () = {
     assert!(k::ENTRY_ACCESSOR == abi::LAYOUT_KEY_ACCESSOR);
     assert!(k::ENTRY_HAS_GET == abi::LAYOUT_KEY_HAS_GET);
     assert!(k::ENTRY_HAS_SET == abi::LAYOUT_KEY_HAS_SET);
+    assert!(k::PRIVATE_FIELD_ENTRY == abi::LAYOUT_KEY_PRIVATE_FIELD);
 };
 
 /// Are `built`'s own properties and [[Prototype]] exactly `d`'s?
@@ -1700,17 +1825,10 @@ pub(crate) fn family_birth_desc(class_id: u32, args: &[f64]) -> Option<*const Pe
     }
 }
 
-/// The inline width an instance of `class_id` must be born with to adopt its
-/// family layout (0 when it has none).
-pub(crate) fn family_birth_width(class_id: u32) -> u32 {
-    // SAFETY: a record of this program's section.
-    family_of_class(class_id).map_or(0, |(_, d)| unsafe { (*d).slot_count })
-}
-
 /// Class births allocate the complete fixed layout directly.
 /// Retained for a runtime construction path that already made a keyless shell.
 pub(crate) unsafe fn adopt_family_layout(obj: *mut ObjectHeader) -> *mut ObjectHeader {
-    if obj.is_null() || is_family_layout_word((*obj).parent_class_id) {
+    if obj.is_null() || is_family_object(obj) {
         return obj;
     }
     let Some((_, desc)) = family_of_class((*obj).class_id) else {
@@ -1729,16 +1847,13 @@ pub(crate) unsafe fn adopt_family_layout(obj: *mut ObjectHeader) -> *mut ObjectH
     let object = scope.root_raw_mut_ptr(obj);
     let proto = scope.root_nanbox_u64(prototype);
     let brand = scope.root_nanbox_u64(brand);
-    if prototype != 0 || brand.get_nanbox_u64() != 0 {
+    // A family object's evaluation brand lives in its meta record
+    // (`shapes::object_evaluation_brand`); its [[Prototype]] stays a shape
+    // fact, re-linked below once the object is on the layout.
+    if brand.get_nanbox_u64() != 0 {
         let (meta, current) =
             object.across_mut::<ObjectHeader, _>(|| super::object_meta_ensure(obj));
-        (*meta).prototype = proto.get_nanbox_u64();
         (*meta).private_evaluation_brand = brand.get_nanbox_u64();
-        crate::gc::runtime_write_barrier_slot(
-            meta as usize,
-            std::ptr::addr_of!((*meta).prototype) as usize,
-            (*meta).prototype,
-        );
         crate::gc::runtime_write_barrier_slot(
             meta as usize,
             std::ptr::addr_of!((*meta).private_evaluation_brand) as usize,
@@ -1755,7 +1870,15 @@ pub(crate) unsafe fn adopt_family_layout(obj: *mut ObjectHeader) -> *mut ObjectH
         *fields.add(i) = crate::value::TAG_HOLE;
     }
     super::shapes::stamp_object_shape_id_with_carrier_note(obj, d.layout_id);
-    obj
+    // A birth linked to another prototype (a class evaluation's, a
+    // newTarget's) keeps that link as its shape's identity: the funnel moves
+    // the object to that evaluation's copy of the layout (or off the family,
+    // for a link no class instance identity names).
+    let prototype = proto.get_nanbox_u64();
+    if prototype != 0 {
+        super::prototype_chain::object_link_class_evaluation_prototype(obj as usize, prototype);
+    }
+    object.get_raw_mut_ptr::<ObjectHeader>()
 }
 
 /// A key publication on a static family object
@@ -1778,13 +1901,10 @@ pub(crate) unsafe fn route_family_add(
     if word & LAYOUT_SHADOW_BIT != 0 {
         return false;
     }
-    let Some(index) = layout_index_of_word(word) else {
+    let Some(d) = family_desc_of(obj) else {
         return false;
     };
-    let d = &*desc_at(index);
-    if d.class_id == 0
-        || registered_layout_id(d.layout_id) != Some(word)
-        || live_inline_slot_count != d.slot_count
+    if live_inline_slot_count != d.slot_count
         || keys.arr().is_null()
         || keys.count() != d.slot_count + 1
     {
@@ -1829,7 +1949,8 @@ static KEEP_PERRY_LAYOUT_INDEX_PROBE: unsafe extern "C" fn(
     *const StaticAtom,
 ) -> i32 = perry_layout_index_probe;
 
-/// Does this word name a compiler-owned class instance layout?
+/// Does this word name a compiler-owned class instance layout (the family's
+/// own id; an evaluation's copy is an object fact, [`is_family_object`])?
 #[inline]
 pub(crate) fn is_family_layout_word(word: u32) -> bool {
     layout_index_of_word(word).is_some_and(|i| unsafe {
@@ -1877,10 +1998,101 @@ pub(crate) unsafe fn family_desc_of(obj: *const ObjectHeader) -> Option<&'static
         return None;
     }
     let word = (*obj).parent_class_id;
-    let index = layout_index_of_word(word)?;
+    let Some(index) = layout_index_of_word(word) else {
+        return evaluation_family_desc_of(word);
+    };
     let d = &*desc_at(index);
     (d.class_id != 0 && registered_layout_id(d.layout_id) == Some(layout_id_of_word(word)))
         .then_some(d)
+}
+
+/// Is `obj` a class family object: on its family layout, or on a class
+/// evaluation's copy of it ([`family_desc_of`])?
+///
+/// # Safety
+/// `obj` is a live object or null.
+#[inline]
+pub(crate) unsafe fn is_family_object(obj: *const ObjectHeader) -> bool {
+    family_desc_of(obj).is_some()
+}
+
+/// The family descriptor of an instance of a class EVALUATION (a class
+/// expression evaluated more than once): its layout word is not the family's
+/// own id but the evaluation's copy of that layout, the family's facts at
+/// the identity `MIXED | class | serial` that names the evaluation's
+/// prototype. The prototype funnel moves an instance there when it links it
+/// (`prototype_chain::object_link_class_evaluation_prototype`,
+/// [`adopt_family_layout`]), and the copy's record names the family layout
+/// it was taken from ([`note_family_relink`]): the class's layout or one of
+/// its creation-split layouts. Only a linked word (its kind bits) can be a
+/// copy, so every other receiver answers from its header word.
+///
+/// # Safety
+/// Reads the agent shape directory and this program's descriptor section.
+#[inline(always)]
+unsafe fn evaluation_family_desc_of(word: u32) -> Option<&'static PerryLayoutDesc> {
+    // A copy's identity is `MIXED` (the class and the evaluation prototype's
+    // serial), which only ids of the mixed kind name: every other receiver
+    // answers from its header word.
+    let id = layout_id_of_word(word);
+    if super::shapes::shape_word_kind(id) != super::shapes::SHAPE_ID_KIND_MIXED
+        || !super::shapes::is_shape_id(id)
+    {
+        return None;
+    }
+    evaluation_family_desc_of_record(id)
+}
+
+/// [`evaluation_family_desc_of`]'s record read, out of line so the static
+/// family answer stays inline in every geometry reader.
+#[inline(never)]
+unsafe fn evaluation_family_desc_of_record(id: u32) -> Option<&'static PerryLayoutDesc> {
+    evaluation_layout_desc(super::shapes::evaluation_layout_family(id))
+}
+
+/// The family descriptor a shape record's `evaluation_layout_of` fact names
+/// (`shapes::evaluation_layout_family`), or `None` for 0.
+///
+/// # Safety
+/// `family` is a record's `evaluation_layout_of` fact.
+#[inline]
+pub(crate) unsafe fn evaluation_layout_desc(family: u32) -> Option<&'static PerryLayoutDesc> {
+    match family {
+        0 => None,
+        // The record names a registered class family layout: only
+        // [`note_family_relink`] writes it, from one.
+        family => {
+            debug_assert!(is_family_layout_word(family));
+            Some(&*desc_at(family - LAYOUT_BASE))
+        }
+    }
+}
+
+/// Is `word` (an `ObjectHeader` layout word) a static class family layout
+/// candidate: in the descriptor section's id range, which only
+/// [`family_own_key`] answers without a shape record?
+#[inline(always)]
+pub(crate) fn word_in_layout_index(word: u32) -> bool {
+    word.wrapping_sub(LAYOUT_BASE) < LAYOUT_INDEX_LIMIT
+}
+
+/// A prototype transition moved an object from layout word `previous` to
+/// ShapeId `id`. When `previous` is a class family layout, or an evaluation
+/// copy of one, and `id` has that family's facts at a class evaluation's
+/// identity, `id`'s record names the family
+/// (`shapes::note_evaluation_layout`), so its objects stay family objects.
+pub(crate) fn note_family_relink(previous: u32, id: u32) {
+    let previous = layout_id_of_word(previous);
+    let family = if is_family_layout_word(previous) {
+        previous
+    } else if super::shapes::shape_word_may_be_linked(previous) {
+        super::shapes::evaluation_layout_family(previous)
+    } else {
+        0
+    };
+    if family != 0 {
+        super::shapes::note_evaluation_layout(id, family);
+    }
 }
 
 struct FamilyDiag {
@@ -1925,7 +2137,7 @@ pub(crate) fn family_diag_init() {
 /// `PERRY_FAMILY_DIAG=2`: count out-of-order fills by (family, key written,
 /// first later key present) and print the most frequent at exit (measurement
 /// only: which key orders the census gets wrong).
-fn family_diag_pairs_on() -> bool {
+pub(crate) fn family_diag_pairs_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("PERRY_FAMILY_DIAG").as_deref() == Ok("2"))
 }
@@ -1935,7 +2147,7 @@ static OUT_OF_ORDER_PAIRS: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 #[cold]
-unsafe fn note_out_of_order_pair(obj: *const ObjectHeader, pos: u32) {
+pub(crate) unsafe fn note_out_of_order_pair(obj: *const ObjectHeader, pos: u32) {
     let Some(d) = family_desc_of(obj) else {
         return;
     };
@@ -2026,7 +2238,6 @@ fn family_diag_report() {
 
 /// Why the next `overflow::ensure` on a family object installs its table.
 pub(crate) mod install_cause {
-    pub const UNKNOWN: u8 = 0;
     pub const LATE_OUT_OF_ORDER: u8 = 1;
     pub const LATE_PROTO_OR_SPILL: u8 = 2;
     pub const OTHER_KEY: u8 = 3;
@@ -2198,6 +2409,11 @@ pub(crate) unsafe fn family_store(
     if !family && !super::key_view::object_may_have_holes(obj) {
         return false;
     }
+    // A private field's by-name write is the private path's: it fills or
+    // overwrites the element, never a property of that spelling.
+    if super::field_get_set::private_namespace_bytes(bytes) {
+        return false;
+    }
     FAMILY_DIAG.seen.fetch_add(1, Relaxed);
     if family && family_overwrite(obj, bytes, value) {
         return true;
@@ -2330,35 +2546,60 @@ pub(crate) unsafe fn family_own_key_hashed(
     // shadow bit (an overflow sets it). Most objects are not family objects.
     let word = (*obj).parent_class_id;
     let index = word.wrapping_sub(LAYOUT_BASE);
-    if index >= LAYOUT_INDEX_LIMIT {
+    let d = if index < LAYOUT_INDEX_LIMIT {
+        let (start, end) = layout_bounds();
+        if index as usize >= end.saturating_sub(start) / std::mem::size_of::<PerryLayoutDesc>() {
+            return None;
+        }
+        let d = &*desc_at(index);
+        if d.class_id == 0 || registered_layout_id(d.layout_id) != Some(word) {
+            return None;
+        }
+        d
+    } else if word & LAYOUT_SHADOW_BIT == 0 {
+        // A class evaluation's copy of the layout: the same keys and slots.
+        evaluation_family_desc_of(word)?
+    } else {
         return None;
-    }
-    let (start, end) = layout_bounds();
-    if index as usize >= end.saturating_sub(start) / std::mem::size_of::<PerryLayoutDesc>() {
-        return None;
-    }
-    let d = &*desc_at(index);
-    if d.class_id == 0
-        || registered_layout_id(d.layout_id) != Some(word)
-        || d.index.is_null()
-        || d.keys.is_null()
-    {
+    };
+    desc_own_key(d, bytes, hash)
+}
+
+/// [`family_own_key_hashed`] of an object whose family descriptor the caller
+/// already holds (`d`, from its layout word or its shape record).
+///
+/// # Safety
+/// `d` is a registered class family descriptor; `hash`, when given, is
+/// `bytes`' hash.
+#[inline(always)]
+pub(crate) unsafe fn desc_own_key(
+    d: &PerryLayoutDesc,
+    bytes: &[u8],
+    hash: Option<u64>,
+) -> Option<Option<(u32, u32)>> {
+    if d.index.is_null() || d.keys.is_null() {
         return None;
     }
     let keys = std::slice::from_raw_parts(d.keys, d.key_count as usize);
-    let at = |pos: usize| Some(Some((pos as u32, keys[pos].slot)));
+    // A private element is no own property (the index omits it too). A
+    // layout lists each spelling once, so only a match is checked.
+    let own = |pos: usize, k: &PerryLayoutKey| {
+        (k.attrs & super::key_attrs::ENTRY_PRIVATE == 0).then_some((pos as u32, k.slot))
+    };
     if let Some(pos) = leading_position(bytes).filter(|&pos| (pos as usize) < keys.len()) {
-        if atom_bytes(keys[pos as usize].atom) == Some(bytes) {
-            return at(pos as usize);
+        let k = &keys[pos as usize];
+        if atom_bytes(k.atom) == Some(bytes) {
+            return Some(own(pos as usize, k));
         }
     }
     // A short list: its keys' lengths, then their bytes, with no hashing.
     if keys.len() <= SHORT_FAMILY_KEYS {
-        return Some(
-            keys.iter()
-                .position(|k| atom_bytes(k.atom) == Some(bytes))
-                .map(|pos| (pos as u32, keys[pos].slot)),
-        );
+        for (pos, k) in keys.iter().enumerate() {
+            if atom_bytes(k.atom) == Some(bytes) {
+                return Some(own(pos, k));
+            }
+        }
+        return Some(None);
     }
     let hash = hash.unwrap_or_else(|| super::key_bytes_hash(bytes.as_ptr(), bytes.len()));
     Some(desc_position_hashed(d, bytes, hash).map(|pos| (pos, keys[pos as usize].slot)))
@@ -2652,5 +2893,32 @@ pub(crate) unsafe fn prepare_hole_define(receiver: u64, key: u64) {
     if super::key_view::own_key_is_hole(obj, crate::JSValue::from_bits(key)) {
         note_install_cause(install_cause::DEFINE);
         super::overflow::ensure(obj);
+    }
+}
+
+// Wasm uses the same records and registration logic; only image enumeration
+// differs because relocated data cannot live in Rust's Wasm custom sections.
+fn image_atoms() -> impl Iterator<Item = *mut StaticAtom> {
+    #[cfg(target_family = "wasm")]
+    {
+        inventory::iter::<crate::wasm_image::Atom>
+            .into_iter()
+            .map(|item| item.0.cast_mut())
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        records::<StaticAtom>(atom_bounds())
+    }
+}
+fn image_layouts() -> impl Iterator<Item = *mut PerryLayoutDesc> {
+    #[cfg(target_family = "wasm")]
+    {
+        inventory::iter::<crate::wasm_image::Layout>
+            .into_iter()
+            .map(|item| item.0)
+    }
+    #[cfg(not(target_family = "wasm"))]
+    {
+        records::<PerryLayoutDesc>(layout_bounds())
     }
 }

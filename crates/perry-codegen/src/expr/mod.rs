@@ -102,6 +102,7 @@ pub(crate) mod family_slot;
 pub(crate) mod folded_builtin_override;
 pub(crate) mod hot_tls;
 pub(crate) mod inline_birth;
+pub(crate) mod literal_chunks;
 mod literal_descriptor;
 /// A worker program's literal-descriptor IR, for the dialect reader's round trip.
 #[cfg(test)]
@@ -119,8 +120,6 @@ mod channel;
 #[cfg(test)]
 mod class_method_arguments_object_tests;
 pub(crate) mod collection_receiver;
-#[cfg(test)]
-mod conforming_layout_note_tests;
 mod helpers;
 mod i32_fast_path;
 mod index;
@@ -495,6 +494,10 @@ pub(crate) struct FnCtx<'a> {
     /// reading the field, because they consult it *after* lowering their
     /// operands, by which point the field has been taken again.
     pub discard_this_expr: bool,
+    /// A chunked literal birth's own arguments are being lowered
+    /// (`literal_chunks`): a chunked argument is the birth's `undefined`
+    /// fill, and anywhere else it is an invariant violation.
+    pub literal_chunk_fill: bool,
     /// A condition consumer is lowering a call and can consume an `i1`
     /// truthiness result directly. Guarded user-method dispatch uses this to
     /// keep the statically-resolved arm's constructively-Boolean result native
@@ -881,6 +884,8 @@ pub(crate) struct FnCtx<'a> {
     /// module's namespace object rather than a binding. See the doc on
     /// `CompileOptions::namespace_member_nested`.
     pub namespace_member_nested: &'a std::collections::HashSet<(String, String)>,
+    /// `CompileOptions::cjs_interop_namespaces`.
+    pub cjs_interop_namespaces: &'a std::collections::HashSet<String>,
     /// Issue #5924: per-namespace origin-name resolution. Keyed by
     /// `(namespace_local_name, member_name)` → `origin_name`. Consulted
     /// before `import_function_origin_names` when computing the symbol
@@ -903,6 +908,11 @@ pub(crate) struct FnCtx<'a> {
     /// Used by direct `FuncRef` calls to re-link returned iterator objects to
     /// the same closure-cached prototype that `g.prototype` reads expose.
     pub local_generator_funcs: &'a std::collections::HashSet<u32>,
+    /// The subset of `local_generator_funcs` that are sync (fixed-state)
+    /// generator wrappers: their birth (`js_generator_create`) already links
+    /// the instance to its function's prototype, so a direct call needs no
+    /// call-site relink.
+    pub fixed_generator_funcs: &'a std::collections::HashSet<u32>,
     /// FuncIds of source-`async` closures CPS-rewritten into async-step
     /// state machines (the rewrite clears `Expr::Closure.is_async`) — see
     /// `CrossModuleCtx::async_step_closures` (#6185). Used by the
@@ -3292,8 +3302,8 @@ mod member_update;
 mod typed_array_rmw;
 mod typed_array_update;
 pub(crate) use instance_misc1::builtin_parent_reserved_class_id;
-pub(crate) mod class_field_inline_guard;
 pub(crate) mod class_family_read;
+pub(crate) mod class_field_inline_guard;
 pub(crate) mod element_shape_guard;
 pub(crate) mod element_shape_reads;
 mod generator_control_slots;
@@ -3329,7 +3339,7 @@ mod super_method;
 #[cfg(test)]
 mod super_property_set_order_tests;
 pub(crate) mod this_super_call;
-pub(crate) use this_super_call::is_other_builtin_constructor_name;
+pub(crate) use perry_hir::is_other_builtin_constructor_name;
 mod unary;
 mod url_main;
 

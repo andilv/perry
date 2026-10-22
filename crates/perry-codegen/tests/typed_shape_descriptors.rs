@@ -30,6 +30,7 @@ fn empty_opts() -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
@@ -37,7 +38,7 @@ fn empty_opts() -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -64,9 +65,10 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        namespace_adopts_cjs_exports: false,
         debug_locations: false,
         module_source: None,
         debug_source_line_offset: 0,
@@ -496,12 +498,12 @@ fn c262_array_has_own_property_uses_object_prototype_dispatch() {
     );
 
     let ir = ir_for(module);
-    // The method site's cold call (`js_method_site_miss`) is the universal
-    // dispatch for every receiver its memo cannot describe.
+    // The method site's cold call (`js_method_call_slow`) is the universal
+    // dispatch for every receiver the layout probe cannot describe.
     assert!(
         ir.contains("call double @js_typed_feedback_native_call_method")
-            || ir.contains("call double @js_method_site_miss"),
-        "array hasOwnProperty should dispatch through Object.prototype semantics"
+            || ir.contains("call double @js_method_call_slow("),
+        "array hasOwnProperty should dispatch through Object.prototype semantics:\n{ir}"
     );
 }
 

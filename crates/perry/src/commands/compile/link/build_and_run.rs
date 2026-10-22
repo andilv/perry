@@ -198,17 +198,34 @@ pub(crate) fn build_and_run_link(
     if !is_windows {
         if is_android || is_linux || is_harmonyos {
             cmd.arg("-Wl,--gc-sections");
-            // Native glibc Linux only: not the static musl target, not a
-            // cross link (the probe tests the host toolchain), not Android or
-            // HarmonyOS. Falls back silently to today's link when unsupported.
+            // Native glibc Linux executables link at a fixed base (ET_EXEC),
+            // as bun does. Every pointer in perry's static data (class method
+            // slots, shape/key tables, string and closure headers, stack-map
+            // function addresses) is then final at link time. As a PIE the
+            // same pointers were relative relocations that ld.so applied at
+            // every start: 1.74M of them for OpenCode, dirtying 32 MB of
+            // `.data.rel.ro` copy-on-write before `main`.
+            //
+            // Why this is safe for the runtime: every image-address consumer
+            // reads the load bias (`dl_iterate_phdr`'s `dlpi_addr`, `dladdr`)
+            // instead of assuming one, and the fixed base (0x400000) sits
+            // above the NaN-box handle band (`HANDLE_BAND_MAX` = 0x200000), so
+            // a static object never classifies as a registry handle. Generated
+            // and Rust objects stay PIC, and a PIC object links into a
+            // fixed-base executable as is. Shared objects (plugins, Node-API
+            // addons) are unaffected and still resolve the host's exports
+            // dynamically. With no relative relocations left, DT_RELR
+            // (`-z pack-relative-relocs`) has nothing to pack.
+            //
+            // Native glibc Linux only: not the static musl target, not a cross
+            // link, not Android or HarmonyOS (those produce shared objects).
             if is_linux
                 && !is_musl
                 && !is_android
                 && !is_harmonyos
                 && matches!(target, None | Some("linux"))
-                && super::platform_cmd::linux_pack_relative_relocs_supported()
             {
-                cmd.arg("-Wl,-z,pack-relative-relocs");
+                cmd.arg("-no-pie");
             }
         } else if is_cross_ios || is_cross_visionos || is_cross_macos || is_cross_tvos {
             // ld64.lld called directly — no -Wl, prefix needed
@@ -419,7 +436,7 @@ pub(crate) fn build_and_run_link(
     let archive_group = ElfArchiveGroup::open(
         &mut cmd,
         !is_windows && (is_linux || is_android || is_harmonyos),
-        !skip_runtime || ctx.needs_stdlib,
+        !skip_runtime || ctx.needs_stdlib || !well_known_libs.is_empty(),
     );
     if !skip_runtime {
         if ctx.needs_stdlib || is_windows {
@@ -542,6 +559,16 @@ pub(crate) fn build_and_run_link(
             }
         } else {
             eprintln!("Warning: stdlib required but libperry_stdlib.a not found");
+        }
+    }
+    // Optional archives can provide runtime-level services (for example the
+    // component engine) without requiring perry-stdlib. The branches above
+    // append them only when a stdlib archive is actually linked.
+    let wrappers_linked_with_stdlib =
+        (ctx.needs_stdlib || (!skip_runtime && is_windows)) && stdlib_lib.is_some();
+    if !wrappers_linked_with_stdlib {
+        for library in &well_known_libs {
+            cmd.arg(library);
         }
     }
     archive_group.close(&mut cmd);
@@ -1873,9 +1900,10 @@ pub(crate) fn build_and_run_link(
     // long. (os error 206)` before the linker even starts. Route the whole
     // argument vector through a linker *response file* (`@file`), which
     // `link.exe` / `lld-link` (and `clang`/`cc`) read instead of the command
-    // line, so the invocation no longer scales with module count. Only the
-    // native-Windows host is affected (other hosts have a multi-MB `ARG_MAX`);
-    // `PERRY_FORCE_LINK_RESPONSE_FILE=1` forces the path elsewhere for testing.
+    // line, so the invocation no longer scales with module count. Other hosts
+    // take the same path once the arguments are large: macOS caps them at
+    // 1 MiB (`link_args_need_response_file`).
+    // `PERRY_FORCE_LINK_RESPONSE_FILE=1` forces the path for testing.
     // PERRY_EXTRA_LINK_ARGS — space-separated args appended verbatim to the
     // final link invocation. Diagnostic escape hatch (e.g.
     // `-Wl,-why_live,_js_fs_open` to ask ld64 why a symbol survived
@@ -1887,7 +1915,10 @@ pub(crate) fn build_and_run_link(
     }
 
     let mut response_file_to_clean: Option<PathBuf> = None;
-    if cfg!(target_os = "windows") || std::env::var_os("PERRY_FORCE_LINK_RESPONSE_FILE").is_some() {
+    if cfg!(target_os = "windows")
+        || std::env::var_os("PERRY_FORCE_LINK_RESPONSE_FILE").is_some()
+        || link_args_need_response_file(cmd.get_args())
+    {
         // MSVC-style quoting for the native-Windows linker (link.exe/lld-link);
         // GNU-style for a clang/cc driver (the forced-test path on macOS/Linux).
         let msvc_quoting = cfg!(target_os = "windows") && is_windows;

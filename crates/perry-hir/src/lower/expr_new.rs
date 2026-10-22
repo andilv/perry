@@ -1698,12 +1698,36 @@ pub(super) fn lower_new(ctx: &mut LoweringContext, new_expr: &ast::NewExpr) -> R
             // constructable JavaScript wrappers (`repl.start`, `events.init`)
             // from native non-constructors (`path.toNamespacedPath`). The
             // runtime's explicit export metadata makes that decision. Keep
-            // capitalized class exports on the specialized paths below.
+            // capitalized class exports on the specialized paths below, except
+            // WASI: its registered runtime constructor owns the native context.
             if let Some((module, Some(export))) = ctx.lookup_native_module(&class_name) {
-                if export
-                    .chars()
-                    .next()
-                    .is_some_and(|first| !first.is_uppercase())
+                // Named imports use the same ordinary Socket allocator as
+                // namespace construction, including Stream and import aliases.
+                // A declared class can fall through to static New below even
+                // while the module-global import registry still has its name.
+                // Class/value owners must win over that stale import entry.
+                if module == "net"
+                    && matches!(export, "Socket" | "Stream")
+                    && ctx.lookup_class(&class_name).is_none()
+                    && !ctx
+                        .resolve_class_alias(&class_name)
+                        .is_some_and(|name| ctx.lookup_class(&name).is_some())
+                    && callee_local_at_entry.is_none()
+                    && ctx.lookup_local(&class_name).is_none()
+                {
+                    return Ok(Expr::NativeMethodCall {
+                        module: "net".to_string(),
+                        class_name: None,
+                        object: None,
+                        method: "Socket".to_string(),
+                        args,
+                    });
+                }
+                if (module == "wasi" && export == "WASI")
+                    || export
+                        .chars()
+                        .next()
+                        .is_some_and(|first| !first.is_uppercase())
                 {
                     return Ok(Expr::NewDynamic {
                         callee: Box::new(Expr::PropertyGet {

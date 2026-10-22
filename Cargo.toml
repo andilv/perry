@@ -43,6 +43,8 @@ members = [
     "crates/perry-ext-parcel-watcher",
     "crates/perry-ext-typescript",
     "crates/perry-wasm-host",
+    "crates/perry-wit",
+    "crates/perry-component-host",
     "crates/perry-container-compose",
     "crates/perry-container-e2e",
     "crates/perry-stdlib",
@@ -367,7 +369,7 @@ codegen-units = 1
 codegen-units = 1
 
 [workspace.package]
-version = "0.5.1662"
+version = "0.5.1663"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/PerryTS/perry"
@@ -570,7 +572,7 @@ tar = "0.4"
 # RFC 6455 §4.2.2's `Sec-WebSocket-Accept` digest. Already in the lockfile
 # through perry-stdlib's optional `sha1`, so naming it here adds no package.
 sha1 = "0.11"
-zip = "8"
+zip = "9"
 # zstd for transparent decompression of the npm-shipped `*.a.zst` archives.
 # Statically vendored (no system libzstd dependency on the user's machine).
 zstd = "0.13"

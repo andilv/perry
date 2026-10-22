@@ -12,12 +12,17 @@ use std::sync::{LazyLock, Mutex};
 use crate::array::{js_array_length, ArrayHeader};
 use crate::closure::{
     js_closure_alloc, js_closure_call1, js_closure_call4, js_closure_get_capture_f64,
-    js_closure_get_capture_ptr, js_closure_set_capture_f64, js_closure_set_capture_ptr,
-    ClosureHeader,
+    js_closure_set_capture_f64, ClosureHeader,
 };
 use crate::object::ObjectHeader;
 use crate::string::{js_string_from_bytes, StringHeader};
 use crate::value::{JSValue, POINTER_MASK};
+
+mod resource_methods;
+use resource_methods::{
+    async_resource_bind_thunk, async_resource_destroy_thunk, async_resource_id_thunk,
+    async_resource_run_thunk, async_resource_trigger_id_thunk,
+};
 
 mod arg_values;
 use arg_values::{
@@ -290,60 +295,6 @@ extern "C" fn async_hook_disable_thunk(
     this: crate::closure::JsThis,
 ) -> f64 {
     js_async_hook_disable(crate::value::js_nanbox_get_pointer(this.as_f64()))
-}
-
-extern "C" fn async_resource_id_thunk(
-    _closure: *const ClosureHeader,
-    this: crate::closure::JsThis,
-) -> f64 {
-    js_async_resource_async_id(crate::value::js_nanbox_get_pointer(this.as_f64()))
-}
-
-extern "C" fn async_resource_trigger_id_thunk(
-    _closure: *const ClosureHeader,
-    this: crate::closure::JsThis,
-) -> f64 {
-    js_async_resource_trigger_async_id(crate::value::js_nanbox_get_pointer(this.as_f64()))
-}
-
-extern "C" fn async_resource_destroy_thunk(
-    _closure: *const ClosureHeader,
-    this: crate::closure::JsThis,
-) -> f64 {
-    js_async_resource_emit_destroy(crate::value::js_nanbox_get_pointer(this.as_f64()))
-}
-
-extern "C" fn async_resource_run_thunk(
-    _closure: *const ClosureHeader,
-    this: crate::closure::JsThis,
-    callback: f64,
-    this_arg: f64,
-    rest: f64,
-) -> f64 {
-    js_async_resource_run_in_async_scope(
-        crate::value::js_nanbox_get_pointer(this.as_f64()),
-        callback,
-        this_arg,
-        crate::value::js_nanbox_get_pointer(rest),
-    )
-}
-
-extern "C" fn async_resource_bind_thunk(
-    _closure: *const ClosureHeader,
-    this: crate::closure::JsThis,
-    callback: f64,
-    this_arg: f64,
-) -> f64 {
-    let bound = js_async_resource_bind(
-        crate::value::js_nanbox_get_pointer(this.as_f64()),
-        callback,
-        this_arg,
-    );
-    if bound == 0 {
-        TAG_UNDEFINED_F64
-    } else {
-        crate::value::js_nanbox_pointer(bound)
-    }
 }
 
 unsafe fn resource_payload(receiver: i64) -> Option<&'static mut AsyncResourcePayload> {
@@ -1875,7 +1826,8 @@ pub extern "C" fn js_async_local_storage_static_bind_direct(
 
 pub(crate) mod context_snapshots;
 pub use context_snapshots::{
-    js_async_local_storage_static_snapshot_direct, js_async_local_storage_static_snapshot_method,
+    async_local_storage_static_snapshot_value, js_async_local_storage_static_snapshot_direct,
+    js_async_local_storage_static_snapshot_method, run_with_context_snapshot,
 };
 
 pub fn scan_async_hooks_roots(mark: &mut dyn FnMut(f64)) {

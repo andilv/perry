@@ -37,6 +37,7 @@ fn empty_opts() -> CompileOptions {
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
         namespace_member_nested: Vec::new(),
+        cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
         short_spread_method_candidates: std::sync::Arc::default(),
@@ -44,7 +45,7 @@ fn empty_opts() -> CompileOptions {
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
-        type_aliases: std::collections::HashMap::new(),
+        type_aliases: Default::default(),
         imported_func_param_counts: std::collections::HashMap::new(),
         imported_func_has_rest: std::collections::HashSet::new(),
         imported_func_synthetic_arguments: std::collections::HashSet::new(),
@@ -71,9 +72,10 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
-        deferred_module_prefixes: std::collections::HashSet::new(),
+        deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
+        namespace_adopts_cjs_exports: false,
         debug_locations: false,
         module_source: None,
         debug_source_line_offset: 0,
@@ -227,9 +229,28 @@ fn named_frame_persistence_is_sso_safe_and_configured_before_run() {
             let ir = compile_ir("app_frame_persistence", vec![app_call(fields)]);
             let setter = "call void @perry_ui_app_set_frame_autosave_name";
             assert_eq!(ir.matches(setter).count(), 1, "IR:\n{ir}");
+            // A literal name is passed as the address of its immutable string
+            // image (never an inline short-string value, which has no
+            // address): the setter's pointer operand is the image's payload.
+            let hex: String = name.bytes().map(|b| format!("{b:02x}")).collect();
+            let setter_line = ir
+                .lines()
+                .find(|l| l.contains(setter))
+                .unwrap_or_else(|| panic!("IR:\n{ir}"));
+            let operand = setter_line
+                .rsplit("i64 ")
+                .next()
+                .unwrap()
+                .trim_end_matches(')')
+                .to_string();
+            let image = format!(
+                "{}.image = getelementptr i8, ptr @perry_image_literal_0_{hex}, i64 8",
+                operand
+            );
             assert!(
-                ir.contains("call i64 @js_get_string_pointer_unified"),
-                "IR:\n{ir}"
+                ir.contains(&image)
+                    && ir.contains(&format!("{operand} = ptrtoint ptr {operand}.image to i64")),
+                "the autosave name must be the literal's image pointer ({image}):\n{ir}"
             );
             let create = ir.find("call i64 @perry_ui_app_create").unwrap();
             let state = ir.find("call void @perry_ui_app_set_window_state").unwrap();

@@ -172,6 +172,8 @@ mod bun_store_tests;
 #[cfg(test)]
 mod declaration_map_source_tests;
 #[cfg(test)]
+mod exports_subpath_source_tests;
+#[cfg(test)]
 mod extension_resolution_tests;
 #[cfg(test)]
 mod package_enumeration_tests;
@@ -310,9 +312,13 @@ pub(super) fn enumerate_installed_package_roots(
     //
     // Walk every ancestor in Node resolution order. A package-local cache or
     // a workspace member's node_modules must not hide packages further up.
+    // One `visited` set spans the whole enumeration. A `node_modules` reached
+    // twice holds the same packages both times, so skipping the repeat only
+    // drops duplicates the dedupe below would discard anyway.
+    let mut visited = HashSet::new();
     for nm in ancestor_node_modules_dirs(project_root) {
-        collect_packages_in_node_modules(&nm, &mut out);
-        collect_packages_in_bun_store(&nm, &mut out);
+        collect_packages_in_node_modules(&nm, &mut out, &mut visited);
+        collect_packages_in_bun_store(&nm, &mut out, &mut visited);
     }
     // Symlinks and recursively discovered nested packages can expose the same
     // physical root more than once. Keep its first occurrence, preserving the
@@ -332,7 +338,11 @@ pub(super) fn enumerate_installed_package_roots(
 /// ordinary `node_modules` directory, so walk it with the same collector.
 /// `node_modules` need not exist (`fs::read_dir` on the derived `.bun` path
 /// simply fails and returns).
-fn collect_packages_in_bun_store(node_modules: &Path, out: &mut HashMap<String, Vec<PathBuf>>) {
+fn collect_packages_in_bun_store(
+    node_modules: &Path,
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    visited: &mut HashSet<PathBuf>,
+) {
     let bun_dir = node_modules.join(".bun");
     let entries = match fs::read_dir(&bun_dir) {
         Ok(e) => e,
@@ -341,14 +351,36 @@ fn collect_packages_in_bun_store(node_modules: &Path, out: &mut HashMap<String, 
     for entry in entries.flatten() {
         let nested = entry.path().join("node_modules");
         if nested.is_dir() {
-            collect_packages_in_node_modules(&nested, out);
+            collect_packages_in_node_modules(&nested, out, visited);
         }
     }
 }
 
 /// Walk a single `node_modules` directory, recording each package name and
 /// recursing into any nested `node_modules` it contains.
-fn collect_packages_in_node_modules(node_modules: &Path, out: &mut HashMap<String, Vec<PathBuf>>) {
+///
+/// `visited` holds the canonical path of every directory already walked, and
+/// is what makes the recursion terminate. Workspace layouts symlink members
+/// into each other's `node_modules`, so `@scope/a/node_modules/@scope/a/...`
+/// is an infinite directory tree, and every extra outlet per node multiplies
+/// the paths explored. A cycle whose nodes have one outlet each only stops
+/// because the accumulating path hits `ENAMETOOLONG`; with two or more it does
+/// not stop at all. Measured before this guard: 73k `openat` calls in 25s for
+/// two packages, and a 19-package workspace exhausted 32GB without collecting
+/// a single module (#12822).
+fn collect_packages_in_node_modules(
+    node_modules: &Path,
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    visited: &mut HashSet<PathBuf>,
+) {
+    // Canonicalize so the same physical directory reached by different
+    // symlink paths counts as one visit. An un-canonicalizable path (a broken
+    // link, a race with an installer) is walked under its literal path rather
+    // than skipped.
+    let key = fs::canonicalize(node_modules).unwrap_or_else(|_| node_modules.to_path_buf());
+    if !visited.insert(key) {
+        return;
+    }
     let entries = match fs::read_dir(node_modules) {
         Ok(e) => e,
         Err(_) => return,
@@ -382,7 +414,7 @@ fn collect_packages_in_node_modules(node_modules: &Path, out: &mut HashMap<Strin
                         .push(sub_path.clone());
                     let nested = sub_path.join("node_modules");
                     if nested.is_dir() {
-                        collect_packages_in_node_modules(&nested, out);
+                        collect_packages_in_node_modules(&nested, out, visited);
                     }
                 }
             }
@@ -391,21 +423,7 @@ fn collect_packages_in_node_modules(node_modules: &Path, out: &mut HashMap<Strin
         out.entry(name.to_string()).or_default().push(path.clone());
         let nested = path.join("node_modules");
         if nested.is_dir() {
-            collect_packages_in_node_modules(&nested, out);
-        }
-    }
-}
-
-/// Find node_modules directory starting from a given path
-pub(super) fn find_node_modules(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
-    loop {
-        let node_modules = current.join("node_modules");
-        if node_modules.is_dir() {
-            return Some(node_modules);
-        }
-        if !current.pop() {
-            return None;
+            collect_packages_in_node_modules(&nested, out, visited);
         }
     }
 }
@@ -925,12 +943,26 @@ pub(super) fn resolve_package_source_entry(
         }
     }
 
-    // For subpaths, try src/<subpath>.ts first. If that shorthand does not
-    // exist, respect package.json "exports" for the subpath before considering
-    // the package root. Falling back to src/index.ts for a subpath misroutes
-    // imports like `@tanstack/router-core/isServer` to the root barrel and
-    // leaves callers linked against symbols that the root never exports.
+    // For subpaths, a package.json "exports" entry that names the subpath is
+    // authoritative, as in Node and Bun: when it points at TypeScript source,
+    // or at an emit whose source mirror exists, that file is the module.
+    // `@opencode/tui` maps `./mini/tool` to `src/mini/tool.public.ts` next to
+    // an unrelated `src/mini/tool.ts`; guessing `src/<subpath>` first bound
+    // importers to the wrong file. The `src/<subpath>` shorthand is only a
+    // fallback for a subpath whose exports target is JS with no source
+    // mirror, or that exports does not define. Falling back to src/index.ts
+    // for a subpath misroutes imports like `@tanstack/router-core/isServer`
+    // to the root barrel and leaves callers linked against symbols that the
+    // root never exports.
     if let Some(sub) = subpath {
+        if package_exports_define(package_dir, &format!("./{sub}")) {
+            if let Some(source) = normal_entry
+                .clone()
+                .and_then(|entry| prefer_ts_source_for_package_entry(package_dir, entry))
+            {
+                return Some(source);
+            }
+        }
         let src_path = package_dir.join("src").join(sub);
         if let Some(resolved) = resolve_with_extensions(&src_path) {
             if !is_js_file(&resolved) && !is_hybrid_cjs_emit_input(&resolved) {
@@ -953,6 +985,26 @@ pub(super) fn resolve_package_source_entry(
     // Try using normal entry resolution but prefer TS over JS
     let normal_entry = normal_entry?;
     prefer_ts_source_for_package_entry(package_dir, normal_entry)
+}
+
+/// True when the package.json `exports` field of `package_dir` is a subpath
+/// map (keys start with `.`) with an entry for `export_key`, exact or by
+/// pattern. The sugar forms (a string, an array or a condition object) only
+/// define the package root `.`.
+fn package_exports_define(package_dir: &Path, export_key: &str) -> bool {
+    let Ok(content) = fs::read_to_string(package_dir.join("package.json")) else {
+        return false;
+    };
+    let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(exports) = pkg.get("exports") else {
+        return false;
+    };
+    let is_subpath_map = exports
+        .as_object()
+        .is_some_and(|map| map.keys().all(|key| key.starts_with('.')));
+    is_subpath_map && !resolve_exports_candidates(exports, export_key).is_empty()
 }
 
 fn prefer_ts_source_for_package_entry(
@@ -1833,7 +1885,18 @@ pub(super) fn discover_extension_entries(dir: &Path) -> Result<Vec<(PathBuf, Str
 }
 
 /// Compute a sanitized module prefix from a resolved path for scoped cross-module symbols
-pub(super) fn compute_module_prefix(resolved_path: &str, project_root: &Path) -> String {
+/// The symbol prefix of the module at `resolved_path`. `overrides` holds the
+/// prefixes [`super::module_prefixes::disambiguate`] gave modules whose
+/// sanitized names collide; every other module keeps its sanitized
+/// project-relative path.
+pub(super) fn compute_module_prefix(
+    resolved_path: &str,
+    project_root: &Path,
+    overrides: &HashMap<String, String>,
+) -> String {
+    if let Some(prefix) = overrides.get(resolved_path) {
+        return prefix.clone();
+    }
     let source_path = PathBuf::from(resolved_path);
     let source_module_name = source_path
         .strip_prefix(project_root)
@@ -1847,18 +1910,7 @@ pub(super) fn compute_module_prefix(resolved_path: &str, project_root: &Path) ->
                 .unwrap_or("module")
                 .to_string()
         });
-    let mut prefix = source_module_name.replace(|c: char| !c.is_alphanumeric() && c != '_', "_");
-    // LLVM IR identifiers cannot start with a digit. Prefix with `_`
-    // if the first character would be one (e.g. `05_fibonacci.ts`).
-    if prefix
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        prefix.insert(0, '_');
-    }
-    prefix
+    perry_codegen::symbol_names::module_prefix(&source_module_name)
 }
 
 /// Cached wrapper around resolve_import to avoid redundant I/O

@@ -262,42 +262,80 @@ pub(crate) fn generator_function_prototype_of(closure_ptr: usize) -> Option<f64>
     let kind = closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
         closure_generator_kind(closure as usize)
     })?;
-    // A previously-created (or user-assigned) `prototype` wins — preserves
-    // identity and lets `g.prototype = X` overrides stick.
-    let existing = closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
-        // Reuse the function shape's existing descriptor proof. An explicit
-        // undefined value differs from an unmaterialized own property.
-        match unsafe { crate::closure::shape::closure_own_prototype_by_shape(closure) } {
+    // The declared slot: a previously materialized (or user-assigned)
+    // `prototype` wins, which preserves identity and lets `g.prototype = X`
+    // stick. A keyed Function shape names its slot; a FunctionDictionary
+    // closure's bag answers by key.
+    let own = |closure: *const crate::closure::ClosureHeader| unsafe {
+        match crate::closure::shape::closure_own_prototype_by_shape(closure) {
             Some(value) => value,
-            None => {
-                if let Some(value) =
-                    crate::closure::closure_get_own_dynamic_prop(closure as usize, "prototype")
-                {
-                    return Some(value);
-                }
-                let value = crate::closure::closure_get_dynamic_prop(closure as usize, "prototype");
-                (value.to_bits() != crate::value::TAG_UNDEFINED).then_some(value)
-            }
+            None => crate::closure::closure_get_own_dynamic_prop(closure as usize, "prototype"),
         }
-    });
-    if let Some(existing) = existing {
+    };
+    if let Some(existing) = closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(own) {
         return Some(existing);
     }
-    ensure_generator_intrinsics();
-    // #7577: `js_object_alloc` below can run a copying minor, which moves both
-    // `%Generator.prototype%` (an ordinary heap object reached through a
-    // GC-rooted atomic the collector rewrites) and, once it exists, `obj`
-    // itself. `object_set_static_prototype` allocates too — `object_meta_ensure`
-    // mints a meta record — so `obj` was stale again by the time it was
-    // NaN-boxed for `closure_set_dynamic_prop`, and the `g.prototype` this
-    // returned was a from-space address. So: allocate first, root, and re-read
-    // the prototype from its rooted slot rather than caching it across.
-    let obj = js_object_alloc(0, 0);
-    if obj.is_null() {
+    // Unmaterialized: the function has no bag yet. Its bag is born with the
+    // declared slot holding the original prototype (`closure::props`).
+    let born = closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| unsafe {
+        let closure = closure as usize;
+        if !crate::closure::props::bag_of(closure).is_null() {
+            return false;
+        }
+        // The raw closure address is used across the bag birth.
+        let _no_move = crate::gc::GcSuppressScope::new();
+        crate::closure::props::bag_ensure(closure);
+        crate::closure::shape::refresh_closure_shape(closure);
+        true
+    });
+    if born {
+        if let Some(existing) = closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(own) {
+            return Some(existing);
+        }
+    }
+    // A bag that exists without the slot (a native constructor's installed
+    // bag): define the slot once, with its declared attributes.
+    let _ = kind;
+    let proto = closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
+        generator_original_prototype(closure as usize)
+    });
+    if !crate::value::JSValue::from_bits(proto.to_bits()).is_pointer() {
         return None;
     }
-    let obj_h = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(obj as i64));
+    let proto = scope.root_nanbox_f64(proto);
+    closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| unsafe {
+        let closure = closure as usize;
+        crate::closure::props::bag_define_data_with_attrs_bytes(
+            closure,
+            b"prototype",
+            proto.get_nanbox_f64(),
+            crate::closure::props::GENERATOR_PROTOTYPE_ATTRS.bits,
+        );
+        crate::closure::shape::refresh_closure_shape(closure);
+    });
+    Some(proto.get_nanbox_f64())
+}
 
+/// The original `prototype` of the generator function at `closure_ptr`:
+/// OrdinaryObjectCreate(%GeneratorPrototype%) (or the async one), with no own
+/// properties. Its bag's birth installs it in the declared slot. Allocates:
+/// the caller holds no unrooted pointer across it, or runs it in a no-move
+/// window (the bag birth). `undefined` for a non-generator closure.
+pub(crate) fn generator_original_prototype(closure_ptr: usize) -> f64 {
+    let Some(kind) = closure_generator_kind(closure_ptr) else {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    };
+    let scope = crate::gc::RuntimeHandleScope::new();
+    ensure_generator_intrinsics();
+    // #7577: `js_object_alloc` can run a copying minor, which moves both
+    // `%Generator.prototype%` (reached through a GC-rooted atomic the
+    // collector rewrites) and `obj`; `object_set_static_prototype` allocates
+    // too. Allocate first, root, and re-read the prototype from its slot.
+    let obj = js_object_alloc(0, 0);
+    if obj.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    let obj_h = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(obj as i64));
     let gen_proto = generator_prototype_ptr(matches!(kind, GeneratorKind::Async));
     if !gen_proto.is_null() {
         let proto_bits = crate::value::js_nanbox_pointer(gen_proto as i64).to_bits();
@@ -306,17 +344,7 @@ pub(crate) fn generator_function_prototype_of(closure_ptr: usize) -> Option<f64>
             proto_bits,
         );
     }
-    let obj_value = obj_h.get_nanbox_f64();
-    closure_h.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
-        let closure = closure as usize;
-        crate::closure::closure_set_dynamic_prop(closure, "prototype", obj_value);
-        super::super::set_builtin_property_attrs(
-            closure,
-            "prototype".to_string(),
-            super::super::PropertyAttrs::new(true, false, false),
-        );
-    });
-    Some(obj_h.get_nanbox_f64())
+    obj_h.get_nanbox_f64()
 }
 
 /// `%Generator.prototype%` / `%AsyncGenerator.prototype%` pointer (the object
@@ -463,6 +491,59 @@ fn generator_proto_method(
         ),
         None => bad_receiver(method),
     }
+}
+
+/// The `%GeneratorPrototype%` protocol operation a function value IS, read
+/// from its immutable info: the intrinsic's body identity is the whole proof
+/// (0 = next, 1 = return, 2 = throw). Any other callable answers `None`.
+fn intrinsic_sync_generator_op(method: f64) -> Option<f64> {
+    let method = JSValue::from_bits(method.to_bits());
+    if !method.is_pointer() {
+        return None;
+    }
+    let info = crate::closure::closure_info(method.as_pointer::<crate::closure::ClosureHeader>())?;
+    let code = info.code as usize;
+    if code == generator_proto_next_thunk as *const () as usize {
+        Some(0.0)
+    } else if code == generator_proto_return_thunk as *const () as usize {
+        Some(1.0)
+    } else if code == generator_proto_throw_thunk as *const () as usize {
+        Some(2.0)
+    } else {
+        None
+    }
+}
+
+/// Call(`method`, `iter`, « `arg` ») when `method` is an intrinsic sync
+/// generator protocol body and `iter` carries the sync generator brand: the
+/// call IS that record's resume, so enter it without the general callable
+/// dispatch or the thunk's receiver re-classification. The step comes back as
+/// its (value, kind) pair; no IteratorResult object exists unless the caller
+/// materializes one. `None` leaves the ordinary call to the caller. Decided
+/// per use by the receiver's shape and the method's info; nothing is
+/// remembered.
+///
+/// # Safety
+/// Ordinary call semantics: may run user code and collect. The caller holds
+/// no unrooted managed pointer across it.
+pub(crate) unsafe fn resume_intrinsic_sync_step(
+    iter: f64,
+    method: f64,
+    arg: f64,
+) -> Option<super::generator_state::FixedStep> {
+    let op = intrinsic_sync_generator_op(method)?;
+    let state = super::generator_state::fixed_generator_state(iter)?;
+    Some(super::generator_state::resume_fixed_step(state, op, arg))
+}
+
+/// The kind of the step [`resume_intrinsic_sync_step`] just took through the
+/// same (`iter`, `method`) pair, read from the record's own step control.
+/// `None` when that pair is not the intrinsic protocol on a branded record:
+/// the step was an ordinary call and returned its result object.
+pub(crate) fn intrinsic_sync_step_kind(iter: f64, method: f64) -> Option<u32> {
+    intrinsic_sync_generator_op(method)?;
+    let state = super::generator_state::fixed_generator_state(iter)?;
+    Some(unsafe { super::generator_state::fixed_step_kind(state) })
 }
 
 extern "C" fn generator_proto_next_thunk(

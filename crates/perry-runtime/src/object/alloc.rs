@@ -87,12 +87,52 @@ pub(crate) fn registered_class_keys_array(
 /// #1175: allocate an object whose `[[Prototype]]` is null. Same layout as
 /// `js_object_alloc`, but the `OBJ_FLAG_NULL_PROTO` bit is set on the GC
 /// header so `Object.getPrototypeOf` returns null instead of the heap
-/// pointer / synthesized proto. Used by `querystring.parse` to mirror Node's
-/// `Object.create(null)`-backed result and dodge prototype-pollution
-/// surprises.
+/// pointer / synthesized proto. A runtime record born here is not marked
+/// ordinary (a namespace, scope, resource or internal state record); a plain
+/// dictionary result uses [`js_object_alloc_null_proto_ordinary`].
 #[no_mangle]
 pub extern "C" fn js_object_alloc_null_proto(class_id: u32, field_count: u32) -> *mut ObjectHeader {
     super::alloc_basic::object_alloc_null_proto(class_id, field_count)
+}
+
+/// A plain-dictionary result with a null `[[Prototype]]` (Node builds it with
+/// `Object.create(null)`: `querystring.parse`, `Object.groupBy`, sqlite rows,
+/// `util.parseEnv`, `getHeaders()`): born ordinary, so its shape is the
+/// `Ordinary` kind with `PROTO_ID_NULL`, the same birth as
+/// `Object.create(null)`. Every key it ever holds is an own data property.
+#[no_mangle]
+pub extern "C" fn js_object_alloc_null_proto_ordinary(field_count: u32) -> *mut ObjectHeader {
+    super::alloc_basic::object_alloc_ordinary_null_proto(field_count)
+}
+
+/// Copy distinct UTF-8 keys and original values into a fresh null-prototype
+/// data object. The borrowed inputs stay valid throughout this callback-free
+/// birth; the existing bulk initializer publishes the final canonical shape.
+/// No JS pointer is retained outside the returned object's traced fields.
+///
+/// # Safety
+/// Each input array has `count` entries; every key is a valid distinct UTF-8
+/// byte span. Values are live NaN-boxed JS values on entry.
+#[no_mangle]
+pub unsafe extern "C" fn js_object_alloc_null_proto_entries(
+    keys: *const *const u8,
+    key_lengths: *const usize,
+    values: *const f64,
+    count: u32,
+) -> *mut ObjectHeader {
+    // The existing unpublished-object birth requires one non-collecting
+    // construction window. Dropping this guard only restores the policy;
+    // it does not run a deferred collection.
+    let _birth = crate::gc::GcSuppressScope::new();
+    let mut entries = Vec::with_capacity(count as usize);
+    for i in 0..count as usize {
+        let key = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            *keys.add(i),
+            *key_lengths.add(i),
+        ));
+        entries.push((key, *values.add(i)));
+    }
+    object_alloc_null_proto_with_key_attrs(&entries, &[])
 }
 
 /// A null-prototype object born holding `entries` as its own data properties,
@@ -134,7 +174,8 @@ pub(crate) unsafe fn object_alloc_null_proto_with_key_attrs_and_inline(
     debug_assert!(crate::gc::gc_is_suppressed());
     let count = entries.len() as u32;
     if count == 0 {
-        return js_object_alloc_null_proto(0, 0);
+        // The same ordinary birth the keyed path below marks.
+        return js_object_alloc_null_proto_ordinary(0);
     }
     // Under suppression the unpublished bag cannot move or be traced before
     // its final keys and live bound are stamped. Publish no empty predecessor.

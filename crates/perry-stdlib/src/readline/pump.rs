@@ -16,7 +16,7 @@ use super::*;
 /// rooted across the two string allocations: either one can trigger a
 /// moving minor GC that would otherwise leave `obj` pointing at from-space.
 fn build_keypress_object(name: &str, ctrl: bool, shift: bool, meta: bool, seq: &str) -> f64 {
-    use perry_runtime::object::{js_object_alloc_with_shape, js_object_set_field};
+    use perry_runtime::object::js_object_set_field;
     let scope = perry_runtime::gc::RuntimeHandleScope::new();
     let obj = unsafe {
         perry_runtime::object::runtime_layouts::perry_alloc_runtime_record(std::ptr::addr_of!(
@@ -356,6 +356,11 @@ fn stdin_eof_input_drained() -> bool {
 /// iteration. Returns the number of callbacks fired.
 #[no_mangle]
 pub extern "C" fn js_readline_process_pending() -> i32 {
+    // fd 0 and these queues belong to the primary agent (see
+    // `process_stdin_is_owned_here`); a worker's loop leaves them alone.
+    if !perry_runtime::os::process_stdin_is_owned_here() {
+        return 0;
+    }
     let mut fired: i32 = 0;
     route_pending_stdin_input();
 
@@ -623,6 +628,9 @@ pub extern "C" fn js_readline_process_pending() -> i32 {
 /// keep running.
 #[no_mangle]
 pub extern "C" fn js_readline_has_active() -> i32 {
+    if !perry_runtime::os::process_stdin_is_owned_here() {
+        return 0;
+    }
     // #3962: a TUI that tore down stdin (`process.stdin.destroy()/.pause()/
     // .unref()`) no longer pins the event loop, so the process can quiesce.
     if perry_runtime::os::stdin_is_detached() {

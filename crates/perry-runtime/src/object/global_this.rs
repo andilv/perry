@@ -35,6 +35,12 @@ mod generator;
 mod generator_state;
 mod install_static;
 mod math_temporal;
+
+// Complete namespace construction, reached through feature hooks.
+mod builtin_namespace;
+mod json_reflect_namespaces;
+mod math_namespace;
+
 mod object_intrinsic;
 mod populate;
 mod proto_methods;
@@ -90,8 +96,7 @@ pub(crate) use array_error::{
 };
 pub(crate) use bigint_promise::{
     array_from_thunk, array_is_array_thunk, array_of_thunk, bigint_as_int_n_thunk,
-    bigint_as_n_dispatch, bigint_as_uint_n_thunk, json_is_raw_json_thunk, json_parse_thunk,
-    json_raw_json_thunk, json_stringify_thunk, map_group_by_thunk, number_is_finite_thunk,
+    bigint_as_n_dispatch, bigint_as_uint_n_thunk, map_group_by_thunk, number_is_finite_thunk,
     number_is_integer_thunk, number_is_nan_thunk, number_is_safe_integer_thunk,
     number_parse_float_thunk, number_parse_int_thunk, object_assign_thunk, object_create_thunk,
     object_define_properties_thunk, object_define_property_thunk, object_entries_thunk,
@@ -101,14 +106,9 @@ pub(crate) use bigint_promise::{
     object_hasown_thunk, object_is_extensible_thunk, object_is_frozen_thunk,
     object_is_sealed_thunk, object_is_thunk, object_keys_thunk, object_prevent_extensions_thunk,
     object_seal_thunk, object_set_prototype_of_thunk, object_values_thunk,
-    promise_static_function_spec, reflect_apply_thunk, reflect_construct_thunk,
-    reflect_define_property_thunk, reflect_delete_property_thunk,
-    reflect_get_own_property_descriptor_thunk, reflect_get_prototype_of_thunk, reflect_get_thunk,
-    reflect_has_thunk, reflect_is_extensible_thunk, reflect_own_keys_thunk,
-    reflect_prevent_extensions_thunk, reflect_set_prototype_of_thunk, reflect_set_thunk,
-    regexp_escape_thunk, string_from_char_code_static, string_from_code_point_static,
-    string_raw_static, symbol_for_thunk, symbol_key_for_thunk, typed_array_from_thunk,
-    typed_array_of_thunk,
+    promise_static_function_spec, regexp_escape_thunk, string_from_char_code_static,
+    string_from_code_point_static, string_raw_static, symbol_for_thunk, symbol_key_for_thunk,
+    typed_array_from_thunk, typed_array_of_thunk,
 };
 pub use bigint_promise::{js_bigint_as_int_n_call, js_bigint_as_uint_n_call};
 pub use builtin_thunks::js_function_ctor_from_strings;
@@ -146,11 +146,11 @@ pub(crate) use fetch_globals::collect_before_global_this_alloc_for_test;
 #[cfg(feature = "temporal")]
 pub(crate) use fetch_globals::temporal_subclass_super;
 pub(crate) use fetch_globals::{
-    attach_fetch_handle_for_construction, global_this_blob_thunk, global_this_builtin_noop_thunk,
-    global_this_date_thunk, global_this_eval_thunk, global_this_file_thunk,
-    global_this_headers_thunk, global_this_is_materialized, global_this_request_thunk,
-    global_this_response_error_thunk, global_this_response_json_thunk,
-    global_this_response_redirect_thunk, global_this_response_thunk, is_thread_realm_global,
+    global_this_blob_thunk, global_this_builtin_noop_thunk, global_this_date_thunk,
+    global_this_eval_thunk, global_this_file_thunk, global_this_headers_thunk,
+    global_this_is_materialized, global_this_request_thunk, global_this_response_error_thunk,
+    global_this_response_json_thunk, global_this_response_redirect_thunk,
+    global_this_response_thunk, is_thread_realm_global,
 };
 pub use fetch_globals::{
     js_fetch_or_value_super, js_get_global_this, js_global_or_console_property_by_name,
@@ -161,22 +161,26 @@ pub(crate) use generator::append_async_function_root_snapshot;
 pub(crate) use generator::function_kind_prototype_unwritten;
 pub(crate) use generator::{
     ensure_generator_intrinsics, generator_function_constructor_of, generator_function_proto_of,
-    generator_function_prototype_of, set_intrinsic_data_prop, set_intrinsic_to_string_tag,
-    wire_function_intrinsic_parents,
+    generator_function_prototype_of, generator_original_prototype, set_intrinsic_data_prop,
+    set_intrinsic_to_string_tag, wire_function_intrinsic_parents,
 };
+pub(crate) use generator::{intrinsic_sync_step_kind, resume_intrinsic_sync_step};
 pub use generator::{js_generator_attach_closure_prototype, js_generator_attach_prototype};
 pub(crate) use generator_state::{
     call_generator_symbol_method, fixed_generator_state, install_class_symbol_method,
-    install_evaluation_generator_symbols,
+    install_evaluation_generator_symbols, STEP_DONE, STEP_INNER_RESULT,
+};
+pub(crate) use generator_state::{
+    generator_observe_record_prototype, generator_original_prototype_key,
+    generator_record_prototype_word,
 };
 pub use generator_state::{js_generator_create, js_generator_result, js_generator_set_slot};
 pub use install_static::js_promise_static_function_value;
 pub(crate) use install_static::{
     builtin_species_getter_thunk, install_atomics_namespace_members,
     install_builtin_constructor_statics, install_builtin_species_accessor,
-    install_constructor_static, install_json_namespace_members, install_noop_proto_methods,
-    install_proto_method, install_proto_method_alias, install_proto_method_rest,
-    install_proto_method_rest_with_length, install_reflect_namespace_members,
+    install_constructor_static, install_noop_proto_methods, install_proto_method,
+    install_proto_method_alias, install_proto_method_rest, install_proto_method_rest_with_length,
     subtle_crypto_decapsulate_bits_thunk, subtle_crypto_decapsulate_key_thunk,
     subtle_crypto_encapsulate_bits_thunk, subtle_crypto_encapsulate_key_thunk,
     url_pattern_exec_thunk, url_pattern_test_thunk, ConstructorStatics,
@@ -187,7 +191,8 @@ pub(crate) use math_temporal::install_temporal_namespace;
 pub(crate) use math_temporal::temporal_ctor_kind_impl;
 #[cfg(feature = "temporal")]
 pub(crate) use math_temporal::temporal_kind_prototype;
-pub(crate) use math_temporal::{install_math_namespace, temporal_ctor_kind};
+
+pub(crate) use math_temporal::temporal_ctor_kind;
 pub(crate) use object_intrinsic::{
     ensure_object_intrinsics, ensure_object_prototype_shape, object_intrinsics_for_realm,
     object_prototype_intrinsic_bits,

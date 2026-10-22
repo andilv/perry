@@ -23,6 +23,8 @@ mod bundle_ios;
 mod bundle_macos;
 mod compile_env;
 mod defines;
+mod module_aliases;
+mod module_prefixes;
 pub(crate) mod sync_program;
 // `pub(crate)` so `commands::deps` can reuse `cjs_wrap::detect`'s
 // comment/string masker for its source scans (D005) instead of duplicating a
@@ -31,9 +33,11 @@ pub(crate) mod cjs_wrap;
 mod codegen_steps;
 mod collect_modules;
 mod collect_modules_helpers;
+mod component_host;
 mod compressed_libs;
 mod embed;
 mod env_fold;
+mod export_analysis;
 mod fallback_diag;
 mod fn_infer;
 mod gc_effects_sidecar;
@@ -56,6 +60,7 @@ mod parse_cache;
 mod post_link;
 mod precompile_capture;
 mod program_facts;
+mod reach_report;
 mod reachability;
 mod size_report;
 mod solid_config;
@@ -194,9 +199,10 @@ pub fn run(
     verbose: u8,
 ) -> Result<CompileResult> {
     // Cross-module metadata can require a complete second lowering pass.
-    // Retain parsed ASTs for the lifetime of this build so large source-first
-    // graphs do not reread and reparse every module during that pass.
-    let mut parse_cache = ParseCache::with_capacity(usize::MAX);
+    // Retain parsed ASTs through lowering so large source-first graphs do not
+    // reread and reparse every module during that pass. The driver releases
+    // this batch cache once the final lowering pass is complete.
+    let mut parse_cache = ParseCache::for_batch();
     let result = run_with_parse_cache(args, Some(&mut parse_cache), format, use_color, verbose)?;
     // Batch builds retain a parse cache too. Report their object-cache
     // statistics here, as dev does for its separate long-lived parse cache.

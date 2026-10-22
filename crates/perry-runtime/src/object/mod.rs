@@ -60,10 +60,10 @@ pub use spread::js_object_spread_fresh;
 mod spread_tests;
 pub use alloc::{
     js_object_alloc, js_object_alloc_fast, js_object_alloc_fast_with_parent,
-    js_object_alloc_null_proto, js_object_alloc_plain, js_object_alloc_with_parent,
+    js_object_alloc_null_proto, js_object_alloc_null_proto_entries,
+    js_object_alloc_null_proto_ordinary, js_object_alloc_plain, js_object_alloc_with_parent,
     js_object_coerce,
 };
-#[cfg(feature = "regex-engine")]
 pub(crate) use alloc_basic::object_alloc_plain_born;
 pub(crate) use alloc_basic::{
     object_alloc_born, object_alloc_branded, object_alloc_plain, object_alloc_unpublished,
@@ -295,8 +295,8 @@ pub(crate) mod regex_read_sites;
 mod spill;
 pub(crate) use spill::{
     learned_inline_field_count, learned_inline_fields_hot_addr, overflow_get, overflow_set,
-    reserve_object_spill, spill_get_present, spill_reserve_claimed,
-    spill_store_would_be_in_capacity, SPILL_MAX_FIELD_INDEX,
+    reserve_object_spill, spill_reserve_claimed, spill_store_would_be_in_capacity,
+    SPILL_MAX_FIELD_INDEX,
 };
 #[cfg(test)]
 pub(crate) use spill::{
@@ -393,8 +393,6 @@ pub use class_meta_registry::{
     js_register_class_has_instance, js_register_class_to_string_tag,
 };
 #[cfg(test)]
-pub(crate) use descriptor_state::set_builtin_accessor_pair;
-#[cfg(test)]
 pub(crate) use descriptor_state::test_may_have_descriptor_entry;
 pub(crate) use descriptor_state::{
     accessor_descriptor_keys_for_obj, class_instance_set_may_intercept, clear_accessor_descriptor,
@@ -407,6 +405,8 @@ pub(crate) use descriptor_state::{
     set_builtin_property_attrs, set_property_attrs, AccessorDescriptor, PropertyAttrs,
 };
 #[cfg(test)]
+pub(crate) use field_get_set::private_lexical_brand_depth;
+#[cfg(test)]
 pub(crate) use field_get_set::private_member_access_hints_depth;
 pub(crate) use field_get_set::FieldLookupCaches;
 pub(crate) use field_get_set::{
@@ -416,14 +416,15 @@ pub(crate) use field_get_set::{
     private_member_access_hints_check_marks, private_member_access_hints_unwind_to,
     scan_private_lexical_brand_roots_mut,
 };
-pub(crate) use field_get_set::{private_lexical_brand_depth, private_lexical_brand_truncate};
+#[cfg(test)]
+pub(crate) use this_binding::static_private_owner_push_at;
 pub(crate) use this_binding::{
     derived_super_binding_check_marks, derived_super_binding_len, derived_super_binding_truncate,
     derived_super_binding_unwind_to, new_target_restore_after_throw,
     scan_dispatch_binding_roots_mut, static_private_owner_check_marks,
     static_private_owner_current, static_private_owner_pop, static_private_owner_push,
-    static_private_owner_push_at, static_private_owner_unwind_to, static_this_arm,
-    static_this_arm_if_unarmed, static_this_disarm, SuperNewTargetScope,
+    static_private_owner_unwind_to, static_this_arm, static_this_arm_if_unarmed,
+    static_this_disarm, SuperNewTargetScope,
 };
 #[cfg(test)]
 pub(crate) use this_binding::{derived_super_scope_push_at, static_private_owner_depth};
@@ -939,25 +940,14 @@ pub(crate) struct TransitionEntry {
 // SAFETY: all integer fields; `key_ptr == 0` is the miss (#11507).
 unsafe impl crate::zeroed_cache::ZeroEmpty for TransitionEntry {}
 
-/// ── Emitted transition-IC ABI (#9287) ──────────────────────────────────────
+/// Transition-entry layout and packed-key contract.
 ///
-/// The emitted per-site transition hit probes THIS cache inline: hash the
-/// (prev ShapeId, key id) pair exactly as `transition_cache_slot` does —
-/// key id per `transition_key_id`'s content namespace, computable call-free
-/// from a FRESH string — load the entry, compare (including the length
-/// marker), and on a match perform the stamp + slot store with zero calls. Everything the emitted
-/// code depends on is fixed here and pinned by
-/// `emitted_transition_probe_matches_runtime_slot` below:
-///
-/// * the entry layout (`#[repr(C)]`, 32 bytes, field offsets 0/8/16/20/24/28),
-/// * the two hash multipliers and the `key id >> 3` pre-shift,
-/// * `transition_key_id`'s content rule (LE u64 of the first 6..=8 bytes),
-/// * the table size/mask.
-///
-/// The table lives in thread-local state (`ObjectHotTables`), and worker
-/// threads each have their own — so the emitted code takes the base from
-/// `perry_transition_cache_base()` ONCE per function/loop preheader, never
-/// from a link-time constant.
+/// The entry layout is fixed (`#[repr(C)]`, 32 bytes, offsets 0/8/16/20/24/28).
+/// Packed 6..=8-byte keys retain their existing little-endian identity and a
+/// length marker. Slot placement mixes all payload bytes and the marker;
+/// interned-pointer keys use their content hash. Every hit still checks the
+/// full identity. The earlier emitted inline transition probe has been
+/// replaced by runtime dispatch; no generated pointer-bit hash remains.
 pub const TRANSITION_HASH_MUL_SHAPE: u64 = 0x9E3779B97F4A7C15;
 pub const TRANSITION_HASH_MUL_KEY: u64 = 0xC6BC279692B5C323;
 pub const TRANSITION_ENTRY_SIZE: usize = 32;
@@ -977,13 +967,6 @@ pub extern "C" fn js_transition_ic_probe_report() {
 }
 
 const TRANSITION_CACHE_SIZE: usize = 16384;
-/// Mask for slot computation: TRANSITION_CACHE_SIZE - 1
-///
-/// #854: kept alongside the size constant so future cache-resizing edits
-/// touch both in one place. Codegen-emitted slot-index expressions match
-/// against this value even when no Rust path consults it directly.
-#[allow(dead_code)]
-const TRANSITION_CACHE_MASK: usize = TRANSITION_CACHE_SIZE - 1;
 crate::perry_thread_local! {
     /// #9754: transition-cache slots whose `key_ptr` / `next_keys` may still be
     /// acted on by a minor (see `gc/young_log.rs`); a minor-scoped
@@ -1119,11 +1102,64 @@ fn transition_key_id(key: *const crate::StringHeader) -> (usize, u32) {
 
 const TRANSITION_SLOT_IDX_MASK: u32 = 0x00FF_FFFF;
 
+/// Hash only stable key properties. The namespace changes how identity is
+/// checked, but an interned address must never select a table slot.
 #[inline(always)]
-fn transition_cache_slot(prev_shape_id: u32, key_id: usize) -> usize {
+fn transition_cache_slot(prev_shape_id: u32, key_id: usize, namespace: u32) -> usize {
+    let hash = match namespace {
+        0 => interned_key_slot_hash(key_id),
+        spread::SPREAD_TRANSITION_NAMESPACE => key_id as u64,
+        // Packed keys have no alignment bits. Include the length so a
+        // zero-padded shorter name is not forced to alias a longer one.
+        _ => key_id as u64 ^ (u64::from(namespace) << 56),
+    };
     let mixed = (prev_shape_id as u64).wrapping_mul(TRANSITION_HASH_MUL_SHAPE)
-        ^ ((key_id >> 3) as u64).wrapping_mul(TRANSITION_HASH_MUL_KEY);
-    (mixed as usize) & (TRANSITION_CACHE_SIZE - 1)
+        ^ hash.wrapping_mul(TRANSITION_HASH_MUL_KEY);
+    // Multiplicative hashing selects the high bits: low-bit masking would
+    // ignore a packed key's later bytes (e.g. literal/literals), forcing
+    // those edges to evict one another at every construction.
+    (mixed >> (64 - TRANSITION_CACHE_SIZE.trailing_zeros())) as usize
+}
+
+/// A content hash selects a bucket; canonical-pointer equality still proves
+/// the key. Property atoms use the hash stored after their payload. Legacy
+/// interned strings hash every immutable byte in full-width chunks: replaying
+/// byte-at-a-time FNV at each slot probe dominates their transition fast path.
+#[inline(always)]
+fn interned_key_slot_hash(key_ptr: usize) -> u64 {
+    if key_ptr == 0 {
+        return 0;
+    }
+    unsafe {
+        let key = key_ptr as *const crate::StringHeader;
+        let hash = if crate::string::is_property_atom(key) {
+            crate::string::property_atom_hash(key)
+        } else {
+            legacy_key_slot_hash(key)
+        };
+        hash ^ (hash >> 32)
+    }
+}
+
+/// A slot digest for legacy strings, which have no stored creation hash.
+/// Word and tail reads stay within byte_len; the length and every payload
+/// byte participate. This does not change interning or key identity.
+#[inline]
+unsafe fn legacy_key_slot_hash(key: *const crate::StringHeader) -> u64 {
+    let len = (*key).byte_len as usize;
+    let data = crate::string::string_data(key);
+    let mut h = 0xcbf29ce484222325u64 ^ len as u64;
+    let mut offset = 0;
+    while len - offset >= 8 {
+        let word = u64::from_le(std::ptr::read_unaligned(data.add(offset).cast::<u64>()));
+        h = (h ^ word).wrapping_mul(0x100000001b3);
+        offset += 8;
+    }
+    while offset < len {
+        h = (h ^ u64::from(*data.add(offset))).wrapping_mul(0x100000001b3);
+        offset += 1;
+    }
+    h
 }
 
 /// #6006: verify the cached transition edge really adds `key` at `slot_idx`,
@@ -1185,7 +1221,7 @@ fn transition_cache_lookup(
     interned_key: *const crate::StringHeader,
 ) -> Option<(ObjectKeys, u32, u32)> {
     let (kid, len_marker) = transition_key_id(interned_key);
-    let slot = transition_cache_slot(prev_shape_id, kid);
+    let slot = transition_cache_slot(prev_shape_id, kid, len_marker);
     let entry = with_transition_cache(|t| unsafe { (*t)[slot] });
     if entry.next_keys != 0
         && entry.prev_shape_id == prev_shape_id
@@ -1345,7 +1381,7 @@ fn transition_cache_insert(
         return;
     }
     let (kid, len_marker) = transition_key_id(interned_key);
-    let slot = transition_cache_slot(prev_shape_id, kid);
+    let slot = transition_cache_slot(prev_shape_id, kid, len_marker);
     let mut target_len = 0;
     unsafe {
         if slot_idx < TRANSITION_CACHE_EAGER_SHARE_MAX_SLOT
@@ -1770,7 +1806,9 @@ unsafe fn set_object_keys_with_live_rep(
         && shapes::object_shape_descriptor(obj).is_some_and(|d| d.hole_count == 0)
     {
         layout_desc::note_install_cause(layout_desc::install_cause::UNIQUE_RUN);
-        overflow::ensure(obj);
+        // The key just appended is being added: its value is stored after
+        // this publication, so its slot may still hold the hole.
+        overflow::ensure_adding(obj, Some(keys.count() - 1));
         canonical_keys::note_latched_away(keys);
     }
 }
@@ -1813,3 +1851,6 @@ pub(crate) use packed_keys::packed_key_names;
 pub(crate) use iterator_prototypes::array_record_close_is_absent;
 #[cfg(test)]
 mod record_layout_tests;
+
+#[cfg(test)]
+mod address_free_slots_tests;

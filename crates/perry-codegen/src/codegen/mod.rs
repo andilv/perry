@@ -29,10 +29,12 @@
 //! Anything else (objects, arrays, classes, closures, async, imports, …)
 //! errors with an actionable "Phase X not yet supported" message.
 
+pub mod reach_report;
+
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -48,59 +50,98 @@ pub(super) struct CompileProgress {
     started: Instant,
     last_checkpoint: Cell<Instant>,
     phase: Arc<AtomicU8>,
-    stop: Arc<AtomicBool>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    /// This module's row in the heartbeat's in-flight list.
+    ticket: Option<u64>,
     module: String,
+    stage: &'static str,
+}
+
+/// Every module in a codegen stage right now, for the one heartbeat thread.
+/// A stage that runs long names itself even when its module is too small for
+/// detailed progress: a births pre-pass once ran for an hour with no output.
+struct InFlight {
+    next: u64,
+    modules: Vec<(u64, String, &'static str, Instant, Arc<AtomicU8>)>,
+}
+
+static IN_FLIGHT: Mutex<InFlight> = Mutex::new(InFlight {
+    next: 0,
+    modules: Vec::new(),
+});
+static HEARTBEAT: Once = Once::new();
+
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
+
+fn start_heartbeat() {
+    HEARTBEAT.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("perry-progress".into())
+            .spawn(|| loop {
+                std::thread::sleep(HEARTBEAT_EVERY);
+                let in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+                for (_, module, stage, started, phase) in &in_flight.modules {
+                    let elapsed = started.elapsed();
+                    if elapsed < HEARTBEAT_EVERY {
+                        continue;
+                    }
+                    let label = match phase.load(Ordering::Relaxed) {
+                        0 => "lowering HIR",
+                        1 => "finalizing generated IR",
+                        2 => "partitioning/freezing/LLVM codegen",
+                        3 => "releasing generated IR",
+                        _ => "LLVM optimization and object emission",
+                    };
+                    eprintln!(
+                        "[perry] codegen: {module}: {stage}: {label}, elapsed {:.1} min",
+                        elapsed.as_secs_f64() / 60.0
+                    );
+                }
+            });
+        // Progress is diagnostic: a compile without a heartbeat still compiles.
+        drop(spawned);
+    });
 }
 
 impl CompileProgress {
-    fn new(module: &str, callables: usize) -> Self {
+    fn new(module: &str, callables: usize, births: bool) -> Self {
         let progress_mode = std::env::var("PERRY_CODEGEN_PROGRESS").unwrap_or_default();
         // Avoid three status lines for every tiny module in dependency-heavy
         // projects. Long modules get automatic reporting; `=all` is the
         // diagnostic override when per-module detail is wanted regardless.
+        // The heartbeat covers every module whenever progress is on.
         let enabled = progress_mode == "all" || (progress_mode == "1" && callables >= 1_000);
+        let stage = if births {
+            "births pre-pass"
+        } else {
+            "lowering"
+        };
         let started = Instant::now();
         let phase = Arc::new(AtomicU8::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
         if enabled {
-            eprintln!("[perry] codegen: lowering {module} ({callables} callables)");
+            eprintln!("[perry] codegen: {stage} {module} ({callables} callables)");
         }
-        let worker = enabled.then(|| {
-            let phase = Arc::clone(&phase);
-            let stop = Arc::clone(&stop);
-            let module = module.to_string();
-            std::thread::Builder::new()
-                .name("perry-progress".into())
-                .spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        std::thread::park_timeout(Duration::from_secs(30));
-                        if stop.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let label = match phase.load(Ordering::Relaxed) {
-                            0 => "lowering HIR",
-                            1 => "finalizing generated IR",
-                            2 => "partitioning/freezing/LLVM codegen",
-                            3 => "releasing generated IR",
-                            _ => "LLVM optimization and object emission",
-                        };
-                        eprintln!(
-                            "[perry] codegen: {module}: {label}, elapsed {:.1} min",
-                            started.elapsed().as_secs_f64() / 60.0
-                        );
-                    }
-                })
-                .expect("spawn Perry progress reporter")
+        let ticket = matches!(progress_mode.as_str(), "1" | "all").then(|| {
+            start_heartbeat();
+            let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let ticket = in_flight.next;
+            in_flight.next += 1;
+            in_flight.modules.push((
+                ticket,
+                module.to_string(),
+                stage,
+                started,
+                Arc::clone(&phase),
+            ));
+            ticket
         });
         Self {
             enabled,
             started,
             last_checkpoint: Cell::new(started),
             phase,
-            stop,
-            worker,
+            ticket,
             module: module.to_string(),
+            stage,
         }
     }
 
@@ -159,15 +200,18 @@ impl CompileProgress {
 
 impl Drop for CompileProgress {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            worker.thread().unpark();
-            let _ = worker.join();
+        if let Some(ticket) = self.ticket {
+            IN_FLIGHT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .modules
+                .retain(|(t, ..)| *t != ticket);
         }
         if self.enabled {
             eprintln!(
-                "[perry] codegen: {}: stage finished in {:.1}s",
+                "[perry] codegen: {}: {} finished in {:.1}s",
                 self.module,
+                self.stage,
                 self.started.elapsed().as_secs_f64()
             );
         }
@@ -227,6 +271,8 @@ mod literal_method_this_tests;
 mod ordinary_method_artifacts;
 pub mod split_regions;
 #[cfg(test)]
+mod split_regions_literal_tests;
+#[cfg(test)]
 mod split_regions_tests;
 #[cfg(test)]
 mod string_accumulator_tests;
@@ -239,7 +285,7 @@ pub use helpers::{set_worker_entries, worker_entries};
 pub(crate) mod accessor_numeric;
 pub(crate) mod global_transfer;
 pub(crate) mod inherited_accessors;
-mod literal_constructor;
+pub(crate) mod literal_constructor;
 mod method;
 mod method_registry;
 mod method_trampolines;
@@ -290,7 +336,6 @@ mod testing_feature_gate_tests;
 mod trusted_box_callback_tests;
 mod typed_abi;
 mod typed_abi_opt_report;
-pub(crate) mod typed_body;
 mod typed_entry;
 pub(crate) use typed_entry::{emit_plain_number_bits_test, emit_plain_number_test};
 #[cfg(test)]
@@ -332,8 +377,8 @@ use function::{
     compile_typed_i32_function, compile_typed_string_function,
 };
 use helpers::{
-    collect_return_class, emit_buffer_alias_metadata, function_body_returns_generator_object,
-    sanitize, scoped_method_name,
+    collect_return_class, emit_buffer_alias_metadata, function_body_is_fixed_state_generator,
+    function_body_returns_generator_object, sanitize, scoped_method_name,
 };
 
 // Collector and boxing-analysis walkers live in dedicated modules. The
@@ -510,6 +555,8 @@ fn lower_module(
     opts: CompileOptions,
     births: Option<&mut Vec<ModuleBirth>>,
 ) -> Result<Option<LoweredModule>> {
+    let reach_census = reach_report::active();
+    let _reach_scope = reach_census.as_ref().map(|_| reach_report::enter_module());
     let collect_births = births.is_some();
     // No family facts of a previous module on this thread reach this one's
     // early analyses; this module's are installed once its births are known.
@@ -535,7 +582,7 @@ fn lower_module(
         || !opts.thread_literal_module_prefixes.is_empty()
         || local_thread_use;
     let agent_strings_tls = opts.program_has_worker || thread_agents;
-    let progress = CompileProgress::new(&hir.name, module_callable_count(hir));
+    let progress = CompileProgress::new(&hir.name, module_callable_count(hir), collect_births);
     let triple = opts.target.clone().unwrap_or_else(default_target_triple);
     // ConstFn lanes are one decision for the whole compile, from its options.
     let constfn_enabled = static_constfn::enabled(&opts);
@@ -1209,6 +1256,8 @@ fn lower_module(
     let mut local_async_funcs: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut local_generator_funcs: std::collections::HashSet<u32> =
         std::collections::HashSet::new();
+    let mut fixed_generator_funcs: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
     let mut funcs_reading_dynamic_this: std::collections::HashSet<u32> =
         std::collections::HashSet::new();
     for f in &hir.functions {
@@ -1221,6 +1270,9 @@ fn lower_module(
         }
         if function_body_returns_generator_object(&f.body) {
             local_generator_funcs.insert(f.id);
+            if function_body_is_fixed_state_generator(&f.body) {
+                fixed_generator_funcs.insert(f.id);
+            }
         }
         if perry_hir::analysis::body_reads_dynamic_this(&f.body) {
             funcs_reading_dynamic_this.insert(f.id);
@@ -1323,14 +1375,9 @@ fn lower_module(
             .map(|(_, p, ext, fields)| (fields.clone(), ext.clone(), p.clone()))
     };
 
-    // Distinct source class names can `sanitize()` to the SAME symbol — e.g.
-    // `$X` and `_X` both become `_X` (minified bundles use `$`/`_` heavily).
-    // Two such classes are genuinely different (different shapes), so each needs
-    // its OWN keys-global; emitting `@perry_class_keys_<prefix>__<sanitized>`
-    // twice makes clang reject the IR ("redefinition of global"). Track every
-    // emitted name and disambiguate collisions with a numeric suffix. The
-    // (real-name-keyed) `class_keys_globals_map` stores the unique name, so every
-    // `new ClassName()` site still resolves to the right global.
+    // Source components use the injective encoder. Reserve a distinct global
+    // for any repeated internal class name; the real-name keyed map carries
+    // that selected global to allocation sites and capability harvesting.
     let mut used_class_keys_globals: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     for c in &hir.classes {
@@ -1644,6 +1691,22 @@ fn lower_module(
             typed_layout.raw_f64_mask_words,
             typed_layout.pointer_mask_words,
         ));
+    }
+    // Every key a class key list above names is one of this module's pool
+    // literals. A key text's image literal is the program's atom of that text
+    // (`js_string_register_property_atom`), and read sites pass the image
+    // itself. The lists are built in this module's string init, which can run
+    // before the module whose pool holds the text (an imported class's keys
+    // are built by the importer, which initializes first); the runtime then
+    // minted a second atom for the text, which the objects' key lists held and
+    // no read site passed (zod's `spa` under a marked import: the probe
+    // answered absent and `this.spa.bind(this)` threw). As this module's own
+    // literal, the key's image is registered as the atom before any list
+    // holds it.
+    for (_, packed_keys, _, _, _) in &class_keys_init_data {
+        for key in packed_keys.split('\0').filter(|k| !k.is_empty()) {
+            strings.intern(key);
+        }
     }
 
     // Derive __platform__ number from target triple:
@@ -2860,14 +2923,15 @@ fn lower_module(
         class_hierarchy: class_hierarchy::ClassHierarchy::default(),
         namespace_imports: opts.namespace_imports.iter().cloned().collect(),
         namespace_member_nested: opts.namespace_member_nested.iter().cloned().collect(),
+        cjs_interop_namespaces: opts.cjs_interop_namespaces.iter().cloned().collect(),
         namespace_member_prefixes: opts.namespace_member_prefixes,
         namespace_member_origin_names: opts.namespace_member_origin_names,
         imported_async_funcs: opts.imported_async_funcs,
         short_spread_method_candidates: Arc::clone(&opts.short_spread_method_candidates),
-        program_class_accessor_names: opts.program_class_accessor_names.clone(),
         object_literal_method_candidates: Arc::clone(&opts.object_literal_method_candidates),
         local_async_funcs,
         local_generator_funcs,
+        fixed_generator_funcs,
         async_step_closures: hir.async_step_closures.iter().copied().collect(),
         module_global_proven_types: std::collections::HashMap::new(),
         module_global_transfers: std::collections::HashMap::new(),
@@ -2900,7 +2964,7 @@ fn lower_module(
             .iter()
             .map(|ic| {
                 let effective_name = ic.effective_name();
-                let ctor_name = format!("{}__{}_constructor", ic.source_prefix, ic.name);
+                let ctor_name = crate::symbol_names::constructor(&ic.source_prefix, &ic.name);
                 (
                     effective_name,
                     ImportedCtor {
@@ -3172,6 +3236,7 @@ fn lower_module(
         deferred_module_prefixes: opts.deferred_module_prefixes.clone(),
         module_init_deps: opts.module_init_deps.clone(),
         is_dynamic_import_target: opts.is_dynamic_import_target,
+        namespace_adopts_cjs_exports: opts.namespace_adopts_cjs_exports,
     };
 
     let module_globals_emit::ModuleGlobals {
@@ -3412,9 +3477,9 @@ fn lower_module(
                     format!("closure_func_id={func_id}"),
                     format!(
                         "symbol={}",
-                        typed_f64_closure_name(&format!(
-                            "perry_closure_{}__{}",
-                            module_prefix, func_id
+                        typed_f64_closure_name(&crate::symbol_names::closure(
+                            &module_prefix,
+                            func_id
                         ))
                     ),
                 ],
@@ -3442,9 +3507,9 @@ fn lower_module(
                     format!("closure_func_id={func_id}"),
                     format!(
                         "symbol={}",
-                        typed_i1_closure_name(&format!(
-                            "perry_closure_{}__{}",
-                            module_prefix, func_id
+                        typed_i1_closure_name(&crate::symbol_names::closure(
+                            &module_prefix,
+                            func_id
                         ))
                     ),
                 ],
@@ -3472,9 +3537,9 @@ fn lower_module(
                     format!("closure_func_id={func_id}"),
                     format!(
                         "symbol={}",
-                        typed_i32_closure_name(&format!(
-                            "perry_closure_{}__{}",
-                            module_prefix, func_id
+                        typed_i32_closure_name(&crate::symbol_names::closure(
+                            &module_prefix,
+                            func_id
                         ))
                     ),
                 ],
@@ -3504,9 +3569,9 @@ fn lower_module(
                     format!("closure_func_id={func_id}"),
                     format!(
                         "symbol={}",
-                        typed_string_closure_name(&format!(
-                            "perry_closure_{}__{}",
-                            module_prefix, func_id
+                        typed_string_closure_name(&crate::symbol_names::closure(
+                            &module_prefix,
+                            func_id
                         ))
                     ),
                 ],
@@ -4018,22 +4083,9 @@ fn lower_module(
             let Some(f) = func_by_id.get(func_id) else {
                 continue;
             };
-            // NOTE: do NOT early-skip when `f.name == exported_name`. The real
-            // body is emitted under `scoped_fn_name` (the INJECTIVE
-            // `sanitize_member`), but cross-module callers and the #461
-            // undefined-stub / #836 verbatim-alias paths compute the symbol via
-            // plain `sanitize`. For a non-plain name like `$constructor`
-            // (`export function $constructor` in zod core, #5431) those two
-            // manglings diverge — body at `perry_fn_<mod>__u__24constructor`,
-            // callers at `perry_fn_<mod>___constructor` — even though local ==
-            // exported. Without a forwarding alias the #461 loop below claims
-            // `_constructor` with an undefined-returning stub and every
-            // cross-module call resolves to it (function reference is fine,
-            // every CALL returns `undefined`). The `alias_sym == target_sym`
-            // check below is the correct guard: it skips the plain-name case
-            // (where both manglings agree) while still emitting the alias when
-            // they differ.
-            let alias_sym = format!("perry_fn_{}__{}", module_prefix, sanitize(exported_name));
+            // Publish the exported spelling through the same constructor used
+            // by importers. The function registry owns the local body symbol.
+            let alias_sym = crate::symbol_names::function(&module_prefix, &exported_name);
             let target_sym = match func_names.get(func_id) {
                 Some(s) => s.clone(),
                 None => continue,
@@ -4117,7 +4169,7 @@ fn lower_module(
             })
             .collect();
         for exported in stub_targets {
-            let stub_sym = format!("perry_fn_{}__{}", module_prefix, sanitize(&exported));
+            let stub_sym = crate::symbol_names::function(&module_prefix, &exported);
             if llmod.has_function(&stub_sym) {
                 continue;
             }
@@ -4284,6 +4336,11 @@ fn lower_module(
         .native_rep_records
         .extend(typed_clone_rejection_records);
 
+    if let Some(census) = &reach_census {
+        census.bind_namespace_getters(&hir.name, &module_prefix, &opts.namespace_entries);
+        census.capture(&hir.name, &llmod)?;
+    }
+
     progress.phase(1, "lowering complete; releasing HIR and analyses");
     // Return only emission inputs: every lowering analysis, borrowed callable,
     // CJS HIR copy, string-pool index and CompileOptions graph dies here.
@@ -4400,6 +4457,9 @@ fn emit_lowered_module(lowered: LoweredModule) -> Result<Vec<u8>> {
         decide_codegen_units(callable_count, llmod.estimated_function_ir_bytes())
     };
     if n_units > 1 {
+        if opts.output_type == "executable" {
+            llmod.bind_generated_globals_to_image();
+        }
         progress.phase(2, &format!("partitioning into {n_units} codegen units"));
         if let Some(result) =
             try_native_units(&mut llmod, n_units, opts.target.as_deref(), &module_prefix)

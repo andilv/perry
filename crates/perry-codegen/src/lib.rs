@@ -8,6 +8,7 @@ mod array_storage;
 pub mod block;
 pub(crate) mod boxed_vars;
 pub(crate) mod builtin_proto;
+mod call_entry;
 pub(crate) mod closure_births;
 pub mod codegen;
 pub(crate) mod collectors;
@@ -132,7 +133,8 @@ pub use collectors::segview::{
 };
 // Object model step 3: the program-wide prototype-write census.
 pub use layout_desc::create_families::{
-    program_proto_exports, program_proto_exports_key, set_program_proto_exports,
+    name_computed_class_fields, program_proto_exports, program_proto_exports_key,
+    set_program_proto_exports,
 };
 pub use proto_constants::{program_proto_census_key, set_program_proto_census};
 // #11394: whole-program set of methods written onto a builtin prototype.
@@ -320,3 +322,6 @@ mod receiver_call_effect_tests;
 
 mod array_record_stack;
 mod lower_array_record_length;
+
+/// Canonical linker symbol constructors for JavaScript names.
+pub mod symbol_names;

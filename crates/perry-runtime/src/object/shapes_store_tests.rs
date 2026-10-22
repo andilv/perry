@@ -49,6 +49,7 @@ fn kind_codes_round_trip() {
         ShapeObjectKind::FunctionBoundApply,
         ShapeObjectKind::FunctionBound,
         ShapeObjectKind::OrdinaryNativeAlias,
+        ShapeObjectKind::OrdinaryUnmarkedNativeAlias,
         ShapeObjectKind::CallableOrdinary,
     ] {
         assert_eq!(kind as u8, kind.code() as u8, "kind cache decoding ordinal");
@@ -187,7 +188,9 @@ fn the_agent_directory_is_the_agent_slab_and_an_absent_id_reads_empty() {
         }
         // Growing a band's page vector moves its buffer: the directory
         // follows, and the records already there are still found.
-        let far = SITE_SHAPE_ID_END - 2;
+        // In the top group's plain-kind granule: the record has the default
+        // identity.
+        let far = SITE_SHAPE_ID_END - 3 * (1 << super::super::SHAPE_ID_KIND_SHIFT) - 2;
         let record = ShapeRecord::new(0, 0, 3, 0, ShapeObjectKind::Ordinary, 0).with_rep(0b01);
         // SAFETY: no slab reference is held.
         unsafe { table.slab_mut().insert(far, record) };
@@ -324,6 +327,7 @@ fn the_record_geometry_is_bounded_and_facts_key_is_o1() {
     assert_eq!(std::mem::size_of::<ShapeRecord>(), 120, "record grew");
     assert_eq!(std::mem::align_of::<ShapeRecord>(), 8, "record realigned");
     assert_eq!(std::mem::offset_of!(ShapeRecord, element_kind), 72);
+    assert_eq!(std::mem::offset_of!(ShapeRecord, evaluation_layout_of), 76);
     assert_eq!(std::mem::offset_of!(ShapeRecord, probe), 80);
     assert_eq!(std::mem::offset_of!(ShapeRecord, colour_mask), 88);
     assert_eq!(std::mem::offset_of!(ShapeRecord, colour_store_mask), 104);
@@ -924,7 +928,7 @@ fn created_birth_relationship_preserves_identity_and_rollback_edge() {
 #[test]
 fn mutable_key_lists_cannot_publish_symbol_absence() {
     let _gc = crate::gc::GcSuppressScope::new();
-    unsafe {
+    {
         let keys = crate::array::js_array_alloc(1);
         let text = crate::string::js_string_from_bytes(b"key".as_ptr(), 3);
         let keys = crate::array::js_array_push(keys, crate::JSValue::string_ptr(text));
@@ -967,6 +971,7 @@ fn plain_birth_validation_checks_presence_kind_and_width() {
         ShapeObjectKind::FunctionBoundApply,
         ShapeObjectKind::FunctionBound,
         ShapeObjectKind::OrdinaryNativeAlias,
+        ShapeObjectKind::OrdinaryUnmarkedNativeAlias,
     ] {
         let mut record = ShapeRecord::new(0, 0, 2, 0, kind, 0);
         assert_eq!(

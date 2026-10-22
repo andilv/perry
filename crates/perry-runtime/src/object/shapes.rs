@@ -62,9 +62,12 @@ pub(crate) use shapes_last_key_rollback::{
 mod shapes_linked_birth;
 #[path = "shapes_prototype.rs"]
 mod shapes_prototype;
+#[cfg(test)]
+pub(crate) use shapes_linked_birth::shape_is_evaluation_layout_of;
 pub(crate) use shapes_linked_birth::{
-    complete_layout_generation, declaration_parent_identity, mutation_generation,
-    pristine_declaration_holder, stamp_linked_final_shape, stamp_linked_final_shape_requested,
+    complete_layout_generation, declaration_parent_identity, evaluation_layout_family,
+    mutation_generation, note_evaluation_layout, pristine_declaration_holder,
+    stamp_linked_final_shape, stamp_linked_final_shape_requested,
 };
 #[path = "layout_probe.rs"]
 pub(crate) mod layout_probe;
@@ -75,13 +78,13 @@ mod shapes_slot_list;
 #[path = "shapes_store.rs"]
 mod shapes_store;
 pub(crate) use shapes_evaluation_brand::{
-    evaluation_holder_slot, object_evaluation_brand, stamp_evaluation_holder,
-    EVALUATION_HOLDER_BRAND,
+    evaluation_copy_birth_edges, evaluation_holder_slot, object_evaluation_brand,
+    prepare_evaluation_holder, stamp_evaluation_holder, EVALUATION_HOLDER_BRAND,
 };
 #[path = "shapes_worker_seed.rs"]
 mod shapes_worker_seed;
 #[cfg(test)]
-pub(crate) use shapes_prototype::{clear_class_identity_words, scan_shape_prototype_words_mut};
+pub(crate) use shapes_prototype::clear_class_identity_words;
 pub(crate) use shapes_prototype::{
     identity_prototype_word, identity_word_slot, identity_word_slot_in, note_full_trace_begin,
     proto_id_carries_word, prune_dead_shape_prototypes, shape_prototype_word, write_identity_word,
@@ -208,17 +211,6 @@ pub(crate) struct ShapeDescriptor {
 /// Shape identity is the FACTS, never the storage address. A descriptor value
 /// lifted out of the table compares equal to the record it came from.
 impl ShapeDescriptor {
-    /// Own data keys a receiver kind can synthesize outside its inline bag.
-    /// An absent bag slot cannot prove any of these keys absent. Function
-    /// bodies differ in whether they own `prototype`, so this is a conservative
-    /// set; methods on that key keep the ordinary property read.
-    pub(crate) fn implicit_own_keys(&self) -> &'static [&'static [u8]] {
-        match self.object_kind {
-            kind if kind.is_function_layout() => &[b"name", b"length", b"prototype"],
-            _ => &[],
-        }
-    }
-
     #[inline]
     pub(crate) fn constfn_infos(&self) -> &[shapes_store::ConstFnSlotInfo] {
         if self.extras == 0 {
@@ -314,6 +306,7 @@ impl ShapeRecordRef {
 
     /// Test a brand in this already-proved live record, without another probe.
     #[inline]
+    #[allow(dead_code)] // complete ShapeRecordRef accessor set
     pub(crate) fn has_brand(self, brand: u64) -> bool {
         unsafe { (*self.0.as_ptr()).brands().binary_search(&brand).is_ok() }
     }
@@ -414,7 +407,14 @@ impl ShapeRecordRef {
     /// asked before any per-key attribute lookup.
     #[inline]
     pub(crate) fn element_kind(self) -> u64 {
-        unsafe { (*self.0.as_ptr()).element_kind }
+        unsafe { u64::from((*self.0.as_ptr()).element_kind) }
+    }
+
+    /// The class family layout this record is an evaluation copy of, or 0
+    /// (`shapes_linked_birth::evaluation_layout_family`).
+    #[inline]
+    pub(crate) fn evaluation_layout_of(self) -> u32 {
+        unsafe { (*self.0.as_ptr()).evaluation_layout_of }
     }
 
     pub(crate) fn summary(self) -> u8 {
@@ -516,6 +516,7 @@ impl ShapeRecordRef {
 
     /// Stable representation-word address. A persistent borrower must own
     /// this ShapeId as a cache carrier so full-trace pruning retains its slab.
+    #[allow(dead_code)] // complete ShapeRecordRef accessor set
     pub(crate) fn rep_address(self) -> usize {
         self.rep_word() as *const std::sync::atomic::AtomicU64 as usize
     }
@@ -679,35 +680,6 @@ pub(crate) fn test_position_bound_of(obj: *const crate::object::ObjectHeader) ->
     shape_record_by_id(id).map(|r| unsafe { (*r.0.as_ptr()).position_bound() })
 }
 
-/// Walk every present record of this agent's slab: `(records, positional,
-/// ordinary records with an accessor key, disagreements)`, where a
-/// disagreement is a record whose stored POSBOUND differs from
-/// [`ShapeRecord::position_bound_by_facts`].
-#[cfg(test)]
-pub(crate) fn test_positional_census() -> (usize, usize, usize, Vec<u32>) {
-    let table = &crate::state::state().shapes;
-    let (mut n, mut positional, mut accessor, mut bad) = (0usize, 0usize, 0usize, Vec::new());
-    table.slab().for_each(|id, p| {
-        let r = unsafe { &*p };
-        if !r.present() {
-            return;
-        }
-        n += 1;
-        if r.stored_position_bound() > 0 {
-            positional += 1;
-        }
-        if r.object_kind().is_ordinary_layout()
-            && r.summary() & crate::object::key_attrs::SUMMARY_ACCESSOR != 0
-        {
-            accessor += 1;
-        }
-        if r.stored_position_bound() != r.position_bound_by_facts() {
-            bad.push(id);
-        }
-    });
-    (n, positional, accessor, bad)
-}
-
 /// `(stored POSBOUND, its definition)` for shape `id`.
 #[cfg(test)]
 pub(crate) fn test_positional_of_id(id: u32) -> Option<(u32, u32)> {
@@ -723,12 +695,6 @@ pub(crate) fn test_positional_of_id(id: u32) -> Option<(u32, u32)> {
 #[inline]
 pub(crate) fn ordinary_dir_addr() -> *const u8 {
     ShapeSlab::ordinary_dir_addr()
-}
-
-/// The position bound of shape `id` (S3c), or `None` when it names no record.
-#[cfg(test)]
-pub(crate) fn test_position_bound_of_id(id: u32) -> Option<u32> {
-    shape_record_by_id(id).map(|r| unsafe { (*r.0.as_ptr()).position_bound() })
 }
 
 /// [`positional_key_words`] for the computed-key read
@@ -912,9 +878,20 @@ pub(crate) enum ShapeObjectKind {
     /// Ordinary ObjectHeader slots with a birth-declared [[Call]] method.
     /// Unlike Function kinds, this is not a ClosureHeader allocation.
     CallableOrdinary,
+    /// Runtime-born ordinary storage with native read forwarding, without
+    /// the plain-store admission carried by OrdinaryNativeAlias.
+    OrdinaryUnmarkedNativeAlias,
 }
 
 impl ShapeObjectKind {
+    #[inline]
+    pub(crate) fn is_native_alias(self) -> bool {
+        matches!(
+            self,
+            Self::OrdinaryNativeAlias | Self::OrdinaryUnmarkedNativeAlias
+        )
+    }
+
     #[inline]
     pub(crate) fn is_function_layout(self) -> bool {
         matches!(
@@ -952,6 +929,7 @@ impl ShapeObjectKind {
                 | ShapeObjectKind::NativeNamespace
                 | ShapeObjectKind::OrdinaryNativeAlias
                 | ShapeObjectKind::CallableOrdinary
+                | ShapeObjectKind::OrdinaryUnmarkedNativeAlias
         )
     }
 
@@ -972,6 +950,7 @@ impl ShapeObjectKind {
             ShapeObjectKind::FunctionBound => 9,
             ShapeObjectKind::OrdinaryNativeAlias => 10,
             ShapeObjectKind::CallableOrdinary => 11,
+            ShapeObjectKind::OrdinaryUnmarkedNativeAlias => 12,
         }
     }
 }
@@ -1303,19 +1282,23 @@ const _: () = assert!(SITE_SHAPE_ID_END < SHAPE_ID_END);
 /// stamp arriving on another thread must never alias an id that thread
 /// allocated for a different shape. Monotonic — ids are NEVER reused, so
 /// a stale stamp or cache entry can only miss, not falsely hit.
-static SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 3] = [
+static SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 4] = [
     std::sync::atomic::AtomicU32::new(shapes_branded_birth::NATIVE_BIRTH_LAYOUT_END),
+    std::sync::atomic::AtomicU32::new(STATIC_SHAPE_ID_END),
     std::sync::atomic::AtomicU32::new(STATIC_SHAPE_ID_END),
     std::sync::atomic::AtomicU32::new(STATIC_SHAPE_ID_END),
 ];
 
 /// The exotic band's own monotonic counters ([`EXOTIC_SHAPE_ID_BASE`]).
-static EXOTIC_SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 3] = [
+static EXOTIC_SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 4] = [
     std::sync::atomic::AtomicU32::new(
         EXOTIC_SHAPE_ID_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
     ),
     std::sync::atomic::AtomicU32::new(
         crate::codegen_abi::FUNCTION_SHAPE_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
+    ),
+    std::sync::atomic::AtomicU32::new(
+        EXOTIC_SHAPE_ID_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
     ),
     std::sync::atomic::AtomicU32::new(
         EXOTIC_SHAPE_ID_BASE + crate::codegen_abi::FUNCTION_SHAPE_COUNT,
@@ -1329,13 +1312,18 @@ static EXOTIC_SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 3] = [
 ///   records no prototype: the realm default, a compiled class's declaration
 ///   prototype, a per-object identity;
 /// * [`SHAPE_ID_KIND_WORD`] (1): a LINKED identity with a word naming its
-///   prototype (a recorded prototype's serial, `MIXED`, a `UNIQUE` link);
-/// * [`SHAPE_ID_KIND_NULL`] (2): a null [[Prototype]].
+///   prototype (a recorded prototype's serial, a `UNIQUE` link);
+/// * [`SHAPE_ID_KIND_NULL`] (2): a null [[Prototype]];
+/// * [`SHAPE_ID_KIND_MIXED`] (3): a LINKED identity of a class instance, a
+///   `MIXED` one (its class and its recorded prototype's serial), with a word
+///   naming that prototype. A class evaluation's copy of a family layout is
+///   one (`layout_desc::family_desc_of`), so only an id of this kind can be
+///   one: every other linked receiver answers "not a family object" from its
+///   header word, without reading its shape record.
 ///
 /// Every band draws its ids from one counter per kind, and the counters hand
-/// out 2^20-id granules in turn (kind 3 is never minted), so the kind is a
-/// fact of the id's VALUE, fixed at the mint (`ShapeSlab::insert` asserts
-/// it). The static band (`[SHAPE_ID_BASE, STATIC_SHAPE_ID_END)`, 2^20 ids) is
+/// out 2^20-id granules in turn, so the kind is a fact of the id's VALUE,
+/// fixed at the mint (`ShapeSlab::insert` asserts it). The static band (`[SHAPE_ID_BASE, STATIC_SHAPE_ID_END)`, 2^20 ids) is
 /// one plain granule: the compiler names only class and literal shapes.
 ///
 /// It is what lets `object_prototype_word` answer the common receiver (a
@@ -1347,16 +1335,30 @@ static EXOTIC_SHAPE_ID_NEXT: [std::sync::atomic::AtomicU32; 3] = [
 /// memory: a kind's untouched pages are never allocated.
 pub(crate) const SHAPE_ID_KIND_SHIFT: u32 = 20;
 pub(crate) const SHAPE_ID_KIND_MASK: u32 = 3 << SHAPE_ID_KIND_SHIFT;
+const _: () = assert!(SHAPE_ID_KIND_MASK == crate::codegen_abi::SHAPE_ID_KIND_MASK);
 pub(crate) const SHAPE_ID_KIND_PLAIN: u32 = 0;
 pub(crate) const SHAPE_ID_KIND_WORD: u32 = 1;
 pub(crate) const SHAPE_ID_KIND_NULL: u32 = 2;
-/// One granule of each kind (and the never-minted fourth).
+pub(crate) const SHAPE_ID_KIND_MIXED: u32 = 3;
+const _: () = assert!(SHAPE_ID_KIND_MIXED << SHAPE_ID_KIND_SHIFT == SHAPE_ID_KIND_MASK);
+/// One granule of each kind.
 const SHAPE_ID_KIND_GROUP: u32 = 4 << SHAPE_ID_KIND_SHIFT;
 const _: () = assert!(STATIC_SHAPE_ID_END - SHAPE_ID_BASE <= 1 << SHAPE_ID_KIND_SHIFT);
 const _: () = assert!(SHAPE_ID_BASE % SHAPE_ID_KIND_GROUP == 0);
 const _: () = assert!(SITE_SHAPE_ID_END % SHAPE_ID_KIND_GROUP == 0);
 const _: () = assert!(EXOTIC_SHAPE_ID_BASE % SHAPE_ID_KIND_GROUP == 0);
 const _: () = assert!(SHAPE_ID_END % SHAPE_ID_KIND_GROUP == 0);
+
+/// May ShapeId `id` hold a record of identity `proto_id`? The id's kind is
+/// the identity's for every kind a reader trusts without the record (plain,
+/// null, mixed); a word-kind id holds any identity but a mixed one, which
+/// only the mixed kind names (`layout_desc::family_desc_of` trusts that).
+#[inline]
+pub(crate) fn shape_id_kind_admits(id: u32, proto_id: u64) -> bool {
+    let kind = shape_word_kind(id);
+    let identity = proto_id_kind(proto_id);
+    kind == identity || (kind == SHAPE_ID_KIND_WORD && identity != SHAPE_ID_KIND_MIXED)
+}
 
 /// The identity kind `header_word` (an `ObjectHeader`'s ShapeId word, or
 /// whatever else it holds) carries in its kind bits.
@@ -1381,8 +1383,13 @@ pub(crate) fn proto_id_kind(proto_id: u64) -> u32 {
     if (PROTO_ID_CLASS..PROTO_ID_MIXED).contains(&proto_id) {
         // The identity word is an implied class link, not an instance override.
         SHAPE_ID_KIND_PLAIN
+    } else if (PROTO_ID_MIXED..PROTO_ID_UNIQUE).contains(&proto_id) {
+        SHAPE_ID_KIND_MIXED
     } else if proto_id == PROTO_ID_NULL {
         SHAPE_ID_KIND_NULL
+    } else if proto_id == PROTO_ID_RECORD_HELD {
+        // No word, but never a plain answer: the record holds the link.
+        SHAPE_ID_KIND_WORD
     } else if shapes_prototype::proto_id_carries_word(proto_id) {
         SHAPE_ID_KIND_WORD
     } else {
@@ -1498,12 +1505,16 @@ fn alloc_shape_id_of_kind(
 /// mint except a dictionary or exotic shape's.
 fn alloc_shape_id(proto_id: u64) -> Result<u32, ShapeIdExhausted> {
     let kind = proto_id_kind(proto_id);
+    #[cfg(test)]
+    note_thread_mint();
     alloc_shape_id_of_kind(&SHAPE_ID_NEXT[kind as usize], SITE_SHAPE_ID_END, kind)
 }
 
 /// An exotic-band ShapeId ([`EXOTIC_SHAPE_ID_BASE`]).
 fn alloc_exotic_shape_id(proto_id: u64) -> Result<u32, ShapeIdExhausted> {
     let kind = proto_id_kind(proto_id);
+    #[cfg(test)]
+    note_thread_mint();
     alloc_shape_id_of_kind(&EXOTIC_SHAPE_ID_NEXT[kind as usize], SHAPE_ID_END, kind)
 }
 
@@ -1514,17 +1525,31 @@ fn alloc_shape_id_for_generation(
     alloc_shape_id(proto_id)
 }
 
-/// The ordinary-band ids this process has handed out, as a counter.
+#[cfg(test)]
+thread_local! {
+    /// ShapeIds minted by THIS thread (test builds only).
+    static THREAD_SHAPE_MINTS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_thread_mint() {
+    THREAD_SHAPE_MINTS.with(|mints| mints.set(mints.get().wrapping_add(1)));
+}
+
+/// The ShapeIds the CALLING THREAD has minted, as a counter.
 ///
 /// Tests assert the DELTA across a workload, because ids come from a 2^30
 /// range that is never reused and parks (fail-stop) at the end: a path that
 /// mints one id per operation is a process-LIFETIME bug, not merely a memory
 /// cost, and nothing in the program's output ever reveals it.
+///
+/// Per thread rather than per process: libtest runs one thread per test, and
+/// a process-wide counter is moved by whichever other test happens to mint
+/// meanwhile, so a delta over it read the whole parallel suite instead of the
+/// workload (the id range itself is, and must stay, process-wide).
 #[cfg(test)]
 pub(crate) fn test_shape_id_counter() -> u32 {
-    SHAPE_ID_NEXT.iter().fold(0u32, |sum, next| {
-        sum.wrapping_add(next.load(std::sync::atomic::Ordering::Relaxed))
-    })
+    THREAD_SHAPE_MINTS.with(std::cell::Cell::get)
 }
 
 /// Get or create the exact structural descriptor. The public allocation and
@@ -2475,23 +2500,9 @@ pub(crate) fn plain_birth_rep_by_id(shape_id: u32, field_count: u32) -> Option<u
     // SAFETY: the directory is this agent's live published ordinary band.
     let record =
         unsafe { ShapeSlab::ordinary_record_in(ShapeSlab::ordinary_dir_addr(), shape_id) }?;
-    record.admits_plain_birth(field_count).then(|| {
-        // SAFETY: a present record, read before any collection point.
-        unsafe { ShapeRecordRef(std::ptr::NonNull::from(record)).rep() }
-    })
-}
-
-/// The attribute summary (`key_attrs::SUMMARY_*`) of an ordinary-band layout
-/// with a shared key list, read from this agent's ordinary directory with no
-/// band select: `None` for any other id (a dictionary or exotic layout, or a
-/// layout whose keys live with its object), which the caller answers from the
-/// object's keys.
-#[inline(always)]
-pub(crate) fn ordinary_layout_summary(shape_id: u32) -> Option<u8> {
-    // SAFETY: the directory is this agent's live published ordinary band.
-    let record =
-        unsafe { ShapeSlab::ordinary_record_in(ShapeSlab::ordinary_dir_addr(), shape_id) }?;
-    (record.present() && record.keys != 0).then(|| record.summary())
+    record
+        .admits_plain_birth(field_count)
+        .then(|| ShapeRecordRef(std::ptr::NonNull::from(record)).rep())
 }
 
 /// The record of an ordinary-band layout, read from this agent's ordinary
@@ -4417,6 +4428,24 @@ pub(crate) unsafe fn transition_object_shape_prototype(
     proto_id: u64,
     proto_bits: u64,
 ) -> u32 {
+    transition_object_shape_prototype_with_holder(obj, proto_id, proto_bits, 0)
+}
+
+/// [`transition_object_shape_prototype`] that also gives the receiver the
+/// evaluation holder brand `holder_brand` (`EVALUATION_HOLDER_BRAND |
+/// identity`, its identity word already written: `prepare_evaluation_holder`),
+/// or none for 0: a class evaluation's first instance takes its prototype
+/// and its brand in one transition, so the shape it reaches is minted once.
+///
+/// # Safety
+/// As [`transition_object_shape_prototype`].
+#[cfg_attr(feature = "shape-mint-diag", track_caller)]
+pub(crate) unsafe fn transition_object_shape_prototype_with_holder(
+    obj: *mut crate::object::ObjectHeader,
+    proto_id: u64,
+    proto_bits: u64,
+    holder_brand: u64,
+) -> u32 {
     if obj.is_null() || !shape_word_is_writable(obj) {
         return 0;
     }
@@ -4429,6 +4458,10 @@ pub(crate) unsafe fn transition_object_shape_prototype(
     // a mint below that collects repairs it with everything else.
     shapes_prototype::write_identity_word(proto_id, proto_bits);
     if current.proto_id == proto_id {
+        // The brand alone, when one was asked for (a no-op when present).
+        if holder_brand != 0 {
+            transition_object_shape_add_brand(obj, holder_brand);
+        }
         return object_shape_stamp(obj);
     }
     let generation = if crate::object::overflow::has_overflow(obj) {
@@ -4436,6 +4469,13 @@ pub(crate) unsafe fn transition_object_shape_prototype(
     } else {
         current.semantic_generation
     };
+    let mut receiver = receiver_facts_of_current(obj, &current);
+    if holder_brand != 0 {
+        debug_assert!(shapes_evaluation_brand::is_evaluation_holder_brand(
+            holder_brand
+        ));
+        receiver.brands.replace_evaluation_holder(holder_brand);
+    }
     // The lanes describe the receiver's OWN slots, which a new [[Prototype]]
     // leaves as they are: carry them (normalized, as a key-add carries the
     // lanes below it), so a class instance linked to its evaluation's
@@ -4448,10 +4488,13 @@ pub(crate) unsafe fn transition_object_shape_prototype(
         store_kind::mint_kind(current.object_kind, obj),
         current.hole_count,
         proto_id,
-        receiver_facts_of_current(obj, &current),
+        receiver,
         super::field_rep::normalized_without_special(current.rep),
         None,
     ));
+    // A class family instance keeps its family's layout at the new identity:
+    // the record names the family it is a copy of (`layout_desc::family_desc_of`).
+    super::layout_desc::note_family_relink(object_shape_stamp(obj), id);
     stamp_same_keys_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
     id
@@ -4596,6 +4639,15 @@ pub(crate) const PROTO_ID_UNIQUE: u64 = 3 << PROTO_ID_TAG_SHIFT;
 /// (a dictionary-kind shape shared by many receivers): `UNIQUE | 0`, which
 /// [`fresh_unique_proto_id`] never hands out (its counter starts at 1).
 pub(crate) const PROTO_ID_PER_OBJECT: u64 = PROTO_ID_UNIQUE;
+/// The prototype identity of a shape whose [[Prototype]] is held by the
+/// receiver's own record rather than named by the shape: a sync generator
+/// instance (`generator_state`), whose resume record's prototype control is
+/// the authority. It carries no identity word, but its ShapeIds are of the
+/// word kind, so every prototype read leaves the plain one-compare answer and
+/// reaches the record ([`linked_object_prototype_word`]). The top of the
+/// `UNIQUE` band below [`PROTO_ID_NULL`]; [`fresh_unique_proto_id`] never
+/// hands it out.
+pub(crate) const PROTO_ID_RECORD_HELD: u64 = PROTO_ID_NULL - 1;
 /// Serial bits a MIXED identity can carry beside a 32-bit class id.
 const PROTO_ID_MIXED_SERIAL_BITS: u32 = 30;
 
@@ -4608,7 +4660,8 @@ pub(crate) fn fresh_unique_proto_id() -> u64 {
     // modulo the band size minus one rather than masking with `...FE`: that
     // mask dropped bit 0, so serials 2k and 2k+1 collapsed onto one identity
     // and two distinct prototypes could share a shape.
-    PROTO_ID_UNIQUE | (n % ((1 << PROTO_ID_TAG_SHIFT) - 1))
+    // The band's two top numbers are PROTO_ID_RECORD_HELD and PROTO_ID_NULL.
+    PROTO_ID_UNIQUE | (n % ((1 << PROTO_ID_TAG_SHIFT) - 2))
 }
 
 /// The class whose vtable an instance of `class_id` inherits through, or 0 for
@@ -4895,6 +4948,9 @@ unsafe fn linked_object_prototype_word(obj: *const crate::object::ObjectHeader) 
         // CLASS is an implied link, rather than an instance override.
         return 0;
     }
+    if proto_id == PROTO_ID_RECORD_HELD {
+        return crate::object::generator_record_prototype_word(obj);
+    }
     if proto_id != PROTO_ID_NULL {
         return record.prototype_word();
     }
@@ -5133,6 +5189,9 @@ pub(crate) unsafe fn transition_object_shape_add_brand(
             None,
         ))
     });
+    // A class evaluation's copy of a family layout stays one with its brand
+    // (`layout_desc::family_desc_of`): the brand changes no slot.
+    super::layout_desc::note_family_relink(object_shape_stamp(obj), id);
     stamp_same_keys_shape_id_with_carrier_note(obj, id);
     debug_assert_object_shape_parity(obj);
     true

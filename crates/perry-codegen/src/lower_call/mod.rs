@@ -48,7 +48,8 @@ mod closure_analysis;
 mod closure_call_arity_tests;
 mod console_promise;
 pub(crate) use console_promise::{
-    emit_method_args_buffer, lower_split_method_call, try_lower_optional_method_call,
+    emit_method_args_buffer, emit_native_method_str_dispatch, lower_split_method_call,
+    try_lower_optional_method_call,
 };
 /// Rooting and evaluation-order coverage for the `console.*` arms slice 6
 /// repaired (#7649) — see the module header for why these assert on IR.
@@ -77,7 +78,7 @@ pub(crate) use func_ref::{
     guarded_call_return_proof, guarded_discriminant_branch_proofs, guarded_expr_proof,
     guarded_path_type,
 };
-mod direct_method_guard;
+pub(crate) mod direct_method_guard;
 mod jsx;
 pub(crate) mod lookup_first;
 #[cfg(test)]
@@ -103,6 +104,7 @@ mod native_module_rooting_tests;
 mod native_table;
 mod new;
 pub(crate) mod new_alloc;
+mod new_builtin_arms;
 #[cfg(test)]
 mod new_builtin_shadow_tests;
 mod new_ctor_args;
@@ -180,9 +182,7 @@ pub(crate) use native::lower_native_method_call;
 // (codegen.rs / expr.rs / stmt.rs) so `crate::lower_call::lower_new`
 // etc. keep resolving after the split.
 pub(crate) use builtin::lower_global_intrinsic_new;
-pub(crate) use field_init::{
-    apply_field_initializers_recursive, defer_dynamic_derived_fields, FieldInitMode,
-};
+pub(crate) use field_init::{apply_field_initializers_recursive, FieldInitMode};
 pub(crate) use new::{
     emit_class_capture_writeback, lower_new, lower_new_checked, lower_new_member_captured,
 };
@@ -588,6 +588,7 @@ pub(crate) fn lower_rest_call_args_rooted<'a>(
 /// 2. `console.log(expr)` where `expr` lowers to a double — emits a
 ///    `js_console_log_number` call and returns `0.0` as the statement value.
 pub(crate) fn lower_call(ctx: &mut FnCtx<'_>, callee: &Expr, args: &[Expr]) -> Result<String> {
+    let _callee_cause = crate::fallback_diag::callee_cause(ctx, callee);
     // A static field used as a callee remains a property Reference:
     // P.f() binds P. Read-only StaticFieldGet lowering otherwise loses it.
     if let Expr::StaticFieldGet {

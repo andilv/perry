@@ -230,13 +230,8 @@ pub(crate) fn default_call(ctx: &mut FnCtx<'_>, class: &Class, args: &[Expr]) ->
         {
             return None;
         }
-        (ctor.params.len() == args.len()).then(|| {
-            format!(
-                "{}__{}_constructor",
-                ctx.strings.module_prefix(),
-                parent.name
-            )
-        })
+        (ctor.params.len() == args.len())
+            .then(|| crate::symbol_names::constructor(&ctx.strings.module_prefix(), &parent.name))
     });
     let Some((plan, target)) = plan(ctx, class).zip(target) else {
         return super::super_constructor::call(ctx, class, args);
@@ -317,7 +312,6 @@ pub(crate) fn spread(
                 Ok(ctx.block().load(DOUBLE, &slot))
             },
             |ctx| {
-                crate::lower_call::defer_dynamic_derived_fields(ctx, class);
                 let cid = super::super_constructor::lexical_class_id(ctx, class);
                 let parent =
                     ctx.block()

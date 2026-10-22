@@ -33,7 +33,11 @@ mod parent_port;
 #[cfg(test)]
 mod parent_port_tests;
 mod thread_values;
+mod worker_error;
+#[cfg(test)]
+mod worker_error_tests;
 mod worker_options;
+use worker_error::{plain_error_message, worker_error_message};
 #[cfg(test)]
 mod worker_owner_tests;
 mod worker_pump;
@@ -816,7 +820,11 @@ extern "C" {
 fn pump_worker_microtasks() {
     // Bounded so a job queue that re-arms itself cannot wedge the worker here.
     for _ in 0..4096 {
-        let mut ran = perry_runtime::promise::microtasks::js_promise_run_microtasks_await_loop();
+        // This worker's own events first (its child processes, ptys, fs
+        // watchers and extension streams; every queue is filtered by owner
+        // agent), so the jobs their listeners queue run in this same pass.
+        let mut ran = unsafe { js_run_agent_pumps() };
+        ran += perry_runtime::promise::microtasks::js_promise_run_microtasks_await_loop();
         // Owner-FILTERED timer tick: with this thread holding its own agent id
         // (see the spawn body), this fires only timers whose closures live in
         // this worker's arena. That is what lets `await` of a timer — or of
@@ -828,9 +836,6 @@ fn pump_worker_microtasks() {
         // collects it, and nothing else ever settles it.
         ran += crate::worker_threads::async_shim::js_stdlib_process_pending();
         ran += js_worker_threads_channels_process_pending();
-        // Extension events this worker made (its zlib streams): their queues
-        // are per agent, and only this thread may deliver them.
-        ran += unsafe { js_run_agent_pumps() };
         if ran == 0 {
             break;
         }
@@ -1640,23 +1645,6 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
     }
 
     object_value(worker_obj)
-}
-
-/// The value a worker threw, cloned for its parent's 'error' event. A value
-/// that cannot be cloned arrives as a plain Error saying so.
-fn worker_error_message(thrown: f64) -> SerializedValue {
-    clone::try_clone_message(thrown, js_undefined()).unwrap_or_else(|_| {
-        plain_error_message(b"the worker threw a value that could not be cloned")
-    })
-}
-
-fn plain_error_message(message: &[u8]) -> SerializedValue {
-    SerializedValue::Error {
-        name: b"Error".to_vec(),
-        message: Some(message.to_vec()),
-        stack: None,
-        cause: None,
-    }
 }
 
 /// worker_threads.setEnvironmentData(key, value)

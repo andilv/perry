@@ -760,6 +760,7 @@ pub(super) fn compile_module_entry(
             current_block: 0,
             discard_expr_value: false,
             discard_this_expr: false,
+            literal_chunk_fill: false,
             truthy_call_result_requested: false,
             pending_truthy_call_result: None,
             func_names,
@@ -845,10 +846,12 @@ pub(super) fn compile_module_entry(
             namespace_imports: &cross_module.namespace_imports,
             namespace_member_prefixes: &cross_module.namespace_member_prefixes,
             namespace_member_nested: &cross_module.namespace_member_nested,
+            cjs_interop_namespaces: &cross_module.cjs_interop_namespaces,
             namespace_member_origin_names: &cross_module.namespace_member_origin_names,
             imported_async_funcs: &cross_module.imported_async_funcs,
             local_async_funcs: &cross_module.local_async_funcs,
             local_generator_funcs: &cross_module.local_generator_funcs,
+            fixed_generator_funcs: &cross_module.fixed_generator_funcs,
             async_step_closures: &cross_module.async_step_closures,
             funcs_reading_dynamic_this: &cross_module.funcs_reading_dynamic_this,
             type_aliases: &cross_module.type_aliases,
@@ -1135,6 +1138,8 @@ pub(super) fn compile_module_entry(
                     &cross_module.namespace_entries,
                     namespace_key_globals,
                     module_prefix,
+                    output_type,
+                    cross_module.namespace_adopts_cjs_exports,
                 );
             }
         }

@@ -308,14 +308,6 @@ pub(crate) fn test_evict_interned(bytes: &[u8]) {
     });
 }
 
-/// Test view: is `p` the atom of its text?
-#[cfg(test)]
-pub(crate) unsafe fn is_atom_for_test(p: *const StringHeader) -> bool {
-    let bytes = std::slice::from_raw_parts(string_data(p), (*p).byte_len as usize);
-    let hash = crate::object::key_bytes_hash(bytes.as_ptr(), bytes.len());
-    atom_lookup(bytes, hash) == Some(p)
-}
-
 /// Discard weak addresses before any object can move or its storage be reused.
 /// Called at collection scope entry and before a tracked string realloc.
 /// Unrelated reallocations cannot invalidate a StringHeader address. No entry
@@ -824,7 +816,37 @@ pub(crate) unsafe fn property_atom(key: *const StringHeader) -> *const StringHea
     atom
 }
 
+/// [`existing_property_atom`] for a string key VALUE: a heap string, or an
+/// SSO immediate whose text is read from the value itself, so no heap copy
+/// of the key is made. `None` for any other value and for a spelling no
+/// property atom has.
+///
+/// # Safety
+/// `bits` is a live key value.
+#[inline]
+pub(crate) unsafe fn existing_property_atom_of_value(bits: u64) -> Option<*const StringHeader> {
+    let key = crate::JSValue::from_bits(bits);
+    if key.is_string() {
+        return existing_property_atom(key.as_string_ptr());
+    }
+    if !key.is_short_string() {
+        return None;
+    }
+    let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let bytes = crate::string::js_string_key_bytes(key, &mut scratch)?;
+    let atom = atom_lookup(
+        bytes,
+        crate::object::key_bytes_hash(bytes.as_ptr(), bytes.len()),
+    )?;
+    ((*atom).flags & PROPERTY_ATOM != 0).then_some(atom)
+}
+
 pub(crate) unsafe fn property_atom_from_value(bits: u64) -> u64 {
+    // A spelling that already has its atom is answered from the value (an
+    // SSO key needs no heap copy); only a new spelling mints one below.
+    if let Some(atom) = existing_property_atom_of_value(bits) {
+        return crate::JSValue::string_ptr(atom as *mut _).bits();
+    }
     let scope = crate::gc::RuntimeHandleScope::new();
     let key = scope.root_nanbox_f64(f64::from_bits(bits));
     let header = crate::value::js_get_string_pointer_unified(key.get_nanbox_f64());
@@ -864,10 +886,6 @@ pub unsafe extern "C" fn js_string_register_property_atom(key: *const StringHead
         }
         table.insert(hash, key);
     });
-}
-
-pub(crate) unsafe fn property_atom_is_program_named(key: *const StringHeader) -> bool {
-    (*key).flags & PROGRAM_ATOM != 0
 }
 
 /// This weak registry never emits roots in the mark or copy phase. Live atom
