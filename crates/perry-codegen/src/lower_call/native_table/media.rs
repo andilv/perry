@@ -379,8 +379,8 @@ pub(super) const MEDIA_ROWS: &[NativeModSig] = &[
         method: "inflateSync",
         class_filter: None,
         runtime: "js_zlib_inflate_sync",
-        // #2935: see gunzipSync above.
-        args: &[NA_JSV],
+        // Preserve the options slot for preset dictionary application.
+        args: &[NA_JSV, NA_F64],
         ret: NR_F64,
     },
     NativeModSig {
@@ -502,7 +502,7 @@ pub(super) const MEDIA_ROWS: &[NativeModSig] = &[
         method: "brotliDecompressSync",
         class_filter: None,
         runtime: "js_zlib_brotli_decompress_sync",
-        args: &[NA_JSV],
+        args: &[NA_JSV, NA_F64],
         ret: NR_F64,
     },
     NativeModSig {

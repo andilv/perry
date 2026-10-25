@@ -45,6 +45,7 @@ fn tracked_classifier_accepts_image_heap_and_malloc_strings() {
         let heap = crate::string::js_string_from_bytes(b"heap string".as_ptr(), 11) as usize;
         assert!(try_read_tracked_gc_header_of_type(heap, crate::gc::GC_TYPE_STRING).is_some());
         let malloc = crate::gc::gc_malloc(32, crate::gc::GC_TYPE_STRING);
+        // GC_STORE_AUDIT(POINTER_FREE): Test malloc StringHeader initialized only with scalar lengths/refcount/flags under GcSuppressScope; no managed children.
         (malloc as *mut StringHeader).write(StringHeader {
             utf16_len: 7,
             byte_len: 7,
@@ -127,8 +128,9 @@ fn native_string_validators_use_canonical_classifier() {
         .expect("source invariant requires Python 3");
     assert!(
         output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

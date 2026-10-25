@@ -669,10 +669,36 @@ def generic_native_rep_contract_results(
             )
 
     allowed_reasons = {str(r) for r in check_spec.get("allow_materialization_reasons", [])}
+    # Reviews are exact single-record proofs, never a reason-wide allowance.
+    review_fields = {
+        "name", "claim", "function", "source_function", "block_label",
+        "expr_kind", "consumer", "native_rep_name", "materialization_reason",
+    }
+    reviewed_records: set[int] = set()
+    review_names: set[str] = set()
+    for review in check_spec.get("review_materializations", []) or []:
+        valid = (
+            isinstance(review, dict)
+            and set(review) == review_fields
+            and all(isinstance(value, str) and value.strip() for value in review.values())
+            and review["materialization_reason"] not in allowed_reasons
+        )
+        name = str(review.get("name", "invalid")) if isinstance(review, dict) else "invalid"
+        matches = [
+            i for i, record in enumerate(materialization_records)
+            if valid and _record_matches_required(record, review)
+        ]
+        unique = len(matches) == 1 and name not in review_names and not reviewed_records.intersection(matches)
+        add(f"native_reps_materialization_review_{name}", valid and unique,
+            f"review={json.dumps(review, sort_keys=True)} matches={len(matches)}")
+        review_names.add(name)
+        if valid and unique:
+            reviewed_records.update(matches)
     unexpected_materializations = [
         r
-        for r in materialization_records
-        if r.get("materialization_reason")
+        for i, r in enumerate(materialization_records)
+        if i not in reviewed_records
+        and r.get("materialization_reason")
         and _field_name(r.get("materialization_reason")) not in allowed_reasons
     ]
     dynamic_fallbacks = [r for r in records if _is_dynamic_fallback(r)]
@@ -938,10 +964,25 @@ def native_rep_contract_results(
             ]
 
         def denied_alias(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            # Scalar buffer fallbacks produce i32, not a retained buffer_view.
+            # Count only an actual buffer access with an explicit rejected
+            # alias proof; unrelated integer arithmetic cannot satisfy this.
             return [
                 r
                 for r in rows
-                if r.get("native_rep_name") in {"buffer_view", "u8"}
+                if (
+                    r.get("native_rep_name") in {"buffer_view", "u8"}
+                    or (
+                        r.get("native_rep_name") == "i32"
+                        and _is_dynamic_fallback(r)
+                        and str(r.get("expr_kind", "")).startswith(
+                            ("BufferIndex", "Uint8Array")
+                        )
+                        and _record_has_fact(
+                            r, "rejected_facts", kind="alias_noalias", state="missing"
+                        )
+                    )
+                )
                 and _state_name(r.get("alias_state")) in {"unknown", "may_alias", ""}
                 and not r.get("emitted_noalias")
             ]
@@ -981,13 +1022,7 @@ def native_rep_contract_results(
                 )
             ]
 
-        denied_noalias = [
-            r
-            for r in records
-            if r.get("native_rep_name") in {"buffer_view", "u8"}
-            and _state_name(r.get("alias_state")) in {"unknown", "may_alias", ""}
-            and not r.get("emitted_noalias")
-        ]
+        denied_noalias = denied_alias(records)
         denied_inbounds = [
             r
             for r in records

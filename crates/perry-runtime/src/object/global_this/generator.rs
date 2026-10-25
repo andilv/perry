@@ -369,7 +369,13 @@ pub(crate) fn set_intrinsic_data_prop(
     value: f64,
     attrs: super::super::PropertyAttrs,
 ) {
-    let key = crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    // These linker-shared images are also the executable's literal keys,
+    // including when native bootstrap precedes its literal registration.
+    let key = match name {
+        "constructor" => super::super::runtime_layouts::BP_ATOM_CONSTRUCTOR.string,
+        "prototype" => super::super::runtime_layouts::BP_ATOM_PROTOTYPE.string,
+        _ => crate::string::intern_ascii_literal(name.as_bytes()),
+    };
     super::super::define_builtin_data_property(obj, key, value, name.to_string(), attrs);
 }
 
@@ -441,54 +447,12 @@ fn generator_proto_method(
     if !is_async {
         return bad_receiver(method);
     }
-    let jv = JSValue::from_bits(this.to_bits());
-    if !jv.is_pointer() {
-        return bad_receiver(method);
-    }
-    let this_obj = jv.as_pointer::<ObjectHeader>();
-    // Reject the prototype singletons themselves: they carry these methods as
-    // OWN thunks, so delegating below would re-enter this thunk forever. A real
-    // generator instance is never the prototype object.
-    if this_obj == generator_prototype_ptr(false) || this_obj == generator_prototype_ptr(true) {
-        return bad_receiver(method);
-    }
-    // Brand-check + delegation use OWN properties only. A generator instance
-    // (Perry's `{next,return,throw}` object) owns all three state-machine
-    // closures; an object that merely INHERITS them (e.g. `g.prototype`, whose
-    // [[Prototype]] is `%Generator.prototype%`) is not a generator — and reading
-    // the inherited method would resolve back to this very thunk and recurse.
-    let own_method = |name: &[u8]| -> Option<*const crate::closure::ClosureHeader> {
-        let v = crate::object::js_object_get_own_field_or_undef(this, name.as_ptr(), name.len());
-        let vv = JSValue::from_bits(v.to_bits());
-        if vv.is_pointer() && crate::closure::is_closure_ptr(vv.as_pointer::<u8>() as usize) {
-            Some(vv.as_pointer::<crate::closure::ClosureHeader>())
-        } else {
-            None
+    // The async brand proves the receiver and its record (the prototype
+    // singletons and any other object answer `None`).
+    match super::async_generator_state::async_generator_record(this) {
+        Some(record) => {
+            super::async_generator_state::async_generator_request(record, op as u32, arg)
         }
-    };
-    if own_method(b"next").is_none()
-        || own_method(b"return").is_none()
-        || own_method(b"throw").is_none()
-    {
-        return bad_receiver(method);
-    }
-    // A sync generator instance also owns `next`/`return`/`throw`, so the
-    // structural check above can't tell it from an async generator. The
-    // `%AsyncGenerator.prototype%` methods must reject a sync-generator `this`
-    // (and vice versa): gate on the async request-queue brand.
-    if is_async
-        != super::super::async_generator_queue::is_async_generator_instance(
-            this_obj as *mut ObjectHeader,
-        )
-    {
-        return bad_receiver(method);
-    }
-    match own_method(method) {
-        Some(own_closure) => crate::closure::js_closure_call1(
-            own_closure,
-            crate::closure::plain_call_receiver(),
-            arg,
-        ),
         None => bad_receiver(method),
     }
 }
@@ -740,7 +704,9 @@ fn mark_generator_step_closures_no_rebind(obj: f64) {
 /// call is the re-read.
 #[no_mangle]
 pub extern "C" fn js_generator_attach_prototype(obj: f64, is_async: i32) -> f64 {
-    if super::generator_state::fixed_generator_state(obj).is_some() {
+    if super::generator_state::fixed_generator_state(obj).is_some()
+        || super::async_generator_state::async_generator_record(obj).is_some()
+    {
         return obj;
     }
     let jv = JSValue::from_bits(obj.to_bits());
@@ -756,10 +722,6 @@ pub extern "C" fn js_generator_attach_prototype(obj: f64, is_async: i32) -> f64 
     // Pin each step closure's lexical generator-body `this` so `yield*`
     // delegation (`next.call(iter, v)`) can't rebind it to the iterator object.
     mark_generator_step_closures_no_rebind(obj_h.get_nanbox_f64());
-    if is_async != 0 {
-        let async_target = handle_object_ptr(&obj_h);
-        super::super::async_generator_queue::wrap_async_generator_instance(async_target);
-    }
     // First call may build the whole tower; only its NULL-ness is used here, so
     // the pointer itself is re-read after the allocation below.
     if generator_prototype_ptr(is_async != 0).is_null() {
@@ -819,7 +781,9 @@ pub extern "C" fn js_generator_attach_closure_prototype(
     obj: f64,
     closure_ptr: *const crate::closure::ClosureHeader,
 ) -> f64 {
-    if super::generator_state::fixed_generator_state(obj).is_some() {
+    if super::generator_state::fixed_generator_state(obj).is_some()
+        || super::async_generator_state::async_generator_record(obj).is_some()
+    {
         return obj;
     }
     let jv = JSValue::from_bits(obj.to_bits());
@@ -839,20 +803,6 @@ pub extern "C" fn js_generator_attach_closure_prototype(
     let closure = crate::closure::clean_closure_ptr(closure_ptr);
     if closure.is_null() || crate::closure::get_valid_func_ptr(closure).is_null() {
         return obj_h.get_nanbox_f64();
-    }
-
-    // Async-generator instances need the request-queue wrapper installed on
-    // their `next`/`return`/`throw` so same-stack follow-up calls queue (spec
-    // AsyncGeneratorEnqueue) and `.return(v)` awaits `v`. The non-closure
-    // fallback (`js_generator_attach_prototype`) does this when codegen knows
-    // the function is async; on the closure-identity path we read the async
-    // brand from the function's info (FN_ASYNC_GENERATOR on the
-    // `async function*` wrapper's info).
-    if crate::closure::closure_info(closure)
-        .is_some_and(|info| crate::closure::info_has(info, crate::closure::FN_ASYNC_GENERATOR))
-    {
-        let async_target = handle_object_ptr(&obj_h);
-        super::super::async_generator_queue::wrap_async_generator_instance(async_target);
     }
 
     // Allocates a fresh `g.prototype` on the first call for this function, so
@@ -933,8 +883,12 @@ fn build_generator_tower(
     );
     // Realm intrinsics, built once: born old and never-move (O3), so the
     // method sites that answer from them are admitted before any minor.
-    let proto = crate::object::object_alloc_prototype_old(0, 0); // %Generator% / %AsyncGenerator%
-    let gen_proto = crate::object::object_alloc_prototype_old(0, 0); // %Generator.prototype%
+    // Use the ordinary intrinsic installer with only the room these fixed
+    // holders need. Old allocations cannot return spare capacity at fit time;
+    // the installed keys and final shape still own the live inline bound.
+    let proto = super::proto_room::alloc_builtin_prototype_with_room(3);
+    let gen_proto =
+        super::proto_room::alloc_builtin_prototype_with_room(if is_async { 5 } else { 6 });
     if ctor.is_null() || proto.is_null() || gen_proto.is_null() {
         return;
     }
@@ -988,9 +942,25 @@ fn build_generator_tower(
             crate::fn_info!(generator_proto_throw_thunk, 1; with_declared(1), with_flags(crate::closure::FN_BUILTIN)),
         )
     };
-    install_proto_method(gen_proto, "next", next_info, 1);
-    install_proto_method(gen_proto, "return", return_info, 1);
-    install_proto_method(gen_proto, "throw", throw_info, 1);
+    for (name, info, key) in [
+        (
+            "next",
+            next_info,
+            super::super::runtime_layouts::BP_ATOM_NEXT.string,
+        ),
+        (
+            "return",
+            return_info,
+            super::super::runtime_layouts::BP_ATOM_RETURN.string,
+        ),
+        (
+            "throw",
+            throw_info,
+            super::super::runtime_layouts::BP_ATOM_THROW.string,
+        ),
+    ] {
+        install_proto_method_with_key(gen_proto, name, info, 1, key);
+    }
     // Spec: `%AsyncGenerator.prototype%` inherits `[Symbol.asyncIterator]` from
     // `%AsyncIteratorPrototype%` and `%Generator.prototype%` inherits
     // `[Symbol.iterator]` from `%IteratorPrototype%` — both returning `this`.
@@ -1038,6 +1008,12 @@ fn build_generator_tower(
     }
     set_intrinsic_to_string_tag(gen_proto, inst_tag);
 
+    // SAFETY: both holders are live and unexposed in this no-move window.
+    unsafe {
+        super::proto_room::fit_builtin_prototype(proto);
+        super::proto_room::fit_builtin_prototype(gen_proto);
+    }
+
     // SAFETY: `proto` is the live, just-built %(Async)GeneratorFunction.prototype%.
     unsafe {
         crate::object::proto_validity::assign_intrinsic_prototype_serial(
@@ -1077,3 +1053,7 @@ pub(crate) fn ensure_generator_intrinsics() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "generator_shape_tests.rs"]
+mod generator_shape_tests;

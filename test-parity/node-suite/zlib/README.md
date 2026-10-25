@@ -35,6 +35,70 @@ GC-owned fallback, not an unconditional prompt-release guarantee. Runtime
 ownership and copy/getter-order witnesses accompany these public fixtures;
 they do not assert the stronger exceptional prompt-release claim.
 
+## Gzip constructor option phases
+
+`options/constructor-option-values.ts` uses the pinned Node 26.12.1
+[`Zlib` and `ZlibBase` constructors](https://github.com/nodejs/node/blob/v26.12.1/lib/zlib.js).
+Eight finite public `createGzip()` cases observe conditional `windowBits` reads,
+dictionary-before-chunk validation, first-validated compression levels across
+later enumerable option copying, and thrown-sentinel identity. Accepted streams
+report genuine Gzip identity, gzip header XFL, `bytesWritten`, end and close;
+they do not compare backend-specific DEFLATE bytes.
+
+The Gzip-only constructor path retains rooted codec options, owns the same codec
+before base/Transform getters, and passes a real enumerable option copy to the
+existing Transform initializer. Other codecs and shared sync/callback validators
+keep their previous schedule. Gzip dictionary acceptance still does not apply it
+to the backend. Exceptional construction retains the existing GC-owned fallback;
+this change does not promise unconditional prompt release after getter throws.
+
+`options/constructor-getter-phases.ts` remains the original full-hex diagnostic,
+byte-for-byte unchanged. Its known compression-backend residual is separate from
+this semantic fixture; preserving it does not mark it green. The existing
+`options/validation-order.ts` is also unchanged. Historical audit measurements
+and exclusions below describe their original fixture roster, not these additions.
+
+## DEFLATE preset dictionaries
+
+`dictionary/deflate-roundtrip.ts`, `dictionary/source-types.ts`, and
+`dictionary/stream-application.ts` exercise real zlib-wrapped preset dictionary
+application, not just constructor validation. `deflateSync` and `createDeflate`
+use the already-linked zlib-ng backend only when a dictionary is supplied;
+ordinary compression retains its existing backend and output. `inflateSync`
+and `createInflate` supply the owned dictionary when the decoder requests it.
+Buffer, TypedArray, DataView and ArrayBuffer sources retain their byte range.
+Stream reset retains the selected dictionary, without retaining borrowed JS
+pointers. Native codec working allocations remain in the payload buffer ledger.
+
+`dictionary/deflate-wrong-dictionary.ts` pins the Node 26.12.1 errors for missing
+and wrong dictionaries (`Z_NEED_DICT`, with distinct messages), a sliced DataView,
+and reset followed by split input. Brotli dictionary application remains separate
+unsupported codec work.
+
+## Zstd dictionary history
+
+`dictionary/zstd-roundtrip.ts` covers direct and captured synchronous APIs and
+stream constructors, sliced DataView/TypedArray dictionaries, reset followed by
+split input, and ordinary no-history controls. Sync calls read only the dictionary
+option; stream constructors retain their existing validation schedule. Each codec
+owns an immediate view-bounded byte snapshot, and reset reloads it into the new
+native context through the existing payload owner and allocation accounting.
+Actual backend error numbers determine Zstd error codes, not message matching.
+A wrong raw-content dictionary can succeed with incorrect plaintext; the fixture
+does not invent a universal wrong-dictionary error. Missing-history rejection
+distinguishes real dictionary application from an ordinary roundtrip.
+Callback option capture and settlement are unchanged by this sync/stream work.
+
+## Brotli one-shot output limits
+
+`options/max-output-length.ts` covers namespace, named and captured one-shot
+Brotli decompression. Both synchronous and callback routes enforce
+`maxOutputLength` before appending beyond the cap, accept an exact-size result,
+and preserve the ordinary uncapped behavior and compressed input bytes.
+Over-limit results use a managed `RangeError` with `ERR_BUFFER_TOO_LARGE`;
+callbacks receive no output while retaining their genuine codec receiver.
+This policy does not change DEFLATE dictionaries or general stream options.
+
 ## Locked sources
 
 - Node 26.5.0 commit [`bebd1b8d92bf4cc917844d6335ed1ecf9c2a75fb`][node-tree]:
@@ -205,3 +269,23 @@ was deterministic, portable, non-redundant, and safe for this granular suite.
 [bun-zlib-tests]: https://github.com/oven-sh/bun/tree/43d60f69c95a9f31591165816ced29b83e94673e/test/js/node/zlib
 [bun-zlib-main]: https://github.com/oven-sh/bun/blob/43d60f69c95a9f31591165816ced29b83e94673e/test/js/node/zlib/zlib.test.js
 [bun-bytes-written]: https://github.com/oven-sh/bun/blob/43d60f69c95a9f31591165816ced29b83e94673e/test/js/node/zlib/bytesWritten.test.ts
+
+## Descriptor and write policy
+
+`constants/descriptor-write-policy.ts` checks the pinned oracle's complete
+legacy-alias descriptor surface, read-only constants and module exports, the
+frozen bidirectional `codes` object, and rejection without value changes.
+Legacy aliases remain non-enumerable; ordinary function exports remain mutable
+and can be restored after an override. Descriptor values share the same
+`constants` object as ordinary reads. This supplements `constants/immutability`
+and `imports/legacy-constant-aliases` without changing those fixtures.
+
+### Synchronous DEFLATE info results
+
+`deflateSync` and `inflateSync` return an enumerable `{ buffer, engine }`
+record when `options.info` is truthy. The genuine `Deflate` or `Inflate` owner
+processes the input through its attached codec; `bytesWritten` reports consumed
+input, and releasing its native handle does not destroy or close the Transform.
+False/default info retains the bare Buffer and existing one-shot backend.
+The public fixture covers named, namespace and captured calls, truthiness,
+option-getter order, malformed input, and view-bounded input accounting.

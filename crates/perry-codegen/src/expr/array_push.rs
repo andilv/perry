@@ -1439,7 +1439,11 @@ fn lower_inner(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> Resul
                     let arr_ptr = blk.inttoptr(I64, &payload);
                     // GC_STORE_AUDIT(POINTER_FREE): array length header update has no child pointer.
                     blk.store(I32, &new_length, &arr_ptr);
-                    blk.br(&merge_label);
+                    // The guard excluded a named layout, so no element
+                    // descriptor can sit at the frontier (EK §3.1).
+                    let pushed_bits = blk.bitcast_double_to_i64(&v);
+                    ctx.note_ek_frontier(&payload, &length, &pushed_bits);
+                    ctx.block().br(&merge_label);
                 }
 
                 // Realloc: capacity exhausted. Runtime allocates a

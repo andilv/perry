@@ -87,7 +87,6 @@ mod arguments_forward_tests;
 mod arguments_latch_tests;
 mod array_object_ops;
 mod assert;
-mod async_generator_queue;
 mod bigint_dispatch;
 mod buffer_dispatch;
 mod class_accessor_guard;
@@ -322,7 +321,6 @@ pub use alloc::*;
 pub use arguments::*;
 pub(crate) use array_object_ops::*;
 pub use assert::*;
-pub(crate) use async_generator_queue::is_async_generator_instance_value;
 pub(crate) use bigint_dispatch::*;
 pub use buffer_dispatch::*;
 pub use class_constructors::*;
@@ -344,6 +342,7 @@ pub use delete_rest::*;
 pub use descriptors::*;
 pub use field_get_set::*;
 pub use field_set_by_name::*;
+pub(crate) use global_this::is_async_generator_instance_value;
 pub use global_this::*;
 pub(crate) use global_this_tables::*;
 pub use groupby::*;
@@ -1483,7 +1482,6 @@ pub fn scan_object_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'
             visitor.visit_atomic_i64_slot(slot, Ordering::Acquire, Ordering::Release);
         });
     }
-    async_generator_queue::scan_async_generator_queue_roots_mut(visitor);
     collection_proto_thunks::scan_builtin_collection_method_roots_mut(visitor);
     // Shared `%IteratorPrototype%`-style singletons for builtin iterator
     // objects. Each iterator instance's `[[Prototype]]` points here, so these
@@ -1714,7 +1712,7 @@ const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 16 - size_of::
 const _: () = assert!(
     std::mem::offset_of!(ObjectHeader, parent_class_id) == crate::codegen_abi::OBJECT_SHAPE_OFFSET
 );
-const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 16);
+const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 24);
 
 pub(crate) mod cell_meta;
 pub(crate) use cell_meta::{cell_expando_ensure, cell_expando_get, cell_meta_slot};

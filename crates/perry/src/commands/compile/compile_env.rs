@@ -56,6 +56,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_FACTS_MAX_PTS",
     "PERRY_FACTS_MAX_WORK",
     "PERRY_FACTS_SABOTAGE",
+    "PERRY_FACTS_UNITS",
     "PERRY_FACTS_WIDEN",
     "PERRY_FAMILY_SLOT_SABOTAGE",
     "PERRY_FAST_MATH",
@@ -223,6 +224,8 @@ pub(super) fn compile_env_value(name: &str) -> Option<String> {
 #[cfg(test)]
 const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
     ("PERRY_REACH_REPORT", "Compiler-only diagnostic; bypasses object caches and does not change emitted code."),
+    ("PERRY_SOURCE_NEED_REPORT", "Compiler-only retained-source census; bypasses object caches and does not change emitted code."),
+    ("PERRY_RETAIN_ALL_SOURCE", "Diagnostic: keeps retained source the compiler would drop; each module's HIR hash (its object-cache key) reflects the text, and whole-binary caching is bypassed."),
     ("PERRY_ENUM_IMAGE_CENSUS", "Prints enum-image census diagnostics only; no lowering decision depends on this report."),
     ("PERRY_FALLBACK_DIAG", "Opt-in sidecar labels; all caches are bypassed while enabled. Off leaves emitted code and cache identity unchanged."),
     (

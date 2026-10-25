@@ -21,7 +21,13 @@
 //! - `PERRY_FACTS_PROFILE=1`: per-constraint-kind solve profile in the dump;
 //! - `PERRY_FACTS_EXPLAIN=1`: diagnostics — each ⊤ site verdict names
 //!   where ⊤ first entered (the precision report groups by it);
-//! - `PERRY_FACTS_ONLY=1`: stop after writing the dump (analysis-only runs).
+//! - `PERRY_FACTS_ONLY=1`: stop after writing the dump (analysis-only runs);
+//! - `PERRY_FACTS_UNITS=0`: whole-program facts, the reference mode (one
+//!   solve over every module). The default is per-unit facts (decision 151):
+//!   one solve per module, the other modules unknown code
+//!   (`perry_wpfacts::compute_units`), the bounds per unit. Per-unit is the
+//!   default because whole-program exact points-to does not scale (fastify
+//!   does not converge); owner decision 2026-10-23.
 //!
 //! Interpreted code (`new Function`, `eval`, `vm`) is no program-wide kill
 //! (decision 150): the analysis models it as the ⊤ summary node, and when it
@@ -34,8 +40,7 @@ use std::sync::Arc;
 
 /// Solve-work bound (see `perry_wpfacts::FactsConfig::max_work`), sized so
 /// the whole pass costs a few seconds at most. With `this` bound per
-/// (receiver, key), shared accessor walks and groups, and edges into
-/// widened sets cut at the source, tsc needs 45M, fastify 59M, Effect 27M,
+/// (receiver, key), shared accessor walks and groups, tsc needed 45M, fastify 59M, Effect 27M,
 /// zod 3.9M, commander 1.8M; the Next.js server (~3G) still stops at the
 /// bound and gets no facts.
 const DEFAULT_MAX_WORK: u64 = 200_000_000;
@@ -45,8 +50,37 @@ pub(crate) fn contracts_requested() -> bool {
         .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
 }
 
+/// Every module's `export … from "src"` sources resolved the way module
+/// collection and init order resolve them, for the targets that are program
+/// modules. The HIR keeps a re-export's source as written; without this the
+/// analysis cannot link `export * as X from "./x"` to `./x`'s namespace.
+pub(crate) fn export_sources(ctx: &super::CompilationContext) -> perry_wpfacts::ExportSources {
+    let mut out = perry_wpfacts::ExportSources::new();
+    for (path, module) in &ctx.native_modules {
+        for export in &module.exports {
+            let source = match export {
+                perry_hir::Export::ExportAll { source }
+                | perry_hir::Export::ReExport { source, .. }
+                | perry_hir::Export::NamespaceReExport { source, .. } => source,
+                perry_hir::Export::Named { .. } => continue,
+            };
+            let Some((target, _)) = super::resolve::resolve_import_with_context(source, path, ctx)
+            else {
+                continue;
+            };
+            if ctx.native_modules.contains_key(&target) {
+                out.entry(path.display().to_string())
+                    .or_default()
+                    .insert(source.clone(), target.display().to_string());
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn run(
     modules: &BTreeMap<PathBuf, perry_hir::Module>,
+    export_sources: perry_wpfacts::ExportSources,
     dynamic_code: bool,
     dynamic_code_reach: &perry_hir::dynamic_code::DynamicCodeReach,
     wrapped: &std::collections::HashMap<PathBuf, super::types::CjsWrapDebugSource>,
@@ -75,14 +109,6 @@ pub(crate) fn run(
                 .unwrap_or(DEFAULT_MAX_WORK),
         ),
         profile: std::env::var("PERRY_FACTS_PROFILE").is_ok_and(|v| v == "1"),
-        // Widening: a points-to set past this many tokens becomes ⊤ and its
-        // members escape (sound; bounds memory on merged generic helpers).
-        widen_k: Some(
-            std::env::var("PERRY_FACTS_WIDEN")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(64),
-        ),
         // Points-to entries bound (memory); past it the program gets no facts.
         max_pts: Some(
             std::env::var("PERRY_FACTS_MAX_PTS")
@@ -90,6 +116,7 @@ pub(crate) fn run(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(400_000_000),
         ),
+        export_sources,
         explain: std::env::var("PERRY_FACTS_EXPLAIN").is_ok_and(|v| v == "1")
             || perry_codegen::fallback_diag::enabled(),
         dynamic_code_reach: dynamic_code_reach.clone(),
@@ -97,12 +124,21 @@ pub(crate) fn run(
             "E14 the program can run interpreted code (deferred new Function/eval or node:vm)"
                 .into()
         }),
+        unit: false,
+        // Decision 32: the one unit-jobs setting (`PERRY_CODEGEN_UNIT_JOBS`,
+        // else the budget's CPU slots, else cores bounded by memory).
+        jobs: perry_codegen::workers::unit_workers(),
+        unit_io: dump.is_some(),
     };
     let list: Vec<(String, &perry_hir::Module)> = modules
         .iter()
         .map(|(p, m)| (p.display().to_string(), m))
         .collect();
-    let pf = perry_wpfacts::compute(&list, &cfg);
+    let pf = if per_unit_facts(std::env::var("PERRY_FACTS_UNITS").ok().as_deref()) {
+        perry_wpfacts::compute_units(&list, &cfg)
+    } else {
+        perry_wpfacts::compute(&list, &cfg)
+    };
     let elapsed = started.elapsed().as_secs_f64() * 1000.0;
     if let Some(path) = &dump {
         let mut text = pf.dump_text();
@@ -163,10 +199,28 @@ pub(crate) fn run(
             s.solve_ms,
             s.pops,
             s.work,
-            if s.aborted { ", OVER the work/time bound: no facts" } else { "" },
+            if s.aborted {
+                ", OVER the work/time bound: no facts"
+            } else {
+                ""
+            },
             s.derive_ms,
             elapsed
         );
+        for (path, u) in &pf.units {
+            eprintln!(
+                "perry: wpfacts: unit {path}: {} nodes, {} pts entries, work {}, {:.0} ms{}",
+                u.nodes,
+                u.pts_entries,
+                u.work,
+                u.gen_ms + u.solve_ms + u.derive_ms,
+                if u.aborted {
+                    ", OVER the bound: no facts"
+                } else {
+                    ""
+                }
+            );
+        }
     }
     if std::env::var("PERRY_FACTS_ONLY").is_ok_and(|v| v == "1") {
         // Analysis-only run (precision reports, checkers): stop after the
@@ -256,12 +310,7 @@ fn elision_for(pf: &perry_wpfacts::ProgramFacts, path: &str) -> perry_codegen::E
     let Some(mb) = pf.bindings_for(path) else {
         return out;
     };
-    let stable: std::collections::HashMap<u32, &perry_wpfacts::TemplateFacts> = pf
-        .templates
-        .iter()
-        .filter(|t| t.prefix_stable)
-        .filter_map(|t| Some((t.class_id?, t)))
-        .collect();
+    let stable = pf.stable_classes();
     let recv = |b: &perry_wpfacts::BindingFacts| -> Option<FactsRecv> {
         let class_ids: Vec<u32> = b
             .class_ids
@@ -321,4 +370,34 @@ fn elision_for(pf: &perry_wpfacts::ProgramFacts, path: &str) -> perry_codegen::E
         );
     }
     out
+}
+
+/// Per-unit is the default facts mode: whole-program exact points-to does not
+/// scale (fastify exceeds the work bound and does not converge unbounded);
+/// owner decision 2026-10-23. `PERRY_FACTS_UNITS=0` opts into the
+/// whole-program reference mode.
+fn per_unit_facts(env: Option<&str>) -> bool {
+    env != Some("0")
+}
+
+#[cfg(test)]
+mod facts_mode_tests {
+    use super::per_unit_facts;
+
+    #[test]
+    fn per_unit_is_the_default_mode() {
+        // per-unit is the default: whole-program exact points-to does not
+        // scale; owner 2026-10-23.
+        assert!(
+            per_unit_facts(None),
+            "the default facts mode must be per-unit"
+        );
+        assert!(per_unit_facts(Some("1")));
+        assert!(per_unit_facts(Some("")));
+    }
+
+    #[test]
+    fn whole_program_is_an_explicit_opt_in() {
+        assert!(!per_unit_facts(Some("0")));
+    }
 }

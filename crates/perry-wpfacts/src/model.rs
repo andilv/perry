@@ -24,6 +24,9 @@ pub const ITER_ELEM: &str = "#iter";
 /// model. Its presence in a node means "any escaped object or anything else".
 pub const TOP: Tok = 0;
 
+/// The context of a template's own token (`TokKind::Obj`).
+pub const NO_CTX: CallId = u32::MAX;
+
 /// Primitive kind bits carried next to the object tokens of a node.
 pub mod prim {
     pub const NUM: u16 = 1 << 0;
@@ -78,16 +81,27 @@ pub enum BuiltinNs {
     Map,
     /// `Set` / `WeakSet`: `new` builds a collection of the values.
     Set,
+    /// The program's `require` from `module.createRequire` (one per
+    /// program: every CommonJS wrapper shares it). A call resolves its
+    /// constant specifier ([`Model::call_lit`]): a compiled module's path
+    /// gives that module's exports; anything else is the unknown loader.
+    Require,
     Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TokKind {
     Top,
-    /// An instance of a birth template.
-    Obj(TmplId),
-    /// A function value (closure, function declaration, method body).
-    Func(FnIdx),
+    /// An instance of a birth template, born at a context: `NO_CTX` for the
+    /// template's own token (generation-time births, template-wide marks),
+    /// else the `new` call that made it (one token per birth site; a call
+    /// an instance made is that instance's own call).
+    Obj(TmplId, CallId),
+    /// A function value (closure, function declaration, method body), with
+    /// its closure context: `NO_CTX`, or the context a closure created
+    /// inside a summary instance carries (`Model::clo_ctx`: the instance's
+    /// nodes for the closure's outer terms).
+    Func(FnIdx, CallId),
     /// `f.bind(t, ...)` result: index into `Model::bound`.
     Bound(u32),
     /// The class constructor value of a class template.
@@ -100,9 +114,6 @@ pub enum TokKind {
     Builtin(BuiltinNs),
     /// An opaque runtime function value (a builtin method read as a value).
     BuiltinFn,
-    /// A runtime-created container that holds only primitives (split/match
-    /// results, `Object.keys` arrays …). Shared by every such container.
-    PrimBox,
     /// A module's namespace / `module.exports` object.
     ModNs(u32),
     /// The prototype of a native parent class (`extends EventEmitter`),
@@ -120,8 +131,14 @@ pub enum TmplKind {
         class_id: u32,
         literal_shape: bool,
     },
-    /// An object literal site that stays an `Expr::Object` / `ObjectSpread`.
-    Lit { module: u32, site: SiteId },
+    /// An object literal site that stays an `Expr::Object` / `ObjectSpread`,
+    /// or a TS enum's object (`enum_image`: its keys are the members, named
+    /// by the enum, §18.2).
+    Lit {
+        module: u32,
+        site: SiteId,
+        enum_image: bool,
+    },
     /// Instances of `new f()` on a constructor-function body.
     FnInst { func: FnIdx },
     /// `Object.create(p)` result at a site (a separate template; E10 makes
@@ -172,6 +189,14 @@ pub struct Template {
     /// Keys the class defines on its prototype at class creation (methods,
     /// accessors, `constructor`): a lookup that finds one stops there.
     pub proto_members: Vec<Atom>,
+    /// A parent that is not a class of the unit at gen time (§17.2): the
+    /// value of the `extends` expression and the load of its `prototype`.
+    /// The class object's and the prototype's proto nodes take their tokens
+    /// from them; after the solve one class token there becomes `parent`.
+    pub parent_value: Option<(NodeId, NodeId)>,
+    /// Classes whose constructor chain `super()` ran on this class's
+    /// instances during the solve (the parent value's class tokens).
+    pub parent_links: Vec<TmplId>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,14 +212,30 @@ pub struct FuncInfo {
     /// Holds every argument (the `arguments` object's elements + extra args).
     pub args_all: NodeId,
     /// The body has an `arguments` object, the only reader of `args_all`:
-    /// calls feed `args_all` only then (a node nobody reads must not widen
-    /// and escape the arguments of a helper called with many objects).
+    /// calls feed `args_all` only then (nobody else reads it).
     pub has_arguments: bool,
     pub token: Tok,
     /// This function is the constructor of that class template.
     pub ctor_of: Option<TmplId>,
     /// Arrow function / `captures_this` closure: `this` is the enclosing one.
     pub lexical_this: bool,
+    /// Something outside the call protocol writes the parameters (an object
+    /// literal IIFE, a computed accessor): never summarized.
+    pub no_summary: bool,
+    /// The step closure of a transformed generator: the generator object
+    /// (`LinkGeneratorPrototype`); `next`/`return`/`throw` and the
+    /// iteration protocol on it run the closure.
+    pub gen_step: bool,
+    /// A class constructor of the shape `constructor(...a) { super(...a) }`
+    /// (the spec default a derived class gets): the `new` call's own
+    /// arguments construct the parent, position by position, not through
+    /// one rest array whose elements reach every parameter of the parent
+    /// (DECISIONS 49). Its body is not walked: `run_ctor_chain` runs the
+    /// parent with the `new` call itself.
+    pub forwards_super: bool,
+    /// The function whose body creates this closure (`NO_FN` for
+    /// declarations, methods and builtins).
+    pub parent: FnIdx,
 }
 
 #[derive(Clone, Debug)]
@@ -214,11 +255,31 @@ pub struct CallSite {
     pub site: SiteId,
 }
 
+/// What a published class's method did to its receiver (`Model::recv_log`).
+#[derive(Clone, Copy, Debug)]
+pub enum RecvEffect {
+    Store(Key, NodeId, SiteId),
+    Hard(Hard, u32),
+    Escape(u32),
+}
+
 /// A property key: a named atom, or any key (computed).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Key {
     Named(Atom),
     Any,
+}
+
+/// A lookup that passed a native prototype not defining its key.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeMiss {
+    /// A value read into this node.
+    Load(NodeId),
+    /// A method call with this receiver.
+    Call(Tok, CallId),
+    /// A program-owned global (`builtins::global_user_key`) read into the
+    /// first node; the second is the global's field.
+    Global(NodeId, NodeId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -273,6 +334,10 @@ pub enum Cons {
     Load { key: Key, dst: NodeId },
     /// Values of own properties only (enumerability over-approximated).
     OwnValues { dst: NodeId },
+    /// `registerPathModule`: dst ⊇ a CommonJS record's live `exports` (the
+    /// wrapper's record literal carries `__perry_cjs_record` at birth), or
+    /// the published value itself for a raw publication.
+    CjsPublish { dst: NodeId },
     /// write(t, key) ⊇ src for every t in the node.
     Store { key: Key, src: NodeId, site: SiteId },
     /// The node is a callee.
@@ -282,6 +347,10 @@ pub enum Cons {
     CallThis { call: CallId, this: Tok },
     /// The node is a `new` callee.
     New { call: CallId },
+    /// `new Name(...)` of a builtin constructor named in the source: runs
+    /// once per call (the holder holds one marker token), so an instance
+    /// that renames the call constructs its own object.
+    NewNamed { name: Atom, call: CallId },
     /// The node is a method-call receiver (`recv.key(...)`).
     MCall { key: Key, call: CallId },
     /// The node is `ProtoNode(cur)`: continue a lookup for `origin`.
@@ -292,6 +361,32 @@ pub enum Cons {
     },
     /// Every token escapes (goes to ⊤), with the reason.
     TopSink { reason: u32 },
+    /// A parameter of a closed class's stand-in constructor (design §18.13,
+    /// DECISIONS 109): an instance of another unit's contract (a stand-in)
+    /// goes to the defining unit's constructor through the argument
+    /// contract, which describes it there as the same stand-in, so that
+    /// unit's census covers what the constructor does with it; any other
+    /// token escapes, with the reason.
+    HandOver { reason: u32 },
+    /// The `this` of a contract stand-in of another unit's class `tmpl`
+    /// (design §11.2): its instances are inside the contract; any other
+    /// receiver escapes (that unit runs the method on it unseen).
+    /// `this` of another unit's method: only that class's instances (and,
+    /// for a static method, its class object); any other receiver escapes.
+    ContractThis {
+        tmpl: TmplId,
+        reason: u32,
+        statics: bool,
+    },
+    /// Once anything (a token or a primitive) reaches the node, `dst` holds
+    /// ⊤ and everything `from` holds: the result of a call that exists only
+    /// when an argument reaches it.
+    /// (`reason` `None`: only `from`, no ⊤.)
+    TopIfAny {
+        dst: NodeId,
+        from: NodeId,
+        reason: Option<u32>,
+    },
     /// Every object token reaches a HARD operation.
     Hard { kind: Hard, reason: u32 },
     /// Every token gains keys after birth (computed store …).
@@ -329,6 +424,10 @@ pub enum Cons {
     /// The node holds method closures installed on `recv` (literal methods):
     /// their `this` is `recv`.
     ThisFrom { recv: NodeId },
+    /// A literal's own content: every token here gets `src` in field `key`
+    /// (no store: a birth, as generation's direct field edges are). A
+    /// summary's form of a literal born in its body.
+    BirthField { key: Key, src: NodeId },
     /// The node holds getter/setter functions installed on the objects of
     /// `holder` under `key`.
     Accessor {
@@ -337,7 +436,8 @@ pub enum Cons {
         setter: bool,
     },
     /// Internal: install accessor `f` on every token of the node.
-    AccessorInstall { key: Atom, f: FnIdx, setter: bool },
+    /// `f`: the accessor's function token (its closure context included).
+    AccessorInstall { key: Atom, f: Tok, setter: bool },
     /// The node holds objects whose prototype set includes `src`'s values.
     ProtoFrom { src: NodeId },
     /// dst ⊇ prototypes of the node's objects (`Object.getPrototypeOf`).
@@ -356,6 +456,11 @@ pub enum Cons {
     /// The node is an arithmetic operand: dst ⊇ the kinds its values turn
     /// into (`+` when `add`: strings concatenate).
     Arith { dst: NodeId, add: bool },
+    /// The node is the only argument of `Array(x)` / `new Array(x)`: a Number
+    /// is the length (the array has holes, no element), any other value is
+    /// the one element (ECMA-262 Array). `dst` ⊇ its tokens and its
+    /// non-number primitives.
+    ArrayLenArg { dst: NodeId },
     /// The node holds the source of a typed array `ta`: a buffer or view
     /// there means `ta` shares (and so exposes) that buffer (B1).
     ShareBuffer { ta: Tok },
@@ -367,6 +472,17 @@ pub enum Cons {
     /// nodes its receivers found): arguments and result bind once per
     /// (call, function) (the argument half of `CallThis`).
     CallArgs { call: CallId },
+    /// The node is the source of an object spread / `Object.assign` into
+    /// the values of `into`: each source object copies its own keys, key
+    /// by key, into each target (`Model::spread_into`), never through one
+    /// any-key bucket.
+    Spread { into: NodeId, site: SiteId },
+    /// The node holds the targets of a spread from source token `src`.
+    SpreadFrom { src: Tok, site: SiteId },
+    /// The node is a receiver of summarized function token `ft` at `call`
+    /// (or of no call: `NO_NODE`): each value binds the instance of its
+    /// layout (`Model::bind_layout`).
+    ThisInst { call: CallId, ft: Tok },
     /// The node is a method node some call sites bound through: a builtin
     /// namespace value in it runs per (call, receiver) (`callee_sites`).
     BuiltinCallee,
@@ -400,13 +516,18 @@ impl Cons {
         match self {
             Cons::Load { .. } => "load",
             Cons::OwnValues { .. } => "ownvalues",
+            Cons::CjsPublish { .. } => "cjspublish",
             Cons::Store { .. } => "store",
             Cons::Call { .. } => "call",
             Cons::CallThis { .. } => "callthis",
             Cons::New { .. } => "new",
+            Cons::NewNamed { .. } => "newnamed",
             Cons::MCall { .. } => "mcall",
             Cons::Chain { .. } => "chain",
             Cons::TopSink { .. } => "top",
+            Cons::HandOver { .. } => "handover",
+            Cons::ContractThis { .. } => "contractthis",
+            Cons::TopIfAny { .. } => "topifany",
             Cons::Hard { .. } => "hard",
             Cons::AddsKeys => "addskeys",
             Cons::Implicit { .. } => "implicit",
@@ -420,6 +541,7 @@ impl Cons {
             Cons::SuperCtor { .. } => "superctor",
             Cons::SuperCtorParent { .. } => "superctorparent",
             Cons::ThisFrom { .. } => "thisfrom",
+            Cons::BirthField { .. } => "birthfield",
             Cons::Accessor { .. } => "accessor",
             Cons::AccessorInstall { .. } => "accinstall",
             Cons::ProtoFrom { .. } => "protofrom",
@@ -427,11 +549,15 @@ impl Cons {
             Cons::IterNext { .. } => "iternext",
             Cons::NewTargetHard { .. } => "newtargethard",
             Cons::Arith { .. } => "arith",
+            Cons::ArrayLenArg { .. } => "arraylenarg",
             Cons::IdxLoad { .. } => "idxload",
             Cons::IdxKey { .. } => "idxkey",
             Cons::ShareBuffer { .. } => "sharebuffer",
             Cons::ThisTo { .. } => "thisto",
             Cons::CallArgs { .. } => "callargs",
+            Cons::Spread { .. } => "spread",
+            Cons::SpreadFrom { .. } => "spreadfrom",
+            Cons::ThisInst { .. } => "thisinst",
             Cons::BuiltinCallee => "builtincallee",
             Cons::HolderStep { .. } => "holderstep",
             Cons::VisitHolders { .. } => "visitholders",
@@ -449,22 +575,22 @@ pub struct Node {
     pub succ: Vec<NodeId>,
     pub cons: Vec<Cons>,
     pub in_wl: bool,
-    /// The set grew past the widening bound: it holds only ⊤ from now on,
-    /// and every token that reaches it escapes.
-    pub widened: bool,
-    /// A solver relay (callee relay, shared accessor walk), not a program
-    /// value: never widened (its members are bound or forwarded exactly as
-    /// the per-site rules it replaces would have).
-    pub internal: bool,
+    /// A delivery left out a marker that reads as ⊤ here (DECISIONS 42):
+    /// this node no longer holds every value of its sources, so it never
+    /// takes a source's set by sharing (`copy_to`, `try_copy_delivery`).
+    pub dropped: bool,
     /// Successor set, once the list is long (exact edge dedup for hubs: a
     /// function's return node can be offered the same edge millions of
     /// times).
     pub succ_set: Option<std::rc::Rc<crate::pts::FxHashSet<NodeId>>>,
-    /// Some successor was widened: every token reaching this node escapes
-    /// (what that successor did with it), and the edge to it carries only
-    /// primitive kinds from then on (`prim_succ`).
-    pub esc_out: bool,
-    pub prim_succ: Vec<NodeId>,
+    /// An observation node: a parameter-derived node of a summarized
+    /// function's shared body. It holds the union over every call for the
+    /// read sites; only read rules apply to it, it never feeds a node that
+    /// is not an observation node, and its effects are skipped.
+    pub obs: bool,
+    /// A parameter node (an instance's, a function's): it holds its
+    /// argument marker in place of the markers that arrive (DECISIONS 44).
+    pub param: bool,
 }
 
 /// A store site: where, and whether it is a construction-phase writer for
@@ -494,6 +620,8 @@ pub struct FieldWriters {
 pub struct Model {
     pub toks: Vec<TokKind>,
     pub tok_index: FxHashMap<TokKind, Tok>,
+    /// Template -> its birth-site tokens (`Obj(tm, ctx)`, ctx != NO_CTX).
+    pub site_toks: FxHashMap<TmplId, Vec<Tok>>,
     pub tmpls: Vec<Template>,
     pub funcs: Vec<FuncInfo>,
     pub nodes: Vec<Node>,
@@ -506,10 +634,6 @@ pub struct Model {
     pub work: u64,
     pub max_work: u64,
     pub max_nodes: usize,
-    /// Widening bound on one points-to set (0 = none).
-    pub widen_k: usize,
-    pub widen_queue: Vec<Tok>,
-    pub widened_nodes: u64,
     pub atoms: Vec<String>,
     pub atom_index: FxHashMap<String, Atom>,
     pub calls: Vec<CallSite>,
@@ -522,7 +646,7 @@ pub struct Model {
     pub proto_node: FxHashMap<Tok, NodeId>,
     pub field_keys: FxHashMap<Tok, Vec<Atom>>,
     /// accessors[(proto-or-object tok, key)] = (getter fns, setter fns)
-    pub accessors: FxHashMap<(Tok, Atom), (Vec<FnIdx>, Vec<FnIdx>)>,
+    pub accessors: FxHashMap<(Tok, Atom), (Vec<Tok>, Vec<Tok>)>,
     pub accessor_keys: FxHashMap<Tok, Vec<Atom>>,
     pub writers: FxHashMap<(TmplId, Atom), FieldWriters>,
     pub any_writers: FxHashMap<TmplId, FieldWriters>,
@@ -552,6 +676,10 @@ pub struct Model {
     pub relays: FxHashMap<CallId, NodeId>,
     pub relay_done: crate::pts::FxHashSet<(CallId, NodeId)>,
     pub callee_sites: FxHashMap<NodeId, Vec<(CallId, Tok)>>,
+    /// The calls bound through each (method node, receiver): a summarized
+    /// target's instance for the call takes exactly the receivers whose
+    /// lookup found it.
+    pub via_calls: FxHashMap<(NodeId, Tok), Vec<CallId>>,
     pub builtin_callee: crate::pts::FxHashSet<NodeId>,
     /// Shared accessor walks: (receiver, start, key, load/store/call) → the
     /// node the walk's accessors feed (load/call) or read from (store).
@@ -571,12 +699,20 @@ pub struct Model {
     /// Reused token buffers (no allocation per rule application).
     pub bufs: Vec<Vec<Tok>>,
     pub sunk_nodes: crate::pts::FxHashSet<NodeId>,
+    /// Classes linked to a parent at gen time whose `extends` expression is
+    /// still evaluated (a class in a CommonJS factory, §17.4): the node the
+    /// evaluated value reaches. After the solve it must be that parent.
+    pub parent_checks: Vec<(TmplId, NodeId)>,
     pub any_walk_done: crate::pts::FxHashSet<(NodeId, Tok, ChainAct)>,
     pub any_walks: Vec<(NodeId, Tok, Tok, ChainAct)>,
     /// Computed-key walks by holder: every (receiver, act) whose walk
     /// reached that holder (the receiver itself or a prototype in its
     /// closure), so installing an accessor replays only those.
     pub any_walk_holders: FxHashMap<Tok, Vec<(Tok, ChainAct)>>,
+    /// Source token of a spread -> its targets (and the spread site): a key
+    /// the source gains later is copied too (`Model::field`).
+    pub spread_to: FxHashMap<Tok, Vec<(Tok, SiteId)>>,
+    pub spread_done: crate::pts::FxHashSet<(Tok, Tok)>,
     /// Calls the runtime makes for a protocol (ToPrimitive, iteration …).
     pub protocol_calls: crate::pts::FxHashSet<CallId>,
     /// Shared prototype-chain value nodes: (token, key) → node.
@@ -597,6 +733,12 @@ pub struct Model {
     pub rel_phase: u8,
     pub stats_cons: u64,
     pub site_tmpls: FxHashMap<(CallId, &'static str), Tok>,
+    /// Generation-time birth templates (literals, arrays, builtin objects)
+    /// -> the function whose body makes them.
+    pub tmpl_fn: FxHashMap<TmplId, FnIdx>,
+    /// Template tokens of literals a summary births per instance: they live
+    /// on observation nodes only, so their own nodes observe too.
+    pub obs_toks: crate::pts::FxHashSet<Tok>,
     /// Typed-array owner templates born by `TypedArrayNew` with a known
     /// element kind (`perry_hir::TYPED_ARRAY_KIND_*`).
     pub ta_elem: FxHashMap<TmplId, u8>,
@@ -625,6 +767,40 @@ pub struct Model {
     /// them. `None` after the solve: compiled code never writes them
     /// ([`Model::note_fnproto_write`]).
     pub fnproto_write: Option<u32>,
+    /// Native parent prototypes (`EventEmitter.prototype`, `Error.prototype`
+    /// …) are runtime-owned, like `Object.prototype`: sealed static layouts
+    /// whose keys the analysis knows ([`crate::builtins::native_proto_keys`]),
+    /// so a lookup of a key one does not define continues up the chain
+    /// instead of running an opaque member. Why one may be written anyway,
+    /// per (target, key): the target is the prototype's own token,
+    /// `ObjectProto` (a global native's prototype collapses into it) or ⊤ (a
+    /// native module's values, interpreted code); key `None`: every key.
+    pub native_writes: FxHashMap<(Tok, Option<Atom>), u32>,
+    /// Lookups of a key their native prototype does not define: they run
+    /// today's opaque member once that key may be written there.
+    pub native_missing: Vec<(Tok, Atom, NativeMiss)>,
+    /// A builtin function value has been written (`store_into`): the reason.
+    /// Property reads of such values are ⊤ from then on; `bf_reads` are the
+    /// reads made before.
+    pub bf_written: Option<u32>,
+    pub bf_reads: Vec<NodeId>,
+    /// A call's constant first argument (a string), for callees whose
+    /// result depends on it (`BuiltinNs::Require`). Compiler data.
+    pub call_lit: FxHashMap<CallId, Atom>,
+    /// The CommonJS registry: every published record (`CJSREG`), the
+    /// records under an unknown path (`CJSUNKNOWNPATH`), and the records
+    /// published under each constant path (`Gen::cjs_path_node`).
+    pub cjs_union: NodeId,
+    pub cjs_unknown: NodeId,
+    pub cjs_paths: FxHashMap<Atom, NodeId>,
+    /// `require.cache` / `require.extensions` of [`BuiltinNs::Require`].
+    pub require_parts: Option<(Tok, Tok)>,
+    /// Fields of the global object under program-owned keys.
+    pub global_fields: Vec<(Atom, NodeId)>,
+    /// A ⊤ value may be the global object: it reached unmodeled code, or
+    /// dynamic code may hand it out (`Function('return this')()`). Until
+    /// then a store into ⊤ cannot write a global.
+    pub global_in_top: bool,
     /// Targets of a possible [[Prototype]] write (TOP included).
     pub super_relink: crate::pts::FxHashSet<Tok>,
     /// Source constructor of a type-specialized instance layout (compiler data).
@@ -650,6 +826,96 @@ pub struct Model {
     /// (delta × successors, delta × constraints).
     pub label_work: FxHashMap<&'static str, (u64, u64, u64)>,
     pub fn_inst: FxHashMap<FnIdx, TmplId>,
+    /// Per-unit contracts (design §11.2): the methods of a published class
+    /// run on its receiver token (`Model::publish_class`).
+    pub published_this: FxHashMap<FnIdx, Tok>,
+    /// A published class's receiver token -> the instances other units
+    /// hold: the one they construct, then each one this unit gives them
+    /// through a contract (`Model::give_out`). What a method does to its
+    /// receiver happens to each of them.
+    pub contract_recv: FxHashMap<Tok, Vec<Tok>>,
+    /// What the methods did to a receiver token so far: replayed on an
+    /// instance given out later.
+    pub recv_log: FxHashMap<Tok, Vec<RecvEffect>>,
+    /// A published class -> its receiver token.
+    pub contract_recv_of: FxHashMap<TmplId, Tok>,
+    /// Another unit's templates this unit sees through a contract, with the
+    /// facts their defining unit published (design §11.2).
+    pub foreign: FxHashMap<TmplId, crate::TemplateFacts>,
+    /// Foreign templates this unit stored into (a census report).
+    pub foreign_written: crate::pts::FxHashSet<TmplId>,
+    /// Existing data fields of other units' literal layouts and class
+    /// instances this unit stored into: store effects, not census reports
+    /// (decision 17), with the node of each stored value (its kinds are
+    /// published, DECISIONS 73).
+    pub foreign_stores: crate::pts::FxHashSet<(TmplId, Atom, NodeId)>,
+    /// Published functions with a contract (design §11.2): their results
+    /// are checked after the solve instead of escaping.
+    pub contract_fns: crate::pts::FxHashSet<FnIdx>,
+    /// Closed functions (decision 13): per parameter the node holding what
+    /// the other units' calls pass (`Gen::closed_params`), instead of ⊤.
+    pub closed_params: FxHashMap<FnIdx, Vec<NodeId>>,
+    /// Per closed function: which parameters every caller passes a
+    /// described value (no unknown one) (decision 17).
+    pub closed_described: FxHashMap<FnIdx, Vec<bool>>,
+    /// Argument markers (and their reach markers) that stand only for
+    /// markers beside their values (`beside_values`, DECISIONS 74, 75).
+    /// A marker leaves it when a member that is not beside links in.
+    pub beside_markers: crate::pts::FxHashSet<Tok>,
+    /// Per beside argument marker: the argument markers it is a member of
+    /// that are beside too (they leave with it, DECISIONS 75).
+    pub beside_up: FxHashMap<Tok, Vec<Tok>>,
+    /// Per beside argument marker: the arithmetic results that took no
+    /// object kinds for it (DECISIONS 75); they take them if it leaves.
+    pub beside_arith: FxHashMap<Tok, Vec<(NodeId, u16)>>,
+    /// Decision 19: the reason a closed function is published to the
+    /// module's other units (`Gen::unit_boundary`). Published that way its
+    /// token does not escape: its parameters hold the closed contract's
+    /// stand-ins (`escape_fn_params`). Any other escape is a real one
+    /// (unknown code may call it): ⊤ parameters.
+    pub closed_pub_reason: Option<u32>,
+    pub closed_pub: crate::pts::FxHashSet<Tok>,
+    pub contract_rets: Vec<(FnIdx, NodeId)>,
+    /// A contract function's parameter markers: one object token per
+    /// parameter standing for everything the caller passes (anything read
+    /// from it is the marker again), and what the callee did with it
+    /// (`MARK_*`).
+    pub param_marker: FxHashMap<Tok, (FnIdx, u32)>,
+    pub marker_of: FxHashMap<(FnIdx, u32), Tok>,
+    pub marker_use: FxHashMap<Tok, u8>,
+    /// The markers of what a parameter or argument reaches (not the
+    /// argument itself).
+    pub reach_marker: crate::pts::FxHashSet<Tok>,
+    /// A parameter marker's reach marker.
+    pub marker_reach: FxHashMap<Tok, Tok>,
+    /// A parameter marker's reach markers by the named key it was read
+    /// under (`p.k`, design §18.4): what the argument reaches through `k`.
+    /// The reach marker above stands for what a computed key reaches.
+    pub keyed_reach: FxHashMap<Tok, Vec<(Atom, Tok)>>,
+    /// An argument marker's keyed reach marker -> (the argument marker, key).
+    pub keyed_parent: FxHashMap<Tok, (Tok, Atom)>,
+    /// Uses under a named key that reached a marker through argument
+    /// markers (`keyed_use`), by marker.
+    pub keyed_uses: FxHashMap<Tok, Vec<(Atom, u8)>>,
+    /// Markers that read as ⊤ (DECISIONS 42), a bit per token: the
+    /// contract records the escape, so the consumer sinks the argument and
+    /// reads nothing else of it; the marker says no more than the ⊤ beside
+    /// it.
+    pub marker_top: Vec<u64>,
+    /// DECISIONS 44: a parameter node's argument marker. The markers its
+    /// arguments carry arrive as this one token, which stands for each of
+    /// them: they take its uses, and the readers after the solve read it as
+    /// them (`marker_members`). One body shared by many callers then holds
+    /// one marker per parameter, not every caller's.
+    pub arg_marker_of: FxHashMap<NodeId, Tok>,
+    /// An argument marker -> the markers it stands for.
+    pub arg_members: FxHashMap<Tok, Vec<Tok>>,
+    pub arg_linked: crate::pts::FxHashSet<(Tok, Tok)>,
+    /// Argument markers, a bit per token.
+    pub arg_bits: Vec<u64>,
+    /// The `this` node of each instance method / accessor of a class: the
+    /// binding its entry guard tests (design §11.4).
+    pub this_class: FxHashMap<NodeId, TmplId>,
     /// Birth keys / definite keys of `new f()` instances, from the
     /// construction-phase analysis of `f`'s body.
     pub fn_birth: FxHashMap<FnIdx, (Vec<Atom>, Vec<Atom>)>,
@@ -660,6 +926,15 @@ pub struct Model {
     pub cur_src: NodeId,
     pub cur_why: u32,
     pub top_vals: FxHashMap<String, NodeId>,
+    /// The function whose body generation is walking (`NO_FN` outside).
+    pub cur_fn: FnIdx,
+    /// Owner of each node: the function whose body made it (`Gen::tmp`,
+    /// `Gen::tok_node`, `Gen::local`), `NO_FN` for every other node.
+    pub node_fn: Vec<FnIdx>,
+    /// (node, function): a function references a node another function
+    /// owns (a local, a parameter, or the enclosing `this` of an arrow).
+    pub captures: crate::pts::FxHashSet<(NodeId, FnIdx)>,
+    pub sum: crate::summary::SumState,
 }
 
 /// The accessors of one holder under one key (or every key, `Key::Any`),
@@ -680,6 +955,7 @@ pub struct AccGroup {
 }
 
 pub const NO_NODE: NodeId = u32::MAX;
+pub const NO_FN: FnIdx = u32::MAX;
 
 /// Marks a `super` walk's start in `Model::walk_nodes` keys (it begins with
 /// a stop check at the start prototype, unlike a receiver's own walk).
@@ -783,9 +1059,28 @@ impl Model {
             return t;
         }
         let t = self.toks.len() as Tok;
+        if let TokKind::Obj(tm, ctx) = k {
+            if ctx != NO_CTX {
+                self.site_toks.entry(tm).or_default().push(t);
+            }
+        }
         self.toks.push(k.clone());
         self.tok_index.insert(k, t);
         t
+    }
+
+    /// The template token of `tm` and every birth-site token of it.
+    pub fn tmpl_toks(&self, tm: TmplId) -> Vec<Tok> {
+        let mut v: Vec<Tok> = self
+            .tok_index
+            .get(&TokKind::Obj(tm, NO_CTX))
+            .copied()
+            .into_iter()
+            .collect();
+        if let Some(s) = self.site_toks.get(&tm) {
+            v.extend_from_slice(s);
+        }
+        v
     }
 
     pub fn node(&mut self, name: impl FnOnce() -> String) -> NodeId {
@@ -801,11 +1096,17 @@ impl Model {
             self.aborted = true;
         }
         self.nodes.push(Node::default());
+        self.node_fn.push(NO_FN);
         self.labels.push(label);
         if self.relations.is_some() {
             self.node_names.push(name());
         }
         id
+    }
+
+    /// `n` belongs to the body generation is walking.
+    pub fn own(&mut self, n: NodeId) {
+        self.node_fn[n as usize] = self.cur_fn;
     }
 
     pub fn node_l(&mut self, label: &'static str) -> NodeId {
@@ -820,18 +1121,25 @@ impl Model {
         }
     }
 
+    /// The function of a function token (`NO_FN` for any other token).
+    pub fn tok_fn(&self, t: Tok) -> FnIdx {
+        match self.toks[t as usize] {
+            TokKind::Func(f, _) => f,
+            _ => NO_FN,
+        }
+    }
+
     pub fn tok_name(&self, t: Tok) -> String {
         match &self.toks[t as usize] {
             TokKind::Top => "TOP".into(),
-            TokKind::Obj(tm) => format!("obj:{}", self.tmpls[*tm as usize].display),
-            TokKind::Func(f) => format!("fn:{}", self.funcs[*f as usize].name),
+            TokKind::Obj(tm, _) => format!("obj:{}", self.tmpls[*tm as usize].display),
+            TokKind::Func(f, _) => format!("fn:{}", self.funcs[*f as usize].name),
             TokKind::Bound(b) => format!("bound:{b}"),
             TokKind::ClassObj(tm) => format!("class:{}", self.tmpls[*tm as usize].display),
             TokKind::Proto(tm) => format!("proto:{}", self.tmpls[*tm as usize].display),
             TokKind::ObjectProto => "Object.prototype".into(),
             TokKind::Builtin(b) => format!("builtin:{b:?}"),
             TokKind::BuiltinFn => "builtin-fn".into(),
-            TokKind::PrimBox => "primbox".into(),
             TokKind::ModNs(m) => format!("ns:{m}"),
             TokKind::NativeProto(n) => format!("native:{n}"),
         }
@@ -879,15 +1187,16 @@ impl Model {
         for (i, k) in self.toks.iter().enumerate() {
             let d = match k {
                 TokKind::Top => "top -".to_string(),
-                TokKind::Obj(t) => format!("obj {t}"),
-                TokKind::Func(f) => format!("func {f}"),
+                TokKind::Obj(t, NO_CTX) => format!("obj {t}"),
+                TokKind::Obj(t, c) => format!("obj {t}@{c}"),
+                TokKind::Func(f, NO_CTX) => format!("func {f}"),
+                TokKind::Func(f, c) => format!("func {f}@{c}"),
                 TokKind::Bound(b) => format!("bound {b}"),
                 TokKind::ClassObj(t) => format!("classobj {t}"),
                 TokKind::Proto(t) => format!("proto {t}"),
                 TokKind::ObjectProto => "objectproto -".into(),
                 TokKind::Builtin(b) => format!("builtin {b:?}"),
                 TokKind::BuiltinFn => "builtinfn -".into(),
-                TokKind::PrimBox => "primbox -".into(),
                 TokKind::ModNs(m) => format!("modns {m}"),
                 TokKind::NativeProto(n) => format!("nativeproto {n}"),
             };
@@ -992,11 +1301,11 @@ impl Model {
         }
         let mut v: Vec<String> = Vec::new();
         for ((h, k), (g, s)) in &self.accessors {
-            for f in g {
-                v.push(format!("G accseed {h} {k} {f} 0"));
+            for &t in g {
+                v.push(format!("G accseed {h} {k} {} 0", self.tok_fn(t)));
             }
-            for f in s {
-                v.push(format!("G accseed {h} {k} {f} 1"));
+            for &t in s {
+                v.push(format!("G accseed {h} {k} {} 1", self.tok_fn(t)));
             }
         }
         v.sort();
@@ -1038,7 +1347,7 @@ impl Model {
 
     pub fn tmpl_of(&self, t: Tok) -> Option<TmplId> {
         match self.toks[t as usize] {
-            TokKind::Obj(tm) => Some(tm),
+            TokKind::Obj(tm, _) => Some(tm),
             _ => None,
         }
     }
@@ -1070,4 +1379,379 @@ pub fn esc_key(s: &str) -> String {
         }
     }
     o
+}
+
+/// A contract parameter's marker was read through (the caller's getters
+/// may run), touched by a builtin protocol (ToPrimitive, iteration …: the
+/// caller's methods may run), or used beyond that (stored into, opened,
+/// called, a method called on it, escaped: the argument escapes).
+pub const MARK_READ: u8 = 1;
+
+#[inline]
+pub(crate) fn marker_top_bit(bits: &[u64], t: Tok) -> bool {
+    bits.get((t >> 6) as usize)
+        .is_some_and(|w| w >> (t & 63) & 1 != 0)
+}
+pub const MARK_TOUCH: u8 = 2;
+pub const MARK_ESCAPE: u8 = 4;
+
+impl Model {
+    /// Record what the callee did to a parameter marker.
+    #[inline]
+    pub(crate) fn mark_use(&mut self, t: Tok, bits: u8) {
+        if self.param_marker.is_empty() {
+            return;
+        }
+        // An argument marker's use is a use of each marker it stands for.
+        if self.is_arg_marker(t) {
+            let mut st = vec![(t, bits)];
+            while let Some((x, b)) = st.pop() {
+                // Each marker the walk visits is solve work (113-CWL3).
+                self.work += 1;
+                if !self.is_arg_marker(x) {
+                    self.mark_use(x, b);
+                    continue;
+                }
+                if let Some(&(p, a)) = self.keyed_parent.get(&x) {
+                    self.keyed_use(p, a, b);
+                    continue;
+                }
+                let u = self.marker_use.entry(x).or_default();
+                let new = b & !*u;
+                *u |= b;
+                if new != 0 {
+                    st.extend(self.arg_members[&x].iter().map(|&m| (m, new)));
+                }
+            }
+            return;
+        }
+        let Some(&(f, i)) = self.param_marker.get(&t) else {
+            return;
+        };
+        let u = self.marker_use.entry(t).or_default();
+        let new = bits & !*u;
+        *u |= bits;
+        // An escaped argument is sunk by the contract's consumer, which
+        // then reads none of its other uses, results or reached values
+        // (gen.rs `stand_in_fn_of`): the marker, and for the argument
+        // itself its reach marker, read as ⊤ from now on (DECISIONS 42).
+        // A closed function's described parameter keeps its uses: its
+        // contract drops the escape (decision 17), and its callers' values
+        // are beside the marker, not ⊤.
+        let described = self
+            .closed_described
+            .get(&f)
+            .and_then(|d| d.get(i as usize))
+            .is_some_and(|&d| d);
+        if new & MARK_ESCAPE != 0 && !described {
+            self.set_marker_top(t);
+            if let Some(&r) = self.marker_reach.get(&t) {
+                self.set_marker_top(r);
+            }
+        }
+    }
+
+    /// Parameter marker `t`'s reach marker for named key `a` (design
+    /// §18.4): the value of `p.a`, and everything read from it. Its uses
+    /// are published per key, so the caller applies them to its argument's
+    /// `a` alone, not to everything the argument reaches (its prototype,
+    /// its class).
+    pub(crate) fn keyed_reach_of(&mut self, t: Tok, a: Atom) -> Tok {
+        if let Some(&(_, r)) = self
+            .keyed_reach
+            .get(&t)
+            .and_then(|v| v.iter().find(|(k, _)| *k == a))
+        {
+            return r;
+        }
+        let TokKind::Obj(tm, _) = self.toks[t as usize] else {
+            unreachable!("a marker is an object token")
+        };
+        let display = format!(
+            "{}:reach.{}",
+            self.tmpls[tm as usize].display, self.atoms[a as usize]
+        );
+        let rm = self.marker_template(display);
+        let r = self.tok(TokKind::Obj(rm, NO_CTX));
+        let rany = self.field_any(r);
+        self.add_tok(rany, r);
+        self.reach_marker.insert(r);
+        self.keyed_reach.entry(t).or_default().push((a, r));
+        match self.param_marker.get(&t).copied() {
+            Some(fi) => {
+                self.param_marker.insert(r, fi);
+            }
+            // An argument marker's keyed reach: its uses are its members'
+            // uses under the same key (DECISIONS 44), kept per (marker, key)
+            // in `keyed_uses`, not as a token per member (`keyed_use`).
+            None => {
+                let w = (r >> 6) as usize;
+                if self.arg_bits.len() <= w {
+                    self.arg_bits.resize(w + 1, 0);
+                }
+                self.arg_bits[w] |= 1 << (r & 63);
+                self.arg_members.insert(r, Vec::new());
+                self.keyed_parent.insert(r, (t, a));
+                if self.beside_markers.contains(&t) {
+                    self.beside_markers.insert(r);
+                }
+            }
+        }
+        r
+    }
+
+    /// A use `bits` of what marker `t` reaches through named key `a`
+    /// (design §18.4). A parameter marker records it for its contract; an
+    /// argument marker passes it to each marker it stands for; a reach
+    /// marker reaches itself under every key.
+    pub(crate) fn keyed_use(&mut self, t: Tok, a: Atom, bits: u8) {
+        let mut st = vec![(t, bits)];
+        while let Some((x, b)) = st.pop() {
+            // Each marker the walk visits is solve work (113-CWL3).
+            self.work += 1;
+            if self.reach_marker.contains(&x) {
+                self.mark_use(x, b);
+                continue;
+            }
+            let v = self.keyed_uses.entry(x).or_default();
+            let new = match v.iter_mut().find(|(k, _)| *k == a) {
+                Some((_, u)) => {
+                    let new = b & !*u;
+                    *u |= b;
+                    new
+                }
+                None => {
+                    v.push((a, b));
+                    b
+                }
+            };
+            if new == 0 {
+                continue;
+            }
+            if self.is_arg_marker(x) {
+                st.extend(self.arg_members[&x].iter().map(|&m| (m, new)));
+            }
+        }
+    }
+
+    pub(crate) fn set_marker_top(&mut self, t: Tok) {
+        let w = (t >> 6) as usize;
+        if self.marker_top.len() <= w {
+            self.marker_top.resize(w + 1, 0);
+        }
+        self.marker_top[w] |= 1 << (t & 63);
+    }
+
+    /// A marker that reads as ⊤ (DECISIONS 42).
+    #[inline]
+    pub(crate) fn marker_is_top(&self, t: Tok) -> bool {
+        marker_top_bit(&self.marker_top, t)
+    }
+
+    /// A marker that stands for no value of its own (DECISIONS 74): one of
+    /// a closed function's described parameter (decision 17), what it
+    /// reaches, or an argument marker all of whose members are such
+    /// markers (DECISIONS 75), and what that reaches. The callers' values
+    /// are the contract's, beside it in every node it reaches (they arrive
+    /// together), so it adds no kinds.
+    pub(crate) fn beside_values(&self, t: Tok) -> bool {
+        match self.param_marker.get(&t) {
+            Some(&(f, i)) => self
+                .closed_described
+                .get(&f)
+                .and_then(|d| d.get(i as usize))
+                .is_some_and(|&d| d),
+            None => self.beside_markers.contains(&t),
+        }
+    }
+
+    /// A parameter marker or an argument marker (DECISIONS 44).
+    #[inline]
+    pub(crate) fn is_marker(&self, t: Tok) -> bool {
+        self.param_marker.contains_key(&t) || self.is_arg_marker(t)
+    }
+
+    #[inline]
+    pub(crate) fn is_arg_marker(&self, t: Tok) -> bool {
+        marker_top_bit(&self.arg_bits, t)
+    }
+
+    /// The parameter markers token `t` stands for: itself, unless it is an
+    /// argument marker (DECISIONS 44).
+    pub(crate) fn marker_members(&self, t: Tok) -> Vec<Tok> {
+        if !self.is_arg_marker(t) {
+            return vec![t];
+        }
+        let mut out = Vec::new();
+        let mut seen = crate::pts::FxHashSet::default();
+        let mut st = vec![t];
+        while let Some(x) = st.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            match self.arg_members.get(&x) {
+                Some(ms) => st.extend(ms.iter().copied()),
+                None => out.push(x),
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Parameter node `n`'s argument marker, with its own reach marker.
+    pub(crate) fn arg_marker(&mut self, n: NodeId) -> Tok {
+        if let Some(&t) = self.arg_marker_of.get(&n) {
+            return t;
+        }
+        let tm = self.marker_template(format!("args{n}"));
+        let t = self.tok(TokKind::Obj(tm, NO_CTX));
+        let rm = self.marker_template(format!("args{n}:reach"));
+        let r = self.tok(TokKind::Obj(rm, NO_CTX));
+        for x in [t, r] {
+            let w = (x >> 6) as usize;
+            if self.arg_bits.len() <= w {
+                self.arg_bits.resize(w + 1, 0);
+            }
+            self.arg_bits[w] |= 1 << (x & 63);
+            self.arg_members.insert(x, Vec::new());
+        }
+        self.marker_reach.insert(t, r);
+        self.reach_marker.insert(r);
+        self.arg_marker_of.insert(n, t);
+        // It stands for its members alone (DECISIONS 75): beside while it
+        // has none, and while each one that links in is beside
+        // (`link_marker`). The caller links the arriving markers before
+        // the marker reaches any node.
+        self.beside_markers.insert(t);
+        self.beside_markers.insert(r);
+        let any = self.field_any(t);
+        self.add_tok(any, r);
+        let rany = self.field_any(r);
+        self.add_tok(rany, r);
+        t
+    }
+
+    /// Argument marker `r` stands for marker `m` too: `m` takes every use
+    /// of `r`, and what `m` reaches takes every use of what `r` reaches.
+    pub(crate) fn link_marker(&mut self, m: Tok, r: Tok) {
+        if m == r || !self.arg_linked.insert((r, m)) {
+            return;
+        }
+        self.arg_members.get_mut(&r).unwrap().push(m);
+        if self.beside_markers.contains(&r) {
+            match self.beside_values(m) {
+                true if !self.param_marker.contains_key(&m) => {
+                    self.beside_up.entry(m).or_default().push(r)
+                }
+                true => {}
+                false => self.leave_beside(r),
+            }
+        }
+        let u = self.marker_use.get(&r).copied().unwrap_or(0);
+        if u != 0 {
+            self.mark_use(m, u);
+        }
+        let reach = |s: &Self, x: Tok| s.marker_reach.get(&x).copied().unwrap_or(x);
+        let (mr, rr) = (reach(self, m), reach(self, r));
+        if (mr, rr) != (m, r) {
+            self.link_marker(mr, rr);
+        }
+        // And per key (§18.4): what `m` reaches through `k` takes the uses
+        // of what `r` reaches through `k` so far (later ones: `keyed_use`).
+        for (a, b) in self.keyed_uses.get(&r).cloned().unwrap_or_default() {
+            self.keyed_use(m, a, b);
+        }
+    }
+
+    /// Argument marker `t` stands for a value of its own now (DECISIONS
+    /// 75): so do what it reaches and the argument markers it is a member
+    /// of, and each arithmetic result that skipped it takes the object
+    /// kinds it would have taken. Beside only ever turns off: monotone.
+    pub(crate) fn leave_beside(&mut self, t: Tok) {
+        let mut st = vec![t];
+        while let Some(x) = st.pop() {
+            if !self.beside_markers.remove(&x) {
+                continue;
+            }
+            for (dst, out) in self.beside_arith.remove(&x).unwrap_or_default() {
+                self.add_prim(dst, out);
+            }
+            st.extend(self.beside_up.remove(&x).unwrap_or_default());
+            st.extend(self.marker_reach.get(&x).copied());
+            if let Some(ks) = self.keyed_reach.get(&x) {
+                st.extend(ks.iter().map(|&(_, r)| r));
+            }
+        }
+    }
+
+    fn marker_template(&mut self, display: String) -> TmplId {
+        let tm = self.tmpls.len() as TmplId;
+        self.tmpls.push(Template {
+            kind: TmplKind::BObj {
+                module: 0,
+                site: 0,
+                what: "parameter marker",
+            },
+            display,
+            birth_keys: Vec::new(),
+            definite: Vec::new(),
+            parent: None,
+            ctor: None,
+            native_parent: None,
+            accessor_keys: Vec::new(),
+            has_computed_members: false,
+            field_init: None,
+            proto_members: Vec::new(),
+            parent_value: None,
+            parent_links: Vec::new(),
+        });
+        tm
+    }
+
+    /// The marker of parameter `i` of contract function `f`.
+    pub(crate) fn param_marker_tok(&mut self, f: FnIdx, i: u32) -> Tok {
+        if let Some(&t) = self.marker_of.get(&(f, i)) {
+            return t;
+        }
+        let tm = self.tmpls.len() as TmplId;
+        let display = format!("{}:param{i}", self.funcs[f as usize].name);
+        self.tmpls.push(Template {
+            kind: TmplKind::BObj {
+                module: 0,
+                site: 0,
+                what: "parameter marker",
+            },
+            display,
+            birth_keys: Vec::new(),
+            definite: Vec::new(),
+            parent: None,
+            ctor: None,
+            native_parent: None,
+            accessor_keys: Vec::new(),
+            has_computed_members: false,
+            field_init: None,
+            proto_members: Vec::new(),
+            parent_value: None,
+            parent_links: Vec::new(),
+        });
+        let t = self.tok(TokKind::Obj(tm, NO_CTX));
+        // What the argument reaches has its own marker (fields of fields
+        // reach it again), so a result can tell the argument itself from
+        // values reachable from it (§11.2 "the return").
+        let rm = self.tmpls.len() as TmplId;
+        let mut reach = self.tmpls[tm as usize].clone();
+        reach.display = format!("{}:param{i}:reach", self.funcs[f as usize].name);
+        self.tmpls.push(reach);
+        let r = self.tok(TokKind::Obj(rm, NO_CTX));
+        let any = self.field_any(t);
+        self.add_tok(any, r);
+        let rany = self.field_any(r);
+        self.add_tok(rany, r);
+        self.param_marker.insert(t, (f, i));
+        self.param_marker.insert(r, (f, i));
+        self.reach_marker.insert(r);
+        self.marker_reach.insert(t, r);
+        self.marker_of.insert((f, i), t);
+        t
+    }
 }

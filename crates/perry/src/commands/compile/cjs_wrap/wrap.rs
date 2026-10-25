@@ -231,6 +231,13 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
     messages: &mut Vec<String>,
     computed_require_warnings: Option<&mut Vec<String>>,
 ) -> (String, Option<usize>) {
+    // Equal-length compiler-owned aliases preserve source offsets and class
+    // identities while carrying the original strictness through both wraps.
+    let create_require = if super::strictness::has_strict_directive(source, source_path) {
+        "__perry_cjs_strict_require"
+    } else {
+        "__perry_cjs_create_require"
+    };
     let mut source_cow = Cow::Borrowed(source);
 
     // Issue #5498: a genuine CommonJS file may carry a leading shebang
@@ -594,7 +601,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         .collect::<Vec<_>>()
         .join("\n");
     let imports = format!(
-        "import {{ createRequire as __perry_cjs_create_require, isBuiltin as __perry_cjs_is_builtin }} from 'node:module';\n{imports}"
+        "import {{ createRequire as {create_require}, isBuiltin as __perry_cjs_is_builtin }} from 'node:module';\n{imports}"
     );
 
     // An UNRESOLVABLE adopted specifier (`require('@opentelemetry/api')`
@@ -704,7 +711,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
                 // modules). createRequire calls js_create_native_module_namespace
                 // under the hood — the same path Node.js uses for require("process").
                 format!(
-                    "{link_child}return (globalThis.__perry_cjs_shared_require || (globalThis.__perry_cjs_shared_require = __perry_cjs_create_require({:?})))(specifier);",
+                    "{link_child}return (globalThis.__perry_cjs_shared_require || (globalThis.__perry_cjs_shared_require = {create_require}({:?})))(specifier);",
                     source_path.to_string_lossy()
                 )
             } else if needs_runtime_record {
@@ -1215,6 +1222,11 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
     );
     let module_path_literal = format!("{:?}", source_path.to_string_lossy());
     let module_filename_literal = module_path_literal.clone();
+    // The factory a reload after `delete require.cache[...]` runs again. The
+    // runtime keeps it in the record's private slot (`CJS_MODULE_RECORD`): not
+    // a property, so user code cannot read (or stringify) it, and its text
+    // (the whole module) is not retained for it. The flat emission (#4933) has
+    // no factory.
     let cjs_factory_value = if flat_default_class.is_some() {
         "undefined"
     } else {
@@ -1242,20 +1254,18 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
     } else {
         "require.main = __perry_get_cjs_main_module();"
     };
-    // #10735: entry-only. A non-entry module keeps the single-literal
-    // construction below unchanged (still recognised by
-    // `cjs_scaffolding.rs`'s `Ptr<Shape>` folding — see the comment on that
-    // literal). The entry instead mutates the ALREADY-PUBLISHED placeholder
-    // in place, field by field, so its identity matches what a dependency
-    // may have captured before this preamble ran. This is entry-only (one
-    // object per program), so it does not reintroduce the eleven-shape-
-    // transition cost the folded literal below exists to avoid.
+    // #10735: entry-only. A non-entry module builds its record in one runtime
+    // call below (recognised by `cjs_scaffolding.rs`'s `Ptr<Shape>` report).
+    // The entry instead fills the ALREADY-PUBLISHED placeholder in place,
+    // field by field, so its identity matches what a dependency may have
+    // captured before this preamble ran. The placeholder is born with the
+    // record layout, so these are stores to existing keys, and the factory
+    // goes to its private slot.
     let cjs_module_init_stmt = if is_entry_module {
         format!(
             r#"const __cjs_module = __perry_get_cjs_main_module();
     __cjs_module.exports = {{}};
     __cjs_module.__perry_cjs_record = true;
-    __cjs_module.__perry_cjs_factory = {cjs_factory_value};
     __cjs_module.id = {module_filename_literal};
     __cjs_module.path = {module_dir_literal};
     __cjs_module.filename = {module_filename_literal};
@@ -1263,23 +1273,20 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
     __cjs_module.children = [];
     __cjs_module.parent = globalThis.__perry_cjs_pending_parent;
     __cjs_module.paths = [{module_dir_literal} + '/node_modules'];
-    __cjs_module.require = undefined;"#
+    __cjs_module.require = undefined;
+    __perry_set_cjs_factory(__cjs_module, {cjs_factory_value});"#
         )
     } else {
         format!(
-            r#"const __cjs_module = {{
-        exports: {{}},
-        __perry_cjs_record: true,
-        __perry_cjs_factory: {cjs_factory_value},
-        id: {module_filename_literal},
-        path: {module_dir_literal},
-        filename: {module_filename_literal},
-        loaded: false,
-        children: [],
-        parent: globalThis.__perry_cjs_pending_parent,
-        paths: [{module_dir_literal} + '/node_modules'],
-        require: undefined,
-    }};"#
+            r#"const __cjs_module = __perry_cjs_module_record(
+        {{}},
+        {module_filename_literal},
+        {module_dir_literal},
+        [],
+        globalThis.__perry_cjs_pending_parent,
+        [{module_dir_literal} + '/node_modules'],
+        {cjs_factory_value}
+    );"#
         )
     };
     let cjs_preamble = format!(
@@ -1295,18 +1302,17 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
     // #6769: the Node `Module` record surface. Set before user code so a
     // recursive load of this module observes the same shape Node exposes.
     //
-    // ONE object literal, so the record is allocated with its final shape.
-    // As eleven sequential assignments it walked eleven shape transitions and
-    // eleven cold property stores — about 10k instructions each at module-init
-    // time — in every CommonJS module in the graph. Folding only some of the
-    // fields does not help: the trailing assignments keep transitioning the
-    // record and the win disappears (measured at -0.08%), so the whole surface
-    // folds or none of it does.
+    // ONE runtime call, so the record is born with its final layout
+    // (`CJS_MODULE_RECORD`): Node's keys, the `__perry_cjs_record` marker, and
+    // a private slot for the factory that no script can name. As sequential
+    // assignments it walked a shape transition and a cold property store per
+    // key, about 10k instructions each at module-init time, in every CommonJS
+    // module in the graph. `exports`, `children` and `paths` stay the
+    // wrapper's own literals.
     //
-    // `cjs_scaffolding.rs`'s `record_binding` matches this field list
-    // positionally. Adding or reordering a field drops the record back to being
-    // reported as a denied user candidate in the `Ptr<Shape>` report;
-    // `preamble_canary_tests` is what catches that.
+    // `cjs_scaffolding.rs`'s `record_binding` matches this call. Changing it
+    // drops the record back to being reported as a denied user candidate in
+    // the `Ptr<Shape>` report; `preamble_canary_tests` is what catches that.
     {cjs_module_init_stmt}
     globalThis.__perry_cjs_pending_parent = undefined;
     // Node populates `module.parent` before the body evaluates, so link it
@@ -1327,7 +1333,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
     // cost OpenCode's ~2,200 CJS modules a quarter of a billion instructions
     // before any user code ran.
     const __perry_cjs_base_require = (globalThis.__perry_cjs_shared_require
-        || (globalThis.__perry_cjs_shared_require = __perry_cjs_create_require({module_filename_literal})));
+        || (globalThis.__perry_cjs_shared_require = {create_require}({module_filename_literal})));
     __perry_cjs_base_require.cache[{module_filename_literal}] = __cjs_module;
     function __perry_cjs_require_error(kind, code, message) {{
         const err = kind === 'type' ? new TypeError(message) : new Error(message);
@@ -1357,7 +1363,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         const cached = __perry_cjs_base_require.cache[path];
         if (cached !== undefined) return cached.exports;
         if (!__perry_has_path_module(path)) return value;
-        if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = __perry_cjs_create_require({module_filename_literal});
+        if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = {create_require}({module_filename_literal});
         return __perry_cjs_reload_require(path);
     }}
     function require(specifier) {{
@@ -1374,7 +1380,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         // Native addons resolve through the same authenticated manifest and
         // cache as createRequire and process.dlopen, including computed paths.
         if (specifier.slice(-5) === '.node') {{
-            if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = __perry_cjs_create_require({module_filename_literal});
+            if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = {create_require}({module_filename_literal});
             return __perry_cjs_reload_require(specifier);
         }}
         // Runtime `require(path)` of a module Perry AOT-compiled but that is
@@ -1432,7 +1438,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_addon_paths(
         }}
         // A computed bare platform package can name a manifest-listed addon
         // through package.json main, without a .node suffix in the request.
-        if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = __perry_cjs_create_require({module_filename_literal});
+        if (__perry_cjs_reload_require === undefined) __perry_cjs_reload_require = {create_require}({module_filename_literal});
         return __perry_cjs_reload_require(specifier);
     }}
     // No `defineProperty(require, 'name', ...)`: a `function require(...)`

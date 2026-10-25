@@ -65,7 +65,7 @@ pub(crate) fn array_capacity_or_throw(capacity: u32) -> u32 {
 /// a request raises `RangeError: Invalid array length` before any memory is
 /// reserved (`header::array_byte_size`), as node does for an array it cannot
 /// hold. The capacity (logical slots plus any named-property reserve) is at
-/// most 536 870 909 elements, a 4 GiB block.
+/// most 536 870 907 elements, a 4 GiB block.
 pub(crate) const ARRAY_MAX_CAPACITY: u32 =
     ((u32::MAX as usize - crate::gc::GC_HEADER_SIZE - std::mem::size_of::<ArrayHeader>())
         / std::mem::size_of::<f64>()) as u32;
@@ -88,6 +88,8 @@ pub extern "C" fn js_array_alloc(capacity: u32) -> *mut ArrayHeader {
         (*ptr).length = 0;
         (*ptr).capacity = actual_capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         // HOLE-initialize the whole capacity so the unused [length, capacity)
         // slack never holds stale arena bits that the whole-heap from-space
         // scan misreads as live from-space pointers.
@@ -159,6 +161,8 @@ pub(crate) fn js_array_alloc_pointer_elements(capacity: u32) -> *mut ArrayHeader
         (*ptr).length = 0;
         (*ptr).capacity = actual_capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         // The caller writes a slot before it publishes the length that
         // covers it, so every slot it does not reach stays a hole.
         fill_fresh_capacity_with_holes(ptr);
@@ -234,6 +238,8 @@ fn alloc_key_list(
         (*ptr).length = 0;
         (*ptr).capacity = capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         let header = crate::gc::header_from_trusted_user_ptr(ptr.cast()).cast_mut();
         if canonical {
             (*header).gc_flags |= crate::gc::GC_FLAG_SHAPE_SHARED;
@@ -291,6 +297,8 @@ pub extern "C" fn js_array_alloc_with_length(capacity: u32) -> *mut ArrayHeader 
         (*ptr).length = capacity; // Set length = requested capacity
         (*ptr).capacity = actual_capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         let elements_ptr = crate::array::array_elements_ptr(ptr as *const ArrayHeader) as *mut u64;
         // The whole capacity: `[length, capacity)` is hole-filled on every
         // array (`array_truncate_length`).
@@ -323,6 +331,8 @@ pub(crate) fn js_array_alloc_with_length_exact(capacity: u32) -> *mut ArrayHeade
         (*ptr).length = capacity;
         (*ptr).capacity = capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         let elements_ptr = crate::array::array_elements_ptr(ptr as *const ArrayHeader) as *mut u64;
         for i in 0..capacity as usize {
             // GC_STORE_AUDIT(POINTER_FREE): TAG_HOLE is a non-pointer sentinel for fresh array slots.
@@ -405,6 +415,8 @@ pub extern "C" fn js_array_alloc_with_length_longlived(capacity: u32) -> *mut Ar
         (*ptr).length = capacity;
         (*ptr).capacity = capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         clear_array_numeric_layout(ptr);
         crate::gc::layout_init_pointer_free(ptr as *mut u8);
     }
@@ -493,6 +505,9 @@ pub extern "C" fn js_array_from_arraylike_holey_value(boxed: f64) -> *mut ArrayH
     let jv = crate::value::JSValue::from_bits(bits);
     if jv.is_undefined() || jv.is_null() {
         crate::object::has_own_helpers::throw_to_object_nullish_type_error();
+    }
+    if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
+        return super::generic_copy::proxy_holey_snapshot(boxed);
     }
     if !jv.is_pointer() {
         return crate::array::js_array_from_value(boxed);
@@ -682,6 +697,8 @@ pub extern "C" fn js_array_alloc_literal(capacity: u32) -> *mut ArrayHeader {
         (*ptr).length = capacity;
         (*ptr).capacity = capacity;
         (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
         clear_array_numeric_layout(ptr);
         crate::gc::layout_init_pointer_free(ptr as *mut u8);
     }
@@ -709,8 +726,13 @@ pub extern "C" fn js_array_from_values(values: *const f64, n: u32) -> *mut Array
     }
     let parent = arr as u64;
     let elems = unsafe { crate::array::array_elements_ptr(arr as *const ArrayHeader) as *mut f64 };
+    // The birth row of EK §3.1: P = the leading run of non-hole values.
+    let mut run = n;
     for i in 0..n as usize {
         let v = unsafe { *values.add(i) };
+        if run == n && v.to_bits() == crate::value::TAG_HOLE {
+            run = i as u32;
+        }
         let slot = unsafe { elems.add(i) };
         // A uniquely-owned string element now aliases this slot — demote it to
         // shared so a later `s += x` allocates fresh instead of mutating the
@@ -725,6 +747,7 @@ pub extern "C" fn js_array_from_values(values: *const f64, n: u32) -> *mut Array
         crate::gc::js_gc_note_slot_layout(parent, i as u32, vbits);
         crate::gc::js_write_barrier_slot(parent, slot as u64, vbits);
     }
+    unsafe { super::ek_set_prefix(arr, (*arr).ek_prefix, run) };
     arr
 }
 

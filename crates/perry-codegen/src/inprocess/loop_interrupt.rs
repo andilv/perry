@@ -42,7 +42,9 @@ pub(crate) const PLACE_SAFEPOINTS_OPTIONS: [&str; 3] =
 /// external linkage only so the module link keeps it (an unreferenced local
 /// definition is dropped by the linker); [`place`] deletes it once every use
 /// is inlined, so no unit ever exports it.
-const POLL_IR: &str = r#"
+// Inkwell 0.9 on Windows requires the input terminator to be present.
+// A C string keeps that precondition in the type, including after IR edits.
+const POLL_IR: &std::ffi::CStr = cr#"
 @PERRY_LOOP_INTERRUPT_ARMED = external global i32
 declare void @js_loop_interrupt() #0
 define void @gc.safepoint_poll() {
@@ -80,7 +82,8 @@ pub(super) fn place(module: &Module<'_>, tm: &TargetMachine) -> Result<()> {
         return Ok(());
     }
     let ctx = module.get_context();
-    let buffer = MemoryBuffer::create_from_memory_range_copy(POLL_IR.as_bytes(), "perry_loop_poll");
+    let buffer =
+        MemoryBuffer::create_from_memory_range_copy(POLL_IR.to_bytes_with_nul(), "perry_loop_poll");
     let poll = ctx
         .create_module_from_ir(buffer)
         .map_err(|e| anyhow!("loop interrupt poll IR: {e}"))?;
@@ -190,6 +193,28 @@ entry:
         let start = ir.find(&format!("@{name}(")).unwrap();
         let end = start + ir[start..].find("\n}\n").unwrap();
         &ir[start..end]
+    }
+
+    // Non-Windows uses inkwell 0.10, which accepts either input form. Windows
+    // uses 0.9 and rejects the old form before LLVM sees it. Prove that adding
+    // the required terminator leaves the parsed poll module byte-identical;
+    // the same linking and safepoint pipeline consumes that module afterward.
+    #[cfg(not(windows))]
+    #[test]
+    fn terminated_poll_input_preserves_the_llvm_ir() {
+        let context = Context::create();
+        let parse = |bytes: &[u8]| {
+            let buffer = MemoryBuffer::create_from_memory_range_copy(bytes, "perry_loop_poll");
+            context
+                .create_module_from_ir(buffer)
+                .unwrap()
+                .print_to_string()
+                .to_string()
+        };
+        assert_eq!(
+            parse(POLL_IR.to_bytes()),
+            parse(POLL_IR.to_bytes_with_nul())
+        );
     }
 
     #[test]

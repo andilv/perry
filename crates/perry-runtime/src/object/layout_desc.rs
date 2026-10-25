@@ -1102,6 +1102,7 @@ unsafe fn alloc_layout_object_sized(
         .add(std::mem::size_of::<ObjectHeader>())
         .cast::<u64>();
     for i in 0..physical_slots {
+        // GC_STORE_AUDIT(POINTER_FREE): All three stores write the immediate TAG_HOLE to physical object slots. They introduce no pointer/child edge; allocation or rooted object custody surrounds the fill and shape publication follows.
         *fields.add(i) = crate::value::TAG_HOLE;
     }
     mark_layout_object_facts(obj, d);
@@ -1224,6 +1225,7 @@ pub(crate) unsafe fn alloc_derived_layout_object(
         .add(std::mem::size_of::<ObjectHeader>())
         .cast::<u64>();
     for i in 0..d.slot_count as usize {
+        // GC_STORE_AUDIT(POINTER_FREE): All three stores write the immediate TAG_HOLE to physical object slots. They introduce no pointer/child edge; allocation or rooted object custody surrounds the fill and shape publication follows.
         *fields.add(i) = crate::value::TAG_HOLE;
     }
     mark_layout_object_facts(obj, d);
@@ -1867,6 +1869,7 @@ pub(crate) unsafe fn adopt_family_layout(obj: *mut ObjectHeader) -> *mut ObjectH
         .add(std::mem::size_of::<ObjectHeader>())
         .cast::<u64>();
     for i in 0..d.slot_count as usize {
+        // GC_STORE_AUDIT(POINTER_FREE): All three stores write the immediate TAG_HOLE to physical object slots. They introduce no pointer/child edge; allocation or rooted object custody surrounds the fill and shape publication follows.
         *fields.add(i) = crate::value::TAG_HOLE;
     }
     super::shapes::stamp_object_shape_id_with_carrier_note(obj, d.layout_id);
@@ -2121,7 +2124,9 @@ static FAMILY_DIAG: FamilyDiag = FamilyDiag {
 
 /// `PERRY_FAMILY_DIAG=1`: print the family store counters at exit.
 pub(crate) fn family_diag_init() {
-    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    per_test_global! {
+        static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    }
     extern "C" fn report() {
         family_diag_report();
     }
@@ -2138,7 +2143,9 @@ pub(crate) fn family_diag_init() {
 /// first later key present) and print the most frequent at exit (measurement
 /// only: which key orders the census gets wrong).
 pub(crate) fn family_diag_pairs_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    per_test_global! {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    }
     *ON.get_or_init(|| std::env::var("PERRY_FAMILY_DIAG").as_deref() == Ok("2"))
 }
 
@@ -2265,7 +2272,9 @@ static INSTALLS_BY_CAUSE: [std::sync::atomic::AtomicU64; 8] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 pub(crate) fn family_diag_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    per_test_global! {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    }
     *ON.get_or_init(|| std::env::var_os("PERRY_FAMILY_DIAG").is_some())
 }
 

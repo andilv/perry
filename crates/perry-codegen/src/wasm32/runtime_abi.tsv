@@ -217,6 +217,7 @@ js_arraylike_findIndex	f64	f64,f64,f64
 js_arraylike_findLast	f64	f64,f64,f64
 js_arraylike_findLastIndex	f64	f64,f64,f64
 js_arraylike_flat	f64	f64,f64
+js_arraylike_flatMap	f64	f64,f64,f64
 js_arraylike_forEach	f64	f64,f64,f64
 js_arraylike_includes	f64	f64,f64,f64,i32s
 js_arraylike_indexOf	f64	f64,f64,f64,i32s
@@ -232,7 +233,10 @@ js_arraylike_slice	f64	f64,f64,i32s,f64,i32s
 js_arraylike_some	f64	f64,f64,f64
 js_arraylike_sort	f64	f64,f64
 js_arraylike_splice	f64	f64,ptr,i32s
+js_arraylike_toReversed	f64	f64
+js_arraylike_toSorted	f64	f64,f64
 js_arraylike_unshift	f64	f64,ptr,i32s
+js_arraylike_with	f64	f64,f64,f64
 js_assert_assert_ctor	f64	f64
 js_assert_assertion_error_ctor	f64	f64
 js_assert_deep_equal	f64	f64,f64,f64
@@ -270,6 +274,7 @@ js_async_disposable_stack_symbol_async_dispose	f64	ptr
 js_async_disposable_stack_use	f64	ptr,f64
 js_async_first_call	f64	f64
 js_async_fn_result	ptr	f64
+js_async_generator_create	f64	f64,ptr
 js_async_generator_resume	f64	f64,f64,f64
 js_async_hook_disable	f64	i64
 js_async_hook_enable	f64	i64
@@ -645,6 +650,8 @@ js_bun_plugin	f64	f64
 js_bun_serve	i64	f64
 js_bun_server_request_ip	f64	i64,f64
 js_bun_server_stop	f64	i64,f64
+js_bun_sleep	f64	f64
+js_bun_sleep_sync	f64	f64
 js_bun_spawn	f64	f64,f64
 js_bun_sql_new	f64	f64,f64
 js_bun_sqlite_database_call	i64	f64,f64
@@ -681,8 +688,6 @@ js_bun_transpiler_transform	ptr	i64,ptr,ptr
 js_bun_transpiler_transform_sync	ptr	i64,ptr,ptr
 js_bun_unsupported	f64	f64
 js_bun_which	f64	f64,f64
-js_bun_sleep	f64	f64
-js_bun_sleep_sync	f64	f64
 js_bun_wrap_ansi	f64	f64,f64,f64
 js_bun_write	f64	f64,f64
 js_bun_zstd_decompress	f64	f64
@@ -732,6 +737,8 @@ js_child_process_validate_command	f64	f64,ptr,i32u
 js_child_process_validate_fork_module	f64	f64
 js_child_process_validate_options	f64	f64,i32s,i32s
 js_child_process_validate_spawn_args	f64	f64,i32s,i32s
+js_cjs_module_record	f64	f64,f64,f64,f64,f64,f64,f64
+js_cjs_record_set_factory	void	f64,f64
 js_class_accessor_shape_guard	i32s	f64,i32u,i64,ptr,usize
 js_class_capture_value	f64	i32u,i32u
 js_class_capture_value_for_receiver	f64	f64,i32u,i32u
@@ -2697,6 +2704,7 @@ js_object_alloc_fast	ptr	i32u,i32u
 js_object_alloc_fast_with_parent	ptr	i32u,i32u,i32u
 js_object_alloc_null_proto	ptr	i32u,i32u
 js_object_alloc_null_proto_entries	ptr	ptr,ptr,ptr,i32u
+js_object_alloc_null_proto_ordinary	ptr	i32u
 js_object_alloc_plain	ptr	i32u
 js_object_alloc_with_parent	ptr	i32u,i32u,i32u
 js_object_alloc_with_shape	ptr	i32u,i32u,ptr,i32u
@@ -2737,9 +2745,12 @@ js_object_get_field_by_name_f64	f64	ptr,ptr
 js_object_get_field_by_property_id_f64	f64	ptr,i64
 js_object_get_field_f64	f64	ptr,i32u
 js_object_get_field_nonptr	f64	i64,ptr,i64
+js_object_get_field_site_slow	f64	i64,ptr,ptr
 js_object_get_field_slow	f64	i64,ptr
 js_object_get_field_value	f64	i64,ptr,i64
+js_object_get_field_value_site	f64	i64,ptr,i64,ptr
 js_object_get_index_polymorphic	f64	i64,f64
+js_object_get_keyed_site_slow	f64	f64,f64,i64,i32u,ptr
 js_object_get_keyed_slow	f64	f64,f64,i64,i32u
 js_object_get_own_field_or_undef	f64	f64,ptr,usize
 js_object_get_own_property_descriptor	f64	f64,f64
@@ -3579,6 +3590,7 @@ js_run_ext_pump	void
 js_run_module_init_catching	void	i64
 js_run_module_init_guarded	void	i64,i64
 js_run_stdlib_pump	void	
+js_runtime_component_io_ops	ptr	
 js_runtime_describe_received	f64	f64
 js_runtime_init	void	
 js_runtime_install_bun_cli_utils	void	
@@ -4584,6 +4596,7 @@ js_writable_stream_new_with_sink_type	f64	f64,f64,f64,f64,f64,f64
 js_writable_stream_subclass_init	f64	f64,f64,f64,f64,f64
 js_writable_stream_throw_invalid_sink	f64	
 js_write_barrier	void	i64,i64
+js_write_barrier_birth_slots	void	i64,i64,i32u,i32u
 js_write_barrier_root_heap_word	void	i64
 js_write_barrier_root_nanbox	void	i64
 js_write_barrier_slot	void	i64,i64,i64
@@ -4646,7 +4659,8 @@ js_zlib_brotli_compress_init	f64	f64,f64
 js_zlib_brotli_compress_sync	f64	i64
 js_zlib_brotli_decompress	void	f64,f64,f64
 js_zlib_brotli_decompress_init	f64	f64,f64
-js_zlib_brotli_decompress_sync	f64	i64
+js_zlib_brotli_decompress_sync	f64	i64,f64
+js_zlib_brotli_max_output_length	usize	f64
 js_zlib_crc32	f64	f64,f64
 js_zlib_create_brotli_compress	f64	f64
 js_zlib_create_brotli_decompress	f64	f64
@@ -4661,6 +4675,7 @@ js_zlib_create_zstd_compress	f64	f64
 js_zlib_create_zstd_decompress	f64	f64
 js_zlib_deflate	void	f64,f64,f64
 js_zlib_deflate_init	f64	f64,f64
+js_zlib_deflate_options	f64	f64,i32s
 js_zlib_deflate_raw	void	f64,f64,f64
 js_zlib_deflate_raw_init	f64	f64,f64
 js_zlib_deflate_raw_sync	f64	f64,f64
@@ -4669,14 +4684,17 @@ js_zlib_gunzip	void	f64,f64,f64
 js_zlib_gunzip_init	f64	f64,f64
 js_zlib_gunzip_sync	f64	i64
 js_zlib_gzip	void	f64,f64,f64
+js_zlib_gzip_base_options	f64	f64
+js_zlib_gzip_codec_options	f64	f64
 js_zlib_gzip_init	f64	f64,f64
 js_zlib_gzip_sync	f64	i64,f64
+js_zlib_gzip_transform_options	f64	f64,i32s
 js_zlib_inflate	void	f64,f64,f64
 js_zlib_inflate_init	f64	f64,f64
 js_zlib_inflate_raw	void	f64,f64,f64
 js_zlib_inflate_raw_init	f64	f64,f64
 js_zlib_inflate_raw_sync	f64	f64
-js_zlib_inflate_sync	f64	i64
+js_zlib_inflate_sync	f64	i64,f64
 js_zlib_is_callback	i32s	f64
 js_zlib_resolve_level	i32s	f64
 js_zlib_stream_error	f64	ptr,usize,i32s
@@ -5045,7 +5063,11 @@ perry_probe_get	f64	ptr,i64,i64,i64
 perry_probe_get_binding	f64	ptr,i64,i64,i64
 perry_probe_get_keyed	f64	ptr,i64,i64
 perry_probe_get_length	f64	ptr,i64,i64,i64
+perry_probe_get_memo	f64	ptr,i64,i64,ptr
+perry_probe_get_site	f64	ptr,i64,i64,i64,ptr
 perry_probe_get_value	f64	ptr,i64,i64,i64
+perry_probe_get_value_memo	f64	ptr,i64,i64,ptr
+perry_probe_get_value_site	f64	ptr,i64,i64,i64,ptr
 perry_probe_own_method	f64	ptr,f64,i64,i64
 perry_probe_set	i32s	ptr,i64,i64,i64,f64
 perry_register_static_plugin	void	ptr,f64

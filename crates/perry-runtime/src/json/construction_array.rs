@@ -73,6 +73,9 @@ impl ConstructionArray {
             (*ptr).capacity = capacity;
             // GC_STORE_AUDIT(INIT): a fresh array owns no named layout.
             (*ptr).named = std::ptr::null_mut();
+            // The element-kind word starts at the weakest claim (P = 0, ANY).
+            (*ptr).ek_prefix = 0;
+            (*ptr).ek_kind = 0;
             let slots = crate::array::array_elements_ptr(raw as *const ArrayHeader).cast::<u64>();
             for index in 0..capacity as usize {
                 // GC_STORE_AUDIT(INIT): initialize all physical slack for the
@@ -187,6 +190,8 @@ impl ConstructionArray {
     ) -> *mut ArrayHeader {
         self.right_size(batch);
         self.finish_layout(batch);
+        // JSON has no holes: every slot below the length is a parsed value.
+        crate::array::ek_birth_prefix(self.ptr, (*self.ptr).length);
         self.ptr
     }
 

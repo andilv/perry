@@ -7,7 +7,7 @@
 //! - builtin data structures (arrays, maps, sets, promises …): modeled flows;
 //! - everything else fails closed (operands escape, result ⊤).
 
-use crate::gen::{Fx, Gen};
+use crate::gen::{variant_name, Fx, Gen};
 use crate::model::*;
 use perry_hir::Expr;
 
@@ -30,14 +30,14 @@ impl<'a> Gen<'a> {
 
     pub(crate) fn bobj(&mut self, mi: u32, what: &'static str) -> (Tok, NodeId) {
         let tm = self.new_bobj_template(mi, what);
-        let t = self.m.tok(TokKind::Obj(tm));
+        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
         let n = self.tok_node(t);
         (t, n)
     }
 
     pub(crate) fn new_arr_from(&mut self, mi: u32, what: &str, elems: &[NodeId]) -> NodeId {
         let tm = self.new_arr_template(mi, what);
-        let t = self.m.tok(TokKind::Obj(tm));
+        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
         let fa = self.m.field_any(t);
         for &e in elems {
             self.m.edge(e, fa);
@@ -98,8 +98,12 @@ impl<'a> Gen<'a> {
             } => {
                 let o = object.as_ref().map(|o| self.expr(fx, o));
                 let a: Vec<NodeId> = args.iter().map(|x| self.expr(fx, x)).collect();
+                let m0 = module.strip_prefix("node:").unwrap_or(module);
                 if module == "__perry_runtime" {
                     self.runtime_glue(fx, method, o, a, args)
+                } else if m0 == "module" && method == "createRequire" && object.is_none() {
+                    let t = self.m.tok(TokKind::Builtin(BuiltinNs::Require));
+                    self.tok_node(t)
                 } else {
                     if module == "vm" || module == "node:vm" {
                         crate::builtins::set_dyn_eval(&mut self.m, "E14 node:vm");
@@ -347,42 +351,6 @@ impl<'a> Gen<'a> {
             | Expr::FileURLToPath(..)
             | Expr::RegExpExecIndex
             | Expr::JsonIsRawJson(..)
-            | Expr::MathFloor(..)
-            | Expr::MathCeil(..)
-            | Expr::MathRound(..)
-            | Expr::MathTrunc(..)
-            | Expr::MathSign(..)
-            | Expr::MathAbs(..)
-            | Expr::MathSqrt(..)
-            | Expr::MathLog(..)
-            | Expr::MathLog2(..)
-            | Expr::MathLog10(..)
-            | Expr::MathPow(..)
-            | Expr::MathMin(..)
-            | Expr::MathMax(..)
-            | Expr::MathImul(..)
-            | Expr::MathRandom
-            | Expr::MathSin(..)
-            | Expr::MathCos(..)
-            | Expr::MathTan(..)
-            | Expr::MathAsin(..)
-            | Expr::MathAcos(..)
-            | Expr::MathAtan(..)
-            | Expr::MathAtan2(..)
-            | Expr::MathCbrt(..)
-            | Expr::MathHypot(..)
-            | Expr::MathFround(..)
-            | Expr::MathF16round(..)
-            | Expr::MathClz32(..)
-            | Expr::MathExpm1(..)
-            | Expr::MathLog1p(..)
-            | Expr::MathSinh(..)
-            | Expr::MathCosh(..)
-            | Expr::MathTanh(..)
-            | Expr::MathAsinh(..)
-            | Expr::MathAcosh(..)
-            | Expr::MathAtanh(..)
-            | Expr::MathExp(..)
             | Expr::PerformanceNow
             | Expr::WebAssemblyValidate(..)
             | Expr::Atob(..)
@@ -528,16 +496,66 @@ impl<'a> Gen<'a> {
             | Expr::UrlSearchParamsDelete { .. }
             | Expr::UrlSearchParamsToString(..)
             | Expr::UrlSearchParamsSort(..)
-            | Expr::ObjectIs(..)
-            | Expr::ObjectHasOwn(..)
-            | Expr::ArrayIsArray(..)
             | Expr::ArrayIterationPatched
-            | Expr::ParseInt { .. }
+            | Expr::ImportMetaUrl(..)
+            | Expr::ProxyRevoke(..) => {
+                self.prim_kids(fx, e, prim::ALL, "primitive builtin operand")
+            }
+            // Every Math function returns a Number (ECMA-262 Math).
+            Expr::MathFloor(..)
+            | Expr::MathCeil(..)
+            | Expr::MathRound(..)
+            | Expr::MathTrunc(..)
+            | Expr::MathSign(..)
+            | Expr::MathAbs(..)
+            | Expr::MathSqrt(..)
+            | Expr::MathLog(..)
+            | Expr::MathLog2(..)
+            | Expr::MathLog10(..)
+            | Expr::MathPow(..)
+            | Expr::MathMin(..)
+            | Expr::MathMax(..)
+            | Expr::MathImul(..)
+            | Expr::MathRandom
+            | Expr::MathSin(..)
+            | Expr::MathCos(..)
+            | Expr::MathTan(..)
+            | Expr::MathAsin(..)
+            | Expr::MathAcos(..)
+            | Expr::MathAtan(..)
+            | Expr::MathAtan2(..)
+            | Expr::MathCbrt(..)
+            | Expr::MathHypot(..)
+            | Expr::MathFround(..)
+            | Expr::MathF16round(..)
+            | Expr::MathClz32(..)
+            | Expr::MathExpm1(..)
+            | Expr::MathLog1p(..)
+            | Expr::MathSinh(..)
+            | Expr::MathCosh(..)
+            | Expr::MathTanh(..)
+            | Expr::MathAsinh(..)
+            | Expr::MathAcosh(..)
+            | Expr::MathAtanh(..)
+            | Expr::MathExp(..) => self.prim_kids(fx, e, prim::NUM, "primitive builtin operand"),
+            // The global conversions and predicates: the operation fixes the
+            // kind of its result (ECMA-262; the HIR operation's contract).
+            Expr::ParseInt { .. }
             | Expr::ParseFloat(..)
             | Expr::NumberCoerce(..)
-            | Expr::BigIntCoerce(..)
-            | Expr::StringCoerce(..)
-            | Expr::TemplateStringCoerce(..)
+            | Expr::MathMinSpread(..)
+            | Expr::MathMaxSpread(..) => {
+                self.prim_kids(fx, e, prim::NUM, "primitive builtin operand")
+            }
+            Expr::BigIntCoerce(..) => {
+                self.prim_kids(fx, e, prim::BIGINT, "primitive builtin operand")
+            }
+            Expr::StringCoerce(..) | Expr::TemplateStringCoerce(..) | Expr::ArrayJoin { .. } => {
+                self.prim_kids(fx, e, prim::STR, "primitive builtin operand")
+            }
+            Expr::ObjectIs(..)
+            | Expr::ObjectHasOwn(..)
+            | Expr::ArrayIsArray(..)
             | Expr::BooleanCoerce(..)
             | Expr::IsNaN(..)
             | Expr::IsUndefinedOrBareNan(..)
@@ -546,13 +564,8 @@ impl<'a> Gen<'a> {
             | Expr::NumberIsFinite(..)
             | Expr::NumberIsInteger(..)
             | Expr::NumberIsSafeInteger(..)
-            | Expr::ImportMetaUrl(..)
-            | Expr::ProxyRevoke(..)
-            | Expr::ReflectHas { .. }
-            | Expr::ArrayJoin { .. }
-            | Expr::MathMinSpread(..)
-            | Expr::MathMaxSpread(..) => {
-                self.prim_kids(fx, e, prim::ALL, "primitive builtin operand")
+            | Expr::ReflectHas { .. } => {
+                self.prim_kids(fx, e, prim::BOOL, "primitive builtin operand")
             }
 
             // ------------------------------------------- builtin objects
@@ -666,8 +679,10 @@ impl<'a> Gen<'a> {
                     has_computed_members: true,
                     field_init: None,
                     proto_members: vec![],
+                    parent_value: None,
+                    parent_links: Vec::new(),
                 });
-                let t = self.m.tok(TokKind::Obj(tm));
+                let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
                 let pn = self.m.proto_node(t);
                 self.m.edge(p, pn);
                 let n = self.tok_node(t);
@@ -780,7 +795,7 @@ impl<'a> Gen<'a> {
                 let ks = kids(e);
                 let (t, n) = self.bobj(mi, "TypedArray");
                 if let Expr::TypedArrayNew { kind, .. } = e {
-                    if let TokKind::Obj(tm) = self.m.toks[t as usize] {
+                    if let TokKind::Obj(tm, _) = self.m.toks[t as usize] {
                         self.m.ta_elem.insert(tm, *kind);
                     }
                 }
@@ -835,6 +850,12 @@ impl<'a> Gen<'a> {
                 ..
             } => {
                 let o = self.expr(fx, obj);
+                // The generator object is its step closure.
+                for t in self.m.nodes[o as usize].pts.to_sorted() {
+                    if let TokKind::Func(f, _) = self.m.toks[t as usize] {
+                        self.m.funcs[f as usize].gen_step = true;
+                    }
+                }
                 for id in i32_controls.iter().chain(i1_controls.iter()) {
                     let l = self.local(mi, *id);
                     self.m.add_prim(l, prim::NUM | prim::BOOL);
@@ -1647,274 +1668,4 @@ impl<'a> Gen<'a> {
             | Expr::PutValueSet { .. } => self.fail_closed(fx, e, "routed"),
         }
     }
-
-    fn iter_res_node(&mut self, fx: &Fx) -> NodeId {
-        if let Some(&n) = self.mods[fx.module as usize].iterres.get(&fx.f) {
-            return n;
-        }
-        let n = self.tmp("iterres");
-        self.mods[fx.module as usize].iterres.insert(fx.f, n);
-        n
-    }
-
-    /// `Object.defineProperty(o, key, desc)`: E5 on the target, the
-    /// descriptor's value is a post-construction write, and its accessors
-    /// become accessors of the target (called with `this` = the target).
-    fn define_property(&mut self, fx: &Fx, o: NodeId, key: Option<String>, desc: NodeId, r: u32) {
-        self.m.cons(
-            o,
-            Cons::Hard {
-                kind: Hard::E5DefineProperty,
-                reason: r,
-            },
-        );
-        let va = self.m.atom("value");
-        let v = self.load(desc, Key::Named(va));
-        let k = match &key {
-            Some(s) => Key::Named(self.m.atom(s)),
-            None => Key::Any,
-        };
-        self.store(fx, o, k, v, "defineProperty".into(), None, false);
-        let ka = match &key {
-            Some(s) => self.m.atom(s),
-            None => self.m.atom(crate::STAR_KEY),
-        };
-        if key.is_some() {
-            self.m.accessor_atoms.insert(ka);
-        }
-        for (name, setter) in [("get", false), ("set", true)] {
-            let a = self.m.atom(name);
-            let f = self.load(desc, Key::Named(a));
-            self.m.cons(
-                f,
-                Cons::Accessor {
-                    holder: o,
-                    key: ka,
-                    setter,
-                },
-            );
-        }
-    }
-
-    fn descriptor_of(&mut self, mi: u32, o: NodeId) -> NodeId {
-        let r = self
-            .m
-            .reason("getOwnPropertyDescriptor (accessors handed out)");
-        self.m.cons(o, Cons::Implicit { reason: r });
-        let vals = self.load(o, Key::Any);
-        let (t, n) = self.bobj(mi, "descriptor");
-        let fa = self.m.field_any(t);
-        self.m.edge(vals, fa);
-        // get/set functions of the object: handed to user code without a
-        // receiver — ⊤-called.
-        self.m.add_tok(fa, TOP);
-        self.m.add_prim(fa, prim::ALL);
-        n
-    }
-
-    fn json_value(&mut self, mi: u32) -> NodeId {
-        let (t, n) = self.bobj(mi, "json");
-        let fa = self.m.field_any(t);
-        self.m.add_prim(fa, prim::ALL);
-        self.m.add_tok(fa, t);
-        let arr = self.new_arr_template(mi, "json");
-        let at = self.m.tok(TokKind::Obj(arr));
-        let afa = self.m.field_any(at);
-        self.m.add_prim(afa, prim::ALL);
-        self.m.add_tok(afa, t);
-        self.m.add_tok(afa, at);
-        self.m.add_tok(fa, at);
-        let out = self.tmp("json");
-        self.m.edge(n, out);
-        self.m.add_tok(out, at);
-        self.m.add_prim(out, prim::ALL);
-        out
-    }
-
-    pub(crate) fn error_obj(&mut self, mi: u32, cause: Option<NodeId>) -> NodeId {
-        let (t, n) = self.bobj(mi, "Error");
-        for k in ["message", "stack", "name"] {
-            let a = self.m.atom(k);
-            let f = self.m.field(t, a);
-            self.m.add_prim(f, prim::STR);
-        }
-        if let Some(c) = cause {
-            let a = self.m.atom("cause");
-            let f = self.m.field(t, a);
-            self.m.edge(c, f);
-        }
-        n
-    }
-
-    /// `__perry_runtime` glue calls emitted by HIR lowering (iteration,
-    /// destructuring, CJS module records).
-    fn runtime_glue(
-        &mut self,
-        fx: &Fx,
-        method: &str,
-        object: Option<NodeId>,
-        args: Vec<NodeId>,
-        source_args: &[Expr],
-    ) -> NodeId {
-        let arg = |i: usize| args.get(i).copied();
-        match method {
-            "arrayRecordNeedsIterator" | "arrayRecordForBound" | "hasPathModule" => {
-                self.prim_node(prim::BOOL)
-            }
-            "arrayRecordIndex" | "arrayRecordLength" | "arrayRecordForUpdate" => {
-                self.prim_node(prim::NUM | prim::BOOL)
-            }
-            "requireResolveNodeModules" => self.prim_node(prim::STR | prim::UNDEF),
-            "arrayRecordPayload" | "arrayRecordForValue" | "requireObjectCoercible" => {
-                let out = self.tmp("glue-pass");
-                for a in &args {
-                    self.m.edge(*a, out);
-                }
-                // The payload of a for-of record is iterated by the loop.
-                if method == "arrayRecordPayload" {
-                    if let Some(a) = arg(0) {
-                        let it = self.iterate(a);
-                        let io = self.iter_out_node(fx);
-                        self.m.edge(it, io);
-                    }
-                }
-                out
-            }
-            "iteratorNextMethod" => {
-                let Some(it) = arg(0) else {
-                    return self.m.top_val("iteratorNextMethod without argument");
-                };
-                let out = self.tmp("nextmethod");
-                self.m.cons(it, Cons::IterNext { dst: out });
-                out
-            }
-            "iteratorStep" => {
-                let (Some(it), Some(next)) = (arg(0), arg(1)) else {
-                    return self.prim_node(prim::BOOL);
-                };
-                let res =
-                    self.call_value(next, ThisArg::Node(it), vec![self.m.top_tok_node], vec![]);
-                let va = self.m.atom("value");
-                let v = self.load(res, Key::Named(va));
-                let io = self.iter_out_node(fx);
-                self.m.edge(v, io);
-                let all = self.iterate(it);
-                self.m.edge(all, io);
-                self.prim_node(prim::BOOL)
-            }
-            "iteratorStepOutput" => self.iter_out_node(fx),
-            "iteratorCloseOnThrow" | "iteratorCloseIfNotDone" | "arrayRecordClose" => {
-                if let Some(it) = arg(0) {
-                    // `iterator.return()` runs.
-                    let ra = self.m.atom("return");
-                    let _ = self.mcall(it, Key::Named(ra), vec![], vec![]);
-                }
-                let out = self.tmp("close");
-                self.m.edge(self.thrown, out);
-                for a in args.iter().skip(1) {
-                    self.m.edge(*a, out);
-                }
-                out
-            }
-            "registerPathModule" | "registerPathModulePartial" => {
-                if let Some(value) = arg(1) {
-                    let registry = match source_args.first() {
-                        Some(Expr::String(path)) if std::path::Path::new(path).is_absolute() => {
-                            self.cjs_path_node(path)
-                        }
-                        _ => self.cjs_unknown_path,
-                    };
-                    self.m.edge(value, registry);
-                    self.m.edge(value, self.cjs_registry);
-                }
-                self.prim_node(prim::UNDEF)
-            }
-            "linkPathModuleParent" => {
-                // The helper links an existing record through require.cache;
-                // it does not publish a new path-module value.
-                // Keep the record in the dynamic loader summary.
-                if let Some(record) = arg(0) {
-                    self.m.edge(record, self.cjs_registry);
-                }
-                self.prim_node(prim::UNDEF)
-            }
-            "requirePathModule" => {
-                let registry = match source_args.first() {
-                    Some(Expr::String(path)) if std::path::Path::new(path).is_absolute() => {
-                        let named = self.cjs_path_node(path);
-                        let r = self.tmp("cjs-path-read");
-                        self.m.edge(named, r);
-                        self.m.edge(self.cjs_unknown_path, r);
-                        // The runtime also accepts directory package-main and
-                        // index paths. Keep those on the summary until their
-                        // resolver is modeled here as well.
-                        if std::path::Path::new(path).is_dir() {
-                            self.m.edge(self.cjs_registry, r);
-                        }
-                        r
-                    }
-                    _ => self.cjs_registry,
-                };
-                let out = self.tmp("require");
-                // Raw publications remain supported; CJS records unwrap their
-                // live exports, including replacements during a cycle.
-                self.m.edge(registry, out);
-                let ea = self.m.atom("exports");
-                let ex = self.load(registry, Key::Named(ea));
-                self.m.edge(ex, out);
-                self.m.add_prim(out, prim::UNDEF);
-                out
-            }
-            "getCjsMainModule" => self.cjs_main_value(fx.module),
-            "setCjsMainModule" => {
-                let main = self.cjs_main_value(fx.module);
-                if let Some(record) = arg(0) {
-                    self.m.edge(record, main);
-                    self.to_sink(record, "CJS main record published to process.mainModule");
-                }
-                self.prim_node(prim::UNDEF)
-            }
-            _ => {
-                let why = format!("argument of runtime glue {method}");
-                for n in object.into_iter().chain(args) {
-                    self.to_sink(n, &why);
-                }
-                self.m.top_val(&format!("result of runtime glue {method}"))
-            }
-        }
-    }
-
-    fn iter_out_node(&mut self, fx: &Fx) -> NodeId {
-        if let Some(&n) = self.mods[fx.module as usize].iterout.get(&fx.f) {
-            return n;
-        }
-        let n = self.tmp("iterout");
-        self.mods[fx.module as usize].iterout.insert(fx.f, n);
-        n
-    }
-}
-
-/// The variant name of an expression, without formatting its children: a
-/// `fmt::Write` that stops at the first non-identifier character.
-fn variant_name(e: &Expr) -> String {
-    struct Head(String, bool);
-    impl std::fmt::Write for Head {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            if self.1 {
-                return Err(std::fmt::Error);
-            }
-            for c in s.chars() {
-                if c.is_alphanumeric() || c == '_' {
-                    self.0.push(c);
-                } else {
-                    self.1 = true;
-                    return Err(std::fmt::Error);
-                }
-            }
-            Ok(())
-        }
-    }
-    let mut h = Head(String::new(), false);
-    let _ = std::fmt::write(&mut h, format_args!("{e:?}"));
-    h.0
 }

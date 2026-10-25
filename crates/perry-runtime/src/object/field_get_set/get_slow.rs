@@ -3,18 +3,19 @@
 //!
 //! A site reads a coloured key through its 2c arm, and everything else
 //! through the unknown-receiver probe (`layout_probe.rs`). What the probe
-//! declines reaches one of these entries, which hold no site state: an
+//! declines reaches one of these entries: an
 //! accessor the probe's walk handed back is called; every exotic receiver
 //! (a closure, an array, a typed array, a buffer, a native handle, a Proxy,
 //! a namespace, a string wrapper, ...) takes the complete by-name operation,
-//! which is its spec path.
+//! which is its spec path. The site-specific counterparts accept caller-owned
+//! shape/slot storage and revalidate it before calling a live getter.
 use crate::object::ObjectHeader;
 
 /// `[[Get]]` through the accessor `acc` that the layout walk found for a key
 /// of `obj` (on `obj` or on its chain), with `obj` as `this`. `None` for a
 /// static class accessor, which the complete read calls.
 #[inline]
-unsafe fn call_getter(
+pub(super) unsafe fn call_getter(
     obj: *const ObjectHeader,
     acc: crate::object::accessor_pair::Accessor,
 ) -> Option<f64> {
@@ -187,6 +188,17 @@ pub unsafe extern "C-unwind" fn js_object_get_keyed_slow(
     site_id: u64,
     dynamic: u32,
 ) -> f64 {
+    keyed_slow_impl(obj_box, key, site_id, dynamic, None)
+}
+
+#[inline(always)]
+unsafe fn keyed_slow_impl(
+    obj_box: f64,
+    key: f64,
+    site_id: u64,
+    dynamic: u32,
+    memo: Option<&crate::object::layout_probe::site_memo::KeyedSiteMemo>,
+) -> f64 {
     crate::object::layout_probe::verify::check(
         (obj_box.to_bits() & crate::value::POINTER_MASK) as usize,
         key.to_bits(),
@@ -195,6 +207,33 @@ pub unsafe extern "C-unwind" fn js_object_get_keyed_slow(
     if let Some(recv) = recv {
         if let Some(value) = crate::object::overflow::own_get_key(recv, key.to_bits()) {
             return f64::from_bits(value.bits());
+        }
+        // Share the complete read's receiver classification and own-data
+        // handling. A memo attempt cannot precede or repeat that work.
+        if let Some(memo) = memo {
+            use crate::object::layout_probe::{
+                self,
+                site_memo::{self, Answer},
+            };
+            match site_memo::keyed_answer(
+                crate::object::shapes::ordinary_dir_addr(),
+                obj_box.to_bits(),
+                key.to_bits(),
+                memo,
+            ) {
+                Some(Answer::Data(bits)) => return f64::from_bits(bits),
+                Some(Answer::Getter(pair)) => {
+                    if let Some(acc) = crate::object::accessor_pair::pair_of_value(pair) {
+                        if layout_probe::verify::on() {
+                            layout_probe::verify::accessor(recv as usize, key.to_bits(), &acc);
+                        }
+                        if let Some(value) = call_getter(recv, acc) {
+                            return value;
+                        }
+                    }
+                }
+                None => {}
+            }
         }
     }
     match recv {
@@ -209,4 +248,121 @@ pub unsafe extern "C-unwind" fn js_object_get_keyed_slow(
         }
         _ => crate::value::js_dyn_index_get(obj_box, key),
     }
+}
+
+/// Collecting half of the same fixed-name site. Revalidate shapes, then
+/// load and call the holder's CURRENT accessor; no callable is remembered.
+/// # Safety
+/// memo is the shared atomic five-pair storage belonging to this fixed key.
+#[no_mangle]
+pub unsafe extern "C-unwind" fn js_object_get_field_site_slow(
+    obj_handle: i64,
+    key: *const crate::StringHeader,
+    memo: *mut crate::object::layout_probe::site_memo::ReadSiteMemo,
+) -> f64 {
+    use crate::object::layout_probe::{
+        self,
+        site_memo::{self, Answer},
+    };
+    let obj = obj_handle as *const ObjectHeader;
+    if crate::value::addr_class::is_above_handle_band(obj as usize)
+        && !key.is_null()
+        && crate::string::is_property_atom(key)
+    {
+        let key_bits = crate::value::STRING_TAG | key as u64;
+        let dir = crate::object::shapes::ordinary_dir_addr();
+        layout_probe::verify::check(obj as usize, key_bits);
+        let answer = site_memo::collect(
+            dir,
+            obj,
+            key_bits,
+            crate::string::property_atom_hash(key),
+            &*memo,
+        );
+        match answer {
+            Some(Answer::Data(bits)) => return f64::from_bits(bits),
+            Some(Answer::Getter(pair)) => {
+                if let Some(acc) = crate::object::accessor_pair::pair_of_value(pair) {
+                    if layout_probe::verify::on() {
+                        layout_probe::verify::accessor(obj as usize, key_bits, &acc);
+                    }
+                    if let Some(value) = call_getter(obj, acc) {
+                        return value;
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    js_object_get_field_slow(obj_handle, key)
+}
+
+/// Boxed collecting entrance for the same fixed-name site. Keep the
+/// original representation migration and non-pointer dispatch unchanged.
+/// # Safety
+/// memo belongs to this fixed key (shared across agents), as for the raw entrance.
+#[no_mangle]
+pub unsafe extern "C-unwind" fn js_object_get_field_value_site(
+    obj_bits: i64,
+    key: *const crate::StringHeader,
+    site_id: u64,
+    memo: *mut crate::object::layout_probe::site_memo::ReadSiteMemo,
+) -> f64 {
+    let bits = obj_bits as u64;
+    if bits >> 48 == crate::value::POINTER_TAG >> 48
+        && crate::value::addr_class::is_above_handle_band(
+            (bits & crate::value::POINTER_MASK) as usize,
+        )
+    {
+        crate::object::field_rep_store::migrate_on_miss_value(bits);
+        return js_object_get_field_site_slow(
+            (bits & crate::value::POINTER_MASK) as i64,
+            key,
+            memo,
+        );
+    }
+    js_object_get_field_nonptr(obj_bits, key, site_id)
+}
+
+/// Collecting computed-key half. An accessor is read from its holder's
+/// live slot after the same shape proof used by the fixed-name entrance.
+/// # Safety
+/// memo belongs to this computed read site (shared across agents).
+#[no_mangle]
+pub unsafe extern "C-unwind" fn js_object_get_keyed_site_slow(
+    obj_box: f64,
+    key: f64,
+    site_id: u64,
+    dynamic: u32,
+    memo: *mut crate::object::layout_probe::site_memo::KeyedSiteMemo,
+) -> f64 {
+    let bits = key.to_bits();
+    let tag = bits & crate::value::TAG_MASK;
+    let may_fit = if tag == crate::value::SHORT_STRING_TAG {
+        true
+    } else if tag == crate::value::STRING_TAG {
+        let string = (bits & crate::value::POINTER_MASK) as *const crate::StringHeader;
+        crate::string::is_valid_string_ptr(string)
+            && (*string).byte_len as usize <= crate::value::SHORT_STRING_MAX_LEN
+    } else {
+        false
+    };
+    if may_fit {
+        keyed_memo_slow(obj_box, key, site_id, dynamic, memo)
+    } else {
+        js_object_get_keyed_slow(obj_box, key, site_id, dynamic)
+    }
+}
+
+/// Keep the refusal dispatcher frameless: unsupported keys tail-call the
+/// complete read without reserving the memo path's registers or stack.
+#[inline(never)]
+unsafe fn keyed_memo_slow(
+    obj_box: f64,
+    key: f64,
+    site_id: u64,
+    dynamic: u32,
+    memo: *const crate::object::layout_probe::site_memo::KeyedSiteMemo,
+) -> f64 {
+    keyed_slow_impl(obj_box, key, site_id, dynamic, Some(&*memo))
 }

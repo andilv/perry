@@ -51,6 +51,9 @@ fn gunzip_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 fn throw_deflate_decode_error(err: IoError) -> ! {
+    if stream::needs_dictionary(&err) {
+        perry_ffi::throw_with_code(&err.to_string(), "Z_NEED_DICT", ErrorKind::Error);
+    }
     if err.kind() == IoErrorKind::UnexpectedEof {
         perry_ffi::throw_with_code("unexpected end of file", "Z_BUF_ERROR", ErrorKind::Error);
     }
@@ -163,24 +166,49 @@ pub unsafe extern "C" fn js_zlib_gunzip_sync(data_bits: i64) -> f64 {
 /// `RangeError` before any compression runs (#2935).
 #[no_mangle]
 pub unsafe extern "C" fn js_zlib_deflate_sync(data_bits: i64, opts: f64) -> f64 {
-    stream::js_zlib_validate_options(opts, 8); // deflate accepts windowBits >= 8 (#3662)
-    stream::js_zlib_validate_buffer_arg(data_bits);
-    let level = stream::compression_from_opts(opts);
-    match stream::read_input_from_bits(data_bits).map(|d| deflate_bytes_with(&d, level)) {
+    let roots = perry_ffi::TransientRootScope::enter();
+    let data = roots.root_nanbox(f64::from_bits(data_bits as u64));
+    let opts = roots.root_nanbox(opts);
+    let (captured, dictionary) = stream::sync_options(opts.get(), 8);
+    let opts = roots.root_nanbox(captured);
+    stream::js_zlib_validate_buffer_arg(data.get().to_bits() as i64);
+    let level = stream::compression_from_opts(opts.get());
+    if stream::sync_info(opts.get()) {
+        let input = stream::read_input_from_bits(data.get().to_bits() as i64).unwrap();
+        return stream::sync_info_result(input, opts.get(), stream::Codec::Deflate, dictionary);
+    }
+    match stream::read_input_from_bits(data.get().to_bits() as i64).map(|d| {
+        if let Some(dictionary) = dictionary {
+            stream::deflate_dictionary_bytes(&d, level, &dictionary)
+        } else {
+            deflate_bytes_with(&d, level)
+        }
+    }) {
         Some(Ok(out)) => stream::value_bytes(&out),
         _ => f64::from_bits(perry_ffi::JsValue::UNDEFINED.bits()),
     }
 }
 
-/// `zlib.inflateSync(data)`.
+/// `zlib.inflateSync(data, options?)`.
 ///
 /// # Safety
 ///
 /// `data_bits` is the raw NaN-box bit pattern of the data argument (#2935).
 #[no_mangle]
-pub unsafe extern "C" fn js_zlib_inflate_sync(data_bits: i64) -> f64 {
-    stream::js_zlib_validate_buffer_arg(data_bits); // #3662
-    match stream::read_input_from_bits(data_bits).map(|d| inflate_bytes(&d)) {
+pub unsafe extern "C" fn js_zlib_inflate_sync(data_bits: i64, opts: f64) -> f64 {
+    let roots = perry_ffi::TransientRootScope::enter();
+    let data = roots.root_nanbox(f64::from_bits(data_bits as u64));
+    let opts = roots.root_nanbox(opts);
+    let (captured, dictionary) = stream::sync_options(opts.get(), 0);
+    let opts = roots.root_nanbox(captured);
+    stream::js_zlib_validate_buffer_arg(data.get().to_bits() as i64);
+    if stream::sync_info(opts.get()) {
+        let input = stream::read_input_from_bits(data.get().to_bits() as i64).unwrap();
+        return stream::sync_info_result(input, opts.get(), stream::Codec::Inflate, dictionary);
+    }
+    match stream::read_input_from_bits(data.get().to_bits() as i64)
+        .map(|d| stream::decode_dictionary_bytes(&d, dictionary))
+    {
         Some(Ok(out)) => stream::value_bytes(&out),
         Some(Err(err)) => throw_deflate_decode_error(err),
         _ => f64::from_bits(perry_ffi::JsValue::UNDEFINED.bits()),
@@ -378,12 +406,12 @@ pub unsafe extern "C" fn js_ext_zlib_native_dispatch(
         "gzipSync" => js_zlib_gzip_sync(arg(0).to_bits() as i64, arg(1)),
         "gunzipSync" => js_zlib_gunzip_sync(arg(0).to_bits() as i64),
         "deflateSync" => js_zlib_deflate_sync(arg(0).to_bits() as i64, arg(1)),
-        "inflateSync" => js_zlib_inflate_sync(arg(0).to_bits() as i64),
+        "inflateSync" => js_zlib_inflate_sync(arg(0).to_bits() as i64, arg(1)),
         "deflateRawSync" => js_zlib_deflate_raw_sync(arg(0), arg(1)),
         "inflateRawSync" => js_zlib_inflate_raw_sync(arg(0)),
         "unzipSync" => js_zlib_unzip_sync(arg(0)),
         "brotliCompressSync" => js_zlib_brotli_compress_sync(arg(0).to_bits() as i64),
-        "brotliDecompressSync" => js_zlib_brotli_decompress_sync(arg(0).to_bits() as i64),
+        "brotliDecompressSync" => js_zlib_brotli_decompress_sync(arg(0).to_bits() as i64, arg(1)),
         "zstdCompressSync" => js_zlib_zstd_compress_sync(arg(0), arg(1)),
         "zstdDecompressSync" => js_zlib_zstd_decompress_sync(arg(0), arg(1)),
         "crc32" => js_zlib_crc32(arg(0), if args_len >= 2 { arg(1) } else { 0.0 }),
@@ -553,23 +581,39 @@ mod tests {
         assert_eq!(crc32_bytes_with_seed(b"", 0), 0);
     }
 
+    // A one-shot has a write completion and a separately queued final flush.
+    // Drain the real event-loop phases; one check phase cannot settle both.
+    fn pump_dispatch_callbacks() {
+        for _ in 0..1024 {
+            let micro = perry_runtime::promise::js_promise_run_microtasks();
+            let immediate = perry_runtime::timer::js_event_loop_check_phase();
+            if micro == 0 && immediate == 0 {
+                return;
+            }
+        }
+        panic!("zlib dispatch did not become idle");
+    }
+
     #[test]
     fn external_native_dispatch_routes_async_gzip_callback() {
         let _agent = crate::stream::OwnAgent::enter();
         DISPATCH_CALLBACK_FIRED.with(|fired| fired.set(false));
         DISPATCH_CALLBACK_OK.with(|ok| ok.set(false));
 
-        let callback = alloc_closure(
-            perry_ffi::js_function_info!(record_dispatch_callback, 2; with_declared(2)),
-            0,
-        );
-        assert!(!callback.is_null());
+        let scope = perry_ffi::TransientRootScope::enter();
+        let callback = scope.root_nanbox(f64::from_bits(
+            JsValue::from_object_ptr(alloc_closure(
+                perry_ffi::js_function_info!(record_dispatch_callback, 2; with_declared(2)),
+                0,
+            ))
+            .bits(),
+        ));
 
         let input = alloc_buffer(b"captured zlib export");
         assert!(!input.is_null());
         let args = [
             f64::from_bits(JsValue::from_object_ptr(input).bits()),
-            f64::from_bits(JsValue::from_object_ptr(callback).bits()),
+            callback.get(),
         ];
         let method = b"gzip";
         let result = unsafe {
@@ -577,7 +621,7 @@ mod tests {
         };
 
         assert_eq!(result.to_bits(), JsValue::UNDEFINED.bits());
-        perry_runtime::timer::js_event_loop_check_phase();
+        pump_dispatch_callbacks();
         assert!(DISPATCH_CALLBACK_FIRED.with(Cell::get));
         assert!(DISPATCH_CALLBACK_OK.with(Cell::get));
     }
@@ -623,7 +667,7 @@ mod tests {
         let args = [data.get(), f64::from_bits(options.bits()), callback.get()];
         unsafe {
             js_ext_zlib_native_dispatch(b"gzip".as_ptr(), 4, args.as_ptr(), args.len());
-            perry_runtime::timer::js_event_loop_check_phase();
+            pump_dispatch_callbacks();
         }
         assert!(DISPATCH_CALLBACK_FIRED.with(Cell::get));
     }
@@ -645,6 +689,9 @@ mod tests {
     /// phase. Both threads below act for the primary agent from their own
     /// arenas, as any thread that is not a worker does.
     fn queue_plain_thread_one_shot(run: bool) {
+        // This plain thread retains PRIMARY_AGENT, but still needs the static
+        // shape seed that emitted main and enter_worker_agent normally run.
+        perry_ffi::initialize_runtime_fixture();
         let scope = perry_ffi::TransientRootScope::enter();
         let callback = scope.root_nanbox(f64::from_bits(
             JsValue::from_object_ptr(alloc_closure(
@@ -661,7 +708,7 @@ mod tests {
             js_ext_zlib_native_dispatch(b"gzip".as_ptr(), 4, args.as_ptr(), args.len());
         }
         if run {
-            perry_runtime::timer::js_event_loop_check_phase();
+            pump_dispatch_callbacks();
         }
     }
 

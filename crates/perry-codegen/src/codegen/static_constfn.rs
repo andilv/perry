@@ -1012,6 +1012,7 @@ pub(crate) fn birth_literal(
             use crate::types::{I32, I64, I8};
             let raw = ctx.block().inttoptr(I64, &object);
             // The literal's synthetic class identity is independent of its layout.
+            // GC_STORE_AUDIT(POINTER_FREE): The i32 store writes the synthetic class ID at ObjectHeader offset0, not a pointer or JSValue; rooted operands survive the surrounding inline_birth allocation.
             ctx.block().store(I32, &class_id.to_string(), &raw);
             let header = crate::target_layout::object_header_size_bytes(ctx.target_triple);
             let fields = ctx.block().gep(I8, &raw, &[(I64, &header.to_string())]);
@@ -1034,20 +1035,26 @@ pub(crate) fn birth_literal(
                     ctx.block().bitcast_double_to_i64(value)
                 };
                 let ptr = ctx.block().gep(I64, &fields, &[(I64, &slot.to_string())]);
-                // GC_STORE_AUDIT(INIT): fixed slot of an unpublished layout birth.
+                // GC_STORE_AUDIT(INIT): fixed slot of an unpublished layout birth;
+                // its barrier is the birth's one barrier below.
                 ctx.block().store(I64, &bits, &ptr);
-                if slot >= 32 || (shape.rep >> (slot * 2)) & 3 != 1 {
-                    let address = ctx.block().ptrtoint(&ptr, I64);
-                    crate::expr::emit_write_barrier_slot_value_and_generation_tested(
-                        ctx,
-                        &object,
-                        &object,
-                        &address,
-                        &bits,
-                        "literal_birth",
-                    );
-                }
             }
+            // The stores above are plain stores into the one fresh object, with
+            // no call or safepoint among them: one parent gate decides every
+            // slot's barrier, and the runtime replays them (raw numeric lanes
+            // carry doubles, not values, and owe none).
+            let raw = (0..props.len().min(32))
+                .filter(|&slot| (shape.rep >> (slot * 2)) & 3 == 1)
+                .fold(0u32, |raw, slot| raw | 1 << slot);
+            let address = ctx.block().ptrtoint(&fields, I64);
+            crate::expr::emit_write_barrier_birth_slots_generation_tested(
+                ctx,
+                &object,
+                &address,
+                props.len(),
+                raw,
+                "literal_birth",
+            );
             // Reserved slots are absent until written.
             // The born object must survive every patch helper and be re-read
             // below it. The operand scope still owns all evaluated values.

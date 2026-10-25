@@ -474,55 +474,81 @@ def numeric_array_native_records():
 
 
 def numeric_arrays_inline_ir():
-    # Repsel 4a.1/4a.2 shapes: canonical pushes take the inline store + length
-    # bump (no guarded helper), the dense numeric read arm loads the raw slot,
-    # and a runtime-checked RHS is canonicalized before its direct store.
+    # Compact current lowering witness: inline stores maintain the dense-prefix
+    # frontier, reads admit loaded bits, and numeric writes canonicalize NaN.
     return """
-define i32 @main() {
+define double @numericArraysChecksum(ptr %header, ptr %slot, i32 %index, double %rhs) {
 entry:
   br label %apush.inbounds.0
 
 apush.inbounds.0:
-  %lp = inttoptr i64 1 to ptr
-  %len = load i32, ptr %lp
-  %paddr = add i64 1, 8
-  %pp = inttoptr i64 %paddr to ptr
-  store double 2.0, ptr %pp, align 8
-  %newlen = add i32 %len, 1
-  store i32 %newlen, ptr %lp, align 4
-  br label %apush.merge.0
+  %len = load i32, ptr %header
+  store double 8.0, ptr %slot
+  %next = add i32 %len, 1
+  store i32 %next, ptr %header
+  %frontier = icmp eq i32 %len, 0
+  br i1 %frontier, label %ek.frontier.raise.1, label %ek.frontier.join.2
 
-apush.merge.0:
-  %g = call i32 @js_typed_feedback_numeric_array_index_get_guard(i64 1, double 0.0, double 0.0, i32 0, i32 1)
-  %gc = icmp ne i32 %g, 0
-  br i1 %gc, label %bidx.num.fast.1, label %bidx.num.fallback.2
+ek.frontier.raise.1:
+  br label %ek.frontier.join.2
 
-bidx.num.fast.1:
-  %addr = add i64 1, 8
-  %p = inttoptr i64 %addr to ptr
-  %v = load double, ptr %p, align 8
-  br label %bidx.num.merge.3
+ek.frontier.join.2:
+  br label %bidx.num.guard.deref.3
 
-bidx.num.fallback.2:
-  br label %bidx.num.merge.3
+bidx.num.guard.deref.3:
+  %kind = load i32, ptr %header
+  %array = icmp eq i32 %kind, 1
+  br i1 %array, label %bidx.num.guard.prefix.4, label %bidx.num.cold.exact_args.7
 
-bidx.num.merge.3:
-  %sg = call i32 @js_typed_feedback_numeric_array_index_set_guard(i64 1, double 0.0, i32 0, double 3.0, i32 1)
-  %sc = icmp ne i32 %sg, 0
-  br i1 %sc, label %idxset.bounded_numeric_fast.4, label %idxset.bounded_numeric_merge.5
+bidx.num.guard.prefix.4:
+  br label %bidx.num.guard.backing.5
 
-idxset.bounded_numeric_fast.4:
-  %sval = fadd double 3.0, 0.0
-  %saddr = add i64 1, 8
-  %sp = inttoptr i64 %saddr to ptr
-  %sraw = call double @js_array_numeric_value_to_raw_f64(double %sval)
-  store double %sraw, ptr %sp, align 8
-  br label %idxset.bounded_numeric_merge.5
+bidx.num.guard.backing.5:
+  %capacity = load i32, ptr %header
+  %inside = icmp ult i32 %index, %capacity
+  br i1 %inside, label %bidx.num.fast.6, label %bidx.num.cold.exact_args.7
 
-idxset.bounded_numeric_merge.5:
-  ret i32 0
+bidx.num.fast.6:
+  %bits = load i64, ptr %slot
+  %value = bitcast i64 %bits to double
+  %magnitude = and i64 %bits, 9223372036854775807
+  %numeric = icmp ule i64 %magnitude, 9221401712017801215
+  br i1 %numeric, label %bidx.num.merge.8, label %bidx.num.cold.exact_args.7
+
+bidx.num.cold.exact_args.7:
+  br label %bidx.num.merge.8
+
+bidx.num.merge.8:
+  br label %idxset.guard.deref.9
+
+idxset.guard.deref.9:
+  %write_kind = load i32, ptr %header
+  %write_array = icmp eq i32 %write_kind, 1
+  %rhs_bits = bitcast double %rhs to i64
+  %rhs_mag = and i64 %rhs_bits, 9223372036854775807
+  %rhs_numeric = icmp ult i64 %rhs_mag, 9221401712017801216
+  %write_ok = and i1 %write_array, %rhs_numeric
+  br i1 %write_ok, label %idxset.guarded.10, label %idxset.guard.cold.11
+
+idxset.guarded.10:
+  br label %idxset.inbounds.kind.canon.12
+
+idxset.guard.cold.11:
+  ret double 0.0
+
+idxset.inbounds.kind.canon.12:
+  %nan = fcmp uno double %rhs, %rhs
+  %canonical = bitcast i64 9221120237041090560 to double
+  %stored = select i1 %nan, double %canonical, double %rhs
+  br label %idxset.inbounds.kind.done.13
+
+idxset.inbounds.kind.done.13:
+  %result = phi double [ %stored, %idxset.inbounds.kind.canon.12 ]
+  store double %result, ptr %slot
+  ret double %result
 }
 """
+
 
 
 def h1_equivalence_native_records():
@@ -2147,12 +2173,7 @@ idxset.bounded_numeric_merge.5:
         )
 
     def test_generic_native_rep_checks_require_configured_records(self):
-        # The numeric indexed read is inlined: a guarded fast block computes the
-        # element pointer (inttoptr), performs a direct `load double`, and
-        # canonicalizes NaN payloads (repsel 4a.2) instead of calling
-        # js_array_numeric_get_f64_unboxed. The indexed write stores the
-        # canonical value inline after its guard, and canonical pushes take the
-        # inline store + length bump (repsel 4a.1).
+        # Native-rep records and the current inline lowering must agree.
         ir = numeric_arrays_inline_ir()
         records = numeric_array_native_records()
         report = HARNESS.verify_artifacts(
@@ -2165,6 +2186,30 @@ idxset.bounded_numeric_merge.5:
             native_reps=[{"records": records}],
         )
         self.assertEqual(report["status"], "pass", report["errors"])
+
+    def test_numeric_array_gate_rejects_missing_operations(self):
+        ir = numeric_arrays_inline_ir()
+        mutants = [
+            ("store double 8.0", "store double 9.0", "numeric_array_push_inlines_store"),
+            ("store i32 %next", "; removed store i32 %next", "numeric_array_push_inlines_store"),
+            ("icmp ult i32 %index", "icmp ugt i32 %index", "numeric_array_uses_unboxed_get"),
+            ("icmp ule i64 %magnitude", "icmp uge i64 %magnitude", "numeric_array_uses_unboxed_get"),
+            ("9221120237041090560", "0", "numeric_array_uses_unboxed_set"),
+            ("store double %result", "store double 0.0", "numeric_array_uses_unboxed_set"),
+        ]
+        for old, new, expected in mutants:
+            with self.subTest(operation=old):
+                self.assertEqual(ir.count(old), 1)
+                report = HARNESS.verify_artifacts(
+                    workload="numeric_arrays",
+                    ir_before=ir.replace(old, new),
+                    ir_after=ir,
+                    assembly=GOOD_ASM,
+                    benchmark={"runs": [{"exit_code": 0, "stdout_first": "25\n"}]},
+                    vectorization={"vectorized_count": 0},
+                    native_reps=[{"records": numeric_array_native_records()}],
+                )
+                self.assertEqual({error.split(":", 1)[0] for error in report["errors"]}, {expected})
 
     def test_stdout_checks_require_benchmark_data(self):
         ir = numeric_arrays_inline_ir()
@@ -2641,6 +2686,61 @@ idxset.bounded_numeric_merge.5:
             native_reps=[{"records": records}],
         )
         self.assertEqual(report["status"], "pass", report["errors"])
+
+    def test_scalar_buffer_fallbacks_keep_alias_rejection_gate_live(self):
+        records = self.h1_alias_negative_records([
+            native_record(
+                function="lengthMismatch", rep="i32",
+                region_id="h1_buffer_alias_negative_ts.lengthmismatch.length_mismatch",
+                bounds_state="unknown", access_mode="dynamic_fallback",
+                expr_kind="BufferIndexSet", consumer="BufferIndexSet.slow_path",
+            )
+        ])
+        for record in records:
+            if record["native_rep_name"] != "buffer_view":
+                continue
+            record.update(
+                native_rep_name="i32", native_rep={"kind": "i32"},
+                bounds_state="unknown", alias_state=None,
+                access_mode="dynamic_fallback", native_value_state="dynamic_fallback",
+                expr_kind="Uint8ArrayGet", consumer="Uint8ArrayGet.slow_path_i32",
+                materialization_reason="unknown_alias", fallback_reason="unknown_alias",
+                rejected_facts=[
+                    native_fact("bounds", "missing", "unknown", "unknown_alias"),
+                    native_fact("alias_noalias", "missing", "unknown_or_may_alias", "unknown_alias"),
+                    native_fact("materialization_hazard", "invalidated", "unknown_alias", "unknown_alias"),
+                ],
+            )
+
+        def verify(rows):
+            return HARNESS.verify_artifacts(
+                workload="h1_buffer_alias_negative",
+                ir_before=GOOD_IR, ir_after=GOOD_IR, assembly=GOOD_ASM,
+                benchmark=None,
+                vectorization={"vectorized_count": 0, "missed_count": 0, "analysis_count": 0},
+                native_reps=[{"records": rows}],
+            )
+
+        report = verify(records)
+        self.assertEqual(report["status"], "pass", report["errors"])
+        for mutation in ("missing_alias_fact", "unrelated_integer", "emitted_noalias"):
+            with self.subTest(mutation=mutation):
+                rows = json.loads(json.dumps(records))
+                for row in rows:
+                    if mutation == "missing_alias_fact":
+                        row["rejected_facts"] = [
+                            fact for fact in row.get("rejected_facts", [])
+                            if fact["kind"] != "alias_noalias"
+                        ]
+                    elif mutation == "unrelated_integer":
+                        row["expr_kind"] = "Binary"
+                    else:
+                        row["emitted_noalias"] = True
+                report = verify(rows)
+                self.assertTrue(any(
+                    error.startswith("native_reps_negative_denies_unsafe_noalias:")
+                    for error in report["errors"]
+                ), report["errors"])
 
     def test_array_buffer_view_noalias_fails_gate(self):
         length_region = "h1_buffer_alias_negative_ts.lengthmismatch.length_mismatch"
@@ -3291,6 +3391,78 @@ class QuotedLlvmLabelBlockBoundaryTests(unittest.TestCase):
         functions = {fn for fn, _, _ in extract_blocks_with_functions(ir)}
         self.assertIn("mod$spec_i32", functions)
 
+
+
+class RawFieldGateTests(unittest.TestCase):
+    def setUp(self):
+        self.ir = (REPO_ROOT / "tests/fixtures/raw_field_gate.ll").read_text()
+        self.records = json.loads((REPO_ROOT / "tests/fixtures/raw_field_gate_records.json").read_text())["records"]
+        self.checks = {c["name"]: c for c in HARNESS.WORKLOADS["raw_numeric_object_fields"]["ir_checks"]}
+
+    def test_current_shapes_and_refusal_paths(self):
+        from compiler_output_harness.verification import _text_check_passes
+        for name, check in self.checks.items():
+            self.assertTrue(_text_check_passes(self.ir, check), name)
+            self.assertFalse(_text_check_passes("declare double @forceDynamicRead(double)\n", check), name)
+
+    def test_bypassing_each_shape_record_and_representation_check_fails(self):
+        import re
+        from compiler_output_harness.verification import _text_check_passes
+        mutations = [
+            ("raw_field_l2c_receiver", "forceDynamicRead", "stack_guard.ok", "br i1 %r10", "br i1 true"),
+            ("raw_field_l2s_receiver", "forceDynamicWrite", "stack_guard.ok", "br i1 %r14", "br i1 true"),
+            ("raw_field_l2c_shape_bound", "forceDynamicRead", "l2c.word", "br i1 %r23", "br i1 true"),
+            ("raw_field_l2s_shape_bound", "forceDynamicWrite", "l2s.word", "br i1 %r27", "br i1 true"),
+            ("raw_field_read_record", "forceDynamicRead", "l2c.record", "br i1 %r29", "br i1 true"),
+            ("raw_field_read_slot", "forceDynamicRead", "l2c.load", "br i1 %r33", "br i1 false"),
+            ("raw_field_read_fallback", "forceDynamicRead", "pget.slow", "@js_object_get_field_value(", "@wrong_get("),
+            ("raw_field_write_record", "forceDynamicWrite", "l2c.record", "br i1 %r33", "br i1 true"),
+            ("raw_field_write_representation", "forceDynamicWrite", "l2s.lane", "br i1 %r36", "br i1 true"),
+            ("raw_field_write_representation", "forceDynamicWrite", "l2s.rep", "br i1 %r41", "br i1 true"),
+            ("raw_field_write_metadata", "forceDynamicWrite", "l2s.meta", "br i1 %r45", "br i1 true"),
+            ("raw_field_write_slot", "forceDynamicWrite", "l2s.load", "br i1 %r49", "br i1 false"),
+            ("raw_field_write_store_and_barrier", "forceDynamicWrite", "l2s.hit", "  store double %r9", "  ; store double %r9"),
+            ("raw_field_write_store_and_barrier", "forceDynamicWrite", "l2s.barrier", "@js_write_barrier_slot_validated_parent(", "@wrong_barrier("),
+            ("raw_field_write_fallback", "forceDynamicWrite", "put.pic.set", "@js_put_value_set(", "@wrong_set("),
+            ("raw_field_family_shape", "rawNumericObjectFieldsChecksum", "class_family.word", "br i1 %r270", "br i1 true"),
+            ("raw_field_family_slot", "rawNumericObjectFieldsChecksum", "class_family.load", "br i1 %r274", "br i1 true"),
+        ]
+        for check, function, block, old, new in mutations:
+            with self.subTest(check=check, block=block):
+                pattern = r"(define double @[^\n]*__"+function+r"\([^\n]*\n[\s\S]*?"+re.escape(block)+r"\.\d+:\n)([\s\S]*?)(?=\n\n|\n})"
+                match = re.search(pattern, self.ir)
+                self.assertIsNotNone(match)
+                self.assertEqual(match[2].count(old), 1)
+                mutated = self.ir[:match.start(2)] + match[2].replace(old,new) + self.ir[match.end(2):]
+                self.assertFalse(_text_check_passes(mutated,self.checks[check]), check)
+
+    def test_exact_materialization_review_and_scalar_requirements(self):
+        import copy
+        from compiler_output_harness.verification import generic_native_rep_contract_results
+        def failures(records, spec=None):
+            results = generic_native_rep_contract_results("raw_numeric_object_fields", records, 1, spec or HARNESS.WORKLOADS)
+            return [r["name"] for r in results if not r["passed"]]
+        self.assertEqual(failures(self.records), [])
+        reviewed = next(r for r in self.records if r["materialization_reason"] == "function_abi")
+        for field in ("function", "source_function", "block_label", "expr_kind", "consumer", "native_rep_name", "materialization_reason"):
+            changed = copy.deepcopy(self.records)
+            next(r for r in changed if r["materialization_reason"] == "function_abi")[field] = "changed"
+            self.assertTrue(failures(changed), field)
+        self.assertTrue(failures([r for r in self.records if r is not reviewed]))
+        self.assertTrue(failures(self.records + [reviewed]))
+        unrelated = copy.deepcopy(reviewed)
+        unrelated["source_function"] = "unreviewedCaller"
+        self.assertTrue(failures(self.records + [unrelated]))
+        for field in ("function", "source_function", "block_label", "expr_kind", "consumer", "native_rep_name", "materialization_reason", "claim"):
+            spec = copy.deepcopy(HARNESS.WORKLOADS)
+            del spec["raw_numeric_object_fields"]["native_rep_checks"]["review_materializations"][0][field]
+            self.assertTrue(failures(self.records, spec), field)
+        spec = copy.deepcopy(HARNESS.WORKLOADS)
+        reviews = spec["raw_numeric_object_fields"]["native_rep_checks"]["review_materializations"]
+        reviews.append(copy.deepcopy(reviews[0]))
+        self.assertTrue(failures(self.records, spec))
+        for kind in ("ScalarObjectFieldGet", "ScalarObjectFieldSet"):
+            self.assertTrue(failures([r for r in self.records if r["expr_kind"] != kind]), kind)
 
 if __name__ == "__main__":
     unittest.main()

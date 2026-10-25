@@ -17,52 +17,33 @@ impl Model {
         if a == b {
             return;
         }
+        // An observation node feeds only observation nodes.
+        if self.nodes[a as usize].obs && !self.nodes[b as usize].obs {
+            return;
+        }
         // Dedup against short successor lists only: a duplicate edge costs
         // a little propagation, a global edge set costs gigabytes.
-        // This value can never change again. Deliver the initial literal
-        // below, but do not retain an edge waiting for impossible updates.
-        if !(self.nodes[a as usize].widened && self.nodes[a as usize].prim == prim::ALL) {
-            let b_widened = self.nodes[b as usize].widened;
-            {
-                let node = &mut self.nodes[a as usize];
-                match &mut node.succ_set {
-                    Some(set) => {
-                        if !std::rc::Rc::make_mut(set).insert(b) {
-                            return;
-                        }
-                    }
-                    None => {
-                        if node.succ.contains(&b) || (node.widened && node.prim_succ.contains(&b)) {
-                            return;
-                        }
-                        if node.succ.len()
-                            + if node.widened {
-                                node.prim_succ.len()
-                            } else {
-                                0
-                            }
-                            >= 16
-                        {
-                            let mut set: crate::pts::FxHashSet<NodeId> =
-                                node.succ.iter().copied().collect();
-                            if node.widened {
-                                set.extend(node.prim_succ.iter().copied());
-                            }
-                            set.insert(b);
-                            node.succ_set = Some(std::rc::Rc::new(set));
-                        }
+        {
+            let node = &mut self.nodes[a as usize];
+            match &mut node.succ_set {
+                Some(set) => {
+                    if !std::rc::Rc::make_mut(set).insert(b) {
+                        return;
                     }
                 }
-                if (!node.widened && !b_widened) || (node.widened && !node.succ.is_empty()) {
-                    node.succ.push(b);
-                } else {
-                    // A widened source has only TOP forever; the initial copy below
-                    // delivers it. A widened target escapes values at the source.
-                    // Both kinds of edge carry only future primitive changes.
-                    node.esc_out = true;
-                    node.prim_succ.push(b);
+                None => {
+                    if node.succ.contains(&b) {
+                        return;
+                    }
+                    if node.succ.len() >= 16 {
+                        let mut set: crate::pts::FxHashSet<NodeId> =
+                            node.succ.iter().copied().collect();
+                        set.insert(b);
+                        node.succ_set = Some(std::rc::Rc::new(set));
+                    }
                 }
             }
+            node.succ.push(b);
         }
         if log {
             self.rel(|| format!("copy {a} {b}"));
@@ -82,6 +63,8 @@ impl Model {
         let mut toks = self.bufs.pop().unwrap_or_default();
         toks.clear();
         self.nodes[a as usize].pts.sorted_into(&mut toks);
+        // Registration sends what `a` holds: solve work.
+        self.work += toks.len() as u64;
         let saved = (self.cur_src, self.cur_why);
         self.cur_src = a;
         self.cur_why = u32::MAX;
@@ -92,7 +75,8 @@ impl Model {
 
     pub(super) fn copy_to(&mut self, src: NodeId, dst: NodeId, toks: Tokens<'_>, prim: u16) -> u64 {
         self.add_tokens(dst, toks, prim);
-        if !self.nodes[dst as usize].widened
+        // Equal sizes prove equal sets only while `dst` holds all of `src`.
+        if !self.nodes[dst as usize].dropped
             && self.nodes[src as usize].pts.len() > 1
             && self.nodes[src as usize].pts.len() == self.nodes[dst as usize].pts.len()
         {
@@ -128,11 +112,23 @@ impl Model {
         let source = &self.nodes[src as usize];
         let target = &self.nodes[dst as usize];
         let len = source.pts.len();
-        if count == 0
-            || source.widened
-            || target.widened
-            || len.checked_sub(count) != Some(target.pts.len())
-            || (!target.internal && self.widen_k != 0 && len > self.widen_k)
+        if count == 0 || len.checked_sub(count) != Some(target.pts.len()) || target.dropped {
+            return false;
+        }
+        // A marker that reads as ⊤ is delivered by `add_tokens` (DECISIONS 42),
+        // a marker into a parameter node too (DECISIONS 44).
+        if self.nodes[dst as usize].param
+            && !self.param_marker.is_empty()
+            && Tokens::Delivery(delta, dst)
+                .iter()
+                .any(|&t| self.is_marker(t))
+        {
+            return false;
+        }
+        if !self.marker_top.is_empty()
+            && Tokens::Delivery(delta, dst)
+                .iter()
+                .any(|&t| self.marker_is_top(t))
         {
             return false;
         }

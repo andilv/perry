@@ -1689,6 +1689,15 @@ pub fn run_with_parse_cache(
         std::collections::HashMap<String, perry_hir::types::Type>,
     > = std::sync::Arc::new(all_type_aliases.into_iter().collect());
 
+    // The HIR is final here: from the next loop on, `exported_classes` borrows
+    // it until codegen. Retained function source no execution can read is
+    // dropped now, before the object-cache key hashes each module's HIR (its
+    // text is part of it).
+    let source_need_started = Instant::now();
+    let need = super::source_need::compute(&ctx, args.output_type != "executable");
+    let dropped_source = super::source_need::drop_unread_source(&mut ctx, &need);
+    let source_need_seconds = source_need_started.elapsed().as_secs_f64();
+
     // Build a map of all exported classes from all modules
     // Key: (resolved_path, class_name) -> Class reference
     let mut exported_classes: BTreeMap<(String, String), &perry_hir::Class> = BTreeMap::new();
@@ -2902,6 +2911,7 @@ pub fn run_with_parse_cache(
             .as_deref()
             == Some("1");
     let cache_enabled = std::env::var_os("PERRY_REACH_REPORT").is_none()
+        && std::env::var_os(super::source_need::KNOB).is_none()
         && !args.no_cache
         && !cache_env_disabled
         && !verify_native_regions
@@ -4740,7 +4750,39 @@ pub fn run_with_parse_cache(
                                 .then(|| (source.clone(), ns_scan_name.clone()))
                         })
                     };
-                    let Some((hop_src, hop_imported)) = named_hop.or_else(export_all_hop) else {
+                    // `import { X } from "m"; export { X }` re-exports X
+                    // exactly as `export { X } from "m"` does, but lowers to
+                    // an Import plus `Export::Named`, which neither arm above
+                    // matches — so the scan stopped one module short of a
+                    // `NamespaceReExport` origin and the local was never
+                    // classified as a namespace.
+                    let named_import_hop = || {
+                        let local = hir.exports.iter().find_map(|e| match e {
+                            perry_hir::Export::Named { local, exported }
+                                if *exported == ns_scan_name =>
+                            {
+                                Some(local.as_str())
+                            }
+                            _ => None,
+                        })?;
+                        hir.imports.iter().find_map(|import| {
+                            if import.type_only || import.runtime_erased {
+                                return None;
+                            }
+                            import.specifiers.iter().find_map(|spec| match spec {
+                                perry_hir::ImportSpecifier::Named {
+                                    imported,
+                                    local: import_local,
+                                } if import_local == local => {
+                                    Some((import.source.clone(), imported.clone()))
+                                }
+                                _ => None,
+                            })
+                        })
+                    };
+                    let Some((hop_src, hop_imported)) =
+                        named_hop.or_else(export_all_hop).or_else(named_import_hop)
+                    else {
                         break;
                     };
                     let Some((hop_path, _)) = resolve_import_with_context(
@@ -6296,6 +6338,7 @@ pub fn run_with_parse_cache(
         &static_shape_ids,
     );
     let reach_report = super::reach_report::start(&ctx, args.output_type != "executable")?;
+    let source_need = super::source_need::start(need, &dropped_source, source_need_seconds)?;
     // fninfer (decision 140): per-function inferred signatures over the
     // final HIR. Measurement dump only (`PERRY_FNINFER_DUMP=<path>`).
     super::fn_infer::dump(&ctx.native_modules);
@@ -6308,6 +6351,7 @@ pub fn run_with_parse_cache(
     program_step("whole-program facts", None);
     let program_facts = super::program_facts::run(
         &ctx.native_modules,
+        super::program_facts::export_sources(&ctx),
         // The dyn-eval interpreter is installed (E14 possible): the same
         // condition that selects `perry-runtime/dyn-eval` for the installer.
         perry_hir::has_deferred_dynamic_code_sites()
@@ -8389,6 +8433,9 @@ pub fn run_with_parse_cache(
     }
 
     if let Some(report) = &reach_report {
+        report.finish(&exe_path)?;
+    }
+    if let Some(report) = &source_need {
         report.finish(&exe_path)?;
     }
 

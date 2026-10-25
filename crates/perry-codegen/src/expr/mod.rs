@@ -224,11 +224,11 @@ pub(crate) use write_barrier::{
     emit_jsvalue_slot_store_with_value_bits_on_block, emit_layout_note_slot_on_block,
     emit_may_carry_heap_pointer_check, emit_root_nanbox_store_for_expr,
     emit_root_nanbox_store_on_block, emit_scalar_aware_store_gated_on_pointerness,
-    emit_write_barrier, emit_write_barrier_slot_generation_tested,
-    emit_write_barrier_slot_on_block, emit_write_barrier_slot_value_and_generation_tested,
-    lower_array_super_init, lower_event_emitter_async_resource_subclass_init,
-    lower_event_emitter_subclass_init, lower_node_stream_super_init, lower_stream_super_init,
-    EVENT_EMITTER_INIT_KEYS,
+    emit_write_barrier, emit_write_barrier_birth_slots_generation_tested,
+    emit_write_barrier_slot_generation_tested, emit_write_barrier_slot_on_block,
+    emit_write_barrier_slot_value_and_generation_tested, lower_array_super_init,
+    lower_event_emitter_async_resource_subclass_init, lower_event_emitter_subclass_init,
+    lower_node_stream_super_init, lower_stream_super_init, EVENT_EMITTER_INIT_KEYS,
 };
 
 // Issue #1098 phase 3: the `FnCtx` definition stays in this trunk, but its
@@ -250,6 +250,8 @@ mod class_field_barrier_tests;
 #[cfg(test)]
 mod class_field_get_shape_tests;
 mod dispatch;
+#[cfg(test)]
+mod ek_prefix_tests;
 #[cfg(test)]
 mod entry_block_alloca_tests;
 #[cfg(test)]
@@ -395,6 +397,11 @@ pub(crate) struct FnCtx<'a> {
     pub wpfacts_off: bool,
     pub program_has_worker: bool,
     pub program_has_thread_agents: bool,
+    /// The program's accessor names (`ClassAccessorNames`): a fixed-name read
+    /// owns a shape/slot memo only for a name some getter of the program is
+    /// declared under. `None` (a compile that did not collect them) gives
+    /// every fixed-name read its memo.
+    pub program_class_accessor_names: Option<std::sync::Arc<crate::codegen::ClassAccessorNames>>,
     /// Function being built (blocks, params, registers).
     pub func: &'a mut LlFunction,
     /// Stable slug for native-region ids derived from this module.

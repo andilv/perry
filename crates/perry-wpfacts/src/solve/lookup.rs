@@ -6,14 +6,14 @@ use crate::model::*;
 impl Model {
     /// dst ⊇ value of `key` read on object `t` (receiver `origin`).
     pub fn load_from(&mut self, origin: Tok, t: Tok, key: Key, dst: NodeId) {
+        self.mark_use(t, crate::model::MARK_READ);
         if self.is_iter_key(key) {
             match self.toks[t as usize] {
                 TokKind::Top
                 | TokKind::Builtin(_)
                 | TokKind::BuiltinFn
-                | TokKind::NativeProto(_)
-                | TokKind::PrimBox => {}
-                TokKind::Obj(_) if self.is_array_like(t) => {}
+                | TokKind::NativeProto(_) => {}
+                TokKind::Obj(_, _) if self.is_array_like(t) => {}
                 // A program object/function iterates only through its
                 // protocol, which `Gen::iterate` follows separately.
                 _ => return,
@@ -39,6 +39,24 @@ impl Model {
             }
             return;
         }
+        if matches!(self.toks[t as usize], TokKind::BuiltinFn) {
+            // Opaque (no field storage, `store_into`): its members are
+            // builtin functions and primitives (`tok_load`), or ⊤ once any
+            // builtin function value has been written.
+            if self.bf_written.is_some() {
+                self.add_top(dst, |_| {
+                    "property of a written builtin function value".into()
+                });
+            } else {
+                self.bf_reads.push(dst);
+            }
+            self.with_b(|m| builtins::tok_load(m, t, key, dst));
+            return;
+        }
+        if self.is_array_length(t, key) {
+            self.add_prim(dst, prim::NUM);
+            return;
+        }
         // An absent key reads `undefined`: only a definite birth key of a
         // fact unit is known to be present.
         let present = match (key, self.tmpl_of(t)) {
@@ -61,6 +79,15 @@ impl Model {
                 self.edge(all, dst);
             }
         }
+        // A marker (decision 13, DECISIONS 44) is use tracking, not a value:
+        // the values it stands for sit beside it (DECISIONS 74, 76) or
+        // arrive with ⊤, and a load from them reads what the parameter
+        // holds. A load from the marker reads its fields only, the reach
+        // markers of what the argument reaches (`field`): no builtin
+        // member, no prototype chain (DECISIONS 111).
+        if self.is_marker(t) {
+            return;
+        }
         self.with_b(|m| builtins::tok_load(m, t, key, dst));
         // Element reads of array-likes stop at their own elements: their
         // builtin prototype members are approximated by `tok_load`.
@@ -75,10 +102,27 @@ impl Model {
         self.accessor_walk(origin, t, key, ChainAct::Load(dst));
     }
 
+    /// A key no builtin prototype defines (ToPropertyKey of `true`, `false`,
+    /// `null`, `undefined`; ECMA-262 has no such member): the receiver's own
+    /// field and its program prototype chain, else `undefined`. The builtin
+    /// member approximation (`tok_load`) has nothing under it.
+    pub fn load_program_key(&mut self, t: Tok, a: Atom, dst: NodeId) {
+        if t == TOP || matches!(self.toks[t as usize], TokKind::BuiltinFn) {
+            return self.load_from(t, t, Key::Named(a), dst);
+        }
+        self.mark_use(t, crate::model::MARK_READ);
+        self.add_prim(dst, prim::UNDEF);
+        let f = self.field(t, a);
+        self.edge(f, dst);
+        let cv = self.cv(t, Key::Named(a));
+        self.edge(cv, dst);
+        self.accessor_walk(t, t, Key::Named(a), ChainAct::Load(dst));
+    }
+
     /// Accessors run with the receiver as `this`. Named keys an accessor
     /// may be defined under walk the chain per receiver; computed keys
     /// visit, through the prototype closure, only holders with accessors.
-    pub(super) fn accessor_walk(&mut self, origin: Tok, t: Tok, key: Key, act: ChainAct) {
+    pub(crate) fn accessor_walk(&mut self, origin: Tok, t: Tok, key: Key, act: ChainAct) {
         if !self.needs_accessor_walk(key) {
             return;
         }
@@ -124,16 +168,8 @@ impl Model {
             Some(&n) => (n, false),
             None => {
                 let n = self.node_l(["walk-load", "walk-store", "walk-call"][kind as usize]);
-                // A call walk relays getter results to calls: never widened.
-                // A load walk's members all reach every site's result, and a
-                // store walk's every setter's parameter, which would widen
-                // past the bound anyway: those widen like any value node.
-                match kind {
-                    1 => {
-                        self.walk_store_pending.insert(n, Vec::new());
-                    }
-                    2 => self.nodes[n as usize].internal = true,
-                    _ => {}
+                if kind == 1 {
+                    self.walk_store_pending.insert(n, Vec::new());
                 }
                 self.walk_nodes.insert((origin, t, key, kind), n);
                 (n, true)
@@ -163,8 +199,6 @@ impl Model {
         }
         let p = self.node_l("holders");
         let s = self.node_l("holders-stop");
-        self.nodes[p as usize].internal = true;
-        self.nodes[s as usize].internal = true;
         self.holder_nodes.insert((t, key), (p, s));
         self.add(p, &[t], 0);
         let pn = self.proto_node(t);
@@ -194,8 +228,6 @@ impl Model {
         let (p, s) = if at_start {
             let p = self.node_l("holders");
             let s = self.node_l("holders-stop");
-            self.nodes[p as usize].internal = true;
-            self.nodes[s as usize].internal = true;
             let x = self.node_l("holders-start");
             self.add(x, &[t], 0);
             self.cons(
@@ -268,14 +300,25 @@ impl Model {
 
     pub fn is_array_like(&self, t: Tok) -> bool {
         match self.toks[t as usize] {
-            TokKind::PrimBox => true,
-            TokKind::Obj(tm) => match self.tmpls[tm as usize].kind {
+            TokKind::Obj(tm, _) => match self.tmpls[tm as usize].kind {
                 TmplKind::Arr { .. } => true,
                 TmplKind::BObj { what, .. } => what != "CjsMain",
                 _ => false,
             },
             _ => false,
         }
+    }
+
+    /// An Array's own `length` (design §17.8, DECISIONS 54): a data property
+    /// that always holds a Number and is never an element. A read is that
+    /// Number; a store converts its value with ToNumber and only moves the
+    /// end of the element range (a new slot reads `undefined`, which every
+    /// element read already has). Neither touches a field, so `length` never
+    /// joins the elements (`all_fields`) nor reads them (`field_any`).
+    pub fn is_array_length(&self, t: Tok, key: Key) -> bool {
+        matches!(key, Key::Named(a) if self.atoms[a as usize] == "length")
+            && matches!(self.toks[t as usize], TokKind::Obj(tm, _)
+                if matches!(self.tmpls[tm as usize].kind, TmplKind::Arr { .. }))
     }
 
     pub fn is_constructor_key(&self, key: Key) -> bool {
@@ -330,6 +373,9 @@ impl Model {
             return;
         }
         match act {
+            ChainAct::Load(dst) if self.is_array_length(start, key) => {
+                self.add_prim(dst, prim::NUM);
+            }
             ChainAct::Load(dst) => {
                 let f = match key {
                     Key::Named(a) => self.field(start, a),
@@ -450,11 +496,7 @@ impl Model {
         let gt = self.node_l("acc-this");
         let ar = self.node_l("acc-ret");
         let st = self.node_l("acc-setthis");
-        // The setter parameter source widens like the parameter it feeds.
         let sp = self.node_l("acc-setarg");
-        for n in [gt, ar, st] {
-            self.nodes[n as usize].internal = true;
-        }
         self.acc_groups.insert(
             (holder, key),
             AccGroup {
@@ -513,18 +555,16 @@ impl Model {
     }
 
     /// Accessor `f` hangs off group (holder, key).
-    pub(super) fn group_connect(&mut self, holder: Tok, key: Key, f: FnIdx, setter: bool) {
+    pub(super) fn group_connect(&mut self, holder: Tok, key: Key, f: Tok, setter: bool) {
         let g = self.acc_groups[&(holder, key)].clone();
         // An accessor with a lexical `this` (arrow) never sees the
         // receiver, as for a call (`call_tok`).
-        let this = (!self.funcs[f as usize].lexical_this).then(|| self.funcs[f as usize].this);
+        let this = (!self.funcs[self.tok_fn(f) as usize].lexical_this).then(|| self.this_any(f));
         if setter {
             if let Some(this) = this {
                 self.edge_quiet(g.st, this);
             }
-            if let Some(&p0) = self.funcs[f as usize].params.first() {
-                self.edge_quiet(g.sp, p0);
-            }
+            self.group_bind(holder, key, f, true);
             self.group_live(holder, key);
             if self.acc_groups.contains_key(&(holder, Key::Any)) {
                 self.group_live(holder, Key::Any);
@@ -533,8 +573,34 @@ impl Model {
             if let Some(this) = this {
                 self.edge_quiet(g.gt, this);
             }
+            self.group_bind(holder, key, f, false);
+        }
+    }
+
+    /// The parameter/result half of `group_connect`.
+    pub(crate) fn group_bind(&mut self, holder: Tok, key: Key, ft: Tok, setter: bool) {
+        let f = self.tok_fn(ft);
+        if !self.sum.ready {
+            self.sum
+                .deferred
+                .push(crate::summary::Deferred::Group(holder, key, ft, setter));
+            return;
+        }
+        let (sp, ar) = {
+            let g = &self.acc_groups[&(holder, key)];
+            (g.sp, g.ar)
+        };
+        if self.summarized(f) {
+            self.group_summarized(ft, sp, ar, setter);
+            return;
+        }
+        if setter {
+            if let Some(&p0) = self.funcs[f as usize].params.first() {
+                self.edge_quiet(sp, p0);
+            }
+        } else {
             let ret = self.funcs[f as usize].ret;
-            self.edge_quiet(ret, g.ar);
+            self.edge_quiet(ret, ar);
         }
     }
 
@@ -560,7 +626,7 @@ impl Model {
         &mut self,
         holder: Tok,
         key: Atom,
-        f: FnIdx,
+        f: Tok,
         setter: bool,
         replay: bool,
     ) {
@@ -615,14 +681,27 @@ impl Model {
             return;
         }
         self.rel(|| format!("callthis {callee} {call} {origin}"));
+        self.via_calls
+            .entry((callee, origin))
+            .or_default()
+            .push(call);
         if self.this_done.insert((callee, origin)) {
             self.cons(callee, Cons::ThisTo { origin });
+        } else {
+            let mut toks = self.bufs.pop().unwrap_or_default();
+            toks.clear();
+            self.nodes[callee as usize].pts.sorted_into(&mut toks);
+            // A replay per new call is solve work.
+            self.work += toks.len() as u64;
+            for &t in &toks {
+                self.this_calls(t, origin, &[call]);
+            }
+            self.bufs.push(toks);
         }
         let relay = match self.relays.get(&call) {
             Some(&r) => r,
             None => {
                 let r = self.node_l("callee-relay");
-                self.nodes[r as usize].internal = true;
                 self.relays.insert(call, r);
                 self.cons(r, Cons::CallArgs { call });
                 r
@@ -640,6 +719,8 @@ impl Model {
             let mut toks = self.bufs.pop().unwrap_or_default();
             toks.clear();
             self.nodes[callee as usize].pts.sorted_into(&mut toks);
+            // A replay per new call is solve work.
+            self.work += toks.len() as u64;
             for &t in &toks {
                 if matches!(self.toks[t as usize], TokKind::Builtin(_)) {
                     self.call_tok(call, t, Some(origin));
@@ -656,13 +737,24 @@ impl Model {
                 let r = self.reason("receiver of a call of an unknown function value");
                 self.escape(origin, r);
             }
-            TokKind::Func(f) => {
+            TokKind::Func(f, _) => {
                 if !self.funcs[f as usize].lexical_this {
-                    let this = self.funcs[f as usize].this;
-                    self.add_tok(this, origin);
+                    self.this_lookup(t, origin);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The instance half of `this_to`: each call bound through the method
+    /// node binds its instance of `t` with this receiver.
+    pub(super) fn this_calls(&mut self, t: Tok, origin: Tok, calls: &[CallId]) {
+        if let TokKind::Func(f, _) = self.toks[t as usize] {
+            if !self.funcs[f as usize].lexical_this && self.summarized(f) {
+                for &call in calls {
+                    self.this_into(call, t, Some(origin));
+                }
+            }
         }
     }
 
@@ -675,7 +767,7 @@ impl Model {
                     self.unknown_callee_args(call, t, false);
                 }
             }
-            TokKind::Func(_) => self.bind_args(call, t),
+            TokKind::Func(_, _) => self.bind_args(call, t),
             TokKind::Bound(_) => {
                 if self.bind_done.insert((call, t, u32::MAX)) {
                     self.call_bound(call, t);

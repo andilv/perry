@@ -36,7 +36,7 @@ pub const WEAKMAP_BIRTH_LAYOUT: u32 = SHAPE_ID_BASE + (4 << 20);
 pub const WEAKSET_BIRTH_LAYOUT: u32 = WEAKMAP_BIRTH_LAYOUT + 1;
 
 /// `array::ArrayHeader` size: element 0 follows it.
-pub const ARRAY_HEADER_SIZE: usize = 16;
+pub const ARRAY_HEADER_SIZE: usize = 24;
 
 /// `PerryLayoutKey.attrs` bit (the runtime's key entry byte, `ENTRY_OPTIONAL`):
 /// the key is a layout's optional or late member. Its slot may hold the hole
@@ -279,6 +279,10 @@ pub const GC_OBJECT_CALLABLE: u16 = 0x0020;
 pub const GC_TYPE_PROXY: u8 = 37;
 pub const GC_TYPE_SYMBOL: u8 = 32;
 pub const GC_TYPE_STRING: u8 = 3;
+/// `gc::GC_TYPE_BOX`: a JSValue cell (one 8-byte payload word) holding a
+/// boxed binding. A declaring function's inline box read accepts exactly this
+/// kind, unforwarded, of exactly that size.
+pub const GC_TYPE_BOX: u8 = 22;
 
 /// Classify the first four GC-header bytes, loaded as a native-endian u32.
 /// No shape or target read is needed after the creation-time publication.
@@ -973,6 +977,7 @@ pub const BYTES_ELEMENT_SHIFT: [u8; 19] = [0, 0, 0, 1, 1, 2, 2, 1, 2, 3, 3, 3, 0
 
 pub mod component_guest;
 pub mod component_host;
+pub mod component_io;
 pub mod native_class_ids;
 pub mod wasm_host;
 

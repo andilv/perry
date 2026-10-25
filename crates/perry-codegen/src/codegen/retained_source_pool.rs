@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use aho_corasick::{AhoCorasickBuilder, AhoCorasickKind};
 
+use perry_hir::types::FuncId;
+
 use crate::{
     block::LlBlock,
     module::LlModule,
@@ -26,6 +28,9 @@ pub(super) struct SourceRange {
     pub(super) offset: usize,
     pub(super) byte_len: usize,
     pub(super) decoded_offset: Option<usize>,
+    /// Offset in the pool's uncompressed blob. Compiler-only: the census
+    /// (`PERRY_SOURCE_NEED_REPORT`) reports owners in decoded bytes.
+    pub(super) pool_offset: usize,
 }
 
 impl SourceRange {
@@ -56,7 +61,12 @@ impl SourceRange {
     }
 }
 
-pub(super) struct SourcePool<'a>(HashMap<&'a str, SourceRange>);
+pub(super) struct SourcePool<'a> {
+    ranges: HashMap<&'a str, SourceRange>,
+    /// Uncompressed blob bytes and the bytes the global stores.
+    decoded_len: usize,
+    physical_len: usize,
+}
 
 impl<'a> SourcePool<'a> {
     pub(super) fn emit(llmod: &mut LlModule, sources: impl Iterator<Item = &'a str>) -> Self {
@@ -85,7 +95,11 @@ impl<'a> SourcePool<'a> {
             }
         }
         if unique.is_empty() {
-            return Self(HashMap::new());
+            return Self {
+                ranges: HashMap::new(),
+                decoded_len: 0,
+                physical_len: 0,
+            };
         }
         let bytes: Vec<&[u8]> = unique.iter().map(|source| source.as_bytes()).collect();
         let plan = plan(&bytes, MIN_PATTERN_BYTES, MAX_PATTERN_BYTES, MAX_MATCHES);
@@ -101,6 +115,8 @@ impl<'a> SourcePool<'a> {
                 blob.push_str(unique[idx]);
             }
         }
+        let decoded_len = blob.len();
+        let mut physical_len = blob.len();
         let (global, frame_offsets) = if compressed {
             let mut encoded = Vec::new();
             let mut frame_offsets = Vec::new();
@@ -123,6 +139,7 @@ impl<'a> SourcePool<'a> {
             if frame_offsets.is_empty() {
                 frame_offsets.push(0);
             }
+            physical_len = encoded.len();
             (
                 llmod.add_compressed_retained_source_constant(&encoded).0,
                 frame_offsets,
@@ -130,39 +147,43 @@ impl<'a> SourcePool<'a> {
         } else {
             (llmod.add_retained_source_constant(&blob).0, Vec::new())
         };
-        Self(
-            unique
-                .into_iter()
-                .enumerate()
-                .map(|(idx, source)| {
-                    let (parent, offset) = plan[idx];
-                    let original = parent_offsets[&parent] + offset;
-                    let (offset, decoded_offset) = if compressed {
-                        let block = (original / perry_abi::RETAINED_SOURCE_BLOCK_BYTES)
-                            .min(frame_offsets.len() - 1);
-                        (
-                            frame_offsets[block],
-                            Some(original - block * perry_abi::RETAINED_SOURCE_BLOCK_BYTES),
-                        )
-                    } else {
-                        (original, None)
-                    };
+        let ranges = unique
+            .into_iter()
+            .enumerate()
+            .map(|(idx, source)| {
+                let (parent, offset) = plan[idx];
+                let original = parent_offsets[&parent] + offset;
+                let (offset, decoded_offset) = if compressed {
+                    let block = (original / perry_abi::RETAINED_SOURCE_BLOCK_BYTES)
+                        .min(frame_offsets.len() - 1);
                     (
-                        source,
-                        SourceRange {
-                            global: global.clone(),
-                            offset,
-                            byte_len: source.len(),
-                            decoded_offset,
-                        },
+                        frame_offsets[block],
+                        Some(original - block * perry_abi::RETAINED_SOURCE_BLOCK_BYTES),
                     )
-                })
-                .collect(),
-        )
+                } else {
+                    (original, None)
+                };
+                (
+                    source,
+                    SourceRange {
+                        global: global.clone(),
+                        offset,
+                        byte_len: source.len(),
+                        decoded_offset,
+                        pool_offset: original,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            ranges,
+            decoded_len,
+            physical_len,
+        }
     }
 
     pub(super) fn get(&self, source: &str) -> SourceRange {
-        self.0
+        self.ranges
             .get(source)
             .expect("retained source was prepared")
             .clone()
@@ -174,7 +195,8 @@ impl<'a> SourcePool<'a> {
 /// frames and each info's own immutable source parts.
 pub(super) fn prepare_ranges(
     llmod: &mut LlModule,
-    user_fn_source: &[(String, std::borrow::Cow<'_, str>, bool)],
+    module_prefix: &str,
+    user_fn_source: &[(String, std::borrow::Cow<'_, str>, bool, FuncId)],
     classes: &HashMap<String, &perry_hir::Class>,
     class_ids: &HashMap<String, u32>,
     class_source_text: &HashMap<u32, perry_hir::SourceText>,
@@ -216,17 +238,25 @@ pub(super) fn prepare_ranges(
     };
     let compressed_sources: Vec<&str> = user_fn_source
         .iter()
-        .filter(|(symbol, source, _)| compressed_pool_member(llmod, symbol, source))
-        .map(|(_, source, _)| source.as_ref())
+        .filter(|(symbol, source, _, _)| compressed_pool_member(llmod, symbol, source))
+        .map(|(_, source, _, _)| source.as_ref())
         .collect();
+    // A function whose text the compiler dropped (an empty text: no execution
+    // can read it, see the driver's `source_need::drop_unread_source`) still
+    // owns its strictness bit. An info carries that bit on its own; a body
+    // registered through the copying table registers an empty range instead,
+    // which `toString` treats as absent.
+    let registers_empty = |llmod: &LlModule, symbol: &str, non_strict: bool| {
+        non_strict && !(strings_outlive_registry && llmod.can_attach_fn_source(symbol))
+    };
     let raw_sources: Vec<&str> = user_fn_source
         .iter()
-        .filter(|(symbol, source, _)| {
+        .filter(|(symbol, source, non_strict, _)| {
             !symbol.is_empty()
-                && !source.is_empty()
+                && (!source.is_empty() || registers_empty(llmod, symbol, *non_strict))
                 && !compressed_pool_member(llmod, symbol, source)
         })
-        .map(|(_, source, _)| source.as_ref())
+        .map(|(_, source, _, _)| source.as_ref())
         .collect();
     let compressed_pool = SourcePool::emit_compressed(llmod, compressed_sources.into_iter());
     let source_pool = SourcePool::emit(
@@ -236,11 +266,19 @@ pub(super) fn prepare_ranges(
             .chain(class_sources.iter().map(|(_, source)| source.as_str())),
     );
     let mut user_fn_source_constants: Vec<(String, SourceRange, bool)> = Vec::new();
-    for (wrapper_sym, source_text, is_non_strict_ordinary) in user_fn_source {
-        if wrapper_sym.is_empty() || source_text.is_empty() {
+    for (wrapper_sym, source_text, is_non_strict_ordinary, _) in user_fn_source {
+        if wrapper_sym.is_empty() {
             continue;
         }
         let in_info = strings_outlive_registry && llmod.can_attach_fn_source(wrapper_sym);
+        if source_text.is_empty() {
+            if !*is_non_strict_ordinary {
+                continue;
+            }
+            if in_info && llmod.mark_fn_non_strict_ordinary(wrapper_sym) {
+                continue;
+            }
+        }
         let source = if compressed_pool_member(llmod, wrapper_sym, source_text) {
             compressed_pool.get(source_text)
         } else {
@@ -267,7 +305,76 @@ pub(super) fn prepare_ranges(
         .into_iter()
         .map(|(cid, source)| (cid, source_pool.get(source)))
         .collect();
+    if super::source_need::active() {
+        record_census(
+            llmod,
+            module_prefix,
+            user_fn_source,
+            &source_pool,
+            &compressed_pool,
+            &class_source_constants,
+            class_source_text,
+            strings_outlive_registry,
+        );
+    }
     (user_fn_source_constants, class_source_constants)
+}
+
+/// PERRY_SOURCE_NEED_REPORT: report the ranges chosen above in decoded bytes
+/// (the raw pool, then the compressed pool's uncompressed blob). Nothing
+/// emitted depends on this.
+#[allow(clippy::too_many_arguments)]
+fn record_census(
+    llmod: &LlModule,
+    module_prefix: &str,
+    user_fn_source: &[(String, std::borrow::Cow<'_, str>, bool, FuncId)],
+    source_pool: &SourcePool<'_>,
+    compressed_pool: &SourcePool<'_>,
+    class_source_constants: &[(u32, SourceRange)],
+    class_source_text: &HashMap<u32, perry_hir::SourceText>,
+    strings_outlive_registry: bool,
+) {
+    use super::source_need::{source_hash, StoredEntry, StoredKey};
+    let raw_len = source_pool.decoded_len;
+    let mut entries = Vec::new();
+    for (symbol, text, _, fid) in user_fn_source {
+        if symbol.is_empty() || text.is_empty() {
+            continue;
+        }
+        let compressed = text.len() > perry_abi::RETAINED_SOURCE_RAW_MAX_BYTES
+            && strings_outlive_registry
+            && llmod.can_attach_fn_source(symbol);
+        let offset = if compressed {
+            raw_len + compressed_pool.get(text).pool_offset
+        } else {
+            source_pool.get(text).pool_offset
+        };
+        entries.push(StoredEntry {
+            key: StoredKey::Func(*fid),
+            symbol: symbol.clone(),
+            offset,
+            len: text.len(),
+            hash: source_hash(text.as_bytes()),
+        });
+    }
+    for (cid, r) in class_source_constants {
+        let hash = class_source_text
+            .get(cid)
+            .map_or(0, |s| source_hash(s.as_str().as_bytes()));
+        entries.push(StoredEntry {
+            key: StoredKey::Class(*cid),
+            symbol: format!("class#{cid}"),
+            offset: r.pool_offset,
+            len: r.byte_len,
+            hash,
+        });
+    }
+    super::source_need::record_module(
+        module_prefix,
+        raw_len + compressed_pool.decoded_len,
+        source_pool.physical_len + compressed_pool.physical_len,
+        entries,
+    );
 }
 
 /// Each result names an input parent and an exact byte offset. Empty sources
@@ -446,7 +553,7 @@ mod tests {
         assert_eq!(pool.get("small").offset, 0);
         assert_eq!(pool.get("other").offset, 5);
         assert_eq!(pool.get("").offset, 10);
-        assert_eq!(pool.0.len(), 3);
+        assert_eq!(pool.ranges.len(), 3);
         assert_eq!(pool.get("").byte_len, 0);
         let ir = module.to_ir();
         assert_eq!(
@@ -499,6 +606,58 @@ mod tests {
             !ir.contains(child),
             "compiled infos retain compressed bytes only"
         );
+    }
+
+    /// A function whose text the driver dropped (empty) keeps its kind: an
+    /// info gets the non-strict bit without a source range; the copying
+    /// registry gets an empty range carrying the bit. A strict one gets
+    /// nothing.
+    #[test]
+    fn a_dropped_text_keeps_the_non_strict_bit_and_retains_no_bytes() {
+        use std::borrow::Cow;
+        let js_body = || {
+            vec![
+                (crate::types::PTR, "%this_closure".to_string()),
+                (crate::types::I64, "%js_this".to_string()),
+            ]
+        };
+        let sources = vec![
+            ("body_sloppy".to_string(), Cow::Borrowed(""), true, 1u32),
+            ("body_strict".to_string(), Cow::Borrowed(""), false, 2u32),
+        ];
+        let no_classes = HashMap::new();
+        for outlive in [true, false] {
+            let mut module = LlModule::new("x86_64-unknown-linux-gnu");
+            module.define_function("body_sloppy", crate::types::DOUBLE, js_body());
+            module.define_function("body_strict", crate::types::DOUBLE, js_body());
+            let (constants, classes) = prepare_ranges(
+                &mut module,
+                "m_",
+                &sources,
+                &no_classes,
+                &HashMap::new(),
+                &HashMap::new(),
+                outlive,
+            );
+            assert!(classes.is_empty());
+            let flags = |body: &str| {
+                let mut out = (0, false);
+                module.note_fn_info(body, |f| out = (f.flags, f.source.is_some()));
+                out
+            };
+            let bit = perry_abi::FN_NON_STRICT_ORDINARY;
+            if outlive {
+                assert!(constants.is_empty());
+                assert_eq!(flags("body_sloppy"), (bit, false));
+            } else {
+                assert_eq!(constants.len(), 1);
+                assert_eq!(constants[0].0, "body_sloppy");
+                assert_eq!(constants[0].1.byte_len, 0);
+                assert!(constants[0].2);
+                assert_eq!(flags("body_sloppy").0 & bit, 0);
+            }
+            assert_eq!(flags("body_strict"), (0, false));
+        }
     }
 
     #[test]

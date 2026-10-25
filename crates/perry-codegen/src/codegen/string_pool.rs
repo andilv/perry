@@ -149,7 +149,12 @@ pub(super) fn emit_string_pool(
     // original source we retained. Each entry produces one
     // `js_register_function_source_static` call in `__perry_init_strings_<prefix>`
     // so `fn.toString()` can reconstruct the source.
-    user_fn_source: &[(String, std::borrow::Cow<'_, str>, bool)],
+    user_fn_source: &[(
+        String,
+        std::borrow::Cow<'_, str>,
+        bool,
+        perry_hir::types::FuncId,
+    )],
     // The templates the module evaluates per evaluation (`ClassExprFresh`):
     // their static methods' entries run in the function object's home.
     fresh_class_templates: &std::collections::HashSet<String>,
@@ -225,6 +230,7 @@ pub(super) fn emit_string_pool(
     let (user_fn_source_constants, class_source_constants) =
         super::retained_source_pool::prepare_ranges(
             llmod,
+            module_prefix,
             user_fn_source,
             classes,
             class_ids,
@@ -748,7 +754,7 @@ pub(super) fn emit_string_pool(
         }
     }
 
-    // Register the parent-class chain for every class with a parent.
+    // Register parent edges for the classes this module defines.
     // The runtime allocators do this on every alloc; the inline
     // bump allocator skips it. Without this one-time call, the
     // CLASS_REGISTRY misses the `child → parent` edge and walks of
@@ -758,22 +764,25 @@ pub(super) fn emit_string_pool(
     // class id for deterministic ordering.
     chunker.literals = false;
     let mut parent_pairs: Vec<(u32, u32)> = Vec::new();
-    for (name, &cid) in class_ids.iter() {
-        if let Some(class) = classes.get(name) {
-            if let Some(parent_name) = &class.extends_name {
-                if let Some(&parent_cid) = class_ids.get(parent_name) {
-                    if parent_cid != 0 {
-                        parent_pairs.push((cid, parent_cid));
-                    }
-                } else if let Some(reserved) =
-                    crate::expr::builtin_parent_reserved_class_id(parent_name)
-                {
-                    // `class S extends Array {}` — the parent is a built-in
-                    // with a reserved runtime class id, not a user class. Wire
-                    // the edge so `new S() instanceof Array` walks the chain to
-                    // the reserved id and matches. Refs class/subclass-builtins.
-                    parent_pairs.push((cid, reserved));
+    // Imported class stubs describe lookup in this module; their defining
+    // module publishes the parent edge. Repeating it here duplicates startup
+    // work and makes unrelated function partitioning depend on an import's
+    // native parent. Definition identity also avoids repeating the same edge
+    // through self-binding aliases.
+    for class in module_classes {
+        if let Some(parent_name) = &class.extends_name {
+            if let Some(&parent_cid) = class_ids.get(parent_name) {
+                if parent_cid != 0 {
+                    parent_pairs.push((class.id, parent_cid));
                 }
+            } else if let Some(reserved) =
+                crate::expr::builtin_parent_reserved_class_id(parent_name)
+            {
+                // `class S extends Array {}` — the parent is a built-in
+                // with a reserved runtime class id, not a user class. Wire
+                // the edge so `new S() instanceof Array` walks the chain to
+                // the reserved id and matches. Refs class/subclass-builtins.
+                parent_pairs.push((class.id, reserved));
             }
         }
     }
@@ -953,7 +962,7 @@ pub(super) fn emit_string_pool(
                     &f.body,
                     fresh_class_templates.contains(class_name),
                 ),
-                is_generator: super::helpers::body_has_fixed_generator_state(&f.body),
+                generator: super::helpers::body_generator_record_kind(&f.body),
             });
         }
         // #1787: the standalone constructor `<prefix>__<class>_constructor`
@@ -1117,11 +1126,7 @@ pub(super) fn emit_string_pool(
             has_user_rest: has_rest,
             has_synth_args,
             home: home && method_entries::source_needs_home(&local_classes, cid, definition_order),
-            is_generator: method_entries::source_is_generator(
-                &local_classes,
-                cid,
-                definition_order,
-            ),
+            generator: method_entries::source_generator_kind(&local_classes, cid, definition_order),
             generator_owner: method_entries::source_needs_owner(
                 &local_classes,
                 cid,
@@ -1229,7 +1234,7 @@ pub(super) fn emit_string_pool(
                 has_user_rest,
                 has_synth_args,
                 home: fresh_cids.contains(&cid),
-                is_generator: method_entries::source_is_generator(
+                generator: method_entries::source_generator_kind(
                     &local_classes,
                     cid,
                     definition_order,

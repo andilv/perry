@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2016 entries across 111 modules
+// Coverage: 2020 entries across 111 modules
 
 type PerryI8 = number & { readonly __perryI8?: never };
 type PerryI16 = number & { readonly __perryI16?: never };
@@ -353,6 +353,10 @@ declare module "bun" {
   export function plugin(plugin: any): any;
   /** stdlib */
   export function serve(options: any): any;
+  /** stdlib */
+  export function sleep(...args: any[]): any;
+  /** stdlib */
+  export function sleepSync(...args: any[]): any;
   /** stdlib */
   export function spawn(...args: any[]): any;
   /** stdlib */
@@ -2472,9 +2476,13 @@ declare module "perry/component" {
   /** stdlib */
   export function callComponentImport(interfaceName: string, functionName: string, args: any): any;
   /** stdlib */
+  export function createComponentHostResource(handle: any, resourceType: string, payload: any, destructor?: any): any;
+  /** stdlib */
   export function createComponentResource(resourceType: number, payload: any, destructor: any): any;
   /** stdlib */
   export function disposeComponent(handle: any): void;
+  /** stdlib */
+  export function getComponentHostResourceValue(handle: any, resourceType: string, resource: any): any;
   /** stdlib */
   export function getComponentResourceValue(resourceType: number, resource: any): any;
   /** stdlib */
@@ -4417,7 +4425,7 @@ declare module "zlib" {
   /** stdlib */
   export function inflateRawSync(p0: string): Buffer;
   /** stdlib */
-  export function inflateSync(p0: any): Buffer;
+  export function inflateSync(p0: any, options?: any): Buffer;
   /** stdlib */
   export function unzip(buffer: any, options?: any, callback?: any): void;
   /** stdlib */

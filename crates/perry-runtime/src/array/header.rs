@@ -922,6 +922,18 @@ pub struct ArrayHeader {
     pub capacity: u32,
     /// Ordinary own-property layout, independent of the element backing.
     pub named: *mut crate::object::ObjectHeader,
+    /// ILP32 keeps `ek_prefix` at +16, the offset emitted code reads.
+    #[cfg(target_pointer_width = "32")]
+    pub _ek_pad: u32,
+    /// Element kind, dense prefix P: every slot below P holds a plain data
+    /// element (no hole, no element descriptor), and P <= min(length,
+    /// capacity). A lower bound: lowering it is always sound, raising it
+    /// needs a proof at the store (EK_ELEMENT_KIND_DESIGN 3.1). Zero is the
+    /// weakest claim, so a birth that writes zero is slow, never wrong.
+    pub ek_prefix: u32,
+    /// Element kind, value tag: bits 0..3 the tag, bits 3..32 the class id
+    /// of CLASS(c). Zero is ANY, the weakest claim (design 3.2).
+    pub ek_kind: u32,
 }
 
 #[inline]
@@ -1142,6 +1154,7 @@ pub(crate) unsafe fn array_has_raw_f64_layout_or_holes(arr: *const ArrayHeader) 
 pub(crate) unsafe fn note_array_hole_fill_slot(arr: *mut ArrayHeader, index: usize) {
     // GC_STORE_AUDIT(BARRIERED): TAG_HOLE sentinel store, layout-noted and barriered below.
     std::ptr::write(array_elements_ptr(arr).add(index), crate::value::TAG_HOLE);
+    super::ek_note_slot(arr, index, crate::value::TAG_HOLE);
     crate::gc::layout_note_slot(arr as usize, index, crate::value::TAG_HOLE);
     let slot = array_elements_ptr(arr).add(index) as usize;
     crate::gc::runtime_write_barrier_slot(arr as usize, slot, crate::value::TAG_HOLE);
@@ -1698,6 +1711,7 @@ pub(crate) unsafe fn array_numeric_raw_f64_push_inbounds_resolved(
     let flags = array_object_flags_resolved(arr);
     crate::array::note_element_store_resolved_flags(arr, length as usize, number.to_bits(), flags);
     (*arr).length = length + 1;
+    crate::array::ek_note_published(arr, length as usize);
     true
 }
 

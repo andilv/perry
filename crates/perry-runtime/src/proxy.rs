@@ -27,6 +27,8 @@ mod has_delete;
 pub(crate) use has_delete::reflect_ordinary_delete_property_key;
 pub use has_delete::{js_proxy_delete, js_proxy_has};
 mod invariants;
+#[cfg(test)]
+mod receiver_definition_tests;
 mod set_interceptor;
 pub(crate) use set_interceptor::set_interceptor;
 mod put_value;
@@ -222,6 +224,7 @@ pub extern "C" fn js_proxy_new(target: f64, handler: f64) -> f64 {
             callable,
             "Proxy [[Call]] must agree with its creation-time target"
         );
+        // GC_STORE_AUDIT(INIT): Fresh ProxyEntry under GcSuppressScope begins with target/handler numeric0 and props=null. Real target and handler are subsequently installed through runtime_store_gc_jsvalue_slot (proxy.rs210-247).
         std::ptr::write(
             cell,
             ProxyEntry {
@@ -1597,6 +1600,22 @@ fn create_or_update_receiver_property(receiver: f64, key: f64, value: f64) -> bo
     } else if unsafe { crate::object::layout_desc::family_create(receiver, key, value) } {
         // Case 2c: a family object's late key, or a key outside its layout.
         return true;
+    } else {
+        // OrdinarySetWithOwnDescriptor creates an OWN data property here.
+        // Re-entering [[Set]] would walk the receiver's prototypes again and
+        // recurse forever when that chain contains a trapless Proxy.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let receiver = scope.root_nanbox_f64(receiver);
+        let key = scope.root_nanbox_f64(key);
+        let descriptor = crate::object::object_ops::DescView::create_data(&scope, value);
+        return unsafe {
+            crate::object::object_ops::define_own_property_decoded(
+                &scope,
+                &receiver,
+                &key,
+                &descriptor,
+            )
+        };
     }
     target_set(receiver, key, value);
     true

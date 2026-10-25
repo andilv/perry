@@ -36,10 +36,8 @@ fn facts_of(g: &Gen, n: u32) -> BindingFacts {
     let node = &m.nodes[n as usize];
     let mut out = BindingFacts {
         prims: node.prim,
-        other: node.widened,
-        top: m.explain && (node.widened || node.pts.to_sorted().contains(&TOP)),
-        top_cause: (m.explain && (node.widened || node.pts.to_sorted().contains(&TOP)))
-            .then(|| m.top_origin(n)),
+        top: m.explain && node.pts.contains_tok(TOP),
+        top_cause: (m.explain && node.pts.contains_tok(TOP)).then(|| m.top_origin(n)),
         ..Default::default()
     };
     for t in node.pts.to_sorted() {
@@ -47,8 +45,16 @@ fn facts_of(g: &Gen, n: u32) -> BindingFacts {
             out.other = true;
             continue;
         }
+        // A marker beside its values (a closed function's described
+        // parameter, what it reaches, an argument marker of only such
+        // markers; DECISIONS 74, 75) stands for no value of its own: the
+        // callers' values are the contract's, beside it in this node. It
+        // adds no class and is not `other` (DECISIONS 76).
+        if m.beside_values(t) {
+            continue;
+        }
         match &m.toks[t as usize] {
-            TokKind::Obj(tm) => match m.tmpls[*tm as usize].kind {
+            TokKind::Obj(tm, _) => match m.tmpls[*tm as usize].kind {
                 TmplKind::Class { class_id, .. } => out.class_ids.push(class_id),
                 _ => out.other = true,
             },

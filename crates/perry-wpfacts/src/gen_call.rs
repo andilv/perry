@@ -31,10 +31,30 @@ impl<'a> Gen<'a> {
         byte_offset: u32,
     ) -> NodeId {
         // The object-literal IIFE: `(o => { js_object_literal_define(o, …);
-        // …; return o })({})`. Its defines are the literal's birth.
-        if let (Expr::Closure { params, .. }, [Expr::Object(props)]) = (callee, args) {
-            if props.is_empty() && params.len() == 1 && params[0].name == "__perry_obj_iife" {
-                let lit = self.expr(fx, &args[0]);
+        // …; return o })(seed)`. Its defines are the literal's birth.
+        if let (Expr::Closure { params, .. }, [seed]) = (callee, args) {
+            if crate::decl_units::obj_literal_iife(params) && literal_seed(seed) {
+                // An exported method literal's seed is its shape class,
+                // its constructor storing `undefined` into every field the
+                // defines then store, in order, before the object is
+                // returned: no code sees a placeholder (the value
+                // expressions cannot name the literal). The birth is the
+                // layout's object, born as a literal is, without running
+                // that constructor (design §18.9).
+                let shape = match seed {
+                    Expr::New { class_name, .. } => self.mods[fx.module as usize]
+                        .classes
+                        .get(class_name)
+                        .copied(),
+                    _ => None,
+                };
+                let lit = match shape {
+                    Some(tm) => {
+                        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
+                        self.tok_node(t)
+                    }
+                    None => self.expr(fx, seed),
+                };
                 let tm = self.m.nodes[lit as usize]
                     .pts
                     .to_sorted()
@@ -45,10 +65,26 @@ impl<'a> Gen<'a> {
                     self.iife_birth.insert(pn, tm);
                 }
                 let c = self.expr(fx, callee);
+                if let Expr::Closure { func_id, .. } = callee {
+                    // Its parameter is the literal's birth, not a call input.
+                    let f = self.fn_by_id(fx.module, *func_id);
+                    self.m.funcs[f as usize].no_summary = true;
+                }
                 return self.call_value(c, ThisArg::Undef, vec![lit], vec![]);
             }
         }
+        // A literal `require("...")` in a CommonJS-wrapped module: the one
+        // module the wrapper resolved it to (`Gen::cjs_static_require`).
+        if let (Expr::FuncRef(_) | Expr::LocalGet(_), [Expr::String(spec)]) = (callee, args) {
+            if let Some(n) = self.cjs_static_require(fx.module, callee, spec) {
+                return n;
+            }
+        }
         let a: Vec<NodeId> = args.iter().map(|x| self.expr(fx, x)).collect();
+        self.call_lit_arg = match args.first().map(|x| self.const_eval(fx.module, x)) {
+            Some(Some(crate::gen_const::Const::Str(s))) => Some(self.m.atom(&s)),
+            _ => None,
+        };
         if let Expr::ExternFuncRef { name, .. } = callee {
             if self.is_runtime_extern(fx.module, name) {
                 let lits: Vec<Option<String>> = args
@@ -72,13 +108,17 @@ impl<'a> Gen<'a> {
         spread: Vec<NodeId>,
         byte_offset: u32,
     ) -> NodeId {
+        let lit = self.call_lit_arg.take();
         match callee {
             Expr::PropertyGet {
                 object,
                 property,
                 byte_offset: pb,
             } => {
-                let o = self.expr(fx, object);
+                let o = match self.ns_member(fx.module, object, property, true) {
+                    Some(o) => o,
+                    None => self.expr(fx, object),
+                };
                 let a = self.m.atom(property);
                 let off = if *pb != 0 { *pb } else { byte_offset };
                 if off != 0 {
@@ -106,21 +146,26 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let c = self.expr(fx, callee);
-                self.call_value(c, ThisArg::Undef, args, spread)
+                let r = self.call_value(c, ThisArg::Undef, args, spread);
+                if let Some(a) = lit {
+                    let call = self.m.calls.len() as CallId - 1;
+                    self.m.call_lit.insert(call, a);
+                }
+                r
             }
         }
     }
 
     fn is_runtime_extern(&self, mi: u32, name: &str) -> bool {
         name.starts_with("js_")
-            && !self.mods[mi as usize].imports.contains_key(name)
+            && !self.is_import(mi, name)
             && !self.mods[mi as usize].scope.contains_key(name)
     }
 
     /// `ExternFuncRef { name }` read as a value: an import binding, a
     /// module-scope name, or an unknown runtime/global value (⊤).
     pub(crate) fn extern_value(&mut self, mi: u32, name: &str) -> NodeId {
-        if let Some(&n) = self.mods[mi as usize].imports.get(name) {
+        if let Some(n) = self.import_value(mi, name) {
             return n;
         }
         if let Some(&n) = self.mods[mi as usize].scope.get(name) {
@@ -153,10 +198,15 @@ impl<'a> Gen<'a> {
             .unwrap_or_else(|| format!("closure{func_id}"));
         let f = self.register_fn(mi, *func_id, &name, params, *is_arrow, true);
         let info = self.m.funcs[f as usize].clone();
-        if *captures_this || *is_arrow {
+        // An arrow captures the enclosing `this` only when its body (or an
+        // arrow nested in it) reads `this` or `super` (design §14.2 rule
+        // 1): a `this` nothing reads carries nothing, and capturing it
+        // would key the closure's context by its creator's frame.
+        if *captures_this || (*is_arrow && body.iter().any(stmt_reads_this)) {
             // Captured `this` (arrow semantics, or a slot the runtime
             // patches): the enclosing `this` flows in.
             self.m.edge(fx.this, info.this);
+            self.m.captures.insert((fx.this, f));
         }
         let fn_ctor = !*is_arrow;
         let cfx = Fx {
@@ -198,7 +248,7 @@ impl<'a> Gen<'a> {
         let callee = if let Some(&tm) = self.mods[mi as usize].classes.get(name) {
             let t = self.m.tok(TokKind::ClassObj(tm));
             Some(self.tok_node(t))
-        } else if let Some(&n) = self.mods[mi as usize].imports.get(name) {
+        } else if let Some(n) = self.import_value(mi, name) {
             Some(n)
         } else {
             self.mods[mi as usize].scope.get(name).copied()
@@ -222,7 +272,11 @@ impl<'a> Gen<'a> {
         spread: Vec<NodeId>,
     ) -> NodeId {
         let (call, ret) = self.new_call(ThisArg::Undef, args, spread);
-        crate::builtins::construct_named(&mut self.m, name, call);
+        let h = self.m.node_l("new-named");
+        let mark = self.m.tok(TokKind::Builtin(BuiltinNs::Other));
+        self.m.add_tok(h, mark);
+        let name = self.m.atom(name);
+        self.m.cons(h, Cons::NewNamed { name, call });
         ret
     }
 
@@ -231,7 +285,7 @@ impl<'a> Gen<'a> {
             let t = self.m.tok(TokKind::ClassObj(tm));
             return self.tok_node(t);
         }
-        if let Some(&n) = self.mods[mi as usize].imports.get(name) {
+        if let Some(n) = self.import_value(mi, name) {
             return n;
         }
         if let Some(&n) = self.mods[mi as usize].scope.get(name) {
@@ -240,15 +294,16 @@ impl<'a> Gen<'a> {
         self.m.top_val(&format!("unresolved class value {name}"))
     }
 
-    /// Captured values of a class body (class expression environments).
-    pub(crate) fn class_env(&mut self, mi: u32, name: &str) -> NodeId {
-        let key = format!("{mi}:{name}");
+    /// One captured value of a class body (a slot of the class's capture
+    /// environment): each slot is its own node, as each is its own binding.
+    pub(crate) fn class_env(&mut self, mi: u32, name: &str, index: usize) -> NodeId {
+        let key = format!("{mi}:{name}:{index}");
         if let Some(&n) = self.class_envs.get(&key) {
             return n;
         }
         let n = self
             .m
-            .node_named("classenv", || format!("classenv({name})"));
+            .node_named("classenv", || format!("classenv({name}.{index})"));
         self.class_envs.insert(key, n);
         n
     }
@@ -315,7 +370,11 @@ impl<'a> Gen<'a> {
                 self.m.tok(TokKind::ClassObj(p)),
             ],
             None => {
-                if self.m.tmpls[tm as usize].native_parent.is_some() {
+                // A parent value (§17.2): `super.x` starts at a prototype
+                // the solve computes; unknown here.
+                if self.m.tmpls[tm as usize].native_parent.is_some()
+                    || self.m.tmpls[tm as usize].parent_value.is_some()
+                {
                     vec![TOP]
                 } else {
                     vec![self.m.tok(TokKind::ObjectProto)]
@@ -609,9 +668,42 @@ impl<'a> Gen<'a> {
                 }
                 self.prim_node(prim::UNDEF)
             }
-            "js_vm_module_call" | "js_module_create_require_devirt" => {
-                crate::builtins::set_dyn_eval(&mut self.m, "E14 vm / createRequire");
+            // The runtime calls the delegate's own `throw` / `return` with
+            // the value (`perry-runtime` `iterator_close.rs`); a delegate
+            // without `throw` is closed through `return` first.
+            "js_iterator_delegate_throw" | "js_iterator_delegate_return" => {
+                let (Some(it), Some(v)) = (arg(0), arg(1)) else {
+                    return self.extern_fail(name, &args, &spread);
+                };
+                let k = if name == "js_iterator_delegate_throw" {
+                    "throw"
+                } else {
+                    "return"
+                };
+                let a = self.m.atom(k);
+                let out = self.mcall(it, Key::Named(a), vec![v], vec![]);
+                if k == "throw" {
+                    let ra = self.m.atom("return");
+                    let _ = self.mcall(it, Key::Named(ra), vec![], vec![]);
+                }
+                self.m.add_prim(out, prim::UNDEF);
+                out
+            }
+            // A module-singleton `{}` (`perry-transform` `prototype_birth.rs`).
+            "js_object_literal_prototype_birth" => {
+                let (_, t) = self.new_lit_tmpl(fx.module, &[]);
+                self.tok_node(t)
+            }
+            "js_vm_module_call" => {
+                crate::builtins::set_dyn_eval(&mut self.m, "E14 node:vm");
                 self.extern_fail(name, &args, &spread)
+            }
+            // `module.createRequire` as a value call: the program's require.
+            // Its loader resolves compiled modules, builtins, addons and JSON;
+            // it never interprets code (`perry-runtime` `module_require.rs`).
+            "js_module_create_require_devirt" => {
+                let t = self.m.tok(TokKind::Builtin(BuiltinNs::Require));
+                self.tok_node(t)
             }
             _ => self.extern_fail(name, &args, &spread),
         }
@@ -631,5 +723,56 @@ impl<'a> Gen<'a> {
     fn iife_param_template(&self, _fx: &Fx, args: &[NodeId]) -> Option<TmplId> {
         let first = *args.first()?;
         self.iife_birth.get(&first).copied()
+    }
+}
+
+/// The first value of an object-literal IIFE's parameter: `{}`, or the
+/// shape-class seed of an exported method literal (`new Shape(undefined,
+/// …)`, `perry-hir` `expr_object.rs` `static_shape_seed`).
+fn literal_seed(seed: &Expr) -> bool {
+    match seed {
+        Expr::Object(props) => props.is_empty(),
+        Expr::New { args, .. } => args.iter().all(|a| matches!(a, Expr::Undefined)),
+        _ => false,
+    }
+}
+
+/// `stmt` reads the `this` an arrow inherits: `this` or `super`, in it or
+/// in a nested arrow. A non-arrow closure has its own `this`. The HIR's
+/// `captures_this` says the same for parsed arrows; synthetic arrows set
+/// it to false, so the body is the authority.
+pub(crate) fn stmt_reads_this(stmt: &Stmt) -> bool {
+    perry_hir::walker::stmt_any_expr(stmt, &mut expr_reads_this)
+}
+
+fn expr_reads_this(e: &Expr) -> bool {
+    match e {
+        Expr::This
+        | Expr::SuperCall(_)
+        | Expr::SuperCallSpread(_)
+        | Expr::SuperMethodCall { .. }
+        | Expr::SuperMethodCallSpread { .. }
+        | Expr::SuperPropertyGet { .. }
+        | Expr::SuperPropertySet { .. }
+        | Expr::ObjectSuperPropertyGet { .. }
+        | Expr::ObjectSuperPropertySet { .. }
+        | Expr::ObjectSuperMethodCall { .. } => true,
+        Expr::Closure {
+            is_arrow: false, ..
+        } => false,
+        Expr::Closure {
+            captures_this: true,
+            ..
+        } => true,
+        Expr::Closure { body, .. } => body.iter().any(stmt_reads_this),
+        _ => {
+            let mut found = false;
+            perry_hir::walker::walk_expr_children(e, &mut |c| {
+                if !found && expr_reads_this(c) {
+                    found = true;
+                }
+            });
+            found
+        }
     }
 }

@@ -4,10 +4,10 @@
 use crate::derive::{TemplateFacts, Verdict};
 use crate::ProgramFacts;
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-fn fnv(h: &mut u64, s: &str) {
+pub(crate) fn fnv(h: &mut u64, s: &str) {
     for b in s.as_bytes() {
         *h ^= *b as u64;
         *h = h.wrapping_mul(FNV_PRIME);
@@ -20,7 +20,7 @@ fn b(v: bool) -> u8 {
     v as u8
 }
 
-fn template_lines(t: &TemplateFacts) -> Vec<String> {
+pub(crate) fn template_lines(t: &TemplateFacts) -> Vec<String> {
     let mut v = vec![format!(
         "T {} kind={} class_id={} prefix_stable={} fixed_layout={} adds_keys={} birth=[{}] escape=\"{}\" hard=\"{}\" chain=\"{}\"",
         t.display,
@@ -107,6 +107,22 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
         "# stats modules={} templates={} fact_units={} nodes={} constraints={} tokens={} functions={} gen_ms={:.1} solve_ms={:.1} derive_ms={:.1} pops={} work={} aborted={}\n",
         s.modules, s.templates, s.fact_units, s.nodes, s.constraints, s.tokens, s.functions, s.gen_ms, s.solve_ms, s.derive_ms, s.pops, s.work, s.aborted
     ));
+    if pf.rounds > 0 {
+        out.push_str(&format!(
+            "# rounds {} work_per_round={:?} broken={:?}\n",
+            pf.rounds, pf.round_work, pf.broken
+        ));
+    }
+    for (path, u) in &pf.units {
+        out.push_str(&format!(
+            "# unit {path} nodes={} constraints={} tokens={} pts_entries={} instances={} gen_ms={:.1} solve_ms={:.1} derive_ms={:.1} pops={} work={} aborted={}\n",
+            u.nodes, u.constraints, u.tokens, u.pts_entries, u.instances, u.gen_ms, u.solve_ms, u.derive_ms, u.pops, u.work, u.aborted
+        ));
+    }
+    for l in &pf.unit_io {
+        out.push_str(l);
+        out.push('\n');
+    }
     out.push_str(&format!(
         "# interp_guard {}\n",
         pf.interp_guard.clone().unwrap_or_else(|| "none".into())
@@ -115,10 +131,7 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
     for (k, n, ms) in &s.profile {
         out.push_str(&format!("# profile {k} {n} {ms:.1}\n"));
     }
-    out.push_str(&format!(
-        "# pts_entries {} widened_nodes {}\n",
-        s.pts_entries, s.widened_nodes
-    ));
+    out.push_str(&format!("# pts_entries {}\n", s.pts_entries));
     for (l, n, mix) in &s.big_nodes {
         out.push_str(&format!("# bignode {l} {n} {mix}\n"));
     }
@@ -147,6 +160,7 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
         let v = match &st.verdict {
             Verdict::T0Mono => "T0".to_string(),
             Verdict::T0Set => "T0set".to_string(),
+            Verdict::E0 => "E0".to_string(),
             Verdict::No(r) => format!("no:{r}"),
         };
         out.push_str(&format!(
