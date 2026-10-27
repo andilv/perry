@@ -3,6 +3,8 @@
 //! Four native words, no heap pointers: shape, template identity plus capture
 //! slot, compiled code, and signature. Captures come from the current evaluation.
 use super::*;
+#[cfg(test)]
+use crate::codegen_abi::LayoutWord;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 type Constructor = (usize, u32, u32);
@@ -30,7 +32,7 @@ pub(super) unsafe fn validated_class_entry(
     let header = crate::value::addr_class::try_read_gc_header(object as usize)?;
     if header.obj_type != crate::gc::GC_TYPE_OBJECT
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
-        || crate::object::shapes::object_shape_stamp(object) as u64 != shape
+        || crate::object::shapes::object_shape_stamp(object).0 as u64 != shape
         || (*object).class_id != (*site.add(1)).load(Ordering::Relaxed) as u32
     {
         return None;
@@ -49,11 +51,11 @@ pub(super) unsafe fn site_constructor(
     }
     let shape = crate::object::shapes::object_shape_stamp(object);
     let cid = (*object).class_id;
-    let hit = (*site).load(Ordering::Relaxed) == shape as u64
+    let hit = (*site).load(Ordering::Relaxed) == shape.0 as u64
         && (*site.add(1)).load(Ordering::Relaxed) as u32 == cid;
-    let entry = resolved_site_constructor(site, shape as u64, cid)?;
+    let entry = resolved_site_constructor(site, shape.0 as u64, cid)?;
     if !hit && entry.2 != 0 {
-        let slot = crate::object::shapes::shape_record_by_id(shape)
+        let slot = crate::object::shapes::shape_record_for_word(shape)
             .and_then(|record| record.own_data_slot_of_value(0, b"__perry_ctor_caps"))
             .flatten()
             .or_else(|| {
@@ -61,7 +63,7 @@ pub(super) unsafe fn site_constructor(
                 // retain the ordinary slot layout. The general own-slot
                 // reader deliberately declines this kind; prove only this
                 // compiler-owned capture data slot from the same descriptor.
-                let d = crate::object::shapes::shape_descriptor_by_id(shape)?;
+                let d = crate::object::shapes::shape_descriptor_for_word(shape)?;
                 if d.object_kind != crate::object::shapes::ShapeObjectKind::Class
                     || d.summary & crate::object::key_attrs::SUMMARY_ACCESSOR != 0
                 {
@@ -195,6 +197,14 @@ pub unsafe extern "C-unwind" fn js_class_value_super_construct_site(
             b"Super constructor is not a constructor",
         );
     }
+    // A native Error-family parent initializes the receiver the derived `new`
+    // already allocated; it does not replace it. Constructing a fresh
+    // `ErrorHeader` here made `this` an exotic cell: the user class's methods
+    // and own fields then stopped resolving on the dynamic dispatch path
+    // (`error.render()` returned `{}`, `{...error}` lost `statusCode`/`code`).
+    if let Some(receiver) = init_error_family_receiver(parent, this, args_ptr, args_len) {
+        return receiver;
+    }
     // Reified builtins have a Construct entry distinct from their Call entry
     // (Map/Set deliberately throw on Call). Preserve the current newTarget.
     if crate::proxy::js_proxy_is_proxy(parent) != 0
@@ -235,6 +245,63 @@ fn link_native_super_result(result: f64, receiver: f64) {
     if JSValue::from_bits(proto.to_bits()).is_pointer() {
         crate::object::prototype_chain::object_set_static_prototype(handle, proto.to_bits());
     }
+}
+
+/// `super(message, options)` into a built-in Error-family constructor, run on
+/// the class instance the derived construct already allocated. This is the
+/// initialization the direct `super()` lowering emits
+/// (`js_error_subclass_default_init_with_options`); the receiver stays the
+/// ordinary object carrying the class identity, with `message`, the captured
+/// `stack` and `cause` as own properties. `AggregateError` takes its errors
+/// argument through the generic construct below.
+unsafe fn init_error_family_receiver(
+    parent: f64,
+    this: f64,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> Option<f64> {
+    use super::super::super::global_this_tables::BuiltinConstructorIdentity as Identity;
+    if !matches!(
+        crate::object::global_this_tables::constructor_identity(parent)?,
+        Identity::Error
+            | Identity::TypeError
+            | Identity::RangeError
+            | Identity::ReferenceError
+            | Identity::SyntaxError
+            | Identity::EvalError
+            | Identity::URIError
+    ) {
+        return None;
+    }
+    let receiver = JSValue::from_bits(this.to_bits());
+    if !receiver.is_pointer()
+        || !crate::value::addr_class::try_read_gc_header(
+            receiver.as_pointer::<ObjectHeader>() as usize
+        )
+        .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_OBJECT)
+    {
+        return None;
+    }
+    let args = if args_ptr.is_null() {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(args_ptr, args_len)
+    };
+    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+    // The init runs user JS (`message` ToString, an `options.cause` getter) and
+    // so can run a moving collection: hand the caller the refreshed receiver,
+    // not the raw `this` it passed in, or the caller's own root is overwritten
+    // with a stale address.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let this_h = scope.root_nanbox_f64(this);
+    let message = args.first().copied().unwrap_or(undefined);
+    let options = args.get(1).copied().unwrap_or(undefined);
+    super::super::super::class_constructors::js_error_subclass_default_init_with_options(
+        this_h.get_nanbox_f64(),
+        message,
+        options,
+    );
+    Some(this_h.get_nanbox_f64())
 }
 
 #[used(compiler)]
@@ -318,7 +385,10 @@ mod tests {
                 class.with_mut_ptr::<ObjectHeader, _>(|class| {
                     assert_eq!(site_constructor(site.as_ptr(), class), Some((16, 2, 1)));
                     let (shape, slot) = capture_slot(site.as_ptr()).expect("own capture data slot");
-                    assert_eq!(shape, crate::object::shapes::object_shape_stamp(class));
+                    assert_eq!(
+                        LayoutWord(shape),
+                        crate::object::shapes::object_shape_stamp(class)
+                    );
                     assert_eq!(
                         crate::object::js_object_get_field(class, slot).as_number(),
                         expected

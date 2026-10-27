@@ -12,9 +12,9 @@ mod module_cjs;
 pub(crate) use builtin_closure_metadata::*;
 use module_cjs::attach_module_cjs_constructor_statics;
 pub(crate) use module_cjs::{
-    module_builtin_modules_value, module_cjs_cache_value, module_cjs_extensions_value,
-    module_cjs_global_paths_value, module_cjs_path_cache_value, module_cjs_prototype_for_instance,
-    module_constants_value,
+    install_module_cjs_cache_value, module_builtin_modules_value, module_cjs_cache_value,
+    module_cjs_extensions_value, module_cjs_global_paths_value, module_cjs_path_cache_value,
+    module_cjs_prototype_for_instance, module_constants_value,
 };
 
 #[cfg(test)]
@@ -68,6 +68,16 @@ pub fn bound_native_callable_export_value(module_name: &str, property_name: &str
         )
     {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    // A module the submodule registry implements (`stream/promises`,
+    // `timers/promises`, `stream/web`, ...) has no dispatch bucket: a
+    // BOUND_METHOD closure minted below would dispatch through a module with no
+    // bucket and resolve `undefined` without running anything. The module value
+    // is the registry namespace, so hand out its own export.
+    if let Some(value) =
+        crate::node_submodules::registry_backed_module_callable(module_name, property_name)
+    {
+        return value;
     }
     // node:inspector/promises is the callback namespace with Session replaced.
     if module_name == "inspector/promises" && property_name != "Session" {
@@ -994,8 +1004,7 @@ pub(crate) fn timers_promises_parent_namespace() -> f64 {
             return f64::from_bits(bits);
         }
 
-        let module_name = "timers/promises";
-        let value = js_create_native_module_namespace(module_name.as_ptr(), module_name.len());
+        let value = crate::node_submodules::commonjs_value("timers_promises");
         slot.set(value.to_bits());
         crate::gc::runtime_write_barrier_root_nanbox(value.to_bits());
         value

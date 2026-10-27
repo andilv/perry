@@ -9,6 +9,7 @@
 //! runtime's definitions, none an accessor or read-only data for an instance
 //! key, so the constructor's `[[Set]]`s are own-property creations and fill
 //! the slots. Any other prototype takes the ordinary construction.
+use crate::codegen_abi::LayoutWord;
 use crate::object::layout_desc::{PerryLayoutDesc, LAYOUT_PROTO_NULL, LAYOUT_PROTO_OBJECT};
 use crate::object::ObjectHeader;
 use crate::value::JSValue;
@@ -217,27 +218,27 @@ pub(crate) unsafe fn instance_layout(obj: *const ObjectHeader) -> Option<*const 
     if let Some(desc) = layouts.into_iter().find(|&desc| (*desc).layout_id == word) {
         return Some(desc);
     }
-    derived_instance_layout(word)
+    derived_instance_layout(LayoutWord(word))
 }
 
 /// [`instance_layout`] of a shape id that is not a layout's own: the layout
 /// whose key list its shape has.
 #[inline(never)]
-unsafe fn derived_instance_layout(word: u32) -> Option<*const PerryLayoutDesc> {
+unsafe fn derived_instance_layout(word: LayoutWord) -> Option<*const PerryLayoutDesc> {
     // A derived shape is minted in the dynamic band; a static id (every
     // registered layout, a class family's) is its own layout or none.
-    if word & crate::object::layout_desc::LAYOUT_SHADOW_BIT != 0
-        || crate::object::shapes::is_static_shape_id(word)
+    if word.0 & crate::object::layout_desc::LAYOUT_SHADOW_BIT != 0
+        || crate::object::shapes::is_static_layout_word(word.0)
     {
         return None;
     }
-    let (keys, count, _) = crate::object::shapes::shape_keys_and_proto_by_id(word)?;
+    let (keys, count, _) = crate::object::shapes::shape_keys_and_proto_for_word(word)?;
     if keys == 0 {
         return None;
     }
     instance_layouts().into_iter().find(|&desc| {
         (*desc).key_count == count
-            && crate::object::shapes::shape_keys_and_proto_by_id((*desc).layout_id)
+            && crate::object::shapes::shape_keys_and_proto_for_word(LayoutWord((*desc).layout_id))
                 .is_some_and(|(layout_keys, _, _)| layout_keys == keys)
     })
 }

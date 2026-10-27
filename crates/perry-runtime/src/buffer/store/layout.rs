@@ -53,7 +53,7 @@ use std::sync::{Mutex, OnceLock};
 /// SharedArrayBuffer block) — proven before the header is read.
 #[inline]
 pub(crate) fn byte_word_address(bits: u64) -> Option<usize> {
-    if bits < 0x1000 {
+    if bits < crate::value::addr_class::HANDLE_BAND_MAX as u64 {
         return None;
     }
     if (bits & crate::value::TAG_MASK) == crate::value::POINTER_TAG {
@@ -648,7 +648,6 @@ pub(crate) fn alloc_inline(brand: u8, capacity: u32, length: u32) -> *mut Buffer
     let ptr = crate::arena::arena_alloc_gc_old(buffer_payload_size(capacity as usize), 8, brand)
         as *mut BufferHeader;
     unsafe {
-        (*super::super::store::header(ptr as usize)).gc_flags |= crate::gc::GC_FLAG_TENURED;
         (*ptr).length = length;
         (*ptr).capacity = capacity;
         (*ptr).link = 0;
@@ -690,7 +689,6 @@ pub(crate) fn alloc_foreign(brand: u8, data: *mut u8, length: u32) -> *mut Buffe
         as *mut ForeignBuffer;
     unsafe {
         let gc = (ptr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
-        (*gc).gc_flags |= crate::gc::GC_FLAG_TENURED;
         (*gc)._reserved |= crate::gc::GC_BUFFER_FOREIGN_DATA;
         (*ptr).header.length = length;
         (*ptr).header.capacity = length;

@@ -5,6 +5,7 @@
 //! No behaviour change; moved verbatim.
 
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 fn fixed_slot(slot: *mut u64) -> GcMutableSlotDescriptor {
     GcMutableSlotDescriptor::Slot(GcMutableSlot::new(slot, None))
@@ -188,7 +189,15 @@ pub(super) unsafe fn visit_gc_layout_slot_descriptors_inline<F>(
         }
     }
     if let Some(slot) = child_slots.take_meta_child_slot() {
-        let descriptor = if matches!((*header).obj_type, GC_TYPE_OBJECT | GC_TYPE_CLOSURE) {
+        // The meta word of an object, closure or array is a raw machine
+        // pointer (`ObjectHeader::meta`, `ClosureHeader::props`,
+        // `ArrayHeader::named`), not an eight-byte JS value. On wasm32 it is
+        // four bytes followed by padding, so reading it as a `u64` would fold
+        // uninitialised padding into the address and hide the edge.
+        let descriptor = if matches!(
+            (*header).obj_type,
+            GC_TYPE_OBJECT | GC_TYPE_CLOSURE | GC_TYPE_ARRAY
+        ) {
             pointer_slot(slot.cast())
         } else {
             fixed_slot(slot)
@@ -496,6 +505,22 @@ unsafe fn visit_gc_rewrite_slot_descriptors_with<const INLINE_LAYOUT: bool>(
             // reference (NaN-boxed pointer, raw pointer, or the TAG_NULL /
             // 0-unset sentinels, which the slot visitor ignores).
             let meta = user_ptr as *mut crate::object::ObjectMeta;
+            let birth_word = ((*meta).instance_birth >> 32) as u32;
+            if birth_word != 0 {
+                let birth = crate::object::shapes::shape_record_for_word(LayoutWord(birth_word));
+                if full_trace_active() {
+                    crate::object::shapes::note_full_trace_carrier(birth);
+                }
+                crate::object::shapes::note_old_generation_carrier(birth);
+                if let Some(slot) = crate::object::gc_shape_keys_edge_slot(birth) {
+                    visit(fixed_slot(slot));
+                }
+                if let Some(slot) =
+                    crate::object::gc_shape_prototype_edge_slot(birth, full_trace_active())
+                {
+                    visit(fixed_slot(slot));
+                }
+            }
             visit(fixed_slot(&mut (*meta).prototype as *mut u64));
             // The private boxed primitive is a child edge (string, BigInt,
             // or Symbol), with scalars ignored by the ordinary slot visitor.

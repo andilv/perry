@@ -9,6 +9,7 @@
 //! ordinary path reaching the same facts gets) and stamps it once.
 
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 /// Stamp fresh, unobserved `obj` with the shape of `keys[0..count]` (a
 /// canonical list carrying its attribute entries), [[Prototype]] identity
@@ -42,7 +43,7 @@ pub(crate) unsafe fn stamp_linked_final_shape_requested(
     proto_id: u64,
     proto_bits: u64,
     lane: impl Fn(u32) -> bool,
-    requested: Option<u32>,
+    requested: Option<crate::codegen_abi::PublishedShape>,
 ) -> bool {
     if obj.is_null()
         || keys.is_null()
@@ -97,6 +98,7 @@ pub(crate) unsafe fn stamp_linked_final_shape_requested(
         &infos,
         // The receiver's private brands carry over (#11791).
         birth.brands(),
+        requested.map(|r| r.identity),
         requested,
         true,
         0,
@@ -127,7 +129,7 @@ pub(crate) unsafe fn declaration_parent_identity(
     obj: *const crate::object::ObjectHeader,
     recorded: u64,
 ) -> Option<u64> {
-    let record = &*ShapeSlab::agent_record(object_shape_stamp(obj));
+    let record = &*ShapeSlab::agent_record_for_receiver((object_shape_stamp(obj)).0);
     if record.semantic_generation >> 32 != 0x8000_0000 {
         return None;
     }
@@ -158,13 +160,13 @@ pub(crate) unsafe fn declaration_parent_identity(
 /// the evaluation's family layout: every slot the family names is where the
 /// family puts it, and the record names the prototype the instance inherits
 /// from. Two directory reads; no descriptor copy.
-pub(crate) fn shape_is_evaluation_layout_of(id: u32, family: u32) -> bool {
+pub(crate) fn shape_is_evaluation_layout_of(id: LayoutWord, family: LayoutWord) -> bool {
     if id == family {
         return false;
     }
     let (Some(r), Some(f)) = (
-        ShapeSlab::agent_record_present(id),
-        ShapeSlab::agent_record_present(family),
+        ShapeSlab::agent_record_for_word_present(id),
+        ShapeSlab::agent_record_for_word_present(family),
     ) else {
         return false;
     };
@@ -186,30 +188,33 @@ pub(crate) fn shape_is_evaluation_layout_of(id: u32, family: u32) -> bool {
 
 /// The class family layout ShapeId `id` is an evaluation copy of
 /// ([`shape_is_evaluation_layout_of`]), or 0: the record's
-/// `evaluation_layout_of` fact ([`note_evaluation_layout`]). It is written
+/// `family_desc_index_plus_one` fact ([`note_evaluation_layout`]). It is written
 /// only after the copy's facts were checked against the family's, and both
 /// are facts of their ShapeIds (an id never comes to name other facts; a
 /// family layout's record lives as long as the program), so it holds for
 /// the record's life. One directory read.
 #[inline]
-pub(crate) fn evaluation_layout_family(id: u32) -> u32 {
-    match ShapeSlab::agent_record_present(id) {
+pub(crate) fn evaluation_family_desc_index_plus_one(id: LayoutWord) -> u32 {
+    match ShapeSlab::agent_record_for_word_present(id) {
         // SAFETY: a present record of this agent, read immediately.
-        Some(record) => unsafe { (*record).evaluation_layout_of },
+        Some(record) => unsafe { (*record).family_desc_index_plus_one },
         None => 0,
     }
 }
 
 /// After a prototype transition from family layout `family` (or from an
 /// evaluation copy of it) reached `id`: when `id` is an evaluation copy of
-/// that layout, its record names the family ([`evaluation_layout_family`]).
-pub(crate) fn note_evaluation_layout(id: u32, family: u32) {
+/// that layout, its record names the family ([`evaluation_family_desc_index_plus_one`]).
+pub(crate) fn note_evaluation_layout(id: LayoutWord, family: LayoutWord) {
     if !shape_is_evaluation_layout_of(id, family) {
         return;
     }
-    if let Some(record) = ShapeSlab::agent_record_present(id) {
+    if let Some(record) = ShapeSlab::agent_record_for_word_present(id) {
         // SAFETY: a present record of this agent; one word, no allocation.
-        unsafe { (*record).evaluation_layout_of = family };
+        unsafe {
+            (*record).family_desc_index_plus_one =
+                (*ShapeSlab::agent_record_for_word(family)).family_desc_index_plus_one;
+        }
     }
 }
 
@@ -274,7 +279,7 @@ pub(crate) fn mutation_generation(hash: u64) -> u64 {
 #[inline]
 pub(crate) unsafe fn pristine_declaration_holder(obj: *const crate::object::ObjectHeader) -> bool {
     let id = object_shape_stamp(obj);
-    is_static_shape_id(id)
-        && (*ShapeSlab::agent_record(id)).semantic_generation
+    is_static_layout_word(id.0)
+        && (*ShapeSlab::agent_record_for_word(id)).semantic_generation
             == ((1u64 << 63) | u64::from((*obj).class_id))
 }

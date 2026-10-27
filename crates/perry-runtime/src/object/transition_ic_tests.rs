@@ -3,6 +3,7 @@
 #![cfg(test)]
 
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 /// Every payload byte and the length must affect packed-key placement. The
 /// old low-bit mask ignored later bytes and forced literal/literals to
@@ -21,8 +22,8 @@ fn content_transition_slots_use_every_payload_byte_and_length() {
         let (aid, alen) = transition_key_id(a);
         let (bid, blen) = transition_key_id(b);
         assert_ne!(
-            transition_cache_slot(0x8000_0042, aid, alen),
-            transition_cache_slot(0x8000_0042, bid, blen),
+            transition_cache_slot(LayoutWord(0x8000_0042), aid, alen),
+            transition_cache_slot(LayoutWord(0x8000_0042), bid, blen),
             "content differences must not be discarded before slot selection",
         );
     }
@@ -59,9 +60,16 @@ fn transition_key_id_namespaces_are_exact_and_disjoint() {
 /// with the same bytes — the property the emitted probe relies on, since its
 /// key is freshly concatenated at every write and never the interned one.
 #[test]
+#[allow(non_snake_case)]
 fn transition_cache_hits_a_content_entry_through_a_fresh_key() {
-    const PREDECESSOR: u32 = 0x8000_0301;
-    const TARGET: u32 = 0x8000_0302;
+    // Real published words: the insert reads the predecessor's record, and a
+    // word names a row that exists only once it is published.
+    let _lock = crate::gc::global_side_table_test_lock();
+    let predecessor_keys = 0x8067_0000_0000_3100usize;
+    let target_keys = 0x8067_0000_0000_3200usize;
+    let PREDECESSOR =
+        shapes::shape_descriptor_ensure(predecessor_keys as *const ArrayHeader, 1, 1).unwrap();
+    let TARGET = shapes::shape_descriptor_ensure(target_keys as *const ArrayHeader, 2, 2).unwrap();
     let inserted = crate::string::js_string_from_bytes(b"field_3".as_ptr(), 7);
     let keys = crate::array::js_array_alloc(4);
     let keys = crate::array::js_array_push(keys, JSValue::string_ptr(inserted));
@@ -93,10 +101,12 @@ fn transition_cache_hits_a_content_entry_through_a_fresh_key() {
         (*t)[slot] = TransitionEntry {
             key_ptr: 0,
             next_keys: 0,
-            prev_shape_id: 0,
-            target_shape_id: 0,
+            prev_shape_id: LayoutWord(0),
+            target_shape_id: LayoutWord(0),
             slot_idx: 0,
             target_len: 0,
         };
     });
+    shapes::test_drop_shape_descriptors(predecessor_keys);
+    shapes::test_drop_shape_descriptors(target_keys);
 }

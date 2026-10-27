@@ -52,6 +52,12 @@ attr-census = []
 # collection, and panic on the first disagreement. Also counts how often the
 # store-kind transitions run. Off: every hook compiles to nothing.
 shape-fact-audit = []
+# Test-only, wasm32: run the string-image classifier checks (the same ones the
+# unit tests run) at program start inside the linked wasm module, so the
+# linker-synthesized `perry_strings` bounds and the real data/stack/heap layout
+# are what they classify against. This crate's own test target does not build
+# for wasm32. Never part of a shipped archive.
+wasm-image-selftest = []
 
 # `default` keeps the shipped prebuilt libperry_runtime.a and plain
 # `cargo build`/test full-featured. The auto-optimize path builds with
@@ -270,7 +276,7 @@ ohos-napi = []
 # default builds carry it; the auto-optimize path enables it only when the
 # program contains a deferred dynamic-eval site (the #5206 notice machinery
 # already counts them).
-dyn-eval = ["dep:perry-parser", "dep:perry-diagnostics"]
+dyn-eval = ["dep:perry-parser", "dep:perry-diagnostics", "dep:swc_ecma_visit"]
 
 [dependencies]
 # Replacement/search metadata stays inline until it outgrows the operation stack.
@@ -313,6 +319,7 @@ dirs = { workspace = true, optional = true }
 # generated `new Function` bodies (no second parser). perry-parser depends
 # only on swc + perry-diagnostics — no cycle back into perry-runtime.
 perry-parser = { path = "../perry-parser", optional = true }
+swc_ecma_visit = { workspace = true, optional = true }
 perry-diagnostics = { path = "../perry-diagnostics", optional = true }
 node-semver = { version = "2.2.0", optional = true }
 toml = { workspace = true, optional = true }
@@ -376,11 +383,6 @@ url = { version = "2", optional = true }
 # — it pulls NO tokio into the core runtime, matching net.rs's blocking-I/O
 # style. dns_config reads only the system nameserver list from /etc/resolv.conf.
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
-# #4911/#8515: real node:dgram UDP sockets. socket2 creates sockets so reuse
-# and IPv6-only options are applied before bind; std::net::UdpSocket then drives
-# send/recv and the common multicast/broadcast/TTL options. SockRef covers the
-# remaining multicast-interface and source-specific membership controls.
-socket2 = { workspace = true, features = ["all"] }
 # mimalloc is declared 64-bit-only below (see the target_pointer_width section) —
 # on arm64_32/ILP32 it is neither used nor compiled.
 
@@ -436,6 +438,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     # The shape-record reservation (`object/shapes_store/flat.rs`).
     "Win32_System_Memory",
+    "Win32_System_SystemInformation",
 ] }
 
 # #855: libc::mach_host_self is deprecated; the mach2 crate is the
@@ -490,6 +493,13 @@ perry-component-io.workspace = true
 # `os.hostname()` under `full`. WASI has no hostname (the crate refuses the
 # target), so `js_os_hostname` answers "localhost" there (#11377).
 [target.'cfg(not(target_os = "wasi"))'.dependencies]
+# #4911/#8515: real node:dgram UDP sockets. socket2 creates sockets so reuse
+# and IPv6-only options are applied before bind; std::net::UdpSocket then drives
+# send/recv and the common multicast/broadcast/TTL options. SockRef covers the
+# remaining multicast-interface and source-specific membership controls.
+# Every user is `cfg(unix)`, `cfg(windows)` or `cfg(not(wasm32))`, and socket2
+# does not build for wasm32-wasip1.
+socket2 = { workspace = true, features = ["all"] }
 hostname = { version = "0.4", optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]

@@ -615,11 +615,11 @@ pub(crate) unsafe fn declared_class_chain_blocks_store(
 ) -> Option<bool> {
     for _ in 0..64 {
         class = super::class_generic_origin(class).unwrap_or(class);
-        let id = class_registry::declarations::class_birth_shape(class);
-        let record = super::shapes::shape_record_by_id(id)?;
+        let word = class_registry::declarations::class_birth_word(class);
+        let record = super::shapes::shape_record_for_word(LayoutWord(word.0))?;
         let holder = class_registry::class_decl_prototype_object(class);
         if !holder.is_null() {
-            if (*holder).parent_class_id != id {
+            if (*holder).parent_class_id != word.0 {
                 return None;
             }
             let meta = (*holder).meta;

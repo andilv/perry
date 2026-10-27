@@ -289,8 +289,9 @@ unsafe fn construct_function_impl(
         // this the instance was a class_id=0 empty object whose `.getStore` read
         // back `undefined` -> "getStore is not a function" at server startup.
         // Route to the stdlib handle constructor via the registered dispatcher.
-        if module == "async_hooks"
-            && matches!(method.as_str(), "AsyncLocalStorage" | "AsyncResource")
+        if (module == "async_hooks"
+            && matches!(method.as_str(), "AsyncLocalStorage" | "AsyncResource"))
+            || (module == "string_decoder" && method == "StringDecoder")
         {
             let ptr = crate::value::JS_NATIVE_ASYNC_HOOKS_CONSTRUCT
                 .load(std::sync::atomic::Ordering::SeqCst);
@@ -302,6 +303,21 @@ unsafe fn construct_function_impl(
         // `new ns.Worker(...)` on the worker_threads namespace as a value.
         if let Some(worker) = worker_threads_construct(&module, &method, args_ptr, args_len) {
             return worker;
+        }
+        // `new dns.Resolver()` / `new dp.Resolver()` where the constructor was read
+        // off the namespace as a value (`const dp = require("dns/promises")`).
+        if matches!(module.as_str(), "dns" | "dns/promises") && method == "Resolver" {
+            let mut arr = crate::array::js_array_alloc(args_len as u32);
+            if !args_ptr.is_null() {
+                for i in 0..args_len {
+                    arr = crate::array::js_array_push_f64(arr, *args_ptr.add(i));
+                }
+            }
+            if let Some(resolver) =
+                crate::dns::dispatch_export(module == "dns/promises", "Resolver", arr as i64)
+            {
+                return resolver;
+            }
         }
         if module == "zlib"
             && matches!(

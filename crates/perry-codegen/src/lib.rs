@@ -31,6 +31,8 @@ pub mod inprocess;
 pub mod inst;
 pub(crate) mod layout_desc;
 pub mod layout_families;
+pub mod layout_ordinals;
+pub use layout_ordinals::ProgramLayoutOrdinals;
 pub(crate) mod proto_constants;
 pub use layout_desc::array_families::assign_birth_layouts;
 pub use layout_families::ProgramLayouts;
@@ -110,7 +112,7 @@ pub use codegen::{
     resolve_target_triple, short_spread_method_capabilities, take_module_static_seeds,
     target_os_of, user_function_symbol, AppMetadata, BirthProto, BirthShape, ClassAccessorNames,
     CompileOptions, ConstFnBirth, ConstructorContracts, CtorAbi, DefinedClassShape, ElisionFacts,
-    ExportedObjectLiteralCapability, FactsClass, FactsField, FactsRecv, FpContractMode,
+    ExportedObjectLiteralCapability, FactsBody, FactsClass, FactsField, FactsRecv, FpContractMode,
     ImportedClass, ImportedObjectLiteral, ImportedObjectLiteralMethod, ModuleBirth, NamespaceEntry,
     NamespaceEntryKind, ObjectLiteralMethodCandidate, ProgramClassShapeIds, ProgramFactsView,
     ResolvedConstructorContracts, ShortSpreadMethodCandidate, TypedMasks, STATIC_SEED_FORMAT,
@@ -319,6 +321,9 @@ pub fn module_is_cjs_wrapped(hir: &perry_hir::Module) -> bool {
 
 #[cfg(test)]
 mod receiver_call_effect_tests;
+
+#[cfg(test)]
+mod stubs_tests;
 
 mod array_record_stack;
 mod lower_array_record_length;

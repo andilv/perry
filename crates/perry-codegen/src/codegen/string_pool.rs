@@ -540,31 +540,32 @@ pub(super) fn emit_string_pool(
         );
     }
 
-    // Mark each `__AnonShape_<hash>` class id. `({ x: 1 }).constructor ===
-    // Object` duck-checks (date-fns / drizzle / lodash) resolve through it,
-    // and it is what makes `class_proto_id` answer the ordinary object
-    // prototype an anon shape's instances are born with.
-    {
-        let mut anon_shape_ids: Vec<u32> = Vec::new();
-        for (class_name, class) in classes.iter() {
-            if *class_name != class.name || !class_name.starts_with("__AnonShape_") {
-                continue;
-            }
-            if let Some(cid) = class_ids.get(class_name).copied().filter(|&c| c != 0) {
-                anon_shape_ids.push(cid);
-            }
-        }
-        anon_shape_ids.sort_unstable();
-        anon_shape_ids.dedup();
-        chunker.literals = true;
-        for cid in anon_shape_ids {
+    // Class role descriptors must precede every role-dependent shape birth.
+    let declarations = super::class_declarations::class_declaration_globals(
+        &local_classes,
+        strings,
+        module_prefix,
+        &mut |body| {
             chunker.roll_if_full();
-            let blk = chunker.current_block();
-            blk.call_void(
-                "js_register_anon_shape_class_id",
-                &[(crate::types::I32, &cid.to_string())],
-            );
+            chunker.current_block().fn_info_ref(body)
+        },
+        layouts,
+    );
+    for decl in declarations {
+        for global in decl.globals {
+            chunker.module().add_raw_global(global);
         }
+        chunker.literals = local_classes
+            .iter()
+            .any(|(cid, class)| *cid == decl.cid && class.name.starts_with("__AnonShape_"));
+        chunker.roll_if_full();
+        chunker.current_block().call_void(
+            "js_register_class_declaration",
+            &[
+                (I32, &decl.cid.to_string()),
+                (PTR, &format!("@{}", decl.symbol)),
+            ],
+        );
     }
 
     // Build per-class keys arrays via js_build_class_keys_array,
@@ -605,7 +606,7 @@ pub(super) fn emit_string_pool(
         let cid_str = class_id.to_string();
         // A literal birth names the plain prototype (`BirthProto::Literal`), so
         // its shape mints pass class id 0, exactly as the startup literal seed
-        // (`js_shape_seed_plain`) does. Passing the anonymous class's own id was
+        // (`js_layout_seed_plain`) does. Passing the anonymous class's own id was
         // equivalent only while that id had no vtable class: per-module class
         // ids collide, so an `__AnonShape_*` id can also be another module's
         // DECLARED class, and the mint then derived that class's prototype --
@@ -682,13 +683,21 @@ pub(super) fn emit_string_pool(
             };
             blk.call(
                 I32,
-                "js_object_shape_id_for_class_keys_static",
+                "js_object_layout_for_class_keys_static",
                 &[
                     (I64, &arr),
                     (I32, &fc_str),
                     (I32, &live.to_string()),
                     (I32, &mint_cid_str),
-                    (I32, &requested),
+                    (
+                        PTR,
+                        &format!(
+                            "@{}",
+                            crate::layout_ordinals::request_symbol(
+                                requested.parse().expect("identity")
+                            )
+                        ),
+                    ),
                     (I64, &rep_str),
                 ],
             )
@@ -701,7 +710,7 @@ pub(super) fn emit_string_pool(
             match birth.wide_live {
                 birth_live if birth_live > 0 => blk.call(
                     I32,
-                    "js_object_shape_id_for_class_keys_live",
+                    "js_object_layout_for_class_keys_live",
                     &[
                         (I64, &arr),
                         (I32, &fc_str),
@@ -712,7 +721,7 @@ pub(super) fn emit_string_pool(
                 ),
                 _ => blk.call(
                     I32,
-                    "js_object_shape_id_for_class_keys",
+                    "js_object_layout_for_class_keys",
                     &[
                         (I64, &arr),
                         (I32, &fc_str),
@@ -726,7 +735,9 @@ pub(super) fn emit_string_pool(
             "@{}",
             crate::typed_shape::shape_id_global_name_from_keys_global(global_name)
         );
-        blk.store(I32, &shape_id, &shape_global);
+        if requested == "0" {
+            blk.store(I32, &shape_id, &shape_global);
+        }
 
         // #8122: compose the class's inline-`new` header image —
         // `[packed GcHeader word | class_id | ShapeId << 32]` — beside the
@@ -1067,27 +1078,6 @@ pub(super) fn emit_string_pool(
             "@{global} = internal global [{words} x i64] [i64 {words}{}]",
             ", i64 0".repeat(words - 1)
         ));
-    }
-    // Each class's instance members: one image constant, registered once.
-    let declarations = super::class_declarations::class_declaration_globals(
-        &local_classes,
-        strings,
-        module_prefix,
-        &mut |body| chunker.current_block().fn_info_ref(body),
-        layouts,
-    );
-    for decl in declarations {
-        for global in decl.globals {
-            chunker.module().add_raw_global(global);
-        }
-        chunker.roll_if_full();
-        chunker.current_block().call_void(
-            "js_register_class_declaration",
-            &[
-                (I32, &decl.cid.to_string()),
-                (PTR, &format!("@{}", decl.symbol)),
-            ],
-        );
     }
     method_triples.sort_unstable();
     let mut method_entries: Vec<StaticMethodEntry> = Vec::new();
@@ -1622,7 +1612,7 @@ pub(super) fn emit_string_pool(
             {
                 continue;
             }
-            let Some(id) = super::static_shape_ids::static_final_shape_id(&shape) else {
+            let Some(id) = super::static_shape_ids::static_final_shape_identity(&shape) else {
                 continue;
             };
             chunker.roll_if_full();
@@ -1633,13 +1623,16 @@ pub(super) fn emit_string_pool(
             let keys = crate::expr::unbox_to_i64(blk, &keys_value);
             blk.call(
                 I32,
-                "js_object_final_shape_id_for_class_keys_static_constfn",
+                "js_object_final_layout_for_class_keys_static_constfn",
                 &[
                     (I64, &keys),
                     (I32, &shape.key_count.to_string()),
                     (I32, &shape.live.to_string()),
                     (I32, &birth.class_id.to_string()),
-                    (I32, &id.to_string()),
+                    (
+                        PTR,
+                        &format!("@{}", crate::layout_ordinals::request_symbol(id)),
+                    ),
                     (I64, &shape.rep.to_string()),
                     (
                         PTR,
@@ -1684,7 +1677,7 @@ pub(super) fn emit_string_pool(
             else {
                 continue;
             };
-            let Some(id) = super::static_shape_ids::static_final_shape_id(&shape) else {
+            let Some(id) = super::static_shape_ids::static_final_shape_identity(&shape) else {
                 continue;
             };
             super::static_private_class::emit_final_constants(
@@ -1712,13 +1705,16 @@ pub(super) fn emit_string_pool(
             let keys = crate::expr::unbox_to_i64(blk, &keys_value);
             blk.call(
                 I32,
-                "js_object_final_shape_id_for_class_keys_static_private",
+                "js_object_final_layout_for_class_keys_static_private",
                 &[
                     (I64, &keys),
                     (I32, &shape.key_count.to_string()),
                     (I32, &shape.live.to_string()),
                     (I32, &birth.class_id.to_string()),
-                    (I32, &id.to_string()),
+                    (
+                        PTR,
+                        &format!("@{}", crate::layout_ordinals::request_symbol(id)),
+                    ),
                     (I64, &shape.rep.to_string()),
                     (PTR, &private_ptr),
                     (I32, &shape.private.len().to_string()),

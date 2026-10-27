@@ -7,6 +7,7 @@ use perry_hir::{Expr, Function, Module, Stmt};
 fn options(target: Option<&str>) -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
+        program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
         program_facts: Default::default(),
         program_layouts: Default::default(),
@@ -23,6 +24,7 @@ fn options(target: Option<&str>) -> CompileOptions {
         namespace_node_submodules: Default::default(),
         namespace_v8_specifiers: Default::default(),
         namespace_member_prefixes: Default::default(),
+        namespace_source_prefixes: Default::default(),
         namespace_member_origin_names: Default::default(),
         emit_ir_only: true,
         verify_native_regions: false,

@@ -103,6 +103,7 @@ pub(crate) mod class_value;
 pub(crate) mod default_derived_constructor;
 #[cfg(test)]
 mod zeroed_cache_tests;
+use crate::codegen_abi::LayoutWord;
 pub use class_registry::async_local_storage_prototype_value;
 pub(crate) use class_registry::async_resource_prototype_value;
 pub(crate) use class_registry::class_registry_census;
@@ -695,7 +696,7 @@ impl ObjectHotTables {
             shape_inline_cache: std::cell::UnsafeCell::new(
                 [ShapeCacheEntry {
                     shape_id: 0,
-                    runtime_shape_id: 0,
+                    runtime_shape_id: LayoutWord(0),
                     key_count: 0,
                     keys_array: std::ptr::null_mut(),
                 }; SHAPE_INLINE_CACHE_SIZE],
@@ -758,12 +759,12 @@ const SHAPE_INLINE_CACHE_SIZE: usize = 256;
 #[derive(Clone, Copy)]
 pub(crate) struct ShapeCacheEntry {
     shape_id: u32,
-    /// #6804: the RUNTIME ShapeId (`shapes::shape_id_for_keys_ensure`) of
+    /// #6804: the RUNTIME ShapeId (`shapes::layout_for_keys_ensure`) of
     /// `keys_array`, computed once at insert so the literal-allocation path
     /// can stamp newborn plain objects without a per-allocation table
     /// probe. Distinct from `shape_id`, which is the CODEGEN packed-keys
     /// hash used as this cache's lookup key.
-    runtime_shape_id: u32,
+    runtime_shape_id: LayoutWord,
     /// The cached list's key count. The keys array can be a canonical
     /// backing shared with longer lists, so its header length is not it.
     key_count: u32,
@@ -791,7 +792,7 @@ fn shape_cache_get_with_id(shape_id: u32) -> (ObjectKeys, u32) {
     if entry.shape_id == shape_id {
         return (
             ObjectKeys::new(entry.keys_array, entry.key_count),
-            entry.runtime_shape_id,
+            entry.runtime_shape_id.0,
         );
     }
     // Miss — check the overflow map.
@@ -866,7 +867,7 @@ fn shape_cache_insert(
     // anonymous literal class it IS the literal's birth shape, for a named
     // class its all-default-prototype sibling.
     let runtime_shape_id = if keys_array.is_null() {
-        0
+        LayoutWord(0)
     } else {
         shapes::publish_shape_result(shapes::class_birth_shape_ensure(
             keys_array,
@@ -890,7 +891,7 @@ fn shape_cache_insert(
     st.object_hot
         .shape_cache_overflow
         .borrow_mut()
-        .insert(shape_id, (keys_array, runtime_shape_id, keys.count()));
+        .insert(shape_id, (keys_array, runtime_shape_id.0, keys.count()));
     crate::gc::runtime_write_barrier_root_raw_ptr(keys_array);
     shape_carriers::note_shape_id(runtime_shape_id);
     (live, keys)
@@ -928,12 +929,12 @@ fn shape_cache_insert(
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct TransitionEntry {
-    key_ptr: usize,       // offset 0 — key id: content u64 (len 6..=8) or interned ptr
-    next_keys: usize,     // offset 8 — WEAK target edge (rewritten on move, pruned on death)
-    prev_shape_id: u32,   // offset 16
-    target_shape_id: u32, // offset 20 — exact successor learned on the slow path
-    slot_idx: u32,        // offset 24 — slot | key byte_len << 24 (namespace marker)
-    target_len: u32,      // offset 28, nonzero when target was validated at insert
+    key_ptr: usize,   // offset 0 — key id: content u64 (len 6..=8) or interned ptr
+    next_keys: usize, // offset 8 — WEAK target edge (rewritten on move, pruned on death)
+    prev_shape_id: LayoutWord, // offset 16
+    target_shape_id: LayoutWord, // offset 20 — exact successor learned on the slow path
+    slot_idx: u32,    // offset 24 — slot | key byte_len << 24 (namespace marker)
+    target_len: u32,  // offset 28, nonzero when target was validated at insert
 }
 
 // SAFETY: all integer fields; `key_ptr == 0` is the miss (#11507).
@@ -1104,7 +1105,7 @@ const TRANSITION_SLOT_IDX_MASK: u32 = 0x00FF_FFFF;
 /// Hash only stable key properties. The namespace changes how identity is
 /// checked, but an interned address must never select a table slot.
 #[inline(always)]
-fn transition_cache_slot(prev_shape_id: u32, key_id: usize, namespace: u32) -> usize {
+fn transition_cache_slot(prev_shape_id: LayoutWord, key_id: usize, namespace: u32) -> usize {
     let hash = match namespace {
         0 => interned_key_slot_hash(key_id),
         spread::SPREAD_TRANSITION_NAMESPACE => key_id as u64,
@@ -1112,12 +1113,47 @@ fn transition_cache_slot(prev_shape_id: u32, key_id: usize, namespace: u32) -> u
         // zero-padded shorter name is not forced to alias a longer one.
         _ => key_id as u64 ^ (u64::from(namespace) << 56),
     };
-    let mixed = (prev_shape_id as u64).wrapping_mul(TRANSITION_HASH_MUL_SHAPE)
+    let mixed = (prev_shape_id.0 as u64).wrapping_mul(TRANSITION_HASH_MUL_SHAPE)
         ^ hash.wrapping_mul(TRANSITION_HASH_MUL_KEY);
     // Multiplicative hashing selects the high bits: low-bit masking would
     // ignore a packed key's later bytes (e.g. literal/literals), forcing
     // those edges to evict one another at every construction.
     (mixed >> (64 - TRANSITION_CACHE_SIZE.trailing_zeros())) as usize
+}
+
+/// The way of the two-way bucket (`slot`, `slot ^ 1`) an insert writes: the
+/// edge's own entry if either way holds it, else an empty way, else the
+/// primary. A direct-mapped table made two hot edges whose slots collide
+/// evict each other on every store, so each one re-published its edge
+/// through the slow path forever (Effect `Schema.make`: `rebuild` and
+/// `makeEffect`, ~4k republishes; which pair collides depends only on the
+/// ids, so it moved whenever the id numbering did). The pair now shares a
+/// bucket; lookups probe the primary first, so a primary hit costs the same.
+#[inline(always)]
+fn transition_cache_way(prev_shape_id: u32, kid: usize, len_marker: u32) -> usize {
+    let slot = transition_cache_slot(
+        crate::codegen_abi::LayoutWord(prev_shape_id),
+        kid,
+        len_marker,
+    );
+    with_transition_cache(|t| unsafe {
+        let holds = |i: usize| {
+            let e = &(*t)[i];
+            e.next_keys != 0
+                && e.prev_shape_id == crate::codegen_abi::LayoutWord(prev_shape_id)
+                && e.key_ptr == kid
+                && (e.slot_idx >> 24) == len_marker
+        };
+        if holds(slot) {
+            slot
+        } else if holds(slot ^ 1) {
+            slot ^ 1
+        } else if (*t)[slot].next_keys == 0 || (*t)[slot ^ 1].next_keys != 0 {
+            slot
+        } else {
+            slot ^ 1
+        }
+    })
 }
 
 /// A content hash selects a bucket; canonical-pointer equality still proves
@@ -1216,17 +1252,29 @@ fn transition_edge_places_key(
 /// dictionaries and are validated on lookup.
 #[inline(always)]
 fn transition_cache_lookup(
-    prev_shape_id: u32,
+    prev_shape_id: LayoutWord,
     interned_key: *const crate::StringHeader,
-) -> Option<(ObjectKeys, u32, u32)> {
+) -> Option<(ObjectKeys, u32, LayoutWord)> {
     let (kid, len_marker) = transition_key_id(interned_key);
     let slot = transition_cache_slot(prev_shape_id, kid, len_marker);
-    let entry = with_transition_cache(|t| unsafe { (*t)[slot] });
-    if entry.next_keys != 0
-        && entry.prev_shape_id == prev_shape_id
-        && entry.key_ptr == kid
-        && (entry.slot_idx >> 24) == len_marker
-    {
+    let edge_is = |e: &TransitionEntry| {
+        e.next_keys != 0
+            && e.prev_shape_id == prev_shape_id
+            && e.key_ptr == kid
+            && (e.slot_idx >> 24) == len_marker
+    };
+    // A two-way bucket (`slot`, `slot ^ 1`): see `transition_cache_way`.
+    // The table pointer is resolved once; both ways are read in place.
+    let table = with_transition_cache(|t| t);
+    let entry = unsafe {
+        let primary = &(*table)[slot];
+        if edge_is(primary) {
+            *primary
+        } else {
+            (*table)[slot ^ 1]
+        }
+    };
+    if edge_is(&entry) {
         let entry_slot_idx = entry.slot_idx & TRANSITION_SLOT_IDX_MASK;
         // `key_ptr` is weak address metadata and the target array may still
         // have grown unexpectedly after insertion. Content-validate that the
@@ -1308,10 +1356,10 @@ fn transition_cache_lookup(
 /// class guard, so the cache key carries no class bit).
 #[inline(always)]
 fn transition_cache_lookup_for_value(
-    prev_shape_id: u32,
+    prev_shape_id: LayoutWord,
     interned_key: *const crate::StringHeader,
     value_bits: Option<u64>,
-) -> Option<(ObjectKeys, u32, u32)> {
+) -> Option<(ObjectKeys, u32, LayoutWord)> {
     let hit = transition_cache_lookup(prev_shape_id, interned_key)?;
     if field_rep_store::cached_key_add_admits(hit.2, hit.1, value_bits) {
         return Some(hit);
@@ -1361,17 +1409,17 @@ pub(super) fn arm_transition_cache_young(
 
 fn transition_cache_insert(
     array_tail_owner: *const ObjectHeader,
-    prev_shape_id: u32,
+    prev_shape_id: LayoutWord,
     interned_key: *const crate::StringHeader,
     next_keys: usize,
     slot_idx: u32,
-    target_shape_id: u32,
+    target_shape_id: LayoutWord,
 ) {
     if next_keys == 0 {
         return;
     }
     // Generated hits skip the layout note: never learn from a numeric proof.
-    if shapes::shape_object_kind_by_id(prev_shape_id)
+    if shapes::shape_object_kind_for_word(prev_shape_id)
         == Some(shapes::ShapeObjectKind::OrdinaryNumericProof)
     {
         return;
@@ -1380,7 +1428,7 @@ fn transition_cache_insert(
         return;
     }
     let (kid, len_marker) = transition_key_id(interned_key);
-    let slot = transition_cache_slot(prev_shape_id, kid, len_marker);
+    let slot = transition_cache_way((prev_shape_id).0, kid, len_marker);
     let mut target_len = 0;
     unsafe {
         if slot_idx < TRANSITION_CACHE_EAGER_SHARE_MAX_SLOT
@@ -1419,9 +1467,15 @@ fn transition_cache_insert(
         entry.slot_idx = slot_idx | (len_marker << 24);
         entry.target_len = target_len;
     });
+    // Only a call-free publisher owns its target (`entry_owns_target`); the
+    // runtime path revalidates an unstable target before publishing it. The
+    // predecessor is the lookup key, weak by design: an entry whose
+    // predecessor retires is dropped by `transition_entry_is_dead`, and a
+    // retired row is never reissued, so no live receiver can match it
+    // meanwhile. `recompute_after_full_trace` notes the same set.
     if target_len != 0 {
-        shapes::note_last_key_parent(target_shape_id, prev_shape_id);
         shape_carriers::note_shape_id(target_shape_id);
+        shapes::note_last_key_parent(target_shape_id, prev_shape_id);
     }
     if !array_tail_owner.is_null() {
         array_tail_transition::record_numeric_tail_transition(
@@ -1691,7 +1745,7 @@ pub(crate) unsafe fn object_is_regular(obj: *const ObjectHeader) -> bool {
     };
     header.obj_type == crate::gc::GC_TYPE_OBJECT
         && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
-        && shapes::shape_object_kind_by_id((*obj).shape_word())
+        && shapes::shape_object_kind_of_receiver((*obj).shape_word())
             .is_some_and(|kind| kind.is_ordinary_layout())
 }
 
@@ -1775,7 +1829,7 @@ unsafe fn set_object_keys_with_live_rep(
     // and the header store follows with nothing allocating in between.
     //
     // #6759 C3 rung 1: no `class_id == 0` gate. The word is a ShapeId iff
-    // `is_shape_id` says so, for class instances too, so an instance still
+    // `is_layout_word` says so, for class instances too, so an instance still
     // carrying its allocation-time `parent_class_id` (never in the ShapeId
     // range) is left alone.
     // Case 2c: a static family object keeps its layout word for life; the

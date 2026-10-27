@@ -61,7 +61,7 @@ pub fn class_closure_id(ptr: usize) -> Option<u32> {
     // `is_closure_ptr` pre-checks this mirrors).
     let shape =
         unsafe { *((ptr as *const u8).add(crate::closure::CLOSURE_SHAPE_OFFSET) as *const u32) };
-    if !crate::object::shapes::is_exotic_shape_id(shape) {
+    if !crate::object::shapes::is_exotic_layout_word(shape) {
         return None;
     }
     // SAFETY: an exotic-band ShapeId word means a closure-or-exotic header,
@@ -194,7 +194,7 @@ struct ClassValueDir {
 ///
 /// Anything else (`0`, the ShapeId range) is not a class id and has no slot.
 const CLASS_VALUE_BANDS: usize = 4;
-const FIRST_RUNTIME_CLASS_ID: u32 = 0x7FFF_FF00;
+pub(crate) const FIRST_RUNTIME_CLASS_ID: u32 = 0x7FFF_FF00;
 const SYNTHETIC_CLASS_ID_BASE: u32 =
     super::class_registry::prototype_objects::SYNTHETIC_CLASS_ID_BASE;
 const SYNTHETIC_CLASS_ID_END: u32 =
@@ -778,7 +778,7 @@ fn static_call_shape_code(class_id: u32) -> u32 {
             if bag.is_null() {
                 u32::MAX - 1
             } else {
-                super::shapes::object_shape_stamp(bag)
+                super::shapes::object_shape_stamp(bag).0
             }
         },
     }
@@ -887,7 +887,7 @@ fn arm_static_call_memo(memo: &mut StaticCallMemo, cid: u32, owner: u32) {
     let c = class_value_ptr(cid);
     let o = class_value_ptr(owner);
     let (sc, so) = (static_call_shape_code(cid), static_call_shape_code(owner));
-    if !super::shapes::is_shape_id(sc) || !super::shapes::is_shape_id(so) {
+    if !super::shapes::is_layout_word(sc) || !super::shapes::is_layout_word(so) {
         return;
     }
     // GC_STORE_AUDIT(ROOT): a compiled site's memo naming PINNED class

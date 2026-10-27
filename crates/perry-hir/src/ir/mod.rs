@@ -62,6 +62,7 @@ pub use decl::{
     ArgumentsObjectMeta, Class, ClassComputedMember, ClassComputedMemberKind, ClassField,
     ClassFieldOrigin, Decorator, Enum, EnumMember, EnumValue, Export, Function, Global, Import,
     ImportSpecifier, Interface, InterfaceMethod, InterfaceProperty, Param, TypeAlias,
+    DECLARED_KEYS_CLASS_PREFIX, DECLARED_KEYS_OBJECT_CLASS_PREFIX,
 };
 
 // ---- stmt.rs ----

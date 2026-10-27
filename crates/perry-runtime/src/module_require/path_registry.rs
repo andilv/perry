@@ -40,6 +40,10 @@ struct PathModuleEntry {
     /// partial/final publication also runs for eagerly initialized modules, so
     /// `init_addr` alone cannot distinguish the two completion boundaries.
     active_claim: Option<std::thread::ThreadId>,
+    /// The CommonJS wrapper's factory (a closure), handed over with the
+    /// partial publication: a reload after `delete require.cache[path]` calls
+    /// it. Never a property of any object.
+    factory: Option<u64>,
 }
 
 #[derive(Default)]
@@ -155,6 +159,7 @@ impl PathModuleRegistry {
             exports: None,
             status: PathModuleStatus::Registered,
             active_claim: None,
+            factory: None,
         });
         entry.init_addr = Some(init_addr);
         true
@@ -178,6 +183,7 @@ impl PathModuleRegistry {
                 exports: None,
                 status: PathModuleStatus::Registered,
                 active_claim: None,
+                factory: None,
             },
         );
         true
@@ -187,7 +193,8 @@ impl PathModuleRegistry {
     /// adapter unwraps its current `.exports` on each read, including cycles.
     /// Only same-thread recursive loads may observe it; unrelated waiters stay
     /// parked while the status is `Initializing`.
-    pub(super) fn register_partial_exports(&self, key: String, exports: u64) -> bool {
+    /// The wrapper factory is retained for a reload.
+    pub(super) fn register_partial(&self, key: String, exports: u64, factory: Option<u64>) -> bool {
         let current = std::thread::current().id();
         let stored = {
             let mut state = self.lock();
@@ -210,6 +217,7 @@ impl PathModuleRegistry {
                     exports: None,
                     status: PathModuleStatus::Registered,
                     active_claim: None,
+                    factory: None,
                 });
                 if matches!(entry.status, PathModuleStatus::Failed(_))
                     || matches!(entry.status, PathModuleStatus::Initializing(owner) if owner != current)
@@ -217,6 +225,9 @@ impl PathModuleRegistry {
                     return false;
                 }
                 entry.exports = Some(exports);
+                if factory.is_some() {
+                    entry.factory = factory;
+                }
                 if entry.status == PathModuleStatus::Registered {
                     entry.status = PathModuleStatus::Initializing(current);
                     (true, entry.active_claim.is_none())
@@ -264,6 +275,7 @@ impl PathModuleRegistry {
                     exports: None,
                     status: PathModuleStatus::Registered,
                     active_claim: None,
+                    factory: None,
                 });
                 if matches!(entry.status, PathModuleStatus::Failed(_))
                     || entry.active_claim.is_some_and(|owner| owner != current)
@@ -520,11 +532,19 @@ impl PathModuleRegistry {
         })
     }
 
+    /// The factory the wrapper of `key` handed over, if any.
+    pub(super) fn factory(&self, key: &str) -> Option<u64> {
+        self.lock().entries.get(key).and_then(|entry| entry.factory)
+    }
+
     pub(super) fn scan_roots(&self, visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
         let mut state = crate::gc::lock_gc_root_registry(&self.state);
         for entry in state.entries.values_mut() {
             if let Some(exports) = entry.exports.as_mut() {
                 visitor.visit_nanbox_u64_slot(exports);
+            }
+            if let Some(factory) = entry.factory.as_mut() {
+                visitor.visit_nanbox_u64_slot(factory);
             }
             if let PathModuleStatus::Failed(error) = &mut entry.status {
                 visitor.visit_nanbox_u64_slot(error);
@@ -694,7 +714,7 @@ mod path_module_registry_tests {
             _ => panic!("unexpected initializer address {addr}"),
         };
         calls[call_index].fetch_add(1, Ordering::Relaxed);
-        assert!(registry.register_partial_exports(key.into(), partial));
+        assert!(registry.register_partial(key.into(), partial, None));
         let observed = registry.require_with(other_key, &|next_addr| {
             initialize_two_key_cycle(registry, gate, calls, partial_observations, next_addr)
         });
@@ -722,7 +742,7 @@ mod path_module_registry_tests {
             .require_with("route.js", &|addr| {
                 assert_eq!(addr, 7);
                 calls.fetch_add(1, Ordering::Relaxed);
-                assert!(registry.register_partial_exports("route.js".into(), 0xA1));
+                assert!(registry.register_partial("route.js".into(), 0xA1, None));
                 let recursive = registry.require_with("route.js", &|_| {
                     panic!("recursive load must not execute the initializer")
                 });
@@ -760,7 +780,7 @@ mod path_module_registry_tests {
                 registry.require_with("chunk.js", &|addr| {
                     assert_eq!(addr, 11);
                     calls.fetch_add(1, Ordering::Relaxed);
-                    assert!(registry.register_partial_exports("chunk.js".into(), 0xB1));
+                    assert!(registry.register_partial("chunk.js".into(), 0xB1, None));
                     init_entered.wait();
                     release_init.wait();
                     assert!(registry.register_final_exports("chunk.js".into(), 0xB2));
@@ -856,13 +876,13 @@ mod path_module_registry_tests {
         let worker = std::thread::spawn(move || {
             worker_registry.require_with("a.js", &|addr| {
                 assert_eq!(addr, 41);
-                assert!(worker_registry.register_partial_exports("a.js".into(), 0xA1));
+                assert!(worker_registry.register_partial("a.js".into(), 0xA1, None));
                 entered_tx.send(()).unwrap();
                 worker_release.wait();
                 assert_eq!(
                     worker_registry.require_with("b.js", &|nested_addr| {
                         assert_eq!(nested_addr, 43);
-                        assert!(worker_registry.register_partial_exports("b.js".into(), 0xB1));
+                        assert!(worker_registry.register_partial("b.js".into(), 0xB1, None));
                         assert!(worker_registry.register_final_exports("b.js".into(), 0xB2));
                         Ok(())
                     }),
@@ -877,7 +897,7 @@ mod path_module_registry_tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("loader owner did not enter generated initialization");
         assert!(
-            !registry.register_partial_exports("b.js".into(), 0xDEAD),
+            !registry.register_partial("b.js".into(), 0xDEAD, None),
             "a foreign initializer must not publish while the loader is owned"
         );
         release.wait();
@@ -888,7 +908,7 @@ mod path_module_registry_tests {
     fn registered_initializer_can_complete_through_an_eager_wrapper_pair() {
         let registry = PathModuleRegistry::default();
         assert!(registry.register_init("eager.js".into(), 47));
-        assert!(registry.register_partial_exports("eager.js".into(), 0xE1));
+        assert!(registry.register_partial("eager.js".into(), 0xE1, None));
         assert!(registry.register_final_exports("eager.js".into(), 0xE2));
         assert_eq!(
             registry.require_with("eager.js", &|_| panic!(
@@ -903,7 +923,7 @@ mod path_module_registry_tests {
         let registry = Arc::new(PathModuleRegistry::default());
         assert!(registry.register_init("eager-throws.js".into(), 49));
         let boundary = registry.begin_module_boundary();
-        assert!(registry.register_partial_exports("eager-throws.js".into(), 0xE1));
+        assert!(registry.register_partial("eager-throws.js".into(), 0xE1, None));
 
         let (waiting_tx, waiting_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
@@ -948,9 +968,9 @@ mod path_module_registry_tests {
         assert!(registry.register_init("outer.js".into(), 51));
         assert!(registry.register_init("inner.js".into(), 53));
         let outer_boundary = registry.begin_module_boundary();
-        assert!(registry.register_partial_exports("outer.js".into(), 0xA1));
+        assert!(registry.register_partial("outer.js".into(), 0xA1, None));
         let inner_boundary = registry.begin_module_boundary();
-        assert!(registry.register_partial_exports("inner.js".into(), 0xB1));
+        assert!(registry.register_partial("inner.js".into(), 0xB1, None));
 
         assert_eq!(
             registry.finish_module_boundary(inner_boundary, Some(0xBAD)),
@@ -976,7 +996,7 @@ mod path_module_registry_tests {
         let registry = PathModuleRegistry::default();
         assert!(registry.register_init("outer.js".into(), 55));
         let outer_boundary = registry.begin_module_boundary();
-        assert!(registry.register_partial_exports("outer.js".into(), 0xA1));
+        assert!(registry.register_partial("outer.js".into(), 0xA1, None));
 
         // A lazily claimed inner module does not enter the eager stack. Its
         // native catch must leave the outer wrapper available to catch or
@@ -999,7 +1019,7 @@ mod path_module_registry_tests {
         let registry = PathModuleRegistry::default();
         assert!(registry.register_init("returns.js".into(), 57));
         let boundary = registry.begin_module_boundary();
-        assert!(registry.register_partial_exports("returns.js".into(), 0xC1));
+        assert!(registry.register_partial("returns.js".into(), 0xC1, None));
         assert_eq!(registry.finish_module_boundary(boundary, None), 1);
         assert_eq!(
             registry.require_with("returns.js", &|_| {
@@ -1144,7 +1164,7 @@ mod path_module_registry_tests {
         assert!(registry.register_init("undefined.js".into(), 13));
         let value = registry
             .require_with("undefined.js", &|_| {
-                assert!(registry.register_partial_exports("undefined.js".into(), TAG_UNDEFINED));
+                assert!(registry.register_partial("undefined.js".into(), TAG_UNDEFINED, None));
                 assert!(registry.register_final_exports("undefined.js".into(), TAG_UNDEFINED));
                 Ok(())
             })

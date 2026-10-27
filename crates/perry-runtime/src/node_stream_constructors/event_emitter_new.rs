@@ -9,6 +9,7 @@
 //! emitter lives in native memory, and the collector moves it like any other
 //! object.
 use super::*;
+use crate::codegen_abi::LayoutWord;
 use crate::object::ObjectHeader;
 use crate::value::JSValue;
 
@@ -78,10 +79,10 @@ pub(crate) fn own_prototype_by_bag(ctor: f64) -> Option<f64> {
                 return None;
             }
             let id = (*bag).shape_word();
-            if !crate::object::shapes::is_site_matchable_shape_id(id) {
+            if !crate::object::shapes::is_site_matchable_layout_word(id) {
                 return None;
             }
-            let record = crate::object::shapes::shape_record_by_id(id)?;
+            let record = crate::object::shapes::shape_record_for_word(LayoutWord(id))?;
             let pos = record.own_data_position_of_value(0, b"prototype")??;
             pos | if pos >= record.live_inline_slot_count() {
                 SPILL

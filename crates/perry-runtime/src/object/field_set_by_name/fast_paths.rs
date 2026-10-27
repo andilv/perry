@@ -4,6 +4,7 @@
 //! #7402) — pure relocation, no logic changes.
 
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 #[cfg(test)]
 thread_local! {
@@ -169,7 +170,7 @@ unsafe fn existing_own_data_overwrite(
         OverwriteKey::Interned(key) => {
             let key_addr = key as usize;
             let mut own_idx = super::prop_plan::read_plan_lookup(
-                (*obj).shape_word(),
+                LayoutWord((*obj).shape_word()),
                 keys_addr,
                 key_addr,
                 keys_view.count(),
@@ -192,7 +193,12 @@ unsafe fn existing_own_data_overwrite(
                     crate::object::keys_find_property_slot_by_key_ptr(keys, key_count as u32, key)
                 };
                 if let Some(i) = own_idx {
-                    super::prop_plan::read_plan_record((*obj).shape_word(), keys_addr, key_addr, i);
+                    super::prop_plan::read_plan_record(
+                        LayoutWord((*obj).shape_word()),
+                        keys_addr,
+                        key_addr,
+                        i,
+                    );
                 }
             }
             own_idx
@@ -420,8 +426,10 @@ pub(crate) unsafe fn leaf_key_add(
         return true;
     };
     // The target layout names the new slot live: the stamp alone publishes
-    // it (no bound to re-publish, which could mint).
-    if super::shapes::shape_live_inline_slot_count_by_id(target_shape_id)
+    // it (no bound to re-publish, which could mint). The target word came
+    // from the transition cache, not from this receiver's header, so it is
+    // read through the held-word check.
+    if super::shapes::shape_live_inline_slot_count_for_word(target_shape_id)
         .is_none_or(|live| live <= slot_idx)
     {
         return false;
@@ -814,8 +822,9 @@ fn object_set_field_by_name_transition_fast_impl_value<const CHAIN_PROVEN: bool>
         }
         // The header probe above already established a live ordinary heap
         // allocation; ask only its shape for the layout kind here.
-        let object_kind =
-            super::shapes::shape_object_kind_by_id(super::shapes::object_shape_stamp(obj))?;
+        let object_kind = super::shapes::shape_object_kind_of_receiver(
+            (super::shapes::object_shape_stamp(obj)).0,
+        )?;
         if !object_kind.is_ordinary_layout() || (*obj).class_id == NATIVE_MODULE_CLASS_ID {
             return None;
         }
@@ -856,7 +865,7 @@ fn object_set_field_by_name_transition_fast_impl_value<const CHAIN_PROVEN: bool>
         // alongside genuinely class-id-zero objects; a real user class must
         // retain the full inherited-setter/prototype walk.
         let class_id = (*obj).class_id;
-        if !CHAIN_PROVEN && class_id != 0 && !crate::object::is_anon_shape_class_id(class_id) {
+        if !CHAIN_PROVEN && class_id != 0 && !crate::object::shapes::object_is_plain_record(obj) {
             return None;
         }
 
@@ -978,9 +987,9 @@ fn object_set_field_by_name_transition_fast_impl_value<const CHAIN_PROVEN: bool>
                     // target's representation and canonicalized numeric bits.
                     // Reuse its result with the same alias and mark barriers.
                     debug_assert_eq!(
-                        super::shapes::shape_object_kind_by_id(super::shapes::object_shape_stamp(
-                            obj
-                        )),
+                        super::shapes::shape_object_kind_of_receiver(
+                            (super::shapes::object_shape_stamp(obj)).0
+                        ),
                         Some(super::shapes::ShapeObjectKind::Ordinary)
                     );
                     let slot_bits = admitted_bits;
@@ -1261,7 +1270,7 @@ mod tests {
         let prototype = prototype_handle.get_raw_mut_ptr::<ObjectHeader>();
         let predecessor = unsafe { super::super::shapes::object_shape_stamp(prototype) };
         assert!(
-            super::super::shapes::is_shape_id(predecessor),
+            super::super::shapes::is_layout_word(predecessor.0),
             "test premise: Object.prototype has a resolvable ShapeId"
         );
         let old_keys_view = unsafe { super::super::object_keys(prototype) };

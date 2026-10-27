@@ -5,6 +5,7 @@
 //! `super::`.
 
 use super::*;
+use crate::codegen_abi::{LayoutWord, ShapeId};
 
 #[cfg(test)]
 #[inline]
@@ -117,11 +118,23 @@ pub(crate) fn test_clear_shape_table() {
 #[cfg(test)]
 pub(crate) fn test_drop_shape_descriptors(keys_id: usize) {
     let mut inner = crate::state::state().shapes.inner.borrow_mut();
-    let stale: Vec<u32> = inner
+    let stale: Vec<LayoutWord> = inner
         .families
         .get(&(keys_id as u64))
         .map(|ids| ids.as_slice().to_vec())
         .unwrap_or_default();
+    // Forced test retirement first releases cache owners, as production GC
+    // does before deciding that a handle is uncarried.
+    crate::object::with_transition_cache(|table| unsafe {
+        for entry in (*table).iter_mut() {
+            if stale.contains(&entry.prev_shape_id)
+                || stale.contains(&entry.target_shape_id)
+                || crate::object::spread::source_shape(entry).is_some_and(|w| stale.contains(&w))
+            {
+                *entry = std::mem::zeroed();
+            }
+        }
+    });
     for id in stale {
         remove_descriptor_and_reverse_indices(&mut inner, id);
     }
@@ -135,7 +148,7 @@ pub(crate) fn test_rekey_shape_family(old: usize, new: usize) {
     let mut inner = table.inner.borrow_mut();
     if let Some(ids) = inner.families.remove(&(old as u64)) {
         for &id in ids.as_slice() {
-            let Some(record) = table.slab().get(id) else {
+            let Some(record) = table.slab().get_handle(id) else {
                 continue;
             };
             if record.has(shapes_store::RECORD_FLAG_FACTS_INDEXED) {
@@ -149,7 +162,7 @@ pub(crate) fn test_rekey_shape_family(old: usize, new: usize) {
 
 /// The ids currently indexed under `keys_id`, in family order.
 #[cfg(test)]
-pub(crate) fn test_shape_ids_for_keys(keys_id: usize) -> Vec<u32> {
+pub(crate) fn test_shape_ids_for_keys(keys_id: usize) -> Vec<LayoutWord> {
     crate::state::state()
         .shapes
         .inner
@@ -177,7 +190,7 @@ pub(crate) fn test_seed_shape_entry(keys_id: usize) {
 }
 
 #[cfg(test)]
-pub(crate) fn test_shape_id_for_keys(keys_id: usize) -> Option<u32> {
+pub(crate) fn test_shape_id_for_keys(keys_id: usize) -> Option<LayoutWord> {
     test_shape_ids_for_keys(keys_id).first().copied()
 }
 
@@ -196,16 +209,16 @@ pub(crate) fn test_shape_index_len(keys_id: usize) -> u32 {
 /// A process-global shape id no descriptor in this agent has claimed, for the
 /// `install_external_shape_id` path.
 #[cfg(test)]
-pub(crate) fn test_unused_external_shape_id() -> u32 {
+pub(crate) fn test_unused_external_shape_id() -> ShapeId {
     let table = &crate::state::state().shapes;
     // The top of the ORDINARY band: an external (typed) id is an ordinary
     // shape, which sites may hold; the dictionary band above it is not. Its
     // plain-kind granule, as a default-identity id is minted.
     let mut id = super::SITE_SHAPE_ID_END - 3 * (1 << super::SHAPE_ID_KIND_SHIFT) - 1;
-    while table.slab().record_ptr(id).is_some() {
+    while table.slab().record_ptr(ShapeId(id)).is_some() {
         id -= 1;
     }
-    id
+    ShapeId(id)
 }
 
 /// Build the slot index for `keys` through the PRODUCTION path
@@ -246,7 +259,7 @@ pub(crate) fn test_shape_index_migrate_after_delete(
 /// `shapes_slot_list::install_external_shape_id`, same reason.
 #[cfg(test)]
 pub(crate) fn test_install_external_shape_id(
-    id: u32,
+    id: ShapeId,
     keys: *const super::ArrayHeader,
     logical_key_count: u32,
     live_inline_slot_count: u32,
@@ -264,19 +277,19 @@ pub(crate) fn test_install_external_shape_id(
 
 /// Does the record of `id` in this agent carry a carrier flag (never pruned
 /// while no object carries it)? For the static-id seed tests.
-pub(crate) fn test_shape_record_is_carrier(id: u32) -> bool {
+pub(crate) fn test_shape_record_is_carrier(id: LayoutWord) -> bool {
     crate::state::state()
         .shapes
         .slab()
-        .get(id)
+        .get_handle(id)
         .is_some_and(|record| record.cache_carrier())
 }
 
 /// Negative control for the census: remove only the memo accelerator while
 /// retaining the live authoritative record and its keys family.
-pub(crate) fn test_remove_facts_index(id: u32) {
+pub(crate) fn test_remove_facts_index(id: LayoutWord) {
     let table = &crate::state::state().shapes;
-    let record = table.slab().get(id).unwrap();
+    let record = table.slab().get_handle(id).unwrap();
     let facts = record.facts_key_with_keys(record.keys);
     table.inner.borrow_mut().facts_remove(facts, id);
 }

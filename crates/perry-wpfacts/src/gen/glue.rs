@@ -19,6 +19,10 @@ impl<'a> Gen<'a> {
     /// `Object.defineProperty(o, key, desc)`: E5 on the target, the
     /// descriptor's value is a post-construction write, and its accessors
     /// become accessors of the target (called with `this` = the target).
+    /// `accessor`: the descriptor is an accessor descriptor (FVA 4.3a): with
+    /// a constant key the definition is an accessor key on every layout that
+    /// does not hold the key as data, and either descriptor a key of a
+    /// prototype (`Cons::DefineKey`), not E5 HARD.
     pub(crate) fn define_property(
         &mut self,
         fx: &Fx,
@@ -26,21 +30,38 @@ impl<'a> Gen<'a> {
         key: Option<String>,
         desc: NodeId,
         r: u32,
+        accessor: bool,
     ) {
-        self.m.cons(
-            o,
-            Cons::Hard {
-                kind: Hard::E5DefineProperty,
-                reason: r,
-            },
-        );
-        let va = self.m.atom("value");
-        let v = self.load(desc, Key::Named(va));
-        let k = match &key {
-            Some(s) => Key::Named(self.m.atom(s)),
-            None => Key::Any,
-        };
-        self.store(fx, o, k, v, "defineProperty".into(), None, false);
+        match &key {
+            Some(k) => {
+                let ka = self.m.atom(k);
+                self.m.cons(
+                    o,
+                    Cons::DefineKey {
+                        key: ka,
+                        data: !accessor,
+                        reason: r,
+                    },
+                );
+            }
+            None => self.m.cons(
+                o,
+                Cons::Hard {
+                    kind: Hard::E5DefineProperty,
+                    reason: r,
+                },
+            ),
+        }
+        // An accessor descriptor has no value: the getter is the read.
+        if !accessor {
+            let va = self.m.atom("value");
+            let v = self.load(desc, Key::Named(va));
+            let k = match &key {
+                Some(s) => Key::Named(self.m.atom(s)),
+                None => Key::Any,
+            };
+            self.store(fx, o, k, v, "defineProperty".into(), None, false);
+        }
         let ka = match &key {
             Some(s) => self.m.atom(s),
             None => self.m.atom(crate::STAR_KEY),
@@ -62,11 +83,68 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `Object.defineProperty(o, k, desc)` where `k` is the key of the
+    /// for-in body being walked (FVA 4.3b): each run decides on its key node
+    /// `kn`. The run of one key defines it as `define_property` does a
+    /// constant key; any other run defines a computed key. `own`: the
+    /// descriptor's own get and set values when it is a literal written in
+    /// place (else they are read from `desc`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn define_keyed(
+        &mut self,
+        fx: &Fx,
+        o: NodeId,
+        kn: NodeId,
+        desc: NodeId,
+        r: u32,
+        accessor: bool,
+        own: [Option<NodeId>; 2],
+    ) {
+        self.m.for_in_defines.insert(fx.f);
+        self.m.cons(
+            kn,
+            Cons::DefineKeyed {
+                o,
+                reason: r,
+                accessor,
+            },
+        );
+        if !accessor {
+            let va = self.m.atom("value");
+            let v = self.load(desc, Key::Named(va));
+            let site = self.store_site(fx.module, fx.f, "defineProperty".into(), None, false);
+            self.m.cons(kn, Cons::StoreKeyed { o, src: v, site });
+        }
+        for ((name, setter), own) in [("get", false), ("set", true)].into_iter().zip(own) {
+            let f = match own {
+                Some(f) => f,
+                None => {
+                    let a = self.m.atom(name);
+                    self.load(desc, Key::Named(a))
+                }
+            };
+            self.m.cons(
+                kn,
+                Cons::AccessorKeyed {
+                    holder: o,
+                    f,
+                    setter,
+                },
+            );
+        }
+    }
+
     pub(crate) fn descriptor_of(&mut self, mi: u32, o: NodeId) -> NodeId {
         let r = self
             .m
             .reason("getOwnPropertyDescriptor (accessors handed out)");
-        self.m.cons(o, Cons::Implicit { reason: r });
+        self.m.cons(
+            o,
+            Cons::Implicit {
+                reason: r,
+                proto: Protocol::Any,
+            },
+        );
         let vals = self.load(o, Key::Any);
         let (t, n) = self.bobj(mi, "descriptor");
         let fa = self.m.field_any(t);
@@ -218,51 +296,45 @@ impl<'a> Gen<'a> {
                     self.m.cons(value, Cons::CjsPublish { dst: registry });
                     self.m.edge(value, self.cjs_registry);
                 }
+                // The partial publication hands over the module's factory:
+                // the runtime's path entry keeps it and calls it, with no
+                // receiver and no arguments, when the module is required
+                // again after its cache entry was deleted.
+                if method == "registerPathModulePartial" {
+                    if let Some(factory) = arg(2) {
+                        let _ = self.call_value(factory, ThisArg::Undef, vec![], vec![]);
+                    }
+                }
                 self.prim_node(prim::UNDEF)
             }
-            "newCjsModuleRecord" => {
-                // `CJS_MODULE_RECORD`: a fresh record per call whose fields
-                // are the arguments (exports, filename, dir, children,
-                // parent, paths) plus the marker, `loaded` and `require`.
-                let (_, record) = self.bobj(fx.module, "CjsRecord");
-                let fields: [(&str, Option<usize>, u16); 10] = [
-                    ("exports", Some(0), prim::UNDEF),
-                    ("__perry_cjs_record", None, prim::BOOL),
-                    ("id", Some(1), prim::UNDEF),
-                    ("path", Some(2), prim::UNDEF),
-                    ("filename", Some(1), prim::UNDEF),
-                    ("loaded", None, prim::BOOL),
-                    ("children", Some(3), prim::UNDEF),
-                    ("parent", Some(4), prim::UNDEF),
-                    ("paths", Some(5), prim::UNDEF),
-                    ("require", None, prim::UNDEF),
-                ];
-                for (name, from, fallback) in fields {
-                    let value = match from.and_then(arg) {
-                        Some(v) => v,
-                        None => self.prim_node(fallback),
-                    };
-                    let key = self.m.atom(name);
+            "cjsInstall" => {
+                // The CommonJS support module's cache and main record become
+                // the runtime's `Module._cache` / `createRequire().cache` and
+                // `process.mainModule`. Reads through `createRequire().cache`
+                // are modelled (`builtins`, `Require.cache`); the runtime also
+                // caches every record a computed specifier loads, under keys
+                // it computes. The main record is what `process.mainModule`
+                // reads (`builtins`). The result is `require.extensions`.
+                if let Some(cache) = arg(0) {
+                    self.m.edge(cache, self.m.cjs_cache);
+                    let registry = self.cjs_registry;
                     self.store(
                         fx,
-                        record,
-                        Key::Named(key),
-                        value,
-                        "cjs record".into(),
+                        cache,
+                        Key::Any,
+                        registry,
+                        "records the runtime caches".into(),
                         None,
                         false,
                     );
                 }
-                if let Some(factory) = arg(6) {
-                    self.cjs_factory_slot(fx, record, factory);
+                if let Some(main) = arg(1) {
+                    self.m.edge(main, self.m.cjs_main);
                 }
-                record
-            }
-            "setCjsFactory" => {
-                if let (Some(record), Some(factory)) = (arg(0), arg(1)) {
-                    self.cjs_factory_slot(fx, record, factory);
-                }
-                self.prim_node(prim::UNDEF)
+                crate::builtins::require_parts(&mut self.m);
+                let out = self.tmp("cjs-extensions");
+                self.m.edge(self.m.cjs_ext, out);
+                out
             }
             "linkPathModuleParent" => {
                 // The helper links an existing record through require.cache;
@@ -270,6 +342,22 @@ impl<'a> Gen<'a> {
                 // Keep the record in the dynamic loader summary.
                 if let Some(record) = arg(0) {
                     self.m.edge(record, self.cjs_registry);
+                    // The runtime links the requiring module's cached record,
+                    // or a stand-in object it makes for a parent outside the
+                    // cache (`module_require.rs` `link_parent`).
+                    let pa = self.m.atom("parent");
+                    let (_, stand_in) = self.bobj(fx.module, "CjsParent");
+                    let registry = self.cjs_registry;
+                    self.m.edge(registry, stand_in);
+                    self.store(
+                        fx,
+                        record,
+                        Key::Named(pa),
+                        stand_in,
+                        "runtime parent link".into(),
+                        None,
+                        false,
+                    );
                 }
                 self.prim_node(prim::UNDEF)
             }
@@ -279,40 +367,31 @@ impl<'a> Gen<'a> {
                     Some(Some(crate::gen_const::Const::Str(s))) => Some(Expr::String(s)),
                     _ => None,
                 };
-                let registry = match known.as_ref().or(source_args.first()) {
+                // A path node holds publications: a record's live exports or
+                // a raw value, unwrapped once at registration. The registry
+                // union holds the published values themselves (records, for
+                // `require.cache`), so a read of it unwraps a record as the
+                // runtime does, including an exports replacement during a
+                // cycle, and never yields the record (DECISIONS 100).
+                let out = self.tmp("require");
+                let whole_registry = match known.as_ref().or(source_args.first()) {
                     Some(Expr::String(path)) if std::path::Path::new(path).is_absolute() => {
                         let named = self.cjs_path_node(path);
-                        let r = self.tmp("cjs-path-read");
-                        self.m.edge(named, r);
-                        self.m.edge(self.cjs_unknown_path, r);
+                        self.m.edge(named, out);
+                        self.m.edge(self.cjs_unknown_path, out);
                         // The runtime also accepts directory package-main and
                         // index paths. Keep those on the summary until their
                         // resolver is modeled here as well.
-                        if std::path::Path::new(path).is_dir() {
-                            self.m.edge(self.cjs_registry, r);
-                        }
-                        r
+                        std::path::Path::new(path).is_dir()
                     }
-                    _ => self.cjs_registry,
+                    _ => true,
                 };
-                let out = self.tmp("require");
-                // Raw publications remain supported; CJS records unwrap their
-                // live exports, including replacements during a cycle.
-                self.m.edge(registry, out);
-                let ea = self.m.atom("exports");
-                let ex = self.load(registry, Key::Named(ea));
-                self.m.edge(ex, out);
+                if whole_registry {
+                    self.m
+                        .cons(self.cjs_registry, Cons::CjsPublish { dst: out });
+                }
                 self.m.add_prim(out, prim::UNDEF);
                 out
-            }
-            "getCjsMainModule" => self.cjs_main_value(fx.module),
-            "setCjsMainModule" => {
-                let main = self.cjs_main_value(fx.module);
-                if let Some(record) = arg(0) {
-                    self.m.edge(record, main);
-                    self.to_sink(record, "CJS main record published to process.mainModule");
-                }
-                self.prim_node(prim::UNDEF)
             }
             _ => {
                 let why = format!("argument of runtime glue {method}");
@@ -322,24 +401,6 @@ impl<'a> Gen<'a> {
                 self.m.top_val(&format!("result of runtime glue {method}"))
             }
         }
-    }
-
-    /// A CommonJS record's private factory slot. The slot belongs to the
-    /// record: whatever reaches the record's contents (an escape) reaches the
-    /// factory. The runtime calls it, with no receiver and no arguments, when
-    /// a loaded module is required again after its cache entry was deleted.
-    pub(crate) fn cjs_factory_slot(&mut self, fx: &Fx, record: NodeId, factory: NodeId) {
-        let key = self.m.atom("__perry_cjs_factory");
-        self.store(
-            fx,
-            record,
-            Key::Named(key),
-            factory,
-            "cjs factory slot".into(),
-            None,
-            false,
-        );
-        let _ = self.call_value(factory, ThisArg::Undef, vec![], vec![]);
     }
 
     pub(crate) fn iter_out_node(&mut self, fx: &Fx) -> NodeId {

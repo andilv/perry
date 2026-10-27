@@ -35,6 +35,7 @@ use perry_hir::{Expr, Function, Module, ModuleInitKind, Stmt};
 fn empty_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
+        program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
         program_facts: Default::default(),
         program_layouts: Default::default(),
@@ -51,6 +52,7 @@ fn empty_opts() -> CompileOptions {
         namespace_node_submodules: std::collections::HashMap::new(),
         namespace_v8_specifiers: std::collections::HashMap::new(),
         namespace_member_prefixes: std::collections::HashMap::new(),
+        namespace_source_prefixes: Default::default(),
         namespace_member_origin_names: std::collections::HashMap::new(),
         emit_ir_only: true,
         verify_native_regions: false,
@@ -796,7 +798,7 @@ fn entry_module_top_level_shadow_frame_starts_after_init_prelude() {
     let main_ir = function_slice(&ir, "main");
 
     let gc_init = main_ir
-        .find("call void @js_gc_init()")
+        .find("call void @js_gc_init_with_layouts(ptr @perry_layout_image)")
         .expect("entry main should initialize GC before user code");
     let strings_init = main_ir
         .find("__perry_init_strings_")

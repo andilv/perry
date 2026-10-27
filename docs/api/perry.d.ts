@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2020 entries across 111 modules
+// Coverage: 2021 entries across 111 modules
 
 type PerryI8 = number & { readonly __perryI8?: never };
 type PerryI16 = number & { readonly __perryI16?: never };
@@ -3489,6 +3489,8 @@ declare module "querystring" {
 
 declare module "readline" {
   /** stdlib */
+  export const promises: any;
+  /** stdlib */
   export function clearLine(...args: any[]): any;
   /** stdlib */
   export function clearScreenDown(...args: any[]): any;
@@ -4413,7 +4415,7 @@ declare module "zlib" {
   /** stdlib */
   export function gunzip(buffer: any, options?: any, callback?: any): void;
   /** stdlib */
-  export function gunzipSync(p0: any): Buffer;
+  export function gunzipSync(p0: any, options?: any): Buffer;
   /** stdlib */
   export function gzip(buffer: any, options?: any, callback?: any): void;
   /** stdlib */
@@ -4423,7 +4425,7 @@ declare module "zlib" {
   /** stdlib */
   export function inflateRaw(buffer: any, options?: any, callback?: any): void;
   /** stdlib */
-  export function inflateRawSync(p0: string): Buffer;
+  export function inflateRawSync(p0: string, options?: any): Buffer;
   /** stdlib */
   export function inflateSync(p0: any, options?: any): Buffer;
   /** stdlib */

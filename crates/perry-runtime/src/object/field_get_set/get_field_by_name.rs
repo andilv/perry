@@ -6,6 +6,7 @@ use super::*;
 
 mod class_wtf8;
 mod shape_inherited;
+use crate::codegen_abi::LayoutWord;
 use class_wtf8::class_value_get_wtf8_field;
 
 /// Wall 10 — read a property a framework attached to a native registry handle
@@ -76,19 +77,14 @@ pub extern "C" fn js_object_get_field_by_name(
         return JSValue::undefined();
     }
     if !key.is_null() {
-        let bits = obj as u64;
-        let receiver = match bits >> 48 {
-            0 => JSValue::pointer(obj as *mut u8),
-            0x7FFD => JSValue::from_bits(bits),
-            _ => JSValue::undefined(),
-        };
-        if let Some(value) =
-            unsafe { crate::typedarray_named::get(f64::from_bits(receiver.bits()), key) }
-        {
+        // The probe classifies the raw ABI word itself, after its name test:
+        // a native handle id (`headers[key]`) reaches here before the handle
+        // dispatch below.
+        if let Some(value) = unsafe { crate::typedarray_named::get(obj as u64, key) } {
             return JSValue::from_bits(value.to_bits());
         }
     }
-    if let Some(value) = unsafe { super::super::native_get::try_data_get_by_name(obj, key) } {
+    if let Some(value) = unsafe { super::super::native_get::try_settled_get_by_name(obj, key) } {
         return value;
     }
     get_field_by_name_past_data_probe(obj, key)
@@ -586,7 +582,7 @@ pub(crate) fn get_field_by_name_after_site_miss(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
 ) -> JSValue {
-    if let Some(value) = unsafe { super::super::native_get::try_data_get_by_name(obj, key) } {
+    if let Some(value) = unsafe { super::super::native_get::try_settled_get_by_name(obj, key) } {
         return value;
     }
     get_field_by_name_past_data_probe(obj, key)
@@ -600,7 +596,7 @@ pub(super) fn test_get_past_data_probe(
     get_field_by_name_past_data_probe(obj, key)
 }
 
-/// The generic read after `try_data_get_by_name` has already declined.
+/// The generic read after `try_settled_get_by_name` has already declined.
 fn get_field_by_name_past_data_probe(
     obj: *const ObjectHeader,
     key: *const crate::StringHeader,
@@ -779,7 +775,7 @@ fn get_field_by_name_past_data_probe(
                         {
                             let alloc_limit = crate::object::object_inline_capacity(o) as usize;
                             if let Some(idx) = super::super::prop_plan::read_plan_lookup(
-                                (*o).shape_word(),
+                                LayoutWord((*o).shape_word()),
                                 keys as usize,
                                 key as usize,
                                 keys_view.count(),
@@ -818,7 +814,7 @@ fn get_field_by_name_past_data_probe(
                                         )
                                     {
                                         super::super::prop_plan::read_plan_record(
-                                            (*o).shape_word(),
+                                            LayoutWord((*o).shape_word()),
                                             keys as usize,
                                             key as usize,
                                             i,

@@ -1440,32 +1440,9 @@ jobs:
     # Perry's large integration inventory is isolated in the eight-shard slow
     # lane, with its own 120-minute cap per shard.
     timeout-minutes: ${{ fromJSON(needs.plan.outputs.plan).cargo_test_scope == 'pr' && 30 || fromJSON(needs.plan.outputs.plan).tier == 'pr' && 180 || 120 }}
-    # sccache (compiler-level cache, shared across ALL branches/jobs via the
-    # GitHub Actions cache backend) on top of Swatinem/rust-cache (target/ +
-    # registry). rust-cache only writes on main (save-if below), so PRs can't
-    # warm it — and any change to the constantly-churning perry-runtime
-    # invalidates the whole downstream target/, whereas sccache still reuses
-    # the unchanged compilation units. CARGO_INCREMENTAL=0 is required: sccache
-    # cannot cache incremental builds. SCCACHE_CACHE_SIZE bounds the on-runner
-    # cache so it doesn't compound this job's known disk pressure (the prune
-    # loop below).
+    # Reuse mbx objects across jobs and the prebuilt Blaze compiler across edits.
     env:
-      RUSTC_WRAPPER: sccache
-      # sccache on a LOCAL DISK cache, persisted as a single tarball via
-      # actions/cache (see the "Cache sccache objects" step) — NOT the GitHub
-      # Actions cache backend (SCCACHE_GHA_ENABLED). The GHA backend stores one
-      # cache object per compilation unit; GitHub's cache service throttled /
-      # LRU-evicted the thousands of tiny entries, so a full build wrote ~3.3k
-      # objects (≈35 min of write time) yet the next run got ~0% Rust hits
-      # (measured: 3 hits / 3209 misses, 613 write errors) — i.e. every run
-      # recompiled the dependency graph cold. A single tarball'd disk cache
-      # restores in one step and gives real cross-run hit rates. Note
-      # SCCACHE_CACHE_SIZE is honoured by the disk backend (it was a silent
-      # no-op under the GHA backend, which is why the old "2G" never mattered).
-      SCCACHE_GHA_ENABLED: "false"
-      SCCACHE_DIR: ${{ github.workspace }}/.sccache
-      SCCACHE_CACHE_SIZE: "12G"
-      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-C force-unwind-tables=yes -C linker-features=-lld"
     steps:
       - name: Checkout repository (inline git)
         shell: bash
@@ -1489,31 +1466,12 @@ jobs:
           if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
             git config http.https://github.com/.extraheader "$auth_header"
           fi
-      - name: Install Rust toolchain
-        run: rustup toolchain install nightly-2026-10-04 --profile minimal
+      - name: Activate prebuilt Rust build tools
+        run: sh scripts/setup-blaze.sh --github-env
       - uses: ./.github/actions/setup-llvm22
-
-      - name: Install sccache
-        uses: ./.github/actions/perry/mozilla-actions/sccache-action # v0.0.11
-
-      # Persist the sccache disk cache across runs. The github.job +
-      # github.run_id key makes every run (including PRs) save its own fresh
-      # entry — distinct per job so the three sccache jobs don't collide on
-      # save — while the shared prefix restore-keys pull the most recent prior
-      # cache from ANY of them. The object cache therefore warms continuously
-      # and cross-pollinates instead of starting cold each run.
-      - name: Restore sccache objects
-        uses: ./.github/actions/perry/actions/cache/restore # v6
+      - uses: ./.github/actions/perry-mbx-cache
         with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-${{ runner.os }}-perry-${{ hashFiles('rust-toolchain.toml') }}-${{ github.job }}-${{ github.run_id }}
-          restore-keys: |
-            sccache-${{ runner.os }}-perry-${{ hashFiles('rust-toolchain.toml') }}-
-
-      - uses: ./.github/actions/perry/Swatinem/rust-cache # v2
-        with:
-          shared-key: "${{ runner.os }}-perry"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-generation: blaze-nightly-2026-10-25
 
       # #5892 — the auto-opt archive cache (target/perry-auto-<hash>) keys on
       # perry-runtime's source hash and does NOT account for ext-crate sources,
@@ -1562,7 +1520,7 @@ jobs:
           # Rust's Ubuntu target can drive `cc` with `-fuse-ld=lld`; on the
           # shared runner this has repeatedly terminated large test links with
           # SIGBUS. Use the system linker for the cargo-test gate.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C force-unwind-tables=yes -C linker-features=-lld"
           # Keep test artifacts small enough for the shared runner disk. The
           # cargo-test job does not need line tables, and debug info was enough
           # to make later package archives hit ENOSPC after several package
@@ -1698,9 +1656,12 @@ jobs:
             # lib test binary would link the runtime for zero tests).
             export CARGO_BUILD_JOBS=1
             # perry-runtime first, single-threaded (process-global state); it is
-            # a lib-only crate, so filter to --lib.
+            # a lib-only crate, so filter to --lib. Blaze currently crashes
+            # while running low-level unwind tests through Perry's naked ABI
+            # trampoline. Keep mbx and the pinned nightly, but use Cargo for
+            # this full runtime harness until Blaze can execute those frames.
             if printf '%s\n' "$scope" | grep -qx 'perry-runtime'; then
-              RUST_TEST_THREADS=1 python3 scripts/runtime_test_batches.py --lib
+              MBX_BLAZE=0 RUST_TEST_THREADS=1 python3 scripts/runtime_test_batches.py --lib
             fi
             rest="$(printf '%s\n' "$scope" | grep -vx 'perry-runtime' \
               | python3 scripts/ci_test_scope.py --with-tests || true)"
@@ -1736,23 +1697,9 @@ jobs:
       # still matches the runtime it mirrors.
       - name: perry-ffi ABI mirror matches the runtime (#8113)
         env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C force-unwind-tables=yes -C linker-features=-lld"
           CARGO_PROFILE_TEST_DEBUG: "0"
         run: cargo test -p perry-ffi --features runtime-link --lib
-
-      # sccache SAVE is main-line only (restore above is unconditional). PR
-      # runs used to write a fresh ~0.5-1.3 GB tarball per job per push --
-      # ~200 GB/day into a 10 GB repo cache budget -- which evicted every
-      # useful entry (including rust-cache's) within the hour. Now only sweep /
-      # nightly / release runs write, and PRs restore the newest main-line blob
-      # via the restore-keys prefix, i.e. a cache built from the tip they
-      # branched from.
-      - name: Save sccache objects (main-line runs only)
-        if: always() && github.event_name != 'pull_request'
-        uses: ./.github/actions/perry/actions/cache/save # v6
-        with:
-          path: ${{ github.workspace }}/.sccache
-          key: sccache-${{ runner.os }}-perry-${{ hashFiles('rust-toolchain.toml') }}-${{ github.job }}-${{ github.run_id }}
 
   # ---------------------------------------------------------------------------
   # Full-tier perry integration tests (#8914)
@@ -2111,6 +2058,21 @@ jobs:
               fi
               cargo build --release "${runtime_packages[@]}"
               scripts/gc_call_effects/sidecars.sh target/release
+            fi
+            # A suite that compiles with a GC/diagnostic instrument knob
+            # (PERRY_CHECK_CONTRACTS, PERRY_GC_TRACE, PERRY_GC_INSTRUMENTS, a
+            # schedule seed, ...) links the instrumented archives, as in the
+            # full-tier integration shards. Build them when a selected suite
+            # sets one.
+            needs_instr=0
+            while read -r package suite bound; do
+              [ "$package" = perry ] || continue
+              if grep -qE 'PERRY_(CHECK_CONTRACTS|GC_INSTRUMENTS|GC_TRACE|GC_SCHEDULE_SEED)' "crates/perry/tests/$suite.rs" 2>/dev/null; then
+                needs_instr=1
+              fi
+            done <<< "$SUITES"
+            if [ "$needs_instr" = 1 ]; then
+              PERRY_INSTR_PACKAGES=runtime scripts/build_instr_runtime.sh
             fi
             export PERRY_RUNTIME_DIR="$PWD/target/release"
           fi
@@ -5106,7 +5068,12 @@ jobs:
     # the same 20-slot pool.
     needs: [plan, check]
     if: fromJSON(needs.plan.outputs.plan).jobs.binary_size
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     steps:
       - name: Checkout repository (inline git)
         shell: bash
@@ -5139,6 +5106,15 @@ jobs:
           shared-key: "${{ runner.os }}-perry"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Install linker retention diagnostics (ELF)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y lld-22
+
+      - name: Setup pinned Node oracle
+        uses: ./.github/actions/perry/actions/setup-node # v7
+        with:
+          node-version-file: .node-version
+
       - name: Build release binaries
         run: |
           cargo build-perry --release
@@ -5150,7 +5126,24 @@ jobs:
       # size exceeds benchmarks/runtime_size_budget/budget.json. Between the
       # July and September size campaigns a small program's size regrew by
       # ~50% (4.7 -> 7.1 MB) with no signal anywhere.
+      - name: Runtime link absence (HWS)
+        env:
+          PERRY_RUNTIME_DIR: ${{ github.workspace }}/target/release
+        run: python3 scripts/link_absence.py --perry target/release/perry --output target/link-absence
+
+      - name: Upload link absence evidence
+        if: always()
+        uses: ./.github/actions/perry/actions/upload-artifact # v7
+        with:
+          name: link-absence-${{ matrix.os }}
+          path: |
+            target/link-absence/report.json
+            target/link-absence/**/*.log
+            target/link-absence/**/*.stdout
+            target/link-absence/**/*.stderr
+
       - name: Runtime size budget (small programs)
+        if: runner.os == 'macOS'
         run: python3 scripts/runtime_size_budget.py --check --perry target/release/perry
 
       - name: Report binary sizes
@@ -5164,7 +5157,7 @@ jobs:
       - name: Upload size report
         uses: ./.github/actions/perry/actions/upload-artifact # v7
         with:
-          name: binary-sizes
+          name: binary-sizes-${{ matrix.os }}
           path: /tmp/sizes.md
 
 
@@ -5211,8 +5204,8 @@ jobs:
         if [[ "$CHECKOUT_PERSIST_CREDENTIALS" == "true" ]]; then
           git config http.https://github.com/.extraheader "$auth_header"
         fi
-    - name: Install Rust toolchain with the WASI target
-      run: rustup toolchain install nightly-2026-10-04 --profile minimal --target wasm32-wasip2
+    - name: Install Rust toolchain with the WASI targets
+      run: rustup toolchain install nightly-2026-10-04 --profile minimal --target wasm32-wasip2 --target wasm32-wasip1
     - uses: ./.github/actions/setup-llvm22
     - uses: ./.github/actions/perry/Swatinem/rust-cache
       with:
@@ -5231,11 +5224,23 @@ jobs:
       run: |
         toolchain_env="$(./scripts/wasi_toolchain.sh "$RUNNER_TEMP/wasi")"
         eval "$toolchain_env"
-        for key in WASI_SDK_PATH WASMTIME CC_wasm32_wasip2 AR_wasm32_wasip2 CFLAGS_wasm32_wasip2 CC_SHELL_ESCAPED_FLAGS; do
+        for key in WASI_SDK_PATH WASMTIME CC_wasm32_wasip2 AR_wasm32_wasip2 CFLAGS_wasm32_wasip2 CC_wasm32_wasip1 AR_wasm32_wasip1 CFLAGS_wasm32_wasip1 CC_SHELL_ESCAPED_FLAGS; do
           printf '%s=%s\n' "$key" "${!key}" >> "$GITHUB_ENV"
         done
     - name: Build the runtime for wasm32-wasip2
       run: python scripts/wasi_build_runtime.py
+    - name: Image classifier checks as a wasm program
+      run: python scripts/wasi_image_selftest.py target/perry-dev/perry
+    - name: Build the runtime for wasm32-wasip1 and check it imports only preview 1
+      shell: bash
+      run: |
+        python scripts/wasi_imports_check.py --self-test
+        archive="$(python scripts/wasi_build_runtime.py wasm32-wasip1 | sed -n 's/^WASI archive: //p' | tail -n 1)"
+        python scripts/wasi_imports_check.py "$archive"
+        # The image classifier checks, built for wasip1. Running them needs a
+        # linked program, which comes with the wasip1 compiler target.
+        CARGO_TARGET_DIR=target/wasi-image-selftest-p1 python scripts/wasi_build_runtime.py wasm32-wasip1 --image-selftest | tee "$RUNNER_TEMP/selftest-p1.log"
+        python scripts/wasi_imports_check.py "$(sed -n 's/^WASI archive: //p' "$RUNNER_TEMP/selftest-p1.log" | tail -n 1)"
     - name: WASI smoke and complete issue 11375 acceptance
       shell: bash
       run: |

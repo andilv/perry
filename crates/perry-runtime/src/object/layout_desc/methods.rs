@@ -2,6 +2,7 @@
 //! this table; each entry names the complete static holder chain and its slot.
 //! A changed holder word, or a shadowed receiver, takes ordinary dispatch.
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 #[repr(C)]
 pub struct PerryFamilyMethods {
@@ -19,7 +20,7 @@ pub struct PerryFamilyMethod {
 #[repr(C)]
 pub struct PerryMethodHolder {
     pub class_id: u32,
-    pub word: u32,
+    pub word: LayoutWord,
 }
 unsafe impl Sync for PerryFamilyMethods {}
 unsafe impl Sync for PerryFamilyMethod {}
@@ -45,8 +46,8 @@ const _: () = assert!(std::mem::size_of::<PerryMethodHolder>() == 8);
 /// The carried descriptor band (including possible class method tables).
 /// This immutable word range rejects runtime and shadowed layouts cheaply.
 #[inline(always)]
-pub(crate) const fn may_have_methods(word: u32) -> bool {
-    word.wrapping_sub(LAYOUT_BASE) < LAYOUT_INDEX_LIMIT
+pub(crate) fn may_have_methods(word: u32) -> bool {
+    super::word_in_layout_index(word)
 }
 
 /// A GC leaf: a layout-indexed method lookup, with no allocation, TLS lookup,
@@ -106,7 +107,7 @@ pub unsafe extern "C" fn perry_probe_family_method(
     }
     let mut holder = std::ptr::null::<ObjectHeader>();
     for guard in std::slice::from_raw_parts(entry.guards, entry.depth as usize) {
-        let pid = super::super::shapes::class_proto_id(guard.class_id);
+        let pid = super::super::shapes::class_identity_proto_id(guard.class_id);
         let Some(cell) = super::super::shapes::identity_word_slot_in(word_dir, pid) else {
             return 0;
         };
@@ -115,7 +116,7 @@ pub unsafe extern "C" fn perry_probe_family_method(
             return 0;
         }
         holder = (bits & crate::value::POINTER_MASK) as *const ObjectHeader;
-        if (*holder).parent_class_id != guard.word {
+        if (*holder).parent_class_id != guard.word.0 {
             return 0;
         }
     }

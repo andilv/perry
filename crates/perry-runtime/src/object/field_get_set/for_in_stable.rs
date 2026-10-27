@@ -1,6 +1,7 @@
 //! Allocation-free stable-shape arm for compiled `for...in` loops (#8694).
 
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 /// The semantic identity of the canonical `%Object.prototype%` chain used by
 /// the one-key proof.  Addresses are comparison tokens only, never
@@ -10,7 +11,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PrototypeSignature {
     prototype_addr: usize,
-    shape_id: u32,
+    shape_id: LayoutWord,
 }
 
 #[derive(Clone, Copy)]
@@ -49,8 +50,8 @@ unsafe fn prototype_signature(prototype_addr: usize) -> Option<PrototypeSignatur
         return None;
     }
     let prototype = prototype_addr as *const ObjectHeader;
-    let shape_id = super::super::shapes::object_shape_id(prototype);
-    if shape_id == 0 {
+    let shape_id = super::super::shapes::object_layout_stamp(prototype);
+    if shape_id == LayoutWord(0) {
         return None;
     }
     Some(PrototypeSignature {
@@ -159,7 +160,7 @@ fn stable_single_own_for_in_keys(value: f64) -> Option<*mut ArrayHeader> {
     let object = receiver_addr as *const ObjectHeader;
     let descriptor = unsafe {
         let class_id = (*object).class_id;
-        if class_id != 0 && !super::super::is_anon_shape_class_id(class_id) {
+        if class_id != 0 && !super::super::shapes::object_is_plain_record(object) {
             return stable_miss("receiver_class");
         }
         if !(*object).meta.is_null() {

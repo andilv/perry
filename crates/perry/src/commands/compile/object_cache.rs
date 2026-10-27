@@ -371,6 +371,10 @@ fn compute_object_cache_key_with_env(
     // embeds as immediates. A cached object is reused exactly when every id
     // it embeds is unchanged.
     h.field("static_shape_ids", &format!("{:?}", opts.static_shape_ids));
+    h.field(
+        "program_layout_ordinals",
+        &opts.program_layout_ordinals.cache_key(),
+    );
     // The seed sidecar's line format: an entry of another format is a miss.
     h.field("static_seed_format", perry_codegen::STATIC_SEED_FORMAT);
     h.field(
@@ -623,6 +627,18 @@ fn compute_object_cache_key_with_env(
             "ns_imports",
             &v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
         );
+    }
+
+    // The owning namespace module can differ from all member origins (barrels).
+    {
+        let mut values: Vec<_> = opts.namespace_source_prefixes.iter().collect();
+        values.sort_by(|a, b| a.0.cmp(b.0));
+        let value = values
+            .iter()
+            .map(|(local, prefix)| format!("{local}={prefix}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        h.field("namespace_source_prefixes", &value);
     }
 
     // Import function prefixes (HashMap — MUST sort).

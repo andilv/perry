@@ -12,6 +12,7 @@ use tempfile::tempdir;
 fn empty_opts() -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
+        program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
         program_facts: Default::default(),
         program_layouts: Default::default(),
@@ -35,6 +36,7 @@ fn empty_opts() -> CompileOptions {
         verify_native_regions: false,
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
+        namespace_source_prefixes: Default::default(),
         namespace_member_nested: Vec::new(),
         cjs_interop_namespaces: Vec::new(),
         imported_classes: Vec::new(),
@@ -1413,4 +1415,42 @@ fn path_reaches_the_object_key_only_through_the_tools_it_resolves() {
         key(Some("/usr/bin")),
         key(Some("/usr/libexec/perf-core:/usr/bin"))
     );
+}
+
+#[test]
+fn whole_image_layout_plan_changes_every_package_cache_key() {
+    use perry_codegen::layout_ordinals::*;
+    let plan = ProgramLayoutOrdinals::assign(native_inputs(), []).unwrap();
+    let mut a = empty_opts();
+    a.program_layout_ordinals = std::sync::Arc::new(plan);
+    let mut package = a.clone();
+    assert!(std::sync::Arc::ptr_eq(
+        &a.program_layout_ordinals,
+        &package.program_layout_ordinals
+    ));
+    let key = compute_object_cache_key(&a, 1, "dense-layout-test");
+    let mut changed = (*a.program_layout_ordinals).clone();
+    changed.family_count += 1;
+    package.program_layout_ordinals = std::sync::Arc::new(changed);
+    assert_ne!(
+        key,
+        compute_object_cache_key(&package, 1, "dense-layout-test")
+    );
+    let mut changed = (*a.program_layout_ordinals).clone();
+    changed.entries[0].proto_kind = 2;
+    package.program_layout_ordinals = std::sync::Arc::new(changed);
+    assert_ne!(
+        key,
+        compute_object_cache_key(&package, 1, "dense-layout-test")
+    );
+}
+
+#[test]
+fn namespace_owner_is_part_of_the_object_key() {
+    let mut options = empty_opts();
+    let before = compute_object_cache_key(&options, 1, "0.5.156");
+    options
+        .namespace_source_prefixes
+        .insert("ns".into(), "owner".into());
+    assert_ne!(before, compute_object_cache_key(&options, 1, "0.5.156"));
 }

@@ -1,6 +1,6 @@
 //! Ordinary function constructor layouts. Immutable info tails name existing
 //! rooted bindings and current closure captures; admission never evaluates JS.
-use super::{section, ATOM_TY, DESC_TY, KEY_TY, LAYOUT_ID_CARRIED};
+use super::{section, ATOM_TY, DESC_TY, KEY_TY};
 use crate::{module::LlModule, strings::StringPool};
 use perry_hir::{Expr, Module, Stmt};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -223,7 +223,8 @@ pub(crate) fn emit(
                 }
                 Key::Binding(id) => {
                     let name = format!("{desc}$key{slot}");
-                    llmod.add_raw_global(format!("@{name} = private global {ATOM_TY} {{ i64 0, ptr null, i8 {}, [3 x i8] zeroinitializer, i32 {slot} }}, section \"{atom_sect}\", align 8", crate::runtime_abi::ATOM_KIND_BINDING_SYMBOL));
+                    let atom_storage = super::atom_storage(&llmod.target_triple);
+                    llmod.add_raw_global(format!("@{name} = private {atom_storage} {ATOM_TY} {{ i64 0, ptr null, i8 {}, [3 x i8] zeroinitializer, i32 {slot} }}, section \"{atom_sect}\", align 8", crate::runtime_abi::ATOM_KIND_BINDING_SYMBOL));
                     let source = &sources[id];
                     // A metadata constant cannot hold the address of a TLS
                     // binding for every agent. This immutable reader is one
@@ -278,7 +279,15 @@ pub(crate) fn emit(
             "@{desc}$keys = private constant [{count} x {KEY_TY}] [{}], align 8",
             entries.join(", ")
         ));
-        llmod.add_raw_global(format!("@{desc} = global {DESC_TY} {{ i32 {}, i16 {}, i8 {}, i8 0, i32 {count}, i32 {}, i64 0, i64 2, ptr @{desc}$keys, i32 {count}, i32 {}, ptr @{desc}$index, i32 0, i32 0, ptr null }}, align 8", super::fnv1a(desc.as_bytes()) as u32 & 0x7fff_ffff, crate::runtime_abi::LAYOUT_VARIANT_FUNCTION_CONSTRUCTOR, 0u8, LAYOUT_ID_CARRIED as i32, cap - 1));
+        let word = crate::layout_ordinals::descriptor_word(
+            &desc,
+            format!("{keys:?}|{count}|{operands:?}"),
+            0,
+            false,
+            false,
+            0,
+        );
+        llmod.add_raw_global(format!("@{desc} = global {DESC_TY} {{ i32 {}, i16 {}, i8 {}, i8 0, i32 {count}, i32 {}, i64 0, ptr inttoptr (i64 2 to ptr), ptr @{desc}$keys, i32 {count}, i32 {}, ptr @{desc}$index, i32 0, i32 0, ptr null, i32 0, i32 0 }}, align 8", super::fnv1a(desc.as_bytes()) as u32 & 0x7fff_ffff, crate::runtime_abi::LAYOUT_VARIANT_FUNCTION_CONSTRUCTOR, 0u8, word as i32, cap - 1));
         let n = operands.len();
         llmod.add_raw_global(format!(
             "@{desc}$operands = private constant [{n} x {{ ptr, i32, i16, i16 }}] [{}]",

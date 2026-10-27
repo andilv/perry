@@ -18,6 +18,7 @@ use crate::object::{js_object_alloc, js_object_set_field_by_name, ObjectHeader};
 use crate::value::{js_nanbox_pointer, JSValue, TAG_NULL, TAG_UNDEFINED};
 
 mod ffi;
+pub(crate) use ffi::dispatch_export;
 mod records;
 mod resolve_build;
 
@@ -514,6 +515,13 @@ fn dns_not_found_error(hostname: &str) -> f64 {
     plain_error_value(&format!("getaddrinfo ENOTFOUND {hostname}"), "ENOTFOUND")
 }
 
+/// WASI preview 1 cannot resolve names; the resolver stub reports the positive
+/// `ENOTSUP`. (preview 2 reports negative `EAI_*` codes, so it never matches.)
+#[cfg(target_os = "wasi")]
+fn dns_not_supported_error(hostname: &str) -> f64 {
+    plain_error_value(&format!("getaddrinfo ENOTSUP {hostname}"), "ENOTSUP")
+}
+
 fn throw_invalid_dns_order(value: f64) -> ! {
     let message = format!(
         "The argument 'dnsOrder' must be one of: 'verbatim', 'ipv4first', 'ipv6first'. Received {}",
@@ -955,8 +963,11 @@ fn lookup_addresses(hostname: &str, family: i32) -> Result<Vec<ResolvedAddress>,
         .map(|iter| iter.collect::<Vec<_>>());
     #[cfg(target_os = "wasi")]
     let resolved = wasi_lookup_addresses(hostname, family);
-    let Ok(iter) = resolved else {
-        return Err(dns_not_found_error(hostname));
+    let iter = match resolved {
+        Ok(iter) => iter,
+        #[cfg(target_os = "wasi")]
+        Err(code) if code == libc::ENOTSUP => return Err(dns_not_supported_error(hostname)),
+        Err(_) => return Err(dns_not_found_error(hostname)),
     };
     let mut addresses: Vec<ResolvedAddress> = Vec::new();
     for socket_addr in iter {
@@ -982,7 +993,7 @@ fn lookup_addresses(hostname: &str, family: i32) -> Result<Vec<ResolvedAddress>,
 }
 
 #[cfg(target_os = "wasi")]
-fn wasi_lookup_addresses(hostname: &str, family: i32) -> Result<Vec<SocketAddr>, ()> {
+fn wasi_lookup_addresses(hostname: &str, family: i32) -> Result<Vec<SocketAddr>, i32> {
     use core::ffi::{c_char, c_void};
     extern "C" {
         fn perry_wasi_resolve(
@@ -1001,7 +1012,7 @@ fn wasi_lookup_addresses(hostname: &str, family: i32) -> Result<Vec<SocketAddr>,
         };
         addresses.push(SocketAddr::new(ip, 0));
     }
-    let hostname = std::ffi::CString::new(hostname).map_err(|_| ())?;
+    let hostname = std::ffi::CString::new(hostname).map_err(|_| libc::EINVAL)?;
     let mut addresses = Vec::<SocketAddr>::new();
     let result = unsafe {
         perry_wasi_resolve(
@@ -1014,7 +1025,7 @@ fn wasi_lookup_addresses(hostname: &str, family: i32) -> Result<Vec<SocketAddr>,
     if result == 0 {
         Ok(addresses)
     } else {
-        Err(())
+        Err(result)
     }
 }
 

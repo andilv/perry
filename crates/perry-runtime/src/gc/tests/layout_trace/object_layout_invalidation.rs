@@ -1,4 +1,5 @@
 use super::*;
+use crate::codegen_abi::LayoutWord;
 
 // This file used to exercise the `PERRY_UNBOXED_OBJECT_FIELDS` prototype's
 // `js_gc_init_unboxed_object_layout` installer. That prototype was deleted
@@ -145,8 +146,8 @@ fn test_f64_lanes_move_with_the_shape_on_copying_minor_and_skip_raw_slots() {
     assert_eq!(first, 10.5);
     assert_eq!(third, -3.25);
     assert_eq!(
-        unsafe { crate::object::shapes::object_shape_id(after as *const _) },
-        shape,
+        unsafe { crate::object::shapes::object_layout_stamp(after as *const _) },
+        LayoutWord(shape),
         "the copy carries the shape, and with it the F64 lanes"
     );
     assert_eq!(test_heap_child_slot_count(after as *mut u8), 1);

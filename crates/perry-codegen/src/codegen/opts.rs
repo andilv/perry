@@ -334,6 +334,8 @@ pub struct CompileOptions {
     /// Codegen uses this to know that `X.foo()` should be dispatched as
     /// a cross-module call rather than an object method call.
     pub namespace_imports: Vec<String>,
+    /// Namespace local -> owning compiled module prefix, before following re-exports.
+    pub namespace_source_prefixes: std::collections::HashMap<String, String>,
     /// #7189: `(namespace local, member)` pairs whose member is itself a MODULE
     /// NAMESPACE, from `export * as ns from "./m.ts"` in the imported module.
     ///
@@ -600,6 +602,8 @@ pub struct CompileOptions {
     /// module's class-birth contents (`module_birth_shapes`), sorted. Empty
     /// when the driver ran no pre-pass: every class then mints as before.
     pub static_shape_ids: Vec<(super::BirthShape, u32)>,
+    /// One immutable whole-image ordinal plan, shared by every package.
+    pub program_layout_ordinals: std::sync::Arc<crate::ProgramLayoutOrdinals>,
     /// Decision 16: this module's slice of the program-wide map of each
     /// class's static id as its defining module assigns it (typed or plain):
     /// the ids its importer guards and foreign shape globals compare against.
@@ -961,12 +965,15 @@ pub(crate) struct CrossModuleCtx {
     /// Case 2c: the program's families and colouring
     /// (`CompileOptions::program_layouts`).
     pub program_layouts: std::sync::Arc<crate::layout_families::ProgramLayouts>,
+    /// Per-module compile-time receiver candidates, not emitted target state.
+    pub receiver_families: std::sync::Arc<std::collections::BTreeMap<u32, u32>>,
     pub program_has_worker: bool,
     pub program_has_thread_agents: bool,
     /// The class and method tables inverted (`class_hierarchy`). Set once
     /// both tables are final, before any function body is lowered.
     pub class_hierarchy: super::class_hierarchy::ClassHierarchy,
     pub namespace_imports: std::collections::HashSet<String>,
+    pub namespace_source_prefixes: std::collections::HashMap<String, String>,
     /// #7189: `(namespace local, member)` pairs whose member is itself a MODULE
     /// NAMESPACE, from `export * as ns from "./m.ts"` in the imported module.
     ///

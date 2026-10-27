@@ -39,6 +39,7 @@ use perry_hir::{BinaryOp, Class, ClassField, Expr, Function, Module, ModuleInitK
 fn ir_opts(is_entry: bool) -> CompileOptions {
     CompileOptions {
         static_shape_ids: Vec::new(),
+        program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
         program_facts: Default::default(),
         program_layouts: Default::default(),
@@ -61,6 +62,7 @@ fn ir_opts(is_entry: bool) -> CompileOptions {
         verify_native_regions: false,
         disable_buffer_fast_path: false,
         namespace_imports: Vec::new(),
+        namespace_source_prefixes: Default::default(),
         namespace_member_nested: Vec::new(),
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
@@ -1179,7 +1181,7 @@ fn single_arm_method_shape_guard_is_inlined_with_the_runtime_contract() {
             && probe.contains("add i32")
             && probe.contains(", -2147483648")
             && probe.contains("icmp ult i32")
-            && probe.contains(", 1073741824"),
+            && probe.contains(", 268435456"),
         "the packed header block must check the GC type, forwarding flag, own-descriptor bit, exact class/ShapeId pair, and ShapeId domain:\n{probe}"
     );
 }

@@ -986,8 +986,11 @@ pub(super) fn compile_closure(
         &mut shadow_slot_map,
         native_facts.number_by_construction_locals(),
     );
-    let shadow_slot_clears_after_stmt =
-        crate::collectors::collect_shadow_slot_clear_points(body, &shadow_slot_map);
+    let shadow_slot_clears_after_stmt = crate::collectors::collect_shadow_slot_clear_points(
+        body,
+        &shadow_slot_map,
+        &cross_module.scope_map,
+    );
 
     // Representation-selection context gates (see codegen/function.rs).
     // Async-step closures (CPS-rewritten `async` closures — the rewrite clears
@@ -1187,6 +1190,7 @@ pub(super) fn compile_closure(
         class_hierarchy: &cross_module.class_hierarchy,
         wpfacts: cross_module.wpfacts.clone(),
         program_layouts: cross_module.program_layouts.clone(),
+        receiver_families: cross_module.receiver_families.clone(),
         wpfacts_sites: 0,
         wpfacts_tested: Vec::new(),
         wpfacts_off: false,
@@ -1302,6 +1306,7 @@ pub(super) fn compile_closure(
         object_literal_locals: HashSet::new(),
         constructed_kind_locals: HashMap::new(),
         namespace_imports: &cross_module.namespace_imports,
+        namespace_source_prefixes: &cross_module.namespace_source_prefixes,
         namespace_member_prefixes: &cross_module.namespace_member_prefixes,
         namespace_member_nested: &cross_module.namespace_member_nested,
         cjs_interop_namespaces: &cross_module.cjs_interop_namespaces,

@@ -261,7 +261,7 @@ pub(super) fn compile_module_entry(
                 .entry_source_path
                 .as_deref()
                 .filter(|path| !path.is_empty())
-                .map(|path| llmod.add_string_constant(path))
+                .map(|path| llmod.add_string_constant(&perry_hir::source_remap::baked_path(path)))
         };
         // i18n startup init: when the project configures `[i18n]`, bake the
         // configured locale-code list (and the optional `[i18n.currencies]`
@@ -339,7 +339,8 @@ pub(super) fn compile_module_entry(
             .nextjs_path_init_modules
             .iter()
             .map(|(path, prefix)| {
-                let (cn, len) = llmod.add_string_constant(path);
+                let (cn, len) =
+                    llmod.add_string_constant(&perry_hir::source_remap::baked_path(path));
                 (cn, len, prefix.clone())
             })
             .collect();
@@ -353,7 +354,8 @@ pub(super) fn compile_module_entry(
                     prefix == module_prefix || non_entry_module_prefixes.contains(prefix)
                 })
                 .map(|(path, prefix)| {
-                    let (cn, len) = llmod.add_string_constant(path);
+                    let (cn, len) =
+                        llmod.add_string_constant(&perry_hir::source_remap::baked_path(path));
                     // A program with worker entries always has thread-local
                     // init guards (`program_has_worker`), so the guarded
                     // wrapper runs once per thread.
@@ -382,6 +384,10 @@ pub(super) fn compile_module_entry(
         } else {
             Vec::new()
         };
+        llmod.add_raw_global(format!(
+            "@perry_layout_image = private constant {{ i32, i32, i32, i32 }} {}, align 4",
+            crate::layout_ordinals::current_plan().image_initializer()
+        ));
         let main = if is_dylib {
             llmod.define_function("perry_module_init", VOID, vec![])
         } else {
@@ -407,7 +413,7 @@ pub(super) fn compile_module_entry(
                     &[(PTR, path_ptr.as_str()), (I32, len_str.as_str())],
                 );
             }
-            blk.call_void("js_gc_init", &[]);
+            blk.call_void("js_gc_init_with_layouts", &[(PTR, "@perry_layout_image")]);
             blk.call_void(
                 "perry_array_iteration_init",
                 &[(I32, &crate::expr::array_program_facts().to_string())],
@@ -607,14 +613,6 @@ pub(super) fn compile_module_entry(
                     ],
                 );
             }
-            // #10735: publish the shared `require.main` placeholder before
-            // ANY module's `__init` below runs (those are this CJS entry's
-            // OWN static imports, which ESM eval order runs before the
-            // entry's own preamble). See the callee's doc comment. Skipped
-            // for an ESM entry, which must leave `require.main` `undefined`.
-            if crate::collectors::is_cjs_wrapped_module(hir) {
-                blk.call_void("js_bootstrap_cjs_main_module_placeholder", &[]);
-            }
             // The topo sort intentionally drops cyclic evaluation back-edges.
             // A first eager module can therefore call a later module's hoisted
             // factory without ever reaching that module's __init wrapper. All
@@ -649,8 +647,12 @@ pub(super) fn compile_module_entry(
         let main_init: &[perry_hir::Stmt] = if entry_in_init { &[] } else { &hir.init };
         let flat_const_ids: std::collections::HashSet<u32> =
             cross_module.flat_const_arrays.keys().copied().collect();
-        let (mut main_shadow_slot_map, _) =
-            enable_module_init_shadow_frame(main, main_init, &flat_const_ids);
+        let (mut main_shadow_slot_map, _) = enable_module_init_shadow_frame(
+            main,
+            main_init,
+            &flat_const_ids,
+            &cross_module.scope_map,
+        );
         // #10663: module init is the textbook run-once body.
         super::helpers::decide_straight_line_store_outline(main, main_init);
 
@@ -705,7 +707,11 @@ pub(super) fn compile_module_entry(
             main_native_facts.number_by_construction_locals(),
         );
         let main_shadow_slot_clears_after_stmt =
-            crate::collectors::collect_shadow_slot_clear_points(main_init, &main_shadow_slot_map);
+            crate::collectors::collect_shadow_slot_clear_points(
+                main_init,
+                &main_shadow_slot_map,
+                &cross_module.scope_map,
+            );
 
         // #7109: the program-entry body participates in canonical (i32/u32/Str)
         // selection on exactly the per-value rules a function body uses. There
@@ -773,6 +779,7 @@ pub(super) fn compile_module_entry(
             class_hierarchy: &cross_module.class_hierarchy,
             wpfacts: cross_module.wpfacts.clone(),
             program_layouts: cross_module.program_layouts.clone(),
+            receiver_families: cross_module.receiver_families.clone(),
             wpfacts_sites: 0,
             wpfacts_tested: Vec::new(),
             wpfacts_off: false,
@@ -845,6 +852,7 @@ pub(super) fn compile_module_entry(
             object_literal_locals: HashSet::new(),
             constructed_kind_locals: HashMap::new(),
             namespace_imports: &cross_module.namespace_imports,
+            namespace_source_prefixes: &cross_module.namespace_source_prefixes,
             namespace_member_prefixes: &cross_module.namespace_member_prefixes,
             namespace_member_nested: &cross_module.namespace_member_nested,
             cjs_interop_namespaces: &cross_module.cjs_interop_namespaces,

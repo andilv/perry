@@ -37,6 +37,7 @@
 //! shadowed: its sites take the generic arm.
 
 use super::ObjectHeader;
+use crate::codegen_abi::LayoutWord;
 
 /// The first namespace family (namespace `i` is `FIRST + i`).
 pub(crate) const FIRST: usize = crate::codegen_abi::BUILTIN_PROTO_FAMILIES;
@@ -93,7 +94,7 @@ unsafe fn holder_of_value(bits: u64) -> *mut ObjectHeader {
 /// `object_keys_and_live_slot_count`, not the layout's keys.
 unsafe fn layout_keys(obj: *const ObjectHeader) -> (super::ObjectKeys, u32) {
     let id = super::layout_desc::layout_id_of_word((*obj).parent_class_id);
-    match super::shapes::shape_record_by_id(id) {
+    match super::shapes::shape_record_for_word(LayoutWord(id)) {
         Some(record) => (
             super::object_keys_from_shape_record(obj, record),
             record.live_inline_slot_count(),
@@ -153,7 +154,7 @@ pub(crate) fn seal_namespaces(global: *mut ObjectHeader) {
                 snapshot_members(i, obj);
             }
             trace(name, "sealed", (*obj).parent_class_id);
-            if super::shapes::is_site_matchable_shape_id((*obj).parent_class_id) {
+            if super::shapes::is_site_matchable_layout_word((*obj).parent_class_id) {
                 crate::agent_ptrs::publish_intrinsic_proto(FIRST + i, obj);
             } else {
                 // Its word cannot carry the bit: never pristine.

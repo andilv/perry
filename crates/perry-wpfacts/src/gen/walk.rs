@@ -80,7 +80,8 @@ impl<'a> Gen<'a> {
     }
 
     fn compute_birth_keys(&mut self, tm: TmplId, module: &Module) {
-        if !self.m.tmpls[tm as usize].birth_keys.is_empty() {
+        // Another unit's class: its keys are its contract's.
+        if !self.m.tmpls[tm as usize].birth_keys.is_empty() || self.stand_in_cc.contains_key(&tm) {
             return;
         }
         let mut keys = Vec::new();
@@ -106,14 +107,20 @@ impl<'a> Gen<'a> {
         let Some(c) = module.classes.iter().find(|c| c.name == name) else {
             return;
         };
+        let mut declared = Vec::new();
         for f in &c.fields {
             if f.is_private || f.key_expr.is_some() {
                 continue;
             }
             let a = self.m.atom(&f.name);
             push_unique(&mut keys, a);
-            push_unique(&mut definite, a);
+            if f.origin == perry_hir::ClassFieldOrigin::Declared {
+                push_unique(&mut declared, a);
+            } else {
+                push_unique(&mut definite, a);
+            }
         }
+        self.m.tmpls[tm as usize].declared = declared;
         if let Some(ph) = self.ctor_phase.get(&tm).cloned() {
             for k in &ph.assigned_order {
                 let a = self.m.atom(k);
@@ -170,6 +177,12 @@ impl<'a> Gen<'a> {
     /// A constructor up `tm`'s chain may leak `this` before `tm`'s own
     /// stores run: one that leaks, a native parent, a parent value not
     /// settled, or another unit's class (its constructor is not seen).
+    /// Whether `tm`'s constructor or one up its chain leaks `this`
+    /// (published as `ClassContract::ctor_leaks`).
+    pub(crate) fn chain_leaks(&self, tm: TmplId) -> bool {
+        self.ctor_phase.get(&tm).map_or(true, |ph| ph.leaks) || self.parent_chain_leaks(tm)
+    }
+
     fn parent_chain_leaks(&self, tm: TmplId) -> bool {
         if self.m.tmpls[tm as usize].native_parent.is_some() || self.parent_pending(tm) {
             return true;
@@ -177,7 +190,7 @@ impl<'a> Gen<'a> {
         let mut cur = self.m.tmpls[tm as usize].parent;
         while let Some(p) = cur {
             if self.ctor_phase.get(&p).is_some_and(|ph| ph.leaks)
-                || self.stand_in_cc.contains_key(&p)
+                || self.stand_in_cc.get(&p).is_some_and(|c| c.ctor_leaks)
                 || self.m.tmpls[p as usize].native_parent.is_some()
             {
                 return true;
@@ -227,6 +240,7 @@ impl<'a> Gen<'a> {
         if fn_ctor {
             self.note_fn_phase(fxi, crate::ctor_phase::analyze_fn(f));
         }
+        self.rooted_stores.extend(crate::rooted::stores(&f.body));
         let fx = Fx {
             module: mi,
             f: fxi,
@@ -357,6 +371,13 @@ impl<'a> Gen<'a> {
         };
         let cobj = self.m.tok(TokKind::ClassObj(tm));
         for f in &c.static_fields {
+            // A declared static field (`Model::static_fields`), whether the
+            // walk sees its initializer here or where a nested class is
+            // evaluated.
+            if f.key_expr.is_none() {
+                let a = self.m.atom(&f.name);
+                self.m.static_fields.insert((tm, a));
+            }
             if c.is_nested && (f.init.is_some() || f.key_expr.is_some()) {
                 // A nested class's static initializers run where the class
                 // is evaluated (`StaticFieldSet`, `ClassStaticSymbolSet`,
@@ -442,6 +463,8 @@ impl<'a> Gen<'a> {
             ctor_phase_of,
             birth,
             ctor_fn: None,
+            rooted: false,
+            deep: false,
         });
         id
     }
@@ -523,6 +546,11 @@ impl<'a> Gen<'a> {
                     }
                     None => self.m.add_prim(n, prim::UNDEF),
                 }
+                if let Some(perry_hir::Expr::ForInKeys(o)) = init {
+                    if let perry_hir::Expr::LocalGet(obj) = o.as_ref() {
+                        self.for_in_keys_of.insert((fx.module, *id), *obj);
+                    }
+                }
             }
             Stmt::Expr(e) => {
                 let _ = self.expr(fx, e);
@@ -565,7 +593,10 @@ impl<'a> Gen<'a> {
                 if let Some(u) = update {
                     let _ = self.expr(fx, u);
                 }
-                self.stmts(fx, body);
+                match self.for_in_of(fx, body) {
+                    Some(f) => self.for_in_body(fx, &f),
+                    None => self.stmts(fx, body),
+                }
             }
             Stmt::Labeled { body, .. } => self.stmt(fx, body),
             Stmt::Break

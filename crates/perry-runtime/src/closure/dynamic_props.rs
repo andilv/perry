@@ -127,7 +127,7 @@ pub fn is_closure_ptr(ptr: usize) -> bool {
 
     // Ownership above is the proof that this payload byte is readable.
     let shape = unsafe { *((ptr as *const u8).add(super::CLOSURE_SHAPE_OFFSET) as *const u32) };
-    if !crate::object::shapes::is_exotic_shape_id(shape) {
+    if !crate::object::shapes::is_exotic_layout_word(shape) {
         return false;
     }
     let header = match tracked_header {
@@ -790,9 +790,12 @@ mod tests_1802 {
             // so there is nothing for a barrier to track.
             let word = (error as *mut u8).add(super::super::CLOSURE_SHAPE_OFFSET) as *mut u32;
             let saved = word.read();
-            word.write(super::super::shape::function_base_shape(
-                super::super::shape::FunctionProtoKind::Function,
-            ));
+            word.write(
+                super::super::shape::function_base_shape(
+                    super::super::shape::FunctionProtoKind::Function,
+                )
+                .0,
+            );
 
             assert!(!is_closure_ptr(error as usize));
             // GC_STORE_AUDIT(POINTER_FREE): restores the scalar error_kind word.

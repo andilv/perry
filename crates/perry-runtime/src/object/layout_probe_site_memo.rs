@@ -7,6 +7,7 @@
 //! passes the memo instead of a hash: short own lists need neither; other
 //! paths load the atom's existing creation hash. Keyed leaves stay stateless.
 use super::*;
+use crate::codegen_abi::LayoutWord;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 const PAIRS: usize = 5;
@@ -20,12 +21,19 @@ const ACCESSOR: u32 = 1 << 31;
 const SPILL: u32 = 1 << 30;
 const SLOT_MASK: u32 = SPILL - 1;
 
-/// Exactly five (ShapeId, slot) pairs. Zero shape means an empty answer.
-/// Shared integer storage, never indexed through a registry. ShapeIds are
-/// process-global and never reused. Each atomic word is a complete proof for
-/// this fixed key; a racing writer can cause a shape mismatch, never a torn
-/// (shape, slot). Every continuation revalidates the live link and next shape.
-/// There is no whole-memo validity bit, epoch, or cached heap address.
+/// Exactly five (LayoutWord, slot) pairs. Zero shape means an empty answer.
+/// Shared integer storage, never indexed through a registry. A LayoutWord is
+/// agent-local storage of a row, but within one image it names one shape in
+/// every agent: static rows are the image's compile-time ordinals, dynamic
+/// rows come from process-unique chunks. A compiled site's memo lives in its
+/// image's data; a runtime-crate memo is shared by every image of the process,
+/// whose static rows N..S-1 differ, so it serves only the primary image
+/// (`class_image::process_shared_memo`). A hit also needs a live receiver
+/// carrying the word, so the row it reads is published in this agent. Each
+/// atomic word is a complete proof for this fixed key; a racing writer can
+/// cause a shape mismatch, never a torn (shape, slot). Every continuation
+/// revalidates the live link and next shape. There is no whole-memo validity
+/// bit, epoch, or cached heap address.
 #[repr(C)]
 pub struct ReadSiteMemo {
     pairs: [AtomicU64; PAIRS],
@@ -75,7 +83,7 @@ unsafe fn ordinary_word(obj: *const ObjectHeader) -> Option<u32> {
     }
     let word = (*obj).parent_class_id;
     // An overflow's SHADOW_BIT deliberately prevents a site comparison.
-    crate::object::shapes::is_site_matchable_shape_id(word).then_some(word)
+    crate::object::shapes::is_site_matchable_layout_word(word).then_some(word)
 }
 
 #[inline(always)]
@@ -129,7 +137,7 @@ pub(crate) unsafe fn lookup(
                 return None;
             }
         }
-        let r = record_of(dir, shape);
+        let r = record_of(dir, LayoutWord(shape));
         if r.is_null() {
             return None;
         }
@@ -158,7 +166,7 @@ unsafe fn declined(obj: *const ObjectHeader, memo: &ReadSiteMemo) -> bool {
 unsafe fn decline(obj: *const ObjectHeader, memo: &ReadSiteMemo) {
     let word = (*obj).parent_class_id;
     let held = memo.pairs[0].load(Relaxed);
-    if crate::object::shapes::is_site_matchable_shape_id(word)
+    if crate::object::shapes::is_site_matchable_layout_word(word)
         && (held == 0 || held as u32 == DECLINE)
     {
         // A decline uses only word zero. Do not clear a racing positive
@@ -210,7 +218,7 @@ pub(crate) unsafe fn prime(
     let mut learned = [0u64; PAIRS];
     for i in 0..PAIRS {
         let shape = ordinary_word(obj)?;
-        let r = record_of(dir, shape);
+        let r = record_of(dir, LayoutWord(shape));
         if r.is_null()
             || !(*r).present()
             || !positional_layout(&*r)
@@ -376,7 +384,14 @@ pub(super) unsafe fn miss_underived<const ABSENT_OK: bool, const LAZY_HASH: bool
     }
     let hash = site_key_hash::<LAZY_HASH>(key_bits, hash);
     let word = (*obj).parent_class_id;
-    probe_get_underived::<ABSENT_OK>(dir, obj, word, record_of(dir, word), key_bits, hash)
+    probe_get_underived::<ABSENT_OK>(
+        dir,
+        obj,
+        LayoutWord(word),
+        record_of(dir, LayoutWord(word)),
+        key_bits,
+        hash,
+    )
 }
 
 #[inline(never)]
@@ -392,7 +407,14 @@ unsafe fn miss_underived_matched<const ABSENT_OK: bool, const LAZY_HASH: bool>(
     }
     let hash = site_key_hash::<LAZY_HASH>(key_bits, hash);
     let word = (*obj).parent_class_id;
-    probe_get_underived::<ABSENT_OK>(dir, obj, word, record_of(dir, word), key_bits, hash)
+    probe_get_underived::<ABSENT_OK>(
+        dir,
+        obj,
+        LayoutWord(word),
+        record_of(dir, LayoutWord(word)),
+        key_bits,
+        hash,
+    )
 }
 
 /// The own slot at position `pos` read a hole.
@@ -413,7 +435,7 @@ pub(super) unsafe fn miss_hole<const ABSENT_OK: bool, const LAZY_HASH: bool>(
     own_hole::<ABSENT_OK>(
         dir,
         obj,
-        record_of(dir, (*obj).parent_class_id),
+        record_of(dir, LayoutWord((*obj).parent_class_id)),
         pos,
         key_bits,
         hash,
@@ -436,7 +458,7 @@ unsafe fn miss_hole_matched<const ABSENT_OK: bool, const LAZY_HASH: bool>(
     own_hole::<ABSENT_OK>(
         dir,
         obj,
-        record_of(dir, (*obj).parent_class_id),
+        record_of(dir, LayoutWord((*obj).parent_class_id)),
         pos,
         key_bits,
         hash,

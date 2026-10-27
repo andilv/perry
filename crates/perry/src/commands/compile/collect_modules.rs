@@ -39,6 +39,7 @@ mod import_meta_require;
 mod import_meta_resolve;
 mod json_module;
 mod native_addon;
+mod native_esm_namespace;
 mod parse_error;
 pub(crate) mod reexport_prune;
 mod script_string;
@@ -141,6 +142,28 @@ pub(crate) struct PreparedModule {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The CommonJS support module's path: under the cache dir, named by the
+/// entry, so one program always compiles it at the same path.
+pub(super) fn cjs_support_path(ctx: &mut CompilationContext) -> PathBuf {
+    if let Some(p) = &ctx.cjs_support_path {
+        return p.clone();
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ctx.entry_canonical.hash(&mut hasher);
+    // Canonical, like every collected module's key: the file itself is
+    // written only after the walk, so its directory is canonicalized.
+    let dir = ctx.cache_dir.join("synthetic-modules");
+    let _ = std::fs::create_dir_all(&dir);
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let path = dir.join(format!("perry-cjs-{:016x}.mjs", hasher.finish()));
+    // Compiler-generated code: compiled natively wherever the cache dir is
+    // (by default under `node_modules/.cache`).
+    ctx.aot_discovered_modules.insert(path.clone());
+    ctx.cjs_support_path = Some(path.clone());
+    path
+}
+
 fn collect_module_one(
     entry_path: &PathBuf,
     canonical: PathBuf,
@@ -494,6 +517,23 @@ fn collect_module_one(
         ctx.needs_stdlib = true;
         ctx.native_module_imports.insert(module);
     }
+    // `dns` is runtime-only, so `stdlib_modules` never lists it. Note a literal
+    // `require('dns')` (and a `getBuiltinModule` mention of it) separately: it
+    // arms the dns export router (`js_dns_install_exports`).
+    let is_dns = |spec: &str| {
+        matches!(
+            spec.strip_prefix("node:").unwrap_or(spec),
+            "dns" | "dns/promises"
+        )
+    };
+    ctx.uses_dns |= super::cjs_wrap::extract_require_specifiers(&source)
+        .iter()
+        .any(|spec| is_dns(spec));
+    if source.contains("getBuiltinModule") {
+        ctx.uses_dns |= node_specifier_literals(&source)
+            .into_iter()
+            .any(|spec| is_dns(spec));
+    }
     if let Some(prefix_line_count) = debug_prefix_line_count {
         ctx.cjs_wrap_debug_sources.insert(
             canonical.clone(),
@@ -578,8 +618,16 @@ fn collect_module_one(
     let forwarding_module =
         reexport_prune::normalize_forwarding_barrel(ast_module, entry_path, ctx);
     let ast_module = forwarding_module.as_ref().unwrap_or(ast_module);
+    let native_namespace_module = native_esm_namespace::rewrite_static(ast_module, &ctx.cache_dir)?;
+    let ast_module = native_namespace_module.as_ref().unwrap_or(ast_module);
     let file_loader_sources = file_loader_import_sources(ast_module);
     let source_file_path = canonical.to_string_lossy().to_string();
+    if !perry_hir::source_remap::is_covered(&canonical) {
+        eprintln!(
+            "warning: {} is outside --source-root; its real path is baked into the output",
+            canonical.display()
+        );
+    }
     // JavaScript class fields are always [[Define]]; a TypeScript module
     // follows its tsconfig's `useDefineForClassFields`.
     let assign_class_fields = canonical
@@ -1054,9 +1102,12 @@ fn collect_module_one(
                             Some(l) => format!("{}:{}", source_file_path, l),
                             None => source_file_path.clone(),
                         };
+                        // The message is baked into the program, so it names the
+                        // remapped path; the build notice keeps the real one.
+                        let baked_loc = perry_hir::source_remap::baked_path(&loc);
                         let msg = format!(
                             "dynamic import() of a runtime-computed path cannot run in an \
-                             ahead-of-time compiled binary ({loc})"
+                             ahead-of-time compiled binary ({baked_loc})"
                         );
                         perry_hir::record_deferred_aot_site("import(...)", loc);
                         dynamic_path_sets.push(DynImportOutcome::Deferred(msg));
@@ -1257,11 +1308,13 @@ fn collect_module_one(
         // edge is skipped by init order and export pruning. Folding into one
         // dropped the real `import("./x.ts")` or `new Worker(new URL("./x.ts",
         // ...))` of the same file, so it gets its own dynamic edge instead.
-        if let Some(existing) = hir_module
-            .imports
-            .iter_mut()
-            .find(|i| i.source == source && !i.is_dynamic && !i.type_only && !i.runtime_erased)
-        {
+        if let Some(existing) = hir_module.imports.iter_mut().find(|i| {
+            i.source == source
+                && !i.is_dynamic
+                && !i.type_only
+                && !i.runtime_erased
+                && !native_esm_namespace::is_builtin(&source)
+        }) {
             existing.is_dynamic_target = true;
             continue;
         }
@@ -1288,6 +1341,25 @@ fn collect_module_one(
 
     // Process imports and update their resolved paths and module kinds
     for import in &mut hir_module.imports {
+        // The CommonJS support module: written by the walk once the graph is
+        // complete (`walk::write_cjs_support`), so it is not queued here.
+        if import.source == super::cjs_wrap::support::SPECIFIER {
+            import.resolved_path = Some(cjs_support_path(ctx).to_string_lossy().into_owned());
+            import.module_kind = ModuleKind::NativeCompiled;
+            continue;
+        }
+        // A native dynamic import owns the same ordinary ESM namespace as
+        // a static namespace import. Keep default/named native imports native:
+        // their binding values and method lowering already have the right ABI.
+        if import.is_dynamic && native_esm_namespace::is_builtin(&import.source) {
+            let path = native_esm_namespace::materialize(&ctx.cache_dir, &import.source)?;
+            let path = path.canonicalize()?;
+            import.resolved_path = Some(path.to_string_lossy().into_owned());
+            import.is_native = false;
+            import.module_kind = ModuleKind::NativeCompiled;
+            pending.push(path);
+            continue;
+        }
         ensure_bunfs_import_resolves(&import.source, &canonical, ctx)?;
         // Resolve TypeScript type-only imports for metadata, but never queue
         // their target as a runtime module. The final graph may already
@@ -1902,6 +1974,7 @@ fn collect_module_one(
                 || import.is_dynamic
                 || import.is_native
                 || import.module_kind != perry_hir::ModuleKind::NativeCompiled
+                || import.source == super::cjs_wrap::support::SPECIFIER
             {
                 continue;
             }
@@ -1924,6 +1997,7 @@ fn collect_module_one(
         }
     }
 
+    ctx.uses_dns |= hir_module.imports.iter().any(|i| is_dns(&i.source));
     ctx.reexport_pruner.imports(&hir_module.imports);
 
     // Process re-exports

@@ -26,15 +26,26 @@ use crate::module::LlModule;
 use crate::strings::StringPool;
 
 /// `%PerryLayoutDesc`: family, variant, kind, integrity, slot_count,
-/// layout_id, rep, proto, keys, key_count, index_mask, index (56 bytes).
+/// template word, rep, proto, keys, key_count, index_mask, index, class, parent,
+/// methods, identity and pad (80 bytes LP64; 64 bytes ILP32).
 pub const DESC_TY: &str =
-    "{ i32, i16, i8, i8, i32, i32, i64, i64, ptr, i32, i32, ptr, i32, i32, ptr }";
+    "{ i32, i16, i8, i8, i32, i32, i64, ptr, ptr, i32, i32, ptr, i32, i32, ptr, i32, i32 }";
 mod methods;
 /// `%PerryLayoutKey`: atom, slot, attrs, pad (16 bytes).
 pub const KEY_TY: &str = "{ ptr, i32, i8, [3 x i8] }";
 /// `%StaticAtom`: hash, string, kind, pad, index (24 bytes; §6a).
 pub const ATOM_TY: &str = "{ i64, ptr, i8, [3 x i8], i32 }";
-/// Byte offset of `layout_id` in a descriptor.
+// Windows atom records share one read-only COFF image with the Rust atoms
+// and boundary markers. A writable input would be split into another section.
+fn atom_storage(target: &str) -> &'static str {
+    if target.contains("windows") {
+        "constant"
+    } else {
+        "global"
+    }
+}
+
+/// Byte offset of the immutable template LayoutWord in a descriptor.
 pub const DESC_LAYOUT_ID_OFFSET: u32 = 12;
 
 /// `PerryLayoutDesc.layout_id` of a layout objects carry (the runtime's
@@ -272,8 +283,9 @@ fn atom(
         "__DATA,__perry_atoms",
         ".perryatm$m",
     );
+    let atom_storage = atom_storage(&llmod.target_triple);
     llmod.add_coalesced_global(&name, format!(
-        "@{name} = weak_odr global {ATOM_TY} {{ i64 {}, ptr {image}, i8 {}, [3 x i8] [i8 {}, i8 0, i8 0], i32 {} }}, section \"{sect}\", align 8",
+        "@{name} = weak_odr {atom_storage} {ATOM_TY} {{ i64 {}, ptr {image}, i8 {}, [3 x i8] [i8 {}, i8 0, i8 0], i32 {} }}, section \"{sect}\", align 8",
         fnv1a(key.as_bytes()) as i64,
         crate::runtime_abi::ATOM_KIND_STRING,
         u8::from(colour.is_some()),
@@ -313,8 +325,9 @@ fn symbol_atom(
             "__DATA,__perry_atoms",
             ".perryatm$m",
         );
+        let atom_storage = atom_storage(&llmod.target_triple);
         llmod.add_raw_global(format!(
-            "@{name} = internal global {ATOM_TY} {{ i64 {}, ptr null, i8 {}, [3 x i8] zeroinitializer, i32 0 }}, section \"{sect}\", align 8",
+            "@{name} = internal {atom_storage} {ATOM_TY} {{ i64 {}, ptr null, i8 {}, [3 x i8] zeroinitializer, i32 0 }}, section \"{sect}\", align 8",
             hash as i64,
             crate::runtime_abi::ATOM_KIND_BINDING_SYMBOL,
         ));
@@ -355,8 +368,9 @@ fn symbol_atom(
         "__DATA,__perry_atoms",
         ".perryatm$m",
     );
+    let atom_storage = atom_storage(&llmod.target_triple);
     llmod.add_coalesced_global(&name, format!(
-        "@{name} = weak_odr global {ATOM_TY} {{ i64 {}, ptr {image}, i8 {kind}, [3 x i8] zeroinitializer, i32 {index} }}, section \"{sect}\", align 8",
+        "@{name} = weak_odr {atom_storage} {ATOM_TY} {{ i64 {}, ptr {image}, i8 {kind}, [3 x i8] zeroinitializer, i32 {index} }}, section \"{sect}\", align 8",
         hash as i64,
     ));
     emitted.insert(spelling, name.clone());
@@ -407,10 +421,25 @@ fn emit_image_descriptor(
         "@{index_name} = private unnamed_addr constant [{cap} x i32] [{}], align 4",
         index_items.join(", ")
     ));
+    let identity = 0;
+    let word = crate::layout_ordinals::descriptor_word(
+        desc_name,
+        format!("{keys:?}|{family}|{proto}|{variant}|{integrity}"),
+        if proto == "1" {
+            2
+        } else if proto == "0" {
+            0
+        } else {
+            1
+        },
+        false,
+        true,
+        identity,
+    );
     llmod.add_raw_global(format!(
-        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 {variant}, i8 0, i8 {integrity}, i32 {}, i32 {}, i64 0, i64 {proto}, ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null }}, section \"{sect}\", align 8",
+        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 {variant}, i8 0, i8 {integrity}, i32 {}, i32 {}, i64 0, ptr inttoptr (i64 {proto} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null, i32 {identity}, i32 0 }}, section \"{sect}\", align 8",
         count.max(1),
-        LAYOUT_ID_CARRIED as i32,
+        word as i32,
         cap - 1
     ));
 }
@@ -662,6 +691,20 @@ pub(crate) fn layouts_enabled(output_type: &str, target_triple: &str) -> bool {
         && std::env::var("PERRY_LAYOUT_DESCS").as_deref() != Ok("0")
 }
 
+/// The descriptor prototype tag of a class family: 0 (the class's own
+/// prototype) for every class but a declared-keys record, whose instances
+/// have a null prototype (1, `require.cache`) or `%Object.prototype%` (3,
+/// `exports`).
+fn declared_proto_tag(class: &perry_hir::Class) -> u8 {
+    if !class.is_declared_keys_record() {
+        0
+    } else if class.declared_keys_null_proto() {
+        1
+    } else {
+        3
+    }
+}
+
 /// One descriptor plus its keys and index tables. `keys` is the key sequence
 /// in enumeration order with each key's slot.
 #[allow(clippy::too_many_arguments)]
@@ -674,6 +717,7 @@ fn emit_desc(
     slot_count: u32,
     class: (u32, u32),
     methods: &str,
+    proto: u8,
 ) {
     let (keys_name, index_name, desc_name) = names;
     let count = keys.len();
@@ -720,9 +764,20 @@ fn emit_desc(
         "@{index_name} = private unnamed_addr constant [{cap} x i32] [{}], align 4",
         index_items.join(", ")
     ));
+    let word = crate::layout_ordinals::descriptor_word(
+        desc_name,
+        format!("{keys:?}|{family}|{slot_count}|{class:?}"),
+        0,
+        true,
+        // Both nominal and admitted classless families carry their DPA word.
+        true,
+        0,
+    );
     llmod.add_raw_global(format!(
-        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 0, i64 0, ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 {}, i32 {}, ptr {methods} }}, section \"{sect}\", align 8",
-        if class.0 == 0 { 0 } else { LAYOUT_ID_CARRIED as i32 },
+        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 0, ptr inttoptr (i64 {} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 {}, i32 {}, ptr {methods}, i32 0, i32 0 }}, section \"{sect}\", align 8",
+        word as i32,
+        // The `PerryLayoutDesc.proto` tag (perry-runtime `layout_desc`).
+        proto,
         cap - 1,
         class.0,
         class.1
@@ -787,8 +842,9 @@ pub(crate) fn emit_module_layouts(
             );
             // weak_odr coalesces one well-known atom across modules.
             if !atoms.contains_key(name) {
+                let atom_storage = atom_storage(&llmod.target_triple);
                 llmod.add_coalesced_global(name, format!(
-                    "@{name} = weak_odr global {ATOM_TY} {{ i64 {}, ptr null, i8 {}, [3 x i8] zeroinitializer, i32 {} }}, section \"{atom_sect}\", align 8",
+                    "@{name} = weak_odr {atom_storage} {ATOM_TY} {{ i64 {}, ptr null, i8 {}, [3 x i8] zeroinitializer, i32 {} }}, section \"{atom_sect}\", align 8",
                     hash as i64, crate::runtime_abi::ATOM_KIND_WELL_KNOWN_SYMBOL,
                     crate::runtime_abi::WELL_KNOWN_SYMBOL_ITERATOR));
                 atoms.insert(name.into(), name.into());
@@ -1017,9 +1073,28 @@ pub(crate) fn emit_module_layouts(
             variants.push((v.key_bits, vnamed, v.slot_count));
         }
         let methods = methods::emit(llmod, strings, &mut atoms, fam);
+        let literal = layouts.literal_families.contains(&fam.class_id);
+        let identity = if literal {
+            (0, 0)
+        } else {
+            (fam.class_id, fam.parent_class_id)
+        };
+        // First-birth literal descriptors are static image data outside the
+        // startup enumeration. DPA assigns their immutable row words; the
+        // runtime publishes the current agent's facts only at first birth.
+        let family_section = if literal {
+            section(
+                &llmod.target_triple,
+                "perry_literal_layouts",
+                "__DATA,__perry_litlay",
+                ".perrylit$m",
+            )
+        } else {
+            sect.clone()
+        };
         emit_desc(
             llmod,
-            &sect,
+            &family_section,
             (
                 &format!("perry_layout_keys_{module_prefix}_{n}"),
                 &format!("perry_layout_index_{module_prefix}_{n}"),
@@ -1028,8 +1103,9 @@ pub(crate) fn emit_module_layouts(
             family,
             &named,
             fam.slot_count,
-            (fam.class_id, fam.parent_class_id),
+            identity,
             &methods,
+            declared_proto_tag(class),
         );
         n += 1;
         let mut entries = Vec::with_capacity(variants.len());
@@ -1037,7 +1113,7 @@ pub(crate) fn emit_module_layouts(
             let name = format!("perry_layout_class_{}_v{j}", fam.class_id);
             emit_desc(
                 llmod,
-                &sect,
+                &family_section,
                 (
                     &format!("perry_layout_keys_{module_prefix}_{n}"),
                     &format!("perry_layout_index_{module_prefix}_{n}"),
@@ -1046,8 +1122,9 @@ pub(crate) fn emit_module_layouts(
                 family,
                 vnamed,
                 *slot_count,
-                (fam.class_id, fam.parent_class_id),
+                identity,
                 &methods,
+                declared_proto_tag(class),
             );
             n += 1;
             entries.push((*key_bits, name));
@@ -1259,9 +1336,28 @@ fn emit_descriptor(
             "@{index_name} = private unnamed_addr constant [{cap} x i32] [{}], align 4",
             index_items.join(", ")
         ));
+        let identity = if layout_id == LAYOUT_ID_CARRIED {
+            0
+        } else {
+            layout_id
+        };
+        let word = crate::layout_ordinals::descriptor_word(
+            desc_name,
+            format!("{keys:?}|{family}|{slot_count}|{rep}|{first_hash:?}|{proto}"),
+            if proto == "1" {
+                2
+            } else if proto == "0" {
+                0
+            } else {
+                1
+            },
+            false,
+            layout_id != 0,
+            identity,
+        );
         llmod.add_raw_global(format!(
-            "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 {}, i64 {proto}, ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null }}, section \"{sect}\", align 8",
-            layout_id as i32,
+            "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 {}, ptr inttoptr (i64 {proto} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null, i32 {identity}, i32 0 }}, section \"{sect}\", align 8",
+            word as i32,
             rep as i64,
             cap - 1
         ));

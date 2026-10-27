@@ -424,9 +424,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[DOUBLE, DOUBLE, I32, PTR, I32, DOUBLE],
     );
     module.declare_function(
-        "js_object_final_shape_id_for_class_keys_static_private",
+        "js_object_final_layout_for_class_keys_static_private",
         I32,
-        &[I64, I32, I32, I32, I32, I64, PTR, I32, PTR, I32],
+        &[I64, I32, I32, I32, PTR, I64, PTR, I32, PTR, I32],
     );
     module.declare_function(
         "js_private_method_guard",
@@ -740,6 +740,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         I32,
         &[DOUBLE, DOUBLE, I64, I64, I64, I32, I32, I32, I64],
     );
+    // FVA: the contract witness of an elided call (`lower_call/proven_call.rs`).
+    module.declare_function("perry_wpfacts_check_call", PTR, &[DOUBLE, I64, I64]);
+    module.declare_function("perry_wpfacts_check_call_miss", I32, &[PTR, I64]);
     // #8655: guarded packed-array / dense Array-subclass read before the
     // fully generic dynamic dispatcher. Used by unknown-receiver loop reads,
     // and (#T2) the single out-of-line exit of the emitted dynamic `obj[i]`
@@ -1196,14 +1199,14 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[I32, I32, I32, I64, I32, I64],
     );
     module.declare_function("js_build_class_keys_array", I64, &[I32, I32, PTR, I32, I64]);
-    module.declare_function("js_object_shape_id_for_keys", I32, &[I64, I32]);
+    module.declare_function("js_object_layout_for_keys", I32, &[I64, I32]);
     module.declare_function(
-        "js_object_shape_id_for_class_keys",
+        "js_object_layout_for_class_keys",
         I32,
         &[I64, I32, I32, I64],
     );
     module.declare_function(
-        "js_object_shape_id_for_class_keys_live",
+        "js_object_layout_for_class_keys_live",
         I32,
         &[I64, I32, I32, I32, I64],
     );
@@ -1220,14 +1223,14 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Design step 4: the per-class mint with the driver's static id, and the
     // literal-shape seed.
     module.declare_function(
-        "js_object_shape_id_for_class_keys_static",
+        "js_object_layout_for_class_keys_static",
         I32,
-        &[I64, I32, I32, I32, I32, I64],
+        &[I64, I32, I32, I32, PTR, I64],
     );
     module.declare_function(
-        "js_object_final_shape_id_for_class_keys_static_constfn",
+        "js_object_final_layout_for_class_keys_static_constfn",
         I32,
-        &[I64, I32, I32, I32, I32, I64, PTR, I32],
+        &[I64, I32, I32, I32, PTR, I64, PTR, I32],
     );
     module.declare_function(
         "js_object_finalize_constfn_static",
@@ -1235,6 +1238,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
         &[I64, I32, PTR, I32, I32, I32, I32, I64, PTR, I32],
     );
     module.declare_function("perry_alloc_layout", PTR, &[PTR]);
+    module.declare_function("perry_alloc_literal_layout", PTR, &[PTR]);
     module.declare_function("perry_alloc_class_family", PTR, &[PTR, I32, I32]);
     module.declare_function(
         "perry_function_family_symbol_set",
@@ -1249,7 +1253,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     );
     // `PERRY_CHECK_CONTRACTS` builds only.
     module.declare_function("js_create_family_contract_check", VOID, &[PTR, DOUBLE]);
-    module.declare_function("js_shape_seed_plain", I32, &[I32, PTR, I32, I32, I32, I64]);
+    module.declare_function("js_layout_seed_plain", I32, &[PTR, PTR, I32, I32, I32, I64]);
     module.declare_function("js_shape_register_static_seed", VOID, &[PTR]);
     module.declare_function("js_shape_run_static_seed", VOID, &[]);
     // Inline bump-allocator state accessor + slow path. Ordinary allocation
@@ -1528,7 +1532,6 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // literals (`{ x: 1 }`) return the global `Object` constructor
     // instead of the synthetic class ref. Refs #968 / date-fns
     // `constructFrom` blocker.
-    module.declare_function("js_register_anon_shape_class_id", VOID, &[I32]);
     // Built-in constructor / namespace value-lookup on the globalThis
     // singleton. Used to wire `instance.constructor` and bare
     // `Date`/`Array`/`Object` identifiers to the same closure pointer
