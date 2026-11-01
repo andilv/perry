@@ -249,29 +249,33 @@ jobs:
           Compress-Archive -Path staging-lite/* -DestinationPath "${{ matrix.artifact }}-lite.zip"
 
       - name: Upload artifact (Unix)
+        # archive:false skips the zip envelope — the payload is already one
+        # self-contained tar.gz, so the default would double-compress it.
+        # Constraint: the `name` input is ignored and the FILENAME becomes
+        # the artifact name (perry-<target>.tar.gz on the run page).
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
+          archive: false
           path: "${{ matrix.artifact }}.tar.gz"
 
       - name: Upload lite artifact (Unix)
         if: steps.filter.outputs.run == 'true' && runner.os != 'Windows'
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}-lite
-          path: "*-lite.tar.gz"
+          archive: false
+          path: "${{ matrix.artifact }}-lite.tar.gz"
 
       - name: Upload artifact (Windows)
         if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
+          archive: false
           path: "${{ matrix.artifact }}.zip"
 
       - name: Upload lite artifact (Windows)
         if: steps.filter.outputs.run == 'true' && runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}-lite
-          path: "*-lite.zip"
+          archive: false
+          path: "${{ matrix.artifact }}-lite.zip"
