@@ -30,6 +30,7 @@
 //! errors with an actionable "Phase X not yet supported" message.
 
 pub mod reach_report;
+pub(crate) mod realm_image;
 pub mod source_need;
 
 use std::cell::Cell;
@@ -232,8 +233,10 @@ mod class_artifacts;
 pub(crate) mod class_hierarchy;
 #[cfg(test)]
 mod clone_suffix_tests;
+pub(crate) mod closed_targets;
 mod closure;
 mod closure_capture_cells;
+mod closure_captures;
 mod closure_collect;
 mod constructor_contracts;
 #[cfg(test)]
@@ -244,6 +247,7 @@ mod ctor_arity;
 pub use ctor_arity::{
     context_free_ctor_abi, context_free_ctor_param_count, CtorAbi, UNRESOLVED_PARENT_FWD_ARITY,
 };
+mod checked_integer;
 #[cfg(test)]
 mod declared_string_add_tests;
 #[cfg(test)]
@@ -254,7 +258,6 @@ mod export_value_wrappers;
 pub(crate) mod fresh_class_templates;
 pub(crate) mod func_registry;
 mod function;
-mod function_metadata_descriptors;
 mod function_source_header;
 #[cfg(test)]
 mod guarded_falsy_default_method_tests;
@@ -267,6 +270,7 @@ mod imported_global_order_tests;
 #[cfg(test)]
 mod index_method_clone_tests;
 mod indexed_method_artifacts;
+mod integer_contract;
 #[cfg(test)]
 mod literal_method_this_tests;
 mod ordinary_method_artifacts;
@@ -298,7 +302,8 @@ mod number_exactness_tests;
 mod opts;
 mod program_facts_view;
 pub use program_facts_view::{
-    ElisionFacts, FactsBody, FactsClass, FactsField, FactsRecv, ProgramFactsView,
+    ElisionFacts, FactsBody, FactsClass, FactsField, FactsIndexedOwner, FactsNumericExpr,
+    FactsNumericFunction, FactsRecv, ProgramFactsView,
 };
 #[cfg(test)]
 mod ordinary_param_guard_tests;
@@ -333,6 +338,8 @@ mod string_pool;
 pub(crate) fn string_pool_image_pointer(entry: &crate::strings::StringEntry) -> String {
     string_pool::image_pointer(entry)
 }
+pub(crate) use string_pool::{emit_image_record, image_record_symbol};
+pub(crate) mod numeric_remainder;
 #[cfg(test)]
 mod testing_feature_gate_tests;
 #[cfg(test)]
@@ -517,6 +524,7 @@ pub fn user_function_symbol(module_name: &str, function_name: &str) -> String {
 /// hash to AFTER codegen.
 pub fn compile_module(hir: &HirModule, mut opts: CompileOptions) -> Result<Vec<u8>> {
     ensure_layout_plan(hir, &mut opts)?;
+    crate::facts_consumed::begin_module(&hir.name);
     let _fallback = crate::fallback_diag::begin(
         &hir.name,
         opts.module_source.as_deref(),
@@ -533,6 +541,7 @@ pub fn compile_module(hir: &HirModule, mut opts: CompileOptions) -> Result<Vec<u
 /// Lowering only borrows the input, preserving its object-cache identity.
 pub fn compile_module_owned(hir: HirModule, mut opts: CompileOptions) -> Result<Vec<u8>> {
     ensure_layout_plan(&hir, &mut opts)?;
+    crate::facts_consumed::begin_module(&hir.name);
     let _fallback = crate::fallback_diag::begin(
         &hir.name,
         opts.module_source.as_deref(),
@@ -644,6 +653,7 @@ fn lower_module(
     // runs it does not reach, when this module's codegen ends.
     let _region_diag = (!collect_births).then(|| crate::expr::region_guard::ModuleDiag::start(hir));
     crate::stmt::region_loop::begin_module(hir);
+    closed_targets::begin_module();
     let fp_flags = crate::block::FpFlags::new(opts.fast_math, opts.fp_contract_mode);
 
     // #5334 lever B: decide ONCE, up front, whether this module is large enough
@@ -662,6 +672,7 @@ fn lower_module(
     // FEAT_JSCVT decision is per-target (apple-arm64 only) — same
     // set-per-module discipline as the outline gate above.
     helpers::set_jscvt_for_target(&triple);
+    helpers::set_js_text_section_for_target(&triple);
     // Native roots are the default lowering wherever the runtime can walk the
     // frames, and the shadow stack elsewhere. Same per-module discipline.
     helpers::set_native_roots_for_target(&triple);
@@ -749,6 +760,7 @@ fn lower_module(
         .unwrap_or(&module_prefix);
     let mut strings = StringPool::with_prefix(module_prefix.clone());
     strings.set_thread_literal_callback_prefix(thread_literal_callback_prefix.clone());
+    strings.set_image_literals(opts.output_type != "dylib" && opts.output_type != "staticlib");
     strings.tdz_binding_names = tdz_names::collect(hir);
     // #5247: install per-module source-location context for the dynamic
     // call-dispatch throw path, but only under `--debug-symbols` (which sets
@@ -2642,7 +2654,11 @@ fn lower_module(
             let Some(&class_id) = class_ids.get(class_name) else {
                 continue;
             };
-            let gc_packed = crate::target_layout::inline_alloc_gc_packed(&triple, field_count);
+            let gc_packed = crate::target_layout::inline_alloc_gc_packed(
+                &triple,
+                crate::target_layout::class_instance_form(class_name),
+                field_count,
+            );
             match inits.get(keys_global) {
                 // Two names (an alias) sharing one keys global must agree on
                 // the word module init writes; if they do not, neither may use
@@ -2988,7 +3004,21 @@ fn lower_module(
             .into_iter()
             .filter(|id| !funcs_reading_dynamic_this.contains(id))
             .collect();
+    // Closure collection + derived per-closure dispatch maps. See
+    // `closure_collect::collect_module_closures`.
+    let closure_collect::ModuleClosures {
+        closures,
+        direct_call_closures,
+        closure_rest_params,
+        closure_synthetic_arguments,
+        closure_rest_and_arguments,
+        closure_arities,
+        closure_lengths,
+        closure_arrow_functions,
+    } = closure_collect::collect_module_closures(hir);
     let mut cross_module = CrossModuleCtx {
+        numeric_order_functions: &hir.functions,
+        numeric_order_closures: &closures,
         region_closures: hir
             .closure_display_names
             .iter()
@@ -3006,6 +3036,7 @@ fn lower_module(
         program_has_thread_agents: thread_agents,
         class_hierarchy: class_hierarchy::ClassHierarchy::default(),
         namespace_imports: opts.namespace_imports.iter().cloned().collect(),
+        namespace_self_import: opts.namespace_self_import,
         namespace_source_prefixes: opts.namespace_source_prefixes,
         namespace_member_nested: opts.namespace_member_nested.iter().cloned().collect(),
         cjs_interop_namespaces: opts.cjs_interop_namespaces.iter().cloned().collect(),
@@ -3319,6 +3350,7 @@ fn lower_module(
         namespace_entries: opts.namespace_entries.clone(),
         dynamic_import_path_to_prefix: opts.dynamic_import_path_to_prefix.clone(),
         nextjs_path_init_modules: opts.nextjs_path_init_modules.clone(),
+        lazy_path_init_modules: opts.lazy_path_init_modules.clone(),
         deferred_module_prefixes: opts.deferred_module_prefixes.clone(),
         module_init_deps: opts.module_init_deps.clone(),
         is_dynamic_import_target: opts.is_dynamic_import_target,
@@ -3474,18 +3506,6 @@ fn lower_module(
     // inside an arrow callback. Lazy emission tracks declares at the
     // actual emission point so any path the lowering reaches is covered.
 
-    // Closure collection + derived per-closure dispatch maps. See
-    // `closure_collect::collect_module_closures`.
-    let closure_collect::ModuleClosures {
-        closures,
-        direct_call_closures,
-        closure_rest_params,
-        closure_synthetic_arguments,
-        closure_rest_and_arguments,
-        closure_arities,
-        closure_lengths,
-        closure_arrow_functions,
-    } = closure_collect::collect_module_closures(hir);
     crate::layout_desc::function_families::collect(
         hir,
         &module_prefix,
@@ -4429,6 +4449,7 @@ fn lower_module(
     // total — otherwise functions whose scope ids exceed the init
     // function's count emit `!alias.scope !N` references with no matching
     // metadata definition (issue #71).
+    closed_targets::apply(&mut llmod);
     let total_buffer_scopes = llmod.buffer_alias_counter;
     emit_buffer_alias_metadata(&mut llmod, total_buffer_scopes);
     llmod
@@ -4496,6 +4517,7 @@ fn emit_lowered_module(lowered: LoweredModule) -> Result<Vec<u8>> {
     // renderer and the in-process constructor see the same IR; a pass living in
     // one of them would silently not apply to the other.
     // See `crate::root_reload`.
+    numeric_remainder::define_checked_number_remainder_if_used(&mut llmod);
     progress.phase(1, "lowering complete; finalizing generated IR");
     crate::root_reload::apply_to_module(&mut llmod);
 

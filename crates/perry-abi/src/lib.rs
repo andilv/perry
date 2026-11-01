@@ -6,9 +6,25 @@
 //! compile until the number is right — so emitted code can never disagree
 //! with the struct it indexes. No dependencies.
 
+pub mod function_metadata;
+mod object_type;
+pub use function_metadata::*;
+extern crate alloc;
+
 pub mod accessor_guards;
+mod builtin_proto;
+pub use builtin_proto::{BuiltinProto, FunctionProtoKind};
+pub mod intrinsic_serials;
+pub mod object_meta_flags;
+mod shape_kind;
+pub use shape_kind::ShapeObjectKind;
+mod set_cells;
+pub use set_cells::*;
+mod realm_cells;
+pub use realm_cells::*;
 pub mod layouts;
 pub use layouts::*;
+pub mod realm_header;
 
 /// `object::shapes::SHAPE_ID_BASE`: the first ShapeId.
 pub const SHAPE_ID_BASE: u32 = 0x8000_0000;
@@ -46,6 +62,33 @@ pub const ARRAY_HEADER_SIZE: usize = 24;
 /// §3.2). A descriptor emits it only for such keys; the layout then carries
 /// the "may have holes" summary bit and every other layout keeps its cost.
 pub const LAYOUT_KEY_OPTIONAL: u8 = 0x80;
+/// `PerryLayoutDesc.gc_plan` bit 31: the descriptor carries a static GC scan
+/// plan. Bits 0..=30 are the slots that may hold a heap pointer (a lane whose
+/// representation is `Any`); every other slot is a raw number and is never
+/// scanned. A descriptor with more than [`LAYOUT_GC_PLAN_MAX_SLOTS`] slots, or
+/// with a `SPECIAL` representation lane (whose collectability is a runtime
+/// fact of the shape), carries 0: the collectors use the generic walk.
+pub const LAYOUT_GC_PLAN_STATIC: u32 = 1 << 31;
+pub const LAYOUT_GC_PLAN_MAX_SLOTS: u32 = 31;
+/// The static GC scan plan of a family layout of `slot_count` inline slots and
+/// field representation word `rep` (two bits per slot: 0 `Any`, 1 `F64`,
+/// 2 deprecated `F64`, 3 `SPECIAL`). Codegen emits it; the runtime reads it.
+pub const fn layout_gc_plan(slot_count: u32, rep: u64) -> u32 {
+    if slot_count > LAYOUT_GC_PLAN_MAX_SLOTS {
+        return 0;
+    }
+    let mut mask = 0u32;
+    let mut slot = 0;
+    while slot < slot_count {
+        match (rep >> (2 * slot)) & 0b11 {
+            0 => mask |= 1 << slot,
+            3 => return 0,
+            _ => {}
+        }
+        slot += 1;
+    }
+    LAYOUT_GC_PLAN_STATIC | mask
+}
 /// `PerryLayoutKey.attrs` attribute bits (the runtime's `key_attrs` entry
 /// bits, pinned there): `[[Writable]]`, `[[Enumerable]]`, `[[Configurable]]`
 /// false, an accessor, and which halves it has.
@@ -87,6 +130,10 @@ pub const ATOM_KIND_REGISTERED_SYMBOL: u8 = 3;
 /// the prototype's bind (`perry_bind_family_prototype`) hands the layout's
 /// such keys in key order, and the layout registers there.
 pub const ATOM_KIND_BINDING_SYMBOL: u8 = 4;
+/// The atom's pointer directly names an immutable realm symbol cell. The
+/// pointer field carries a SymbolHeader rather than a StringHeader for this
+/// kind; no symbol creation or registry lookup is needed to link its keys.
+pub const ATOM_KIND_IMAGE_SYMBOL: u8 = 5;
 /// `PerryLayoutDesc.variant` of a carried prototype layout (object model
 /// §3.6): a marked prototype's, registered under its own semantic generation.
 pub const LAYOUT_VARIANT_PROTOTYPE_IMAGE: u16 = 1;
@@ -278,6 +325,34 @@ pub const OBJ_FLAGS_REFUSE_FAMILY_RUN: u16 = 0x0407;
 /// Creation-time [[Call]] on OBJECT and PROXY only. This bit has no other
 /// meaning; closures are callable by their type byte.
 pub const GC_OBJECT_CALLABLE: u16 = 0x0020;
+/// Heap-birth facts shared by runtime allocation and realm-cell emission.
+/// These are existing meanings in GcHeader::_reserved, never image markers.
+pub const OBJ_FLAG_PLAIN_ORDINARY: u16 = 0x0200;
+/// An object has a null [[Prototype]].
+pub const OBJ_FLAG_NULL_PROTO: u16 = 0x40;
+/// At least one own property carries non-default descriptor attributes.
+pub const OBJ_FLAG_HAS_DESCRIPTORS: u16 = 0x800;
+/// An array has one front-reserve pointer to its key-attribute array.
+pub const GC_ARRAY_KEY_ATTRS: u16 = 0x100;
+
+/// Integrity bits in every object/array GC header, shared with image births.
+pub const OBJ_FLAG_FROZEN: u16 = 0x01;
+pub const OBJ_FLAG_SEALED: u16 = 0x02;
+pub const OBJ_FLAG_NO_EXTEND: u16 = 0x04;
+/// Requested on prototype holders; image holders preserve this birth fact.
+pub const OBJ_FLAG_NEVER_MOVE: u16 = 0x80;
+/// A per-kind `<TypedArray>.prototype` whose `[[Prototype]]` is the shared
+/// `%TypedArray%.prototype` intrinsic.
+pub const OBJ_FLAG_TYPED_ARRAY_PROTO: u16 = 0x100;
+/// Per-instance builtin non-constructability on a closure. Kind-disjoint from
+/// the object meaning of bit 7.
+pub const GC_CLOSURE_NON_CONSTRUCTABLE: u16 = 0x80;
+/// The class id of a native module namespace, whose members a vtable serves.
+pub const NATIVE_MODULE_CLASS_ID: u32 = 0xFFFF_FFFE;
+
+pub const GC_LAYOUT_POINTER_FREE: u16 = 0x4000;
+pub const GC_LAYOUT_SIDE_MASK: u16 = 0x8000;
+pub const GC_LAYOUT_ALL_POINTERS: u16 = 0x2000;
 pub const GC_TYPE_PROXY: u8 = 37;
 pub const GC_TYPE_SYMBOL: u8 = 32;
 pub const GC_TYPE_STRING: u8 = 3;
@@ -294,7 +369,8 @@ pub const fn gc_header_word_is_callable(word: u32) -> bool {
     let kind = bytes[0];
     let facts = u16::from_ne_bytes([bytes[2], bytes[3]]);
     kind == GC_TYPE_CLOSURE
-        || ((kind == GC_TYPE_OBJECT || kind == GC_TYPE_PROXY) && facts & GC_OBJECT_CALLABLE != 0)
+        || ((crate::gc_type_is_object!(kind) || kind == GC_TYPE_PROXY)
+            && facts & GC_OBJECT_CALLABLE != 0)
 }
 
 /// The JS BODY calling convention. Every native body a function object runs —
@@ -586,6 +662,9 @@ pub const FN_ARGUMENTS_OBJECT: u32 = 1 << 18;
 pub const FN_ARGUMENTS_RESTRICTED: u32 = 1 << 19;
 /// The directly born object needs slots for mapped parameter aliases.
 pub const FN_ARGUMENTS_MAPPED: u32 = 1 << 20;
+/// A builtin export body whose three captures carry its module/member identity.
+/// Invocation uses `code`; this flag only licenses the export metadata layout.
+pub const FN_NATIVE_EXPORT: u32 = 1 << 26;
 /// Any rest kind.
 pub const FN_REST_MASK: u32 =
     FN_REST_USER | FN_REST_SYNTHETIC_ARGUMENTS | FN_REST_USER_AND_ARGUMENTS | FN_REST_NATIVE_ARGS;
@@ -1096,3 +1175,79 @@ mod call_entry_layout_tests {
         );
     }
 }
+
+/// Frame-owned wasm EH checkpoint. Fixed-width depths keep this POD layout
+/// identical in the host compiler and the wasm32 runtime. No managed values.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WasmEhCheckpoint {
+    pub handles: u64,
+    pub shadow_frame_top: u64,
+    pub shadow_len: u64,
+    pub async_context: u64,
+    pub temp_roots: u64,
+    pub call_method: u64,
+    pub pump: u64,
+    pub set_foreach: u64,
+    pub map_foreach: u64,
+    pub prototype_resolution: u64,
+    pub static_private_owner: u64,
+    pub private_lexical_brand: u64,
+    pub derived_super_binding: u64,
+    pub private_member_access_hints: u64,
+    pub namespace_override: u64,
+}
+
+/// One canonical key's immutable attribute word, including cumulative prefix
+/// summaries/Bloom filters and an optional descriptor storage slot. Shared by
+/// heap writers and image-cell emitters; no key spelling is repeated here.
+pub const fn canonical_key_attribute_word(
+    previous: u64,
+    entry: u8,
+    bloom: u16,
+    slot: Option<u32>,
+) -> u64 {
+    let mut summary = (previous >> 8) as u8;
+    let mut entries = (previous >> 16) as u16;
+    let mut accessors = (previous >> 32) as u16;
+    if summary & 0x80 != 0 {
+        summary &= !0x80;
+        entries = u16::MAX;
+        accessors = u16::MAX;
+    }
+    if entry & 8 != 0 {
+        summary |= 1;
+    } else if entry & 1 != 0 {
+        summary |= 2;
+    }
+    if entry & 2 != 0 {
+        summary |= 4;
+    }
+    if entry & 4 != 0 {
+        summary |= 8;
+    }
+    if entry & 0x40 != 0 {
+        summary |= 0x10;
+    }
+    if entry & 0x80 != 0 {
+        summary |= 0x20;
+    }
+    if entry != 0 {
+        entries |= bloom;
+        if entry & 8 != 0 {
+            accessors |= bloom;
+        }
+    }
+    if let Some(slot) = slot {
+        summary |= 0xc0;
+        entries = slot as u16;
+        accessors = (slot >> 16) as u16;
+    }
+    0x7ffe_0000_0000_0000
+        | entry as u64
+        | (summary as u64) << 8
+        | (entries as u64) << 16
+        | (accessors as u64) << 32
+}
+
+mod fn_info;

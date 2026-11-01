@@ -1351,6 +1351,7 @@ fn is_redundant_cell_propagation(items: &[Expr], index_uses: &HashSet<LocalId>) 
         object,
         property,
         value,
+        ..
     }] = items
     else {
         return false;
@@ -1471,6 +1472,8 @@ fn rewrite_stmt(stmt: &mut Stmt, shared: &HashSet<LocalId>, index_uses: &HashSet
                     id,
                     Box::new(Expr::Array(
                         vec![Expr::IndexGet {
+                            byte_end: 0,
+                            byte_offset: 0,
                             object: Box::new(Expr::LocalGet(id)),
                             index: Box::new(Expr::Integer(0)),
                         }],
@@ -1541,6 +1544,8 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
         // the ARRAY handle and is not re-rewritten.
         Expr::LocalGet(id) if index_uses.contains(id) => {
             *expr = Expr::IndexGet {
+                byte_offset: 0,
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(*id)),
                 index: Box::new(Expr::Integer(0)),
             };
@@ -1562,6 +1567,8 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
                 object: Box::new(Expr::LocalGet(*id)),
                 index: Box::new(Expr::Integer(0)),
                 value: Box::new(v),
+                byte_offset: 0,
+                byte_end: 0,
             };
             return;
         }
@@ -1589,6 +1596,8 @@ fn rewrite_expr(expr: &mut Expr, shared: &HashSet<LocalId>, index_uses: &HashSet
                 },
                 prefix: *prefix,
                 strict: false,
+                byte_offset: 0,
+                byte_end: 0,
             };
             return;
         }

@@ -236,7 +236,7 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
         // Reflect entry point shares `[[GetOwnProperty]]` semantics (trap +
         // invariant checks + FromPropertyDescriptor) and forwards non-proxies
         // straight back here, so there's no recursion. (Proxy crash cluster.)
-        if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
+        if crate::proxy_hooks::proxy_is_proxy(obj_value) != 0 {
             return OwnProperty::public(crate::proxy::js_reflect_get_own_property_descriptor(
                 obj_value, key_value,
             ));
@@ -428,7 +428,7 @@ pub(crate) unsafe fn own_property(obj_value: f64, key_value: f64) -> Option<OwnP
             }
             return OwnProperty::public(
                 crate::typedarray_props::typed_array_get_own_property_descriptor(
-                    addr as *const crate::typedarray::TypedArrayHeader,
+                    addr as *const crate::typedarray_hook_slots::TypedArrayHeader,
                     key_str,
                 ),
             );
@@ -1059,7 +1059,7 @@ unsafe fn ordinary_own_property(obj: *mut ObjectHeader, name: &[u8]) -> Option<O
     // attributes, and that same position supplies either the data value
     // or the accessor pair. Reflection never performs an inherited Get.
     let keys = super::object_keys(obj);
-    let Some(slot) = super::keys_find_property_slot_by_bytes(keys.arr(), keys.count(), name) else {
+    let Some(slot) = super::keys_find_property_slot_by_bytes(keys, keys.count(), name) else {
         return None;
     };
     let entry = super::key_attrs::keys_entry(keys.arr(), slot);
@@ -1194,8 +1194,8 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
         // A Proxy is a small registered id, not a heap object — route it to the
         // `ownKeys` trap (string subset) before the handle-dispatch fallback,
         // which would mis-read the fake pointer and return an empty array.
-        if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
-            return crate::proxy::proxy_own_property_names(obj_value);
+        if crate::proxy_hooks::proxy_is_proxy(obj_value) != 0 {
+            return crate::proxy_hooks::proxy_own_property_names(obj_value);
         }
         if obj_jv.is_handle() {
             let raw = obj_jv.as_handle();
@@ -1238,7 +1238,7 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
         }
         if let Some(addr) = crate::typedarray_props::typed_array_addr_from_value(obj_value) {
             let result = crate::typedarray_props::typed_array_own_property_names(
-                addr as *const crate::typedarray::TypedArrayHeader,
+                addr as *const crate::typedarray_hook_slots::TypedArrayHeader,
                 false,
             );
             return f64::from_bits((result as u64) | 0x7FFD_0000_0000_0000);
@@ -1528,7 +1528,7 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
         {
             let gc =
                 (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-            if (*gc).obj_type != crate::gc::GC_TYPE_OBJECT {
+            if crate::gc_type_is_not_object!((*gc).obj_type) {
                 let empty = crate::array::js_array_alloc(0);
                 return f64::from_bits((empty as u64) | 0x7FFD_0000_0000_0000);
             }
@@ -1551,8 +1551,8 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
         // Drop only compiler/runtime storage keys. A user String key beginning
         // with `#` is still an ordinary reflectable property.
         let hide_private = super::field_get_set::own_keys_may_hide(obj);
-        let hide_wasi_state = crate::wasi::is_wasi_import_object(obj)
-            || crate::wasi::is_wasi_instance(f64::from_bits(
+        let hide_wasi_state = crate::wasi_hook_slots::is_wasi_import_object(obj)
+            || crate::wasi_hook_slots::is_wasi_instance(f64::from_bits(
                 crate::value::js_nanbox_pointer(obj as i64).to_bits(),
             ));
 
@@ -1656,7 +1656,7 @@ unsafe fn proxy_get_own_property_descriptors(obj_value: f64) -> f64 {
     // live in handles (same discipline as the generic path below).
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj_handle = scope.root_nanbox_f64(obj_value);
-    let keys_boxed = crate::proxy::js_proxy_own_keys(obj_value);
+    let keys_boxed = crate::proxy_hooks::proxy_own_keys(obj_value);
     let keys_arr =
         (keys_boxed.to_bits() & crate::value::POINTER_MASK) as *mut crate::array::ArrayHeader;
     let keys_handle = scope.root_raw_mut_ptr(keys_arr);
@@ -1733,7 +1733,7 @@ pub extern "C" fn js_object_get_own_property_descriptors(obj_value: f64) -> f64 
         // enumerates string and symbol keys through two separate helpers,
         // each firing its own `ownKeys` trap — an observably extra call
         // (test262 getOwnPropertyDescriptors/observable-operations).
-        if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
+        if crate::proxy_hooks::proxy_is_proxy(obj_value) != 0 {
             return proxy_get_own_property_descriptors(obj_value);
         }
         // Root the receiver before the allocating name snapshot. Ordinary
@@ -1911,15 +1911,6 @@ pub(crate) unsafe fn nm_get_own_descriptor(
             }
             _ => {}
         }
-    }
-    if module_name == "vm.constants" {
-        let value = js_object_get_field_by_name(obj, key_str);
-        return Some(build_data_descriptor(
-            f64::from_bits(value.bits()),
-            false,
-            true,
-            false,
-        ));
     }
     let value = js_object_get_field_by_name(obj, key_str);
     if matches!(

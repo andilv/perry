@@ -271,6 +271,9 @@ pub(super) fn compile_module_init(
         crate::boxed_vars::collect_let_types_in_stmts(&hir.init, &mut init_local_types);
     }
     let mut ctx = FnCtx {
+        numeric_order_functions: cross_module.numeric_order_functions,
+        numeric_order_closures: cross_module.numeric_order_closures,
+        numeric_order_ready: Default::default(),
         program_has_worker: cross_module.program_has_worker,
         program_has_thread_agents: cross_module.program_has_thread_agents,
         program_class_accessor_names: cross_module.program_class_accessor_names.clone(),
@@ -374,6 +377,9 @@ pub(super) fn compile_module_init(
         resolved_versioned_loop_callback_targets: HashMap::new(),
         trusted_box_captures: false,
         fixed_generator_state: false,
+        private_resume_frame: false,
+        private_async_resume_frame: false,
+        resume_locals: None,
         versioned_loop_deopt_context: None,
         trusted_box_capture_ptrs: HashMap::new(),
         ready_cell_roots: Default::default(),
@@ -470,6 +476,7 @@ pub(super) fn compile_module_init(
         typed_element_locals: std::collections::HashSet::new(),
         create_families: Default::default(),
         class_guard_window: None,
+        map_entry_fusion: Default::default(),
         i1_local_slots: HashMap::new(),
         index_used_locals: init_native_facts.index_used_locals(),
         strictly_i32_bounded_locals: init_native_facts.strictly_i32_bounded_locals(),
@@ -609,10 +616,7 @@ pub(super) fn compile_module_init(
         // Script" is the right answer there for a wrapped entry too — and
         // that predicate is mirrored in `perry-hir`'s `lower_module_fn`,
         // which runs before the wrap flag is knowable here.
-        let cjs_wrapped_entry = crate::collectors::is_cjs_wrapped_module(hir);
-        if (!hir.imports.is_empty() || !hir.exports.is_empty() || hir.has_top_level_await)
-            && !cjs_wrapped_entry
-        {
+        if super::entry_evaluates_as_esm(hir, cross_module) {
             ctx.block().call_void("js_mark_entry_module_esm", &[]);
         }
         // #5579: GlobalDeclarationInstantiation for a Script. A non-ESM entry
@@ -640,6 +644,22 @@ pub(super) fn compile_module_init(
         }
     }
     init_static_fields_early(&mut ctx, hir)?;
+    // See the same reasoning in the entry emitter: a module that
+    // namespace-imports itself must have its namespace populated before its
+    // own body runs.
+    let self_namespace_populated = cross_module.namespace_self_import
+        && (!cross_module.namespace_entries.is_empty() || cross_module.is_dynamic_import_target)
+        && !ctx.block().is_terminated();
+    if self_namespace_populated {
+        emit_namespace_populator(
+            &mut ctx,
+            &cross_module.namespace_entries,
+            namespace_key_globals,
+            module_prefix,
+            output_type,
+            cross_module.namespace_adopts_cjs_exports,
+        );
+    }
     stmt::lower_top_level_stmts(&mut ctx, &hir.init)
         .with_context(|| format!("lowering init statements of module '{}'", hir.name))?;
     init_static_fields_late(&mut ctx, hir)?;
@@ -657,7 +677,8 @@ pub(super) fn compile_module_init(
     // is a target). The populator emits `js_create_namespace(0, ...)`
     // → an empty NaN-boxed object → stored into `@__perry_ns_<prefix>`,
     // satisfying the consumer-side extern reference.
-    if (!cross_module.namespace_entries.is_empty() || cross_module.is_dynamic_import_target)
+    if !self_namespace_populated
+        && (!cross_module.namespace_entries.is_empty() || cross_module.is_dynamic_import_target)
         && !ctx.block().is_terminated()
     {
         emit_namespace_populator(

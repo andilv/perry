@@ -401,7 +401,7 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
     ctx: &mut FnCtx<'_>,
     expr: &Expr,
 ) -> Result<Option<String>> {
-    let Expr::IndexGet { object, index } = expr else {
+    let Expr::IndexGet { object, index, .. } = expr else {
         return Ok(None);
     };
     // A planned-bare region read lowers through the value path's hook.
@@ -603,7 +603,7 @@ pub(crate) fn lower_unknown_local_index_get_for_number_context(
     ctx: &mut FnCtx<'_>,
     expr: &Expr,
 ) -> Result<Option<String>> {
-    let Expr::IndexGet { object, index } = expr else {
+    let Expr::IndexGet { object, index, .. } = expr else {
         return Ok(None);
     };
     // Receiver must be a plain local of erased static type. Restricting to
@@ -825,10 +825,11 @@ fn with_confined_read<'a, T>(
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
+    let _consumed = crate::facts_consumed::enter(expr);
     // Step 4b / array S3: a planned-bare element read inside a loop region.
 
     match expr {
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index, .. } => {
             // The private record cursor starts at zero, advances only after a
             // successful read, and is bounded by the array's u32 length here.
             // Consume that proof in the ordinary guarded indexed backend.

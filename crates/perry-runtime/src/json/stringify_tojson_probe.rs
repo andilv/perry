@@ -28,9 +28,11 @@ crate::perry_thread_local! {
     /// Address-bearing fields are comparison tokens only: they are never
     /// dereferenced from this cache. Moving GC therefore turns a prior entry
     /// into a signature miss without requiring another collector root.
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static OBJECT_PROTO_TOJSON_SIGNATURE: std::cell::Cell<Option<ObjectProtoToJsonSignature>> =
         const { std::cell::Cell::new(None) };
     #[cfg(test)]
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static OBJECT_PROTO_TOJSON_RECOMPUTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -225,7 +227,7 @@ unsafe fn compute_object_proto_tojson_state() -> u8 {
     let proto_ptr = (proto_bits & POINTER_MASK) as usize;
     if !crate::value::addr_class::is_plausible_heap_addr(proto_ptr)
         || proto_ptr & 0x7 != 0
-        || gc_obj_type(proto_ptr as *const u8) != crate::gc::GC_TYPE_OBJECT
+        || crate::gc_type_is_not_object!(gc_obj_type(proto_ptr as *const u8))
     {
         return PROTO_TOJSON_PRESENT;
     }
@@ -269,7 +271,7 @@ unsafe fn object_proto_tojson_signature() -> Option<ObjectProtoToJsonSignature> 
     }
     let proto_addr = (proto_bits & POINTER_MASK) as usize;
     let header = crate::value::addr_class::try_read_tracked_gc_header(proto_addr)?.as_ref();
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         return None;
@@ -359,7 +361,7 @@ unsafe fn object_proto_tojson_signature_matches(cached: &ObjectProtoToJsonSignat
     let Some(header) = crate::value::addr_class::try_read_gc_header(proto_addr) else {
         return false;
     };
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved != cached.obj_flags
     {
@@ -458,10 +460,12 @@ crate::perry_thread_local! {
     /// Per-slot `Cell`s rather than a `Cell<[…; N]>`: the latter copies the
     /// whole table in and out on every probe, and this path runs once per
     /// object visited by `JSON.stringify`.
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static CLASS_CHAIN_TOJSON_MEMO: [std::cell::Cell<ClassChainToJsonEntry>;
         CLASS_CHAIN_TOJSON_SLOTS] =
         const { [const { std::cell::Cell::new(EMPTY_CLASS_CHAIN_TOJSON) }; CLASS_CHAIN_TOJSON_SLOTS] };
     #[cfg(test)]
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static CLASS_CHAIN_TOJSON_RECOMPUTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -699,12 +703,12 @@ pub(super) unsafe fn plain_object_member(
     }
     let addr = (bits & POINTER_MASK) as usize;
     if crate::buffer::is_registered_buffer(addr)
-        || crate::typedarray::lookup_typed_array_kind(addr).is_some()
+        || crate::typedarray_hook_slots::lookup_typed_array_kind(addr).is_some()
     {
         return None;
     }
     let header = crate::value::addr_class::try_read_gc_header(addr)?;
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         return None;
@@ -712,7 +716,8 @@ pub(super) unsafe fn plain_object_member(
     let obj = addr as *const crate::ObjectHeader;
     // A recorded prototype (a fact of the shape, or a meta record's word)
     // can carry a `toJSON` of its own: only a default-chained record is plain.
-    if !(*obj).meta.is_null()
+    // A1_UNPROVEN: record-first: A-tested admission, meta read follows (kind-A/B question for S0f).
+    if !crate::object::header::object_meta_if_present(obj as *mut _, header.obj_type).is_null()
         || !object_is_plain_record(obj)
         || crate::object::shapes::object_prototype_word(obj) != 0
     {

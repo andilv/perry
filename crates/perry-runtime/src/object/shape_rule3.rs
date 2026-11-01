@@ -253,6 +253,12 @@ pub(crate) const RULE3_KINDS: &[(u8, &str, &str, Rule3Word)] = &[
         "high half of word_count (< 2^30)",
         Rule3Word::NotPointerTagged,
     ),
+    (
+        gc::GC_TYPE_REGEX_CACHE,
+        "RegexCache",
+        "perex::dfa header word 1: zero before the first build, then the layout number (2)",
+        Rule3Word::NotPointerTagged,
+    ),
     // Cells are compiler-private raw addresses, never JavaScript receivers.
     (
         gc::GC_TYPE_BOX,
@@ -557,8 +563,10 @@ mod tests {
             let set = crate::set::js_set_alloc(8) as usize;
             assert!(!is_layout_word(word_at(set)), "set capacity");
 
-            let ta =
-                crate::typedarray::typed_array_alloc(crate::typedarray::KIND_INT8, 32) as usize;
+            let ta = crate::typedarray_hook_slots::typed_array_alloc(
+                crate::typedarray_hook_slots::KIND_INT8,
+                32,
+            ) as usize;
             assert!(!is_layout_word(word_at(ta)), "typed array capacity");
 
             // A Promise's +4 is struct padding: `arena_alloc_gc` hands back
@@ -684,7 +692,10 @@ mod tests {
         let _lock = crate::gc::global_side_table_test_lock();
         assert_eq!(
             expect_throw(|| {
-                crate::typedarray::typed_array_alloc(crate::typedarray::KIND_INT8, SHAPE_ID_BASE);
+                crate::typedarray_hook_slots::typed_array_alloc(
+                    crate::typedarray_hook_slots::KIND_INT8,
+                    SHAPE_ID_BASE,
+                );
             }),
             "Array buffer allocation failed"
         );
@@ -703,7 +714,7 @@ mod tests {
             expect_throw(|| {
                 crate::native_arena::js_native_arena_view(
                     owner as u64,
-                    crate::typedarray::KIND_INT8 as i32,
+                    crate::typedarray_hook_slots::KIND_INT8 as i32,
                     0,
                     SHAPE_ID_BASE as i64,
                 );
@@ -743,7 +754,7 @@ mod tests {
             -1234.5e10,
         ];
         for ts in timestamps {
-            let value = crate::date::alloc_date_cell(ts);
+            let value = crate::date_hook_slots::alloc_date_cell(ts);
             let addr = crate::value::js_nanbox_get_pointer(value) as usize;
             assert!(addr != 0, "a Date is a NaN-boxed cell pointer");
             let word = unsafe { *((addr + 4) as *const u32) };

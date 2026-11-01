@@ -20,6 +20,8 @@ pub enum LayoutKey {
 pub enum LayoutRole {
     Native,
     ClassFamily,
+    /// Runtime and realm descriptor values, directly indexed on first touch.
+    LazyImage,
     OtherStatic,
 }
 
@@ -45,8 +47,11 @@ pub struct OrdinalEntry {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ProgramLayoutOrdinals {
     pub entries: Vec<OrdinalEntry>,
+    pub lazy_first: u32,
+    pub lazy_count: u32,
     pub family_first: u32,
     pub family_count: u32,
+    pub prototype_serial_end: u64,
 }
 
 impl ProgramLayoutOrdinals {
@@ -67,7 +72,7 @@ impl ProgramLayoutOrdinals {
             }
             Self::append(&mut entries, input)?;
         }
-        let family_first = entries.len() as u32;
+        let lazy_first = entries.len() as u32;
         let mut sorted = BTreeMap::new();
         for input in program {
             if input.role == LayoutRole::Native || matches!(input.key, LayoutKey::Native(_)) {
@@ -95,6 +100,11 @@ impl ProgramLayoutOrdinals {
                 }
             }
         }
+        for input in sorted.values().filter(|i| i.role == LayoutRole::LazyImage) {
+            Self::append(&mut entries, input.clone())?;
+        }
+        let lazy_count = entries.len() as u32 - lazy_first;
+        let family_first = entries.len() as u32;
         let family = |i: &&OrdinalInput| {
             i.role == LayoutRole::ClassFamily && i.band == 0 && i.proto_kind == 0
         };
@@ -102,13 +112,19 @@ impl ProgramLayoutOrdinals {
             Self::append(&mut entries, input.clone())?;
         }
         let family_count = entries.len() as u32 - family_first;
-        for input in sorted.values().filter(|i| !family(i)) {
+        for input in sorted
+            .values()
+            .filter(|i| !family(i) && i.role != LayoutRole::LazyImage)
+        {
             Self::append(&mut entries, input.clone())?;
         }
         Ok(Self {
             entries,
+            lazy_first,
+            lazy_count,
             family_first,
             family_count,
+            prototype_serial_end: perry_abi::intrinsic_serials::FIRST_DYNAMIC_PROTOTYPE_SERIAL,
         })
     }
 
@@ -142,6 +158,26 @@ impl ProgramLayoutOrdinals {
             .map(OrdinalEntry::word)
     }
 
+    /// A carried family descriptor's immutable template word. Family emission
+    /// always carries its word; OtherStatic inputs can also describe static
+    /// metadata whose initializer is zero, so their presence alone is no proof.
+    /// Imported symbols are eligible, but ambiguous spellings stay checked.
+    pub(crate) fn descriptor_template_word(&self, symbol: &str) -> Option<u32> {
+        let mut entries = self.entries.iter().filter(|entry| {
+            matches!(
+                &entry.key, LayoutKey::Descriptor { symbol: name, .. } if name == symbol
+            )
+        });
+        let first = entries.next()?;
+        if first.role != LayoutRole::ClassFamily {
+            return None;
+        }
+        let word = first.word();
+        entries
+            .all(|other| other.role == LayoutRole::ClassFamily && other.word() == word)
+            .then_some(word)
+    }
+
     /// Exact stable cache input, including full keys (not just content hashes),
     /// header bounds, ABI version and the entire native catalog.
     pub fn cache_key(&self) -> String {
@@ -151,13 +187,30 @@ impl ProgramLayoutOrdinals {
         )
     }
 
+    /// The `PerryLayoutImageV1` initializer; `@perry_static_seeds` is the
+    /// program table of the static seed unit (`stubs::static_shape_seed_ll_with_plan`).
     pub fn image_initializer(&self) -> String {
         format!(
-            "{{ i32 {}, i32 {}, i32 {}, i32 {} }}",
+            "{{ i32 {}, i32 {}, i32 {}, i32 {}, ptr @perry_static_seeds }}",
             perry_abi::LAYOUT_WORD_ABI_VERSION,
             self.static_rows(),
             self.family_first,
-            self.family_count
+            self.family_count,
+        )
+    }
+
+    /// The program table's lazy span fields after `count`
+    /// (`PerryProgramTableV1`): count, first row, padding, prototype serial
+    /// end, span.
+    pub fn table_span_initializer(&self) -> String {
+        let lazy = if self.lazy_count == 0 {
+            "null"
+        } else {
+            "@perry_lazy_layouts"
+        };
+        format!(
+            "i32 {}, i32 {}, i32 0, i64 {}, ptr {lazy}",
+            self.lazy_count, self.lazy_first, self.prototype_serial_end,
         )
     }
 }
@@ -246,6 +299,31 @@ mod tests {
         let mut changed = p.clone();
         changed.entries[1].proto_kind = 1;
         assert_ne!(p.cache_key(), changed.cache_key());
+    }
+
+    #[test]
+    fn lazy_descriptors_are_one_directly_indexed_span_before_class_families() {
+        let a = input("a", LayoutRole::LazyImage, 0);
+        let b = input("b", LayoutRole::LazyImage, 2);
+        let c = input("c", LayoutRole::ClassFamily, 0);
+        let d = input("d", LayoutRole::OtherStatic, 0);
+        let plan = ProgramLayoutOrdinals::assign(native_inputs(), [d, b, c, a]).unwrap();
+        let first = perry_abi::NATIVE_LAYOUT_ROWS;
+        assert_eq!((plan.lazy_first, plan.lazy_count), (first, 2));
+        assert_eq!((plan.family_first, plan.family_count), (first + 2, 1));
+        assert_eq!(plan.entries[first as usize].role, LayoutRole::LazyImage);
+        assert_eq!(plan.entries[first as usize + 1].proto_kind, 2);
+        assert!(plan
+            .table_span_initializer()
+            .ends_with("ptr @perry_lazy_layouts"));
+        assert!(ProgramLayoutOrdinals::assign(native_inputs(), [])
+            .unwrap()
+            .table_span_initializer()
+            .ends_with(&format!(
+                "i32 0, i32 {}, i32 0, i64 {}, ptr null",
+                perry_abi::NATIVE_LAYOUT_ROWS,
+                perry_abi::intrinsic_serials::FIRST_DYNAMIC_PROTOTYPE_SERIAL
+            )));
     }
 
     #[test]
@@ -470,4 +548,56 @@ pub(crate) fn deferred_word(birth: &crate::BirthShape, live: u32) -> (u32, u32) 
         })
         .expect("deferred width has a static ordinal");
     (entry.requested_shape_id, entry.word())
+}
+
+#[cfg(test)]
+mod template_word_tests {
+    use super::*;
+
+    fn descriptor(module: &str, symbol: &str) -> OrdinalInput {
+        OrdinalInput {
+            key: LayoutKey::Descriptor {
+                module: module.into(),
+                symbol: symbol.into(),
+                content: vec![1, 2, 3],
+            },
+            requested_shape_id: 0,
+            band: 0,
+            proto_kind: 0,
+            role: LayoutRole::ClassFamily,
+        }
+    }
+
+    #[test]
+    fn only_a_unique_compiler_descriptor_supplies_a_template() {
+        let mut plan = ProgramLayoutOrdinals::assign(
+            [],
+            [
+                descriptor("a", "unique"),
+                descriptor("a", "ambiguous"),
+                descriptor("b", "ambiguous"),
+            ],
+        )
+        .unwrap();
+        let mut metadata = plan.entries[0].clone();
+        metadata.key = LayoutKey::Descriptor {
+            module: "a".into(),
+            symbol: "metadata".into(),
+            content: vec![],
+        };
+        metadata.role = LayoutRole::OtherStatic;
+        plan.entries.push(metadata);
+        assert_eq!(plan.descriptor_template_word("metadata"), None);
+        let entry = plan
+            .entries
+            .iter()
+            .find(|e| match &e.key {
+                LayoutKey::Descriptor { symbol, .. } => symbol == "unique",
+                _ => false,
+            })
+            .unwrap();
+        assert_eq!(plan.descriptor_template_word("unique"), Some(entry.word()));
+        assert_eq!(plan.descriptor_template_word("ambiguous"), None);
+        assert_eq!(plan.descriptor_template_word("opaque"), None);
+    }
 }

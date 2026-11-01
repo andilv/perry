@@ -573,6 +573,9 @@ pub(super) fn compile_method(
         reassigned_locals.remove(&method.params[index].id);
     }
     let mut ctx = FnCtx {
+        numeric_order_functions: cross_module.numeric_order_functions,
+        numeric_order_closures: cross_module.numeric_order_closures,
+        numeric_order_ready: Default::default(),
         program_has_worker: cross_module.program_has_worker,
         program_has_thread_agents: cross_module.program_has_thread_agents,
         program_class_accessor_names: cross_module.program_class_accessor_names.clone(),
@@ -678,6 +681,9 @@ pub(super) fn compile_method(
         resolved_versioned_loop_callback_targets: HashMap::new(),
         trusted_box_captures: false,
         fixed_generator_state: false,
+        private_resume_frame: false,
+        private_async_resume_frame: false,
+        resume_locals: None,
         versioned_loop_deopt_context: None,
         trusted_box_capture_ptrs: HashMap::new(),
         ready_cell_roots: crate::stmt::binding_cell::ReadyCellRoots::with_entry_cells(
@@ -771,6 +777,7 @@ pub(super) fn compile_method(
         typed_element_locals: std::collections::HashSet::new(),
         create_families: Default::default(),
         class_guard_window: None,
+        map_entry_fusion: Default::default(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -1135,6 +1142,7 @@ pub(super) fn compile_method(
                             (ctor.symbol, ctor.param_count)
                         } else {
                             // No callable ctor symbol — bail.
+                            crate::expr::numeric_order::parameters_ready(&mut ctx, &method.params);
                             stmt::lower_stmts(&mut ctx, method_body).with_context(|| {
                                 format!("lowering body of method '{}::{}'", class.name, method.name)
                             })?;
@@ -1602,6 +1610,7 @@ pub(super) fn compile_method(
         None
     };
     // #10812: throw a catchable RangeError before the native stack runs out.
+    crate::expr::numeric_order::parameters_ready(&mut ctx, &method.params);
     crate::expr::stack_guard::emit_stack_guard(&mut ctx);
     if ctor_no_super_throw {
         ctx.block()
@@ -1694,6 +1703,29 @@ pub(super) fn compile_method(
         ) {
             lowered.pre_statepoint_inline = true;
         }
+    }
+    // The primary body of an ordinary method joins the early inliner when the
+    // facts close a call site over it (`closed_targets`) and it fits the same
+    // budget. Clones and wrappers are excluded; async and generator bodies
+    // are state machines.
+    if !is_pshape_clone
+        && !is_index_clone
+        && !arguments_length_clone
+        && !ptr_array_cache_clone
+        && !guarded_undefined_clone
+        && !pshape_arg_clone
+        && !generator_owner
+        && !method.is_async
+        && !method.is_generator
+        && !method.was_plain_async
+    {
+        let lowered = llmod
+            .function_mut(lowered_function_index)
+            .expect("just-lowered method function");
+        lowered.closed_target_preinline = super::helpers::guarded_specialization_admits_preinline(
+            lowered.estimated_ir_bytes(),
+            method.body.len(),
+        );
     }
     publish_lowered_fn_artifacts(llmod, artifacts);
     // The Phase 5a and nonnegative-index clones are purely additive: the

@@ -509,15 +509,15 @@ pub(crate) fn get_field_by_name_object_tail(
         // pre-fix, only Uint8Array worked (it's a registered buffer) so
         // multi-byte `.byteLength` returned undefined.
         if let Some(kind) = crate::gc::is_typed_array_type(gc_type)
-            .then(|| crate::typedarray::lookup_typed_array_kind(obj as usize))
+            .then(|| crate::typedarray_hook_slots::lookup_typed_array_kind(obj as usize))
             .flatten()
         {
             if !key.is_null() {
                 let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
                 let key_len = (*key).byte_len as usize;
                 let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
-                let ta = obj as *const crate::typedarray::TypedArrayHeader;
-                let elem_size = crate::typedarray::elem_size_for_kind(kind);
+                let ta = obj as *const crate::typedarray_hook_slots::TypedArrayHeader;
+                let elem_size = crate::typedarray_hook_slots::elem_size_for_kind(kind);
                 if let Some(value) =
                     crate::typedarray_props::typed_array_get_own_property_value(ta, key)
                 {
@@ -525,11 +525,11 @@ pub(crate) fn get_field_by_name_object_tail(
                 }
                 match key_bytes {
                     b"length" => {
-                        let len = crate::typedarray::js_typed_array_length(ta);
+                        let len = crate::typedarray_hook_slots::js_typed_array_length(ta);
                         return JSValue::number(len as f64);
                     }
                     b"byteLength" => {
-                        let len = crate::typedarray::js_typed_array_length(ta);
+                        let len = crate::typedarray_hook_slots::js_typed_array_length(ta);
                         return JSValue::number((len as usize * elem_size) as f64);
                     }
                     b"buffer" => {
@@ -553,7 +553,7 @@ pub(crate) fn get_field_by_name_object_tail(
                     // needed so a default-`SpeciesCreate`d result reports
                     // `result.constructor === TA`.
                     b"constructor" => {
-                        let name = crate::typedarray::name_for_kind(kind);
+                        let name = crate::typedarray_hook_slots::name_for_kind(kind);
                         let v = js_get_global_this_builtin_value(name.as_ptr(), name.len());
                         return JSValue::from_bits(v.to_bits());
                     }
@@ -1154,7 +1154,7 @@ pub(crate) fn get_field_by_name_object_tail(
         // Only lastIndex is an own header property. Other properties follow
         // expandos and the actual prototype, including observable accessors.
 
-        if gc_type != crate::gc::GC_TYPE_OBJECT {
+        if crate::gc_type_is_not_object!(gc_type) {
             return JSValue::undefined();
         }
         if super::super::is_arguments_object(obj) {
@@ -1195,7 +1195,7 @@ pub(crate) fn get_field_by_name_object_tail(
             let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
             let key_len = (*key).byte_len as usize;
             let key_bytes = std::slice::from_raw_parts(key_ptr, key_len);
-            if key_bytes == b"toJSON" && crate::perf_hooks::is_perf_entry_object(obj) {
+            if key_bytes == b"toJSON" && crate::perf_hook_slots::is_perf_entry_object(obj) {
                 let this_f64 =
                     f64::from_bits(crate::value::js_nanbox_pointer(obj as i64).to_bits());
                 let result = js_class_method_bind(this_f64, b"toJSON".as_ptr(), 6);
@@ -1578,7 +1578,7 @@ pub(crate) fn get_field_by_name_object_tail(
         // stay O(1) instead of O(key_count). A `None` falls through to the
         // linear scan below (the index is an accelerator, not authoritative).
         if key_count >= WIDE_KEY_INDEX_MIN_KEYS {
-            if let Some(i) = wide_key_index_lookup(keys_id, key_bytes, key, keys, key_count) {
+            if let Some(i) = wide_key_index_lookup(keys_id, key_bytes, key, keys_view, key_count) {
                 // A slot holding the hole is an absent key (`key_view`): the
                 // own-key miss below continues the read.
                 let own = object_property_at_with_live(obj, keys, i, live_slots);
@@ -1596,7 +1596,7 @@ pub(crate) fn get_field_by_name_object_tail(
         // shape hash index instead of walking every key; the original match
         // below still gates the hit, so this cannot widen what is accepted.
         if let Some(i) =
-            crate::object::keys_find_property_slot_by_key_ptr(keys, key_count as u32, key)
+            crate::object::keys_find_property_slot_by_key_ptr(keys_view, key_count as u32, key)
                 .map(|v| v as usize)
         {
             let key_val = crate::array::keys_array_slot(keys, i as u32);
@@ -1627,7 +1627,7 @@ pub(crate) fn get_field_by_name_object_tail(
                     } else {
                         super::super::shapes::stamp_object_shape(
                             obj as *mut ObjectHeader,
-                            keys,
+                            keys_view,
                             key_count as u32,
                             live_slots,
                         )

@@ -102,7 +102,7 @@ pub(crate) unsafe fn try_own_store(
             let bag = crate::array::array_property_bag(arr);
             return !bag.is_null() && try_own_store(bag, key, value);
         }
-        if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        if crate::gc_type_is_not_object!(header.obj_type)
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return false;
@@ -368,16 +368,17 @@ pub(crate) unsafe fn try_warm_transition(
         if header.obj_type == crate::gc::GC_TYPE_ARRAY {
             return try_warm_array_transition(obj.cast(), key, value, refresh);
         }
-        if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        if crate::gc_type_is_not_object!(header.obj_type)
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return None;
         }
         shapes::object_shape_record(obj)?
     };
-    if !record.object_kind().is_ordinary_layout()
-        || (*obj).class_id == super::NATIVE_MODULE_CLASS_ID
-    {
+    // A native-module namespace or an unseeded reserved-field receiver is
+    // declined by the transition funnel below
+    // (`runtime_receiver_declines_key_add`), before any write.
+    if !record.object_kind().is_ordinary_layout() {
         return None;
     }
     let bytes = crate::string::header_str_checked(key)?.as_bytes();
@@ -445,8 +446,12 @@ pub(crate) unsafe fn try_dynamic_store(
     }
     let keys = record.keys() as usize as *const crate::ArrayHeader;
     if !keys.is_null()
-        && super::keys_find_property_slot_by_bytes(keys, record.logical_key_count(), bytes)
-            .is_some()
+        && super::keys_find_property_slot_by_bytes(
+            record.keys_view(),
+            record.logical_key_count(),
+            bytes,
+        )
+        .is_some()
     {
         return None;
     }
@@ -476,7 +481,7 @@ unsafe fn dynamic_store_receiver(obj: *mut ObjectHeader) -> Option<shapes::Shape
         return None;
     }
     let header = crate::value::addr_class::try_read_gc_header(obj as usize)?;
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved
             & (crate::gc::OBJ_FLAG_FROZEN
@@ -499,7 +504,8 @@ unsafe fn dynamic_store_receiver(obj: *mut ObjectHeader) -> Option<shapes::Shape
     {
         return None;
     }
-    let meta = (*obj).meta;
+    // A1_UNPROVEN: record-first: receiver shape (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
     if !meta.is_null()
         && ((*meta).elements != 0
             || (*meta).flags
@@ -684,7 +690,7 @@ unsafe fn try_array_store(
                 });
             }
             crate::value::js_nanbox_pointer(proto_bag_root.get_raw_mut_ptr::<ObjectHeader>() as i64)
-        } else if header.obj_type == crate::gc::GC_TYPE_OBJECT {
+        } else if crate::gc_type_is_object!(header.obj_type) {
             proto_root.get_nanbox_f64()
         } else {
             return None;
@@ -775,15 +781,17 @@ pub(crate) unsafe fn try_store_with_refresh(
         }
         return try_function_store(target, key, value, name, may_move);
     }
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         return None;
     }
     let obj = addr as *mut ObjectHeader;
     let shape = shapes::object_shape_descriptor(obj)?;
+    // #9019: an unseeded reserved-field receiver's key count is not a slot;
+    // the complete [[Set]] seeds its floor before the append.
     if !shape.object_kind.is_ordinary_layout()
-        || (*obj).class_id == super::NATIVE_MODULE_CLASS_ID
+        || super::runtime_receiver_declines_key_add(obj)
         || super::overflow::has_overflow(obj)
     {
         return None;
@@ -882,7 +890,8 @@ unsafe fn apply_proven_add(
         let obj = owner.get_raw_mut_ptr::<ObjectHeader>();
         let proof = super::canonical_keys::SharedLayout::of_receiver(obj)?;
         let keys = super::object_keys(obj);
-        let parent = super::canonical_keys::canonicalize(&proof, keys.arr(), slot as u32);
+        let parent =
+            super::canonical_keys::canonical_prefix(&proof, keys, (slot as u32).min(keys.count()));
         let next = super::canonical_keys::extend_key(
             &proof,
             parent,
@@ -996,7 +1005,7 @@ unsafe fn try_function_store(
         }
         let addr = (bits & crate::value::POINTER_MASK) as usize;
         let header = crate::value::addr_class::try_read_gc_header(addr)?;
-        if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        if crate::gc_type_is_not_object!(header.obj_type)
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return None;
@@ -1088,7 +1097,7 @@ pub(crate) unsafe fn chain_blocks(receiver: f64, key: &[u8]) -> bool {
         let Some(header) = crate::value::addr_class::try_read_gc_header(addr) else {
             return true;
         };
-        if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+        if crate::gc_type_is_not_object!(header.obj_type) {
             return true;
         }
         let obj = addr as *const ObjectHeader;

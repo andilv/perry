@@ -40,6 +40,12 @@ impl<'a> Gen<'a> {
     ) -> (CallId, NodeId) {
         let ret = self.tmp("callret");
         let id = self.m.calls.len() as CallId;
+        if let Some(d) = &mut self.diagnostic {
+            d.calls.insert(ret, id);
+        }
+        if let Some(d) = &mut self.m.diagnostic {
+            d.source_calls.insert(id);
+        }
         self.m.calls.push(CallSite {
             this,
             args,
@@ -92,6 +98,35 @@ impl<'a> Gen<'a> {
     }
 
     /// Fail closed: every operand escapes, the result is ⊤.
+    /// The node a conditional's test reads and the guards of its two
+    /// branches: a comparison with `undefined`/`null` tests its operand,
+    /// anything else tests its own value's truthiness.
+    pub(crate) fn guard_test(&mut self, fx: &Fx, condition: &Expr) -> (NodeId, u8, u8) {
+        use crate::model::guard::*;
+        if let Expr::Compare { op, left, right } = condition {
+            let (operand, nil) = match (left.as_ref(), right.as_ref()) {
+                (x, Expr::Undefined) | (Expr::Undefined, x) => (Some(x), Expr::Undefined),
+                (x, Expr::Null) | (Expr::Null, x) => (Some(x), Expr::Null),
+                _ => (None, Expr::Undefined),
+            };
+            if let Some(x) = operand {
+                let strict_undef = matches!(nil, Expr::Undefined);
+                let tests = match op {
+                    CompareOp::Eq if strict_undef => Some((UNDEF, NOT_UNDEF)),
+                    CompareOp::Ne if strict_undef => Some((NOT_UNDEF, UNDEF)),
+                    CompareOp::LooseEq => Some((NULLISH, NOT_NULLISH)),
+                    CompareOp::LooseNe => Some((NOT_NULLISH, NULLISH)),
+                    _ => None,
+                };
+                if let Some((then_test, else_test)) = tests {
+                    let v = self.expr(fx, x);
+                    return (v, then_test, else_test);
+                }
+            }
+        }
+        (self.expr(fx, condition), TRUTHY, FALSY)
+    }
+
     pub(crate) fn fail_closed(&mut self, fx: &Fx, e: &Expr, name: &str) -> NodeId {
         let why = format!("{UNMODELED_OPERAND} {name}");
         let mut kids: Vec<&Expr> = Vec::new();
@@ -195,8 +230,18 @@ impl<'a> Gen<'a> {
     }
 
     /// An element store (`o[k] = v`): no construction phase, maybe rooted.
-    fn store_elem(&mut self, fx: &Fx, e: &Expr, recv: NodeId, key: Key, src: NodeId, desc: &str) {
+    fn store_elem(
+        &mut self,
+        fx: &Fx,
+        e: &Expr,
+        recv: NodeId,
+        key: Key,
+        key_value: NodeId,
+        src: NodeId,
+        desc: &str,
+    ) {
         let site = self.store_site(fx.module, fx.f, desc.into(), None, false);
+        self.m.stores[site as usize].key_value = Some(key_value);
         self.mark_rooted(e, site);
         self.m.cons(recv, Cons::Store { key, src, site });
     }
@@ -307,6 +352,7 @@ impl<'a> Gen<'a> {
             birth_keys: atoms.clone(),
             definite: atoms,
             declared: Vec::new(),
+            reserved: Vec::new(),
             parent: None,
             ctor: None,
             native_parent: None,
@@ -316,6 +362,7 @@ impl<'a> Gen<'a> {
             proto_members: vec![],
             parent_value: None,
             parent_links: Vec::new(),
+            null_proto: false,
         });
         let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
         (tm, t)
@@ -407,6 +454,9 @@ impl<'a> Gen<'a> {
     pub(crate) fn expr(&mut self, fx: &Fx, e: &Expr) -> NodeId {
         let prev = std::mem::replace(&mut self.m.cur_fn, fx.f);
         let n = self.expr_inner(fx, e);
+        if self.diagnostic.is_some() {
+            self.diagnostic_expr(fx, e, n);
+        }
         self.m.cur_fn = prev;
         n
     }
@@ -428,7 +478,17 @@ impl<'a> Gen<'a> {
             Expr::LocalSet(id, v) => {
                 let vn = self.expr(fx, v);
                 let l = self.local_write(mi, *id);
-                self.m.edge(vn, l);
+                match fx.guard {
+                    Some((t, test)) => self.m.cons(
+                        t,
+                        Cons::Guard {
+                            test,
+                            from: vn,
+                            dst: l,
+                        },
+                    ),
+                    None => self.m.edge(vn, l),
+                }
                 vn
             }
             Expr::ScopedTemp { id, value, body } => {
@@ -606,8 +666,21 @@ impl<'a> Gen<'a> {
                 let r = self.expr(fx, right);
                 let out = self.tmp("logical");
                 self.m.edge(l, out);
-                self.m.edge(r, out);
-                let _ = matches!(op, LogicalOp::And);
+                // The right operand is the result only when the left one
+                // selects it.
+                let test = match op {
+                    LogicalOp::And => crate::model::guard::TRUTHY,
+                    LogicalOp::Or => crate::model::guard::FALSY,
+                    LogicalOp::Coalesce => crate::model::guard::NULLISH,
+                };
+                self.m.cons(
+                    l,
+                    Cons::Guard {
+                        test,
+                        from: r,
+                        dst: out,
+                    },
+                );
                 out
             }
             Expr::Conditional {
@@ -615,12 +688,26 @@ impl<'a> Gen<'a> {
                 then_expr,
                 else_expr,
             } => {
-                let _ = self.expr(fx, condition);
+                let (t, then_test, else_test) = self.guard_test(fx, condition);
                 let a = self.expr(fx, then_expr);
                 let b = self.expr(fx, else_expr);
                 let out = self.tmp("cond");
-                self.m.edge(a, out);
-                self.m.edge(b, out);
+                self.m.cons(
+                    t,
+                    Cons::Guard {
+                        test: then_test,
+                        from: a,
+                        dst: out,
+                    },
+                );
+                self.m.cons(
+                    t,
+                    Cons::Guard {
+                        test: else_test,
+                        from: b,
+                        dst: out,
+                    },
+                );
                 out
             }
             Expr::TypeOf(x) => {
@@ -684,6 +771,7 @@ impl<'a> Gen<'a> {
                 object,
                 property,
                 byte_offset,
+                ..
             } => {
                 let o = match self.ns_member(mi, object, property, false) {
                     Some(o) => o,
@@ -707,6 +795,7 @@ impl<'a> Gen<'a> {
                 object,
                 property,
                 value,
+                ..
             } => {
                 let o = self.expr(fx, object);
                 let v = self.expr(fx, value);
@@ -753,9 +842,21 @@ impl<'a> Gen<'a> {
                     }
                 } else {
                     let key = self.key_of(key);
-                    self.store_phased(fx, e, target, t, key, v, "putvalue".into(), owner);
+                    let site =
+                        self.store_phased(fx, e, target, t, key, v, "putvalue".into(), owner);
+                    self.m.stores[site as usize].key_value = Some(k);
                     // A receiver other than the target gets the own data store.
-                    self.store_phased(fx, e, target, rv, key, v, "putvalue-receiver".into(), owner);
+                    let site = self.store_phased(
+                        fx,
+                        e,
+                        target,
+                        rv,
+                        key,
+                        v,
+                        "putvalue-receiver".into(),
+                        owner,
+                    );
+                    self.m.stores[site as usize].key_value = Some(k);
                 }
                 v
             }
@@ -794,7 +895,20 @@ impl<'a> Gen<'a> {
                 );
                 nv2
             }
-            Expr::IndexGet { object, index } => {
+            Expr::BufferLength(array) | Expr::Uint8ArrayLength(array) => {
+                let o = self.expr(fx, array);
+                let key = self.m.atom("length");
+                self.load(o, Key::Named(key))
+            }
+            Expr::IndexGet { object, index, .. }
+            | Expr::Uint8ArrayGet {
+                array: object,
+                index,
+            }
+            | Expr::BufferIndexGet {
+                buffer: object,
+                index,
+            } => {
                 let o = self.expr(fx, object);
                 let i = self.expr(fx, index);
                 let r = self.m.reason("ToPropertyKey");
@@ -820,6 +934,17 @@ impl<'a> Gen<'a> {
                 object,
                 index,
                 value,
+                ..
+            }
+            | Expr::Uint8ArraySet {
+                array: object,
+                index,
+                value,
+            }
+            | Expr::BufferIndexSet {
+                buffer: object,
+                index,
+                value,
             } => {
                 let o = self.expr(fx, object);
                 let i = self.expr(fx, index);
@@ -840,7 +965,7 @@ impl<'a> Gen<'a> {
                     self.m.cons(kp, Cons::StoreKeyed { o, src: v, site });
                 } else {
                     let key = self.key_of(index);
-                    self.store_elem(fx, e, o, key, v, "[]=");
+                    self.store_elem(fx, e, o, key, i, v, "[]=");
                 }
                 v
             }
@@ -873,7 +998,7 @@ impl<'a> Gen<'a> {
                         add: false,
                     },
                 );
-                self.store_elem(fx, e, o, key, nv, "[]++");
+                self.store_elem(fx, e, o, key, i, nv, "[]++");
                 nv
             }
             Expr::Delete(target) => {
@@ -891,11 +1016,16 @@ impl<'a> Gen<'a> {
                     self.m.reason("E7 delete")
                 };
                 match target.as_ref() {
-                    Expr::PropertyGet { object, .. } | Expr::IndexGet { object, .. } => {
+                    Expr::PropertyGet {
+                        object, property, ..
+                    } => {
                         let o = self.expr(fx, object);
-                        if let Expr::IndexGet { index, .. } = target.as_ref() {
-                            let _ = self.expr(fx, index);
-                        }
+                        let key = self.m.atom(property);
+                        self.m.cons(o, Cons::DeleteKey { key, reason: r });
+                    }
+                    Expr::IndexGet { object, index, .. } => {
+                        let o = self.expr(fx, object);
+                        let _ = self.expr(fx, index);
                         self.m.cons(
                             o,
                             Cons::Hard {
@@ -977,6 +1107,16 @@ impl<'a> Gen<'a> {
                 let has_spread = parts.iter().any(|(k, _)| k.is_none());
                 let (tm, t) = self.new_lit(mi, e, if has_spread { &[] } else { &named });
                 let obj = self.tok_node(t);
+                if has_spread {
+                    let named = named.iter().map(|k| self.m.atom(k)).collect();
+                    self.m.lit_spread.insert(
+                        tm,
+                        crate::model::LitSpread {
+                            named,
+                            sites: Vec::new(),
+                        },
+                    );
+                }
                 for (k, v) in parts {
                     let vn = self.expr(fx, v);
                     match k {
@@ -996,6 +1136,10 @@ impl<'a> Gen<'a> {
                             // Own enumerable keys of the source, key by key
                             // (getters run): `Cons::Spread`.
                             let site = self.store_site(mi, fx.f, "lit...".into(), Some(tm), true);
+                            if let Some(l) = self.m.lit_spread.get_mut(&tm) {
+                                l.sites.push((site, None));
+                            }
+                            self.m.lit_spread_site.insert(site, tm);
                             self.m.cons(vn, Cons::Spread { into: obj, site });
                         }
                     }

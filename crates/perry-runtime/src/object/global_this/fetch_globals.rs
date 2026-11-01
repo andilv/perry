@@ -114,7 +114,7 @@ pub extern "C" fn js_get_global_this() -> f64 {
         let _ = crate::gc::gc_collect_minor();
     }
     // First access on this thread — allocate our own global.
-    let new_ptr = js_object_alloc(0, 0) as i64;
+    let new_ptr = crate::realm_decl! { birth js_object_alloc(0, 0); realm { "%Global%", kind = namespace, never_move = true, members = { globalThis = ref("%Global%"); global = ref("%Global%"), attrs = writable | enumerable | configurable; Array = ref(Array); Object = ref(Object); String = ref(String); Number = ref(Number); Boolean = ref(Boolean); Function = ref(Function); RegExp = ref(RegExp); Date = ref(Date); Error = ref(Error); TypeError = ref(TypeError); RangeError = ref(RangeError); SyntaxError = ref(SyntaxError); ReferenceError = ref(ReferenceError); EvalError = ref(EvalError); URIError = ref(URIError); AggregateError = ref(AggregateError); Symbol = ref(Symbol); Promise = ref(Promise); Map = ref(Map); Set = ref(Set); WeakMap = ref(WeakMap); WeakSet = ref(WeakSet); WeakRef = ref(WeakRef); Proxy = ref(Proxy); BigInt = ref(BigInt); Uint8Array = ref(Uint8Array); Int8Array = ref(Int8Array); Uint16Array = ref(Uint16Array); Int16Array = ref(Int16Array); Uint32Array = ref(Uint32Array); Int32Array = ref(Int32Array); Float16Array = ref(Float16Array); Float32Array = ref(Float32Array); Float64Array = ref(Float64Array); Uint8ClampedArray = ref(Uint8ClampedArray); BigInt64Array = ref(BigInt64Array); BigUint64Array = ref(BigUint64Array); ArrayBuffer = ref(ArrayBuffer); SharedArrayBuffer = ref(SharedArrayBuffer); DataView = ref(DataView); TextEncoder = ref(TextEncoder); TextDecoder = ref(TextDecoder); TextEncoderStream = ref(TextEncoderStream); TextDecoderStream = ref(TextDecoderStream); CompressionStream = ref(CompressionStream); DecompressionStream = ref(DecompressionStream); ReadableStream = ref(ReadableStream); WritableStream = ref(WritableStream); TransformStream = ref(TransformStream); Navigator = ref(Navigator); URL = ref(URL); URLSearchParams = ref(URLSearchParams); URLPattern = ref(URLPattern); AbortController = ref(AbortController); AbortSignal = ref(AbortSignal); EventTarget = ref(EventTarget); Crypto = ref(Crypto); CryptoKey = ref(CryptoKey); SubtleCrypto = ref(SubtleCrypto); Event = ref(Event); CustomEvent = ref(CustomEvent); DOMException = ref(DOMException); FormData = ref(FormData); Blob = ref(Blob); File = ref(File); Headers = ref(Headers); Request = ref(Request); Response = ref(Response); MessageChannel = ref(MessageChannel); MessagePort = ref(MessagePort); BroadcastChannel = ref(BroadcastChannel); Storage = ref(Storage); localStorage = accessor(get = "localStorage.<get>", set = "localStorage.<set>"), attrs = enumerable | configurable; sessionStorage = accessor(get = "sessionStorage.<get>", set = "sessionStorage.<set>"), attrs = enumerable | configurable; WebSocket = ref(WebSocket); FinalizationRegistry = ref(FinalizationRegistry); DisposableStack = ref(DisposableStack); AsyncDisposableStack = ref(AsyncDisposableStack); SuppressedError = ref(SuppressedError); Buffer = ref(Buffer); eval = ref(eval); fetch = ref(fetch), attrs = writable | enumerable | configurable; structuredClone = ref(structuredClone), attrs = writable | enumerable | configurable; atob = ref(atob), attrs = writable | enumerable | configurable; btoa = ref(btoa), attrs = writable | enumerable | configurable; setTimeout = ref(setTimeout), attrs = writable | enumerable | configurable; clearTimeout = ref(clearTimeout), attrs = writable | enumerable | configurable; setInterval = ref(setInterval), attrs = writable | enumerable | configurable; clearInterval = ref(clearInterval), attrs = writable | enumerable | configurable; setImmediate = ref(setImmediate), attrs = writable | enumerable | configurable; clearImmediate = ref(clearImmediate), attrs = writable | enumerable | configurable; queueMicrotask = ref(queueMicrotask), attrs = writable | enumerable | configurable; gc = ref(gc); parseInt = ref(parseInt); parseFloat = ref(parseFloat); isNaN = ref(isNaN); isFinite = ref(isFinite); encodeURI = ref(encodeURI); decodeURI = ref(decodeURI); encodeURIComponent = ref(encodeURIComponent); decodeURIComponent = ref(decodeURIComponent); escape = ref(escape); unescape = ref(unescape); console = ref(console); process = ref(process); Math = ref(Math); JSON = ref(JSON); Reflect = ref(Reflect); Atomics = ref(Atomics); Intl = ref(Intl); WebAssembly = ref(WebAssembly); Temporal = ref(Temporal); performance = ref(performance), attrs = writable | enumerable | configurable; Performance = ref(Performance), attrs = writable | enumerable | configurable; PerformanceEntry = ref(PerformanceEntry), attrs = writable | enumerable | configurable; PerformanceMark = ref(PerformanceMark), attrs = writable | enumerable | configurable; PerformanceMeasure = ref(PerformanceMeasure), attrs = writable | enumerable | configurable; PerformanceObserver = ref(PerformanceObserver), attrs = writable | enumerable | configurable; PerformanceObserverEntryList = ref(PerformanceObserverEntryList), attrs = writable | enumerable | configurable; PerformanceResourceTiming = ref(PerformanceResourceTiming), attrs = writable | enumerable | configurable; crypto = accessor(get = "crypto.<get>"), attrs = enumerable | configurable; navigator = ref(navigator), attrs = writable | enumerable | configurable; NaN = NaN; Infinity = Infinity; undefined = undefined; }; } } as i64;
     THREAD_GLOBAL_THIS.with(|c| c.set(crate::value::js_nanbox_pointer(new_ptr).to_bits()));
     // The thread-local cache stores the tagged JSValue, independently of
     // GLOBAL_THIS_PTR's raw pointer field. Register its writable word so marking
@@ -211,7 +211,7 @@ pub(crate) extern "C" fn global_this_date_thunk(
     _this: crate::closure::JsThis,
     _arg: f64,
 ) -> f64 {
-    let string = crate::date::js_date_to_string(crate::date::js_date_new());
+    let string = crate::date_hook_slots::js_date_to_string(crate::date_hook_slots::js_date_new());
     crate::value::js_nanbox_string(string as i64)
 }
 
@@ -730,10 +730,10 @@ pub unsafe extern "C-unwind" fn js_fetch_or_value_super(
             };
             match method.as_str() {
                 "EventEmitter" => {
-                    return crate::node_stream::js_event_emitter_subclass_init(this_box, options)
+                    return crate::stream_hooks::js_event_emitter_subclass_init(this_box, options)
                 }
                 "EventEmitterAsyncResource" => {
-                    return crate::node_stream::js_event_emitter_async_resource_subclass_init(
+                    return crate::stream_hooks::js_event_emitter_async_resource_subclass_init(
                         this_box, options,
                     )
                 }
@@ -753,7 +753,7 @@ pub unsafe extern "C-unwind" fn js_fetch_or_value_super(
         } else {
             undef
         };
-        crate::wasi::js_wasi_init_subclass(this_box, arg0);
+        crate::wasi_hook_slots::js_wasi_init_subclass(this_box, arg0);
         return undef;
     }
     // #10453: `class X extends AsyncResource` threw "Class constructor
@@ -791,7 +791,7 @@ pub unsafe extern "C-unwind" fn js_fetch_or_value_super(
         } else {
             undef
         };
-        crate::async_hooks::js_async_resource_subclass_init(this_box, type_value, options);
+        crate::async_hook_slots::js_async_resource_subclass_init(this_box, type_value, options);
         return undef;
     }
     // #10625: `class X extends AsyncLocalStorage` reached indirectly (local
@@ -1063,13 +1063,13 @@ pub unsafe extern "C-unwind" fn js_fetch_or_value_super(
     // properties; replacing it would lose derived fields and prototype identity.
     match kind {
         Some("EventTarget") => {
-            return crate::event_target::js_event_target_subclass_init(this_box, 0)
+            return crate::event_target_hook_slots::js_event_target_subclass_init(this_box, 0)
         }
         Some("AbortController") => {
-            return crate::event_target::js_event_target_subclass_init(this_box, 1)
+            return crate::event_target_hook_slots::js_event_target_subclass_init(this_box, 1)
         }
         Some("AbortSignal") => {
-            return crate::event_target::js_event_target_subclass_init(this_box, 2)
+            return crate::event_target_hook_slots::js_event_target_subclass_init(this_box, 2)
         }
         Some("Event") | Some("CustomEvent") => {
             let arg0 = if args_len > 0 { *args_ptr } else { undef };
@@ -1078,7 +1078,7 @@ pub unsafe extern "C-unwind" fn js_fetch_or_value_super(
             } else {
                 undef
             };
-            return crate::event_target::js_event_subclass_init(
+            return crate::event_target_hook_slots::js_event_subclass_init(
                 this_box,
                 arg0,
                 arg1,
@@ -1093,7 +1093,9 @@ pub unsafe extern "C-unwind" fn js_fetch_or_value_super(
             } else {
                 undef
             };
-            return crate::event_target::js_dom_exception_subclass_init(this_box, arg0, arg1);
+            return crate::event_target_hook_slots::js_dom_exception_subclass_init(
+                this_box, arg0, arg1,
+            );
         }
         _ => {}
     }

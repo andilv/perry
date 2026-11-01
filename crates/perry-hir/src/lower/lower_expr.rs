@@ -31,6 +31,7 @@ mod assignment;
 mod helpers;
 mod json_literal;
 mod reactive_text;
+mod site_census;
 #[cfg(test)]
 mod stream_module_value_tests;
 
@@ -100,6 +101,79 @@ pub(crate) fn lower_expr(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<
         lower_expr_impl(ctx, expr)
     });
     ctx.expr_lower_depth -= 1;
+    let mut result = result;
+    if std::env::var_os("PERRY_FACTS_DUMP").is_some() {
+        if let Ok(value) = &mut result {
+            let span = expr.span();
+            match (expr, value) {
+                (
+                    ast::Expr::Call(_),
+                    Expr::CallSpread {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    },
+                ) => {
+                    *byte_offset = span.lo.0;
+                    *byte_end = span.hi.0;
+                }
+                (
+                    ast::Expr::Member(_),
+                    Expr::IndexGet {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    },
+                ) => {
+                    *byte_offset = span.lo.0;
+                    *byte_end = span.hi.0;
+                }
+                (
+                    ast::Expr::Assign(_),
+                    Expr::PropertySet {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    }
+                    | Expr::IndexSet {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    }
+                    | Expr::PutValueSet {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    },
+                )
+                | (
+                    ast::Expr::Update(_),
+                    Expr::PropertyUpdate {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    }
+                    | Expr::IndexUpdate {
+                        byte_offset,
+                        byte_end,
+                        ..
+                    },
+                ) => {
+                    *byte_offset = span.lo.0;
+                    *byte_end = span.hi.0;
+                }
+                (ast::Expr::Member(_), Expr::PropertyGet { byte_end, .. })
+                | (ast::Expr::Call(_), Expr::Call { byte_end, .. })
+                | (ast::Expr::New(_), Expr::New { byte_end, .. })
+                | (ast::Expr::New(_), Expr::NewDynamic { byte_end, .. })
+                | (ast::Expr::New(_), Expr::NewDynamicSpread { byte_end, .. }) => {
+                    *byte_end = span.hi.0
+                }
+                _ => {}
+            }
+        }
+        site_census::record(ctx, expr, &result);
+    }
     result
 }
 
@@ -347,6 +421,7 @@ fn lower_expr_impl(ctx: &mut LoweringContext, expr: &ast::Expr) -> Result<Expr> 
 
             let callee = lower_expr(ctx, &tagged.tag)?;
             Ok(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(callee),
                 args: call_args,
                 type_args: vec![],

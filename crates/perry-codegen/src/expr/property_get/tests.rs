@@ -22,6 +22,7 @@ use front_contract::{front_call_block, verify_front_directory};
 
 fn ir_opts(debug_locations: bool, module_source: Option<&str>) -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -33,6 +34,7 @@ fn ir_opts(debug_locations: bool, module_source: Option<&str>) -> CompileOptions
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -110,6 +112,7 @@ fn module_with_nullish_read() -> Module {
             init: Some(Expr::Undefined),
         },
         Stmt::Expr(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "foo".to_string(),
             // BytePos 8 → source index 7 ('o' on line 2) → line 2.
@@ -129,6 +132,7 @@ fn emit(debug: bool, source: Option<&str>) -> String {
 fn imported_variable_read_preserves_class_tags_and_calls_the_live_getter_once() {
     let mut module = Module::new("imported_class_9366.ts");
     module.init.push(Stmt::Expr(Expr::PropertyGet {
+        byte_end: 0,
         object: Box::new(Expr::ExternFuncRef {
             name: "Renamed".to_string(),
             param_types: vec![],
@@ -194,6 +198,7 @@ fn emit_guarded_length_read() -> String {
             init: None,
         },
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(11)),
             property: "length".to_string(),
             byte_offset: 0,
@@ -314,6 +319,7 @@ fn typed_array_length_uses_property_semantics_after_define_property() {
             Box::new(Expr::Object(vec![])),
         )),
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(20)),
             property: "length".to_string(),
             byte_offset: 0,
@@ -339,6 +345,7 @@ fn typed_array_length_keeps_native_load_without_shape_barrier() {
             init: Some(Expr::Uint8ArrayNew(Some(Box::new(Expr::Number(3.0))))),
         },
         Stmt::Return(Some(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(21)),
             property: "length".to_string(),
             byte_offset: 0,
@@ -355,9 +362,10 @@ fn typed_array_length_keeps_native_load_without_shape_barrier() {
 }
 
 #[test]
-fn fs_parent_promises_property_installs_before_resolution() {
+fn fs_parent_promises_property_initializes_only_its_child_before_export_read() {
     let mut module = Module::new("fs_parent_promises_property.ts");
     module.init = vec![Stmt::Return(Some(Expr::PropertyGet {
+        byte_end: 0,
         object: Box::new(Expr::NativeModuleRef("fs".to_string())),
         property: "promises".to_string(),
         byte_offset: 0,
@@ -369,10 +377,16 @@ fn fs_parent_promises_property_installs_before_resolution() {
         .find("call void @js_node_submod_install_fs_promises()")
         .unwrap_or_else(|| panic!("fs.promises must emit its submodule installer:\n{ir}"));
     let resolve = ir
-        .find("call double @js_native_module_property_by_name")
-        .unwrap_or_else(|| {
-            panic!("fs.promises must use the native-module property resolver:\n{ir}")
-        });
+        .find("call double @js_native_module_esm_export_value")
+        .unwrap_or_else(|| panic!("fs.promises must read its selected export cell:\n{ir}"));
+    assert!(
+        !ir.contains("call void @js_nm_install_fs("),
+        "a selected child must not install the parent fs bucket:\n{ir}"
+    );
+    assert!(
+        !ir.contains("call double @js_native_module_property_by_name"),
+        "a selected child must not read through the whole module object:\n{ir}"
+    );
     assert!(
         install < resolve,
         "fs.promises submodule installation must precede property resolution:\n{ir}"
@@ -594,6 +608,7 @@ mod nested_namespace_members {
     fn module_reading(member: &str) -> Module {
         let mut m = Module::new("nsmain.ts");
         m.init = vec![Stmt::Expr(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::ExternFuncRef {
                 name: "B".to_string(),
                 param_types: Vec::new(),
@@ -676,6 +691,7 @@ fn module_reading(property: &str) -> Module {
             init: Some(Expr::Undefined),
         },
         Stmt::Expr(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: property.to_string(),
             byte_offset: 0,

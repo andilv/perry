@@ -30,6 +30,8 @@ fn first_expanded_arg(call: &ast::CallExpr, args: Vec<Expr>) -> Expr {
         })
         .collect();
     Expr::IndexGet {
+        byte_offset: 0,
+        byte_end: 0,
         object: Box::new(Expr::ArraySpread(elements)),
         index: Box::new(Expr::Integer(0)),
     }
@@ -174,6 +176,7 @@ pub(super) fn try_global_builtins(
                 // handles it. Shadow-safe: only fires when no local
                 // / user fn / imported fn named `Array` is in scope.
                 return Ok(Ok(Expr::New {
+                    byte_end: 0,
                     class_name: "Array".to_string(),
                     args,
                     type_args: Vec::new(),
@@ -345,6 +348,7 @@ pub(super) fn try_global_builtins(
                 let class_name =
                     ctx.synthesize_declared_keys_class(&keys, func_name == "__perry_declared_keys");
                 return Ok(Ok(Expr::New {
+                    byte_end: 0,
                     class_name,
                     args: Vec::new(),
                     type_args: Vec::new(),
@@ -424,6 +428,55 @@ pub(super) fn try_global_builtins(
                     args: vec![path],
                 }));
             }
+            // A literal CommonJS `require` is a static edge: the argument is
+            // the target's imported `__perry_cjs_record` binding. Codegen
+            // runs the target's init guard, then reads the binding (the
+            // record, whose `exports` the edge returns).
+            "__perry_cjs_init" => {
+                let record = if !args.is_empty() {
+                    args.remove(0)
+                } else {
+                    Expr::Undefined
+                };
+                return Ok(Ok(Expr::NativeMethodCall {
+                    module: "__perry_runtime".to_string(),
+                    class_name: None,
+                    object: None,
+                    method: "cjsRequireEdge".to_string(),
+                    args: vec![record],
+                }));
+            }
+            // `if (__perry_cjs_open()) { … } else { … }`: the CommonJS
+            // wrapper's escape forms. The program's closed-world bit is known
+            // only after every module is collected; one pass then keeps the
+            // live arm (`cjs_link::resolve_open_sites`), so nothing after it
+            // sees this call.
+            // `module.isBuiltin(specifier)` for the CommonJS wrapper and its
+            // support module, without importing `node:module` (whose import
+            // installs that module's whole runtime dispatcher).
+            "__perry_is_builtin" => {
+                let specifier = if !args.is_empty() {
+                    args.remove(0)
+                } else {
+                    Expr::Undefined
+                };
+                return Ok(Ok(Expr::NativeMethodCall {
+                    module: "__perry_runtime".to_string(),
+                    class_name: None,
+                    object: None,
+                    method: "isBuiltin".to_string(),
+                    args: vec![specifier],
+                }));
+            }
+            "__perry_cjs_open" => {
+                return Ok(Ok(Expr::NativeMethodCall {
+                    module: "__perry_runtime".to_string(),
+                    class_name: None,
+                    object: None,
+                    method: "cjsOpen".to_string(),
+                    args: Vec::new(),
+                }));
+            }
             // Presence bit paired with `requirePathModule`: a real CommonJS
             // module is allowed to export JavaScript `undefined`.
             "__perry_has_path_module" => {
@@ -501,7 +554,9 @@ pub(super) fn try_global_builtins(
                     return Ok(Err(args));
                 }
                 return Ok(Ok(Expr::Call {
+                    byte_end: 0,
                     callee: Box::new(Expr::PropertyGet {
+                        byte_end: 0,
                         byte_offset: 0,
                         object: Box::new(Expr::GlobalGet(0)),
                         property: "fetch".to_string(),
@@ -859,7 +914,9 @@ pub(super) fn try_global_builtins(
                             new_args.push(enc);
                         }
                         return Ok(Ok(Expr::Call {
+                            byte_end: 0,
                             callee: Box::new(Expr::PropertyGet {
+                                byte_end: 0,
                                 byte_offset: 0,
                                 object: Box::new(Expr::NativeModuleRef("crypto".to_string())),
                                 property: "createSecretKey".to_string(),
@@ -880,7 +937,9 @@ pub(super) fn try_global_builtins(
                         let alg_arg = iter.next().unwrap();
                         let options_arg = iter.next().unwrap();
                         return Ok(Ok(Expr::Call {
+                            byte_end: 0,
                             callee: Box::new(Expr::PropertyGet {
+                                byte_end: 0,
                                 byte_offset: 0,
                                 object: Box::new(Expr::NativeModuleRef("crypto".to_string())),
                                 property: "generateKeySync".to_string(),

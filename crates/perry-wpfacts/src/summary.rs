@@ -293,12 +293,19 @@ pub fn map_cons(
             this,
         },
         OverrideThis { tmpl, key, reason } => OverrideThis { tmpl, key, reason },
+        Guard { test, from, dst } => Guard {
+            test,
+            from: n(from),
+            dst: n(dst),
+        },
+        Defined { dst } => Defined { dst: n(dst) },
         TopIfAny { dst, from, reason } => TopIfAny {
             dst: n(dst),
             from: n(from),
             reason,
         },
         Hard { kind, reason } => Hard { kind, reason },
+        DeleteKey { key, reason } => DeleteKey { key, reason },
         AddsKeys => AddsKeys,
         DefineKey { key, data, reason } => DefineKey { key, data, reason },
         DefineAll {
@@ -327,7 +334,13 @@ pub fn map_cons(
         },
         Implicit { reason, proto } => Implicit { reason, proto },
         CreateProto { reason } => CreateProto { reason },
-        ChainUnion { key, dst } => ChainUnion { key, dst: n(dst) },
+        ChainUnion { key, dst, of } => ChainUnion {
+            key,
+            dst: n(dst),
+            of,
+        },
+        ProtoGiven { protos } => ProtoGiven { protos: n(protos) },
+        ParentGiven { of } => ParentGiven { of },
         ProtoClosure { dst } => ProtoClosure { dst: n(dst) },
         ProtoMethods { origin, key, call } => ProtoMethods {
             origin,
@@ -335,6 +348,10 @@ pub fn map_cons(
             call: k(call),
         },
         AnyAccessors { origin, act } => AnyAccessors {
+            origin,
+            act: act_map(act, &mut n, &mut k),
+        },
+        PlainKey { origin, act } => PlainKey {
             origin,
             act: act_map(act, &mut n, &mut k),
         },
@@ -374,6 +391,7 @@ pub fn map_cons(
         AccessorInstall { key, f, setter } => AccessorInstall { key, f, setter },
         ProtoFrom { src } => ProtoFrom { src: n(src) },
         ProtoOf { dst } => ProtoOf { dst: n(dst) },
+        ProtoValues { dst } => ProtoValues { dst: n(dst) },
         IterNext { dst } => IterNext { dst: n(dst) },
         NewTargetHard { reason } => NewTargetHard { reason },
         IdxLoad { idx, dst } => IdxLoad {
@@ -381,6 +399,15 @@ pub fn map_cons(
             dst: n(dst),
         },
         IdxKey { obj, dst } => IdxKey { obj, dst: n(dst) },
+        IdxMCall { idx, call } => IdxMCall {
+            idx: n(idx),
+            call: k(call),
+        },
+        IdxKeyCall { obj, prim, call } => IdxKeyCall {
+            obj,
+            prim,
+            call: k(call),
+        },
         ForInBody { obj, call } => ForInBody {
             obj: n(obj),
             call: k(call),
@@ -502,13 +529,17 @@ fn gen_kind(c: &Cons) -> bool {
             | ContractThis { .. }
             | OverrideThis { .. }
             | TopIfAny { .. }
+            | Guard { .. }
             | Hard { .. }
+            | DeleteKey { .. }
             | DefineKey { .. }
             | DefineAll { .. }
             | AddsKeys
             | Implicit { .. }
             | IdxLoad { .. }
             | IdxKey { .. }
+            | IdxMCall { .. }
+            | IdxKeyCall { .. }
             | ForInBody { .. }
             | DefineKeyed { .. }
             | StoreKeyed { .. }
@@ -540,7 +571,8 @@ fn read_dst(c: &Cons) -> Option<NodeId> {
         | Arith { dst, .. }
         | ArrayLenArg { dst }
         | IterNext { dst }
-        | ProtoOf { dst } => Some(dst),
+        | ProtoOf { dst }
+        | ProtoValues { dst } => Some(dst),
         _ => None,
     }
 }
@@ -554,7 +586,9 @@ impl Model {
         }
         if self.nodes[n as usize].obs {
             let dst = match *c {
-                Cons::TopIfAny { dst, .. } => Some(dst),
+                Cons::TopIfAny { dst, .. } | Cons::Guard { dst, .. } | Cons::Defined { dst } => {
+                    Some(dst)
+                }
                 _ => read_dst(c),
             };
             return !dst.is_some_and(|d| self.nodes[d as usize].obs);
@@ -568,6 +602,8 @@ impl Model {
             | Cons::New { call }
             | Cons::NewNamed { call, .. }
             | Cons::MCall { call, .. }
+            | Cons::IdxMCall { call, .. }
+            | Cons::IdxKeyCall { call, .. }
             | Cons::ProtoMethods { call, .. }
             | Cons::SuperCtor { call, .. }
             | Cons::SuperCtorParent { call, .. }
@@ -579,6 +615,10 @@ impl Model {
                 ..
             }
             | Cons::AnyAccessors {
+                act: ChainAct::Call(call),
+                ..
+            }
+            | Cons::PlainKey {
                 act: ChainAct::Call(call),
                 ..
             }
@@ -792,6 +832,7 @@ impl Model {
         let TokKind::Func(f, ctx) = self.toks[key.2 as usize] else {
             unreachable!("instance of a non-function token")
         };
+        self.activate(f, "instance");
         let s = self.sum.of[&f].clone();
         let inst = self.sum.insts.len() as u32;
         // An instance is solve work: the work bound covers instances too.
@@ -808,6 +849,9 @@ impl Model {
                     let n = self.node_named("inst", || format!("inst{inst}.{i}"));
                     // A fresh slot holds one run's values.
                     self.nodes[n as usize].frame = inst + 1;
+                    if let Some(d) = &mut self.diagnostic {
+                        d.inst_orig.insert(n, s.orig[i as usize]);
+                    }
                     n
                 }
                 _ if ctx == NO_CTX => s.orig[i as usize],
@@ -919,6 +963,14 @@ impl Model {
     /// instance for the call gets the explicit token (the call's own
     /// operand reaches it in `bind_summarized`).
     pub(crate) fn this_into(&mut self, call: CallId, ft: Tok, this_tok: Option<Tok>) {
+        if self.act.is_some() {
+            let f = self.tok_fn(ft);
+            self.activate(f, "this");
+        }
+        if self.diagnostic.is_some() {
+            let f = self.tok_fn(ft);
+            self.diagnostic_reach(f, "this", call);
+        }
         if !self.sum.ready {
             self.sum.deferred.push(Deferred::This(call, ft, this_tok));
             return;
@@ -1026,6 +1078,18 @@ impl Model {
             .is_some_and(|&w| self.nodes[n as usize].pts.contains_tok(w))
     }
 
+    /// The nodes `this` of function value `ft` reaches its body through:
+    /// the shared node, and its instance's when the body is summarized.
+    pub(crate) fn this_nodes(&mut self, ft: Tok) -> Vec<NodeId> {
+        let f = self.tok_fn(ft);
+        let mut dsts = vec![self.funcs[f as usize].this];
+        if self.has_this_term(f) {
+            let inst = self.instance((2, 0, ft));
+            dsts.push(self.sum.insts[inst as usize].this);
+        }
+        dsts
+    }
+
     pub(crate) fn escape_this(&mut self, ft: Tok, reason: u32) {
         if !self.sum.ready {
             self.sum.deferred.push(Deferred::EscapeThis(ft, reason));
@@ -1033,11 +1097,7 @@ impl Model {
         }
         let f = self.tok_fn(ft);
         let why = |m: &Self| format!("this of escaped function: {}", m.reasons[reason as usize]);
-        let mut dsts = vec![self.funcs[f as usize].this];
-        if self.has_this_term(f) {
-            let inst = self.instance((2, 0, ft));
-            dsts.push(self.sum.insts[inst as usize].this);
-        }
+        let dsts = self.this_nodes(ft);
         let insts = self.published_this.get(&f).cloned().unwrap_or_default();
         // DECISIONS 116: a method of sealed classes only, published through
         // its contract, runs on the instances this unit gave out (and the
@@ -1120,6 +1180,10 @@ impl Model {
     /// its birth keys (`for_in_keys`), each run's key parameter holding its
     /// one key, else once with every key.
     pub(crate) fn for_in_tok(&mut self, call: CallId, ft: Tok, t: Tok) {
+        if self.act.is_some() {
+            let f = self.tok_fn(ft);
+            self.activate(f, "for-in");
+        }
         if !self.sum.ready {
             self.sum.deferred.push(Deferred::ForIn(call, ft, t));
             return;
@@ -1314,9 +1378,16 @@ impl Model {
         }
         for &(i, g) in &s.expanded {
             self.sum.composed.insert((kmap[i as usize], g));
+            self.activate(g, "composed");
         }
         for &(slot, ref toks, prim) in &s.seeds {
+            // The summary's own slot is where the instance's seed came from
+            // (the dump follows it to the ⊤'s origin).
+            let saved = (self.cur_src, self.cur_why);
+            self.cur_src = s.orig.get(slot as usize).copied().unwrap_or(NO_NODE);
+            self.cur_why = u32::MAX;
             self.add(base[slot as usize], toks, prim);
+            (self.cur_src, self.cur_why) = saved;
         }
         // Closures born here carry this instance's nodes for their outer
         // terms, in the context those cells differ by (design §14.2): its
@@ -1461,7 +1532,39 @@ impl Model {
         }
         let cret = self.calls[c].ret;
         if !self.rel_into(call, inst + 1, &terms) {
-            self.edge(r, cret);
+            // A summary consisting only of an unwritten parameter copied
+            // to its return passes this call's value back. Its shared
+            // instance still observes every argument, but the caller must
+            // not receive other calls' values (e.g. an identity helper
+            // returning two distinct function arguments).
+            let s = &self.sum.of[&f];
+            let copy = match s.edges.as_slice() {
+                [(from, to)]
+                    if *to == s.ret
+                        && is_slot(*from)
+                        && is_slot(*to)
+                        && s.seeds.is_empty()
+                        && s.cons.is_empty()
+                        && s.calls.is_empty()
+                        && s.births.is_empty()
+                        && s.closures.is_empty()
+                        && self.calls[c].spread.is_empty() =>
+                {
+                    s.params
+                        .iter()
+                        .position(|p| p == from)
+                        .filter(|&i| s.rel[i] && caps[i].is_none())
+                }
+                _ => None,
+            };
+            if let Some(i) = copy {
+                match self.calls[c].args.get(i).copied() {
+                    Some(a) => self.edge(a, cret),
+                    None => self.add_prim(cret, prim::UNDEF),
+                }
+            } else {
+                self.edge(r, cret);
+            }
         }
     }
 
@@ -1723,7 +1826,15 @@ impl Model {
             if contract {
                 // Design §11.2: the result is checked after the solve.
                 self.contract_rets.push((f, r));
-            } else {
+            }
+            // Beyond its publication (an export or a published literal's
+            // field, DECISIONS 210, or known closed callers, DECISIONS 19),
+            // unknown code calls it and retains its result.
+            if !contract
+                || (self.pub_reason != Some(reason)
+                    && self.field_fn_reason != Some(reason)
+                    && closed.is_none())
+            {
                 self.sink_node(r, reason);
             }
         }

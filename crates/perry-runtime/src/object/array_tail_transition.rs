@@ -235,7 +235,8 @@ fn object_hot_for_owner(
 ) -> &'static crate::object::ObjectHotTables {
     unsafe {
         if !owner.is_null() {
-            let meta = (*owner).meta;
+            // A1_UNPROVEN: record-first: owner layout word (kind-A/B question for S0f).
+            let meta = crate::meta_read!(crate::meta_obj_runtime_born!(owner as *mut _));
             if !meta.is_null() {
                 let hot = &crate::state::state().object_hot;
                 let cached =
@@ -539,7 +540,10 @@ fn debug_assert_tables_empty() {
             &crate::state::state().object_hot.array_tail_reverse,
         ),
     ] {
-        let table = unsafe { &*table.get() };
+        let Some(table) = table.mapped() else {
+            continue;
+        };
+        let table = unsafe { &*table };
         if let Some(index) = table.iter().position(|entry| !entry.is_empty()) {
             panic!(
                 "array-tail {name} table slot {index} is occupied but \

@@ -172,7 +172,11 @@ fn lower_guarded_numeric_arg_fast(
                 BinaryOp::Sub => ctx.block().fsub(&left, &right),
                 BinaryOp::Mul => ctx.block().fmul(&left, &right),
                 BinaryOp::Div => ctx.block().fdiv(&left, &right),
-                BinaryOp::Mod => ctx.block().frem(&left, &right),
+                BinaryOp::Mod => ctx.block().call_gc_leaf(
+                    DOUBLE,
+                    crate::codegen::numeric_remainder::CHECKED_NUMBER_REMAINDER,
+                    &[(DOUBLE, &left), (DOUBLE, &right)],
+                ),
                 _ => bail!("unsupported guarded scalar method binary arg"),
             })
         }
@@ -688,7 +692,11 @@ fn emit_materialized_scalar_receiver_direct_field_store(
     value: &str,
 ) {
     let field_idx_str = field_index.to_string();
-    let header_skip = crate::target_layout::object_header_size_bytes(ctx.target_triple).to_string();
+    let header_skip = crate::target_layout::object_slot_base_bytes(
+        ctx.target_triple,
+        crate::target_layout::class_instance_form(class_name),
+    )
+    .to_string();
     let field_ptr = {
         let blk = ctx.block();
         let obj_ptr = blk.inttoptr(I64, obj_handle);

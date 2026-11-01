@@ -393,6 +393,7 @@ impl Planner<'_, '_> {
                 object,
                 property,
                 value,
+                ..
             } => {
                 st = self.expr(object, st);
                 let outer_rhs = self.in_store_rhs;
@@ -423,7 +424,7 @@ impl Planner<'_, '_> {
             // An element read of a region array with a static index range is
             // bare while the facts are fresh: it runs no JS, so it stales
             // nothing. Any other element read is today's tower.
-            Expr::IndexGet { object, index } => {
+            Expr::IndexGet { object, index, .. } => {
                 st = self.expr(object, st);
                 st = self.expr(index, st);
                 self.stale(e, &mut st);
@@ -437,6 +438,7 @@ impl Planner<'_, '_> {
                 object,
                 index,
                 value,
+                ..
             } => {
                 st = self.expr(object, st);
                 st = self.expr(index, st);
@@ -979,6 +981,7 @@ pub(super) fn accesses(ss: &[Stmt]) -> Vec<(Recv, String, bool, usize, Option<&E
                 object,
                 property,
                 value,
+                ..
             } => {
                 if let Some(r) = Recv::of(object) {
                     out.push((

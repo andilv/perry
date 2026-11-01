@@ -694,6 +694,8 @@ fn field_class(
                 object: Box::new(Expr::This),
                 property: p.name.clone(),
                 value: Box::new(Expr::LocalGet(p.id)),
+                byte_offset: 0,
+                byte_end: 0,
             })
         })
         .collect();
@@ -775,6 +777,7 @@ fn literal_and_declared_module() -> perry_hir::Module {
             ty: Type::Any,
             mutable: false,
             init: Some(Expr::New {
+                byte_end: 0,
                 class_name: class.to_string(),
                 args: vec![Expr::Number(v)],
                 type_args: Vec::new(),

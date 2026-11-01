@@ -52,6 +52,9 @@ fn page_boundary_keeps_partial_page_and_dynamic_rows_never_reuse() {
         .unwrap();
     assert_eq!(third.word.row().0, start + 2);
     let boundary = (slab.region.page / 128) as u32;
+    // A 16 KiB page can extend beyond the default native-layout prefix.
+    // Declare both fixture rows as static before testing their page custody.
+    slab.static_rows = slab.static_rows.max(boundary + 1);
     for row in [boundary - 1, boundary] {
         let identity = ShapeId(SHAPE_ID_BASE + 100 + row);
         let word = LayoutWord::new(LayoutRow(row), 0, 0).unwrap();
@@ -183,15 +186,17 @@ fn dead_agents_chunks_are_never_handed_out_again() {
 
 #[test]
 fn a_dropped_slab_returns_its_chunks_to_the_process() {
-    let before = super::CHUNKS.free_len();
-    let mut slab = ShapeSlab::new();
-    for i in 0..(super::DYNAMIC_CHUNK_ROWS + 1) {
-        slab.publish_dynamic(ShapeId(SHAPE_ID_BASE + 9000 + i), record())
-            .unwrap();
-    }
-    assert_eq!(slab.chunks.len(), 2);
-    drop(slab);
-    assert_eq!(super::CHUNKS.free_len(), before + 2);
+    crate::test_isolation::in_own_process(|| {
+        let before = super::CHUNKS.free_len();
+        let mut slab = ShapeSlab::new();
+        for i in 0..(super::DYNAMIC_CHUNK_ROWS + 1) {
+            slab.publish_dynamic(ShapeId(SHAPE_ID_BASE + 9000 + i), record())
+                .unwrap();
+        }
+        assert_eq!(slab.chunks.len(), 2);
+        drop(slab);
+        assert_eq!(super::CHUNKS.free_len(), before + 2);
+    });
 }
 
 #[test]

@@ -209,7 +209,8 @@ pub(crate) unsafe fn collection_brand(obj: *const ObjectHeader) -> Option<u32> {
 
 #[inline]
 pub(crate) unsafe fn owned_storage(obj: *const ObjectHeader) -> *mut WeakStorage {
-    let meta = (*obj).meta;
+    // A1_UNPROVEN: record-first: WeakRef holder layout word (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
     if meta.is_null() {
         return std::ptr::null_mut();
     }
@@ -229,7 +230,10 @@ pub(super) fn initialize(this: f64, class: u32) -> f64 {
 /// Rooted slow path only. Allocation may move the owner and its old cell.
 pub(super) unsafe fn grow(map: crate::gc::RuntimeHandle<'_>) -> *mut WeakStorage {
     let owner = js_nanbox_get_pointer(map.get_nanbox_f64()) as *mut ObjectHeader;
-    crate::object::object_meta_ensure(owner);
+    crate::object::object_meta_ensure(
+        crate::meta_obj_runtime_born!(owner),
+        crate::object::MetaReason::WeakStorage,
+    );
     let old = owned_storage(js_nanbox_get_pointer(map.get_nanbox_f64()) as *mut ObjectHeader);
     let capacity = if old.is_null() {
         4
@@ -260,7 +264,8 @@ pub(super) unsafe fn grow(map: crate::gc::RuntimeHandle<'_>) -> *mut WeakStorage
             }
         }
     }
-    let meta = (*owner).meta;
+    // A1_UNPROVEN: record-first: WeakRef holder layout word (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(owner as *mut _));
     let bits = JSValue::pointer(fresh.cast()).bits();
     (*meta).native_state = bits;
     crate::gc::runtime_write_barrier_slot(

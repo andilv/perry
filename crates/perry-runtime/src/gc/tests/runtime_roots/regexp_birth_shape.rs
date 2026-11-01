@@ -278,10 +278,19 @@ fn keyless_birth_memo_word_is_carried_across_full_traces() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _scan = ConservativeScanDisabledGuard::new();
     let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
-    let word =
-        unsafe { crate::object::shapes::object_shape_stamp(crate::object::object_alloc_plain(0)) };
+    let plain_birth = || unsafe {
+        crate::object::shapes::object_shape_stamp(crate::object::object_alloc_plain(0))
+    };
+    let word = plain_birth();
     for round in 0..3 {
         let control = unrooted_semantic_shape();
+        // The control's unmarked birth took the one memo; a plain keyless
+        // birth hands it back, so the trace runs with the memo naming `word`.
+        assert_eq!(
+            plain_birth(),
+            word,
+            "round {round}: the memo names the plain birth"
+        );
         collect_synchronous_full_trace();
         assert!(
             crate::object::shapes::shape_is_retired(LayoutWord(control)),
@@ -297,16 +306,20 @@ fn keyless_birth_memo_word_is_carried_across_full_traces() {
 }
 
 /// #6 (DPA review): every held-word helper answers absent for a retired word
-/// whose page was decommitted; none may touch the PROT_NONE page.
+/// whose page was decommitted (read-only zero pages on Unix, inaccessible on
+/// Windows); none may read a stale record from that page.
 #[test]
 fn held_word_helpers_are_checked_for_retired_decommitted_rows() {
     use crate::object::shapes as sh;
     let _guard = CopyingNurseryTestGuard::new(0);
     let _scan = ConservativeScanDisabledGuard::new();
     let _triggers = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
-    // More than two chunks of dead semantic shapes: at least one whole chunk
-    // page has no live record after the trace.
-    let words: Vec<u32> = (0..100).map(|_| unrooted_semantic_shape()).collect();
+    // Span three OS pages, including a full interior page even when allocation
+    // starts partway through a page. The 32-row allocation chunks are smaller
+    // than a 16 KiB macOS page, so a fixed 100 rows need not free any page.
+    let words: Vec<u32> = (0..3 * sh::test_region_rows_per_page())
+        .map(|_| unrooted_semantic_shape())
+        .collect();
     collect_synchronous_full_trace();
     assert!(
         words.iter().any(|&w| !sh::test_row_committed(w)),

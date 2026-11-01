@@ -41,6 +41,7 @@ use perry_hir::{Expr, Module, ModuleInitKind, Param, Stmt};
 
 pub(super) fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -52,6 +53,7 @@ pub(super) fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -176,6 +178,7 @@ fn module_with_hoisted_block_fn(prealloc: bool) -> Module {
         init: Some(Expr::Array(Vec::new(), None)),
     });
     init.push(Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::LocalGet(0)),
         args: vec![Expr::Integer(1)],
         type_args: Vec::new(),
@@ -291,6 +294,7 @@ fn a_function_local_prealloc_still_gets_its_box() {
             init: Some(Expr::Array(Vec::new(), None)),
         },
         Stmt::Expr(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::LocalGet(10)),
             args: vec![Expr::Integer(1)],
             type_args: Vec::new(),
@@ -298,6 +302,7 @@ fn a_function_local_prealloc_still_gets_its_box() {
         }),
     ];
     m.init = vec![Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::Closure {
             func_id: 2,
             params: Vec::new(),

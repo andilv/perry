@@ -19,10 +19,14 @@ pub extern "C" fn js_get_global_this_builtin_value(name_ptr: *const u8, name_len
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     let name_bytes = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
-    let name = match std::str::from_utf8(name_bytes) {
-        Ok(s) => s,
-        Err(_) => return f64::from_bits(crate::value::TAG_UNDEFINED),
-    };
+    // Invariant: callers pass the bytes of a Rust `&str` (codegen's interned
+    // builtin name with its `len()`, or a runtime literal/static name), so
+    // they are UTF-8 by construction.
+    debug_assert!(
+        std::str::from_utf8(name_bytes).is_ok(),
+        "builtin name is not UTF-8"
+    );
+    let name = unsafe { std::str::from_utf8_unchecked(name_bytes) };
     // The singleton's shape owns the installed key. Borrow its spelling for
     // an ordinary data read instead of rematerializing a weak intern after
     // every collection. This shared lookup consults the live shape; stores,
@@ -94,7 +98,7 @@ pub extern "C" fn js_object_create(proto_value: f64) -> f64 {
                 )
             }
             .is_some())
-        || crate::proxy::js_proxy_is_proxy(proto_value) != 0
+        || crate::proxy_hooks::proxy_is_proxy(proto_value) != 0
         || (!proto_is_symbol
             && (unsafe { value_is_object_like(proto_value) }
                 || super::class_ref_id(proto_value).is_some()));
@@ -167,7 +171,7 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
         let addr = value.as_pointer::<u8>() as usize;
         unsafe {
             if let Some(header) = crate::value::addr_class::try_read_gc_header(addr) {
-                if header.obj_type == crate::gc::GC_TYPE_OBJECT
+                if crate::gc_type_is_object!(header.obj_type)
                     && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
                     && header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO == 0
                 {
@@ -297,8 +301,8 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
     // `Object.getPrototypeOf(proxy)` matches the target. drizzle aliases columns
     // as `new Proxy(column, …)` and `is(value, type)` reads
     // `getPrototypeOf(value).constructor`, which crashed on `null.constructor`.
-    if crate::proxy::js_proxy_is_proxy(obj_value) != 0 {
-        return crate::proxy::js_proxy_get_prototype_of(obj_value);
+    if crate::proxy_hooks::proxy_is_proxy(obj_value) != 0 {
+        return crate::proxy_hooks::proxy_get_prototype_of(obj_value);
     }
     // A Temporal value is a NaN-boxed opaque cell, not an `ObjectHeader` — the
     // heap-object resolution below would deref its boxed payload as a class id
@@ -431,7 +435,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
         }
         let object = addr as *const ObjectHeader;
         if let Some(header) = unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
-            if header.obj_type == crate::gc::GC_TYPE_OBJECT {
+            if crate::gc_type_is_object!(header.obj_type) {
                 let cid = unsafe { (*object).class_id };
                 if super::super::is_class_id_registered(cid) {
                     return Some(super::class_decl_prototype_value(cid));
@@ -498,7 +502,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
         }
     };
     let typed_array_instance_prototype = |addr: usize| -> Option<f64> {
-        let kind = crate::typedarray::lookup_typed_array_kind(addr)?;
+        let kind = crate::typedarray_hook_slots::lookup_typed_array_kind(addr)?;
         // A `Reflect.construct(TA, …, newTarget)` view with a custom
         // `[[Prototype]]` (spec `GetPrototypeFromConstructor`) resolves to the
         // recorded prototype rather than the default per-kind prototype. The
@@ -508,7 +512,9 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 return Some(f64::from_bits(proto_bits));
             }
         }
-        let proto = crate::object::builtin_prototype_value(crate::typedarray::name_for_kind(kind));
+        let proto = crate::object::builtin_prototype_value(
+            crate::typedarray_hook_slots::name_for_kind(kind),
+        );
         if proto.to_bits() != crate::value::TAG_UNDEFINED {
             Some(proto)
         } else {
@@ -664,7 +670,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // through copying GC.
                 // Bit 8 means "per-kind TypedArray prototype" only on a
                 // `GC_TYPE_OBJECT`; on an array it is `GC_ARRAY_KEY_ATTRS`.
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                if crate::gc_type_is_object!((*gc).obj_type)
                     && (*gc)._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
                 {
                     let p = crate::object::typed_array_intrinsic_proto_ptr();
@@ -730,7 +736,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // Arguments' private header identity describes their tail,
                 // never a constructor prototype. Explicit links were handled
                 // above; an untouched arguments object uses Object.prototype.
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                if crate::gc_type_is_object!((*gc).obj_type)
                     && (*gc)._reserved & crate::gc::OBJ_FLAG_ARGUMENTS != 0
                 {
                     return namespace_default_prototype();
@@ -755,7 +761,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // Its shape and published holder select a declared instance
                 // without an anonymous class-id membership lookup.
                 let instance_class_id = (*obj).class_id;
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                if crate::gc_type_is_object!((*gc).obj_type)
                     && instance_class_id != 0
                     && super::super::shapes::receiver_has_class_identity(obj)
                 {
@@ -779,7 +785,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // with its inherited accessors, descriptors and non-writable
                 // slots. (The same lookup runs further down for receivers that
                 // reach it; this one only moves it ahead of the guess.)
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT {
+                if crate::gc_type_is_object!((*gc).obj_type) {
                     let synth_proto =
                         super::super::class_registry::synthetic_class_prototype_object(
                             (*obj).class_id,
@@ -796,7 +802,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // `constructor`-derived guess below reads `obj.constructor`
                 // by name and then the constructor's `prototype`, on every
                 // `instanceof` hop.
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                if crate::gc_type_is_object!((*gc).obj_type)
                     && ((*obj).class_id == 0 || super::super::shapes::object_is_plain_record(obj))
                 {
                     if let Some(proto) = default_link_prototype(obj) {
@@ -806,7 +812,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 if let Some(proto) = constructor_dynamic_prototype(obj) {
                     return proto;
                 }
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+                if crate::gc_type_is_object!((*gc).obj_type)
                     && ((*obj).class_id == 0 || super::super::shapes::object_is_plain_record(obj))
                 {
                     if let Some(proto_bits) =
@@ -823,7 +829,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 // normally carry it as a recorded static prototype (returned
                 // above), but resolve by class id too so the chain holds even if
                 // the static-prototype side-table entry was dropped.
-                if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT {
+                if crate::gc_type_is_object!((*gc).obj_type) {
                     if let Some(proto) =
                         super::super::iterator_prototype_for_class_id((*obj).class_id)
                     {
@@ -919,7 +925,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
 
             // Bit 8 means "per-kind TypedArray prototype" only on a
             // `GC_TYPE_OBJECT`; on an array it is `GC_ARRAY_KEY_ATTRS`.
-            if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+            if crate::gc_type_is_object!((*gc).obj_type)
                 && (*gc)._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
             {
                 let p = crate::object::typed_array_intrinsic_proto_ptr();
@@ -952,7 +958,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 }
                 return function_prototype_or_null();
             }
-            if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+            if crate::gc_type_is_object!((*gc).obj_type)
                 && (*gc)._reserved & crate::gc::OBJ_FLAG_ARGUMENTS != 0
             {
                 return namespace_default_prototype();
@@ -960,7 +966,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             if let Some(proto) = constructor_dynamic_prototype(obj) {
                 return proto;
             }
-            if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+            if crate::gc_type_is_object!((*gc).obj_type)
                 && ((*obj).class_id == 0 || super::super::shapes::object_is_plain_record(obj))
             {
                 if let Some(proto_bits) =
@@ -970,7 +976,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 }
                 return f64::from_bits(TAG_NULL);
             }
-            if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT {
+            if crate::gc_type_is_object!((*gc).obj_type) {
                 if let Some(proto) = super::super::iterator_prototype_for_class_id((*obj).class_id)
                 {
                     return proto;

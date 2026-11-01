@@ -22,7 +22,7 @@ mod select;
 mod tower;
 use collapse::method_dispatch_collapse_enabled;
 use dispatch_receiver_class::*;
-use tower::{emit_tower_pshape_call, tower_pshape_route};
+use tower::{emit_tower_pshape_call, tower_layout_proven, tower_pshape_route};
 
 // Reach the override-emit helpers (`pub(super)` of `lower_call`) by their
 // canonical crate-relative path.
@@ -130,6 +130,17 @@ fn build_direct_method_args(
     direct_args
 }
 
+/// Is implementor `class`'s `property` (body `function`) a prototype constant
+/// a proven site may call directly? (`select::cased`.)
+pub(crate) fn method_target_is_cased(
+    ctx: &FnCtx<'_>,
+    class: &str,
+    property: &str,
+    function: &str,
+) -> bool {
+    select::cased(ctx, class, property, function)
+}
+
 /// Every class whose `extends` chain resolves `property`: each class the
 /// method table registers it under, and every transitive subclass of one.
 /// Unordered and possibly repeating; callers sort and dedup by their own key.
@@ -227,14 +238,22 @@ pub(crate) fn try_lower_instance_method_call(
         )
         .map(Some);
     }
+    // D1: a receiver with a static class (an annotation, or `this` in a
+    // method) first asks the facts whether the site is proven; the
+    // annotation only picks the lowering, the facts prove the semantics.
+    let typed_candidate = !needs_dynamic_dispatch
+        && !is_global
+        && !is_builtin_receiver
+        && receiver_class.is_some()
+        && crate::expr::wpfacts_access::proven_receiver_classes(ctx, object).is_some();
     // #11910: arguments that can observe when the method is read. The
     // tower's implementor arms read nothing (a proven class id under intact
     // prototype guards names its body); every other receiver must have its
     // method read before the arguments, through the split method site.
-    let split = needs_dynamic_dispatch
+    let split = (needs_dynamic_dispatch || typed_candidate)
         && crate::expr::method_site::args_may_observe_lookup(ctx, args)
         && crate::expr::method_site::method_site_enabled(ctx, property, args.len());
-    if needs_dynamic_dispatch {
+    if needs_dynamic_dispatch || typed_candidate {
         // Find all (class_id → fn_name) for `property` — including
         // INHERITED methods. Per JS spec, `subInstance.method()` for a
         // method defined on a parent dispatches to the parent's
@@ -317,7 +336,44 @@ pub(crate) fn try_lower_instance_method_call(
                 cur = ctx.classes.get(&c).and_then(|cc| cc.extends_name.clone());
             }
         }
-        if !implementors.is_empty() {
+        // A compiled case is a class whose method is a prototype constant
+        // (`select::cased`: a chain the compiler names, a slot the write
+        // census proves written once). Receivers of any other class keep
+        // the universal method site, and a site with no case is that
+        // generic arm alone.
+        let cased: Vec<bool> = implementors
+            .iter()
+            .zip(&impl_class)
+            .map(|((_, f), class)| select::cased(ctx, class, property, f))
+            .collect();
+        // FVA: the facts prove the receiver one of its classes, each a
+        // cased implementor: the site is the T0set read shape, one load
+        // of the receiver's class id and a switch whose arms are the
+        // direct calls, with no probe. Its generic arm is only a nullable
+        // receiver's (the receiver test a read keeps): a nullish receiver
+        // reads its method, before the arguments, and throws.
+        let proven: Option<(Vec<(u32, usize)>, bool)> =
+            crate::expr::wpfacts_access::proven_receiver_classes(ctx, object).and_then(
+                |(cids, nullable)| {
+                    cids.iter()
+                        .map(|&cid| {
+                            implementors
+                                .iter()
+                                .zip(&cased)
+                                .position(|((c, _), &k)| k && *c == cid)
+                                .map(|i| (cid, i))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .map(|m| (m, nullable))
+                },
+            );
+        // A typed receiver takes this route only when the facts close the
+        // site over cased implementors; otherwise the guarded typed path
+        // below is unchanged.
+        let typed_closed = typed_candidate
+            && !(crate::codegen::full_outline_ic_enabled() && method_dispatch_collapse_enabled())
+            && proven.is_some();
+        if !implementors.is_empty() && (needs_dynamic_dispatch || typed_closed) {
             // #9417: the receiver is lowered FIRST — JS evaluation order requires
             // the MemberExpression to be evaluated before the arguments — and
             // consumed LAST, after every argument expression. Each of those is
@@ -361,37 +417,6 @@ pub(crate) fn try_lower_instance_method_call(
             if collapse_dynamic {
                 return Ok(None);
             }
-            // A compiled case is a class whose method is a prototype constant
-            // (`select::cased`: a chain the compiler names, a slot the write
-            // census proves written once). Receivers of any other class keep
-            // the universal method site, and a site with no case is that
-            // generic arm alone.
-            let cased: Vec<bool> = implementors
-                .iter()
-                .zip(&impl_class)
-                .map(|((_, f), class)| select::cased(ctx, class, property, f))
-                .collect();
-            // FVA: the facts prove the receiver one of its classes, each a
-            // cased implementor: the site is the T0set read shape, one load
-            // of the receiver's class id and a switch whose arms are the
-            // direct calls, with no probe. Its generic arm is only a nullable
-            // receiver's (the receiver test a read keeps): a nullish receiver
-            // reads its method, before the arguments, and throws.
-            let proven: Option<(Vec<(u32, usize)>, bool)> =
-                crate::expr::wpfacts_access::proven_receiver_classes(ctx, object).and_then(
-                    |(cids, nullable)| {
-                        cids.iter()
-                            .map(|&cid| {
-                                implementors
-                                    .iter()
-                                    .zip(&cased)
-                                    .position(|((c, _), &k)| k && *c == cid)
-                                    .map(|i| (cid, i))
-                            })
-                            .collect::<Option<Vec<_>>>()
-                            .map(|m| (m, nullable))
-                    },
-                );
             let closed = proven.as_ref().is_some_and(|(_, nullable)| !nullable);
             let split = split && !closed;
             let post_args_may_collect = ctx.strings.call_location_for(call_byte_offset).is_some()
@@ -497,6 +522,21 @@ pub(crate) fn try_lower_instance_method_call(
             };
             ctx.block().emit_raw(switch);
             ctx.block().mark_terminated();
+            // The bodies the facts closed this site over: a direct call of
+            // one may be flattened by the early inliner
+            // (`codegen/closed_targets.rs`).
+            let closed_bodies: Vec<&str> = match &proven {
+                Some((map, _)) => {
+                    let mut t: Vec<&str> = map
+                        .iter()
+                        .map(|&(_, i)| implementors[i].1.as_str())
+                        .collect();
+                    t.sort_unstable();
+                    t.dedup();
+                    t
+                }
+                None => Vec::new(),
+            };
             let mut phi_inputs: Vec<(String, String)> = Vec::new();
             for &(i, case_idx) in &case_idxs {
                 ctx.current_block = case_idx;
@@ -525,9 +565,29 @@ pub(crate) fn try_lower_instance_method_call(
                 ) {
                     Some(route) => {
                         let recv_handle = unbox_to_i64(ctx.block(), &recv_box);
-                        emit_tower_pshape_call(ctx, i, &route, &recv_handle, &case_arg_slices)
+                        // The facts prove the receiver is this arm's class
+                        // (`proven`) and that class's layout never changes
+                        // (`fixed_layout`): the arm needs no recheck.
+                        let layout_proven =
+                            proven.is_some() && tower_layout_proven(ctx, implementors[i].0);
+                        emit_tower_pshape_call(
+                            ctx,
+                            i,
+                            &route,
+                            &recv_handle,
+                            &case_arg_slices,
+                            layout_proven,
+                        )
                     }
-                    None => ctx.block().call(DOUBLE, fname, &case_arg_slices),
+                    None => {
+                        if closed_bodies.contains(&fname.as_str()) {
+                            crate::codegen::closed_targets::note_closed_call(
+                                fname,
+                                closed_bodies.len(),
+                            );
+                        }
+                        ctx.block().call(DOUBLE, fname, &case_arg_slices)
+                    }
                 };
                 let after = ctx.block().label.clone();
                 if !ctx.block().is_terminated() {
@@ -1058,9 +1118,10 @@ pub(crate) fn try_lower_instance_method_call(
             let recv_idx = roots.lower(ctx, object, recv_collects)?;
             let selection = if constant_static {
                 let recv = roots.reread(ctx, recv_idx)?;
-                let word = crate::lower_call::method_override::emit_inline_direct_method_word_probe(
-                    ctx, &recv,
-                );
+                let (word, admitted) =
+                    crate::lower_call::method_override::emit_direct_method_selection_probe(
+                        ctx, &recv,
+                    );
                 let key = ctx.strings.intern(property);
                 let dispatch = ctx.strings.static_dispatch_global(key);
                 let method_id = crate::strings::emit_static_dispatch_id(ctx.block(), &dispatch);
@@ -1071,6 +1132,7 @@ pub(crate) fn try_lower_instance_method_call(
                     &constant_candidates,
                     &constant_cased,
                     &word,
+                    &admitted,
                 );
                 let lookup = if static_split {
                     let claimed = ctx.block().icmp_ne(I32, &selected, "0");

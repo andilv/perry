@@ -4,6 +4,17 @@
 
 use super::*;
 
+/// Relocation model of the target machine: PIC everywhere, except that a
+/// wasm32 target opted in with `PERRY_WASM_STATIC_RELOC=1` uses the static
+/// model (no GOT-indirected globals, a plain static wasm link).
+fn reloc_mode_for(effective_target: &str, wasm_static_opt_in: bool) -> RelocMode {
+    if wasm_static_opt_in && effective_target.starts_with("wasm32") {
+        RelocMode::Static
+    } else {
+        RelocMode::PIC
+    }
+}
+
 pub(super) fn optimize_and_emit(
     module: &inkwell::module::Module<'_>,
     effective_target: &str,
@@ -15,6 +26,8 @@ pub(super) fn optimize_and_emit(
     native_roots: bool,
     mut stats: Option<&mut UnitCodegenStats>,
 ) -> Result<Vec<Vec<u8>>> {
+    #[cfg(feature = "target-wasi")]
+    crate::wasi_toolchain::check_linked(effective_target)?;
     global_init(mllvm);
     announce();
 
@@ -56,7 +69,10 @@ pub(super) fn optimize_and_emit(
             &cpu,
             &features,
             opt_level,
-            RelocMode::PIC,
+            reloc_mode_for(
+                effective_target,
+                std::env::var("PERRY_WASM_STATIC_RELOC").as_deref() == Ok("1"),
+            ),
             CodeModel::Default,
         )
         .ok_or_else(|| anyhow!("failed to create TargetMachine for `{effective_target}`"))?;
@@ -75,6 +91,7 @@ pub(super) fn optimize_and_emit(
     // machine's real datalayout.
     module.set_triple(&triple);
     module.set_data_layout(&tm.get_target_data().get_data_layout());
+    super::coff::coalesce_helpers(module, effective_target);
 
     // RS4GC must run BEFORE the optimization pipeline, and — critically — in
     // this process, against this LLVM.
@@ -246,6 +263,18 @@ fn copy_emission_bytes(buffer: inkwell::memory_buffer::MemoryBuffer<'_>) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_reloc_is_opt_in_and_wasm32_only() {
+        for wasm in ["wasm32-wasip1", "wasm32-wasip2"] {
+            assert_eq!(reloc_mode_for(wasm, true), RelocMode::Static);
+            assert_eq!(reloc_mode_for(wasm, false), RelocMode::PIC);
+        }
+        for native in ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"] {
+            assert_eq!(reloc_mode_for(native, true), RelocMode::PIC);
+            assert_eq!(reloc_mode_for(native, false), RelocMode::PIC);
+        }
+    }
 
     #[test]
     fn emission_copy_excludes_storage_terminator_but_preserves_payload_zeros() {

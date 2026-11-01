@@ -11,7 +11,7 @@ pub const LAYOUT_ORDINARY_END: u32 = 0x9000_0000;
 pub const LAYOUT_SHADOWED_BASE: u32 = 0xc000_0000;
 pub const LAYOUT_SHADOWED_END: u32 = 0xd000_0000;
 pub const LAYOUT_PROBE_INDEX_MASK: u32 = 0xb3ff_ffff;
-pub const LAYOUT_WORD_ABI_VERSION: u32 = 1;
+pub const LAYOUT_WORD_ABI_VERSION: u32 = 4;
 pub const LAYOUT_KIND_PLAIN: u32 = 0;
 pub const LAYOUT_KIND_WORD: u32 = 1;
 pub const LAYOUT_KIND_NULL: u32 = 2;
@@ -98,22 +98,135 @@ pub struct PerryLayoutImageV1 {
     pub static_rows: u32,
     pub family_first: u32,
     pub family_count: u32,
+    /// The program's table (WRT step 2, [`PerryProgramTableV1`]): its static
+    /// literal seeds and its lazy descriptor span. Never null; the runtime's own
+    /// image names an empty table.
+    pub program: *const PerryProgramTableV1,
 }
+// The program table is immutable program data every agent reads.
+unsafe impl Send for PerryLayoutImageV1 {}
+unsafe impl Sync for PerryLayoutImageV1 {}
 impl PerryLayoutImageV1 {
     pub const RUNTIME: Self = Self {
         abi_version: LAYOUT_WORD_ABI_VERSION,
         static_rows: NATIVE_LAYOUT_ROWS,
         family_first: NATIVE_LAYOUT_ROWS,
         family_count: 0,
+        program: &PerryProgramTableV1::EMPTY,
     };
-    pub const fn valid(self) -> bool {
-        self.abi_version == LAYOUT_WORD_ABI_VERSION
-            && self.static_rows >= NATIVE_LAYOUT_ROWS
+    /// The header's facts with its program table's span. Without a span the
+    /// class families follow the native rows; a span lies in the static rows,
+    /// apart from the families ([`PerryProgramTableV1::valid_span`]).
+    ///
+    /// # Safety
+    /// `program` is null or names a program table.
+    pub const unsafe fn valid(self) -> bool {
+        if self.abi_version != LAYOUT_WORD_ABI_VERSION || self.program.is_null() {
+            return false;
+        }
+        let table = &*self.program;
+        self.static_rows >= NATIVE_LAYOUT_ROWS
             && self.static_rows <= LAYOUT_ROW_LIMIT
-            && self.family_first == NATIVE_LAYOUT_ROWS
-            && self.family_count <= self.static_rows - self.family_first
+            && if table.lazy_count == 0 {
+                self.family_first == NATIVE_LAYOUT_ROWS
+                    && self.family_count <= self.static_rows - self.family_first
+            } else {
+                table.valid_span(self)
+            }
     }
 }
+
+/// One static literal seed of the program (WRT step 2): the facts
+/// `js_layout_seed_plain` used to take, plus the seed's canonical key list
+/// as image data. When every key is an image atom, `keys` names the atoms
+/// (`PerryLayoutKey` records of the runtime, `key_count` of them) and `list`
+/// is the user address of a canonical key list cell in `perry_realm` holding
+/// their strings; the runtime links that cell into the agent's key-list trie
+/// and publishes the record without allocating. Otherwise both are null and
+/// the runtime mints the seed from its packed names.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PerryStaticSeedV1 {
+    pub rep: u64,
+    pub request: *mut PerryStaticLayoutRequestV1,
+    /// NUL-terminated key names, `packed_len` bytes.
+    pub packed: *const u8,
+    pub keys: *const u8,
+    pub list: *const u8,
+    pub constfn: *const ConstFnStaticEntry,
+    pub packed_len: u32,
+    pub key_count: u32,
+    pub live: u32,
+    pub constfn_count: u32,
+}
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(core::mem::size_of::<PerryStaticSeedV1>() == 64);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(core::mem::size_of::<PerryStaticSeedV1>() == 48);
+
+/// The program's table, named by [`PerryLayoutImageV1::program`]: `count`
+/// static seeds follow the header. The header also names the program's lazy
+/// descriptor span: contiguous static rows whose descriptor facts publish on
+/// first use. The span indexes descriptor values directly, never pointers or
+/// ids. Only the startup registrar and a row's first touch read it, so it
+/// stays out of the agent's thread-local copy of the image header.
+#[repr(C)]
+pub struct PerryProgramTableV1 {
+    pub count: u32,
+    pub lazy_count: u32,
+    pub lazy_first: u32,
+    pub _pad: u32,
+    /// Exclusive end of compiler-assigned prototype serials, reserved before births.
+    pub prototype_serial_end: u64,
+    /// `lazy_count` consecutive PerryLayoutDesc records, in row order.
+    /// Runtime descriptor aliases and realm receivers name these same facts.
+    pub lazy_layouts: *const u8,
+    pub seeds: [PerryStaticSeedV1; 0],
+}
+// Immutable program data every agent reads.
+unsafe impl Send for PerryProgramTableV1 {}
+unsafe impl Sync for PerryProgramTableV1 {}
+impl PerryProgramTableV1 {
+    /// The table of an image without a program: no seeds, no lazy span.
+    pub const EMPTY: Self = Self {
+        count: 0,
+        lazy_count: 0,
+        lazy_first: 0,
+        _pad: 0,
+        prototype_serial_end: crate::intrinsic_serials::FIRST_DYNAMIC_PROTOTYPE_SERIAL,
+        lazy_layouts: core::ptr::null(),
+        seeds: [],
+    };
+
+    /// # Safety
+    /// `self` is the program's table: `count` seeds follow the header.
+    pub unsafe fn seeds(&self) -> &[PerryStaticSeedV1] {
+        core::slice::from_raw_parts(self.seeds.as_ptr(), self.count as usize)
+    }
+
+    /// The span's facts under `image` (rows in u64, so no sum wraps): the
+    /// span and the class families lie in the static rows and do not overlap.
+    pub const fn valid_span(&self, image: PerryLayoutImageV1) -> bool {
+        let rows = image.static_rows as u64;
+        let (first, end) = (
+            self.lazy_first as u64,
+            self.lazy_first as u64 + self.lazy_count as u64,
+        );
+        let (family, family_end) = (
+            image.family_first as u64,
+            image.family_first as u64 + image.family_count as u64,
+        );
+        self.prototype_serial_end >= crate::intrinsic_serials::FIRST_DYNAMIC_PROTOTYPE_SERIAL
+            && self.prototype_serial_end < (1 << 32)
+            && !self.lazy_layouts.is_null()
+            && first >= NATIVE_LAYOUT_ROWS as u64
+            && end <= rows
+            && family >= NATIVE_LAYOUT_ROWS as u64
+            && family_end <= rows
+            && (image.family_count == 0 || end <= family || first >= family_end)
+    }
+}
+
 pub const SHAPE_RECORD_ID_OFFSET: usize = 120;
 pub const SHAPE_RECORD_LAYOUT_WORD_OFFSET: usize = 124;
 pub const SHAPE_RECORD_FAMILY_DESC_OFFSET: usize = 76;
@@ -122,6 +235,22 @@ pub const LAYOUT_DESC_ID_OFFSET_LP64: usize = 72;
 pub const LAYOUT_DESC_ID_OFFSET_ILP32: usize = 56;
 pub const LAYOUT_DESC_SIZE_LP64: usize = 80;
 pub const LAYOUT_DESC_SIZE_ILP32: usize = 64;
+/// `PerryLayoutKey.off`: the key's absolute slot offset from the object (u16).
+/// It follows `atom` (a pointer), `slot` (u32), `attrs` and `_pad` (u8 each).
+pub const LAYOUT_KEY_OFF_OFFSET_LP64: usize = 14;
+pub const LAYOUT_KEY_OFF_OFFSET_ILP32: usize = 10;
+/// `PerryLayoutKey` is 16 bytes on LP64 (12 on ILP32).
+pub const LAYOUT_KEY_SIZE_LP64: usize = 16;
+pub const LAYOUT_KEY_SIZE_ILP32: usize = 12;
+/// Offsets of the A1 precomputes (`gc_header_word`) appended after `image_keys`
+/// (`i64` aligned to 8 on every target).
+pub const LAYOUT_DESC_GC_HEADER_WORD_OFFSET_LP64: usize = 88;
+pub const LAYOUT_DESC_GC_HEADER_WORD_OFFSET_ILP32: usize = 72;
+/// The descriptor is padded to 128 bytes on LP64 (112 on ILP32): the runtime indexes the descriptor
+/// sections by `(address - start) / size`, and every size but a power of two costs more
+/// instructions than the old 88 did, which startup may not pay (exact Ir).
+pub const LAYOUT_DESC_FULL_SIZE_LP64: usize = 128;
+pub const LAYOUT_DESC_FULL_SIZE_ILP32: usize = 112;
 
 /// Image metadata, never a closure or managed edge.
 #[repr(C)]
@@ -143,24 +272,6 @@ pub mod ffi {
             class_id: u32,
             request: *mut PerryStaticLayoutRequestV1,
             rep: u64,
-        ) -> u32;
-        pub fn js_layout_seed_plain(
-            request: *mut PerryStaticLayoutRequestV1,
-            packed: *const u8,
-            packed_len: u32,
-            count: u32,
-            live: u32,
-            rep: u64,
-        ) -> u32;
-        pub fn js_layout_seed_plain_constfn(
-            request: *mut PerryStaticLayoutRequestV1,
-            packed: *const u8,
-            packed_len: u32,
-            count: u32,
-            live: u32,
-            rep: u64,
-            entries: *const ConstFnStaticEntry,
-            entry_count: u32,
         ) -> u32;
         pub fn js_object_final_layout_for_class_keys_static_private(
             keys: u64,
@@ -353,14 +464,67 @@ const _: () = {
     assert!(size_of::<PerryStaticLayoutRequestV1>() == 8);
     assert!(align_of::<PerryStaticLayoutRequestV1>() == 4);
     assert!(offset_of!(PerryStaticLayoutRequestV1, layout_word) == 4);
-    assert!(size_of::<PerryLayoutImageV1>() == 16 && align_of::<PerryLayoutImageV1>() == 4);
+    assert!(
+        size_of::<PerryLayoutImageV1>() == 16 + size_of::<usize>()
+            && align_of::<PerryLayoutImageV1>() == size_of::<usize>()
+    );
     assert!(offset_of!(PerryLayoutImageV1, static_rows) == 4);
     assert!(offset_of!(PerryLayoutImageV1, family_first) == 8);
     assert!(offset_of!(PerryLayoutImageV1, family_count) == 12);
+    assert!(offset_of!(PerryLayoutImageV1, program) == 16);
+    assert!(offset_of!(PerryProgramTableV1, lazy_count) == 4);
+    assert!(offset_of!(PerryProgramTableV1, lazy_first) == 8);
+    assert!(offset_of!(PerryProgramTableV1, prototype_serial_end) == 16);
+    assert!(offset_of!(PerryProgramTableV1, lazy_layouts) == 24);
+    assert!(offset_of!(PerryProgramTableV1, seeds) == 32);
 };
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_descriptor_span_is_checked_without_overflow() {
+        let facts = core::ptr::without_provenance(4096);
+        let table = |lazy_first, lazy_count, lazy_layouts| PerryProgramTableV1 {
+            lazy_first,
+            lazy_count,
+            lazy_layouts,
+            ..PerryProgramTableV1::EMPTY
+        };
+        let image =
+            |program: &PerryProgramTableV1, family_first, family_count| PerryLayoutImageV1 {
+                static_rows: NATIVE_LAYOUT_ROWS + 4,
+                family_first,
+                family_count,
+                program,
+                ..PerryLayoutImageV1::RUNTIME
+            };
+        let n = NATIVE_LAYOUT_ROWS;
+        let span = table(n, 3, facts);
+        unsafe {
+            assert!(PerryLayoutImageV1::RUNTIME.valid());
+            assert!(image(&span, n + 3, 1).valid());
+            // A span after the families, as the unit-test runtime places it.
+            assert!(image(&table(n + 1, 3, facts), n, 1).valid());
+            assert!(!image(&span, n + 2, 1).valid());
+            assert!(!image(&span, n + 3, 2).valid());
+            assert!(!image(&table(n, 5, facts), n + 5, 0).valid());
+            assert!(!image(&table(u32::MAX, 3, facts), n + 3, 1).valid());
+            assert!(!image(&table(n, u32::MAX, facts), n + 3, 1).valid());
+            assert!(!image(&table(n, 3, facts), u32::MAX, u32::MAX).valid());
+            assert!(!image(&table(n, 3, core::ptr::null()), n + 3, 1).valid());
+            // Without a span the families follow the native rows.
+            let empty = PerryProgramTableV1::EMPTY;
+            assert!(image(&empty, n, 4).valid());
+            assert!(!image(&empty, n + 1, 0).valid());
+            assert!(!PerryLayoutImageV1 {
+                program: core::ptr::null(),
+                ..PerryLayoutImageV1::RUNTIME
+            }
+            .valid());
+        }
+    }
+
     #[test]
     fn word_encoding_and_receiver_admission() {
         for band in 0..3 {
@@ -401,7 +565,7 @@ mod tests {
     fn catalog_is_sorted_and_image_is_bounded() {
         assert!(NATIVE_LAYOUT_DESCRIPTORS.windows(2).all(|w| w[0] < w[1]));
         assert_eq!(NATIVE_LAYOUT_ROWS, 125);
-        assert!(PerryLayoutImageV1::RUNTIME.valid());
+        assert!(unsafe { PerryLayoutImageV1::RUNTIME.valid() });
         for (i, name) in NATIVE_LAYOUT_DESCRIPTORS.iter().enumerate() {
             assert_eq!(native_layout_row(name).0, 11 + i as u32);
         }
@@ -431,6 +595,14 @@ const _: () = {
     );
 };
 
+/// `ClassMemberDecl::flags` (codegen's `{ ptr, ptr, ptr, i32, i32, i32, i8, i8,
+/// i16 }`, the second `i8`): the member's name bytes are valid UTF-8. The
+/// emitter sets it when it has proven the bytes (codegen: the emitted name has
+/// no lone surrogate; a native class: a Rust `&'static str`), and registration
+/// reads the name without validating it. Clear, the name is validated, and one
+/// that is not UTF-8 (a WTF-8 name) names no member.
+pub const CLASS_MEMBER_NAME_UTF8: u8 = 4;
+
 /// Explicit dynamic mints: all returns and finalizer carriers are LayoutWords.
 pub mod dynamic_layout_ffi {
     unsafe extern "C" {
@@ -450,3 +622,18 @@ pub mod dynamic_layout_ffi {
         ) -> u32;
     }
 }
+
+/// A layout's prototype identity. Runtime-created prototypes leave the image
+/// pointer null; image families name their immutable template address directly.
+/// The pointer is raw so Mach-O can carry it in an ordinary chained fixup.
+#[repr(C)]
+pub struct PerryProtoFamily {
+    pub serial: u64,
+    pub image_prototype: *const u8,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(PerryProtoFamily, serial) == 0);
+    assert!(core::mem::offset_of!(PerryProtoFamily, image_prototype) == 8);
+    assert!(core::mem::size_of::<PerryProtoFamily>() == 16);
+};

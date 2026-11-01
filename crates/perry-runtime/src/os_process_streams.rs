@@ -442,10 +442,70 @@ fn stdin_reader_claim_start() -> bool {
     reader_slot_claim_start(&STDIN_READER_STARTED)
 }
 
+/// fd 0 reached EOF: record it so the main-thread pump can fire JS
+/// `'end'`/`'close'` listeners after the buffer drains, and wake the loop so a
+/// final pump runs even when no more bytes arrive (e.g. `< /dev/null`).
+fn stdin_deliver_eof() {
+    let _route = STDIN_READER_ROUTE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    STDIN_EOF_SEEN.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(on_eof) = stdin_reader_eof_consumer() {
+        on_eof();
+    }
+    crate::event_pump::js_notify_main_thread();
+}
+
+/// Bytes read from fd 0: to readline's consumer when linked, else the buffer
+/// `process.stdin.read()` drains; then wake the loop.
+fn stdin_deliver_data(bytes: &[u8]) {
+    let _route = STDIN_READER_ROUTE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(on_data) = stdin_reader_data_consumer() {
+        on_data(bytes.as_ptr(), bytes.len());
+    } else if let Ok(mut q) = STDIN_BUFFER.lock() {
+        q.extend_from_slice(bytes);
+    }
+    crate::event_pump::js_notify_main_thread();
+}
+
+/// `wasm32-wasip1` has no helper threads, so there is no reader thread: the
+/// slot only records that the program reads stdin, and the event loop (the
+/// ordinary pump with a zero-timeout poll, the park with its wait) watches fd 0
+/// and calls `p1_stdin_ready` when it is readable.
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+pub(crate) fn p1_stdin_wanted() -> bool {
+    use std::sync::atomic::Ordering;
+    STDIN_READER_STARTED.load(Ordering::Acquire)
+        && !STDIN_EOF_SEEN.load(Ordering::Acquire)
+        && !stdin_reader_should_stop()
+}
+
+/// fd 0 is readable (or at EOF): one read cannot block, so deliver what it
+/// returns exactly as the reader thread does elsewhere.
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
+pub(crate) fn p1_stdin_ready() {
+    use std::io::Read;
+    let mut buf = [0u8; 65536];
+    match std::io::stdin().lock().read(&mut buf) {
+        Ok(0) => stdin_deliver_eof(),
+        Ok(n) => stdin_deliver_data(&buf[..n]),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) => {}
+        // As the reader thread does: a failed read stops the reader.
+        Err(_) => STDIN_READER_STARTED.store(false, std::sync::atomic::Ordering::Release),
+    }
+}
+
 fn ensure_stdin_reader() {
-    // wasm32-wasip1 cannot spawn the background reader: stdin delivers nothing
-    // instead of the spawn panicking.
     if cfg!(all(target_os = "wasi", target_env = "p1")) {
+        #[cfg(all(target_os = "wasi", target_env = "p1"))]
+        crate::turnloop_net::register_pump();
+        stdin_reader_claim_start();
         return;
     }
     // A previous reader may have exited (EOF, error, or explicit detach), which
@@ -498,31 +558,10 @@ fn ensure_stdin_reader() {
                 }
                 match handle.read(&mut buf) {
                     Ok(0) => {
-                        // EOF: record it so the main-thread pump can fire JS
-                        // `'end'`/`'close'` listeners after the buffer drains,
-                        // and wake the loop so a final pump runs even when no
-                        // more bytes arrive (e.g. `< /dev/null`).
-                        let _route = STDIN_READER_ROUTE
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        STDIN_EOF_SEEN.store(true, std::sync::atomic::Ordering::Release);
-                        if let Some(on_eof) = stdin_reader_eof_consumer() {
-                            on_eof();
-                        }
-                        crate::event_pump::js_notify_main_thread();
+                        stdin_deliver_eof();
                         break;
                     }
-                    Ok(n) => {
-                        let _route = STDIN_READER_ROUTE
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if let Some(on_data) = stdin_reader_data_consumer() {
-                            on_data(buf.as_ptr(), n);
-                        } else if let Ok(mut q) = STDIN_BUFFER.lock() {
-                            q.extend_from_slice(&buf[..n]);
-                        }
-                        crate::event_pump::js_notify_main_thread();
-                    }
+                    Ok(n) => stdin_deliver_data(&buf[..n]),
                     Err(_) => break,
                 }
             }
@@ -865,14 +904,10 @@ extern "C" fn process_stdin_add_listener_once(
     process_stdin_once(closure, this, event, callback)
 }
 
-/// `process.stdin.removeListener(event, cb)` / `.off(...)`.
-/// One info for `removeListener` and `off`: both install the same singleton
-/// function object (`off === removeListener`).
-static PROCESS_STDIN_REMOVE_LISTENER_INFO: crate::closure::JsFunctionInfo =
-    crate::closure::JsFunctionInfo::of(
-        process_stdin_remove_listener as crate::codegen_abi::JsBody2<crate::closure::ClosureHeader>,
-    )
-    .with_declared(2);
+crate::realm_decl! { info // `process.stdin.removeListener(event, cb)` / `.off(...)`.
+// One info for `removeListener` and `off`: both install the same singleton
+// function object (`off === removeListener`).
+crate::fn_info!(export static PROCESS_STDIN_REMOVE_LISTENER_INFO = crate::os::process_streams::process_stdin_remove_listener, 2; with_declared(2)); realm { process.stdin.off, constructible = true; } }
 
 extern "C" fn process_stdin_remove_listener(
     _closure: *const crate::closure::ClosureHeader,
@@ -1623,7 +1658,7 @@ pub extern "C" fn js_process_stdin() -> f64 {
         let fresh = *slot == 0;
         if fresh {
             *slot = build_stream_object_with_write(
-                crate::fn_info!(process_stdin_write_noop_stub, 3),
+                crate::fn_info!(#[realm(process.stdin.write, provider = closure_alloc)] export crate::os::process_streams::process_stdin_write_noop_stub, 3),
                 0.0,
                 f64::from_bits(crate::value::TAG_UNDEFINED),
             ) as usize;
@@ -1661,7 +1696,7 @@ pub extern "C" fn js_process_stdout() -> f64 {
         let mut slot = slot.borrow_mut();
         if *slot == 0 {
             *slot = build_stream_object_with_write(
-                crate::fn_info!(process_stdout_write_stub, 3; with_declared(3)),
+                crate::fn_info!(#[realm(process.stdout.write, provider = closure_alloc)] export crate::os::process_streams::process_stdout_write_stub, 3; with_declared(3)),
                 1.0,
                 f64::from_bits(crate::value::TAG_TRUE),
             ) as usize;
@@ -1691,7 +1726,7 @@ pub extern "C" fn js_process_stderr() -> f64 {
         let mut slot = slot.borrow_mut();
         if *slot == 0 {
             *slot = build_stream_object_with_write(
-                crate::fn_info!(process_stderr_write_stub, 3; with_declared(3)),
+                crate::fn_info!(#[realm(process.stderr.write, provider = closure_alloc)] export crate::os::process_streams::process_stderr_write_stub, 3; with_declared(3)),
                 2.0,
                 f64::from_bits(crate::value::TAG_TRUE),
             ) as usize;

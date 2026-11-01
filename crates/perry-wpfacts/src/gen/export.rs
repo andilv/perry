@@ -26,6 +26,43 @@ impl<'a> Gen<'a> {
     /// Connect every module's export declarations to their export nodes.
     pub fn link_exports(&mut self) {
         let modules = self.modules.clone();
+        // The names each module exports itself: they shadow every `export *`
+        // (ECMAScript ResolveExport, §16.2.1.6.3; DECISIONS 215).
+        let mut own: crate::pts::FxHashSet<(u32, Atom)> = Default::default();
+        for mi in 0..modules.len() {
+            let mut names: Vec<&str> = Vec::new();
+            for e in self.exports_of(mi) {
+                match e {
+                    Export::Named { exported, .. } | Export::ReExport { exported, .. } => {
+                        names.push(exported)
+                    }
+                    Export::NamespaceReExport { name, .. } => names.push(name),
+                    Export::ExportAll { .. } => {}
+                }
+            }
+            names.extend(
+                self.exported_functions_of(mi)
+                    .iter()
+                    .map(|(n, _)| n.as_str()),
+            );
+            for f in self.functions_of(mi) {
+                if f.is_exported {
+                    names.push(&f.name);
+                }
+            }
+            for c in self.classes_of(mi) {
+                if c.is_exported {
+                    names.push(&c.name);
+                }
+            }
+            names.extend(self.exported_objects_of(mi).iter().map(|n| n.as_str()));
+            let ns = self.mods[mi].ns_tok;
+            for n in names {
+                let a = self.m.atom(n);
+                own.insert((mi as u32, a));
+                self.m.ns_own.insert((ns, a));
+            }
+        }
         for (mi, (_, module)) in modules.iter().enumerate() {
             let mi = mi as u32;
             let ns = self.mods[mi as usize].ns_tok;
@@ -75,20 +112,14 @@ impl<'a> Gen<'a> {
                         let f = self.m.field(ns, a);
                         self.m.edge(en, f);
                     }
+                    // Every export of `t` is visible through `mi` under its
+                    // own name (DECISIONS 215).
                     Export::ExportAll { source } => match self.resolve_source(mi, module, source) {
                         Some(t) => {
-                            // Every export of `t` is visible through `mi`.
                             let tns = self.mods[t as usize].ns_tok;
-                            let all = self.m.all_fields(tns);
-                            let fa = self.m.field_any(ns);
-                            self.m.edge(all, fa);
-                            let _ = all;
+                            self.m.export_star(ns, tns);
                         }
-                        None => {
-                            let fa = self.m.field_any(ns);
-                            self.m
-                                .add_top(fa, |_| format!("unresolved export * source {source}"));
-                        }
+                        None => self.m.export_star(ns, TOP),
                     },
                     Export::NamespaceReExport { source, name } => {
                         let a = self.m.atom(name);
@@ -152,44 +183,9 @@ impl<'a> Gen<'a> {
             }
         }
         // An export a module never declares, asked for by an importer, reads
-        // through `export *` chains: route every export node through the
-        // namespace's computed-key node (the `export *` targets feed it).
-        // A name the module declares itself is not read through them: an
-        // own export shadows every `export *` (ECMAScript ResolveExport,
-        // §18.14).
-        let mut own: crate::pts::FxHashSet<(u32, Atom)> = Default::default();
-        for mi in 0..modules.len() {
-            let mut names: Vec<&str> = Vec::new();
-            for e in self.exports_of(mi) {
-                match e {
-                    Export::Named { exported, .. } | Export::ReExport { exported, .. } => {
-                        names.push(exported)
-                    }
-                    Export::NamespaceReExport { name, .. } => names.push(name),
-                    Export::ExportAll { .. } => {}
-                }
-            }
-            names.extend(
-                self.exported_functions_of(mi)
-                    .iter()
-                    .map(|(n, _)| n.as_str()),
-            );
-            for f in self.functions_of(mi) {
-                if f.is_exported {
-                    names.push(&f.name);
-                }
-            }
-            for c in self.classes_of(mi) {
-                if c.is_exported {
-                    names.push(&c.name);
-                }
-            }
-            names.extend(self.exported_objects_of(mi).iter().map(|n| n.as_str()));
-            for n in names {
-                let a = self.m.atom(n);
-                own.insert((mi as u32, a));
-            }
-        }
+        // through `export *` chains: the namespace's key of that name (each
+        // `export *` source's key of the name, DECISIONS 215). A name the
+        // module declares itself is not read through them (`own`).
         let keys: Vec<(u32, Atom)> = self.exports.keys().copied().collect();
         for (mi, a) in keys {
             if self
@@ -264,6 +260,30 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        if let Some(p) = published {
+            let owners: Vec<_> = self
+                .m
+                .toks
+                .iter()
+                .enumerate()
+                .filter_map(|(t, tok)| {
+                    let TokKind::Obj(tm, _) = tok else {
+                        return None;
+                    };
+                    p.broken
+                        .contains(&format!("owner:{}", self.m.tmpls[*tm as usize].display))
+                        .then_some(t as u32)
+                })
+                .collect();
+            for t in owners {
+                let r = self
+                    .m
+                    .reason("native owner contract revoked by another unit");
+                let n = self.m.node(|| "revoked native owner".into());
+                self.m.add_tok(n, t);
+                self.m.sink_node(n, r);
+            }
+        }
         // Census (DECISIONS 126): the typed-array fields a reader escapes or
         // marks hard: `nested_fields` sinks them.
         if let Some(p) = published {
@@ -284,7 +304,10 @@ impl<'a> Gen<'a> {
                 Some(tm)
                     if published.is_some_and(|p| !p.broken(&self.m.tmpls[tm as usize].display)) =>
                 {
-                    let extended = published.is_some_and(|p| p.extended(path_of(self, mi), name));
+                    let extended = published.is_some_and(|p| {
+                        p.extended(path_of(self, mi), name)
+                            || p.broken(&format!("extends {}", self.m.tmpls[tm as usize].display))
+                    });
                     self.publish_contract_class(Some((mi, a)), n, tm, extended, r);
                 }
                 _ => {
@@ -518,27 +541,33 @@ impl<'a> Gen<'a> {
             }
             let mut nodes = Vec::with_capacity(n);
             for i in 0..n {
-                // A described position holds undefined when a call passes
-                // fewer arguments: its contract's kinds carry it (DECISIONS 77).
+                // No contract yet is no caller input (decision 13), not a
+                // call with omitted arguments. A present caller contract with
+                // a missing position does contribute undefined (77).
                 let node = match ac.and_then(|a| a.params.get(i)) {
                     Some(vc) => self.stand_in_value(0, &format!("{nm}:arg{i}"), vc),
                     None => {
                         let node = self.m.node_named("arg", || format!("arg{i}({nm})"));
-                        self.m.add_prim(node, prim::UNDEF);
+                        // Constructor initialization keeps its existing
+                        // conservative envelope; DEC223 forwards ordinary calls.
+                        if ac.is_some() || self.m.funcs[fx as usize].ctor_of.is_some() {
+                            self.m.add_prim(node, prim::UNDEF);
+                        }
                         node
                     }
                 };
                 nodes.push(node);
             }
             self.m.closed_params.insert(fx, nodes);
-            // A closed local (decision 23) no other unit can name: published
+            // A closed function passed as an argument (decisions 19/23),
+            // including an own function inside its caller SCC: published
             // where it is created, as a contract function through its closed
             // contract (markers on its parameters, not an escape), so a
             // passing call's argument contract can describe it. DECISIONS
             // 195: only one passed by name as an argument can reach another
             // unit; any other is called here alone, its parameters hold its
             // callers' values (as in the whole program) and carry no markers.
-            if nm.contains('#') && view.closed_passed.contains(nm) {
+            if view.closed_passed.contains(nm) {
                 local.push(fx);
             }
         }
@@ -861,7 +890,16 @@ impl<'a> Gen<'a> {
                         let ru = self
                             .m
                             .reason("passed to a call of an unknown function value");
+                        if let Some(d) = self.m.diagnostic.as_mut() {
+                            d.esc_ctx.push(
+                                "contract: undescribed argument of a call through a parameter"
+                                    .into(),
+                            );
+                        }
                         self.m.sink_node(a, ru);
+                        if let Some(d) = self.m.diagnostic.as_mut() {
+                            d.esc_ctx.pop();
+                        }
                         changed = true;
                     }
                 }
@@ -936,6 +974,55 @@ impl<'a> Gen<'a> {
                 changed = true;
             }
         }
+        // DECISIONS 210: the instances constructed here for the units that
+        // construct this unit's functions (`published_ctors`): their layout
+        // is published to them as a class given out is (`give_class`): the
+        // prototype's functions are contracts run on them, the fields leave
+        // (`fn_inst_contract` describes them). One the census broke (a
+        // reader used it beyond the layout) escapes beyond any contract.
+        let runs = self.m.own_ctor_runs.clone();
+        for (f, ret) in runs {
+            let Some(&tm) = self.m.fn_inst.get(&f) else {
+                continue;
+            };
+            let d = self.m.tmpls[tm as usize].display.clone();
+            let broken = self.unit_in.is_some_and(|u| u.broken(&d));
+            for t in self.m.nodes[ret as usize].pts.to_sorted() {
+                if self.m.tmpl_of(t) != Some(tm) {
+                    continue;
+                }
+                if broken {
+                    let rb = self.m.reason(UNDESCRIBED);
+                    changed |= self.m.escape_changed(t, rb);
+                    continue;
+                }
+                if self.m.fn_inst_published.insert(tm) {
+                    self.m.publish_fn_inst(f, tm, t, r);
+                    changed = true;
+                }
+                if !self.ret_ok.contains(&t) {
+                    changed |= self.note_field_fns(t);
+                }
+                changed |= self.fields_leave(t, r);
+            }
+        }
+        // DEC223: a concrete owned callback handed to a known closed callee
+        // is published through the normal value-contract check. This names
+        // its callable identity; it does not close its own entry. The check
+        // retains unknown captures/effects and refuses an undescribed escape.
+        for t in self.closed_arg_functions() {
+            changed |= self.check_toks(vec![t], r).1;
+            // DECISIONS 224: its runners publish their arguments.
+            let f = self.m.tok_fn(t);
+            if self.m.contract_fns.contains(&f) {
+                self.m.callable_pub.insert(f);
+            }
+        }
+        for t in self.closed_arg_literals() {
+            if !self.arr_ok(t) && !self.handed.contains(&t) {
+                self.handed.push(t);
+            }
+        }
         changed |= self.nested_fields(r);
         // A literal of this unit passed to another unit's closed function
         // (decision 13) is described by the argument contract as a value
@@ -1008,6 +1095,7 @@ impl<'a> Gen<'a> {
         let Some(u) = self.unit_in else { return };
         let me = self.view.map(|v| v.key.clone()).unwrap_or_default();
         let seed = self.m.node_named("cell", || format!("cell({key})"));
+        self.cell_seeds.insert(n, seed);
         if u.cells_top {
             self.m
                 .add_top(seed, |_| "cell written by a unit over the bound".into());
@@ -1022,6 +1110,10 @@ impl<'a> Gen<'a> {
                 continue;
             }
             let v = self.stand_in_value(0, key, &w.c);
+            if n == self.thrown {
+                let held = self.m.nodes[v as usize].pts.to_sorted();
+                self.m.thrown_in.extend(held);
+            }
             self.m.edge(v, seed);
         }
         self.m.edge(seed, n);
@@ -1140,6 +1232,36 @@ impl<'a> Gen<'a> {
         (true, changed)
     }
 
+    /// Owned callable values actually reaching parameters of a known closed
+    /// stand-in. Token/member IDs stay in this solve; no source-name guess or
+    /// new caller envelope is involved (DEC223). DECISIONS 224: a stand-in of
+    /// a function published to a known closed callee has known callers too
+    /// (each running unit publishes what it passes): what reaches its
+    /// parameters is published the same way.
+    fn closed_arg_functions(&self) -> Vec<Tok> {
+        let mut out: Vec<Tok> = self
+            .stand_in_fns
+            .iter()
+            .filter(|((_, holder), &(_, t))| {
+                holder.is_none()
+                    && self
+                        .stand_in_fc
+                        .get(&t)
+                        .is_some_and(|fc| fc.closed.is_some() || fc.callable)
+            })
+            .flat_map(|(_, &(_, t))| self.m.funcs[self.m.tok_fn(t) as usize].params.iter())
+            .flat_map(|&p| self.m.nodes[p as usize].pts.to_sorted())
+            .flat_map(|t| self.m.marker_members(t))
+            .filter(|&t| {
+                matches!(self.m.toks[t as usize], TokKind::Func(f, _)
+                if self.m.funcs[f as usize].func_id != u32::MAX)
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// This unit's literal objects its calls pass to other units' closed
     /// functions (`arg_contract_of`): the arguments of their stand-ins.
     fn closed_arg_literals(&self) -> Vec<Tok> {
@@ -1195,6 +1317,7 @@ impl<'a> Gen<'a> {
         let r = self
             .m
             .reason("a field function of a literal given to another unit");
+        self.m.field_fn_reason = Some(r);
         let mut fields: Vec<(Atom, NodeId)> = self
             .m
             .field_keys
@@ -1418,6 +1541,12 @@ impl<'a> Gen<'a> {
             }
         }
         let n = self.m.field_any(t);
+        // Other units' stores under a computed key are published into the
+        // element cell: the named keys read them as well.
+        if self.m.is_elem_array(t) {
+            let na = self.m.named_any(t);
+            self.m.edge(n, na);
+        }
         // DECISIONS 184: a container's elements are primitives besides
         // what was stored (`builtins::tok_load`): its cell says so, as a
         // reader's own container of the same kind reads them.
@@ -1439,6 +1568,15 @@ impl<'a> Gen<'a> {
         // A runtime-owned object: the contract names it (`ValueContract::shared`).
         if self.m.named_shared(t).is_some() {
             return true;
+        }
+        if let Some((tm, _)) = crate::bindings::sealed_owner(&self.m, t) {
+            let d = &self.m.tmpls[tm as usize].display;
+            if !self
+                .unit_in
+                .is_some_and(|u| u.broken(&format!("owner:{d}")))
+            {
+                return true;
+            }
         }
         match self.m.toks[t as usize] {
             // DECISIONS 137: a marker with values beside it (DECISIONS 74)
@@ -1563,8 +1701,14 @@ impl<'a> Gen<'a> {
         let mut changed = false;
         loop {
             let n0 = self.leaving.len();
+            let h0 = self.handed.len();
             let mut by: FxHashMap<TmplId, Vec<Tok>> = FxHashMap::default();
-            for &t in &self.leaving {
+            let lv: crate::pts::FxHashSet<Tok> = self.leaving.iter().copied().collect();
+            for &t in self
+                .leaving
+                .iter()
+                .chain(self.handed.iter().filter(|t| !lv.contains(t)))
+            {
                 if let Some(tm) = self.m.tmpl_of(t) {
                     by.entry(tm).or_default().push(t);
                 }
@@ -1573,12 +1717,16 @@ impl<'a> Gen<'a> {
             tms.sort_unstable();
             for tm in tms {
                 let ts = by.remove(&tm).unwrap_or_default();
+                // Only a leaving token's fields are sunk; a handed one's
+                // (`handed`) are described or read as unknown by the callee.
+                let leaves: Vec<Tok> = ts.iter().copied().filter(|t| lv.contains(t)).collect();
+                let handed_only = leaves.is_empty();
                 if !self.keyed_leave(tm) {
                     // Broken by the census: every field leaves as before.
                     self.field_layouts.retain(|&(t2, _), _| t2 != tm);
                     self.field_values.retain(|&(t2, _), _| t2 != tm);
                     self.field_tas.retain(|&(t2, _), _| t2 != tm);
-                    for &t in &ts {
+                    for &t in &leaves {
                         if !self.all_sunk.contains(&t) {
                             self.sink_all_fields(t, r);
                             changed = true;
@@ -1721,6 +1869,11 @@ impl<'a> Gen<'a> {
                             continue;
                         }
                     }
+                    // A handed literal's instance of a contract class would
+                    // leave key by key: not described here.
+                    if handed_only && !cls.is_empty() {
+                        ok = false;
+                    }
                     if ok {
                         for x in std::mem::take(&mut cls) {
                             changed |= self.fields_leave(x, r);
@@ -1740,7 +1893,7 @@ impl<'a> Gen<'a> {
                         self.field_values.insert((tm, a), ns);
                         self.field_layouts.remove(&(tm, a));
                         for (_, x) in inner {
-                            changed |= self.fields_leave(x, r);
+                            changed |= self.inner_leave(x, handed_only, r);
                         }
                         continue;
                     }
@@ -1756,30 +1909,51 @@ impl<'a> Gen<'a> {
                             self.field_prims.insert((tm, a));
                         }
                         for (_, x) in inner {
-                            changed |= self.fields_leave(x, r);
+                            changed |= self.inner_leave(x, handed_only, r);
                         }
                         continue;
                     }
+                    // Its readers find an unknown value: what it holds leaves
+                    // beyond any contract (DECISIONS 203, 212), unless it
+                    // holds only functions they call through their
+                    // contracts (`note_field_fns`).
                     self.sunk_fields.insert((tm, a));
                     self.field_layouts.remove(&(tm, a));
                     self.field_values.remove(&(tm, a));
                     self.field_tas.remove(&(tm, a));
                     self.field_prims.remove(&(tm, a));
-                    for &t in &ts {
+                    let ru = self.m.reason(UNDESCRIBED);
+                    for &t in &leaves {
                         if let Some(&n) = self.m.fields.get(&(t, a)) {
                             if self.sunk_field_toks.insert((t, a)) {
-                                self.m.sink_node(n, r);
+                                let rf = match self.field_fns.contains_key(&(t, a)) {
+                                    true => r,
+                                    false => ru,
+                                };
+                                self.m.sink_node(n, rf);
                                 changed = true;
                             }
                         }
                     }
                 }
             }
-            if self.leaving.len() == n0 {
+            if self.leaving.len() == n0 && self.handed.len() == h0 {
                 break;
             }
         }
         changed
+    }
+
+    /// A literal of this unit a described field holds: it leaves with its
+    /// holder (`fields_leave`), or is handed with it (`handed`).
+    fn inner_leave(&mut self, x: Tok, handed: bool, r: u32) -> bool {
+        if !handed {
+            return self.fields_leave(x, r);
+        }
+        if !self.handed.contains(&x) {
+            self.handed.push(x);
+        }
+        false
     }
 
     /// The module an `export … from source` of module `mi` reads: the
@@ -1804,6 +1978,12 @@ impl<'a> Gen<'a> {
         }
         if let Some(n) = self.import_value(mi, name) {
             return n;
+        }
+        if self.m.explain {
+            eprintln!(
+                "perry: wpfacts explain: unresolved scope name {name} in {}",
+                self.modules[mi as usize].0
+            );
         }
         self.m.top_val(&format!("unresolved scope name {name}"))
     }

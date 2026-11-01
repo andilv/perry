@@ -38,7 +38,7 @@ impl<'a> ParsedStr<'a> {
 /// is never accepted by itself; exact bytes decide identity, and genuine hash
 /// collisions retain their additional indices in `collisions`.
 struct ParsedObjectIndex {
-    hash_state: ahash::RandomState,
+    hash_state: crate::fast_hash::AHashState,
     primary: crate::fast_hash::PtrHashMap<u64, usize>,
     collisions: Vec<(u64, usize)>,
 }
@@ -46,7 +46,7 @@ struct ParsedObjectIndex {
 impl ParsedObjectIndex {
     unsafe fn from_keys(keys: &[*const StringHeader]) -> Self {
         let mut index = Self {
-            hash_state: ahash::RandomState::new(),
+            hash_state: crate::fast_hash::AHashState::default(),
             primary: crate::fast_hash::PtrHashMap::with_capacity_and_hasher(
                 keys.len(),
                 crate::fast_hash::PtrHasher,
@@ -66,7 +66,7 @@ impl ParsedObjectIndex {
 
     #[inline]
     fn hash_bytes(&self, bytes: &[u8]) -> u64 {
-        self.hash_state.hash_one(bytes)
+        std::hash::BuildHasher::hash_one(&self.hash_state, bytes)
     }
 
     #[inline]
@@ -1095,11 +1095,20 @@ impl<'a> DirectParser<'a> {
                     cached_parse_key_ptr(key_bytes)
                 };
                 let warm_prefix_uses_old_key_identity = warm_shape_slot != 0 && !warm_shape_matches;
-                if let Some(existing) = inline_keys[..inline_len].iter().position(|&ptr| {
-                    ptr == key_ptr
-                        || (warm_prefix_uses_old_key_identity
-                            && json_key_bytes_equal(ptr, key_bytes))
-                }) {
+                // A matched prefix of a canonical shape already has unique
+                // keys in source order. A mismatch withdraws that proof and
+                // retains the content-aware duplicate search (including old
+                // key identities after a nested parse clears the key cache).
+                let existing = if warm_shape_matches {
+                    None
+                } else {
+                    inline_keys[..inline_len].iter().position(|&ptr| {
+                        ptr == key_ptr
+                            || (warm_prefix_uses_old_key_identity
+                                && json_key_bytes_equal(ptr, key_bytes))
+                    })
+                };
+                if let Some(existing) = existing {
                     inline_values[existing] = value;
                 } else if inline_len < inline_keys.len() {
                     inline_keys[inline_len] = key_ptr;

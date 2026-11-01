@@ -51,6 +51,7 @@ mod set_receiver;
 
 pub(crate) fn entry_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -62,6 +63,7 @@ pub(crate) fn entry_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -190,7 +192,9 @@ pub(crate) fn under_both_lowerings(mut body: impl FnMut(&str)) {
 /// `console.log(a, b, …)` — the shape in the #6951 repro.
 pub(crate) fn console_log(args: Vec<Expr>) -> Stmt {
     Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::GlobalGet(0)),
             property: "log".to_string(),
             byte_offset: 0,

@@ -144,7 +144,7 @@ fn is_valid_heap_snapshot_options(value: f64) -> bool {
     let Some(header) = (unsafe { crate::value::addr_class::try_read_gc_header(ptr) }) else {
         return false;
     };
-    header.obj_type == crate::gc::GC_TYPE_OBJECT
+    crate::gc_type_is_object!(header.obj_type)
 }
 
 fn validate_heap_snapshot_options(value: f64) {
@@ -667,8 +667,8 @@ pub(crate) unsafe fn attach_v8_constructor(
     let prototype =
         crate::object::js_function_prototype_value_for_read(constructor.get_nanbox_f64());
     let prototype = scope.root_nanbox_f64(prototype);
-    let method = crate::closure::js_closure_alloc_singleton(crate::fn_info!(
-        unwind gc_profiler_dispose_body,
+    let method = crate::closure::js_closure_alloc_singleton(crate::fn_info!(#[realm("node:v8.GCProfiler.prototype[\"@@dispose\"]", constructible = true)] 
+        export unwind crate::node_v8::gc_profiler_dispose_body,
         0
     ));
     let method = scope.root_raw_mut_ptr(method);
@@ -777,7 +777,7 @@ pub extern "C" fn js_v8_gc_profiler_stop(recv: f64) -> f64 {
 /// `(new v8.GCProfiler()).stop()` report object.
 #[no_mangle]
 pub extern "C" fn js_v8_gc_profiler_report() -> f64 {
-    let now = crate::date::js_date_now();
+    let now = crate::clock::wall_millis();
     let statistics = crate::array::js_array_alloc(0);
     let stats_val = f64::from_bits(JSValue::pointer(statistics as *const u8).bits());
     unsafe {

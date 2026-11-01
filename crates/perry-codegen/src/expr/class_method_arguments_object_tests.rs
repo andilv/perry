@@ -54,6 +54,7 @@ const RECV_ID: u32 = 4;
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -65,6 +66,7 @@ fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -195,6 +197,7 @@ fn module_with_tail(tail: Param) -> Module {
             params: vec![fixed(A_ID, "a"), fixed(B_ID, "b"), tail],
             return_type: Type::Any,
             body: vec![Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(TAIL_ID)),
                 property: "length".to_string(),
                 byte_offset: 0,
@@ -229,6 +232,7 @@ fn module_with_tail(tail: Param) -> Module {
             ty: Type::Named("T".to_string()),
             mutable: false,
             init: Some(Expr::New {
+                byte_end: 0,
                 class_name: "T".to_string(),
                 args: Vec::new(),
                 type_args: Vec::new(),
@@ -237,7 +241,9 @@ fn module_with_tail(tail: Param) -> Module {
             }),
         },
         Stmt::Expr(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(RECV_ID)),
                 property: "m".to_string(),
                 byte_offset: 0,
@@ -325,6 +331,8 @@ fn pushes_of(ir: &str, literal: &str) -> usize {
 fn a_class_method_reading_arguments_is_handed_every_passed_argument() {
     let mut module = module_with_tail(synthetic_arguments_param());
     module.classes[0].methods[0].body = vec![Stmt::Return(Some(Expr::IndexGet {
+        byte_offset: 0,
+        byte_end: 0,
         object: Box::new(Expr::LocalGet(TAIL_ID)),
         index: Box::new(Expr::Integer(0)),
     }))];
@@ -429,6 +437,8 @@ fn a_length_only_family_call_keeps_the_scalar_arguments_abi() {
             object: Box::new(Expr::This),
             property: "late".into(),
             value: Box::new(Expr::Number(1.0)),
+            byte_offset: 0,
+            byte_end: 0,
         }),
     );
     let mut opts = ir_opts();

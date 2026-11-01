@@ -34,6 +34,7 @@ mod pointer_lifetime;
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -94,6 +95,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
@@ -441,6 +443,7 @@ fn add(left: Expr, right: Expr) -> Expr {
 
 fn length(local_id: u32) -> Expr {
     Expr::PropertyGet {
+        byte_end: 0,
         byte_offset: 0,
         object: Box::new(local(local_id)),
         property: "length".to_string(),
@@ -458,6 +461,7 @@ fn buffer_set(buffer_id: u32, index: Expr) -> Stmt {
 fn buffer_read(buffer_id: u32, method: &str, index: Expr) -> Expr {
     call(
         Expr::PropertyGet {
+            byte_end: 0,
             byte_offset: 0,
             object: Box::new(local(buffer_id)),
             property: method.to_string(),
@@ -468,6 +472,8 @@ fn buffer_read(buffer_id: u32, method: &str, index: Expr) -> Expr {
 
 fn index_get(object_id: u32, index: Expr) -> Expr {
     Expr::IndexGet {
+        byte_offset: 0,
+        byte_end: 0,
         object: Box::new(local(object_id)),
         index: Box::new(index),
     }
@@ -475,6 +481,7 @@ fn index_get(object_id: u32, index: Expr) -> Expr {
 
 fn call(callee: Expr, args: Vec<Expr>) -> Expr {
     Expr::Call {
+        byte_end: 0,
         callee: Box::new(callee),
         args,
         type_args: Vec::new(),
@@ -535,6 +542,8 @@ fn array_set(array_id: u32, index: Expr, value: Expr) -> Stmt {
         object: Box::new(local(array_id)),
         index: Box::new(index),
         value: Box::new(value),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -597,7 +606,9 @@ fn artifact_records_buffer_read_u32_and_unsigned_materialization() {
     let body = vec![
         buffer_let(1, "buf", int(8)),
         Stmt::Return(Some(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "readUInt32BE".to_string(),
@@ -665,6 +676,7 @@ fn loop_length_bound_does_not_prove_multibyte_buffer_read_inbounds() {
             length(1),
             vec![Stmt::Expr(call(
                 Expr::PropertyGet {
+                    byte_end: 0,
                     byte_offset: 0,
                     object: Box::new(local(1)),
                     property: "readUInt32BE".to_string(),
@@ -710,7 +722,9 @@ fn artifact_records_buffer_read_double_as_f64() {
     let body = vec![
         buffer_let(1, "buf", int(8)),
         Stmt::Return(Some(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "readDoubleLE".to_string(),
@@ -750,6 +764,7 @@ fn artifact_records_buffer_read_float_as_f32_and_float_extend_materialization() 
         buffer_let(1, "buf", int(8)),
         Stmt::Return(Some(call(
             Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(local(1)),
                 property: "readFloatLE".to_string(),
@@ -1461,6 +1476,8 @@ fn native_owned_call_spread_escape_invalidates_views() {
                 int(8),
             ),
             Stmt::Expr(Expr::CallSpread {
+                byte_offset: 0,
+                byte_end: 0,
                 callee: Box::new(Expr::ExternFuncRef {
                     name: "unknown_spread_escape".to_string(),
                     param_types: Vec::new(),

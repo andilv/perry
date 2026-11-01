@@ -1,4 +1,5 @@
 use super::*;
+use crate::string::StringHeader;
 
 fn text(value: &str) -> f64 {
     crate::value::js_nanbox_string(js_string_from_bytes(value.as_ptr(), value.len() as u32) as i64)
@@ -141,7 +142,10 @@ fn received_native_brands() {
         crate::value::js_nanbox_pointer(backing as i64),
         "ArrayBuffer",
     );
-    add(crate::date::js_date_new_from_timestamp(0.0), "Date");
+    add(
+        crate::date_hook_slots::js_date_new_from_timestamp(0.0),
+        "Date",
+    );
     add(
         crate::value::js_nanbox_pointer(crate::array::js_array_alloc(0) as i64),
         "Array",
@@ -404,7 +408,7 @@ fn with_received_intrinsic_constructor(name: &str, test: impl FnOnce(f64, f64)) 
             let buffer = crate::buffer::store::alloc_test(brand, 1);
             buffer as i64
         }
-        "Date" => crate::value::js_nanbox_get_pointer(crate::date::alloc_date_cell(0.0)),
+        "Date" => crate::value::js_nanbox_get_pointer(crate::date_hook_slots::alloc_date_cell(0.0)),
         _ => panic!("unsupported intrinsic test fixture"),
     };
     let value = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(raw));

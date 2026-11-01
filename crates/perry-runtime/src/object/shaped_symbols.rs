@@ -6,7 +6,7 @@ pub(crate) const PRIVATE_ENTRY: u8 = 0x40;
 
 pub(crate) unsafe fn owner(addr: usize) -> Option<*mut ObjectHeader> {
     let bag = if crate::value::addr_class::is_proxy_cell(addr) {
-        crate::proxy::property_bag(addr)
+        crate::proxy_hooks::property_bag(addr)
     } else if crate::value::addr_class::try_read_tracked_gc_header(addr).is_some() {
         descriptor_state::descriptor_holder(addr)
     } else {
@@ -125,7 +125,7 @@ pub(crate) unsafe fn define(addr: usize, symbol: usize, bits: u64, entry: u8) ->
             let index = keys.count();
             let key = JSValue::from_bits(symbol.get_nanbox_u64());
             let next = if let Some(proof) = canonical_keys::SharedLayout::of_receiver(current) {
-                let parent = canonical_keys::canonicalize(&proof, keys.arr(), keys.count());
+                let parent = canonical_keys::canonicalize_keys(&proof, keys);
                 canonical_keys::extend_slot(
                     &proof,
                     parent,

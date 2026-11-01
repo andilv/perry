@@ -120,12 +120,14 @@ mod channel;
 #[cfg(test)]
 mod class_method_arguments_object_tests;
 pub(crate) mod collection_receiver;
+pub(crate) mod facts_number;
 mod helpers;
 mod i32_fast_path;
 mod index;
 pub(crate) mod nanbox_inline;
 mod native_memory;
 mod native_record;
+pub(crate) mod numeric_order;
 mod object_literal;
 mod pod_layout_constants;
 mod pod_record;
@@ -364,6 +366,10 @@ pub enum HeaderImageSource {
 }
 
 pub(crate) struct FnCtx<'a> {
+    pub numeric_order_functions: &'a [perry_hir::Function],
+    pub numeric_order_closures: &'a [(u32, Expr)],
+    /// Lexical initialization dominance for closed callee reads.
+    pub numeric_order_ready: crate::stmt::binding_cell::ReadyCellRoots,
     /// wpfacts slice 2: this module's elision facts (`expr/wpfacts_access.rs`).
     pub wpfacts: std::sync::Arc<crate::codegen::ElisionFacts>,
     /// Object model step 5 (case 2c): the program's key colouring
@@ -843,6 +849,11 @@ pub(crate) struct FnCtx<'a> {
     pub trusted_box_captures: bool,
     /// Only the transformed synchronous resume body owns direct mutable state captures.
     pub fixed_generator_state: bool,
+    /// The owner stays rooted; only capture addressing adds the frame offset.
+    pub private_resume_frame: bool,
+    pub private_async_resume_frame: bool,
+    /// Resume-local copies of the private controls (see resume_locals.rs).
+    pub resume_locals: Option<resume_locals::ResumeLocals>,
     /// Stack context supplied only to a compiler-private versioned-loop
     /// callback clone. Its cold arms record the exact resume index and poison
     /// the caller's private counter before executing observable fallback code.
@@ -1474,6 +1485,8 @@ pub(crate) struct FnCtx<'a> {
     pub create_families: crate::layout_desc::create_families::CreateState,
     /// The open class-guard run (`class_guard_memo`).
     pub class_guard_window: Option<class_guard_memo::Window>,
+    /// The open Map get-then-set regions (`map_entry_fusion`).
+    pub map_entry_fusion: map_entry_fusion::State,
 
     /// Parallel `i1` slots for ordinary boolean locals that have stayed inside
     /// the representation-first subset. The generic `double` slot remains as a
@@ -2553,7 +2566,7 @@ pub(crate) fn element_shape_loop_fact_for_property_get<'f>(
         return None;
     }
     match object {
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index, .. } => {
             let Expr::LocalGet(array_local_id) = object.as_ref() else {
                 return None;
             };
@@ -3249,6 +3262,8 @@ pub(crate) mod class_env;
 pub(crate) mod class_field_push;
 pub(crate) mod class_first_evaluation;
 mod closure;
+#[cfg(test)]
+mod sort_numeric_codegen_tests;
 pub(crate) use closure::{plain_async_step_release_ids, push_capture_word};
 mod compare;
 pub(crate) use compare::ordinary_object_allocation;
@@ -3270,6 +3285,8 @@ mod index_get_claim_tests;
 mod index_key;
 #[cfg(test)]
 mod kind_entry_selection_tests;
+#[cfg(test)]
+mod map_entry_fusion_tests;
 pub(crate) mod masked_window;
 #[cfg(test)]
 mod null_default_numeric_add_tests;
@@ -3281,6 +3298,7 @@ pub(crate) mod suffix_cursor;
 mod bigint_bitwise_tests;
 pub(crate) mod byte_cell;
 pub(crate) mod class_guard_memo;
+pub(crate) mod map_entry_fusion;
 mod ptr_numarray_access;
 pub(crate) mod ta_element_read;
 mod ta_param_f64_read;
@@ -3320,6 +3338,8 @@ mod generator_control_slots;
 pub(crate) mod ic_fast_split;
 mod js_runtime;
 mod literals_vars;
+pub(crate) mod private_resume_frame;
+pub(crate) mod resume_locals;
 pub(crate) use literals_vars::{bind_lowered_value_to_local, note_born_local_write};
 mod logical_collections;
 mod math_simple;
@@ -4381,6 +4401,7 @@ fn lower_compare_value(
 /// when an existing caller still expects the generic JSValue/`double` ABI.
 pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<LoweredValue>> {
     let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
+    let _consumed = crate::facts_consumed::enter(expr);
     match expr {
         Expr::Bool(value) => {
             let lowered = LoweredValue::i1(if *value { "true" } else { "false" });
@@ -4825,3 +4846,15 @@ mod byte_prepass_tests;
 
 #[cfg(test)]
 mod array_layout_loop_tests;
+
+#[cfg(test)]
+mod sort_numeric_source_tests;
+
+impl ElementShapeLoopFact {
+    /// The header form predicted for the objects this record describes (`HeaderForm`:
+    /// every ordinary object has the meta word today). Sites take their slot base
+    /// from here, never from the type byte.
+    pub(crate) fn form(&self) -> crate::target_layout::HeaderForm {
+        crate::target_layout::HeaderForm::Meta
+    }
+}

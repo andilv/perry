@@ -10,6 +10,7 @@ use perry_hir::{Expr, Module, Stmt};
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -21,6 +22,7 @@ fn empty_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -91,7 +93,9 @@ fn module_with_init(init: Vec<Stmt>) -> Module {
 #[test]
 fn string_trim_with_extra_arg_compiles() {
     let stmt = Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             byte_offset: 0,
             object: Box::new(Expr::String("  x  ".to_string())),
             property: "trim".to_string(),
@@ -117,6 +121,7 @@ fn string_trim_with_extra_arg_compiles() {
 #[test]
 fn any_call_result_trim_emits_string_tag_dispatch() {
     let receiver = Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::ExternFuncRef {
             name: "make".to_string(),
             param_types: Vec::new(),
@@ -127,7 +132,9 @@ fn any_call_result_trim_emits_string_tag_dispatch() {
         byte_offset: 0,
     };
     let stmt = Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             byte_offset: 0,
             object: Box::new(receiver),
             property: "trim".to_string(),
@@ -179,6 +186,7 @@ fn any_call_result_trim_emits_string_tag_dispatch() {
 #[test]
 fn any_call_result_invalid_string_arity_uses_generic_dispatch() {
     let receiver = Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::ExternFuncRef {
             name: "make".to_string(),
             param_types: Vec::new(),
@@ -189,7 +197,9 @@ fn any_call_result_invalid_string_arity_uses_generic_dispatch() {
         byte_offset: 0,
     };
     let stmt = Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             byte_offset: 0,
             object: Box::new(receiver),
             property: "split".to_string(),
@@ -226,7 +236,9 @@ fn any_call_result_invalid_string_arity_uses_generic_dispatch() {
 #[test]
 fn array_pop_with_extra_arg_compiles() {
     let stmt = Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             byte_offset: 0,
             object: Box::new(Expr::Array(vec![Expr::Number(1.0)], None)),
             property: "pop".to_string(),

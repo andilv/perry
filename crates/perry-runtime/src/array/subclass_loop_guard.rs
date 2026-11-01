@@ -28,7 +28,7 @@ fn elements_loop_source(
     raw: *const u8,
     header: &'static crate::gc::GcHeader,
 ) -> Option<(*const u8, &'static crate::gc::GcHeader)> {
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         return None;
@@ -212,7 +212,7 @@ fn packed_arraylike_loop_guard(
         return Some((1, raw));
     }
 
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+    if crate::gc_type_is_not_object!(header.obj_type) {
         return None;
     }
     let object = raw.cast::<ObjectHeader>();
@@ -322,7 +322,7 @@ pub extern "C" fn js_packed_ecs_u32_loop_guard(
     let mut addresses = [0usize; 4];
     let mut common_length = None;
     for index in 0..column_count as usize {
-        let address = crate::typedarray::owning_u32_addr(columns[index]);
+        let address = crate::typedarray_hook_slots::owning_u32_addr(columns[index]);
         if address == 0 || addresses[..index].contains(&address) {
             return 0;
         }
@@ -472,7 +472,7 @@ pub extern "C" fn js_packed_arraylike_loop_revalidate_live(
     }
 
     if kind != 2
-        || header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         return 0;
@@ -604,7 +604,7 @@ fn revalidate_admitted_subclass_live(
             .sub(crate::gc::GC_HEADER_SIZE)
             .cast::<crate::gc::GcHeader>()
     };
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
     {
         return 0;

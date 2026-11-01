@@ -173,8 +173,8 @@ fn load_closure_capture_bits_inline(
     closure_ptr: &str,
     capture_idx: u32,
 ) -> String {
-    let offset =
-        crate::target_layout::closure_header_size_bytes(ctx.target_triple) + 8 * capture_idx as u64;
+    let capture_idx = super::private_resume_frame::slot_index(ctx, capture_idx);
+    let offset = super::private_resume_frame::slot_offset(ctx, &capture_idx);
     let blk = ctx.block();
     let slot_addr = blk.add(I64, closure_ptr, &offset.to_string());
     let slot_ptr = blk.inttoptr(I64, &slot_addr);
@@ -192,10 +192,19 @@ fn store_generator_state_slot(
     pointer_free: bool,
     string_alias: bool,
 ) -> Result<()> {
+    if ctx.private_resume_frame {
+        return super::private_resume_frame::store_slot(
+            ctx,
+            capture_idx,
+            value,
+            pointer_free,
+            string_alias,
+        );
+    }
     let bits = ctx.block().bitcast_double_to_i64(value);
     if pointer_free {
-        let offset = crate::target_layout::closure_header_size_bytes(ctx.target_triple)
-            + 8 * u64::from(capture_idx);
+        let capture_idx = super::private_resume_frame::slot_index(ctx, capture_idx);
+        let offset = super::private_resume_frame::slot_offset(ctx, &capture_idx);
         let address = ctx.block().add(I64, closure_ptr, &offset.to_string());
         let ptr = ctx.block().inttoptr(I64, &address);
         // GC_STORE_AUDIT(POINTER_FREE): the emitted value's construction,
@@ -203,6 +212,7 @@ fn store_generator_state_slot(
         ctx.block().store(I64, &bits, &ptr);
         return Ok(());
     }
+    let capture_idx = super::private_resume_frame::slot_index(ctx, capture_idx);
     ctx.block().call_void(
         "js_generator_set_slot",
         &[
@@ -496,6 +506,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let bits = emit_box_read(ctx, *id, &box_ptr, ctx.trusted_box_captures);
                     let value = ctx.block().bitcast_i64_to_double(&bits);
                     demote_extracted_string_binding(ctx, *id, &value);
+                    return Ok(value);
+                }
+                if let Some(value) = super::resume_locals::read_value(ctx, *id) {
                     return Ok(value);
                 }
                 let closure_ptr = super::current_closure_ptr_value(ctx, "captured local")?;
@@ -954,6 +967,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     }
                     return Ok(if *prefix { new } else { old });
                 }
+                anyhow::ensure!(
+                    !super::resume_locals::managed(ctx, *id),
+                    "resume-local control updated outside its native contract"
+                );
                 let closure_ptr = super::current_closure_ptr_value(ctx, "captured local update")?;
                 let old_bits = if ctx.fixed_generator_state {
                     load_closure_capture_bits_inline(ctx, &closure_ptr, capture_idx)
@@ -1375,7 +1392,10 @@ pub(crate) fn bind_lowered_value_to_local(
     let fixed_slot = ctx.fixed_generator_state
         && ctx.closure_captures.contains_key(&id)
         && !ctx.boxed_vars.contains(&id);
-    if string_alias && !fixed_slot {
+    // A guarded scalar lane or the all-writes numeric fixed point proves
+    // this alias cannot share a string buffer. An annotation alone never
+    // satisfies is_numeric_expr for a local read.
+    if string_alias && !fixed_slot && !crate::type_analysis::is_numeric_expr(ctx, value) {
         super::helpers::emit_string_addref_if_heap_string(ctx, v);
     }
     if crate::array_record_stack::write_local(ctx, id, v, value) {
@@ -1421,6 +1441,9 @@ pub(crate) fn bind_lowered_value_to_local(
                 }
             }
         } else {
+            if super::resume_locals::write_value(ctx, id, v) {
+                return Ok(());
+            }
             let closure_ptr = super::current_closure_ptr_value(ctx, "captured local set")?;
             let v_bits = ctx.block().bitcast_double_to_i64(v);
             if ctx.fixed_generator_state {

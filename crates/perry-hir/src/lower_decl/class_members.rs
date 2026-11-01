@@ -46,6 +46,7 @@ fn capture_class_method_source(
     ctx.closure_source_text.insert(
         func_id,
         crate::ir::FunctionSourceMetadata {
+            source_span: Some((method.span.lo.0, method.span.hi.0)),
             text: src,
             is_non_strict_ordinary: false,
         },
@@ -252,6 +253,8 @@ fn lower_constructor_in_scope(
                     object: Box::new(Expr::This),
                     property: field_name.clone(),
                     value: Box::new(Expr::LocalGet(*param_id)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })
             })
             .collect();

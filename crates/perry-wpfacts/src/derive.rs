@@ -78,6 +78,11 @@ pub struct FieldFacts {
     /// A declared key (`Template::declared`): `slot` is known, presence is
     /// not, so a read is the load plus the hole compare.
     pub declared: bool,
+    /// A constructor-store reservation that is not `definite`
+    /// (`Template::reserved`): `slot` is known, presence is not (the slot
+    /// holds the hole until the constructor stores the key), so a read is
+    /// the load plus the hole compare, and a store adds the key.
+    pub reserved: bool,
     pub data_field: bool,
     pub readonly: bool,
     pub writers_ctor: usize,
@@ -121,6 +126,8 @@ pub struct TemplateFacts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Verdict {
+    /// Immutable own length of an exclusively primitive String receiver.
+    StringLength,
     T0Mono,
     T0Set,
     /// Proven in the typed body behind the entry guard on the receiver
@@ -131,6 +138,10 @@ pub enum Verdict {
 
 #[derive(Clone, Debug)]
 pub struct SiteFacts {
+    /// Observational solve identity. Never read by a proof or digest.
+    pub(crate) diagnostic_unit: Option<String>,
+    /// Observational: per function copy holding the site, its verdict.
+    pub(crate) diagnostic_copies: Vec<(String, Verdict)>,
     pub module: u32,
     pub byte_offset: u32,
     pub key: String,
@@ -146,6 +157,9 @@ pub struct SiteFacts {
     /// names these keys; its verdict is decided after the census
     /// (`units::typed_param_verdicts`).
     pub(crate) guard_keys: Option<Vec<String>>,
+    /// DECISIONS 225: the bodies holding the site, in its module (HIR
+    /// function id, and for a synthetic context its name; `Model::act_key`).
+    pub bodies: Vec<(u32, String)>,
 }
 
 /// `Some` (a reason a claim fails) absorbs `None`; of two reasons the
@@ -195,6 +209,11 @@ impl FieldFacts {
         }
         self.definite &= o.definite;
         self.declared &= o.declared;
+        // A known slot whose presence one of them does not know.
+        self.reserved = (self.definite || self.reserved)
+            && (o.definite || o.reserved)
+            && !(self.definite && o.definite);
+        self.definite &= o.definite;
         self.data_field &= o.data_field;
         self.readonly &= o.readonly;
         self.writers_ctor = self.writers_ctor.max(o.writers_ctor);
@@ -235,13 +254,17 @@ impl TemplateFacts {
         for f in self.fields.iter_mut() {
             match o.fields.iter().find(|g| g.key == f.key) {
                 Some(g) => f.join(g),
-                None => f.definite = false,
+                None => {
+                    f.definite = false;
+                    f.reserved = false;
+                }
             }
         }
         for g in &o.fields {
             if !self.fields.iter().any(|f| f.key == g.key) {
                 let mut g = g.clone();
                 g.definite = false;
+                g.reserved = false;
                 self.fields.push(g);
             }
         }
@@ -420,6 +443,11 @@ fn template_facts(
         chain_problem.get_or_insert_with(|| r.clone());
     }
     let star = m.atom(crate::STAR_KEY);
+    // This obligation affects every receiver sharing the chain, even when
+    // a site's own token has not escaped (DEC220).
+    if accessor_keys.contains(&star) {
+        chain_problem.get_or_insert_with(|| "accessor under a computed key on the chain".into());
+    }
     let escape = if accessor_keys.contains(&star) && escape.is_none() {
         // A computed-key accessor on the chain runs as unknown code with
         // the receiver: treat the template as escaped (kills readonly and
@@ -443,7 +471,21 @@ fn template_facts(
     }
     let escape = global.clone().or(escape);
     let prefix_stable = escape.is_none() && hard.is_none() && chain_problem.is_none();
-    let adds = m.adds_keys.get(&tm).copied().unwrap_or(0);
+    // A named store the solve counted as a key add while the class had only
+    // its own birth keys is no add when the settled layout (the parent unit's
+    // class as its prefix) holds the key from birth.
+    let settled_stores: u32 = m
+        .adds_named
+        .iter()
+        .filter(|((t, a), _)| *t == tm && tpl.birth_keys.contains(a))
+        .map(|(_, n)| *n)
+        .sum();
+    let adds = m
+        .adds_keys
+        .get(&tm)
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(settled_stores);
     // Slots: birth order, valid up to the first non-definite / accessor key.
     let mut fields = Vec::new();
     let mut slot_ok = true;
@@ -464,11 +506,19 @@ fn template_facts(
         let is_accessor = accessor_keys.contains(&a);
         let definite = birth && tpl.definite.contains(&a) && !is_accessor;
         let declared = birth && tpl.declared.contains(&a) && !is_accessor;
-        if birth && !definite && !declared {
+        let reserved = birth && tpl.reserved.contains(&a) && !definite && !is_accessor;
+        if birth && !definite && !declared && !reserved {
             slot_ok = false;
             fixed_layout = false;
         }
-        let slot = (birth && (definite || declared) && slot_ok).then_some(i as u32);
+        // A reserved key keeps its slot, but an instance can be observed
+        // while the slot still holds the hole: its presence is not the
+        // complete birth layout's, so code compiled for that layout (the
+        // `$pshape` clones) keeps its keys recheck.
+        if reserved {
+            fixed_layout = false;
+        }
+        let slot = (birth && (definite || declared || reserved) && slot_ok).then_some(i as u32);
         let w = m.writers.get(&(tm, a)).cloned().unwrap_or_default();
         let any = m.any_writers.get(&tm).cloned().unwrap_or_default();
         let readonly = escape.is_none()
@@ -499,6 +549,7 @@ fn template_facts(
             slot,
             definite,
             declared,
+            reserved,
             data_field: !is_accessor,
             readonly,
             writers_ctor: w.ctor.len(),
@@ -669,6 +720,56 @@ fn field_kind(m: &Model, ts: &[Tok], a: Atom, definite: bool) -> KindFact {
     k
 }
 
+/// DEC220: an own-slot read depends on its receiver's objects. Another
+/// birth sharing their layout may escape or be reconfigured independently.
+/// Layout contracts and all chain/accessor obligations remain template-wide.
+fn private_own_slot(m: &Model, tf: &TemplateFacts, t: Tok, key: &str) -> Option<u32> {
+    if m.foreign.contains_key(&tf.id)
+        || m.is_escaped(t)
+        || m.hard.contains_key(&t)
+        || m.objproto_accessor
+        || tf.sabotaged
+    {
+        return None;
+    }
+    let tpl = &m.tmpls[tf.id as usize];
+    if tpl
+        .native_parent
+        .as_ref()
+        .is_some_and(|(_, n)| !crate::builtins::native_parent_summarized(n))
+    {
+        return None;
+    }
+    let star = m.atom_index.get(crate::STAR_KEY).copied();
+    let computed =
+        |t: Tok| star.is_some_and(|a| m.accessor_keys.get(&t).is_some_and(|ks| ks.contains(&a)));
+    if star.is_some_and(|a| tpl.accessor_keys.contains(&a))
+        || m.tmpl_toks(tf.id).into_iter().any(computed)
+    {
+        return None;
+    }
+    for p in chain_tokens(m, tf.id) {
+        // A literal-shape prototype is a layout, not a runtime object
+        // (DEC217(a)). Its fabricated constructor escape cannot let unknown
+        // code change a private sibling's own slot. Its real ancestors and
+        // every recorded accessor/HARD operation still have to be checked.
+        let layout = matches!(m.toks[p as usize], TokKind::Proto(tm)
+            if matches!(m.tmpls[tm as usize].kind,
+                TmplKind::Class { literal_shape: true, .. }));
+        if p == TOP
+            || m.hard.contains_key(&p)
+            || computed(p)
+            || (!layout && !matches!(m.toks[p as usize], TokKind::ObjectProto) && m.is_escaped(p))
+        {
+            return None;
+        }
+    }
+    tf.fields
+        .iter()
+        .find(|f| f.key == key && f.definite && f.data_field)
+        .and_then(|f| f.slot)
+}
+
 fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
     let m = &g.m;
     let by_id: crate::pts::FxHashMap<TmplId, &TemplateFacts> =
@@ -686,7 +787,7 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
     // One fact per read site: records of the same site (a body walked
     // twice) unite their receivers.
     let mut first: FxHashMap<(u32, u32, u32, bool, bool), usize> = FxHashMap::default();
-    let mut groups: Vec<(usize, Vec<u32>)> = Vec::new();
+    let mut groups: Vec<(usize, Vec<u32>, Vec<FnIdx>)> = Vec::new();
     // The functions only the runtime has (a promise's resolvers). Every
     // other function token is a body: compiled here, or another unit's,
     // held by its contract (a stand-in, a foreign class's method).
@@ -694,15 +795,18 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
     for (i, s) in g.read_sites.iter().enumerate() {
         let k = (s.module, s.byte_offset, s.key, s.is_call, s.value_call);
         match first.get(&k) {
-            Some(&gi) => groups[gi].1.push(s.recv),
+            Some(&gi) => {
+                groups[gi].1.push(s.recv);
+                groups[gi].2.push(s.func);
+            }
             None => {
                 first.insert(k, groups.len());
-                groups.push((i, vec![s.recv]));
+                groups.push((i, vec![s.recv], vec![s.func]));
             }
         }
     }
-    for (i, recvs) in &groups {
-        let s = &g.read_sites[*i];
+    // The verdict of one site over the receiver nodes `recvs`.
+    let verdict_of = |s: &crate::gen::ReadSite, recvs: &[u32]| {
         let mut toks: Vec<Tok> = recvs
             .iter()
             .flat_map(|&r| m.nodes[r as usize].pts.to_sorted())
@@ -715,7 +819,7 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
             .copied()
             .find(|&r| m.nodes[r as usize].pts.to_sorted().contains(&TOP))
             .unwrap_or(s.recv);
-        let key = m.atoms[s.key as usize].clone();
+        let key = &m.atoms[s.key as usize];
         let (mut receivers, mut top, mut verdict, mut fixed_shape, mut targets) =
             judge(m, &by_id, &runtime, s, &key, &toks, prim, top_recv);
         // Design §11.4: a site whose receiver is the `this` of a method of
@@ -759,10 +863,56 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
                 }
             }
         }
+        (receivers, top, verdict, fixed_shape, targets, guard_keys)
+    };
+    for (i, recvs, funcs) in &groups {
+        let s = &g.read_sites[*i];
+        let key = m.atoms[s.key as usize].clone();
+        let (receivers, top, verdict, fixed_shape, targets, guard_keys) = verdict_of(s, recvs);
+        // Observational only (the facts dump): the verdict of each function
+        // copy holding the site (an inlined body is a copy of its own), so a
+        // dump compares a copy with the same copy of another run. Never read
+        // by a proof or a digest.
+        let diagnostic_copies = g.diagnostic.as_ref().map(|_| {
+            let mut fs: Vec<FnIdx> = funcs.clone();
+            fs.sort_unstable();
+            fs.dedup();
+            fs.into_iter()
+                .map(|f| {
+                    let rs: Vec<u32> = recvs
+                        .iter()
+                        .zip(funcs)
+                        .filter(|(_, &x)| x == f)
+                        .map(|(&r, _)| r)
+                        .collect();
+                    let fi = &m.funcs[f as usize];
+                    let path = g.modules.get(fi.module as usize).map_or("", |(p, _)| *p);
+                    (
+                        format!("{path}:{}:{}", fi.func_id, fi.name),
+                        verdict_of(s, &rs).2,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         let mut t: Vec<String> = targets.into_values().collect();
         t.sort();
         t.dedup();
+        let mut bodies: Vec<(u32, String)> = funcs
+            .iter()
+            .map(|&f| {
+                let (_, id, name) = m.act_key(f);
+                (id, name)
+            })
+            .collect();
+        bodies.sort_unstable();
+        bodies.dedup();
         out.push(SiteFacts {
+            bodies,
+            diagnostic_copies: diagnostic_copies.unwrap_or_default(),
+            diagnostic_unit: g
+                .diagnostic
+                .as_ref()
+                .map(|_| g.view.map_or("<whole>", |v| v.key.as_str()).to_owned()),
             module: s.module,
             byte_offset: s.byte_offset,
             key,
@@ -811,6 +961,22 @@ fn judge(
             ),
         };
     }
+    // String boxing creates a non-configurable own length property. Its
+    // value is the published UTF-16 count; prototypes cannot override it.
+    // Keep this native primitive certificate distinct from layout/body T0.
+    if !s.is_call
+        && key == "length"
+        && prim == crate::model::prim::STR
+        && toks.iter().all(|&t| m.closed_marker(t))
+    {
+        return (
+            vec!["primitive:string".into()],
+            false,
+            Verdict::StringLength,
+            true,
+            FxHashMap::default(),
+        );
+    }
     let mut receivers = Vec::new();
     let mut top = false;
     let mut verdict: Option<Verdict> = None;
@@ -857,6 +1023,14 @@ fn judge(
                 };
                 receivers.push(tf.display.clone());
                 if !tf.prefix_stable {
+                    if !s.is_call {
+                        if let Some(slot) = private_own_slot(m, tf, t, key) {
+                            slots.push(Some(slot));
+                            // This proves one slot, not a fixed full layout.
+                            fixed_shape = false;
+                            continue;
+                        }
+                    }
                     let why = if let Some(e) = &tf.escape {
                         format!("escape: {e}")
                     } else if let Some(h) = &tf.hard {
@@ -880,7 +1054,11 @@ fn judge(
                     continue;
                 }
                 match tf.fields.iter().find(|f| f.key == *key) {
-                    Some(f) if (f.definite || f.declared) && f.data_field && f.slot.is_some() => {
+                    Some(f)
+                        if (f.definite || f.declared || f.reserved)
+                            && f.data_field
+                            && f.slot.is_some() =>
+                    {
                         slots.push(f.slot)
                     }
                     Some(f) if !f.data_field => {
@@ -922,10 +1100,14 @@ fn judge(
     // Birth-site tokens of one template are one receiver layout.
     let mut seen_r: FxHashSet<String> = FxHashSet::default();
     receivers.retain(|r| seen_r.insert(r.clone()));
-    if toks.is_empty() && prim == 0 {
+    // A closed marker names no receiver: its callers' values sit beside it.
+    // With nothing beside it no receiver flows, and a proof names the
+    // receivers it is over (the value-call rule, `callee_set`).
+    let none = toks.iter().all(|&t| m.closed_marker(t));
+    if none && prim == 0 {
         verdict.get_or_insert(Verdict::No("dead site (no receiver flows)".into()));
     }
-    if toks.is_empty() && prim != 0 {
+    if none && prim != 0 {
         verdict.get_or_insert(Verdict::No("primitive receiver".into()));
     }
     let mut targets = FxHashMap::default();

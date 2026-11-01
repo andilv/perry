@@ -91,6 +91,7 @@ impl Drop for EnvVarGuard {
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -151,6 +152,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
@@ -398,9 +400,13 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(1.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::PropertyGet {
+                    byte_end: 0,
                     byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "run".to_string(),
@@ -410,6 +416,7 @@ fn typed_feedback_instruments_property_and_method_boundaries() {
                 byte_offset: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
@@ -508,8 +515,11 @@ fn sloppy_property_set_uses_strictness_aware_put_value() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(1.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
@@ -578,9 +588,13 @@ fn a_default_build_emits_no_typed_feedback_recording_calls() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(1.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::PropertyGet {
+                    byte_end: 0,
                     byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "run".to_string(),
@@ -590,6 +604,7 @@ fn a_default_build_emits_no_typed_feedback_recording_calls() {
                 byte_offset: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
@@ -669,10 +684,13 @@ fn typed_feedback_guards_direct_class_field_specialization() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(7.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::Binary {
                 op: BinaryOp::Sub,
                 left: Box::new(Expr::PropertyGet {
+                    byte_end: 0,
                     byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "x".to_string(),
@@ -765,6 +783,8 @@ fn full_outline_ic_collapses_class_field_set_to_single_call() {
                     object: Box::new(Expr::LocalGet(1)),
                     property: "x".to_string(),
                     value: Box::new(Expr::Number(7.0)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 }),
                 Stmt::Return(Some(Expr::Number(0.0))),
             ],
@@ -809,6 +829,7 @@ fn full_outline_ic_collapses_class_field_get_to_single_call() {
             vec![param(1, "p", Type::Named("Point".to_string()))],
             Type::Number,
             vec![Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "x".to_string(),
@@ -998,6 +1019,8 @@ fn class_field_set_elides_write_barrier_for_nonpointer_value() {
                     object: Box::new(Expr::LocalGet(1)),
                     property: "s".to_string(),
                     value: Box::new(val),
+                    byte_offset: 0,
+                    byte_end: 0,
                 }),
                 Stmt::Return(Some(Expr::Number(0.0))),
             ],
@@ -1057,7 +1080,9 @@ fn typed_feedback_guards_direct_class_method_specialization() {
         vec![param(1, "p", Type::Named("Point".to_string()))],
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "inc".to_string(),
@@ -1120,6 +1145,7 @@ fn synthetic_arguments_only_method_uses_shape_guarded_direct_call() {
         ],
         return_type: Type::Number,
         body: vec![Stmt::Return(Some(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(3)),
             property: "length".to_string(),
             byte_offset: 0,
@@ -1168,7 +1194,9 @@ fn synthetic_arguments_only_method_uses_shape_guarded_direct_call() {
         vec![param(1, "counter", Type::Named("Counter".to_string()))],
         Type::Number,
         vec![Stmt::Return(Some(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "count".to_string(),
                 byte_offset: 0,
@@ -1260,6 +1288,7 @@ fn typed_feedback_guards_direct_closure_call_specialization() {
                 }),
             },
             Stmt::Return(Some(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::LocalGet(2)),
                 args: vec![Expr::Number(9.0)],
                 type_args: Vec::new(),
@@ -1292,8 +1321,12 @@ fn typed_feedback_guards_array_index_specialization() {
                 object: Box::new(Expr::LocalGet(1)),
                 index: Box::new(Expr::Number(0.0)),
                 value: Box::new(Expr::Number(7.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::IndexGet {
+                byte_offset: 0,
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 index: Box::new(Expr::Number(0.0)),
             })),
@@ -1410,6 +1443,8 @@ fn typed_feedback_inline_array_writes_note_numeric_downgrade() {
                 object: Box::new(Expr::LocalGet(2)),
                 index: Box::new(Expr::Number(0.0)),
                 value: Box::new(Expr::String("not-number".to_string())),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::ArrayPush {
                 array_id: 2,
@@ -1434,6 +1469,8 @@ fn typed_feedback_guards_computed_numeric_array_index_hot_path() {
         vec![param(1, "xs", array_ty), param(2, "i", Type::Number)],
         Type::Number,
         vec![Stmt::Return(Some(Expr::IndexGet {
+            byte_offset: 0,
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             index: Box::new(Expr::Binary {
                 op: BinaryOp::BitAnd,
@@ -1470,6 +1507,8 @@ fn profile_replay_selects_numeric_read_with_guard_fallback_and_deterministic_ir(
         vec![param(1, "xs", Type::Array(Box::new(Type::Any)))],
         Type::Any,
         vec![Stmt::Return(Some(Expr::IndexGet {
+            byte_offset: 0,
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             index: Box::new(Expr::Number(0.0)),
         }))],

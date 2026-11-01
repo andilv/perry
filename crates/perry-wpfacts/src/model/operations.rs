@@ -226,6 +226,7 @@ impl Model {
             ctor_fn: None,
             rooted: false,
             deep: false,
+            key_value: None,
         });
         id
     }
@@ -241,6 +242,7 @@ impl Model {
             ctor_fn: None,
             rooted: false,
             deep: false,
+            key_value: None,
         });
         id
     }
@@ -421,6 +423,53 @@ impl Model {
         }
     }
 
+    /// DECISIONS 225: a function's identity across the two analyses of a
+    /// program (its module, HIR id, and for a synthetic context its name).
+    pub fn act_key(&self, f: FnIdx) -> (u32, u32, String) {
+        let fi = &self.funcs[f as usize];
+        let name = if fi.func_id == u32::MAX {
+            fi.name.clone()
+        } else {
+            String::new()
+        };
+        (fi.module, fi.func_id, name)
+    }
+
+    /// DECISIONS 225: `f` can run: a transfer of an active body solved to
+    /// it, or it escaped.
+    pub fn activate(&mut self, f: FnIdx, path: &str) {
+        if self
+            .act
+            .as_ref()
+            .is_none_or(|a| a.fixed || a.sabotage.as_deref() == Some(path))
+            || f as usize >= self.funcs.len()
+        {
+            return;
+        }
+        let k = self.act_key(f);
+        let a = self.act.as_mut().unwrap();
+        if a.on.insert(k) {
+            a.queue.push(f);
+        }
+    }
+
+    /// DECISIONS 225: generation walks the body of `f` (noted once the
+    /// activation set is final).
+    pub fn note_walked(&mut self, f: FnIdx) {
+        if self.act.as_ref().is_some_and(|a| a.fixed) {
+            let k = self.act_key(f);
+            self.act.as_mut().unwrap().walked.insert(k);
+        }
+    }
+
+    /// DECISIONS 225: whether generation walks the body of `f` now.
+    pub fn body_active(&self, f: FnIdx) -> bool {
+        match &self.act {
+            None => true,
+            Some(a) => a.on.contains(&self.act_key(f)),
+        }
+    }
+
     #[inline]
     pub fn is_escaped(&self, t: Tok) -> bool {
         self.esc_bits
@@ -527,6 +576,11 @@ impl Model {
             .and_then(|d| d.get(i as usize))
             .is_some_and(|&d| d);
         if new & MARK_ESCAPE != 0 {
+            if let Some(d) = self.diagnostic.as_mut() {
+                let w = d.esc_ctx.last().cloned().unwrap_or_else(|| "other".into());
+                let n = d.cause_node;
+                d.esc_why.entry(t).or_insert((w, n));
+            }
             self.virt_revoke(t, None);
         }
         if new & MARK_ESCAPE != 0 && !described {
@@ -899,9 +953,11 @@ impl Model {
     /// DECISIONS 165: a method no unit runs (`Gen::published_args`), once
     /// the solve knows it is a method of a published class
     /// (`published_this`): its parameter markers stand for no value.
+    /// DECISIONS 224: so for a function published to a known closed callee
+    /// (`callable_pub`), whose runners publish what they pass as a method's
+    /// do: a run one's described parameters hold that join beside them.
     pub(crate) fn method_described(&self, f: FnIdx) -> Option<&Vec<bool>> {
-        self.published_this
-            .contains_key(&f)
+        (self.published_this.contains_key(&f) || self.callable_pub.contains(&f))
             .then(|| self.method_described.get(&f))
             .flatten()
     }
@@ -1359,6 +1415,7 @@ impl Model {
             birth_keys: Vec::new(),
             definite: Vec::new(),
             declared: Vec::new(),
+            reserved: Vec::new(),
             parent: None,
             ctor: None,
             native_parent: None,
@@ -1368,6 +1425,7 @@ impl Model {
             proto_members: Vec::new(),
             parent_value: None,
             parent_links: Vec::new(),
+            null_proto: false,
         });
         tm
     }
@@ -1393,6 +1451,7 @@ impl Model {
             birth_keys: Vec::new(),
             definite: Vec::new(),
             declared: Vec::new(),
+            reserved: Vec::new(),
             parent: None,
             ctor: None,
             native_parent: None,
@@ -1402,6 +1461,7 @@ impl Model {
             proto_members: Vec::new(),
             parent_value: None,
             parent_links: Vec::new(),
+            null_proto: false,
         });
         let t = self.tok(TokKind::Obj(tm, NO_CTX));
         // What the argument reaches has its own marker (fields of fields

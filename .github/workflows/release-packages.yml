@@ -725,6 +725,7 @@ jobs:
       # It is intentionally a repository variable (not fetched at runtime).
       PERRY_CLI_UPDATE_PUBLIC_KEYS: ${{ vars.PERRY_CLI_UPDATE_PUBLIC_KEYS }}
       PERRY_RELEASE_WASI: ${{ matrix.wasi && needs.build-wasi.outputs.enabled == 'true' && '1' || '0' }}
+      PERRY_RELEASE_WASIP1: ${{ matrix.wasi && needs.build-wasi.outputs.wasip1 == 'true' && '1' || '0' }}
       # Pin the macOS deployment target so bottle object files carry a
       # stable LC_VERSION_MIN / LC_BUILD_VERSION tag regardless of which
       # GitHub runner OS built them. Otherwise users linking against the
@@ -897,10 +898,16 @@ jobs:
         run: |
           ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-runtime -p perry-runtime-static
           ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry-stdlib -p perry-stdlib-static
-          # The WebAssembly host archive, co-built with the archives it links
-          # beside: perry links it for a WebAssembly program and never builds
-          # it while compiling one.
-          ${{ runner.os == 'Windows' && 'cargo' || 'mbx' }} build --profile prod --target ${{ matrix.target }} -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host ${{ matrix.wasi && needs.build-wasi.outputs.enabled == 'true' && '--features perry/target-wasi' || '' }}
+
+      - name: Build WebAssembly host archive (Windows)
+        # The WebAssembly host archive, co-built with the archives it links
+        # beside: perry links it for a WebAssembly program and never builds
+        # it while compiling one. On Unix the native ext step below builds this
+        # same package set (plus every extension) in its one invocation, which
+        # is the build that ships; doing it here too cost a full second
+        # compile of perry + runtime + stdlib under a different feature union.
+        if: runner.os == 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
+        run: cargo build --profile prod --target ${{ matrix.target }} -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host ${{ matrix.wasi && needs.build-wasi.outputs.enabled == 'true' && '--features perry/target-wasi' || '' }}
 
       - name: Build panic=abort runtime variant (Unix)
         # Out-of-tree installs can't rebuild the runtime, so ship the
@@ -925,24 +932,42 @@ jobs:
         # needs the prebuilt `libperry_ext_*.a` sitting next to
         # libperry_runtime.a so `perry compile` can link them without a
         # workspace checkout (see optimized_libs.rs::resolve_prebuilt_ext_libs).
-        # #7358: keep the compiler and both shipped wrapper archives in each
-        # Cargo invocation. Building an ext staticlib alone gives its bundled
-        # runtime/shared dependencies a different feature union from stdlib;
-        # the link deduper then cannot remove the whole second copy, and the
-        # HTTP accept loop reads a different async reactor from the one the JS
-        # event loop drives.
+        # #7358: build the compiler, both shipped wrapper archives and every
+        # extension in ONE Cargo invocation, so they all share one feature
+        # union. Building an ext staticlib with a different union from stdlib
+        # leaves its bundled runtime/shared dependencies a second copy the
+        # link deduper cannot remove, and the HTTP accept loop reads a
+        # different async reactor from the one the JS event loop drives.
+        # One invocation per extension (the former loop) gave every extension
+        # its own union, so each iteration recompiled perry, the runtime and
+        # stdlib (3+ h of the Intel leg) and the shipped archives came from
+        # whichever iteration wrote them last.
         # #5716: the governance inventory is the explicit shipping set; adding
         # a crate requires a recorded retain/migration decision. Best-effort
         # per crate: a wrapper that can't build on this host must not fail the
-        # whole release — packaging below ships whatever was produced.
+        # whole release — packaging below ships whatever was produced. If the
+        # combined build fails, the core set must still build on its own, and
+        # each extension is then retried alone as before.
         if: runner.os != 'Windows' && matrix.old_glibc_image == '' && matrix.musl_image == ''
         run: |
           set -euo pipefail
           governed_ext_packages=$(./scripts/release_ext_packages.sh)
+          ext_args=""
+          while IFS= read -r name; do
+            ext_args="$ext_args -p $name"
+          done <<< "$governed_ext_packages"
+          core_args="-p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host ${{ matrix.wasi && needs.build-wasi.outputs.enabled == 'true' && '--features perry/target-wasi' || '' }}"
+          # shellcheck disable=SC2086 # word splitting is the point
+          if mbx build --keep-going --profile prod --target ${{ matrix.target }} $core_args $ext_args; then
+            exit 0
+          fi
+          echo "::warning::combined ext build failed; building the core alone, then each extension on its own"
+          # shellcheck disable=SC2086
+          mbx build --profile prod --target ${{ matrix.target }} $core_args
           while IFS= read -r name; do
             echo "::group::build $name"
-            mbx build --profile prod --target ${{ matrix.target }} \
-              -p perry -p perry-runtime-static -p perry-stdlib-static -p perry-wasm-host -p "$name" ${{ matrix.wasi && needs.build-wasi.outputs.enabled == 'true' && '--features perry/target-wasi' || '' }} \
+            # shellcheck disable=SC2086
+            mbx build --profile prod --target ${{ matrix.target }} $core_args -p "$name" \
               || echo "  (skipped $name — failed to build on this host)"
             echo "::endgroup::"
           done <<< "$governed_ext_packages"
@@ -1309,6 +1334,12 @@ jobs:
         with:
           name: perry-cross-wasm32-wasip2
           path: wasi-release
+      - name: Download the matching wasip1 runtime
+        if: env.PERRY_RELEASE_WASIP1 == '1'
+        uses: ./.github/actions/perry/actions/download-artifact
+        with:
+          name: perry-cross-wasm32-wasip1
+          path: wasip1-release
       - name: Install the pinned Node oracle for WASI qualification
         if: env.PERRY_RELEASE_WASI == '1'
         uses: ./.github/actions/perry/actions/setup-node
@@ -1347,12 +1378,34 @@ jobs:
           python scripts/wasi_release.py install --revision "$EXPECTED_SHA" \
             --bundle wasi-release/perry-cross-wasm32-wasip2.tar.gz \
             --output "target/${{ matrix.target }}/prod/wasm32-wasip2/release"
+      - name: Qualify the release compiler with its packaged wasip1 runtime
+        if: env.PERRY_RELEASE_WASIP1 == '1'
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.preflight.outputs.checkout-sha }}
+        run: |
+          set -euo pipefail
+          compiler="target/${{ matrix.target }}/prod/perry"
+          if [[ "$RUNNER_OS" == Windows ]]; then compiler="$compiler.exe"; fi
+          python scripts/wasi_release_check.py --compiler "$compiler" --target wasm32-wasip1 \
+            --bundle wasip1-release/perry-cross-wasm32-wasip1.tar.gz --revision "$EXPECTED_SHA" \
+            --output "$RUNNER_TEMP/perry-wasip1-release-validation"
+          python scripts/wasi_release.py install --target wasm32-wasip1 --revision "$EXPECTED_SHA" \
+            --bundle wasip1-release/perry-cross-wasm32-wasip1.tar.gz \
+            --output "target/${{ matrix.target }}/prod/wasm32-wasip1/release"
       - name: Upload packaged WASI qualification evidence
         if: always() && env.PERRY_RELEASE_WASI == '1'
         uses: ./.github/actions/perry/actions/upload-artifact
         with:
           name: wasi-release-validation-${{ matrix.target }}
           path: ${{ runner.temp }}/perry-wasi-release-validation
+          if-no-files-found: warn
+      - name: Upload packaged wasip1 qualification evidence
+        if: always() && env.PERRY_RELEASE_WASIP1 == '1'
+        uses: ./.github/actions/perry/actions/upload-artifact
+        with:
+          name: wasip1-release-validation-${{ matrix.target }}
+          path: ${{ runner.temp }}/perry-wasip1-release-validation
           if-no-files-found: warn
 
       - name: Package release archive (Unix)
@@ -1362,6 +1415,9 @@ jobs:
           cp target/${{ matrix.target }}/prod/perry staging/
           if [[ "$PERRY_RELEASE_WASI" == 1 ]]; then
             cp -R target/${{ matrix.target }}/prod/wasm32-wasip2 staging/
+          fi
+          if [[ "$PERRY_RELEASE_WASIP1" == 1 ]]; then
+            cp -R target/${{ matrix.target }}/prod/wasm32-wasip1 staging/
           fi
           # Include static libraries for linking (runtime, stdlib, UI)
           for lib in libperry_runtime.a libperry_runtime_abort.a libperry_stdlib.a libperry_wasm_host.a libperry_ui_macos.a libperry_ui_gtk4.a; do
@@ -1515,6 +1571,9 @@ jobs:
           Copy-Item $binary staging/
           if ($env:PERRY_RELEASE_WASI -eq "1") {
             Copy-Item -Recurse "target/${{ matrix.target }}/prod/wasm32-wasip2" staging/
+          }
+          if ($env:PERRY_RELEASE_WASIP1 -eq "1") {
+            Copy-Item -Recurse "target/${{ matrix.target }}/prod/wasm32-wasip1" staging/
           }
           Copy-Item $llvmRuntime staging/
           Copy-Item "xwin-install/bin/xwin.exe" staging/
@@ -2398,6 +2457,13 @@ jobs:
         uses: ./.github/actions/perry/actions/download-artifact
         with:
           name: perry-cross-wasm32-wasip2
+          path: assets/
+
+      - name: Download the wasip1 runtime bundle
+        if: needs.build-wasi.outputs.wasip1 == 'true'
+        uses: ./.github/actions/perry/actions/download-artifact
+        with:
+          name: perry-cross-wasm32-wasip1
           path: assets/
 
       - name: Download cross bundles

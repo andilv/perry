@@ -732,6 +732,7 @@ mod tests {
 
     fn anon_shape(class_name: &str, args: Vec<Expr>) -> Expr {
         Expr::New {
+            byte_end: 0,
             class_name: class_name.to_string(),
             args,
             type_args: Vec::new(),
@@ -779,6 +780,7 @@ mod tests {
                 EXPORTS_ID,
                 "exports",
                 Expr::PropertyGet {
+                    byte_end: 0,
                     byte_offset: 0,
                     object: Box::new(Expr::LocalGet(CJS_MODULE_ID)),
                     property: "exports".to_string(),
@@ -796,6 +798,7 @@ mod tests {
             0,
             "_cjs",
             Expr::Call {
+                byte_end: 0,
                 callee: Box::new(closure(2, cjs_region(extra))),
                 args: Vec::new(),
                 type_args: Vec::new(),
@@ -889,6 +892,7 @@ mod tests {
         let inits = [
             anon_shape("__AnonShape_user", Vec::new()),
             Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::LocalGet(77)),
                 args: Vec::new(),
                 type_args: Vec::new(),
@@ -999,8 +1003,11 @@ mod tests {
                 object: Box::new(Expr::LocalGet(POINT_ID)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(1.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(POINT_ID)),
                 property: "x".to_string(),
@@ -1084,6 +1091,8 @@ mod tests {
             value: Box::new(value),
             receiver: Box::new(Expr::LocalGet(REQUIRE_ID)),
             strict: true,
+            byte_offset: 0,
+            byte_end: 0,
         })
     }
 
@@ -1365,6 +1374,8 @@ mod tests {
                 value: Box::new(anon_shape("__AnonShape_user", Vec::new())),
                 receiver: Box::new(Expr::LocalGet(77)),
                 strict: true,
+                byte_offset: 0,
+                byte_end: 0,
             }),
             // A user `let` of an object literal — a real rule-1 candidate.
             let_const(55, "row", anon_shape("__AnonShape_row", Vec::new())),

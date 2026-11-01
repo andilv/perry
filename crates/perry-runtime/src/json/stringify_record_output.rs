@@ -19,7 +19,7 @@ const KEY_PREFIX_CACHE_SLOTS: usize = 8;
 const MAX_KEY_PREFIX_BYTES: usize = 256;
 const MAX_REPEATED_OUTPUT_BYTES: usize = 256;
 const SCALAR_FIELD: u8 = u8::MAX;
-const OBJECT_BYTES: usize = std::mem::size_of::<crate::ObjectHeader>();
+const OBJECT_BYTES: usize = crate::object::header::meta_form_alloc_bytes(0);
 const ARRAY_BYTES: usize = std::mem::size_of::<crate::ArrayHeader>();
 
 #[derive(Clone, Copy)]
@@ -92,18 +92,22 @@ crate::perry_thread_local! {
     /// Stable shape IDs index copied native bytes only. No managed pointer or
     /// value survives a stringify call, so the collector has no cache edge to
     /// trace or rewrite.
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static KEY_PREFIX_CACHE: UnsafeCell<[KeyPrefixPlan; KEY_PREFIX_CACHE_SLOTS]> =
         const { UnsafeCell::new([EMPTY_KEY_PREFIX_PLAN; KEY_PREFIX_CACHE_SLOTS]) };
 
     /// A bounded native copy of the last small record result and exact value
     /// tokens. It retains no managed allocation and needs no GC scanning.
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static REPEATED_OUTPUT: UnsafeCell<RepeatedOutput> =
         const { UnsafeCell::new(EMPTY_REPEATED_OUTPUT) };
 }
 
 #[cfg(test)]
 crate::perry_thread_local! {
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static RECEIVER_PROOF_MISSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static REPEATED_OUTPUT_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -172,7 +176,7 @@ pub(super) unsafe fn try_object(bits: u64) -> Option<JSValue> {
     }
     let obj = (bits & POINTER_MASK) as *const crate::ObjectHeader;
     let header = crate::value::addr_class::try_read_tracked_gc_header(obj as usize)?.as_ref();
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!(header.obj_type)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & crate::gc::OBJ_FLAG_HAS_DESCRIPTORS != 0
         || (header.size as usize) < crate::gc::GC_HEADER_SIZE + OBJECT_BYTES

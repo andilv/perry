@@ -31,6 +31,8 @@ pub(crate) use uses_this::{closure_uses_new_target, closure_uses_this, uses_this
 pub mod fn_infer;
 #[cfg(test)]
 mod fn_infer_tests;
+mod numeric_order;
+pub use numeric_order::{numeric_order_with, pure_numeric_order, NumericCallable, NumericOrder};
 mod value_types;
 pub(crate) use value_types::coalesce_type;
 pub use value_types::{infer_expr_type, infer_refinable_expr_type, HirTypeEnv, HirTypeFacts};
@@ -826,6 +828,8 @@ fn remap_with_propagation(
                 object: Box::new(Expr::This),
                 property,
                 value,
+                byte_offset: 0,
+                byte_end: 0,
             },
             CaptureWriteTarget::Env {
                 class_name,
@@ -1175,7 +1179,7 @@ fn replace_this_in_expr(expr: &mut Expr, this_id: LocalId) {
             replace_this_in_expr(value, this_id);
         }
         Expr::PropertyUpdate { object, .. } => replace_this_in_expr(object, this_id),
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index, .. } => {
             replace_this_in_expr(object, this_id);
             replace_this_in_expr(index, this_id);
         }
@@ -1183,6 +1187,7 @@ fn replace_this_in_expr(expr: &mut Expr, this_id: LocalId) {
             object,
             index,
             value,
+            ..
         } => {
             replace_this_in_expr(object, this_id);
             replace_this_in_expr(index, this_id);

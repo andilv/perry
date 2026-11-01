@@ -355,7 +355,11 @@ impl LlModule {
     /// varargs — the symbol is only ever *named* on define lines and in the
     /// unwind tables; generated code never calls it.
     pub fn declare_personality(&mut self) {
-        let name = "perry_eh_personality";
+        let name = if self.target_triple.starts_with("wasm32") {
+            "__gxx_wasm_personality_v0"
+        } else {
+            "perry_eh_personality"
+        };
         if self.declared_names.insert(name.to_string()) {
             self.declarations
                 .push((name.to_string(), format!("declare i32 @{name}(...)")));
@@ -466,7 +470,9 @@ impl LlModule {
     /// reflected function objects run shared runtime thunks and still use the
     /// copying/borrowing registry path in `string_pool`.
     pub(crate) fn can_attach_fn_source(&self, body: &str) -> bool {
-        self.function_named(body).is_some_and(is_js_body)
+        // The source planner includes method entries emitted after string
+        // preparation. Their canonical infos are rendered after all bodies.
+        !body.is_empty()
     }
 
     /// A body whose retained text was dropped (no execution reads it) keeps
@@ -491,10 +497,7 @@ impl LlModule {
         byte_len: usize,
         is_non_strict_ordinary: bool,
     ) -> bool {
-        let Some(function) = self.function_named(body) else {
-            return false;
-        };
-        if !is_js_body(function) {
+        if body.is_empty() {
             return false;
         }
         self.fn_infos
@@ -520,6 +523,7 @@ impl LlModule {
     /// may allocate; an `external` declaration for every allocated body
     /// another module defines. Runs once, after every function exists.
     pub(crate) fn emit_fn_infos(&mut self, permanent_image: bool) {
+        self.emit_function_metadata_owner();
         let exported: Vec<String> = self
             .functions
             .iter()
@@ -562,6 +566,70 @@ impl LlModule {
             )
         };
         self.globals.extend(lines);
+    }
+
+    pub(crate) fn function_metadata_owner_symbol(&self) -> String {
+        format!("__perry_function_metadata_{}", self.symbol_prefix)
+    }
+
+    fn emit_function_metadata_owner(&mut self) {
+        let owner = self.function_metadata_owner_symbol();
+        // entry_bodies is a BTreeSet union: ordinals precede link layout and
+        // never depend on hash iteration, text lengths, or reflection order.
+        let exported: Vec<_> = self
+            .functions
+            .iter()
+            .filter(|f| {
+                f.linkage.is_empty() && f.name.starts_with("__perry_wrap_") && is_js_body(f)
+            })
+            .map(|f| f.name.clone())
+            .collect();
+        let bodies: Vec<_> = self
+            .fn_infos
+            .borrow()
+            .entry_bodies(&exported)
+            .into_iter()
+            .filter(|body| self.has_function(body))
+            .collect();
+        // The bodies the runtime names in a stack trace (a published info
+        // with a non-empty name) are the JS text section's functions.
+        let named: std::collections::HashSet<&str> = bodies
+            .iter()
+            .filter(|b| {
+                self.fn_infos
+                    .borrow()
+                    .facts(b)
+                    .name
+                    .as_ref()
+                    .is_some_and(|n| n.byte_len > 0)
+            })
+            .map(String::as_str)
+            .collect();
+        for function in &mut self.functions {
+            function.js_text = named.contains(function.name.as_str());
+        }
+        if bodies.is_empty() {
+            // Publishing an empty descriptor cannot make any metadata visible.
+            // Omit the dead registration at the same final inventory boundary.
+            for function in &mut self.functions {
+                for block in function.blocks_mut() {
+                    block.insts_mut().retain(|inst| !matches!(inst, crate::inst::LlInst::Call { callee, .. } if callee == "js_register_function_metadata"));
+                }
+            }
+        }
+        let entries = format!("{owner}_entries");
+        let values: Vec<_> = bodies.iter().enumerate().map(|(ordinal, body)| {
+            self.note_fn_info(body, |f| f.metadata = Some((owner.clone(), ordinal as u32)));
+            format!("i32 trunc (i64 sub (i64 ptrtoint (ptr @{} to i64), i64 ptrtoint (ptr @{entries} to i64)) to i32)", crate::fn_info::info_symbol(body))
+        }).collect();
+        self.add_raw_global(format!(
+            "@{entries} = private constant [{} x i32] [{}], align 4",
+            bodies.len(),
+            values.join(", ")
+        ));
+        // One writable word per image; no per-function mutable allocation.
+        // The first two fields are immutable descriptor operands.
+        self.add_raw_global(format!("@{owner} = internal global {{ ptr, i32, i32, ptr }} {{ ptr @{entries}, i32 {}, i32 0, ptr null }}", bodies.len()));
     }
 
     /// A defined function by symbol name.
@@ -813,9 +881,10 @@ impl LlModule {
 
     /// Fold the entire same-named weak data definition, including its section
     /// bytes. Mach-O already coalesces weak symbols at subsection boundaries;
-    /// Wasm uses its separate image inventory. ELF and COFF need a COMDAT.
+    /// ELF, COFF and Wasm need a COMDAT: resolving weak symbol references
+    /// alone leaves duplicate bytes in a mixed live section.
     pub(crate) fn add_coalesced_global(&mut self, name: &str, mut line: String) {
-        if !self.target_triple.contains("apple") && !self.target_triple.contains("wasm") {
+        if !self.target_triple.contains("apple") {
             self.comdat_globals.insert(format!("@{name}"));
             line.push_str(&format!(", comdat(${name})"));
         }
@@ -826,6 +895,16 @@ impl LlModule {
         if let Some((name, rhs)) = line.split_once(" = ") {
             if self.comdat_globals.contains(name) && !rhs.starts_with("external ") {
                 ir.push_str(&format!("${} = comdat any\n", &name[1..]));
+                // Wasm section bounds do not keep otherwise-unreferenced
+                // COMDAT atoms. Iteration is a real use; this directive marks
+                // the resolved symbol live without adding linear-memory data.
+                if self.target_triple.contains("wasm")
+                    && rhs
+                        .split_once(", section \"")
+                        .is_some_and(|(_, attrs)| attrs.starts_with("perry_atoms\""))
+                {
+                    ir.push_str(&format!("module asm \".no_dead_strip {}\"\n", &name[1..]));
+                }
                 // COFF section bounds do not retain unreferenced COMDATs.
                 // Atom iteration is a real use: retain one resolved symbol
                 // with a linker directive, without adding runtime data.

@@ -34,6 +34,7 @@ use perry_hir::{Expr, Function, Module, ModuleInitKind, Stmt};
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -94,6 +95,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
@@ -300,6 +302,8 @@ fn persistent_index_alias_shadow_module() -> Module {
                     ty: Type::Any,
                     mutable: false,
                     init: Some(Expr::IndexGet {
+                        byte_offset: 0,
+                        byte_end: 0,
                         object: Box::new(Expr::LocalGet(21)),
                         index: Box::new(Expr::Integer(0)),
                     }),
@@ -346,6 +350,8 @@ fn flat_const_row_alias_shadow_module() -> Module {
                 ty: Type::Any,
                 mutable: false,
                 init: Some(Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(30)),
                     index: Box::new(Expr::Integer(0)),
                 }),
@@ -356,6 +362,8 @@ fn flat_const_row_alias_shadow_module() -> Module {
                 ty: Type::Any,
                 mutable: false,
                 init: Some(Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(31)),
                     index: Box::new(Expr::Integer(1)),
                 }),
@@ -1193,6 +1201,7 @@ fn canonical_str_shadow_module() -> Module {
                 },
                 // src.length — the canonical `.length` tag dispatch.
                 Stmt::Return(Some(Expr::PropertyGet {
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(2)),
                     property: "length".to_string(),
                     byte_offset: 0,

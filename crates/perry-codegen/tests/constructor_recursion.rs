@@ -4,6 +4,7 @@ use perry_hir::{Class, Expr, Function, Module, ModuleInitKind, Param, Stmt};
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -64,6 +65,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
@@ -96,6 +98,7 @@ fn module_with_recursive_constructor_return() -> Module {
         body: vec![Stmt::If {
             condition: Expr::Bool(false),
             then_branch: vec![Stmt::Return(Some(Expr::New {
+                byte_end: 0,
                 class_name: "RecursiveCtor".to_string(),
                 args: vec![Expr::Bool(false), Expr::LocalGet(11)],
                 type_args: Vec::new(),
@@ -154,6 +157,7 @@ fn module_with_recursive_constructor_return() -> Module {
         annexb_global_undefined_names: Vec::new(),
         init_is_strict: false,
         init: vec![Stmt::Expr(Expr::New {
+            byte_end: 0,
             class_name: "RecursiveCtor".to_string(),
             args: vec![Expr::Bool(true), Expr::Undefined],
             type_args: Vec::new(),

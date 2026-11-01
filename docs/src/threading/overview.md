@@ -193,6 +193,63 @@ Values crossing thread boundaries are serialized to a thread-safe intermediate f
 
 For numeric workloads — the most common parallelizable tasks — the threading overhead is negligible.
 
+## Node.js Worker Constructor Compatibility
+
+For `node:worker_threads`, a truthy `Worker` `name` must be a string; invalid
+names throw `TypeError` with `ERR_INVALID_ARG_TYPE` before transferring data.
+Falsy names use the default. `transferList` is validated even when `workerData`
+is undefined, and listed ArrayBuffers are detached after a successful clone
+whether or not the data references them.
+
+`setEnvironmentData` retains the caller's value until it is replaced or deleted
+by setting `undefined`. A new worker receives a creation-time clone of that map
+alongside `workerData`; shared references and cycles are preserved within this
+snapshot, while later parent changes remain local. Captured namespace methods
+and CommonJS imports use the same storage as named imports. If cloning either
+data source fails, construction throws before transferring any buffers.
+Clone and transfer marks are private, thread-local identity metadata, not object
+properties. Primitive marks are ignored. Clone marks reject ordinary objects and
+Errors in both global `structuredClone` and worker messages; builtin clone kinds
+such as arrays, Maps, Sets and buffers retain their own serialization behavior.
+Marked transfer buffers are rejected without detachment. The marker table does
+not keep its targets alive.
+Inside a Node-compatible Worker, process-wide mutations such as `abort`, `chdir`,
+credential setters, IPC send/disconnect and setting `umask` are rejected before
+OS effects. IPC members remain absent unless enabled by the Worker startup
+environment. Disabled process callables expose `disabled === true`; reading
+`umask` remains allowed. Worker title writes remain local to the existing title
+value, and mutable CommonJS/default reads observe the updated title. Named ESM
+title imports remain a known parity limitation.
+Worker eval source must be a primitive string. A URL with truthy `eval` throws
+before reading workerData or detaching buffers; ordinary file URLs use the same
+registered entry table as dynamically selected files. Literal string eval remains
+compiled ahead of time; dynamically generated source is still unsupported.
+Worker `argv` values are converted in constructor order and installed in the
+child's existing process-argv authority, after execPath and the Worker entry name.
+MessagePort and BroadcastChannel property reads return stored values without
+invoking handlers; method calls retain their receiver through ordinary property lookup.
+Message methods accept transfer iterables directly or through `options.transfer`.
+The complete sequence is consumed before transfer entries are validated; iterator
+errors retain their identity, and rejection leaves ArrayBuffers attached.
+BroadcastChannel ignores its extra argument. Worker constructor transfer admission
+remains separate; MessagePort endpoint movement and direct-message routing/timeout
+parity are not provided by this normalization.
+Main-thread `postMessageToThread` rejects missing or stopped destinations before
+cloning the payload or detaching transfer buffers. Worker-origin messages retain
+Node's forwarding order: cloning precedes destination rejection. Admission does
+not guarantee rollback if a destination exits concurrently after it was admitted.
+Core-module messaging constructor exports retain the original thread-realm
+MessageChannel, MessagePort and BroadcastChannel objects even after global
+reassignment. Explicit CommonJS export overrides and named-export synchronization
+remain separate; vm/eval global population does not replace these thread-core values.
+MessagePort core methods (`postMessage`, `start`, `close`, `ref`, `unref`,
+`hasRef`) operate on their actual receiver, including calls borrowed from another
+port or its prototype. A private ID supplies the brand without observable getters
+or proxy traps; closing a port preserves its brand without retaining a closed
+runtime port in the delivery table. Listener methods and realm movement remain
+separate parity work.
+Other worker API parity gaps remain.
+
 ## Next Steps
 
 - [parallelMap Reference](parallel-map.md) — detailed API and performance tips

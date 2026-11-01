@@ -23,6 +23,7 @@ mod flat_clone;
 mod forwarding;
 mod from_concat;
 mod generic;
+pub(crate) use generic::{al_get as arraylike_get, al_length as arraylike_length};
 mod generic_copy;
 pub use self::generic_copy::{js_arraylike_toReversed, js_arraylike_toSorted, js_arraylike_with};
 #[cfg(test)]
@@ -73,6 +74,8 @@ mod shift_queue_tests;
 #[cfg(test)]
 mod small_capacity_tests;
 mod sort;
+mod sort_numeric;
+pub use sort_numeric::{js_array_sort_key_order, js_array_sort_numeric_order};
 mod species;
 mod splice_slice;
 mod storage;
@@ -83,6 +86,7 @@ pub use storage::array_elements_ptr;
 pub(crate) use storage::{array_front_offset, array_physical_capacity, array_truncate_length};
 mod subclass;
 pub(crate) mod subclass_elements;
+pub(crate) mod subclass_init;
 
 #[cfg(test)]
 mod callback_rooting_tests;
@@ -127,7 +131,7 @@ pub(crate) use self::alloc::{
 pub use self::alloc::{
     js_array_alloc, js_array_alloc_literal, js_array_alloc_with_length,
     js_array_alloc_with_length_longlived, js_array_constructor_single, js_array_create,
-    js_array_from_arraylike_holey_value, js_array_from_f64,
+    js_array_from_arraylike_holey_value, js_array_from_f64, realm_array_alloc, realm_string_array,
 };
 pub(crate) use self::buffer_receiver::{
     buffer_receiver_dispatch, callback_arg, dispatch_result_as_array,
@@ -248,6 +252,8 @@ pub use self::iterator::{
     js_iterator_to_array,
 };
 pub use self::join::{js_array_join, js_array_join_value};
+/// The element kind a realm array birth declares.
+pub use perry_abi::realm_header::ArrayElements;
 
 pub use self::numeric_range::{
     js_array_fill_range_strided_tagged, js_array_numeric_range_add, js_array_numeric_range_add_len,
@@ -383,3 +389,6 @@ pub(crate) use iterator_method::array_shape_iterator;
 pub(crate) use iterator_step::js_array_record_iterator_at;
 #[cfg(test)]
 mod fill_descriptor_tests;
+
+mod refresh_head;
+pub use refresh_head::js_array_refresh_local_head;

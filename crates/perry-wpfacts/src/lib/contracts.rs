@@ -114,7 +114,7 @@ pub(super) fn literal_field_fns(
         let fcs = fs
             .into_iter()
             .map(|(f, ft)| match g.stand_in_fc.get(&ft) {
-                Some(&c) if g.m.funcs[f as usize].func_id == u32::MAX => c.clone(),
+                Some(&c) if g.m.funcs[f as usize].func_id == u32::MAX => forwarded_fn(g, c),
                 _ => fn_contract_of(g, templates, f, layouts_out, open_tm),
             })
             .collect();
@@ -261,8 +261,11 @@ pub(super) fn nested_layouts(
                     // (DECISIONS 101).
                     birth_keys: atoms_of(g, &g.m.tmpls[itm as usize].birth_keys),
                     definite: atoms_of(g, &g.m.tmpls[itm as usize].definite),
+                    reserved: atoms_of(g, &g.m.tmpls[itm as usize].reserved),
                     ctor_leaks: true,
+                    ctor_returns: g.chain_returns(itm),
                     binding_prim: 0,
+                    fn_inst: false,
                 });
                 let nl = nested_layouts(g, templates, itm, layouts_out, open_tm);
                 let fv = field_value_contracts(g, templates, itm, layouts_out, open_tm);
@@ -353,6 +356,32 @@ pub(super) fn atoms_of(g: &gen::Gen, ks: &[model::Atom]) -> Vec<String> {
     ks.iter().map(|&a| g.m.atoms[a as usize].clone()).collect()
 }
 
+fn compiled_body_of(g: &gen::Gen, f: model::FnIdx) -> Option<(String, u32, bool)> {
+    let fi = &g.m.funcs[f as usize];
+    if fi.func_id == u32::MAX {
+        return g.stand_in_fc.get(&fi.token)?.compiled_body.clone();
+    }
+    let closure = g.m.closures.contains(&f);
+    (closure || g.m.decls.contains(&f)).then(|| {
+        (
+            g.modules[fi.module as usize].0.to_owned(),
+            fi.func_id,
+            closure,
+        )
+    })
+}
+
+/// Another unit's function `fc` (a stand-in's contract) as this unit
+/// forwards it: whole, with the functions described inside it that have an
+/// owner's entry named (`units::name_owned_in_fn`, DECISIONS 106).
+pub(super) fn forwarded_fn(g: &gen::Gen, fc: &units::FnContract) -> units::FnContract {
+    let mut c = fc.clone();
+    if let Some(u) = g.unit_in {
+        units::name_owned_in_fn(&mut c, &|n| u.own_fn(n).is_some());
+    }
+    c
+}
+
 pub(super) fn fn_contract_of(
     g: &gen::Gen,
     templates: &[TemplateFacts],
@@ -388,10 +417,15 @@ pub(super) fn fn_contract_of(
     // effects) covers what this body does to it; the marker stands for
     // nothing, so no direct escape is published. What it reaches keeps
     // its uses. DECISIONS 148: a published method's parameter the running
-    // units describe (`Model::method_params`) the same way.
+    // units describe (`Model::method_params`) the same way. DECISIONS 224:
+    // so a function published to a known closed callee, also before any
+    // unit runs it (DECISIONS 165: its markers stand for nothing): a
+    // runner's value reaches it through the argument join, as a stand-in
+    // whose census covers what this body does to it. Unknown at a position
+    // (a runner passes what no contract describes), the marker keeps its
+    // uses.
     let described = g.m.closed_described.get(&f).or_else(|| {
-        g.m.method_params
-            .contains_key(&f)
+        (g.m.method_params.contains_key(&f) || g.m.callable_pub.contains(&f))
             .then(|| g.m.method_described.get(&f))
             .flatten()
     });
@@ -617,7 +651,10 @@ pub(super) fn fn_contract_of(
         .map(|(_, i, k)| (*i, k.clone()))
         .collect();
     units::FnContract {
+        compiled_body: compiled_body_of(g, f),
         method: g.m.published_this.contains_key(&f),
+        callable: g.m.callable_pub.contains(&f),
+        this_class: this_class(g, f),
         this_use,
         this_reach,
         this_stores,
@@ -679,12 +716,27 @@ pub(super) fn unnamed_methods(m: &model::Model) -> impl Iterator<Item = model::F
         )
 }
 
+/// DECISIONS 212: the one published class whose instances method `f` runs
+/// on (its contract receivers, `Model::published_this`), by display.
+fn this_class(g: &gen::Gen, f: model::FnIdx) -> Option<String> {
+    let rs = g.m.published_this.get(&f)?;
+    let mut ds = rs
+        .iter()
+        .filter_map(|r| g.m.recv_class.get(r))
+        .map(|&tm| g.m.tmpls[tm as usize].display.clone());
+    let d = ds.next()?;
+    ds.all(|x| x == d).then_some(d)
+}
+
 pub(super) fn fn_named(g: &gen::Gen, f: model::FnIdx) -> units::FnContract {
     let fi = &g.m.funcs[f as usize];
     let n = fi.params.len();
     let (name, closed) = fn_contract_name(g, f);
     units::FnContract {
+        compiled_body: compiled_body_of(g, f),
         method: g.m.published_this.contains_key(&f),
+        callable: g.m.callable_pub.contains(&f),
+        this_class: this_class(g, f),
         name,
         closed,
         params: vec![model::MARK_ESCAPE; n],
@@ -879,7 +931,36 @@ pub(super) fn describe_nodes(
                 }
                 toks.extend(g.m.marker_members(t));
             }
+            // DEC189 applies to described results/callback arguments too:
+            // an escaped concrete value beside TOP is subsumed by TOP,
+            // independently of which reached this node first. Keep every
+            // marker and actual TOP, and retain private/known-only values.
+            // A function of this unit published through its contract only
+            // (an export, a published field, a contract result: DECISIONS
+            // 147/210) is not held by unknown code: the reader calls it
+            // through that contract and any other use is its census report
+            // (DECISIONS 209). Subsumed, the reader would hold it as ⊤ and
+            // report nothing while its owner reads it as published.
+            let unknown = toks.iter().any(|&t| {
+                matches!(
+                    g.m.toks[t as usize],
+                    model::TokKind::Top | model::TokKind::BuiltinFn
+                ) || g.m.marker_is_top(t)
+            });
+            let contract_only = |t: model::Tok| match g.m.toks[t as usize] {
+                model::TokKind::Func(f, _) => {
+                    g.m.funcs[f as usize].func_id != u32::MAX
+                        && g.m.contract_fns.contains(&f)
+                        && g.m.escaped.get(&t).is_some_and(|&r| {
+                            Some(r) == g.m.pub_reason || Some(r) == g.m.field_fn_reason
+                        })
+                }
+                _ => false,
+            };
             for t in toks {
+                if unknown && g.m.top_beside(t) && !contract_only(t) {
+                    continue;
+                }
                 // An escaped marker reads as ⊤ (DECISIONS 42).
                 if matches!(
                     g.m.toks[t as usize],
@@ -920,7 +1001,7 @@ pub(super) fn describe_nodes(
                 // stand-in contract.
                 if let model::TokKind::Func(f2, _) = g.m.toks[t as usize] {
                     let fc = match g.stand_in_fc.get(&t) {
-                        Some(&fc) => fc.clone(),
+                        Some(&fc) => forwarded_fn(g, fc),
                         None if g.m.funcs[f2 as usize].func_id != u32::MAX => fn_named(g, f2),
                         None => {
                             ret_unknown = true;
@@ -1018,8 +1099,11 @@ pub(super) fn describe_nodes(
                             // (DECISIONS 101).
                             birth_keys: atoms_of(g, &g.m.tmpls[tm as usize].birth_keys),
                             definite: atoms_of(g, &g.m.tmpls[tm as usize].definite),
+                            reserved: atoms_of(g, &g.m.tmpls[tm as usize].reserved),
                             ctor_leaks: true,
+                            ctor_returns: g.chain_returns(tm),
                             binding_prim: 0,
+                            fn_inst: false,
                         });
                         let nl = nested_layouts(g, templates, tm, layouts_out, open_tm);
                         let fv = field_value_contracts(g, templates, tm, layouts_out, open_tm);
@@ -1236,9 +1320,23 @@ pub(super) fn describe_toks(
                 vc.shared.push(s);
             }
         }
+        if let Some((tm, kind)) = crate::bindings::sealed_owner(&g.m, t) {
+            let d = g.m.tmpls[tm as usize].display.clone();
+            if !g.unit_in.is_some_and(|u| u.broken(&format!("owner:{d}"))) {
+                vc.indexed_owners.push(crate::bindings::IndexedOwner {
+                    kind,
+                    min_len: *g.m.ta_min_len.get(&tm).unwrap_or(&0),
+                    exact_len: g.m.ta_exact_len.get(&tm).copied(),
+                    allocations: vec![d],
+                });
+                vc.indexed_owners.sort();
+                vc.indexed_owners.dedup();
+                continue;
+            }
+        }
         let (tm, class) = match g.m.toks[t as usize] {
             model::TokKind::Top | model::TokKind::BuiltinFn => {
-                vc.unknown = true;
+                vc.unknown_because("top-value");
                 continue;
             }
             model::TokKind::Builtin(ns) => {
@@ -1272,7 +1370,7 @@ pub(super) fn describe_toks(
             model::TokKind::Func(f, _)
                 if g.m.funcs[f as usize].func_id != u32::MAX && !g.m.contract_fns.contains(&f) =>
             {
-                vc.unknown = true;
+                vc.unknown_because("escaped-function-without-contract");
                 continue;
             }
             model::TokKind::Func(f, _) if g.m.funcs[f as usize].func_id != u32::MAX => {
@@ -1286,7 +1384,7 @@ pub(super) fn describe_toks(
             _ => {
                 if let Some(&fc) = g.stand_in_fc.get(&t) {
                     if !vc.fns.iter().any(|c| c.name == fc.name) {
-                        vc.fns.push(fc.clone());
+                        vc.fns.push(forwarded_fn(g, fc));
                     }
                 }
                 continue;
@@ -1348,12 +1446,15 @@ pub(super) fn describe_toks(
                     // (DECISIONS 101).
                     birth_keys: atoms_of(g, &g.m.tmpls[tm as usize].birth_keys),
                     definite: atoms_of(g, &g.m.tmpls[tm as usize].definite),
+                    reserved: atoms_of(g, &g.m.tmpls[tm as usize].reserved),
                     ctor_leaks: true,
+                    ctor_returns: g.chain_returns(tm),
                     binding_prim: 0,
+                    fn_inst: false,
                 })
             });
         let Some(mut cc) = cc else {
-            vc.unknown = true;
+            vc.unknown_because("class-without-contract");
             continue;
         };
         if g.stand_in_cc.contains_key(&tm) {
@@ -1396,14 +1497,31 @@ pub(super) fn describe_toks(
                 }
                 None => {
                     layouts_out.push(cc.clone());
-                    if let Some(d) = g.describing.borrow_mut().as_mut() {
-                        d.push(cc.display.clone());
-                    }
                     cc.field_fns =
                         literal_field_fns(&g, templates, &toks, tm, layouts_out, open_tm);
                     cc.field_layouts = nested_layouts(g, templates, tm, layouts_out, open_tm);
                     cc.field_values = field_value_contracts(g, templates, tm, layouts_out, open_tm);
                     cc.field_tas = field_ta_contracts(g, tm);
+                    // A literal layout of this unit goes out under its
+                    // display, described: the owner's entry, which a reader
+                    // takes over any copy (`Gen::other_layout`, DECISIONS 106;
+                    // a class goes out as DECISIONS 132 says). Without it the
+                    // only entry is a forwarder's copy of an earlier round,
+                    // which the forwarder itself reads back and forwards again.
+                    match cc.literal_shape {
+                        true => {
+                            if let Some(e) =
+                                layouts_out.iter_mut().find(|c| c.display == cc.display)
+                            {
+                                *e = cc.clone();
+                            }
+                        }
+                        false => {
+                            if let Some(d) = g.describing.borrow_mut().as_mut() {
+                                d.push(cc.display.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1418,6 +1536,110 @@ pub(super) fn describe_toks(
     }
     vc.shared.sort();
     vc
+}
+
+/// DECISIONS 210: the layout of constructor function `f`'s instances (its
+/// `new <f>` template `tm`) as the units constructing it hold it: its
+/// facts, the methods on its prototype (contract functions among them with
+/// their contracts) and the function's own contract as the constructor. A
+/// prototype that is not the function's own (`f.prototype = ...`) or holds
+/// anything but one function of this unit under a key leaves the keys
+/// open: a reader finds unknown values there.
+pub(super) fn fn_inst_contract(
+    g: &gen::Gen,
+    templates: &[TemplateFacts],
+    f: model::FnIdx,
+    tm: model::TmplId,
+    layouts_out: &mut Vec<units::ClassContract>,
+    open_tm: &pts::FxHashSet<model::TmplId>,
+) -> Option<units::ClassContract> {
+    let facts = templates.iter().find(|t| t.id == tm)?.clone();
+    let m = &g.m;
+    let fi = &m.funcs[f as usize];
+    let proto = m.tok_index.get(&model::TokKind::Proto(tm)).copied();
+    let pa = m.atoms.iter().position(|x| x == "prototype");
+    let ca = m.atoms.iter().position(|x| x == "constructor");
+    let pf = pa.and_then(|a| m.fields.get(&(fi.token, a as model::Atom)).copied());
+    let mut open = pf.is_some_and(|n| {
+        let node = &m.nodes[n as usize];
+        node.prim != 0 || node.pts.to_sorted().iter().any(|&p| Some(p) != proto)
+    });
+    let mut methods: Vec<(String, String)> = Vec::new();
+    let mut method_fns: Vec<(String, units::FnContract)> = Vec::new();
+    if let Some(proto) = proto {
+        let mut own: Vec<(model::Atom, model::NodeId)> = m
+            .field_keys
+            .get(&proto)
+            .into_iter()
+            .flatten()
+            .filter(|&&k| Some(k as usize) != ca)
+            .map(|&k| (k, m.fields[&(proto, k)]))
+            .collect();
+        own.sort_unstable();
+        for (k, n) in own {
+            let node = &m.nodes[n as usize];
+            let ts = node.pts.to_sorted();
+            let fx = ts.first().map(|&t| m.tok_fn(t));
+            match fx {
+                Some(fx)
+                    if ts.len() == 1
+                        && node.prim == 0
+                        && fx != model::NO_FN
+                        && m.funcs[fx as usize].func_id != u32::MAX =>
+                {
+                    let key = m.atoms[k as usize].clone();
+                    methods.push((key.clone(), m.funcs[fx as usize].name.clone()));
+                    if m.contract_fns.contains(&fx) {
+                        method_fns
+                            .push((key, fn_contract_of(g, templates, fx, layouts_out, open_tm)));
+                    }
+                }
+                // A key read through the chain but never written (a lookup
+                // of an own field misses here): no member.
+                _ if ts.is_empty() && node.prim == 0 => {}
+                _ => open = true,
+            }
+        }
+        // Any key: open when something wrote one (a read under an unknown
+        // key leaves the node empty).
+        if let Some(&n) = m.field_any.get(&proto) {
+            let node = &m.nodes[n as usize];
+            if node.prim != 0 || !node.pts.is_empty() {
+                open = true;
+            }
+        }
+    }
+    let tpl = &m.tmpls[tm as usize];
+    Some(units::ClassContract {
+        display: tpl.display.clone(),
+        name: fi.name.clone(),
+        class_id: 0,
+        literal_shape: false,
+        facts,
+        methods,
+        native_parent: None,
+        parent: None,
+        field_fns: Vec::new(),
+        field_layouts: nested_layouts(g, templates, tm, layouts_out, open_tm),
+        field_values: field_value_contracts(g, templates, tm, layouts_out, open_tm),
+        field_tas: field_ta_contracts(g, tm),
+        open_keys: open_tm.contains(&tm) || open,
+        statics: Vec::new(),
+        statics_open: false,
+        static_fns: Vec::new(),
+        static_values: Vec::new(),
+        closed: None,
+        forwards: false,
+        method_fns,
+        ctor_fn: Some(fn_contract_of(g, templates, f, layouts_out, open_tm)),
+        birth_keys: atoms_of(g, &tpl.birth_keys),
+        definite: atoms_of(g, &tpl.definite),
+        reserved: atoms_of(g, &tpl.reserved),
+        ctor_leaks: true,
+        ctor_returns: m.ctor_returns_object(f),
+        binding_prim: 0,
+        fn_inst: true,
+    })
 }
 
 /// DECISIONS 152: `t` is what an argument marker reaches (its reach, or
@@ -1502,7 +1724,7 @@ pub(super) fn arg_contract_of(
             // value no contract describes here (as a parameter marker's
             // reach is), not as nothing.
             if toks.iter().any(|&t| arg_reach_unknown(g, t)) {
-                vc.unknown = true;
+                vc.unknown_because("argument-marker-reach");
                 vc.prim |= model::prim::ALL;
             }
             for t in toks.into_iter().flat_map(|t| g.m.marker_members(t)) {
@@ -1525,31 +1747,60 @@ pub(super) fn arg_contract_of(
                 if let model::TokKind::Func(f, _) = g.m.toks[t as usize] {
                     match g.stand_in_fc.get(&t) {
                         Some(&fc) if !vc.fns.iter().any(|c| c.name == fc.name) => {
-                            vc.fns.push(fc.clone())
+                            vc.fns.push(forwarded_fn(g, fc))
                         }
                         Some(_) => {}
-                        // This unit's closed function published through its
-                        // closed contract (decision 23): its markers carry
-                        // the body's uses; the callee publishes its calls.
-                        // Markers and parameters are the function's, so one
-                        // published token (another context's) covers it.
-                        None if g.m.closed_params.contains_key(&f)
-                            && g.m.contract_fns.contains(&f)
-                            && g.m.closed_pub.iter().any(|&u| g.m.tok_fn(u) == f) =>
+                        // Its closed publication (23), or a valid normal
+                        // publication of an owned callable (223). The latter
+                        // does not close its entry or erase any actual TOP.
+                        // A non-publication escape remains undescribed here.
+                        None if g.m.contract_fns.contains(&f)
+                            && (g.m.closed_params.contains_key(&f)
+                                && g.m.closed_pub.iter().any(|&u| g.m.tok_fn(u) == f)
+                                // DEC223: ordinary publication proves callable
+                                // identity, while its unclosed entry stays generic.
+                                || g.m.escaped.get(&t).is_some_and(|r| {
+                                    Some(*r) == g.m.pub_reason
+                                        || Some(*r) == g.m.field_fn_reason
+                                })) =>
                         {
                             let fc = fn_contract_of(g, templates, f, layouts_out, open_tm);
                             if !vc.fns.iter().any(|c| c.name == fc.name) {
                                 vc.fns.push(fc);
                             }
                         }
-                        None => vc.unknown = true,
+                        None => vc.unknown_because("function-without-publication"),
                     }
                     continue;
                 }
                 let model::TokKind::Obj(tm, _) = g.m.toks[t as usize] else {
-                    vc.unknown = true;
+                    vc.unknown_because(match g.m.toks[t as usize] {
+                        model::TokKind::Top | model::TokKind::BuiltinFn => "top-argument",
+                        model::TokKind::Bound(_) => "bound-function-argument",
+                        model::TokKind::ClassObj(_) => "class-constructor-argument",
+                        model::TokKind::Proto(_)
+                        | model::TokKind::ObjectProto
+                        | model::TokKind::NativeProto(_) => "prototype-argument",
+                        model::TokKind::Builtin(_) => "builtin-argument",
+                        model::TokKind::ModNs(_) => "module-namespace-argument",
+                        model::TokKind::Func(..) | model::TokKind::Obj(..) => "argument-value",
+                    });
                     continue;
                 };
+                if let Some((tm, kind)) = crate::bindings::sealed_owner(&g.m, t) {
+                    let d = g.m.tmpls[tm as usize].display.clone();
+                    if !g.unit_in.is_some_and(|u| u.broken(&format!("owner:{d}"))) {
+                        vc.indexed_owners.push(crate::bindings::IndexedOwner {
+                            kind,
+                            min_len: *g.m.ta_min_len.get(&tm).unwrap_or(&0),
+                            exact_len: g.m.ta_exact_len.get(&tm).copied(),
+                            allocations: vec![d],
+                        });
+                        vc.indexed_owners.sort();
+                        vc.indexed_owners.dedup();
+                        continue;
+                    }
+                }
                 // DECISIONS 149e: an array leaves by its element cell
                 // (`Gen::contract_check`), named as a value contract names it (94).
                 if g.m.is_cell_arr(t) {
@@ -1594,7 +1845,11 @@ pub(super) fn arg_contract_of(
                 }
                 if g.m.param_marker.contains_key(&t) || g.unit_in.is_some_and(|u| u.broken(display))
                 {
-                    vc.unknown = true;
+                    vc.unknown_because(if g.m.param_marker.contains_key(&t) {
+                        "parameter-marker"
+                    } else {
+                        "broken-layout"
+                    });
                     // A marker is the whole argument (DECISIONS 119).
                     if g.m.param_marker.contains_key(&t) {
                         vc.prim |= model::prim::ALL;
@@ -1647,8 +1902,11 @@ pub(super) fn arg_contract_of(
                             // (DECISIONS 101).
                             birth_keys: atoms_of(g, &g.m.tmpls[tm as usize].birth_keys),
                             definite: atoms_of(g, &g.m.tmpls[tm as usize].definite),
+                            reserved: atoms_of(g, &g.m.tmpls[tm as usize].reserved),
                             ctor_leaks: true,
+                            ctor_returns: g.chain_returns(tm),
                             binding_prim: 0,
+                            fn_inst: false,
                         }),
                         _ => None,
                     }
@@ -1665,11 +1923,24 @@ pub(super) fn arg_contract_of(
                                 layouts_out,
                                 open_tm,
                             );
+                            // UEB: its fields as a published literal's
+                            // (`Gen::nested_fields` decided them for the
+                            // literals handed to a closed function,
+                            // `Gen::handed`): what they hold, by key.
+                            if cc.literal_shape
+                                && !contracts_out.iter().any(|(_, c)| &c.display == display)
+                            {
+                                cc.field_layouts =
+                                    nested_layouts(g, templates, tm, layouts_out, open_tm);
+                                cc.field_values =
+                                    field_value_contracts(g, templates, tm, layouts_out, open_tm);
+                                cc.field_tas = field_ta_contracts(g, tm);
+                            }
                         }
                         vc.layouts.push(cc)
                     }
                     Some(_) => {}
-                    None => vc.unknown = true,
+                    None => vc.unknown_because("layout-without-contract"),
                 }
             }
         }

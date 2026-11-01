@@ -27,12 +27,31 @@ use crate::strings::StringPool;
 
 /// `%PerryLayoutDesc`: family, variant, kind, integrity, slot_count,
 /// template word, rep, proto, keys, key_count, index_mask, index, class, parent,
-/// methods, identity and pad (80 bytes LP64; 64 bytes ILP32).
+/// methods, identity, pad, image keys, then the A1 precompute gc_header_word,
+/// 32 bytes of padding (128 bytes LP64; 112 bytes ILP32).
 pub const DESC_TY: &str =
-    "{ i32, i16, i8, i8, i32, i32, i64, ptr, ptr, i32, i32, ptr, i32, i32, ptr, i32, i32 }";
-mod methods;
-/// `%PerryLayoutKey`: atom, slot, attrs, pad (16 bytes).
-pub const KEY_TY: &str = "{ ptr, i32, i8, [3 x i8] }";
+    "{ i32, i16, i8, i8, i32, i32, i64, ptr, ptr, i32, i32, ptr, i32, i32, ptr, i32, i32, ptr, i64, [32 x i8] }";
+pub(crate) mod methods;
+/// `%PerryLayoutKey`: atom, slot, attrs, pad, off (16 bytes on LP64, 12 on ILP32).
+pub const KEY_TY: &str = "{ ptr, i32, i8, i8, i16 }";
+
+/// The descriptor tail after `image_keys`: `gc_header_word` for a layout of `slot_count` slots.
+pub(crate) fn desc_tail(
+    triple: &str,
+    form: crate::target_layout::HeaderForm,
+    slot_count: u32,
+) -> String {
+    use crate::target_layout::layout_gc_header_word;
+    format!(
+        "i64 {}, [32 x i8] zeroinitializer",
+        layout_gc_header_word(triple, form, slot_count)
+    )
+}
+
+/// The `off` field of the key stored in `slot`.
+pub(crate) fn key_off(triple: &str, form: crate::target_layout::HeaderForm, slot: u32) -> u64 {
+    crate::target_layout::layout_key_off(triple, form, slot)
+}
 /// `%StaticAtom`: hash, string, kind, pad, index (24 bytes; §6a).
 pub const ATOM_TY: &str = "{ i64, ptr, i8, [3 x i8], i32 }";
 // Windows atom records share one read-only COFF image with the Rust atoms
@@ -259,7 +278,7 @@ pub(crate) fn image_colour_flags(bytes: &[u8]) -> u32 {
 }
 
 /// The static atom global of `key` (emitting it once per module).
-fn atom(
+pub(crate) fn atom(
     llmod: &mut LlModule,
     strings: &mut StringPool,
     emitted: &mut BTreeMap<String, String>,
@@ -391,6 +410,12 @@ fn emit_image_descriptor(
     integrity: u8,
 ) {
     let count = keys.len();
+    let triple = llmod.target_triple.clone();
+    let tail = desc_tail(
+        &triple,
+        crate::target_layout::HeaderForm::Meta,
+        count.max(1) as u32,
+    );
     let cap = (count * 2).next_power_of_two().max(2);
     let mut index = vec![u32::MAX; cap];
     for (pos, (_, hash, _)) in keys.iter().enumerate() {
@@ -405,8 +430,9 @@ fn emit_image_descriptor(
         .enumerate()
         .map(|(i, (a, _, attrs))| {
             format!(
-                "{KEY_TY} {{ ptr @{a}, i32 {i}, i8 {}, [3 x i8] zeroinitializer }}",
-                *attrs as i8
+                "{KEY_TY} {{ ptr @{a}, i32 {i}, i8 {}, i8 0, i16 {} }}",
+                *attrs as i8,
+                key_off(&triple, crate::target_layout::HeaderForm::Meta, i as u32)
             )
         })
         .collect();
@@ -436,8 +462,17 @@ fn emit_image_descriptor(
         true,
         identity,
     );
+    let image_keys = crate::codegen::realm_image::emit_layout_key_list(
+        llmod,
+        &format!("{desc_name}_image_keys"),
+        &keys
+            .iter()
+            .enumerate()
+            .map(|(i, (a, h, attrs))| (a.clone(), *h, *attrs, i as u32))
+            .collect::<Vec<_>>(),
+    );
     llmod.add_raw_global(format!(
-        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 {variant}, i8 0, i8 {integrity}, i32 {}, i32 {}, i64 0, ptr inttoptr (i64 {proto} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null, i32 {identity}, i32 0 }}, section \"{sect}\", align 8",
+        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 {variant}, i8 0, i8 {integrity}, i32 {}, i32 {}, i64 0, ptr inttoptr (i64 {proto} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null, i32 {identity}, i32 0, ptr {image_keys}, {tail} }}, section \"{sect}\", align 8",
         count.max(1),
         word as i32,
         cap - 1
@@ -681,13 +716,18 @@ fn module_literals(hir: &HirModule) -> Vec<Vec<String>> {
     out
 }
 
+/// Install the program's key colouring on this thread, which [`atom`] reads:
+/// the static seed unit emits atoms outside any module's codegen.
+pub(crate) fn set_colours(layouts: &ProgramLayouts) {
+    COLOURS.with(|c| *c.borrow_mut() = layouts.colored.clone());
+}
+
 /// Whether this compile emits layout descriptors at all (executables only:
 /// atoms point at image strings, which only executables carry).
 /// `PERRY_LAYOUT_DESCS=0` disables emission and with it every family.
-pub(crate) fn layouts_enabled(output_type: &str, target_triple: &str) -> bool {
+pub(crate) fn layouts_enabled(output_type: &str, _target_triple: &str) -> bool {
     output_type != "dylib"
         && output_type != "staticlib"
-        && !target_triple.contains("wasm")
         && std::env::var("PERRY_LAYOUT_DESCS").as_deref() != Ok("0")
 }
 
@@ -721,6 +761,8 @@ fn emit_desc(
 ) {
     let (keys_name, index_name, desc_name) = names;
     let count = keys.len();
+    let triple = llmod.target_triple.clone();
+    let tail = desc_tail(&triple, crate::target_layout::HeaderForm::Meta, slot_count);
     let cap = (count * 2).next_power_of_two().max(2);
     let mut index = vec![u32::MAX; cap];
     // The index answers property lookups (`perry-runtime`
@@ -750,8 +792,9 @@ fn emit_desc(
                     0
                 };
             format!(
-                "{KEY_TY} {{ ptr @{a}, i32 {slot}, i8 {}, [3 x i8] zeroinitializer }}",
-                attrs as i8
+                "{KEY_TY} {{ ptr @{a}, i32 {slot}, i8 {}, i8 0, i16 {} }}",
+                attrs as i8,
+                key_off(&triple, crate::target_layout::HeaderForm::Meta, *slot)
             )
         })
         .collect();
@@ -773,14 +816,32 @@ fn emit_desc(
         true,
         0,
     );
+    let image_keys = crate::codegen::realm_image::emit_layout_key_list(
+        llmod,
+        &format!("{desc_name}_image_keys"),
+        &keys
+            .iter()
+            .map(|(key, atom, slot)| {
+                let attrs = crate::runtime_abi::LAYOUT_KEY_OPTIONAL
+                    | if key.is_private() {
+                        crate::runtime_abi::LAYOUT_KEY_PRIVATE_FIELD
+                    } else {
+                        0
+                    };
+                (atom.clone(), fnv1a(key.spelling().as_bytes()), attrs, *slot)
+            })
+            .collect::<Vec<_>>(),
+    );
     llmod.add_raw_global(format!(
-        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 0, ptr inttoptr (i64 {} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 {}, i32 {}, ptr {methods}, i32 0, i32 0 }}, section \"{sect}\", align 8",
+        "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 0, ptr inttoptr (i64 {} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 {}, i32 {}, ptr {methods}, i32 0, i32 {}, ptr {image_keys}, {tail} }}, section \"{sect}\", align 8",
         word as i32,
         // The `PerryLayoutDesc.proto` tag (perry-runtime `layout_desc`).
         proto,
         cap - 1,
         class.0,
-        class.1
+        class.1,
+        // Every slot of a class family is `Any` (rep 0): a hole or a value.
+        crate::runtime_abi::layout_gc_plan(slot_count, 0) as i32
     ));
 }
 
@@ -883,7 +944,9 @@ pub(crate) fn emit_module_layouts(
     // carried layout naming it.
     let (protos, create_sites, images) = create_families::emission();
     for global in &protos {
-        llmod.add_raw_global(format!("@{global} = internal global i64 0, align 8"));
+        llmod.add_raw_global(format!(
+            "@{global} = internal global {{ i64, ptr }} {{ i64 0, ptr null }}, align 8"
+        ));
     }
     // Object model §3.6: each prototype's carried layout (its birth when
     // the object its initializer built is exactly this).
@@ -1304,6 +1367,8 @@ fn emit_descriptor(
 ) {
     {
         let count = keys.len();
+        let triple = llmod.target_triple.clone();
+        let tail = desc_tail(&triple, crate::target_layout::HeaderForm::Meta, slot_count);
         let cap = (count * 2).next_power_of_two().max(2);
         let mut index = vec![u32::MAX; cap];
         for (pos, k) in keys.iter().enumerate() {
@@ -1324,7 +1389,10 @@ fn emit_descriptor(
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                format!("{KEY_TY} {{ ptr @{a}, i32 {i}, i8 0, [3 x i8] zeroinitializer }}")
+                format!(
+                    "{KEY_TY} {{ ptr @{a}, i32 {i}, i8 0, i8 0, i16 {} }}",
+                    key_off(&triple, crate::target_layout::HeaderForm::Meta, i as u32)
+                )
             })
             .collect();
         llmod.add_raw_global(format!(
@@ -1355,14 +1423,35 @@ fn emit_descriptor(
             layout_id != 0,
             identity,
         );
+        let image_keys = crate::codegen::realm_image::emit_layout_key_list(
+            llmod,
+            &format!("{desc_name}_image_keys"),
+            &atom_names
+                .iter()
+                .zip(keys)
+                .enumerate()
+                .map(|(i, (atom, key))| (atom.clone(), fnv1a(key.as_bytes()), 0, i as u32))
+                .collect::<Vec<_>>(),
+        );
         llmod.add_raw_global(format!(
-            "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 {}, ptr inttoptr (i64 {proto} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null, i32 {identity}, i32 0 }}, section \"{sect}\", align 8",
+            "@{desc_name} = global {DESC_TY} {{ i32 {family}, i16 0, i8 0, i8 0, i32 {slot_count}, i32 {}, i64 {}, ptr inttoptr (i64 {proto} to ptr), ptr @{keys_name}, i32 {count}, i32 {}, ptr @{index_name}, i32 0, i32 0, ptr null, i32 {identity}, i32 {}, ptr {image_keys}, {tail} }}, section \"{sect}\", align 8",
             word as i32,
             rep as i64,
-            cap - 1
+            cap - 1,
+            crate::runtime_abi::layout_gc_plan(slot_count, rep) as i32
         ));
     }
 }
 
 #[cfg(test)]
 mod comdat_tests;
+#[cfg(test)]
+mod gc_plan_tests;
+
+impl FamilyAdd {
+    /// The header form predicted for the family's objects: the base of its
+    /// slots.
+    pub(crate) fn form(&self) -> crate::target_layout::HeaderForm {
+        crate::target_layout::HeaderForm::Meta
+    }
+}

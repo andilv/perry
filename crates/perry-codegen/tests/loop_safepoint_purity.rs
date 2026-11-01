@@ -41,6 +41,7 @@ use perry_hir::{BinaryOp, CompareOp, Export, Expr, Module, ModuleInitKind, Stmt,
 
 fn entry_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -52,6 +53,7 @@ fn entry_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -395,6 +397,7 @@ fn a_call_in_the_body_keeps_the_back_edge_poll() {
             numeric(N, "n", 1000.0),
             numeric(SUM, "sum", 0.0),
             vec![Stmt::Expr(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::LocalGet(SUM)),
                 args: vec![Expr::Number(1.0)],
                 type_args: Vec::new(),

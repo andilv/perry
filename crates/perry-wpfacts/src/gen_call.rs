@@ -73,13 +73,6 @@ impl<'a> Gen<'a> {
                 return self.call_value(c, ThisArg::Undef, vec![lit], vec![]);
             }
         }
-        // A literal `require("...")` in a CommonJS-wrapped module: the one
-        // module the wrapper resolved it to (`Gen::cjs_static_require`).
-        if let (Expr::FuncRef(_) | Expr::LocalGet(_), [Expr::String(spec)]) = (callee, args) {
-            if let Some(n) = self.cjs_static_require(fx.module, callee, spec) {
-                return n;
-            }
-        }
         let a: Vec<NodeId> = args.iter().map(|x| self.expr(fx, x)).collect();
         self.call_lit_arg = match args.first().map(|x| self.const_eval(fx.module, x)) {
             Some(Some(crate::gen_const::Const::Str(s))) => Some(self.m.atom(&s)),
@@ -114,6 +107,7 @@ impl<'a> Gen<'a> {
                 object,
                 property,
                 byte_offset: pb,
+                ..
             } => {
                 let o = match self.ns_member(fx.module, object, property, true) {
                     Some(o) => o,
@@ -134,7 +128,7 @@ impl<'a> Gen<'a> {
                 }
                 self.mcall(o, Key::Named(a), args, spread)
             }
-            Expr::IndexGet { object, index } => {
+            Expr::IndexGet { object, index, .. } => {
                 let o = self.expr(fx, object);
                 let i = self.expr(fx, index);
                 let r = self.m.reason("ToPropertyKey");
@@ -145,8 +139,16 @@ impl<'a> Gen<'a> {
                         proto: Protocol::ToPrimitive,
                     },
                 );
-                let key = self.read_key(index);
-                self.mcall(o, key, args, spread)
+                match self.read_key(index) {
+                    Key::Named(a) => self.mcall(o, Key::Named(a), args, spread),
+                    // DECISIONS 217: the key's values decide which members
+                    // it may name (`Cons::IdxMCall`).
+                    Key::Any => {
+                        let (call, ret) = self.new_call(ThisArg::Node(o), args, spread);
+                        self.m.cons(o, Cons::IdxMCall { idx: i, call });
+                        ret
+                    }
+                }
             }
             Expr::ExternFuncRef { name, .. } if self.is_runtime_extern(fx.module, name) => {
                 self.runtime_extern(fx, name, args, spread, vec![])
@@ -214,8 +216,6 @@ impl<'a> Gen<'a> {
             body,
             captures_this,
             is_arrow,
-            is_async,
-            is_generator,
             ..
         } = canonical
         else {
@@ -244,6 +244,7 @@ impl<'a> Gen<'a> {
         }
         let fn_ctor = !*is_arrow;
         let cfx = Fx {
+            guard: None,
             module: mi,
             f,
             this: info.this,
@@ -254,20 +255,47 @@ impl<'a> Gen<'a> {
             fn_ctor,
         };
         if !self.walked.contains(&f) {
-            self.walked.insert(f);
             if fn_ctor {
                 let ph = crate::ctor_phase::analyze_closure(params, body);
                 self.note_fn_phase(f, ph);
             }
-            self.params(&cfx, params);
-            if *is_async || *is_generator {
-                self.m
-                    .add_top(info.ret, |_| "async/generator closure result".into());
+            // DECISIONS 225: its body is walked once the closure can run.
+            let deferred = match self.emitted_closure(mi, *func_id) {
+                Some(c) => self.defer_walk(f, crate::gen::PendingWalk::Closure(cfx.clone(), c)),
+                None => false,
+            };
+            if !deferred {
+                self.walk_closure_body(&cfx, canonical);
             }
-            self.stmts(&cfx, body);
-            let _: &Vec<Stmt> = body;
         }
         self.tok_node(info.token)
+    }
+
+    /// The body of closure `e` in its context `cfx` (once per function).
+    pub(crate) fn walk_closure_body(&mut self, cfx: &Fx, e: &Expr) {
+        let f = cfx.f;
+        if !self.walked.insert(f) {
+            return;
+        }
+        self.m.note_walked(f);
+        let Expr::Closure {
+            params,
+            body,
+            is_async,
+            is_generator,
+            ..
+        } = e
+        else {
+            return;
+        };
+        let ret = self.m.funcs[f as usize].ret;
+        self.params(cfx, params);
+        if *is_async || *is_generator {
+            self.m
+                .add_top(ret, |_| "async/generator closure result".into());
+        }
+        self.stmts(cfx, body);
+        let _: &Vec<Stmt> = body;
     }
 
     /// `new Name(args)`.
@@ -524,7 +552,7 @@ impl<'a> Gen<'a> {
                     None => self.m.atom(crate::STAR_KEY),
                 };
                 if k.is_some() {
-                    self.m.accessor_atoms.insert(a);
+                    self.m.add_accessor_atom(a);
                 }
                 if let Some(tm) = birth_tm {
                     // An accessor is never a data field (E25).

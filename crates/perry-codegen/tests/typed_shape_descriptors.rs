@@ -7,6 +7,7 @@ use perry_hir::{
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -67,6 +68,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
@@ -194,6 +196,7 @@ fn scalar_object_literal_skips_pure_unobserved_initializers() {
                 ])),
             },
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "used".to_string(),
@@ -237,6 +240,8 @@ fn scalar_array_literal_skips_pure_unobserved_initializers() {
                 )),
             },
             Stmt::Return(Some(Expr::IndexGet {
+                byte_offset: 0,
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 index: Box::new(Expr::Integer(0)),
             })),
@@ -271,6 +276,7 @@ fn scalar_object_literal_keeps_observable_unobserved_initializers() {
                 ])),
             },
             Stmt::Return(Some(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: "used".to_string(),
@@ -311,6 +317,8 @@ fn scalar_object_literal_keeps_initializers_read_by_update() {
                 op: BinaryOp::Add,
                 prefix: false,
                 strict: true,
+                byte_offset: 0,
+                byte_end: 0,
             })),
         ],
         Vec::new(),
@@ -486,7 +494,9 @@ fn c262_array_has_own_property_uses_object_prototype_dispatch() {
                 init: Some(Expr::Array(vec![Expr::Bool(true)], None)),
             },
             Stmt::Return(Some(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::PropertyGet {
+                    byte_end: 0,
                     byte_offset: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     property: "hasOwnProperty".to_string(),
@@ -564,6 +574,7 @@ fn bounded_integer_array_store_omits_layout_note_and_barrier() {
                     op: CompareOp::Lt,
                     left: Box::new(Expr::LocalGet(2)),
                     right: Box::new(Expr::PropertyGet {
+                        byte_end: 0,
                         byte_offset: 0,
                         object: Box::new(Expr::LocalGet(1)),
                         property: "length".to_string(),
@@ -590,6 +601,8 @@ fn bounded_integer_array_store_omits_layout_note_and_barrier() {
                         left: Box::new(Expr::LocalGet(2)),
                         right: Box::new(Expr::Integer(1)),
                     }),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })],
             },
             Stmt::Return(Some(Expr::LocalGet(1))),
@@ -657,6 +670,7 @@ fn numeric_iota_fill_loop_uses_bulk_helper_without_barrier() {
                     op: CompareOp::Lt,
                     left: Box::new(Expr::LocalGet(2)),
                     right: Box::new(Expr::PropertyGet {
+                        byte_end: 0,
                         byte_offset: 0,
                         object: Box::new(Expr::LocalGet(1)),
                         property: "length".to_string(),
@@ -671,6 +685,8 @@ fn numeric_iota_fill_loop_uses_bulk_helper_without_barrier() {
                     object: Box::new(Expr::LocalGet(1)),
                     index: Box::new(Expr::LocalGet(2)),
                     value: Box::new(Expr::LocalGet(2)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })],
             },
             Stmt::Return(Some(Expr::LocalGet(1))),
@@ -819,6 +835,8 @@ fn pointer_store_into_numeric_array_keeps_layout_note_and_barrier() {
                 object: Box::new(Expr::LocalGet(2)),
                 index: Box::new(Expr::Integer(0)),
                 value: Box::new(Expr::LocalGet(1)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(2))),
         ],

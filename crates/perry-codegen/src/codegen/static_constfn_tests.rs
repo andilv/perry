@@ -367,6 +367,8 @@ fn closed_literal_constructor_emits_a_separate_final_shape() {
             object: Box::new(Expr::This),
             property: "m".into(),
             value: Box::new(Expr::LocalGet(9)),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         is_async: false,
         is_generator: false,
@@ -383,6 +385,7 @@ fn closed_literal_constructor_emits_a_separate_final_shape() {
     );
     let mut m = Module::new("cf_closed_literal");
     m.init.push(Stmt::Expr(Expr::New {
+        byte_end: 0,
         class_name: class.name.clone(),
         args: vec![closure(1, false)],
         type_args: Vec::new(),
@@ -514,6 +517,8 @@ fn general_class_proof_covers_local_inheritance_and_declines_uncertain_construct
         object: Box::new(Expr::This),
         property: "added".into(),
         value: Box::new(Expr::Number(1.0)),
+        byte_offset: 0,
+        byte_end: 0,
     })]));
     assert_eq!(
         class_final("p", &mutated, &HashMap::new(), 0, 77).unwrap_err(),
@@ -530,6 +535,7 @@ fn general_class_records_follow_registration_and_finalize_the_completed_result()
         key_expr: None,
         ty: Type::Any,
         init: Some(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::FuncRef(90)),
             args: Vec::new(),
             type_args: Vec::new(),
@@ -543,6 +549,8 @@ fn general_class_records_follow_registration_and_finalize_the_completed_result()
         object: Box::new(Expr::This),
         property: "effect".into(),
         value: Box::new(Expr::Object(Vec::new())),
+        byte_offset: 0,
+        byte_end: 0,
     })]));
     let mut m = Module::new("cf_user_class");
     let mut effect = constructor(vec![
@@ -555,6 +563,7 @@ fn general_class_records_follow_registration_and_finalize_the_completed_result()
     m.functions.push(effect);
     m.classes.push(class);
     m.init.push(Stmt::Expr(Expr::New {
+        byte_end: 0,
         class_name: "User".into(),
         args: Vec::new(),
         type_args: Vec::new(),
@@ -652,6 +661,7 @@ fn class_replacement_returns_never_produce_a_final_record() {
     )])));
     m.classes.push(class);
     m.init.push(Stmt::Expr(Expr::New {
+        byte_end: 0,
         class_name: "Replacement".into(),
         args: Vec::new(),
         type_args: Vec::new(),
@@ -688,6 +698,7 @@ fn default_derived_class_finalizes_inherited_and_own_closure_fields() {
     let mut m = Module::new("cf_user_inherit");
     m.classes.extend([base, child]);
     m.init.push(Stmt::Expr(Expr::New {
+        byte_end: 0,
         class_name: "Child".into(),
         args: Vec::new(),
         type_args: Vec::new(),
@@ -755,6 +766,7 @@ fn completed_class_mints_unbox_the_registered_keys_word() {
         let mut module = Module::new("rootcls_completed_keys");
         module.classes.push(class);
         module.init.push(Stmt::Expr(Expr::New {
+            byte_end: 0,
             class_name: "RootedKeys".into(),
             args: Vec::new(),
             type_args: Vec::new(),
@@ -829,12 +841,16 @@ fn completed_builder_publishes_the_spill_layout_and_declared_callee() {
             object: Box::new(Expr::LocalGet(1)),
             property: format!("k{index}"),
             value: Box::new(Expr::Number(index as f64)),
+            byte_offset: 0,
+            byte_end: 0,
         }));
     }
     module.init.push(Stmt::Expr(Expr::PropertySet {
         object: Box::new(Expr::LocalGet(1)),
         property: "f".into(),
         value: Box::new(Expr::FuncRef(50)),
+        byte_offset: 0,
+        byte_end: 0,
     }));
     module.init.push(Stmt::Let {
         id: 51,
@@ -847,6 +863,8 @@ fn completed_builder_publishes_the_spill_layout_and_declared_callee() {
         object: Box::new(Expr::LocalGet(1)),
         property: "f".into(),
         value: Box::new(Expr::LocalGet(51)),
+        byte_offset: 0,
+        byte_end: 0,
     }));
     module.exported_objects.push("N".into());
     module.exports.push(perry_hir::Export::Named {
@@ -866,7 +884,9 @@ fn completed_builder_publishes_the_spill_layout_and_declared_callee() {
     assert_eq!(capability.final_shape.as_ref(), Some(shape));
     assert_eq!(capability.methods[0].field_index, 35);
     module.init.push(Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "f".into(),
             byte_offset: 0,
@@ -915,6 +935,8 @@ fn final_literal_visitor_harvests_static_import_member_writes() {
         key: Box::new(Expr::String("loggingHost".into())),
         value: Box::new(Expr::Object(Vec::new())),
         strict: true,
+        byte_offset: 0,
+        byte_end: 0,
     }));
     let (_, writes) = crate::exported_object_literal_method_facts(&module);
     assert_eq!(writes, vec![("Debug".into(), "loggingHost".into())]);

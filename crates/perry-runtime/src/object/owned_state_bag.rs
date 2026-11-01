@@ -21,6 +21,12 @@ pub(crate) const COMPONENT_HOST_NEXT_RESOURCE: u32 = 18;
 pub(crate) const COMPONENT_HOST_RESOURCE: u32 = 19;
 pub(crate) const COMPONENT_FINALIZATION: u32 = 20;
 pub(crate) const COMPONENT_RESOURCE_PARENT: u32 = 21;
+pub(crate) const COMPONENT_ASYNC_IMPORTS: u32 = 22;
+pub(crate) const COMPONENT_RESOURCE_BORROW: u32 = 23;
+pub(crate) const COMPONENT_ASYNC_RESULT_TYPE: u32 = 24;
+pub(crate) const COMPONENT_DRIVER_OWNER: u32 = 25;
+pub(crate) const COMPONENT_ASYNC_VALUE: u32 = 26;
+pub(crate) const COMPONENT_ASYNC_WRITER: u32 = 27;
 
 pub(crate) unsafe fn bag(owner: usize, create: bool, last_slot: u32) -> *mut ArrayHeader {
     let _publication = crate::gc::GcSuppressScope::new();
@@ -34,9 +40,14 @@ pub(crate) unsafe fn bag(owner: usize, create: bool, last_slot: u32) -> *mut Arr
         return std::ptr::null_mut();
     }
     let meta = if create {
-        super::object_meta_ensure(holder)
+        // A1_UNPROVEN: descriptor_holder(owner) may return the user object itself (kind-A/B question for S0b-S0e).
+        super::object_meta_ensure(
+            crate::meta_obj_runtime_born!(holder),
+            super::MetaReason::OwnedState,
+        )
     } else {
-        (*holder).meta
+        // A1_UNPROVEN: record-first: holder may be the user object (kind-A/B question for S0f).
+        crate::meta_read!(crate::meta_obj_runtime_born!(holder as *mut _))
     };
     if meta.is_null() {
         return std::ptr::null_mut();

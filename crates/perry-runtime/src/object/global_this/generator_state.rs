@@ -321,7 +321,7 @@ pub(crate) fn fixed_generator_state(value: f64) -> Option<*const crate::closure:
     let addr = value.as_pointer::<u8>() as usize;
     unsafe {
         let header = crate::value::addr_class::try_read_gc_header(addr)?;
-        if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+        if crate::gc_type_is_not_object!(header.obj_type) {
             return None;
         }
         fixed_generator_state_of_object(addr as *const ObjectHeader)
@@ -538,7 +538,7 @@ pub(crate) fn generator_observe_record_prototype(value: f64) {
         let Some(header) = crate::value::addr_class::try_read_gc_header(addr) else {
             return;
         };
-        if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        if crate::gc_type_is_not_object!(header.obj_type)
             || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return;
@@ -636,7 +636,7 @@ pub(crate) unsafe fn resume_fixed_step(
     };
     let set = |index, bits| {
         state.with_const_ptr::<crate::closure::ClosureHeader, _>(|p| {
-            // GC_STORE_AUDIT(POINTER_FREE): shared done/executing/step controls only.
+            // GC_STORE_AUDIT(POINTER_FREE): controls or the canonical undefined sent value.
             p.add(1).cast::<u64>().cast_mut().add(index).write(bits);
         })
     };
@@ -667,9 +667,17 @@ pub(crate) unsafe fn resume_fixed_step(
     }
     set(3, crate::value::TAG_TRUE);
     if op == 0.0 {
-        state.with_const_ptr::<crate::closure::ClosureHeader, _>(|p| {
-            js_generator_set_slot(p.cast_mut(), 2, arg.to_bits(), 1)
-        });
+        // The ordinary next() call sends undefined. Its bits prove there is
+        // neither a managed edge nor a string alias to publish, just as for
+        // the frame's done/executing controls. Keep the full slot operation
+        // for sent values that need barrier or alias handling.
+        if arg.to_bits() == crate::value::TAG_UNDEFINED {
+            set(2, crate::value::TAG_UNDEFINED);
+        } else {
+            state.with_const_ptr::<crate::closure::ClosureHeader, _>(|p| {
+                js_generator_set_slot(p.cast_mut(), 2, arg.to_bits(), 1)
+            });
+        }
     }
     // next consumes the sent slot from this refreshed frame at body entry,
     // including after barrier work. Abrupt arguments cross no slot barrier;
@@ -703,8 +711,11 @@ pub(crate) unsafe fn resume_fixed_step(
 unsafe fn prototype_identity(value: f64) -> Option<u64> {
     let addr = (value.to_bits() & crate::value::POINTER_MASK) as usize;
     if let Some(header) = crate::value::addr_class::try_read_gc_header(addr) {
-        if header.obj_type == crate::gc::GC_TYPE_OBJECT {
-            let meta = (*(addr as *const ObjectHeader)).meta;
+        if crate::object_has_meta_word!(header.obj_type) {
+            let meta = crate::meta_read!(crate::meta_obj_from_type!(
+                addr as *const ObjectHeader as *mut _,
+                header.obj_type,
+            ));
             if !meta.is_null()
                 && (*meta).flags & crate::object::OBJECT_META_FLAG_IS_PROTOTYPE != 0
                 && (*meta).proto_serial != 0
@@ -834,7 +845,7 @@ pub(super) fn classify_prototype(value: f64, is_async: bool) -> Holder {
     let ordinary = jv.is_pointer()
         && unsafe {
             crate::value::addr_class::try_read_gc_header(jv.as_pointer::<u8>() as usize)
-                .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT)
+                .is_some_and(|h| crate::gc_type_is_object!(h.obj_type))
         };
     if ordinary {
         Holder::Record(value.to_bits())

@@ -45,6 +45,7 @@ const STAGE_FUNC_BASE: u32 = 900;
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -56,6 +57,7 @@ fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -159,6 +161,7 @@ fn tiny_factory_class(prefix_stmts: usize) -> Class {
         body.push(Stmt::Expr(Expr::Number(i as f64)));
     }
     body.push(Stmt::Return(Some(Expr::New {
+        byte_end: 0,
         class_name: "Cell".to_string(),
         args: vec![Expr::Number(1.0)],
         type_args: Vec::new(),
@@ -249,6 +252,7 @@ fn walk_module(recurse: bool) -> Module {
                 right: Box::new(Expr::Number(0.0)),
             },
             then_branch: vec![Stmt::Expr(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::FuncRef(WALK_ID)),
                 args: vec![Expr::Binary {
                     op: BinaryOp::Sub,
@@ -262,6 +266,7 @@ fn walk_module(recurse: bool) -> Module {
         });
     }
     body.push(Stmt::Return(Some(Expr::New {
+        byte_end: 0,
         class_name: "Cell".to_string(),
         args: vec![Expr::LocalGet(N_ID)],
         type_args: Vec::new(),
@@ -295,6 +300,7 @@ fn walk_module(recurse: bool) -> Module {
     // Straight-line, ONE call site, no loop: the only thing that can admit
     // `walk` is the recursion itself.
     m.init = vec![Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::FuncRef(WALK_ID)),
         args: vec![Expr::Number(8.0)],
         type_args: Vec::new(),
@@ -330,6 +336,7 @@ fn indirect_closure_module(site_count: u32, call_in_loop: bool) -> Module {
                 params: Vec::new(),
                 return_type: Type::Named("Cell".to_string()),
                 body: vec![Stmt::Return(Some(Expr::New {
+                    byte_end: 0,
                     class_name: "Cell".to_string(),
                     args: vec![Expr::Number(i as f64)],
                     type_args: Vec::new(),
@@ -350,6 +357,7 @@ fn indirect_closure_module(site_count: u32, call_in_loop: bool) -> Module {
     }
 
     let indirect_call = Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::LocalGet(STAGE_LOCAL_BASE)),
         args: Vec::new(),
         type_args: Vec::new(),

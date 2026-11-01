@@ -130,10 +130,13 @@ crate::perry_thread_local! {
     };
 }
 
-#[cfg(not(all(
-    target_vendor = "apple",
-    target_arch = "aarch64",
-    target_pointer_width = "64"
+#[cfg(not(any(
+    all(
+        target_vendor = "apple",
+        target_arch = "aarch64",
+        target_pointer_width = "64"
+    ),
+    all(target_family = "wasm", not(target_feature = "atomics"))
 )))]
 thread_local! {
     /// See the cfg-split rationale above this declaration's sibling arm.
@@ -146,6 +149,59 @@ thread_local! {
         })
     };
 }
+
+/// Single-threaded wasm (no `atomics`): the program has exactly one thread,
+/// so the state is one exported static rather than a thread-local. Generated
+/// code addresses it by symbol and pushes and pops frames inline
+/// (`perry-codegen`'s `wasm32::shadow_frame`), taking `js_shadow_frame_enter` /
+/// `js_shadow_frame_pop` only to grow the buffer or to report a bad handle.
+/// [`SHADOW`] keeps the `thread_local!` access API, so every runtime path below
+/// is the same code on every target.
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+#[repr(transparent)]
+pub struct ShadowStateCell(UnsafeCell<ShadowStackState>);
+
+// SAFETY: a wasm module without `atomics` cannot run a second thread.
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+unsafe impl Sync for ShadowStateCell {}
+
+/// The shadow-stack state generated code reads and writes inline on
+/// single-threaded wasm. Part of the codegen contract: its layout is
+/// [`ShadowStackState`]'s.
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+#[no_mangle]
+pub static PERRY_SHADOW_STATE: ShadowStateCell =
+    ShadowStateCell(UnsafeCell::new(ShadowStackState {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+        cap: 0,
+        frame_top: usize::MAX,
+    }));
+
+/// [`SHADOW`] on single-threaded wasm: `thread_local!`'s access API over
+/// [`PERRY_SHADOW_STATE`].
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+pub(crate) struct ShadowKey;
+
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+impl ShadowKey {
+    #[inline(always)]
+    pub(crate) fn with<R>(&'static self, f: impl FnOnce(&UnsafeCell<ShadowStackState>) -> R) -> R {
+        f(&PERRY_SHADOW_STATE.0)
+    }
+
+    /// Never fails: the static outlives every caller.
+    #[inline(always)]
+    pub(crate) fn try_with<R>(
+        &'static self,
+        f: impl FnOnce(&UnsafeCell<ShadowStackState>) -> R,
+    ) -> Result<R, std::convert::Infallible> {
+        Ok(self.with(f))
+    }
+}
+
+#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
+pub(crate) static SHADOW: ShadowKey = ShadowKey;
 
 /// Frees the shadow buffer at thread exit.
 ///
@@ -278,7 +334,7 @@ fn frame_zero_span(slot_count: usize) -> usize {
         }
 }
 
-/// Encode a bound compiled-local address into a live [`ShadowEntry::meta`].
+/// Encode a bound compiled-local address into a live [`ShadowEntry::bound`].
 ///
 /// Bit 0 carries the liveness flag, so an address whose bit 0 is set cannot be
 /// recorded. Rather than truncate it — which would hand the collector a
@@ -375,7 +431,7 @@ unsafe fn push_frame(s: &mut ShadowStackState, slot_count: u32) -> u64 {
         header,
         ShadowEntry {
             value: s.frame_top as u64,
-            meta: slot_count as usize,
+            bound: slot_count as usize,
         },
     );
     clear_slots(header.add(SHADOW_STACK_HEADER_SLOTS), slot_count as usize);
@@ -524,16 +580,16 @@ pub extern "C" fn js_shadow_slot_set(idx: u32, value: u64) {
             return;
         }
         let entry = s.ptr.add(slot);
-        let meta = (*entry).meta;
+        let meta = (*entry).bound;
         (*entry).value = value;
         if value == 0 {
             // Codegen's "dead from here" clear: drop the liveness bit but keep
             // the binding, so a later re-activation still writes through to the
             // same compiled local slot.
-            (*entry).meta = meta & SLOT_PTR_MASK;
+            (*entry).bound = meta & SLOT_PTR_MASK;
             return;
         }
-        (*entry).meta = meta | SLOT_ACTIVE;
+        (*entry).bound = meta | SLOT_ACTIVE;
         root_shading_barrier(value);
         let bound = (meta & SLOT_PTR_MASK) as *mut u64;
         if !bound.is_null() {
@@ -574,7 +630,7 @@ pub extern "C" fn js_shadow_slot_bind(idx: u32, value_slot: *mut u64) {
             s.ptr.add(slot),
             ShadowEntry {
                 value,
-                meta: bound_slot_meta(raw),
+                bound: bound_slot_meta(raw),
             },
         );
         root_shading_barrier(value);
@@ -648,8 +704,8 @@ pub(crate) fn shadow_stack_has_active_frame() -> bool {
 /// slots carry frame marks (`crate::exception::marks`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FrameRootSavepoint {
-    frame_top: usize,
-    len: usize,
+    pub(crate) frame_top: usize,
+    pub(crate) len: usize,
 }
 
 /// Capture the current shadow-stack depth.
@@ -692,7 +748,7 @@ pub extern "C" fn js_shadow_frame_restore_to(frame_handle: u64) {
         if base >= s.len {
             return;
         }
-        let slots = (*s.ptr.add(base)).meta;
+        let slots = (*s.ptr.add(base)).bound;
         let end = base + SHADOW_STACK_HEADER_SLOTS + slots;
         if end <= s.len {
             s.set_slots_len(end);

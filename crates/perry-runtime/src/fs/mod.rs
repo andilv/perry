@@ -1,5 +1,8 @@
 //! File system module - provides file operations
 
+mod read_file;
+use read_file::{read_file_bytes_with_options, read_file_string_with_options};
+
 mod errors;
 pub(crate) use errors::*;
 
@@ -147,16 +150,18 @@ pub(crate) fn filehandle_object_fd(value: f64) -> Option<i32> {
     }
     let header = unsafe { crate::value::addr_class::try_read_tracked_gc_header(addr) }?;
     unsafe {
-        if (*header.as_ptr()).obj_type != crate::gc::GC_TYPE_OBJECT
+        if crate::gc_type_is_not_object!((*header.as_ptr()).obj_type)
             || (*header.as_ptr()).gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         {
             return None;
         }
         let obj = addr as *const crate::object::ObjectHeader;
-        if (*obj).class_id != CLASS_ID_FS_FILEHANDLE || (*obj).meta.is_null() {
+        if (*obj).class_id != CLASS_ID_FS_FILEHANDLE
+            || crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _)).is_null()
+        {
             return None;
         }
-        let word = (*(*obj).meta).native_state;
+        let word = (*crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _))).native_state;
         (word != 0).then_some(word.wrapping_sub(1) as u32 as i32)
     }
 }
@@ -166,7 +171,10 @@ pub(crate) fn filehandle_object_fd(value: f64) -> Option<i32> {
 pub(crate) unsafe fn set_filehandle_owner_fd(obj: *mut crate::object::ObjectHeader, fd: i32) {
     let _no_move = crate::gc::GcSuppressScope::new();
     debug_assert_eq!((*obj).class_id, CLASS_ID_FS_FILEHANDLE);
-    let meta = crate::object::object_meta_ensure(obj);
+    let meta = crate::object::object_meta_ensure(
+        crate::meta_obj_runtime_born!(obj),
+        crate::object::MetaReason::RuntimeHandle,
+    );
     (*meta).native_state = u64::from(fd as u32) + 1;
 }
 
@@ -190,7 +198,7 @@ fn object_class_id(value: f64) -> Option<u32> {
     unsafe {
         let gc_header =
             (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT {
+        if crate::gc_type_is_not_object!((*gc_header).obj_type) {
             return None;
         }
         Some((*obj).class_id)
@@ -276,7 +284,7 @@ fn numeric_fd_value(value: f64) -> Option<i32> {
             {
                 return None;
             }
-            if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
+            if crate::typedarray_hook_slots::lookup_typed_array_kind(addr).is_some() {
                 return None;
             }
             options_number_field(value, b"fd").map(|fd| fd as i32)
@@ -319,8 +327,14 @@ pub extern "C-unwind" fn js_fs_read_file_sync_options(
             );
         }
 
-        match read_file_bytes_with_options(path_value, options_value) {
-            Ok(bytes) => {
+        match read_file_string_with_options(
+            path_value,
+            options_value,
+            read_file_encoding(options_value)
+                .as_deref()
+                .unwrap_or("utf8"),
+        ) {
+            Ok(text) => {
                 #[cfg(target_os = "android")]
                 {
                     extern "C" {
@@ -335,10 +349,10 @@ pub extern "C-unwind" fn js_fs_read_file_sync_options(
                         3,
                         b"PerryFS\0".as_ptr(),
                         b"readFileSync: OK, %d bytes\0".as_ptr(),
-                        bytes.len() as i32,
+                        (*text).byte_len as i32,
                     );
                 }
-                js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32)
+                text
             }
             Err(failure) => {
                 #[cfg(target_os = "android")]
@@ -378,8 +392,13 @@ pub extern "C-unwind" fn js_fs_read_file_sync_options(
 
 #[no_mangle]
 pub extern "C-unwind" fn js_fs_read_file_dispatch(path_value: f64, options_value: f64) -> f64 {
-    if read_file_encoding(options_value).is_some() {
-        let str_ptr = js_fs_read_file_sync_options(path_value, options_value);
+    // Read the encoding once, before path validation, preserving option getter order.
+    let encoding = read_file_encoding(options_value);
+    validate::validate_path_or_fd("path", path_value, "read");
+    validate::validate_string_or_object_options("options", options_value);
+    if let Some(encoding) = encoding {
+        let str_ptr = read_file_string_with_options(path_value, options_value, &encoding)
+            .unwrap_or_else(|failure| unsafe { crate::exception::js_throw(failure.error_value()) });
         f64::from_bits(crate::value::JSValue::string_ptr(str_ptr).bits())
     } else {
         // Throws on failure (#10452) — never null, so never `undefined`.
@@ -389,21 +408,22 @@ pub extern "C-unwind" fn js_fs_read_file_dispatch(path_value: f64, options_value
 }
 
 /// `readFile`'s shared core for the sync, callback and promise forms (#10452):
-/// the contents as a string (`as_string`) or a Buffer, or the Node-shaped
+/// the contents in the selected text encoding or as a Buffer, or the Node-shaped
 /// error value to throw, hand to the callback, or reject with.
 pub(crate) unsafe fn read_file_value_result(
     path_value: f64,
     options_value: f64,
-    as_string: bool,
+    encoding: Option<&str>,
 ) -> Result<f64, f64> {
     validate::validate_path_or_fd("path", path_value, "read");
     validate::validate_string_or_object_options("options", options_value);
-    let bytes = read_file_bytes_with_options(path_value, options_value)
-        .map_err(|failure| failure.error_value())?;
-    Ok(if as_string {
-        let str_ptr = js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
+    Ok(if let Some(encoding) = encoding {
+        let str_ptr = read_file_string_with_options(path_value, options_value, encoding)
+            .map_err(|failure| failure.async_error_value())?;
         f64::from_bits(crate::value::JSValue::string_ptr(str_ptr).bits())
     } else {
+        let bytes = read_file_bytes_with_options(path_value, options_value)
+            .map_err(|failure| failure.async_error_value())?;
         let buf = buffer_from_file_bytes(&bytes);
         f64::from_bits(crate::value::JSValue::pointer(buf as *const u8).bits())
     })
@@ -438,15 +458,23 @@ pub(crate) fn read_file_encoding(options_value: f64) -> Option<String> {
         return None;
     }
     if let Some(enc) = js_string_value(options_value) {
-        return Some(enc);
+        return (!enc.is_empty()).then_some(enc);
     }
     unsafe {
         let enc = options_field_value(options_value, b"encoding")?;
         let enc_js = crate::value::JSValue::from_bits(enc.bits());
-        if enc_js.is_undefined() || enc_js.is_null() {
+        if enc_js.is_undefined()
+            || enc_js.is_null()
+            || crate::value::js_is_truthy(f64::from_bits(enc.bits())) == 0
+        {
             None
+        } else if let Some(text) = js_string_value(f64::from_bits(enc.bits())) {
+            Some(text)
         } else {
-            js_string_value(f64::from_bits(enc.bits()))
+            validate::throw_type_error_with_code(
+                "The argument 'encoding' is invalid encoding",
+                "ERR_INVALID_ARG_VALUE",
+            )
         }
     }
 }
@@ -491,51 +519,6 @@ fn open_file_for_read_flag(path: &str, flag: &str) -> std::io::Result<fs::File> 
         }
     }
     opts.open(path)
-}
-
-/// The bytes behind every `readFile` form. Failures used to collapse into
-/// `None`, which the Buffer forms turned into `null`/`undefined` instead of an
-/// error (#10452); they now carry the OS error and the failing syscall.
-fn read_file_bytes_with_options(
-    path_value: f64,
-    options_value: f64,
-) -> Result<Vec<u8>, FsReadFailure> {
-    unsafe {
-        if let Some(fd) = numeric_fd_value(path_value) {
-            let mut bytes = Vec::new();
-            let read = FD_REGISTRY.with(|r| {
-                r.borrow_mut()
-                    .get_mut(&fd)
-                    .map(|file| file.read_to_end(&mut bytes))
-            });
-            // `validate_path_or_fd` already threw EBADF for an unknown fd.
-            let read = read.unwrap_or_else(|| Err(ebadf_os_error()));
-            return read.map(|_| bytes).map_err(FsReadFailure::read);
-        }
-        let Some(path_str) = decode_path_value(path_value) else {
-            return Err(FsReadFailure::open(enoent_os_error(), ""));
-        };
-        // #5731 — virtual filesystem: a `$perryfs/...` path (or a bare key that
-        // matches an embedded asset) is served from the in-binary registry
-        // before any disk access, so `fs.readFileSync`/`readFile` (text and
-        // binary) transparently read embedded files in a standalone executable.
-        // A successful registry lookup is the only short-circuit; an unresolved
-        // `$perryfs/...` path is treated as missing, never a literal disk read.
-        if let Some(bytes) = crate::embedded::lookup(&path_str) {
-            return Ok(bytes.to_vec());
-        }
-        if crate::embedded::is_virtual_path(&path_str) {
-            return Err(FsReadFailure::open(enoent_os_error(), &path_str));
-        }
-        let flag = read_file_flag(options_value);
-        let mut file = match open_file_for_read_flag(&path_str, &flag) {
-            Ok(file) => file,
-            Err(err) => return Err(FsReadFailure::open(err, &path_str)),
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(FsReadFailure::read)?;
-        Ok(bytes)
-    }
 }
 
 /// Write content to a file synchronously.
@@ -1234,15 +1217,14 @@ pub(crate) unsafe fn decode_path_value_named(path_value: f64, arg_name: &str) ->
         if obj.is_null() {
             return None;
         }
-        let protocol = crate::url::get_string_content(crate::object::js_object_get_field_f64(
-            obj,
-            crate::url::parse::URL_PROTOCOL,
-        ));
+        let protocol = crate::value::boxed_text::get_string_content(
+            crate::object::js_object_get_field_f64(obj, crate::url::parse::URL_PROTOCOL),
+        );
         if protocol != "file:" {
             return None;
         }
         return Some(reject_null_bytes(
-            crate::url::node_compat::file_url_to_path_string_posix(path_value),
+            crate::url_hooks::file_url_to_path_string_posix(path_value),
             arg_name,
         ));
     }
@@ -1957,3 +1939,7 @@ mod sso_tests_1781 {
         }
     }
 }
+
+mod roots;
+pub(crate) use roots::install_roots;
+pub(crate) use roots::{install_handle_roots, install_stream_roots, install_watcher_roots};

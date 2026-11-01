@@ -55,8 +55,9 @@ pub use dynamic_import::{
     flatten_exports, for_each_dynamic_import, for_each_dynamic_import_mut, for_each_module_expr,
     for_each_worker_new, for_each_worker_new_mut, module_uses_worker_threads, resolve_import_path,
     resolve_import_path_with_consts, resolve_import_path_with_consts_and_params,
-    resolve_import_path_with_context, resolve_worker_path, worker_url_literals, ExportBindings,
-    FlatExport, Resolution, WorkerUrl, DYNAMIC_IMPORT_PATH_CAP,
+    resolve_import_path_with_context, resolve_worker_eval_source, resolve_worker_path,
+    worker_url_literals, ExportBindings, FlatExport, Resolution, WorkerUrl,
+    DYNAMIC_IMPORT_PATH_CAP,
 };
 pub use egress::{audit_module_egress, EgressRefusalReason, EgressViolation};
 pub use enums::fix_imported_enums;
@@ -90,4 +91,9 @@ pub use type_alias_resolve::{resolve_type_aliases_in_module, AliasDef, AliasTabl
 mod iterator_record;
 
 pub mod dynamic_code;
+pub mod realm_reach;
 pub mod static_dynamic_code;
+
+// Build-time schema shared with codegen; the runtime producer stays dependency-free.
+#[path = "../../perry-runtime-manifest/src/realm.rs"]
+pub mod realm_manifest;

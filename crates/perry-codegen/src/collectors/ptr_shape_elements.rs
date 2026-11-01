@@ -793,7 +793,7 @@ impl<'a> ArrayWalk<'a> {
                     // ONLY position an element read is admitted in — see the
                     // `Expr::IndexGet` arm for why every other one is an
                     // escape of the ELEMENT (as opposed to the array).
-                    if let Expr::IndexGet { object, index } = e {
+                    if let Expr::IndexGet { object, index, .. } = e {
                         if let (Expr::LocalGet(a), Expr::LocalGet(i)) =
                             (object.as_ref(), index.as_ref())
                         {
@@ -1006,6 +1006,7 @@ impl<'a> ArrayWalk<'a> {
                 if let Expr::IndexGet {
                     object: array,
                     index,
+                    ..
                 } = object.as_ref()
                 {
                     if let (Expr::LocalGet(array_id), Expr::LocalGet(index_id)) =
@@ -1042,6 +1043,7 @@ impl<'a> ArrayWalk<'a> {
                 object,
                 property,
                 value,
+                ..
             } => {
                 if let Expr::LocalGet(id) = object.as_ref() {
                     if self.root_of(*id).is_some() {
@@ -1109,6 +1111,7 @@ impl<'a> ArrayWalk<'a> {
                 object,
                 index,
                 value,
+                ..
             } => {
                 if let Expr::LocalGet(id) = object.as_ref() {
                     self.disq(*id);
@@ -1139,7 +1142,7 @@ impl<'a> ArrayWalk<'a> {
             // So every unlicensed element read disqualifies the array. The
             // direct bounded declared-field form was consumed by the
             // `PropertyGet` arm above; every other form still reaches here.
-            Expr::IndexGet { object, index } => {
+            Expr::IndexGet { object, index, .. } => {
                 if let Expr::LocalGet(id) = object.as_ref() {
                     self.disq(*id);
                 }

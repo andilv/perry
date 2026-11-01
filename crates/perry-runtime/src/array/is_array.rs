@@ -18,7 +18,7 @@ pub extern "C" fn js_array_is_array(value: f64) -> f64 {
     // ordinary heap-pointer inspection below (proxy ids are small encoded
     // values that the pointer checks would otherwise reject as non-arrays).
     let mut value = value;
-    while let Some(target) = crate::proxy::is_array_proxy_step(value) {
+    while let Some(target) = crate::proxy_hooks::is_array_proxy_step(value) {
         value = target;
     }
 
@@ -55,7 +55,7 @@ pub extern "C" fn js_array_is_array(value: f64) -> f64 {
         let obj_type = (*gc_header).obj_type;
         if obj_type == GC_TYPE_ARRAY || obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
             true_val
-        } else if obj_type == crate::gc::GC_TYPE_OBJECT {
+        } else if crate::object_has_meta_word!(obj_type) {
             // `class X extends Array` — the instance is a plain ObjectHeader, but
             // ECMA-262 IsArray must still report true for an Array subclass.
             if super::subclass::has_array_exotic_brand(
@@ -83,7 +83,7 @@ mod tests {
             super::js_array_is_array(object).to_bits(),
             crate::value::TAG_FALSE
         );
-        crate::node_stream::js_array_subclass_init(object, 0.0);
+        crate::array::subclass_init::js_array_subclass_init(object, 0.0);
         assert_eq!(
             super::js_array_is_array(object).to_bits(),
             crate::value::TAG_TRUE

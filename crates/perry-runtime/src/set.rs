@@ -12,7 +12,8 @@ use std::ptr;
 mod index;
 #[cfg(test)]
 pub(crate) use index::{
-    test_erase_key_identity, test_key_identity, test_snapshot as test_index_snapshot,
+    test_erase_key_identity, test_index_buckets, test_key_identity,
+    test_snapshot as test_index_snapshot,
 };
 
 crate::perry_thread_local! {
@@ -61,13 +62,20 @@ pub(crate) fn set_foreach_unwind_to(sp: usize) {
     });
 }
 
+#[cfg(any(test, target_os = "wasi"))]
+pub(crate) fn set_foreach_restore_depth(depth: usize) {
+    SET_FOREACH_STACK.with(|stack| {
+        stack.borrow_mut().restore_depth(depth);
+    });
+}
+
 pub(crate) fn set_foreach_check_marks(sp: usize) {
     SET_FOREACH_STACK.with(|stack| {
         crate::exception::marks::check_marks(stack.borrow().marks(), sp, "set_foreach")
     });
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "wasi"))]
 pub(crate) fn set_foreach_depth() -> usize {
     SET_FOREACH_STACK.with(|stack| stack.borrow().len())
 }
@@ -237,8 +245,8 @@ pub(crate) unsafe fn finalize_set_side_allocation_for_gc(set: *mut SetHeader) {
     if !store.is_null() {
         finalize_owned_store(store.cast(), true);
     }
-    if !(*set).meta.is_null() {
-        (*(*set).meta).native_state = 0;
+    if !crate::object::cell_meta::set_cell_meta(set).is_null() {
+        (*crate::object::cell_meta::set_cell_meta(set)).native_state = 0;
     }
     // GC_STORE_AUDIT(POINTER_FREE): Set reset clears elements alias to null; no new edge.
     (*set).elements = ptr::null_mut();
@@ -371,7 +379,7 @@ pub(crate) unsafe fn gc_element_slot_range(
     // aarch64 Linux, where user space reaches bit 48).
     let elements_addr = (*set).elements as usize;
     if !crate::value::addr_class::is_plausible_heap_addr(elements_addr) {
-        if crate::gc::gc_diag_enabled() {
+        if crate::gc::diagnostic_hooks::enabled() {
             eprintln!(
                 "[gc-tripwire] Set elements is not a plausible heap address: {:#x} (fabricated Set?)",
                 elements_addr
@@ -614,7 +622,7 @@ static KEEP_SET_FIND_VALUE_INDEX: extern "C" fn(f64, f64) -> f64 = js_set_find_v
 
 /// Members of a set this small are found faster by reading them than by
 /// hashing into the side-table twice (set address, then value).
-const SMALL_SET_SCAN_MAX: u32 = 8;
+use crate::codegen_abi::SMALL_SET_SCAN_MAX;
 
 /// Live-extent accessor for iteration (`0..used` are the raw indices).
 #[inline(always)]
@@ -674,7 +682,7 @@ struct SetCompactionRecord {
 /// before it and truncates them.
 const SET_COMPACTION_LOG_MIN_BUDGET: usize = 4096;
 
-struct SetCompactionLog {
+pub(crate) struct SetCompactionLog {
     records: std::collections::VecDeque<SetCompactionRecord>,
     /// Sum of `records[..].removed.retained_len()`.
     retained: usize,
@@ -705,10 +713,10 @@ unsafe fn note_set_compaction(set: *mut SetHeader, removed: SetRemovedSlots) {
     let budget = std::cmp::max(SET_COMPACTION_LOG_MIN_BUDGET, (*set).capacity as usize);
     if (*(*set).store).compaction.is_none() {
         // Native records contain only indices/epochs, never managed pointers.
-        (*(*set).store).compaction = Some(SetCompactionLog {
+        (*(*set).store).compaction = Some(Box::new(SetCompactionLog {
             records: std::collections::VecDeque::new(),
             retained: 0,
-        });
+        }));
     }
     let entry = (*(*set).store).compaction.as_mut().unwrap();
     if matches!(removed, SetRemovedSlots::Prefix(_)) {
@@ -859,8 +867,8 @@ pub(crate) unsafe fn compact_if_holey_set(set: *mut SetHeader) {
 /// number against the elements by bit identity. `elements[0..used)` is exactly
 /// the membership (`delete` compacts, `add` normalises `-0`), and no tagged
 /// value equals a number, so a bit match is a hit and a full scan is a miss.
-/// Everything else — larger sets, tagged / zero / NaN values, every string —
-/// is [`find_value_index_cold`]'s, using a small scan or the owner-local index.
+/// Larger sets probe the existing index directly for an admitted Number.
+/// Tagged / zero / NaN values and every string keep the general cold path.
 #[inline(always)]
 unsafe fn find_value_index_hot(set: *const SetHeader, value: f64) -> Option<i32> {
     let bits = value.to_bits();
@@ -869,7 +877,11 @@ unsafe fn find_value_index_hot(set: *const SetHeader, value: f64) -> Option<i32>
     }
     let used = (*set).used;
     if used > SMALL_SET_SCAN_MAX {
-        return None;
+        // An untagged legacy pointer needs the ordinary identity hash.
+        if bits >> 48 == 0 {
+            return None;
+        }
+        return Some(index::lookup_plain_number(set, bits));
     }
     let elements = elements_ptr(set);
     for i in 0..used {
@@ -979,7 +991,7 @@ pub extern "C" fn js_set_alloc(capacity: u32) -> *mut SetHeader {
         (*ptr).size = 0;
         (*ptr).capacity = cap;
         (*ptr).elements = (*store).elements;
-        (*ptr).meta = ptr::null_mut();
+        *crate::object::cell_meta::set_cell_meta_slot(ptr) = ptr::null_mut();
         (*ptr).used = 0;
         (*ptr).compaction_epoch = 0;
         (*ptr).store = store;
@@ -1025,7 +1037,7 @@ fn clean_set_ptr(set: *const SetHeader) -> *const SetHeader {
     let addr = set as usize;
     match unsafe { crate::value::addr_class::try_read_gc_header(addr) } {
         Some(header) if header.obj_type == crate::gc::GC_TYPE_SET => set,
-        Some(header) if header.obj_type == crate::gc::GC_TYPE_OBJECT => {
+        Some(header) if crate::gc_type_is_object!(header.obj_type) => {
             crate::object::map_set_subclass::redirect_collection_receiver(
                 addr,
                 crate::object::map_set_subclass::CollectionKind::Set,

@@ -135,13 +135,13 @@ pub extern "C" fn js_process_exit(code: f64) {
 ///    `process.exit(3)` and an uncaught throw into status 9).
 ///
 /// Only SYNCHRONOUS work inside a listener is honoured; see
-/// `crate::os::js_process_emit_exit` for why that needs no suppression.
+/// `crate::os_hook_slots::js_process_emit_exit` for why that needs no suppression.
 pub(crate) fn run_process_exit_sequence(publish: Option<i32>) -> i32 {
     if let Some(code) = publish {
         PROCESS_EXIT_CODE.with(|c| c.set(JSValue::number(code as f64).bits()));
     }
     let code = js_process_pending_exit_code();
-    crate::os::js_process_emit_exit(code as f64);
+    crate::os_hook_slots::js_process_emit_exit(code as f64);
     js_process_pending_exit_code()
 }
 
@@ -317,6 +317,7 @@ fn throw_exit_code_range_error(n: f64) -> ! {
 /// Node's behavior — atexit handlers and other shutdown logic are skipped.
 #[no_mangle]
 pub extern "C" fn js_process_abort() {
+    crate::process::worker_restrictions::ensure_worker_operation_allowed("abort");
     #[cfg(unix)]
     unsafe {
         libc::abort();
@@ -373,11 +374,13 @@ pub extern "C" fn js_process_raw_debug() -> f64 {
 
 #[no_mangle]
 pub extern "C" fn js_process_debug_process() -> f64 {
+    crate::process::worker_restrictions::ensure_worker_operation_allowed("_debugProcess");
     undefined_value()
 }
 
 #[no_mangle]
 pub extern "C" fn js_process_debug_end() -> f64 {
+    crate::process::worker_restrictions::ensure_worker_operation_allowed("_debugEnd");
     undefined_value()
 }
 
@@ -636,7 +639,7 @@ extern "C" fn process_warning_callback(
         let _ = writeln!(stderr, "{hint}");
     }
 
-    crate::os::emit_process_event("warning", &[warning_handle.get_nanbox_f64()]);
+    crate::os_hook_slots::emit_process_event("warning", &[warning_handle.get_nanbox_f64()]);
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
@@ -1417,7 +1420,7 @@ fn env_name_is_settable(name: &str) -> bool {
 }
 
 fn js_process_env_impl() -> f64 {
-    ipc::process_ipc_ensure_initialized();
+    super::ipc_hooks::ensure_initialized();
     let cached = CACHED_ENV.with(|c| c.get());
     if cached != 0.0 {
         return cached;
@@ -1427,7 +1430,7 @@ fn js_process_env_impl() -> f64 {
     // Pad alloc_limit so small env sets still have headroom; large
     // environments (CI runners) spill to the overflow Vec path.
     let alloc_limit = std::cmp::max(vars.len() as u32, crate::object::INLINE_SLOT_FLOOR as u32);
-    let obj = crate::object::js_object_alloc(0, alloc_limit);
+    let obj = crate::realm_decl! { birth crate::object::js_object_alloc(0, alloc_limit); realm { process.env, kind = exotic, members = { }; } };
     for (k, v) in &vars {
         #[cfg(windows)]
         ENV_KEY_CASING.with(|casing| {

@@ -95,8 +95,7 @@ fn expando_lookup(addr: usize, key: &str) -> Option<u64> {
             return None;
         }
         let keys = super::object_keys(bag);
-        let slot =
-            super::keys_find_property_slot_by_bytes(keys.arr(), keys.count(), key.as_bytes())?;
+        let slot = super::keys_find_property_slot_by_bytes(keys, keys.count(), key.as_bytes())?;
         Some(super::key_attrs::object_slot_data(bag, slot).bits())
     }
 }
@@ -109,9 +108,7 @@ fn expando_remove(addr: usize, key: &str) -> bool {
             return false;
         }
         let keys = super::object_keys(bag);
-        if super::keys_find_property_slot_by_bytes(keys.arr(), keys.count(), key.as_bytes())
-            .is_none()
-        {
+        if super::keys_find_property_slot_by_bytes(keys, keys.count(), key.as_bytes()).is_none() {
             return false;
         }
         let key = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
@@ -520,7 +517,7 @@ mod tests {
         let set = crate::set::js_set_alloc(4) as usize;
         let error = crate::error::js_error_new() as usize;
         let promise = crate::promise::js_promise_new() as usize;
-        let date = crate::date::js_date_new();
+        let date = crate::date_hook_slots::js_date_new();
         assert!(exotic_expando_kind(map) == Some(ExoticKind::Map));
         assert!(exotic_expando_kind(set) == Some(ExoticKind::Set));
         assert!(exotic_expando_kind(error) == Some(ExoticKind::Error));

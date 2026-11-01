@@ -64,6 +64,7 @@ impl<'a> Gen<'a> {
                 && vc.builtins.is_empty()
                 && vc.arrays.is_empty()
                 && vc.boxes.is_empty()
+                && vc.indexed_owners.is_empty()
                 && vc.layouts.iter().all(|c| !unit_in.broken(&c.display));
             if !described {
                 continue;
@@ -79,8 +80,8 @@ impl<'a> Gen<'a> {
                         && !self.stand_ins.values().any(|s| s.1 as usize == i)
                         && !self.m.foreign.contains_key(&(i as TmplId))
                 });
-                let tm = match own {
-                    Some(i) => i as TmplId,
+                let tm = match own.map(|i| i as TmplId).or_else(|| self.own_layout(cc)) {
+                    Some(tm) => tm,
                     None => {
                         self.stand_in_class(0, cc);
                         self.stand_ins[&cc.display].1
@@ -97,7 +98,9 @@ impl<'a> Gen<'a> {
     /// the join over every unit) is called only by this unit's code: its
     /// parameter markers stand for no value of another unit (as a closed
     /// function's with no callers, decision 13), so what this unit passes
-    /// is what its parameters hold (`Model::beside_values`). The join only
+    /// is what its parameters hold (`Model::beside_values`). DECISIONS 224:
+    /// a function published to a known closed callee (DECISIONS 223) reads
+    /// it the same way (`Model::method_described`). The join only
     /// grows, and a newly run method solves the owner again (`units::run`).
     /// A unit over the bound may run any; a call through an escaped method
     /// is a census report that breaks it. An accessor runs on a get or a
@@ -162,6 +165,75 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// DECISIONS 210: a contract function of this unit that some unit
+    /// constructs (`Published::ctor_runs`: the join of what their `new`s
+    /// pass) is constructed here with their union, as the whole program
+    /// constructs it where each `new` is: its instances are this unit's
+    /// `new <f>` layout, published to them (`contract_check`,
+    /// `contracts::fn_inst_contract`). A constructing unit that passes what
+    /// no contract describes constructs it with unknown arguments. A
+    /// function the census broke is held by unknown code, which may
+    /// construct it with anything: the one rule for that
+    /// (`Model::construct_unknown`, DECISIONS 210/211) constructs it with
+    /// unknown arguments and its instance escapes, so a layout of it never
+    /// claims what no unit wrote.
+    pub(crate) fn published_ctors(&mut self) {
+        let Some(unit_in) = self.unit_in else {
+            return;
+        };
+        if unit_in.eval_scopes() {
+            return;
+        }
+        let rb = self
+            .m
+            .reason("constructed by unknown code: the census broke the function");
+        for f in 0..self.m.funcs.len() as FnIdx {
+            let fi = &self.m.funcs[f as usize];
+            if fi.module != 0
+                || fi.func_id == u32::MAX
+                || fi.ctor_of.is_some()
+                || fi.lexical_this
+                || fi.gen_step
+            {
+                continue;
+            }
+            let token = fi.token;
+            let n = fi.params.len();
+            let name = crate::contracts::fn_contract_name(self, f).0;
+            let broken = unit_in.broken(&format!("fn:{name}"));
+            let runs = unit_in.ctor_runs.get(&name);
+            if broken {
+                self.m.construct_unknown(token, f, rb);
+                continue;
+            }
+            let Some(runs) = runs else {
+                continue;
+            };
+            let known = Some(runs).filter(|ac| !ac.top);
+            let mut args = Vec::with_capacity(n);
+            for i in 0..n {
+                let node = match known.and_then(|ac| ac.params.get(i)) {
+                    Some(vc) if !vc.unknown => {
+                        self.stand_in_value(0, &format!("{name}:new{i}"), vc)
+                    }
+                    // A call passing fewer arguments passes undefined.
+                    None if known.is_some() => {
+                        let node = self.m.node_named("arg", || format!("new{i}({name})"));
+                        self.m.add_prim(node, prim::UNDEF);
+                        node
+                    }
+                    _ => self.m.top_val("argument of another unit's construction"),
+                };
+                args.push(node);
+            }
+            let (call, ret) = self.new_call(crate::model::ThisArg::Undef, args, Vec::new());
+            self.m.contract_new.insert(call);
+            let fnode = self.tok_node(token);
+            self.m.cons(fnode, Cons::New { call });
+            self.m.own_ctor_runs.push((f, ret));
+        }
+    }
+
     /// This unit's own class named by display: a class has one defining
     /// unit (a literal shape may have several, DECISIONS 112).
     pub(super) fn own_class(&self, display: &str) -> Option<TmplId> {
@@ -169,6 +241,26 @@ impl<'a> Gen<'a> {
             .get(display)
             .copied()
             .filter(|tm| !self.m.foreign.contains_key(tm))
+    }
+
+    /// DECISIONS 210: this unit's own template of a layout described back
+    /// to it: its class's, or, for a constructor function's instances
+    /// (`fn_inst`), the `new <f>` template of its own function `f`, whose
+    /// facts this solve makes (a reader's `new` runs here,
+    /// `published_ctors`): never a stand-in of its own layout.
+    pub(super) fn own_layout(&mut self, cc: &crate::units::ClassContract) -> Option<TmplId> {
+        if let Some(tm) = self.own_class(&cc.display) {
+            return Some(tm);
+        }
+        if !cc.fn_inst {
+            return None;
+        }
+        let f = (0..self.m.funcs.len() as FnIdx).find(|&f| {
+            let fi = &self.m.funcs[f as usize];
+            fi.module == 0 && fi.func_id != u32::MAX && fi.name == cc.name
+        })?;
+        let tm = self.m.fn_inst_template(f);
+        (!self.m.foreign.contains_key(&tm)).then_some(tm)
     }
 
     pub(super) fn value_contract_for(
@@ -192,6 +284,10 @@ impl<'a> Gen<'a> {
         c: &'a crate::units::ValueContract,
     ) -> NodeId {
         let n = self.m.node_named("value", || format!("value({local})"));
+        if let Some(trace) = &mut self.m.diagnostic {
+            trace.contract_inputs.insert(n, (format!("local={local};module={mi};unknown={};prim={};fns={:?};layouts={:?};arrays={:?}", c.unknown,c.prim,c.fns.iter().map(|f| &f.name).collect::<Vec<_>>(),c.layouts.iter().map(|l| &l.display).collect::<Vec<_>>(),c.arrays), crate::diagnostics::why_json(c)));
+        }
+
         let broken = |g: &Self, d: &str| g.unit_in.is_some_and(|u| u.broken(d));
         for cc in &c.layouts {
             if broken(self, &cc.display) {
@@ -203,7 +299,7 @@ impl<'a> Gen<'a> {
             // caller passes this unit's instances to its closed
             // constructor, DECISIONS 133): its own template, whose facts
             // this solve makes, as for the class value (DECISIONS 120).
-            let tm = match self.own_class(&cc.display) {
+            let tm = match self.own_layout(cc) {
                 Some(tm) => tm,
                 None => {
                     self.stand_in_class(mi, cc);
@@ -271,6 +367,43 @@ impl<'a> Gen<'a> {
         for &ns in &c.builtins {
             let t = self.m.tok(TokKind::Builtin(ns));
             self.m.add_tok(n, t);
+        }
+        for o in &c.indexed_owners {
+            for d in &o.allocations {
+                let report = format!("owner:{d}");
+                if broken(self, &report) {
+                    self.m.add_top(n, |_| "broken native owner contract".into());
+                    continue;
+                }
+                let t = if let Some((_, t)) = self.stand_in_tas.iter().find(|(r, _)| r == &report) {
+                    *t
+                } else {
+                    let (t, _) = self.bobj(mi, "TypedArray");
+                    let tm = self.m.tmpl_of(t).unwrap();
+                    self.m.tmpls[tm as usize].display = d.clone();
+                    self.m.ta_elem.insert(tm, o.kind);
+                    self.m.ta_min_len.insert(tm, o.min_len);
+                    if let Some(len) = o.exact_len {
+                        self.m.ta_exact_len.insert(tm, len);
+                    }
+                    self.stand_in_tas.push((report, t));
+                    t
+                };
+                let tm = self.m.tmpl_of(t).unwrap();
+                if self.m.ta_elem.get(&tm).copied() != Some(o.kind) {
+                    self.m
+                        .add_top(n, |_| "conflicting native owner brands".into());
+                    continue;
+                }
+                self.m
+                    .ta_min_len
+                    .entry(tm)
+                    .and_modify(|n| *n = (*n).min(o.min_len));
+                if self.m.ta_exact_len.get(&tm).copied() != o.exact_len {
+                    self.m.ta_exact_len.remove(&tm);
+                }
+                self.m.add_tok(n, t);
+            }
         }
         // DECISIONS 94: another unit's array.
         for d in &c.arrays {
@@ -358,7 +491,9 @@ impl<'a> Gen<'a> {
             proto_members: vec![],
             parent_value: None,
             parent_links: Vec::new(),
+            null_proto: false,
             declared: vec![],
+            reserved: Vec::new(),
         });
         let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
         self.stand_in_arrs.insert(display.to_string(), t);
@@ -399,46 +534,19 @@ impl<'a> Gen<'a> {
             g.m.add_top(n, |_| "field of another unit's class".into());
             g.m.add_prim(n, prim::ALL);
         };
+        // A field whose description the join changed holds what `c`
+        // describes as well (the old description is built already): the
+        // join keeps every description (`ClassContract::join`), so nothing
+        // the owner described becomes ⊤ here. Built once `c` is joined in,
+        // as a nested description may meet this layout again.
+        let mut wire: Vec<(NodeId, String)> = Vec::new();
         for fld in &joined.facts.fields {
             let a = self.m.atom(&fld.key);
             let n = self.m.field(inst, a);
-            let fns = |cc: &crate::units::ClassContract| {
-                cc.field_fns
-                    .iter()
-                    .find(|(k, _)| k == &fld.key)
-                    .map(|(_, f)| f.clone())
-            };
-            let layouts = |cc: &crate::units::ClassContract| {
-                cc.field_layouts
-                    .iter()
-                    .find(|(k, _, _)| k == &fld.key)
-                    .cloned()
-            };
-            let kind = |cc: &crate::units::ClassContract| {
-                cc.facts
-                    .fields
-                    .iter()
-                    .find(|f| f.key == fld.key)
-                    .map(|f| (f.kind.clone(), f.definite))
-            };
-            // The join keeps field functions only where every description
-            // names them: the old ones are wired, the new ones are `c`'s.
-            if fns(&joined).is_some() {
-                if let Some((_, fcs)) = c.field_fns.iter().find(|(k, _)| k == &fld.key) {
-                    for fc in fcs {
-                        let v = self.stand_in_fn_of(mi, fc, Some((tm, false)));
-                        self.m.edge(v, n);
-                    }
-                }
-                continue;
+            let view = |cc| crate::units::field_views(cc, &fld.key);
+            if view(&joined) != view(&old) {
+                wire.push((n, fld.key.clone()));
             }
-            if layouts(&joined).is_some() && layouts(&joined) == layouts(&old) {
-                continue;
-            }
-            if layouts(&joined).is_none() && fns(&old).is_none() && kind(&joined) == kind(&old) {
-                continue;
-            }
-            top(self, n);
         }
         if joined.open_keys && !old.open_keys {
             let n = self.m.field_any(inst);
@@ -476,7 +584,90 @@ impl<'a> Gen<'a> {
             top(self, any);
         }
         self.m.foreign.insert(tm, joined.facts.clone());
+        if joined.ctor_returns {
+            self.m.foreign_ctor_returns.insert(tm);
+        }
         self.stand_in_cc.insert(tm, joined);
+        for (n, k) in wire {
+            self.wire_field(mi, tm, n, c, &k);
+        }
+    }
+
+    /// What `c` describes field `k` of stand-in `tm` to hold, into its node
+    /// `n` (`units::field_views`, as `stand_in_class` builds it).
+    fn wire_field(
+        &mut self,
+        mi: u32,
+        tm: TmplId,
+        n: NodeId,
+        c: &'a crate::units::ClassContract,
+        k: &str,
+    ) {
+        use crate::units::FieldView;
+        let inst = self.m.tok(TokKind::Obj(tm, NO_CTX));
+        for v in crate::units::field_views(c, k) {
+            match v {
+                FieldView::Ta(elem, p) => {
+                    let t = self.stand_in_ta(mi, &c.display, k, elem);
+                    self.m.add_tok(n, t);
+                    self.m.add_prim(n, p);
+                }
+                FieldView::Lay(ds, p) => {
+                    for d in &ds {
+                        if *d == c.display {
+                            self.m.add_tok(n, inst);
+                            continue;
+                        }
+                        match self.other_layout(d) {
+                            Some(ic) => {
+                                self.stand_in_class(mi, ic);
+                                let itm = self.stand_ins[&ic.display].1;
+                                let it = self.m.tok(TokKind::Obj(itm, NO_CTX));
+                                self.m.add_tok(n, it);
+                            }
+                            None => self
+                                .m
+                                .add_top(n, |_| "field of another unit's class".into()),
+                        }
+                    }
+                    if p {
+                        self.m.add_prim(n, prim::ALL);
+                    }
+                }
+                FieldView::Val(vc) => {
+                    let v = self.stand_in_value(mi, k, vc);
+                    self.m.edge(v, n);
+                }
+                FieldView::Fns(fcs) => {
+                    for fc in fcs {
+                        let v = self.stand_in_fn_of(mi, fc, Some((tm, false)));
+                        self.m.edge(v, n);
+                    }
+                }
+                FieldView::Plain(f) => {
+                    let kd = &f.kind;
+                    let undef = if f.definite { 0 } else { prim::UNDEF };
+                    let own = !c.literal_shape
+                        && !kd.objs.is_empty()
+                        && kd.objs.iter().all(|d| *d == c.display);
+                    if f.data_field
+                        && !kd.top
+                        && kd.funcs == 0
+                        && kd.builtin_objs == 0
+                        && (kd.objs.is_empty() && kd.prims != 0 || own)
+                    {
+                        if own {
+                            self.m.add_tok(n, inst);
+                        }
+                        self.m.add_prim(n, kd.prims | undef);
+                    } else {
+                        self.m
+                            .add_top(n, |_| "field of another unit's class".into());
+                        self.m.add_prim(n, prim::ALL);
+                    }
+                }
+            }
+        }
     }
 
     /// Another unit's class as this unit sees it through its contract
@@ -564,17 +755,25 @@ impl<'a> Gen<'a> {
         }
         let birth_keys = c.birth_keys.iter().map(|k| self.m.atom(k)).collect();
         let definite = c.definite.iter().map(|k| self.m.atom(k)).collect();
+        let reserved = c.reserved.iter().map(|k| self.m.atom(k)).collect();
         self.m.tmpls.push(Template {
-            kind: TmplKind::Class {
-                module: mi,
-                name: c.name.clone(),
-                class_id: c.class_id,
-                literal_shape: c.literal_shape,
+            // DECISIONS 210: a constructor function's instances keep their
+            // kind: no class id guards them, and their chain is the
+            // function's `prototype` (`Model::proto_node`).
+            kind: match c.fn_inst {
+                true => TmplKind::FnInst { func: ctor },
+                false => TmplKind::Class {
+                    module: mi,
+                    name: c.name.clone(),
+                    class_id: c.class_id,
+                    literal_shape: c.literal_shape,
+                },
             },
             display: c.display.clone(),
             birth_keys,
             definite,
             declared: Vec::new(),
+            reserved,
             parent: None,
             ctor: Some(ctor),
             native_parent: c.native_parent.clone(),
@@ -584,9 +783,13 @@ impl<'a> Gen<'a> {
             proto_members: Vec::new(),
             parent_value: None,
             parent_links: Vec::new(),
+            null_proto: false,
         });
         self.m.funcs[ctor as usize].ctor_of = Some(tm);
         self.m.foreign.insert(tm, c.facts.clone());
+        if c.ctor_returns {
+            self.m.foreign_ctor_returns.insert(tm);
+        }
         self.stand_in_cc.insert(tm, c.clone());
         // Its parent from another unit (DECISIONS 104): that class's own
         // stand-in, so an inherited method resolves up the chain as in the
@@ -610,7 +813,15 @@ impl<'a> Gen<'a> {
         // A literal layout has no class object: its `constructor` is
         // Object's, found up the chain (decision 17: what an argument
         // reaches is not the stand-in's class).
-        if !c.literal_shape {
+        if c.fn_inst {
+            // DECISIONS 210: the chain of a constructor function's instances
+            // is `f.prototype`: the stub's until `ctor_fn` (the function's
+            // own contract) takes its place below.
+            let pa = self.m.atom("prototype");
+            let ct = self.m.funcs[ctor as usize].token;
+            let pf = self.m.field(ct, pa);
+            self.m.add_tok(pf, proto);
+        } else if !c.literal_shape {
             let pa = self.m.atom("prototype");
             let pf = self.m.field(cobj, pa);
             self.m.add_tok(pf, proto);
@@ -676,6 +887,11 @@ impl<'a> Gen<'a> {
                 .add_top(any, |_| "static member of another unit's class".into());
             self.m.add_prim(any, prim::ALL);
         }
+        // Its prototype defines the contract's methods at class creation, as
+        // the defining unit's does: a lookup of one ends there
+        // (`Model::stops_at`) and never reaches a builtin prototype.
+        let pm: Vec<Atom> = c.methods.iter().map(|(k, _)| self.m.atom(k)).collect();
+        self.m.tmpls[tm as usize].proto_members = pm;
         let mut method_fns: Vec<(NodeId, &'a crate::units::FnContract)> = Vec::new();
         for (key, fname) in &c.methods {
             if let Some((_, fc)) = c.method_fns.iter().find(|(k, _)| k == key) {
@@ -710,22 +926,28 @@ impl<'a> Gen<'a> {
             // DECISIONS 126: a field holding only the defining unit's typed
             // arrays: one stand-in typed array per class and key, whose uses
             // here the census reports (`Gen::reports`).
+            // A field two descriptions joined (`ClassContract::join`) may
+            // carry several: it holds what each describes.
+            let mut described = false;
             if let Some((_, elem, p)) = c.field_tas.iter().find(|(k, _, _)| k == &fld.key) {
                 let t = self.stand_in_ta(mi, &c.display, &fld.key, *elem);
                 self.m.add_tok(n, t);
                 self.m.add_prim(n, *p);
-                continue;
+                described = true;
             }
             // A field holding only the defining unit's literal layouts:
             // instances of their stand-ins (§18.7), made below.
             if let Some(fl) = c.field_layouts.iter().find(|(k, _, _)| k == &fld.key) {
                 nested.push((n, fl));
-                continue;
+                described = true;
             }
             // A field forwarding other units' stand-ins: what its value
             // contract describes (DECISIONS 88), made below.
             if let Some(fv) = c.field_values.iter().find(|(k, _)| k == &fld.key) {
                 value_fields.push((n, fv));
+                described = true;
+            }
+            if described {
                 continue;
             }
             // A field holding only contract functions: their stand-ins,
@@ -802,6 +1024,12 @@ impl<'a> Gen<'a> {
         }
         for (fnode, (_, ds, prims)) in nested {
             for d in ds {
+                // This layout's own instances (a class's links, joined in
+                // as a nested layout by `ClassContract::join`).
+                if *d == c.display {
+                    self.m.add_tok(fnode, inst);
+                    continue;
+                }
                 // A broken layout is ⊤ to every reader (§11.3).
                 match self.other_layout(d) {
                     Some(ic) => {
@@ -849,6 +1077,17 @@ impl<'a> Gen<'a> {
             self.m.funcs[f as usize].ctor_of = Some(tm);
             self.m.funcs[ctor as usize].ctor_of = None;
             self.m.tmpls[tm as usize].ctor = Some(f);
+            if c.fn_inst {
+                // DECISIONS 210: the function is the constructor: its
+                // `prototype` is the chain, the chain's `constructor` is it.
+                self.m.tmpls[tm as usize].kind = TmplKind::FnInst { func: f };
+                let pa = self.m.atom("prototype");
+                let pf = self.m.field(t, pa);
+                self.m.add_tok(pf, proto);
+                let ca = self.m.atom("constructor");
+                let cf = self.m.field(proto, ca);
+                self.m.add_tok(cf, t);
+            }
             // DECISIONS 198: what a `new` (or a subclass's `super`) passes
             // the constructor still reaches the stub's parameters: a closed
             // class's constructions publish them (`closed_ctors`) and hand

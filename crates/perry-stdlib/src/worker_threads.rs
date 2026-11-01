@@ -7,7 +7,7 @@
 //! - parentPort.on('message', callback): Async stdin reader, dispatch on main thread
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -27,12 +27,18 @@ mod channel_pump;
 mod clone;
 mod direct_message;
 mod entry_table;
+mod environment_data;
 mod inbox;
 mod message_port;
+#[cfg(test)]
+mod message_port_receiver_tests;
+pub(crate) use message_port::dispatch_core_operation as dispatch_message_port_core_operation;
 mod parent_port;
 #[cfg(test)]
 mod parent_port_tests;
 mod thread_values;
+#[cfg(test)]
+mod worker_constructor_tests;
 mod worker_error;
 #[cfg(test)]
 mod worker_error_tests;
@@ -94,12 +100,6 @@ thread_local! {
     static STDIN_READER_STARTED: RefCell<bool> = const { RefCell::new(false) };
     /// Whether stdin has reached EOF
     static STDIN_EOF: RefCell<bool> = const { RefCell::new(false) };
-    /// Node-compatible per-thread environment data.
-    static ENVIRONMENT_DATA: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
-    /// Objects marked through worker_threads.markAsUntransferable().
-    static UNTRANSFERABLE_OBJECTS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
-    /// Objects marked through worker_threads.markAsUncloneable().
-    static UNCLONEABLE_OBJECTS: RefCell<HashSet<u64>> = RefCell::new(HashSet::new());
     /// Same-process MessageChannel ports keyed by port id (#3157).
     static MESSAGE_PORTS: RefCell<HashMap<u64, MessagePortState>> = RefCell::new(HashMap::new());
     /// Monotonic counter handing out MessagePort ids. Port ids start at 100 so
@@ -115,7 +115,7 @@ thread_local! {
     /// where its `parentPort.postMessage` events are delivered.
     static CURRENT_PARENT_AGENT: Cell<AgentId> = const { Cell::new(perry_runtime::agent::PRIMARY_AGENT) };
     /// workerData for the current in-process Worker.
-    static CURRENT_WORKER_DATA: RefCell<Option<WorkerData>> = const { RefCell::new(None) };
+    static CURRENT_WORKER_DATA: RefCell<Option<u64>> = const { RefCell::new(None) };
     /// Worker threadName for the current in-process Worker.
     static CURRENT_THREAD_NAME: RefCell<String> = const { RefCell::new(String::new()) };
     /// Worker resourceLimits for the current in-process Worker.
@@ -127,13 +127,6 @@ thread_local! {
     // The mutable-root scanner registry is thread-local, so these latches must be too.
     static ENVIRONMENT_DATA_GC_REGISTERED: Cell<bool> = const { Cell::new(false) };
     static WORKER_GC_REGISTERED: Cell<bool> = const { Cell::new(false) };
-}
-
-/// workerData is received once. Its adopted JS value is rooted by the existing
-/// worker scanner, rather than re-reading a consumed transfer on every getter.
-enum WorkerData {
-    Serialized(SerializedValue),
-    Received(u64),
 }
 
 /// Per-port state for a same-process MessageChannel (#3157). A `MessageChannel`
@@ -269,7 +262,7 @@ struct WorkerRecord {
     alive: bool,
     refed: bool,
     terminate_promise: Option<usize>,
-    async_resources: [perry_runtime::async_hooks::AsyncResourceIds; 3],
+    async_resources: [perry_runtime::async_hook_slots::AsyncResourceIds; 3],
     async_resource_bits: [u64; 3],
 }
 
@@ -403,11 +396,7 @@ fn ensure_worker_gc_scanner() {
 }
 
 fn scan_environment_data_roots_mut(visitor: &mut perry_runtime::gc::RuntimeRootVisitor<'_>) {
-    ENVIRONMENT_DATA.with(|data| {
-        for value in data.borrow_mut().values_mut() {
-            visitor.visit_nanbox_u64_slot(value);
-        }
-    });
+    environment_data::scan_roots(visitor);
     // Keep MessageChannel port listener closures live + rewritten across GC
     // moves (#3157). Stored as NaN-boxed closure value bits.
     MESSAGE_PORTS.with(|ports| {
@@ -513,7 +502,7 @@ pub(crate) mod thread_exit_probe {
             alive: false,
             refed: false,
             terminate_promise: None,
-            async_resources: [perry_runtime::async_hooks::AsyncResourceIds {
+            async_resources: [perry_runtime::async_hook_slots::AsyncResourceIds {
                 async_id: 0,
                 trigger_async_id: 0,
             }; 3],
@@ -532,7 +521,7 @@ pub(crate) mod thread_exit_probe {
 
 fn scan_worker_roots_mut(visitor: &mut perry_runtime::gc::RuntimeRootVisitor<'_>) {
     CURRENT_WORKER_DATA.with(|slot| {
-        if let Some(WorkerData::Received(bits)) = slot.borrow_mut().as_mut() {
+        if let Some(bits) = slot.borrow_mut().as_mut() {
             visitor.visit_nanbox_u64_slot(bits);
         }
     });
@@ -572,47 +561,6 @@ fn string_header_to_string(str_ptr: *const StringHeader) -> Option<String> {
 fn string_value_to_string(value: f64) -> Option<String> {
     let raw_ptr = perry_runtime::value::js_get_string_pointer_unified(value) as *const StringHeader;
     string_header_to_string(raw_ptr)
-}
-
-fn number_key_bits(value: f64) -> u64 {
-    if value == 0.0 {
-        0.0f64.to_bits()
-    } else if value.is_nan() {
-        f64::NAN.to_bits()
-    } else {
-        value.to_bits()
-    }
-}
-
-fn environment_data_key(value: f64) -> String {
-    let bits = value.to_bits();
-    let js_value = JSValue::from_bits(bits);
-
-    if js_value.is_any_string() {
-        if let Some(s) = string_value_to_string(value) {
-            return format!("string:{s}");
-        }
-    }
-    if js_value.is_int32() {
-        return format!(
-            "number:{:016x}",
-            number_key_bits(js_value.as_int32() as f64)
-        );
-    }
-    if js_value.is_number() {
-        return format!("number:{:016x}", number_key_bits(js_value.as_number()));
-    }
-    if js_value.is_bool() {
-        return format!("bool:{}", js_value.as_bool());
-    }
-    if js_value.is_null() {
-        return "null".to_string();
-    }
-    if js_value.is_undefined() {
-        return "undefined".to_string();
-    }
-
-    format!("bits:{bits:016x}")
 }
 
 fn js_undefined() -> f64 {
@@ -683,7 +631,7 @@ fn closure_value_with_worker_id(
     worker_id: u64,
 ) -> f64 {
     let closure = perry_runtime::closure::js_closure_alloc(info, 1);
-    perry_runtime::closure::js_closure_set_capture_ptr(closure, 0, worker_id as i64);
+    perry_runtime::closure::closure_set_capture_word(closure, 0, worker_id as i64);
     f64::from_bits(JSValue::pointer(closure as *const u8).bits())
 }
 
@@ -723,7 +671,7 @@ fn object_ptr_from_value(value: f64) -> Option<*mut perry_runtime::object::Objec
     unsafe {
         let header = (raw as *const u8).sub(perry_runtime::gc::GC_HEADER_SIZE)
             as *const perry_runtime::gc::GcHeader;
-        if (*header).obj_type != perry_runtime::gc::GC_TYPE_OBJECT {
+        if perry_runtime::gc_type_is_not_object!((*header).obj_type) {
             return None;
         }
     }
@@ -953,7 +901,7 @@ fn throw_invalid_state_error(detail: &str) -> ! {
 fn throw_dom_exception(name: &str, detail: &str) -> ! {
     let message = string_value(detail);
     let name = string_value(name);
-    let err = perry_runtime::event_target::js_dom_exception_new(message, name);
+    let err = perry_runtime::event_target_hook_slots::js_dom_exception_new(message, name);
     perry_runtime::exception::js_throw(f64::from_bits(JSValue::pointer(err as *const u8).bits()))
 }
 
@@ -1273,25 +1221,21 @@ fn worker_terminate_by_id(worker_id: u64) -> f64 {
 /// worker_threads.markAsUntransferable(object)
 #[no_mangle]
 pub extern "C" fn js_worker_threads_mark_as_untransferable(value: f64) -> f64 {
-    UNTRANSFERABLE_OBJECTS.with(|objects| {
-        objects.borrow_mut().insert(value.to_bits());
-    });
+    perry_runtime::clone_markers::mark_untransferable(value);
     js_undefined()
 }
 
 /// worker_threads.isMarkedAsUntransferable(object)
 #[no_mangle]
 pub extern "C" fn js_worker_threads_is_marked_as_untransferable(value: f64) -> f64 {
-    let marked = UNTRANSFERABLE_OBJECTS.with(|objects| objects.borrow().contains(&value.to_bits()));
+    let marked = perry_runtime::clone_markers::is_untransferable(value);
     js_bool(marked)
 }
 
 /// worker_threads.markAsUncloneable(object)
 #[no_mangle]
 pub extern "C" fn js_worker_threads_mark_as_uncloneable(value: f64) -> f64 {
-    UNCLONEABLE_OBJECTS.with(|objects| {
-        objects.borrow_mut().insert(value.to_bits());
-    });
+    perry_runtime::clone_markers::mark_uncloneable(value);
     js_undefined()
 }
 
@@ -1341,9 +1285,9 @@ pub extern "C" fn js_worker_threads_receive_message_on_port(port: f64) -> f64 {
     }
 }
 
-/// Recover a port id from a MessagePort JS object (the hidden `__perryPortId`).
+/// Recover the intrinsic private ID without observable property access.
 fn port_id_from_object(port: f64) -> Option<u64> {
-    object_u64_field(port, "__perryPortId")
+    perry_runtime::messaging::message_port_id(port).filter(|id| *id != 0)
 }
 
 fn broadcast_channel_id_from_object(channel: f64) -> Option<u64> {
@@ -1410,33 +1354,41 @@ pub extern "C" fn js_worker_threads_message_channel_new() -> f64 {
 
 #[no_mangle]
 pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> f64 {
+    let options_state = WorkerOptions::from_value(options);
+    worker_new_prepared(entry_ptr, options, options_state, None)
+}
+
+fn worker_new_prepared(
+    entry_ptr: i64,
+    options: f64,
+    mut options_state: WorkerOptions,
+    source: Option<String>,
+) -> f64 {
     ensure_worker_gc_scanner();
     ensure_worker_thread_exit_hook_registered();
     worker_pump::ensure_parent_event_retire_hook();
     crate::worker_threads::async_shim::ensure_pump_registered();
 
+    let process_state =
+        perry_runtime::process::WorkerProcessState::capture(options_state.env.as_deref())
+            .with_worker_argv(source, options_state.argv.take());
+    let payload =
+        match perry_runtime::exception::catch_js_throw(|| environment_data::prepare(options)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                drop(process_state);
+                drop(options_state);
+                perry_runtime::exception::js_throw(error)
+            }
+        };
     let worker_id = NEXT_WORKER_ID.fetch_add(1, Ordering::Relaxed);
-    let options_state = WorkerOptions::from_value(options);
-    let worker_data = if is_undefined(options) {
-        None
-    } else {
-        let data = get_object_field_from_value(options, "workerData");
-        if is_undefined(data) {
-            None
-        } else {
-            let scope = perry_runtime::gc::RuntimeHandleScope::new();
-            let data = scope.root_nanbox_f64(data);
-            let transfer = get_object_field_from_value(options, "transferList");
-            Some(clone_message(data.get_nanbox_f64(), transfer))
-        }
-    };
     let (tx, rx) = mpsc::channel::<WorkerCommand>();
     let sender = WorkerSender::new(tx);
     let published_agent = sender.agent.clone();
     let termination = sender.termination.clone();
     let worker_obj = worker_object(worker_id, &options_state);
     let resource_scope = perry_runtime::gc::RuntimeHandleScope::new();
-    let mut async_resources = [perry_runtime::async_hooks::AsyncResourceIds {
+    let mut async_resources = [perry_runtime::async_hook_slots::AsyncResourceIds {
         async_id: 0,
         trigger_async_id: 0,
     }; 3];
@@ -1448,7 +1400,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
         let resource = perry_runtime::object::js_object_alloc_null_proto(0, 0);
         let resource_handle = resource_scope
             .root_nanbox_f64(perry_runtime::value::js_nanbox_pointer(resource as i64));
-        async_resources[index] = perry_runtime::async_hooks::init_resource(
+        async_resources[index] = perry_runtime::async_hook_slots::init_resource(
             type_name,
             resource_handle.get_nanbox_f64(),
             true,
@@ -1479,7 +1431,7 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
     // only latches for an agent holding a route slot.
     perry_runtime::event_pump::claim_agent_loop_route();
 
-    let thread_options = options_state.clone();
+    let thread_options = options_state;
     // Captured on the creating thread: this Worker's events go to THIS agent.
     let parent_agent = perry_runtime::agent::current_agent();
     // #8546: the Worker re-runs its module bodies on its own thread, but it is
@@ -1526,8 +1478,8 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
             let previous_env = apply_worker_env(&thread_options.env);
             CURRENT_WORKER_ID.with(|id| id.set(worker_id));
             CURRENT_PARENT_AGENT.with(|agent| agent.set(parent_agent));
-            CURRENT_WORKER_DATA
-                .with(|slot| *slot.borrow_mut() = worker_data.map(WorkerData::Serialized));
+            environment_data::install(payload);
+            process_state.install();
             CURRENT_THREAD_NAME
                 .with(|slot| *slot.borrow_mut() = thread_options.thread_name.clone());
             CURRENT_RESOURCE_LIMITS.with(|slot| slot.set(thread_options.resource_limits));
@@ -1647,62 +1599,18 @@ pub extern "C" fn js_worker_threads_worker_new(entry_ptr: i64, options: f64) -> 
     object_value(worker_obj)
 }
 
-/// worker_threads.setEnvironmentData(key, value)
-/// Stores data for this thread. An undefined value deletes the key.
-#[no_mangle]
-pub extern "C" fn js_worker_threads_set_environment_data(key: f64, value: f64) -> f64 {
-    ensure_environment_data_gc_scanner();
-    let key = environment_data_key(key);
-    let value_bits = value.to_bits();
+pub use environment_data::{
+    js_worker_threads_get_environment_data, js_worker_threads_set_environment_data,
+};
 
-    ENVIRONMENT_DATA.with(|data| {
-        let mut data = data.borrow_mut();
-        if JSValue::from_bits(value_bits).is_undefined() {
-            data.remove(&key);
-        } else {
-            data.insert(key, value_bits);
-        }
-    });
-
-    js_undefined()
-}
-
-/// worker_threads.getEnvironmentData(key)
-#[no_mangle]
-pub extern "C" fn js_worker_threads_get_environment_data(key: f64) -> f64 {
-    ensure_environment_data_gc_scanner();
-    let key = environment_data_key(key);
-    ENVIRONMENT_DATA.with(|data| {
-        f64::from_bits(
-            data.borrow()
-                .get(&key)
-                .copied()
-                .unwrap_or_else(|| JSValue::undefined().bits()),
-        )
-    })
-}
-
-/// Get workerData from PERRY_WORKER_DATA environment variable
-/// Returns the JSON-parsed value as a NaN-boxed f64
+/// Returns the worker-local value, or the process-mode environment payload.
 #[no_mangle]
 pub extern "C" fn js_worker_threads_get_worker_data() -> f64 {
     ensure_worker_gc_scanner();
-    // Release the TLS borrow before allocating: the root scanner visits this
-    // slot during deserialization. A pending serialized message owns no GC edge.
-    let data = CURRENT_WORKER_DATA.with(|slot| slot.borrow_mut().take());
-    if let Some(data) = data {
-        let bits = match data {
-            WorkerData::Serialized(data) => unsafe { deserialize_nanbox_on_current_thread(&data) },
-            WorkerData::Received(bits) => bits,
-        };
-        CURRENT_WORKER_DATA.with(|slot| *slot.borrow_mut() = Some(WorkerData::Received(bits)));
+    if let Some(bits) = CURRENT_WORKER_DATA.with(|slot| *slot.borrow()) {
         return f64::from_bits(bits);
     }
-    // Node defaults `workerData` to `null` (typeof === "object") on the main
-    // thread and in workers spawned without a workerData option — not
-    // `undefined`. CURRENT_WORKER_DATA above carries the in-worker payload;
-    // this fallback must stay `null` to match the value-only main-thread
-    // surface (#3899) that the namespace getter now routes through here.
+    // Process-mode workers do not receive an in-process clone payload.
     let data = std::env::var("PERRY_WORKER_DATA").unwrap_or_else(|_| "undefined".to_string());
     if data == "undefined" || data.is_empty() {
         return f64::from_bits(JSValue::null().bits());

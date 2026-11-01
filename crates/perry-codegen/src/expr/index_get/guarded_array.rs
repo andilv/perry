@@ -221,7 +221,11 @@ pub(in crate::expr) fn emit_array_guard_word(
 
 /// `(word & MASK) == EXPECT` and a null named layout: an ordinary array, not
 /// forwarded, no element descriptors.
-fn emit_array_guard_word_ok(blk: &mut crate::block::LlBlock, word: &str, handle: &str) -> String {
+pub(in crate::expr) fn emit_array_guard_word_ok(
+    blk: &mut crate::block::LlBlock,
+    word: &str,
+    handle: &str,
+) -> String {
     let masked = blk.and(I32, word, ARRAY_READ_GUARD_MASK_I32);
     let word_ok = blk.icmp_eq(I32, &masked, ARRAY_READ_GUARD_EXPECT_I32);
     emit_and_no_named_layout(blk, &word_ok, handle)
@@ -1065,6 +1069,8 @@ mod compact_read_tests {
     #[test]
     fn compact_array_read_guards_own_slot_and_sends_holes_cold() {
         let ll = ir(vec![Stmt::Return(Some(Expr::IndexGet {
+            byte_offset: 0,
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             index: Box::new(Expr::Integer(1)),
         }))]);
@@ -1092,6 +1098,7 @@ mod compact_read_tests {
     #[test]
     fn compact_array_length_uses_header_and_generic_miss() {
         let ll = ir(vec![Stmt::Return(Some(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "length".into(),
             byte_offset: 0,
@@ -1107,6 +1114,8 @@ mod compact_read_tests {
     #[test]
     fn rejected_keys_share_one_body_across_sites() {
         let read = || Expr::IndexGet {
+            byte_offset: 0,
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             index: Box::new(Expr::LocalGet(2)),
         };

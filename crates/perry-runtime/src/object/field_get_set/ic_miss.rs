@@ -244,9 +244,9 @@ pub(crate) fn get_field_miss(obj: *const ObjectHeader, key: *const crate::String
         let addr = obj as u64;
         if crate::value::addr_class::is_proxy_cell(addr as usize) {
             let boxed = f64::from_bits(crate::value::POINTER_TAG | (addr & 0x0000_FFFF_FFFF_FFFF));
-            if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
+            if crate::proxy_hooks::proxy_is_proxy(boxed) != 0 {
                 let key_f64 = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
-                return crate::proxy::js_proxy_get(boxed, key_f64);
+                return crate::proxy_hooks::proxy_get(boxed, key_f64);
             }
         }
     }
@@ -292,10 +292,12 @@ pub(crate) fn get_field_miss(obj: *const ObjectHeader, key: *const crate::String
                 if super::has_property::closure_get_is_complete(obj as usize, key) {
                     return f64::from_bits(crate::value::TAG_UNDEFINED);
                 }
-                let binary_receiver = crate::typedarray::is_offheap_sidetable_alloc(obj as usize);
+                let binary_receiver =
+                    crate::typedarray_hook_slots::is_offheap_sidetable_alloc(obj as usize);
                 if binary_receiver
                     && (crate::buffer::is_registered_buffer(obj as usize)
-                        || crate::typedarray::lookup_typed_array_kind(obj as usize).is_some())
+                        || crate::typedarray_hook_slots::lookup_typed_array_kind(obj as usize)
+                            .is_some())
                 {
                     let value = js_object_get_field_by_name(obj, key);
                     return f64::from_bits(value.bits());
@@ -307,9 +309,9 @@ pub(crate) fn get_field_miss(obj: *const ObjectHeader, key: *const crate::String
         {
             let boxed =
                 f64::from_bits(crate::value::POINTER_TAG | ((obj as u64) & 0x0000_FFFF_FFFF_FFFF));
-            if crate::proxy::js_proxy_is_proxy(boxed) != 0 {
+            if crate::proxy_hooks::proxy_is_proxy(boxed) != 0 {
                 let key_f64 = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
-                return crate::proxy::js_proxy_get(boxed, key_f64);
+                return crate::proxy_hooks::proxy_get(boxed, key_f64);
             }
         }
         unsafe {
@@ -390,13 +392,13 @@ mod ladder_skip_tests {
         // The OWN-key miss — the read every megamorphic site takes, and the
         // one the ladder skip was measured on. It resolves in the keys scan
         // and returns before the handler's by-name tail.
-        let before = crate::typedarray::test_typed_array_registry_probe_count();
+        let before = crate::typedarray_hook_slots::test_typed_array_registry_probe_count();
         let hit = obj.with_mut_ptr(|o: *mut ObjectHeader| {
             present.with_const_ptr(|k| super::get_field_miss(o, k))
         });
         assert_eq!(hit, 3.0, "test premise: the own key is answered");
         assert_eq!(
-            crate::typedarray::test_typed_array_registry_probe_count(),
+            crate::typedarray_hook_slots::test_typed_array_registry_probe_count(),
             before,
             "a GC_TYPE_OBJECT receiver must skip the closure/buffer/typed-array \
              ladder: its kind byte already rules all three out (#10828, rule 3)"
@@ -413,11 +415,11 @@ mod ladder_skip_tests {
         // The ladder still runs for a receiver that is not an object: a dense
         // array asked for a non-`length` key reaches the typed-array probe.
         let arr = crate::array::js_array_alloc(2);
-        let before = crate::typedarray::test_typed_array_registry_probe_count();
+        let before = crate::typedarray_hook_slots::test_typed_array_registry_probe_count();
         let v = absent.with_const_ptr(|k| super::get_field_miss(arr as *const ObjectHeader, k));
         assert_eq!(v.to_bits(), crate::value::TAG_UNDEFINED);
         assert!(
-            crate::typedarray::test_typed_array_registry_probe_count() > before,
+            crate::typedarray_hook_slots::test_typed_array_registry_probe_count() > before,
             "test premise: a non-object receiver still walks the ladder, so the \
              counter this test reads is live"
         );
@@ -514,6 +516,13 @@ pub(crate) fn private_lexical_brand_unwind_to(sp: usize) {
     });
 }
 
+#[cfg(any(test, target_os = "wasi"))]
+pub(crate) fn private_lexical_brand_restore_depth(depth: usize) {
+    PRIVATE_LEXICAL_BRAND_STACK.with(|stack| {
+        stack.borrow_mut().restore_depth(depth);
+    });
+}
+
 pub(crate) fn private_lexical_brand_check_marks(sp: usize) {
     PRIVATE_LEXICAL_BRAND_STACK.with(|stack| {
         crate::exception::marks::check_marks(stack.borrow().marks(), sp, "private_lexical_brand")
@@ -572,7 +581,8 @@ pub(crate) unsafe fn stamp_private_evaluation_brand(obj: *mut ObjectHeader, clas
     if obj.is_null() || !super::super::class_registry::is_class_object_value(class_value) {
         return;
     }
-    let meta = (*obj).meta;
+    // A1_UNPROVEN: record-first: ic_miss entry (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _));
     if (meta.is_null() || (*meta).private_evaluation_brand == 0)
         && crate::object::shapes::object_evaluation_brand(obj) == class_value.to_bits()
     {
@@ -582,7 +592,8 @@ pub(crate) unsafe fn stamp_private_evaluation_brand(obj: *mut ObjectHeader, clas
     let obj_handle = scope.root_raw_mut_ptr(obj);
     let class_handle = scope.root_nanbox_f64(class_value);
     let (meta, _) =
-        obj_handle.across_mut::<ObjectHeader, _>(|| crate::object::object_meta_ensure(obj));
+        // A1_UNPROVEN: instance from a JS value, no type test (kind-A/B question for S0b-S0e).
+        obj_handle.across_mut::<ObjectHeader, _>(|| crate::object::object_meta_ensure(crate::meta_obj_runtime_born!(obj), crate::object::MetaReason::EvalBrand));
     let brand = class_handle.get_nanbox_f64().to_bits();
     (*meta).private_evaluation_brand = brand;
     crate::gc::runtime_write_barrier_slot(
@@ -648,7 +659,8 @@ fn private_evaluation_brand(value: f64, declaring_class_id: u32) -> Option<u64> 
 /// ordinary instances carry their evaluation on the shape.
 #[inline]
 unsafe fn private_receiver_evaluation_bits(object: *const ObjectHeader) -> u64 {
-    let meta = (*object).meta;
+    // A1_UNPROVEN: record-first: ic_miss entry (kind-A/B question for S0f).
+    let meta = crate::meta_read!(crate::meta_obj_runtime_born!(object as *mut _));
     if !meta.is_null() && (*meta).private_evaluation_brand != 0 {
         return (*meta).private_evaluation_brand;
     }
@@ -1121,7 +1133,7 @@ fn private_guard_checked(
     let brand_owner_root = scope.root_nanbox_f64(brand_owner);
     let field_name = interned.unwrap_or("");
     if is_static
-        && (crate::proxy::js_proxy_is_proxy(obj) != 0
+        && (crate::proxy_hooks::proxy_is_proxy(obj) != 0
             || !private_static_receiver_is_constructor(obj))
     {
         throw_private_brand_mismatch(

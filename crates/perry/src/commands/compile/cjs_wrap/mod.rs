@@ -66,12 +66,14 @@ mod package_resolution_tests;
 mod parcel_watcher_tests;
 #[cfg(test)]
 mod preamble_canary_tests;
+#[cfg(test)]
+mod static_edge_tests;
 
 // Cross-sibling helpers — siblings reach for these via `use super::*;`.
 use deferred_requires::deferred_require_specs_for_path;
 use detect::is_js_reserved_word;
 use extract_exports::{
-    extract_exports_from_source, extract_named_exports_from_require,
+    export_key_is_own_binding, extract_exports_from_source, extract_named_exports_from_require,
     extract_object_literal_exports_from_require, extract_single_module_exports_assignment,
     module_reexport_specs,
 };
@@ -87,7 +89,7 @@ use hoist_classes::{
 };
 
 // Public API consumed by `compile.rs` / `collect_modules.rs`.
-pub(super) use detect::is_commonjs;
+pub(super) use detect::{declared_module_format_is_esm, is_commonjs};
 #[cfg(test)]
 use wrap::wrap_commonjs_for_target;
 pub(super) use wrap::wrap_commonjs_with_addon_paths;

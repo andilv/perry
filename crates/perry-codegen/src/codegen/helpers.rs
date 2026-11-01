@@ -521,6 +521,34 @@ pub(crate) fn write_barriers_enabled() -> bool {
 }
 
 thread_local! {
+    static JS_TEXT_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The output section every compiled JS function is placed in on x86_64
+/// Linux. There the runtime unwinds by DWARF and meets every runtime frame;
+/// an `Error` capture keeps the JS frames only, and a frame is JS when its
+/// pc lies between the linker's `__start_`/`__stop_` symbols of this section:
+/// a range test on the code's own placement, no table (the runtime side is
+/// `error_stack_frames.rs`). Elsewhere the frame-pointer chain skips the
+/// runtime's frames by itself, so no section is named.
+pub(crate) const JS_TEXT_SECTION_NAME: &str = "perry_js_text";
+
+/// Whether the CURRENT module places its functions in
+/// [`JS_TEXT_SECTION_NAME`] (`set_js_text_section_for_target`).
+pub(crate) fn js_text_section() -> Option<&'static str> {
+    JS_TEXT_SECTION
+        .with(|c| c.get())
+        .then_some(JS_TEXT_SECTION_NAME)
+}
+
+pub(crate) fn set_js_text_section_for_target(triple: &str) {
+    let on = triple.starts_with("x86_64")
+        && target_os_of(triple) == Some("linux")
+        && !triple.contains("android");
+    JS_TEXT_SECTION.with(|c| c.set(on));
+}
+
+thread_local! {
     static FULL_OUTLINE_IC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static JSCVT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -941,6 +969,9 @@ pub fn resolve_target_triple(name: &str) -> Option<String> {
         // Standalone WASI (#11375): only a compiler built with `target-wasi`
         // knows the name; a default build keeps resolving it to None.
         "wasi" if cfg!(feature = "target-wasi") => Some("wasm32-unknown-wasip2".to_string()),
+        // The WASI preview1 flavour: a core module for hosts without the
+        // component model. The runtime and the link use `wasm32-wasip1`.
+        "wasip1" if cfg!(feature = "target-wasi") => Some("wasm32-unknown-wasip1".to_string()),
         "tvos" => Some("aarch64-apple-tvos".to_string()),
         "tvos-simulator" => Some("arm64-apple-tvos17.0-simulator".to_string()),
         "harmonyos" => Some("aarch64-unknown-linux-ohos".to_string()),
@@ -985,6 +1016,7 @@ pub const TARGET_NAMES: &[&str] = &[
     "watchos",
     "watchos-simulator",
     "wasi",
+    "wasip1",
     "tvos",
     "tvos-simulator",
     "harmonyos",
@@ -1091,7 +1123,7 @@ mod target_os_tests {
                 "ios" | "ios-simulator" => "ios",
                 "visionos" | "visionos-simulator" => "visionos",
                 "watchos" | "watchos-simulator" => "watchos",
-                "wasi" => "wasi",
+                "wasi" | "wasip1" => "wasi",
                 "tvos" | "tvos-simulator" => "tvos",
                 "harmonyos" | "harmonyos-simulator" => "ohos",
                 "android" | "android-x86_64" | "wearos" => "android",
@@ -1105,7 +1137,7 @@ mod target_os_tests {
             assert_eq!(target_os_of(name), Some(expected), "alias {name}");
             let Some(triple) = resolve_target_triple(name) else {
                 // WASI is deliberately available only in target-wasi builds.
-                assert_eq!(*name, "wasi");
+                assert!(matches!(*name, "wasi" | "wasip1"));
                 assert_eq!(target_os_of(name), Some(expected));
                 continue;
             };
@@ -1122,6 +1154,7 @@ mod target_os_tests {
             ("aarch64-pc-windows-msvc", "windows"),
             ("x86_64-unknown-linux-musl", "linux"),
             ("wasm32-unknown-wasip2", "wasi"),
+            ("wasm32-unknown-wasip1", "wasi"),
             ("aarch64-apple-ios", "ios"),
             ("arm64-apple-tvos17.0-simulator", "tvos"),
             ("arm64-apple-watchos10.0-simulator", "watchos"),
@@ -1724,7 +1757,11 @@ pub(super) fn emit_callee_binding_resolutions(
         // A statically-known callee takes the known-func_id guarded direct
         // path — a static, inlinable call — which beats the entry-resolved
         // indirect call this map would install.
-        if ctx.local_closure_func_ids.contains_key(&id) {
+        if ctx.local_closure_func_ids.contains_key(&id)
+            || (!ctx.wpfacts_off
+                && !ctx.target_triple.contains("wasm")
+                && ctx.wpfacts.local_bodies.contains_key(&id))
+        {
             continue;
         }
         // A `Function`-hinted binding is consumed by the guarded

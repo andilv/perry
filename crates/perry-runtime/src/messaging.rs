@@ -11,6 +11,11 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Mutex;
 
+mod port_operations;
+pub use port_operations::install_core_methods as install_message_port_core_methods;
+pub use port_operations::js_register_worker_threads_message_port_dispatch;
+pub use port_operations::{message_port_id, message_port_object_with_id, MessagePortOperation};
+
 type MessageChannelFactory = extern "C" fn() -> f64;
 type BroadcastChannelFactory = extern "C" fn(f64) -> f64;
 
@@ -114,19 +119,6 @@ extern "C" fn noop1(
     js_undefined()
 }
 
-extern "C" fn noop2(
-    _closure: *const ClosureHeader,
-    _this: crate::closure::JsThis,
-    _arg0: f64,
-    _arg1: f64,
-) -> f64 {
-    js_undefined()
-}
-
-extern "C" fn has_ref(_closure: *const ClosureHeader, _this: crate::closure::JsThis) -> f64 {
-    js_bool(false)
-}
-
 fn install_method(
     obj: *mut ObjectHeader,
     name: &str,
@@ -163,6 +155,7 @@ struct PortState {
     started: bool,
     /// `.close()` stops further delivery.
     closed: bool,
+    refed: bool,
     /// The current `onmessage` handler value (callable or null/undefined).
     onmessage: f64,
     /// `addEventListener("message", fn)` listeners (closure values).
@@ -171,9 +164,31 @@ struct PortState {
 
 static PORT_STATES: Mutex<Option<HashMap<usize, PortState>>> = Mutex::new(None);
 
-crate::perry_thread_local! {
-    // The mutable-root scanner registry is thread-local, so this latch must be too.
-    static GC_SCANNER_REGISTERED: Cell<bool> = const { Cell::new(false) };
+mod root_guard_tls {
+    use super::*;
+    type Value = Cell<bool>;
+    type Storage = crate::tls_hot::HotCell<Value, { std::mem::needs_drop::<Value>() as usize }>;
+    crate::__perry_thread_local_storage!(Storage, const { Value::new(false) });
+    pub(super) fn resolve(idx: u32) -> Result<*mut u8, crate::tls_hot::AccessError> {
+        STORAGE.try_with(|cell| {
+            cell.arm_guard(idx);
+            cell.value_addr()
+        })
+    }
+    pub(super) static KEY: crate::tls_hot::HotKey<Value> = crate::tls_hot::HotKey::new(
+        crate::tls_hot::SlotId::named(concat!(
+            module_path!(),
+            "::GC_SCANNER_REGISTERED@",
+            line!(),
+            ":",
+            column!()
+        )),
+        crate::messaging_hook_slots::resolve_root_guard,
+    );
+}
+use root_guard_tls::KEY as GC_SCANNER_REGISTERED;
+pub(crate) fn install_root_tls_resolver() {
+    crate::messaging_hook_slots::install_root_resolver(root_guard_tls::resolve);
 }
 
 fn ensure_gc_scanner_registered() {
@@ -440,7 +455,9 @@ fn start_port(self_ptr: usize) {
         return;
     }
     let pending = with_port_states(|map| {
-        let state = map.entry(self_ptr).or_default();
+        let Some(state) = map.get_mut(&self_ptr) else {
+            return 0;
+        };
         if state.closed {
             return 0;
         }
@@ -575,32 +592,7 @@ fn is_message_type(type_value: f64) -> bool {
 
 /// Install the delivery-capable method set + onmessage accessor on a port.
 fn install_port_methods(obj: *mut ObjectHeader) {
-    install_method(
-        obj,
-        "postMessage",
-        crate::fn_info!(port_post_message, 2; with_declared(2)),
-        2,
-    );
-    install_method(
-        obj,
-        "start",
-        crate::fn_info!(port_start, 0; with_declared(0)),
-        0,
-    );
-    install_method(
-        obj,
-        "close",
-        crate::fn_info!(port_close, 0; with_declared(0)),
-        0,
-    );
-    install_method(obj, "ref", crate::fn_info!(noop0, 0; with_declared(0)), 0);
-    install_method(obj, "unref", crate::fn_info!(noop0, 0; with_declared(0)), 0);
-    install_method(
-        obj,
-        "hasRef",
-        crate::fn_info!(has_ref, 0; with_declared(0)),
-        0,
-    );
+    port_operations::install_core_methods(obj);
     install_method(
         obj,
         "addEventListener",
@@ -632,9 +624,8 @@ fn install_port_methods(obj: *mut ObjectHeader) {
 }
 
 /// Install the Node-shaped prototype members for the three messaging
-/// constructors. The method bodies are intentionally small no-ops here; this
-/// slice is about constructor identity and shape, while full message delivery
-/// remains worker_threads parity follow-up work.
+/// constructors. MessagePort core methods share receiver-owned dispatch with
+/// both channel implementations.
 pub fn populate_messaging_prototype(builtin_name: &str, proto: *mut ObjectHeader, ctor: f64) {
     if proto.is_null() {
         return;
@@ -648,39 +639,9 @@ pub fn populate_messaging_prototype(builtin_name: &str, proto: *mut ObjectHeader
 
     match builtin_name {
         "MessagePort" => {
-            install_method(
-                proto,
-                "postMessage",
-                crate::fn_info!(noop2, 2; with_declared(2)),
-                2,
-            );
-            install_method(
-                proto,
-                "start",
-                crate::fn_info!(noop0, 0; with_declared(0)),
-                0,
-            );
-            install_method(proto, "ref", crate::fn_info!(noop0, 0; with_declared(0)), 0);
-            install_method(
-                proto,
-                "unref",
-                crate::fn_info!(noop0, 0; with_declared(0)),
-                0,
-            );
-            install_method(
-                proto,
-                "hasRef",
-                crate::fn_info!(has_ref, 0; with_declared(0)),
-                0,
-            );
+            port_operations::install_core_methods(proto);
             set_field(proto, "onmessage", js_null());
             set_field(proto, "onmessageerror", js_null());
-            install_method(
-                proto,
-                "close",
-                crate::fn_info!(noop0, 0; with_declared(0)),
-                0,
-            );
         }
         "MessageChannel" => {}
         "BroadcastChannel" => {
@@ -688,13 +649,13 @@ pub fn populate_messaging_prototype(builtin_name: &str, proto: *mut ObjectHeader
             install_method(
                 proto,
                 "close",
-                crate::fn_info!(noop0, 0; with_declared(0)),
+                crate::fn_info!(#[realm(realm_decl! { BroadcastChannel.prototype.close, constructible = true; BroadcastChannel.prototype.ref, constructible = true; BroadcastChannel.prototype.unref, constructible = true; })] export crate::messaging::noop0, 0; with_declared(0)),
                 0,
             );
             install_method(
                 proto,
                 "postMessage",
-                crate::fn_info!(noop1, 1; with_declared(1)),
+                crate::fn_info!(#[realm(BroadcastChannel.prototype.postMessage, constructible = true)] export crate::messaging::noop1, 1; with_declared(1)),
                 1,
             );
             install_method(proto, "ref", crate::fn_info!(noop0, 0; with_declared(0)), 0);
@@ -712,7 +673,7 @@ pub fn populate_messaging_prototype(builtin_name: &str, proto: *mut ObjectHeader
 }
 
 fn message_port_object() -> *mut ObjectHeader {
-    let obj = object::js_object_alloc(0, 0);
+    let obj = message_port_object_with_id(0);
     let proto = constructor_prototype("MessagePort");
     set_object_prototype(obj, proto);
     set_field(obj, "constructor", get_global_constructor("MessagePort"));

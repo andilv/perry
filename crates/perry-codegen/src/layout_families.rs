@@ -530,6 +530,7 @@ fn prologue_store<'a>(s: &'a Stmt, params: &BTreeSet<u32>) -> Option<(&'a str, b
             object,
             property,
             value,
+            ..
         }) if matches!(object.as_ref(), Expr::This) => {
             Some((property.as_str(), inert(value, params)))
         }
@@ -980,6 +981,7 @@ fn param_keys(class: &Class) -> Vec<(u32, String)> {
                 object,
                 property,
                 value,
+                ..
             }) => (object.as_ref(), property.as_str(), value.as_ref()),
             Stmt::Expr(Expr::PutValueSet {
                 target, key, value, ..
@@ -1621,12 +1623,7 @@ pub fn compute<'a>(
     layouts.refused = refused;
     // A module body is once per record; exposing the CommonJS loader/cache
     // can create another record. Refuse globally under any such capability.
-    let closed = !perry_hir::has_deferred_dynamic_code_sites()
-        && modules.iter().all(|m| {
-            m.class_family_syntax
-                .as_ref()
-                .is_some_and(|s| s.module_capability_uses == 0)
-        });
+    let closed = perry_hir::program_is_cjs_closed(modules.iter().copied());
     if std::env::var("PERRY_LAYOUT_REPORT").as_deref() == Ok("2") {
         for module in &modules {
             if let Some(s) = &module.class_family_syntax {
@@ -1748,6 +1745,7 @@ mod tests {
         let mut hir = HirModule::new("generator_results");
         let get = |property: &str| {
             Stmt::Expr(Expr::PropertyGet {
+                byte_end: 0,
                 byte_offset: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 property: property.to_string(),
@@ -1904,5 +1902,14 @@ mod tests {
         for (k, s) in &sub.keys[3..] {
             assert!(*s >= 3, "{k}");
         }
+    }
+}
+
+impl ProgramLayouts {
+    /// The header form predicted for the objects this record describes (`HeaderForm`:
+    /// every ordinary object has the meta word today). Sites take their slot base
+    /// from here, never from the type byte.
+    pub(crate) fn form(&self) -> crate::target_layout::HeaderForm {
+        crate::target_layout::HeaderForm::Meta
     }
 }

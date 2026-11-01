@@ -20,13 +20,17 @@ fn object_header_word() -> String {
     const GC_FLAG_ARENA: u64 = 0x02;
     let slots = std::cmp::max(2, crate::target_layout::INLINE_SLOT_FLOOR);
     let size =
-        8 + crate::target_layout::object_header_size_bytes("aarch64-apple-darwin") + 8 * slots;
+        8 + crate::target_layout::object_slot_base_bytes(
+            "aarch64-apple-darwin",
+            crate::target_layout::HeaderForm::Meta,
+        ) + 8 * slots;
     let word = (size << 32) | (GC_FLAG_ARENA << 8) | GC_TYPE_OBJECT;
     format!("constant <2 x i64> <i64 {word}, i64 ")
 }
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -38,6 +42,7 @@ fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -148,11 +153,15 @@ fn two_field_ctor(f0: &str, f1: &str, f1_ty: Type) -> Function {
                 object: Box::new(Expr::This),
                 property: f0.to_string(),
                 value: Box::new(Expr::LocalGet(A_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::This),
                 property: f1.to_string(),
                 value: Box::new(Expr::LocalGet(B_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
         is_async: false,
@@ -229,6 +238,7 @@ pub(super) fn loop_new_module(name: &str, f1_ty: Type, second: Expr) -> Module {
                 ty: Type::Named(name.to_string()),
                 mutable: false,
                 init: Some(Expr::New {
+                    byte_end: 0,
                     class_name: name.to_string(),
                     args: vec![
                         Expr::Binary {
@@ -249,6 +259,7 @@ pub(super) fn loop_new_module(name: &str, f1_ty: Type, second: Expr) -> Module {
             // the bake does nothing. (`collectors/escape_news.rs`; the same trap
             // is called out in the campaign's measurement protocol.)
             Stmt::Expr(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::FuncRef(10)),
                 args: vec![Expr::LocalGet(20)],
                 type_args: Vec::new(),
@@ -271,6 +282,7 @@ pub(super) fn loop_new_module(name: &str, f1_ty: Type, second: Expr) -> Module {
         }],
         return_type: Type::Number,
         body: vec![Stmt::Return(Some(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(30)),
             property: "a".to_string(),
             byte_offset: 0,
@@ -300,6 +312,7 @@ pub(super) fn outlined_new_module(name: &str, f1_ty: Type, second: Expr) -> Modu
             ty: Type::Named(name.to_string()),
             mutable: false,
             init: Some(Expr::New {
+                byte_end: 0,
                 class_name: name.to_string(),
                 args: vec![Expr::Integer(1), second],
                 type_args: Vec::new(),
@@ -308,6 +321,7 @@ pub(super) fn outlined_new_module(name: &str, f1_ty: Type, second: Expr) -> Modu
             }),
         },
         Stmt::Expr(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::FuncRef(10)),
             args: vec![Expr::LocalGet(20)],
             type_args: Vec::new(),
@@ -483,6 +497,7 @@ fn imported_pointer_layout_does_not_invent_a_consumer_typed_shape_id() {
         ty: Type::Named("Remote".to_string()),
         mutable: false,
         init: Some(Expr::New {
+            byte_end: 0,
             class_name: "Remote".to_string(),
             args: vec![Expr::Null],
             type_args: Vec::new(),
@@ -516,6 +531,7 @@ fn imported_length_only_arguments_capability_uses_scalar_direct_abi() {
             ty: Type::Named("Remote".to_string()),
             mutable: false,
             init: Some(Expr::New {
+                byte_end: 0,
                 class_name: "Remote".to_string(),
                 args: vec![Expr::Null],
                 type_args: Vec::new(),
@@ -524,7 +540,9 @@ fn imported_length_only_arguments_capability_uses_scalar_direct_abi() {
             }),
         },
         Stmt::Expr(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(20)),
                 property: "read".to_string(),
                 byte_offset: 0,
@@ -578,6 +596,7 @@ fn imported_stub_mints_with_the_drivers_static_id_and_registers_no_slots() {
             ty: Type::Named("Remote".to_string()),
             mutable: false,
             init: Some(Expr::New {
+                byte_end: 0,
                 class_name: "Remote".to_string(),
                 args: vec![Expr::Null],
                 type_args: Vec::new(),

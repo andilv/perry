@@ -101,6 +101,7 @@ pub(super) const VERIFIED_BARRIER_STEMS: &[(&str, StemKind)] = &[
     ("idxset.recv_global", StemKind::ValueAndGenerationTested),
     ("idxset.recv_prop", StemKind::ValueAndGenerationTested),
     ("idxset.runtime_key", StemKind::ValueAndGenerationTested),
+    ("frame_slot", StemKind::ValueAndGenerationTested),
     ("family_set", StemKind::PointerTestedStore),
     ("l2i", StemKind::PointerTestedStore),
     ("l2s", StemKind::PointerTestedStore),
@@ -108,6 +109,9 @@ pub(super) const VERIFIED_BARRIER_STEMS: &[(&str, StemKind)] = &[
     ("put.pic", StemKind::PointerTestedStore),
     ("scope_set", StemKind::ValueAndGenerationTested),
 ];
+
+#[path = "barrier_frame_slot_probe.rs"]
+mod frame_slot_probe;
 
 const BARRIER_CALL: &str = "call void @js_write_barrier_slot";
 const INCREMENTAL_GLOBAL: &str = "@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT";
@@ -535,6 +539,8 @@ fn idxset_inbounds_ir_for_target(target: Option<&str>) -> String {
                     object: Box::new(Expr::LocalGet(ARR_ID)),
                     index: Box::new(Expr::LocalGet(IDX_ID)),
                     value: Box::new(Expr::LocalGet(VAL_ID)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })],
             },
             Stmt::Return(Some(Expr::LocalGet(ARR_ID))),
@@ -635,8 +641,11 @@ fn idxset_recv_global_ir() -> String {
                         object: Box::new(Expr::LocalGet(G_ID)),
                         index: Box::new(Expr::LocalGet(IDX_ID)),
                         value: Box::new(Expr::LocalGet(VAL_ID)),
+                        byte_offset: 0,
+                        byte_end: 0,
                     }),
                     Stmt::Expr(Expr::Call {
+                        byte_end: 0,
                         callee: Box::new(Expr::LocalGet(VAL_ID)),
                         args: Vec::new(),
                         type_args: Vec::new(),
@@ -722,6 +731,8 @@ fn idxset_recv_captured_ir() -> String {
                             object: Box::new(Expr::LocalGet(ARR_ID)),
                             index: Box::new(Expr::LocalGet(IDX_ID)),
                             value: Box::new(Expr::LocalGet(VAL_ID)),
+                            byte_offset: 0,
+                            byte_end: 0,
                         })],
                     }],
                     captures: vec![ARR_ID, VAL_ID],
@@ -736,6 +747,7 @@ fn idxset_recv_captured_ir() -> String {
                 }),
             },
             Stmt::Expr(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::LocalGet(FILL_ID)),
                 args: Vec::new(),
                 type_args: Vec::new(),
@@ -826,6 +838,8 @@ fn idxset_runtime_key_ir() -> String {
                 object: Box::new(Expr::LocalGet(ARR_ID)),
                 index: Box::new(Expr::LocalGet(IDX_ID)),
                 value: Box::new(Expr::LocalGet(VAL_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(ARR_ID))),
         ],
@@ -869,6 +883,8 @@ fn dynarr_set_ir() -> String {
                 object: Box::new(Expr::LocalGet(ARR_ID)),
                 index: Box::new(Expr::LocalGet(IDX_ID)),
                 value: Box::new(Expr::LocalGet(VAL_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(ARR_ID))),
         ],
@@ -927,6 +943,7 @@ fn idxset_bounded_ir() -> String {
                     op: CompareOp::Lt,
                     left: Box::new(Expr::LocalGet(IDX_ID)),
                     right: Box::new(Expr::PropertyGet {
+                        byte_end: 0,
                         byte_offset: 0,
                         object: Box::new(Expr::LocalGet(ARR_ID)),
                         property: "length".to_string(),
@@ -941,6 +958,8 @@ fn idxset_bounded_ir() -> String {
                     object: Box::new(Expr::LocalGet(ARR_ID)),
                     index: Box::new(Expr::LocalGet(IDX_ID)),
                     value: Box::new(Expr::LocalGet(VAL_ID)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })],
             },
             Stmt::Return(Some(Expr::LocalGet(ARR_ID))),
@@ -994,6 +1013,8 @@ fn private_field_set_ir() -> String {
             }),
             property: format!("#<perry:private-value:{CLASS_ID}:#x>"),
             value: Box::new(Expr::LocalGet(VAL_ID)),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         is_async: false,
         is_generator: false,
@@ -1040,9 +1061,12 @@ fn private_field_set_ir() -> String {
         specialized_from: None,
     }];
     m.init = vec![Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             byte_offset: 0,
             object: Box::new(Expr::New {
+                byte_end: 0,
                 class_name: "Box".to_string(),
                 args: Vec::new(),
                 type_args: Vec::new(),
@@ -1101,6 +1125,7 @@ fn generator_state_ir() -> String {
                     body: vec![
                         Stmt::Expr(Expr::LocalSet(1, Box::new(Expr::LocalGet(3)))),
                         Stmt::Expr(Expr::PropertyGet {
+                            byte_end: 0,
                             object: Box::new(Expr::LocalGet(1)),
                             property: "value".into(),
                             byte_offset: 0,
@@ -1197,6 +1222,7 @@ fn append_ir() -> String {
 fn probe_ir(stem: &str) -> String {
     match stem {
         "apush" => apush_ir(),
+        "frame_slot" => frame_slot_probe::ir(),
         "append" => append_ir(),
         "family_set" | "l2s" | "l2i" => family_store_ir(),
         "class_field_set" => super::class_field_barrier_tests::ir(),

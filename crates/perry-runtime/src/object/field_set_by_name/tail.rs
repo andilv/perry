@@ -176,7 +176,7 @@ pub(crate) fn set_field_by_name_object_tail(
             }
             return;
         }
-        if gc_type != crate::gc::GC_TYPE_OBJECT && gc_type != crate::gc::GC_TYPE_CLOSURE {
+        if crate::gc_type_is_not_object!(gc_type) && gc_type != crate::gc::GC_TYPE_CLOSURE {
             // A RECOGNIZED non-object heap type (Map/Set/Buffer/TypedArray/…)
             // must never fall through to the plain-object write below: their
             // layouts alias ObjectHeader fields. A Map with EXACTLY one entry
@@ -409,7 +409,7 @@ pub(crate) fn set_field_by_name_object_tail(
         if !plan_fast
             && !key.is_null()
             && (key as usize) > 0x10000
-            && crate::url::is_url_object_shape(obj)
+            && crate::object::url_layout::is_url_object_shape(obj)
         {
             let key_str = key_to_str_for_diag(key);
             let obj = obj_handle.get_raw_mut_ptr::<ObjectHeader>();
@@ -417,43 +417,43 @@ pub(crate) fn set_field_by_name_object_tail(
             match key_str.as_str() {
                 "origin" | "searchParams" => return,
                 "host" => {
-                    crate::url::js_url_set_host(obj, value);
+                    crate::url_hooks::url_set_host(obj, value);
                     return;
                 }
                 "pathname" => {
-                    crate::url::js_url_set_pathname(obj, value);
+                    crate::url_hooks::url_set_pathname(obj, value);
                     return;
                 }
                 "search" => {
-                    crate::url::js_url_set_search(obj, value);
+                    crate::url_hooks::url_set_search(obj, value);
                     return;
                 }
                 "hash" => {
-                    crate::url::js_url_set_hash(obj, value);
+                    crate::url_hooks::url_set_hash(obj, value);
                     return;
                 }
                 "protocol" => {
-                    crate::url::js_url_set_protocol(obj, value);
+                    crate::url_hooks::url_set_protocol(obj, value);
                     return;
                 }
                 "hostname" => {
-                    crate::url::js_url_set_hostname(obj, value);
+                    crate::url_hooks::url_set_hostname(obj, value);
                     return;
                 }
                 "port" => {
-                    crate::url::js_url_set_port(obj, value);
+                    crate::url_hooks::url_set_port(obj, value);
                     return;
                 }
                 "username" => {
-                    crate::url::js_url_set_username(obj, value);
+                    crate::url_hooks::url_set_username(obj, value);
                     return;
                 }
                 "password" => {
-                    crate::url::js_url_set_password(obj, value);
+                    crate::url_hooks::url_set_password(obj, value);
                     return;
                 }
                 "href" => {
-                    crate::url::js_url_set_href(obj, value);
+                    crate::url_hooks::url_set_href(obj, value);
                     return;
                 }
                 _ => {}
@@ -911,7 +911,7 @@ pub(crate) fn set_field_by_name_object_tail(
             let proof = crate::object::canonical_keys::SharedLayout::of_receiver(obj)
                 .expect("an object with an overflow appends through it, never here");
             let canonical_parent =
-                crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
+                crate::object::canonical_keys::canonicalize_keys(&proof, keys_view);
             refresh_roots_after_alloc!();
             let new_keys =
                 crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view();
@@ -1012,7 +1012,7 @@ pub(crate) fn set_field_by_name_object_tail(
         // per-index accessors via `js_array_get`); the original match below
         // still gates the hit, so this cannot widen what is accepted.
         if let Some(i) =
-            crate::object::keys_find_property_slot_by_key_ptr(keys, key_count as u32, key)
+            crate::object::keys_find_property_slot_by_key_ptr(keys_view, key_count as u32, key)
                 .map(|v| v as usize)
         {
             let key_val = crate::array::js_array_get(keys, i as u32);
@@ -1098,8 +1098,7 @@ pub(crate) fn set_field_by_name_object_tail(
         let new_index = key_count;
         let proof = crate::object::canonical_keys::SharedLayout::of_receiver(obj)
             .expect("an object with an overflow appends through it, never here");
-        let canonical_parent =
-            crate::object::canonical_keys::canonicalize(&proof, keys, key_count as u32);
+        let canonical_parent = crate::object::canonical_keys::canonicalize_keys(&proof, keys_view);
         refresh_roots_after_alloc!();
         let new_keys =
             crate::object::canonical_keys::extend_key(&proof, canonical_parent, key).view();

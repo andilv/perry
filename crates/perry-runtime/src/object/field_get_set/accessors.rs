@@ -173,7 +173,7 @@ pub unsafe extern "C" fn js_object_record_set_by_bytes(
     let mut index = 0;
     let Some(OwnSlot::Data(_)) = own_property_slot(obj, |keys, count| {
         let position = crate::object::keys_find_property_slot_by_bytes(keys, count, key)?;
-        index = crate::object::key_attrs::key_storage_slot(keys, position);
+        index = crate::object::key_attrs::key_storage_slot(keys.arr(), position);
         Some(position)
     }) else {
         return 0;
@@ -232,13 +232,13 @@ impl OwnSlot {
 
 unsafe fn own_property_slot(
     obj: *const ObjectHeader,
-    find_slot: impl FnOnce(*const crate::array::ArrayHeader, u32) -> Option<u32>,
+    find_slot: impl FnOnce(crate::object::ObjectKeys, u32) -> Option<u32>,
 ) -> Option<OwnSlot> {
     if obj.is_null() || !is_valid_obj_ptr(obj as *const u8) {
         return None;
     }
     let obj_gc = (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    if (*obj_gc).obj_type != crate::gc::GC_TYPE_OBJECT {
+    if crate::gc_type_is_not_object!((*obj_gc).obj_type) {
         return None;
     }
     let keys_view = crate::object::object_keys(obj);
@@ -266,7 +266,7 @@ unsafe fn own_property_slot(
     // isolated overwrite-loop profile still showed `js_array_get_f64` at 23.5%
     // self time, and the caller graph attributed it here. The shared helper
     // preserves #1781's SSO-key acceptance (its byte resolver is SSO-aware).
-    if let Some(islot) = find_slot(keys, key_count as u32) {
+    if let Some(islot) = find_slot(keys_view, key_count as u32) {
         if crate::object::key_attrs::key_is_accessor_at(keys, islot) {
             // The holder's shape resolved the key to this slot, so its lane
             // holds the accessor pair (#12015): read it there, no name search.
@@ -490,7 +490,7 @@ pub(crate) unsafe fn ordinary_object_prototype_property_value(
         return None;
     }
     let gc = gc_header_for(obj);
-    if (*gc).obj_type != crate::gc::GC_TYPE_OBJECT {
+    if crate::gc_type_is_not_object!((*gc).obj_type) {
         return None;
     }
     // #10827: this asked only whether the RECEIVER was born without a
@@ -817,7 +817,7 @@ pub(crate) unsafe fn is_typed_array_prototype(addr: usize) -> bool {
     // shared `_reserved` word; gate the flag read on the object type so a
     // regular array whose `_reserved` happens to collide isn't misclassified.
     let gc = (addr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
+    crate::gc_type_is_object!((*gc).obj_type)
         && ((*gc)._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO) != 0
 }
 

@@ -21,6 +21,7 @@ fn ta_new(kind: u8, arg: Option<Expr>) -> Expr {
 
 fn call(fid: u32, args: Vec<Expr>) -> Expr {
     Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::FuncRef(fid)),
         args,
         type_args: vec![],
@@ -463,6 +464,8 @@ fn put_value_set_receiver_demotes_source_const_len() {
             value: Box::new(Expr::Integer(3)),
             receiver: Box::new(source),
             strict: false,
+            byte_offset: 0,
+            byte_end: 0,
         }),
         let_stmt(
             2,
@@ -539,6 +542,8 @@ fn local_is_reassigned_sees_closure_writes() {
 #[test]
 fn guarded_number_array_rejects_stale_or_aliasable_reads() {
     let read = || Expr::IndexGet {
+        byte_offset: 0,
+        byte_end: 0,
         object: Box::new(Expr::LocalGet(5)),
         index: Box::new(Expr::Integer(0)),
     };
@@ -547,6 +552,8 @@ fn guarded_number_array_rejects_stale_or_aliasable_reads() {
             object: Box::new(Expr::LocalGet(5)),
             index: Box::new(Expr::Integer(0)),
             value: Box::new(Expr::Integer(1)),
+            byte_offset: 0,
+            byte_end: 0,
         })
     };
     let loop_stmt = || Stmt::While {
@@ -615,6 +622,7 @@ fn a_var_redeclared_parameter_is_demoted_like_a_reassigned_one() {
 fn rows_length() -> Expr {
     // `rows.length`, with `rows` (local 1) of unknown provenance.
     Expr::PropertyGet {
+        byte_end: 0,
         object: Box::new(Expr::LocalGet(1)),
         property: "length".to_string(),
         byte_offset: 0,
@@ -726,6 +734,8 @@ fn store_key_const_len(pre: Vec<Stmt>, key: Expr) -> Option<Option<i64>> {
         object: Box::new(Expr::LocalGet(1)),
         index: Box::new(key),
         value: Box::new(Expr::Integer(0)),
+        byte_offset: 0,
+        byte_end: 0,
     }));
     body.push(let_stmt(
         2,

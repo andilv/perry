@@ -200,6 +200,13 @@ pub(crate) fn resolution_stack_unwind_to(sp: usize) {
     });
 }
 
+#[cfg(any(test, target_os = "wasi"))]
+pub(crate) fn resolution_stack_restore_depth(depth: usize) {
+    PROTOTYPE_RESOLUTION_STACK.with(|stack| {
+        stack.borrow_mut().restore_depth(depth);
+    });
+}
+
 pub(crate) fn resolution_stack_check_marks(sp: usize) {
     PROTOTYPE_RESOLUTION_STACK.with(|stack| {
         crate::exception::marks::check_marks(stack.borrow().marks(), sp, "prototype_resolution")
@@ -234,7 +241,7 @@ pub(crate) fn test_resolution_stack_enter_and_forget(owner: usize, mark: usize) 
 /// whose shape can name its prototype directly. Other public owners answer
 /// from their own property holder instead.
 pub(crate) unsafe fn meta_capable_object(obj_ptr: usize) -> Option<*mut crate::ObjectHeader> {
-    (receiver_header_type(obj_ptr)? == crate::gc::GC_TYPE_OBJECT)
+    crate::gc_type_is_object!(receiver_header_type(obj_ptr)?)
         .then_some(obj_ptr as *mut crate::ObjectHeader)
 }
 
@@ -259,7 +266,7 @@ pub(crate) fn owned_prototype_receiver_type(kind: u8) -> bool {
         || matches!(
             kind,
             crate::gc::GC_TYPE_ARRAY
-                | crate::gc::GC_TYPE_OBJECT
+                | crate::gc_object_type_pat!()
                 | crate::gc::GC_TYPE_CLOSURE
                 | crate::gc::GC_TYPE_PROMISE
                 | crate::gc::GC_TYPE_ERROR
@@ -508,15 +515,22 @@ fn object_set_static_prototype_impl_with(
             let per_object = proto_id == crate::object::shapes::PROTO_ID_PER_OBJECT
                 || !crate::object::shapes::shape_word_is_writable(obj);
             let mut obj = obj;
+            // A1_UNPROVEN: record-first: receiver before its type test (kind-A/B question for S0f).
             // The prototype is a fact of the receiver's shape
             // (`shapes::object_prototype_word`), so a link allocates no meta
             // record. A receiver that has one anyway, or whose PER_OBJECT
             // identity answers nothing from its shape, keeps the same bits in
             // it: the cheaper read, written here and nowhere else.
-            if per_object || !(*obj).meta.is_null() {
+            if per_object
+                || !crate::meta_read!(crate::meta_obj_runtime_born!(obj as *mut _)).is_null()
+            {
                 // `object_meta_ensure` allocates and may evacuate the owner.
                 let (meta, moved) = obj_handle.across_mut::<crate::object::ObjectHeader, _>(|| {
-                    crate::object::object_meta_ensure(obj)
+                    // A1_UNPROVEN: receiver from a JS value, no type test (kind-A/B question for S0b-S0e).
+                    crate::object::object_meta_ensure(
+                        crate::meta_obj_runtime_born!(obj),
+                        crate::object::MetaReason::PrototypeOnReceiver,
+                    )
                 });
                 obj = moved;
                 let word = proto_handle.get_nanbox_u64();
@@ -558,7 +572,11 @@ fn object_set_static_prototype_impl_with(
     unsafe {
         let holder = crate::object::descriptor_state::descriptor_holder(obj_ptr);
         if !holder.is_null() {
-            let meta = crate::object::object_meta_ensure(holder);
+            // A1_UNPROVEN: descriptor_holder(obj_ptr) may return the user object itself (kind-A/B question for S0b-S0e).
+            let meta = crate::object::object_meta_ensure(
+                crate::meta_obj_runtime_born!(holder),
+                crate::object::MetaReason::PrototypeHolder,
+            );
             // GC_STORE_AUDIT(BARRIERED): the bag owns this NaN-boxed prototype
             // edge; the exact metadata-slot barrier follows the store.
             (*meta).prototype = proto_bits;
@@ -611,10 +629,14 @@ pub fn object_static_prototype(obj_ptr: usize) -> Option<u64> {
     }
     unsafe {
         let holder = crate::object::descriptor_state::descriptor_holder(obj_ptr);
-        if holder.is_null() || (*holder).meta.is_null() {
+        // A1_UNPROVEN: record-first: holder may be the user object (kind-A/B question for S0f).
+        if holder.is_null()
+            || crate::meta_read!(crate::meta_obj_runtime_born!(holder as *mut _)).is_null()
+        {
             return None;
         }
-        let bits = (*(*holder).meta).prototype;
+        // A1_UNPROVEN: record-first: holder may be the user object (kind-A/B question for S0f).
+        let bits = (*crate::meta_read!(crate::meta_obj_runtime_born!(holder as *mut _))).prototype;
         (bits != 0).then_some(bits)
     }
 }
@@ -735,7 +757,7 @@ unsafe fn class_link_prototype(obj_ptr: usize) -> usize {
     let Some(header) = crate::value::addr_class::try_read_gc_header(obj_ptr) else {
         return 0;
     };
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT {
+    if crate::gc_type_is_not_object!(header.obj_type) {
         return 0;
     }
     let class_id = (*(obj_ptr as *const crate::ObjectHeader)).class_id;
@@ -757,7 +779,7 @@ unsafe fn cell_is_born_null_proto(obj_ptr: usize) -> bool {
     let Some(header) = crate::value::addr_class::try_read_gc_header(obj_ptr) else {
         return false;
     };
-    header.obj_type == crate::gc::GC_TYPE_OBJECT
+    crate::gc_type_is_object!(header.obj_type)
         && header._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0
 }
 
@@ -834,7 +856,7 @@ pub(crate) fn object_prototype_is_foreign(obj_ptr: usize) -> bool {
             return true;
         };
         let class_id = (*obj).class_id;
-        !(header.obj_type == crate::gc::GC_TYPE_OBJECT
+        !(crate::gc_type_is_object!(header.obj_type)
             && class_id != 0
             && (*proto).class_id == class_id)
     }
@@ -888,7 +910,7 @@ pub(crate) unsafe fn default_object_prototype_for_owner(obj_ptr: usize) -> Optio
     if (*gc)._reserved & crate::gc::OBJ_FLAG_NULL_PROTO != 0 {
         return None;
     }
-    if (*gc).obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::gc_type_is_not_object!((*gc).obj_type)
         || ((*obj).class_id != 0 && !super::shapes::object_is_plain_record(obj))
     {
         return None;
@@ -940,14 +962,14 @@ pub(crate) fn resolve_inherited_field_from_prototype(
     // `Object.create(proxy)[k]`.)
     {
         let proto_val = f64::from_bits(proto_bits);
-        if crate::proxy::js_proxy_is_proxy(proto_val) != 0 {
+        if crate::proxy_hooks::proxy_is_proxy(proto_val) != 0 {
             if key.is_null() {
                 return None;
             }
             let key_val = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
             let receiver = super::field_get_set::accessor_receiver_override_take()
                 .unwrap_or_else(|| crate::value::js_nanbox_pointer(obj_ptr as i64));
-            let v = crate::proxy::proxy_get_from_prototype(proto_val, key_val, receiver);
+            let v = crate::proxy_hooks::proxy_get_from_prototype(proto_val, key_val, receiver);
             return Some(crate::value::JSValue::from_bits(v.to_bits()));
         }
     }
@@ -999,7 +1021,7 @@ pub(crate) fn resolve_inherited_field_from_prototype(
     let prev_override_handle = prev_override.map(|value| scope.root_nanbox_f64(value));
     let v = super::js_object_get_field_by_name(proto, key);
     super::field_get_set::accessor_receiver_override_end(
-        prev_override_handle.map(|handle| handle.get_nanbox_f64()),
+        prev_override_handle.map(crate::gc::RuntimeHandle::into_nanbox_f64),
     );
     if v.bits() == 0x7FFC_0000_0000_0001 {
         // undefined — treat as "not present" so callers fall back cleanly.
@@ -1046,7 +1068,10 @@ mod tests {
         object_link_class_default_prototype(class_default as usize, crate::value::TAG_NULL);
         // The prototype is a shape fact, and a link records no flag: the
         // receiver needs no meta record at all.
-        assert!(unsafe { (*class_default).meta }.is_null());
+        assert!(unsafe {
+            crate::meta_read!(crate::meta_obj_runtime_born!(class_default as *mut _))
+        }
+        .is_null());
         assert_eq!(
             object_static_prototype(class_default as usize),
             Some(crate::value::TAG_NULL)
@@ -1061,7 +1086,11 @@ mod tests {
         let evaluated = crate::object::js_object_alloc(CLASS, 0);
         object_link_class_evaluation_prototype(evaluated as usize, crate::value::TAG_NULL);
         assert!(object_has_individual_class_prototype(evaluated as usize));
-        assert!(unsafe { (*evaluated).meta }.is_null(), "no flag, no record");
+        assert!(
+            unsafe { crate::meta_read!(crate::meta_obj_runtime_born!(evaluated as *mut _)) }
+                .is_null(),
+            "no flag, no record"
+        );
         assert!(object_has_individual_class_prototype(
             class_default as usize
         ));
@@ -1075,7 +1104,8 @@ mod tests {
             user_overridden as usize
         ));
         assert!(
-            unsafe { (*user_overridden).meta }.is_null(),
+            unsafe { crate::meta_read!(crate::meta_obj_runtime_born!(user_overridden as *mut _)) }
+                .is_null(),
             "no flag, no record"
         );
     }
@@ -1215,6 +1245,42 @@ mod tests {
         assert_eq!(resolution_stack_depth(), base_depth);
     }
 }
+
+
+    /// `default_object_prototype_for_owner` reads a receiver's header, so it is
+    /// only valid for a heap address. The guard it relies on (`main`'s
+    /// `is_plausible_heap_addr`, added in 9ae3fec0a1) is exactly this: every
+    /// small-handle id must be rejected *before* the header read, and an
+    /// ordinary object must still resolve the default prototype. Nothing in the
+    /// suite asserted the rejection until this test, because the fix for it
+    /// landed without a regression.
+    #[test]
+    fn default_owner_prototype_rejects_handles_and_keeps_ordinary_objects() {
+        use crate::value::addr_class::*;
+        for address in [
+            0,
+            1,
+            COMMON_HANDLE_BAND_END - 1,
+            FETCH_HANDLE_BAND_START,
+            FETCH_HANDLE_BAND_END - 1,
+            PROXY_ID_BAND_START,
+            STREAM_ID_BAND_START,
+            HANDLE_BAND_MAX - 1,
+        ] {
+            assert_eq!(
+                unsafe { default_object_prototype_for_owner(address) },
+                None,
+                "handle {address:#x} must not be read as an object header"
+            );
+        }
+        let _no_move = crate::gc::GcSuppressScope::new();
+        let expected = default_object_prototype_bits().expect("Object prototype");
+        let object = crate::object::js_object_alloc(0, 0);
+        assert_eq!(
+            unsafe { default_object_prototype_for_owner(object as usize) },
+            Some(expected)
+        );
+    }
 
 #[cfg(test)]
 #[path = "proxy_reentry_tests.rs"]

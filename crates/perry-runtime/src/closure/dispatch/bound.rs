@@ -68,7 +68,7 @@ unsafe fn init_bound_native_receiver(
     let receiver_object = crate::value::JSValue::from_bits(receiver.to_bits());
     if receiver_object.is_pointer() && receiver.to_bits() != namespace_obj.to_bits() {
         let address = receiver_object.as_pointer::<u8>() as usize;
-        if matches!(crate::value::addr_class::try_read_gc_header(address), Some(header) if header.obj_type == crate::gc::GC_TYPE_OBJECT)
+        if matches!(crate::value::addr_class::try_read_gc_header(address), Some(header) if crate::gc_type_is_object!(header.obj_type))
             && crate::object::js_object_get_class_id(address as *const crate::object::ObjectHeader)
                 != crate::object::NATIVE_MODULE_CLASS_ID
         {
@@ -534,7 +534,7 @@ pub(crate) fn callee_boxes_primitive_this(target: f64) -> bool {
     }
     // Runtime-created functions and unloadable images retain the owning
     // compatibility registry because their image metadata is not permanent.
-    crate::builtins::function_is_non_strict_ordinary_for_ptr(info.code as usize)
+    crate::builtins::function_is_non_strict_ordinary_for_info(info)
 }
 
 /// `call`/`apply`/`bind`/`Reflect.apply` supply an EXPLICIT `this`. A concise /
@@ -855,7 +855,7 @@ unsafe fn function_bind_observable(
     // pass-through — they can't be wrapped in a BOUND_FUNCTION closure yet.
     if !closure_target
         && !crate::object::value_is_callable(target_value)
-        && crate::proxy::js_proxy_is_proxy(target_value) != 1
+        && crate::proxy_hooks::proxy_is_proxy(target_value) != 1
     {
         let message = b"Bind must be called on a function";
         let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
@@ -1162,8 +1162,8 @@ pub(crate) unsafe fn reify_function_method_value(receiver: f64, method: &'static
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     js_closure_set_capture_f64(closure, 0, receiver);
-    js_closure_set_capture_ptr(closure, 1, method.as_ptr() as i64);
-    js_closure_set_capture_ptr(closure, 2, method.len() as i64);
+    crate::closure::closure_set_capture_word(closure, 1, method.as_ptr() as i64);
+    crate::closure::closure_set_capture_word(closure, 2, method.len() as i64);
     // `.name` = the method name so `typeof v === "function"` and `v.name`
     // read back sensibly (e.g. `"bind"`).
     if let Ok(name) = std::str::from_utf8(method) {

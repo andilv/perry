@@ -52,6 +52,11 @@ fn selection_for_rep_with_special(
     if slot_count == 0 {
         return HeapPayloadSlotSelection::Empty;
     }
+    // All-Any is itself an exact shape fact. Avoid compacting thirty-two
+    // representation lanes only to discover that none can be skipped.
+    if rep == 0 {
+        return HeapPayloadSlotSelection::All { cursor: 0 };
+    }
     let skip = field_rep::non_pointer_slot_bits(rep, special_constfn_mask);
     if skip == 0 || slot_count > INLINE_MASK_SLOTS {
         return HeapPayloadSlotSelection::All { cursor: 0 };
@@ -224,8 +229,11 @@ mod tests {
                 slots.selection,
                 HeapPayloadSlotSelection::Masked { mask: LayoutSlotMask::Inline(m), .. } if m & 0b11 == 0b10
             );
-            let fields = (obj as *mut u8).add(std::mem::size_of::<crate::object::ObjectHeader>());
-            let payload = HeapSlotRange::new(fields as *mut u64, 2);
+            let fields = crate::object::header::object_slot_at(
+                obj,
+                crate::object::header::meta_form_alloc_bytes(0) as u32,
+            );
+            let payload = HeapSlotRange::new(fields, 2);
             let correct =
                 selection_by_shape(crate::object::shapes::object_shape_record(obj), payload);
             let correct_ok = skipped_pointer_slot(payload, &correct).is_none();
@@ -235,7 +243,7 @@ mod tests {
                 crate::object::shapes::shape_descriptor_for_word(LayoutWord(id)).expect("shape");
             let wrong = crate::object::shapes::publish_shape_result(
                 crate::object::shapes::shape_descriptor_ensure_with_rep(
-                    d.keys as usize as *const crate::array::ArrayHeader,
+                    d.keys_view(),
                     d.logical_key_count,
                     d.live_inline_slot_count,
                     d.semantic_generation,

@@ -46,9 +46,12 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_DISABLE_BUFFER_FAST_PATH",
     "PERRY_DISABLE_WELL_KNOWN",
     "PERRY_DYNAMIC_ADD_PAIR_GUARD",
+    "PERRY_DYNAMIC_REACH",
+    "PERRY_DYNAMIC_REACH_MAX_WORK",
     "PERRY_ENTRY_SYMBOL",
     "PERRY_ENUM_DIAG",
     "PERRY_EVAL_CSP",
+    "PERRY_EXPORT_DEMAND",
     "PERRY_EXTRA_LINK_ARGS",
     "PERRY_FACTS_BUDGET_SECS",
     "PERRY_FACTS_ELIDE",
@@ -108,6 +111,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_LD",
     "PERRY_LD64.LLD",
     "PERRY_LIB_DIR",
+    "PERRY_LINK_PAD",
     "PERRY_LINUX_ARM64_CC",
     "PERRY_LINUX_ARM64_SYSROOT",
     "PERRY_LINUX_MUSL_AARCH64_CC",
@@ -145,6 +149,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_OUTLINE_METHOD_DISPATCH",
     "PERRY_PACKED_LOOP_ABRUPT",
     "PERRY_PACKED_LOOP_NUMERIC_ACCUMULATOR",
+    "PERRY_PIP_SABOTAGE",
     "PERRY_PRECOMPILE_CAPTURE",
     "PERRY_PROBE_VERIFY",
     "PERRY_PROGRAM_FACTS",
@@ -152,6 +157,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_PTR_NUMARRAY_LOCALS",
     "PERRY_PTR_SHAPE_LOCALS",
     "PERRY_PTR_SHAPE_THIS",
+    "PERRY_REALM_TEST_FIXTURE",
     "PERRY_RECEIVER_REPR_DIAG",
     "PERRY_RECV_ROUTE_COUNT",
     "PERRY_REGEX_DIAG",
@@ -195,6 +201,9 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_U8_INLINE_READ",
     "PERRY_VERIFY_NATIVE_REGIONS",
     "PERRY_VISIONOS_SYSROOT",
+    "PERRY_WASM_DISCARD",
+    "PERRY_WASM_NET",
+    "PERRY_WASM_STATIC_RELOC",
     "PERRY_WATCHOS_ARM64_32",
     "PERRY_WATCHOS_MIN",
     "PERRY_WINDOWS_SYSROOT",
@@ -223,6 +232,9 @@ pub(super) fn compile_env_value(name: &str) -> Option<String> {
 
 #[cfg(test)]
 const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
+    ("PERRY_DYNAMIC_REACH_REPORT", "Writes the dynamic-reach report file only; no pruning decision or emitted code depends on it."),
+    ("PERRY_EXPORT_DEMAND_REPORT", "Writes the export-demand report file only; no pruning decision or emitted code depends on it."),
+    ("PERRY_REALM_REACH", "Compiler-only diagnostic of source facts; changes no emitted bytes, runtime state or archive selection."),
     ("PERRY_REACH_REPORT", "Compiler-only diagnostic; bypasses object caches and does not change emitted code."),
     ("PERRY_SOURCE_NEED_REPORT", "Compiler-only retained-source census; bypasses object caches and does not change emitted code."),
     ("PERRY_RETAIN_ALL_SOURCE", "Diagnostic: keeps retained source the compiler would drop; each module's HIR hash (its object-cache key) reflects the text, and whole-binary caching is bypassed."),
@@ -383,6 +395,10 @@ const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "PERRY_EVAL_DIAG",
         "Prints lowering diagnostics; no emitted instructions depend on the report.",
+    ),
+    (
+        "PERRY_FACTS_CONSUMED",
+        "Diagnostics/analysis-only output of the program-facts pass; emitted code does not depend on it.",
     ),
     (
         "PERRY_FACTS_DUMP",
@@ -655,6 +671,10 @@ const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "PERRY_TEST_BUNDLE_LAUNCH_CHILD",
         "Test-only fixture/child-process control; absent from compiler production paths.",
+    ),
+    (
+        "PERRY_TEST_DESERIALIZER_FEATURES_CHILD",
+        "Test-only child-process isolation marker; never read by the compiler's production path.",
     ),
     (
         "PERRY_TEST_BUN_CONDITIONS_CHILD",

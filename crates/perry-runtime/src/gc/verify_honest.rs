@@ -116,7 +116,7 @@ pub(super) fn verify_honest_pointers(phase: &str) -> HonestPointerStats {
         }
         stats.objects += 1;
         let parent = (header as *mut u8).add(GC_HEADER_SIZE) as usize;
-        visit_gc_rewrite_slots(header, |slot| {
+        visit_gc_rewrite_slots::<true>(header, |slot| {
             let bits = slot.read();
             if bits & TAG_MASK == POINTER_TAG {
                 stats.record(parent, bits);
@@ -127,6 +127,8 @@ pub(super) fn verify_honest_pointers(phase: &str) -> HonestPointerStats {
     for header in super::verify::malloc_headers_for_verification() {
         visit(header);
     }
+    // WRT: realm image cells are live by definition (born MARKED|PINNED).
+    super::image_cells::for_each_image_cell(|header| visit(header));
     report_honest_pointers(phase, &stats);
     stats
 }

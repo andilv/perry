@@ -103,6 +103,9 @@ impl Model {
                 }
             }
         }
+        if top_new && self.diagnostic.is_some() {
+            self.diagnostic_predecessor(n, self.cur_src, self.cur_why);
+        }
         if top_new && self.explain {
             self.top_pred
                 .entry(n)
@@ -127,6 +130,85 @@ impl Model {
         if changed && !node.in_wl {
             node.in_wl = true;
             self.wl.push_back(n);
+        }
+    }
+
+    /// Charge the work since the last mark to what it was spent for, and
+    /// from now on to `n` (a popped node) or, with `NO_NODE`, to `phase`
+    /// (PERRY_FACTS_PROFILE only).
+    pub fn prof_mark(&mut self, n: NodeId, phase: &'static str) {
+        let Some(p) = self.prof.as_mut() else { return };
+        let (at, w0, ph) = p.at;
+        let w = self.work - w0;
+        if w != 0 {
+            if at == NO_NODE {
+                *p.phase.entry(ph).or_default() += w;
+            } else {
+                *p.node.entry(at).or_default() += w;
+            }
+        }
+        p.at = (n, self.work, phase);
+        if self.work >= p.next_curve {
+            p.next_curve = (self.work / WorkProfile::STEP + 1) * WorkProfile::STEP;
+            let cons: usize = self.nodes.iter().map(|n| n.cons.len()).sum();
+            eprintln!(
+                "perry: wpfacts curve work={} pops={} nodes={} pts={} cons={} toks={} insts={} wl={}",
+                self.work,
+                self.pops,
+                self.nodes.len(),
+                self.pts_entries,
+                cons,
+                self.toks.len(),
+                self.sum.insts.len(),
+                self.wl.len()
+            );
+        }
+    }
+
+    /// The work profile (PERRY_FACTS_PROFILE): phases, steps, rule kinds and
+    /// the 20 nodes the most work was spent for.
+    pub fn prof_report(&mut self) {
+        let Some(p) = self.prof.take() else { return };
+        let mut ph: Vec<_> = p.phase.iter().collect();
+        ph.sort_by(|a, b| b.1.cmp(a.1));
+        let in_pops: u64 = p.node.values().sum();
+        eprintln!(
+            "perry: wpfacts work total={} in pops={in_pops} phases={ph:?} steps pop-charge={} fast-copy={} copy={} copy-extra={}",
+            self.work, p.step[0], p.step[1], p.step[2], p.step[3]
+        );
+        let mut ks: Vec<_> = p.kind.iter().collect();
+        ks.sort_by(|a, b| (b.1 .1 + b.1 .3).cmp(&(a.1 .1 + a.1 .3)));
+        for (k, (n, w, rn, rw)) in ks.iter().take(25) {
+            eprintln!(
+                "perry: wpfacts kindwork {k} applies={n} work={w} attach={rn} attachwork={rw}"
+            );
+        }
+        let mut ns: Vec<_> = p.node.iter().map(|(n, w)| (*w, *n)).collect();
+        ns.sort_unstable_by(|a, b| b.cmp(a));
+        for (w, n) in ns.into_iter().take(20) {
+            let node = &self.nodes[n as usize];
+            let mut kinds: crate::pts::FxHashMap<&'static str, u32> = Default::default();
+            for c in &node.cons {
+                *kinds.entry(c.kind_name()).or_default() += 1;
+            }
+            let mut kinds: Vec<_> = kinds.into_iter().collect();
+            kinds.sort_by(|a, b| b.1.cmp(&a.1));
+            kinds.truncate(6);
+            let some: Vec<String> = node
+                .pts
+                .to_sorted()
+                .iter()
+                .take(8)
+                .map(|&t| self.tok_name(t))
+                .collect();
+            eprintln!(
+                "perry: wpfacts nodework #{n} {} work={w} pts={} top={} succ={} cons={} kinds={kinds:?} some={some:?}",
+                self.labels[n as usize],
+                node.pts.len(),
+                node.pts.contains_tok(TOP) as u8,
+                node.succ.len(),
+                node.cons.len()
+            );
         }
     }
 
@@ -219,14 +301,23 @@ impl Model {
     /// Seed ⊤ into `n` as an ORIGIN (not a propagation): `why` names the
     /// unmodeled thing; only interned in explain mode (diagnostics).
     pub fn add_top(&mut self, n: NodeId, why: impl FnOnce(&Self) -> String) {
-        if self.explain {
+        if self.explain || self.diagnostic.is_some() {
             let w = why(self);
-            let r = self.reason(&w);
-            let saved = (self.cur_src, self.cur_why);
-            self.cur_src = NO_NODE;
-            self.cur_why = r;
-            self.add_tok(n, TOP);
-            (self.cur_src, self.cur_why) = saved;
+            if !self.nodes[n as usize].pts.contains_tok(TOP) {
+                if let Some(d) = &mut self.diagnostic {
+                    d.seeds.entry(n).or_insert(w.clone());
+                }
+            }
+            if self.explain {
+                let r = self.reason(&w);
+                let saved = (self.cur_src, self.cur_why);
+                self.cur_src = NO_NODE;
+                self.cur_why = r;
+                self.add_tok(n, TOP);
+                (self.cur_src, self.cur_why) = saved;
+            } else {
+                self.add_tok(n, TOP);
+            }
         } else {
             self.add_tok(n, TOP);
         }
@@ -234,7 +325,8 @@ impl Model {
 
     /// A node holding only ⊤ (all kinds) for one named unmodeled origin.
     pub fn top_val(&mut self, why: &str) -> NodeId {
-        if !self.explain {
+        // Explain and the dump name each origin: its own node.
+        if !self.explain && self.diagnostic.is_none() {
             return self.top_tok_node;
         }
         if let Some(&n) = self.top_vals.get(why) {
@@ -268,6 +360,9 @@ impl Model {
     /// Attach a complex constraint and apply it to what the node holds now.
     pub fn cons(&mut self, n: NodeId, c: Cons) {
         self.stats_cons += 1;
+        if self.diagnostic.is_some() && matches!(c, Cons::TopSink { .. }) {
+            self.diagnostic_sink(n);
+        }
         if self.relations.is_some()
             && !matches!(
                 c,
@@ -301,6 +396,11 @@ impl Model {
         self.nodes[n as usize].pts.sorted_into(&mut toks);
         // The replay is solve work: the bound covers it.
         self.work += toks.len() as u64 + 1;
+        if let Some(p) = self.prof.as_mut() {
+            let e = p.kind.entry(c.kind_name()).or_default();
+            e.2 += 1;
+            e.3 += toks.len() as u64 + 1;
+        }
         let saved = (self.cur_src, self.cur_why);
         self.cur_src = n;
         self.cur_why = u32::MAX;
@@ -309,13 +409,23 @@ impl Model {
         self.bufs.push(toks);
     }
 
+    /// Work no solve has run yet: what was added since the last one (a
+    /// contract check's escapes and the instances they make) is part of
+    /// the unit's facts only once solved.
+    pub(crate) fn unsolved(&self) -> bool {
+        !self.wl.is_empty() || !self.sum.pending.is_empty() || !self.marker_links.is_empty()
+    }
+
     pub fn solve(&mut self) {
         self.rel_phase = b'S';
         self.mark_params();
         self.members_settled.get_mut().clear();
         loop {
+            self.prof_mark(NO_NODE, "instances");
             self.fill_instances();
+            self.prof_mark(NO_NODE, "marker links");
             self.replay_marker_links();
+            self.prof_mark(NO_NODE, "settle");
             let Some(n) = self.wl.pop_front() else {
                 if self.sum.pending.is_empty()
                     && self.marker_links.is_empty()
@@ -328,6 +438,7 @@ impl Model {
                 continue;
             };
             self.pops += 1;
+            self.prof_mark(n, "");
             if self.aborted {
                 return;
             }
@@ -362,6 +473,9 @@ impl Model {
             self.cur_why = u32::MAX;
             let ncons0 = self.nodes[n as usize].cons.len();
             self.work += (delta.len() as u64 + 1) * ncons0 as u64;
+            if let Some(p) = self.prof.as_mut() {
+                p.step[0] += (delta.len() as u64 + 1) * ncons0 as u64;
+            }
             if self.profile.is_some() {
                 let e = self.label_work.entry(self.labels[n as usize]).or_default();
                 e.1 += delta.len() as u64 * ncons0 as u64;
@@ -376,6 +490,9 @@ impl Model {
                 let s = self.nodes[n as usize].succ[i];
                 if self.try_copy_delivery(n, s, &delta, dprim) {
                     self.work += 1 + delivery_overhead;
+                    if let Some(p) = self.prof.as_mut() {
+                        p.step[1] += 1 + delivery_overhead;
+                    }
                     if self.max_work != 0 && self.work > self.max_work {
                         self.aborted = true;
                         return;
@@ -395,6 +512,9 @@ impl Model {
                 };
                 let visits = toks.len() as u64;
                 self.work += visits + checks + delivery_overhead;
+                if let Some(p) = self.prof.as_mut() {
+                    p.step[2] += visits + checks + delivery_overhead;
+                }
                 if self.profile.is_some() {
                     self.label_work
                         .entry(self.labels[n as usize])
@@ -410,6 +530,9 @@ impl Model {
                 } else {
                     let extra = self.copy_to(n, s, toks, dprim);
                     self.work += extra;
+                    if let Some(p) = self.prof.as_mut() {
+                        p.step[3] += extra;
+                    }
                     if self.max_work != 0 && self.work > self.max_work {
                         self.aborted = true;
                         return;
@@ -457,11 +580,30 @@ impl Model {
             let r = self.keyed_reach_of(t, a);
             self.add_tok(n, r);
         } else {
-            let any = self.field_any(t);
+            // An array's named non-index key is its own key: its elements
+            // (`field_any`) are read under an index only (`named_any`). A
+            // module namespace's named key is resolved by name (DECISIONS
+            // 215): it never reads the namespace's other keys.
+            let named = matches!(self.toks[t as usize], TokKind::ModNs(_))
+                || self.is_elem_array(t) && !numeric_key(&self.atoms[a as usize]);
+            let any = match named {
+                true => self.named_any(t),
+                false => self.field_any(t),
+            };
             self.edge(any, n);
+            if let Some(srcs) = self.star_from.get(&t).cloned() {
+                for s in srcs {
+                    self.star_key(t, s, a, n);
+                }
+            }
         }
         let all = self.all_fields(t);
         self.edge(n, all);
+        if let Some(&nf) = self.num_fields.get(&t) {
+            if self.is_num_atom(a) {
+                self.edge(n, nf);
+            }
+        }
         // A key gained after a spread of `t`: the targets get it too.
         if let Some(v) = self.spread_to.get(&t).cloned() {
             for (d, site) in v {
@@ -484,6 +626,12 @@ impl Model {
         if !self.spread_done.insert((s, d)) {
             return;
         }
+        if let Some(&tm) = self.lit_spread_site.get(&site) {
+            if self.tmpl_of(d) == Some(tm) {
+                let keys = self.spread_source_keys(s);
+                self.spread_source(tm, site, keys);
+            }
+        }
         if d == TOP || matches!(self.toks[d as usize], TokKind::BuiltinFn) {
             let r = self.reason("spread into a value from unmodeled code");
             let all = if s == TOP {
@@ -501,7 +649,7 @@ impl Model {
             TokKind::Obj(tm, _) => matches!(self.tmpls[*tm as usize].kind, TmplKind::BObj { .. }),
             _ => false,
         };
-        let fa_d = self.field_any(d);
+        let fa_d = self.any_key_node(d);
         if opaque {
             self.add_top(fa_d, |_| "spread of an unmodeled object".into());
             self.add_prim(fa_d, prim::ALL);
@@ -536,6 +684,85 @@ impl Model {
         let all = self.all_fields(t);
         self.edge(n, all);
         // Arrays and primitive boxes hold primitives at unknown indices.
+        n
+    }
+
+    /// An Array of the program: its elements (`field_any`: what its
+    /// construction, `push` and the like put at an index, and every store
+    /// under a computed key) are no value of a named non-index key, which
+    /// reads `named_any` instead. A marker's fields are its reach markers.
+    pub fn is_elem_array(&self, t: Tok) -> bool {
+        matches!(self.toks[t as usize], TokKind::Obj(tm, _)
+            if matches!(self.tmpls[tm as usize].kind, TmplKind::Arr { .. }))
+            && !self.is_marker(t)
+    }
+
+    /// The values of `t` under a key no store named: for an Array the ones
+    /// its named non-index keys read (`named_any`, flowing on into its
+    /// elements: the key may be an index too), else `field_any`. Every
+    /// write under an unknown key goes here: a computed-key store, unknown
+    /// code's writes (escape, hard), a spread, a computed-key accessor.
+    pub fn any_key_node(&mut self, t: Tok) -> NodeId {
+        match self.is_elem_array(t) {
+            true => self.named_any(t),
+            false => self.field_any(t),
+        }
+    }
+
+    /// DECISIONS 215 (ECMAScript ResolveExport): `export * from` the module
+    /// of namespace `src` (`TOP`: a source outside the program) makes each
+    /// name of `src` a name of namespace `ns`, unless `ns`'s module exports
+    /// that name itself; `default` is never one. A computed key reads every
+    /// key (`field_any`); a named key reads only that name of each source.
+    pub(crate) fn export_star(&mut self, ns: Tok, src: Tok) {
+        let fa = self.field_any(ns);
+        if src == TOP {
+            self.add_top(fa, |_| "unresolved export * source".into());
+        } else {
+            let all = self.all_fields(src);
+            self.edge(all, fa);
+        }
+        let v = self.star_from.entry(ns).or_default();
+        if v.contains(&src) {
+            return;
+        }
+        v.push(src);
+        // The names asked of `ns` before this source was known.
+        let keys = self.field_keys.get(&ns).cloned().unwrap_or_default();
+        for a in keys {
+            let n = self.fields[&(ns, a)];
+            self.star_key(ns, src, a, n);
+        }
+    }
+
+    /// Name `a` of namespace `ns` (node `n`) through its `export *` source
+    /// `src` (`export_star`).
+    fn star_key(&mut self, ns: Tok, src: Tok, a: Atom, n: NodeId) {
+        if self.ns_own.contains(&(ns, a)) || &*self.atoms[a as usize] == "default" {
+            return;
+        }
+        if src == TOP {
+            self.add_top(n, |_| "unresolved export * source".into());
+        } else {
+            let f = self.field(src, a);
+            self.edge(f, n);
+        }
+    }
+
+    /// An Array's values under a computed key that may be no index
+    /// (`is_elem_array`): its named non-index keys read them, and they are
+    /// among its elements as well.
+    pub fn named_any(&mut self, t: Tok) -> NodeId {
+        if let Some(&n) = self.named_any.get(&t) {
+            return n;
+        }
+        let n = self.node_named("namedany", || format!("namedany({t})"));
+        self.nodes[n as usize].obs = self.obs_toks.contains(&t);
+        self.nodes[n as usize].frame = self.fam_home(t);
+        self.named_any.insert(t, n);
+        self.rel(|| format!("namedany {n} {t}"));
+        let any = self.field_any(t);
+        self.edge(n, any);
         n
     }
 
@@ -581,6 +808,33 @@ impl Model {
             self.add_tok(n, s);
         }
         n
+    }
+
+    /// The fields of `t` a number key may name (DECISIONS 217): those under
+    /// a numeric key or the element key, and what it holds under a
+    /// computed key. ToPropertyKey of a number names no other.
+    pub fn num_fields(&mut self, t: Tok) -> NodeId {
+        if let Some(&n) = self.num_fields.get(&t) {
+            return n;
+        }
+        let n = self.node_named("numfields", || format!("numfields({t})"));
+        self.nodes[n as usize].obs = self.obs_toks.contains(&t);
+        self.nodes[n as usize].frame = self.fam_home(t);
+        self.num_fields.insert(t, n);
+        let fa = self.field_any(t);
+        self.edge(fa, n);
+        for a in self.field_keys.get(&t).cloned().unwrap_or_default() {
+            if self.is_num_atom(a) {
+                let f = self.field(t, a);
+                self.edge(f, n);
+            }
+        }
+        n
+    }
+
+    fn is_num_atom(&self, a: Atom) -> bool {
+        let s = &self.atoms[a as usize];
+        numeric_key(s) || s == ELEM || s == NUM_KEY
     }
 
     /// The node holding the prototype objects of `t`.
@@ -634,11 +888,16 @@ impl Model {
                 (None, None) => match self.tmpls[tm as usize].parent_value {
                     // `S.prototype.__proto__` is the parent's `prototype`.
                     Some((_, pp)) => self.edge(pp, n),
+                    // A null-prototype record: the chain ends here.
+                    None if self.tmpls[tm as usize].null_proto => {}
                     None => self.add_tok(n, objproto),
                 },
             },
             TokKind::NativeProto(_) => self.add_tok(n, objproto),
-            TokKind::Func(_, _) | TokKind::Bound(_) | TokKind::BuiltinFn => {
+            // A builtin namespace's prototype is `Function.prototype` (a
+            // constructor's) or `Object.prototype` (`Math`, `JSON`, the
+            // global object's chain): `ObjectProto` stands for both.
+            TokKind::Func(_, _) | TokKind::Bound(_) | TokKind::BuiltinFn | TokKind::Builtin(_) => {
                 self.add_tok(n, objproto)
             }
             TokKind::ClassObj(tm) => match self.tmpls[tm as usize].parent {
@@ -667,13 +926,30 @@ impl Model {
         self.apply_tokens(n, c, Tokens::Slice(toks), prim);
     }
     fn apply_tokens(&mut self, n: NodeId, c: &Cons, toks: Tokens<'_>, prim: u16) {
+        if let Some(d) = self.diagnostic.as_mut() {
+            let saved = (d.cur_call.take(), d.cause_node.replace(n));
+            self.apply_tokens_in(n, c, toks, prim);
+            if let Some(d) = self.diagnostic.as_mut() {
+                (d.cur_call, d.cause_node) = saved;
+            }
+            return;
+        }
+        self.apply_tokens_in(n, c, toks, prim);
+    }
+    fn apply_tokens_in(&mut self, n: NodeId, c: &Cons, toks: Tokens<'_>, prim: u16) {
         if self.sum_skip(n, c) {
             return;
         }
         if self.profile.is_some() {
             let started = std::time::Instant::now();
+            let w0 = self.work;
             self.apply_inner(n, c, toks, prim);
             let name = c.kind_name();
+            if let Some(p) = self.prof.as_mut() {
+                let e = p.kind.entry(name).or_default();
+                e.0 += 1;
+                e.1 += self.work - w0;
+            }
             let e = self.profile.as_mut().unwrap().entry(name).or_default();
             e.0 += 1;
             e.1 += started.elapsed();
@@ -1005,11 +1281,11 @@ impl Model {
     /// stored keys hold unknown values, what it reaches is escaped or
     /// touched as published). False: `t` escapes.
     pub(crate) fn admit_this(&mut self, t: Tok, tmpl: TmplId, this: u32, reason: u32) -> bool {
-        use crate::model::{MARK_ESCAPE, MARK_READ, MARK_TOUCH};
+        use crate::model::{MARK_ESCAPE, MARK_READ, MARK_TOUCHES};
         let Some(c) = self.this_contracts.get(this as usize).cloned() else {
             return false;
         };
-        if c.uses & (MARK_ESCAPE | MARK_TOUCH) != 0 {
+        if c.uses & (MARK_ESCAPE | MARK_TOUCHES) != 0 {
             return false;
         }
         // A published receiver token stands for its class's instances; a
@@ -1077,7 +1353,7 @@ impl Model {
         }
         // What the receiver reaches (its fields, transitively), as for an
         // argument (gen.rs `stand_in_fn_of`).
-        if c.reach & (MARK_ESCAPE | MARK_TOUCH) != 0 {
+        if c.reach & (MARK_ESCAPE | MARK_TOUCHES) != 0 {
             let h = self.node_l("admitted-this");
             let q = self.node_l("admitted-this-reach");
             self.cons(
@@ -1097,13 +1373,9 @@ impl Model {
             if c.reach & MARK_ESCAPE != 0 {
                 self.sink_node(q, reason);
             } else {
-                self.cons(
-                    q,
-                    Cons::Implicit {
-                        reason,
-                        proto: Protocol::Any,
-                    },
-                );
+                for proto in Protocol::of_touches(c.reach) {
+                    self.cons(q, Cons::Implicit { reason, proto });
+                }
             }
             self.add_tok(h, t);
         }
@@ -1288,7 +1560,9 @@ impl Model {
                 }
                 Some((g, j)) if g == f && j != u32::MAX => from.push(j),
                 _ => match own {
-                    Some(at) => self.mark_use(at, crate::model::MARK_ESCAPE),
+                    Some(at) => {
+                        self.mark_escape_why(at, &|_| "store: flow of another value".into())
+                    }
                     None => {
                         top = true;
                         self.escape(s, reason);
@@ -1364,7 +1638,7 @@ impl Model {
         if !calls && reads.is_empty() {
             return;
         }
-        self.mark_use(t, crate::model::MARK_TOUCH);
+        self.mark_use(t, proto.touch_bit());
         // A marker: the protocol runs on the values beside it; on the
         // marker it calls what the marker reaches under the protocol's
         // keys, an escape of that (`method_on`, DECISIONS 111). It has no
@@ -1374,12 +1648,12 @@ impl Model {
             match &keys {
                 None => {
                     let r = self.reach_of(t);
-                    self.mark_use(r, crate::model::MARK_ESCAPE);
+                    self.mark_escape_why(r, &|_| "protocol: on a marker".into());
                 }
                 Some(ks) => {
                     for &a in ks {
                         let m = self.marker_load(t, Some(a));
-                        self.mark_use(m, crate::model::MARK_ESCAPE);
+                        self.mark_escape_why(m, &|_| "protocol: on a marker".into());
                     }
                 }
             }
@@ -1503,11 +1777,19 @@ impl Model {
                 "overridethis {n} {tmpl} {} {reason}",
                 self.key_name(Key::Named(*key))
             ),
+            Cons::Guard { test, from, dst } => format!("guard {n} {test} {from} {dst}"),
+            Cons::Defined { dst } => format!("defined {n} {dst}"),
             Cons::TopIfAny { dst, from, reason } => format!(
                 "topifany {n} {dst} {from} {}",
                 reason.map_or(-1, |r| r as i64)
             ),
             Cons::Hard { kind, reason } => format!("hard {n} {} {reason}", kind.code()),
+            Cons::DeleteKey { key, reason } => {
+                format!(
+                    "deletekey {n} {} {reason}",
+                    esc_key(&self.atoms[*key as usize])
+                )
+            }
             Cons::AddsKeys => format!("addskeys {n}"),
             Cons::DefineKey { key, data, reason } => {
                 format!(
@@ -1536,9 +1818,11 @@ impl Model {
                 format!("implicit {n} {reason} {}", proto.name())
             }
             Cons::CreateProto { reason } => format!("createproto {n} {reason}"),
-            Cons::ChainUnion { key, dst } => {
-                format!("chainunion {n} {} {dst}", self.key_name(*key))
+            Cons::ChainUnion { key, dst, of } => {
+                format!("chainunion {n} {} {dst} {of}", self.key_name(*key))
             }
+            Cons::ProtoGiven { protos } => format!("protogiven {n} {protos}"),
+            Cons::ParentGiven { of } => format!("parentgiven {n} {of}"),
             Cons::ProtoClosure { dst } => format!("protoclosure {n} {dst}"),
             Cons::ProtoMethods { origin, key, call } => {
                 format!("protomethods {n} {origin} {} {call}", self.key_name(*key))
@@ -1579,6 +1863,8 @@ impl Model {
                 format!("birthfield {n} {} {src}", self.key_name(*key))
             }
             Cons::ProtoOf { dst } => format!("protoof {n} {dst}"),
+            Cons::ProtoValues { dst } => format!("protovalues {n} {dst}"),
+            Cons::PlainKey { origin, act } => format!("plainkey {n} {origin} {act:?}"),
             Cons::IterNext { dst } => format!("iternext {n} {dst}"),
             Cons::NewTargetHard { reason } => format!("newtargethard {n} {reason}"),
             Cons::ShareBuffer { ta } => format!("sharebuffer {n} {ta}"),
@@ -1586,6 +1872,8 @@ impl Model {
             Cons::ArrayLenArg { dst } => format!("arraylenarg {n} {dst}"),
             Cons::IdxLoad { idx, dst } => format!("idxload {n} {idx} {dst}"),
             Cons::IdxKey { obj, dst } => format!("idxkey {n} {obj} {dst}"),
+            Cons::IdxMCall { idx, call } => format!("idxmcall {n} {idx} {call}"),
+            Cons::IdxKeyCall { obj, prim, call } => format!("idxkeycall {n} {obj} {prim} {call}"),
             Cons::ForInBody { obj, call } => format!("forinbody {n} {obj} {call}"),
             Cons::ForInKeys { ft, call } => format!("forinkeys {n} {ft} {call}"),
             Cons::DefineKeyed {
@@ -1640,4 +1928,11 @@ impl Model {
     pub fn fn_tokens(&self, n: NodeId) -> Vec<Tok> {
         self.fns_of(n)
     }
+}
+
+/// May key `name` be ToString of a Number (an index, `1.5`, `-1`, `1e+21`,
+/// `NaN`, `Infinity`)? A store under a Number key lands there. A superset
+/// is safe: such a key reads the elements as well.
+pub(crate) fn numeric_key(name: &str) -> bool {
+    name.parse::<f64>().is_ok() || matches!(name, "NaN" | "Infinity" | "-Infinity")
 }

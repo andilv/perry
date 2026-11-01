@@ -63,17 +63,7 @@ extern "C" fn ns_readable_iterator_chunk_fulfilled(
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn ns_readable_iterator_chunk_rejected(
-    closure: *const ClosureHeader,
-    _this: crate::closure::JsThis,
-    reason: f64,
-) -> f64 {
-    let outer = js_closure_get_capture_ptr(closure, 0) as *mut crate::promise::Promise;
-    if !outer.is_null() {
-        crate::promise::js_promise_reject(outer, reason);
-    }
-    f64::from_bits(TAG_UNDEFINED)
-}
+use crate::promise::then::finally_cleanup_reject as ns_readable_iterator_chunk_rejected;
 
 extern "C" fn ns_readable_source_iterator_fulfilled(
     closure: *const ClosureHeader,
@@ -1194,7 +1184,7 @@ pub(crate) fn mark_foreign_readable_ended(stream: f64) {
 pub(crate) fn install_readable_async_iterator_symbol(stream: f64) {
     install_async_iterator_symbol(
         stream,
-        crate::fn_info!(ns_async_iterator, 0; with_declared(0)),
+        crate::fn_info!(#[realm(realm_decl! { "node:stream.Readable.prototype[\"@@asyncIterator\"]", provider = closure, receiver = undefined; "process.stdin[\"@@asyncIterator\"]", provider = closure, capture = [ref(process.stdin)]; })] export crate::node_stream::async_iterator::ns_async_iterator, 0; with_declared(0)),
     );
 }
 

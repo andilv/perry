@@ -61,6 +61,7 @@ use perry_hir::{Class, Expr, Module, ModuleInitKind, Stmt};
 
 fn entry_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -72,6 +73,7 @@ fn entry_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -327,7 +329,9 @@ fn concat_accumulator_is_rooted_and_written_back() {
     let ir = ir_for(
         "concat_rooted.ts",
         vec![Stmt::Expr(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::Binary {
                     op: perry_hir::BinaryOp::Add,
                     left: Box::new(Expr::String("a".to_string())),
@@ -390,7 +394,9 @@ fn string_method_with_non_allocating_args_emits_no_rooting_calls() {
     let ir = ir_for(
         "string_method_no_gc.ts",
         vec![Stmt::Expr(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::Binary {
                     op: perry_hir::BinaryOp::Add,
                     left: Box::new(Expr::String("a".to_string())),
@@ -419,6 +425,7 @@ fn module_with_new(name: &str, args: Vec<Expr>) -> Module {
     let mut module = module_with_init(
         name,
         vec![Stmt::Expr(Expr::New {
+            byte_end: 0,
             class_name: "Pair".to_string(),
             args,
             type_args: Vec::new(),
@@ -795,6 +802,29 @@ fn string_literal_concat_operand_is_re_derived_below_the_allocating_sibling() {
     // are unambiguous rather than "whichever matched first".
     let f = init_ir(&ir);
     let handle = "load double, ptr @concat_reload_ts_.str.";
+    // JST slice 3: an ASCII source-literal prefix reaches the runtime as its
+    // rodata address and lengths (`js_string_concat_lit_value_box`), a
+    // link-time constant. There is no register holding the literal to go
+    // stale across the sibling's collection point, so the invariant below
+    // holds by construction; assert that form directly.
+    if f.contains("call double @js_string_concat_lit_value_box(") {
+        assert_eq!(
+            f.matches("call double @js_string_concat_lit_value_box(")
+                .count(),
+            1,
+            "exactly one fused string+value concat in @main:\n{f}"
+        );
+        assert_eq!(object_allocation_count(f), 1, "{f}");
+        assert!(
+            f.contains(
+                "@js_string_concat_lit_value_box(i64 ptrtoint (ptr getelementptr (i8, ptr getelementptr (i8, ptr @perry_image_literal_"
+            ),
+            "the literal must travel as a constant image address, never a \
+             register that a collection could leave stale:\n{f}"
+        );
+        assert_no_temp_rooting(f, "a constant operand needs no slot");
+        return;
+    }
     assert_eq!(
         f.matches("call double @js_string_concat_value_box(")
             .count(),
@@ -1607,6 +1637,8 @@ fn a_put_value_set_key_is_re_derived_below_the_value() {
                 value: Box::new(Expr::Object(Vec::new())),
                 receiver: Box::new(Expr::LocalGet(0)),
                 strict: true,
+                byte_offset: 0,
+                byte_end: 0,
             }),
         ],
     );

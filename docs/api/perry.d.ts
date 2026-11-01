@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2021 entries across 111 modules
+// Coverage: 2027 entries across 112 modules
 
 type PerryI8 = number & { readonly __perryI8?: never };
 type PerryI16 = number & { readonly __perryI16?: never };
@@ -2476,7 +2476,11 @@ declare module "perry/component" {
   /** stdlib */
   export function callComponentImport(interfaceName: string, functionName: string, args: any): any;
   /** stdlib */
+  export function closeComponentHttpServer(server: any): void;
+  /** stdlib */
   export function createComponentHostResource(handle: any, resourceType: string, payload: any, destructor?: any): any;
+  /** stdlib */
+  export function createComponentHttpServer(options: any): any;
   /** stdlib */
   export function createComponentResource(resourceType: number, payload: any, destructor: any): any;
   /** stdlib */
@@ -2485,6 +2489,8 @@ declare module "perry/component" {
   export function getComponentHostResourceValue(handle: any, resourceType: string, resource: any): any;
   /** stdlib */
   export function getComponentResourceValue(resourceType: number, resource: any): any;
+  /** stdlib */
+  export function handleComponentHttpRequest(server: any, handle: any, interfaceName: string): any;
   /** stdlib */
   export function loadComponent(bytes: any, contract: string, imports: any, options: any): any;
   /** stdlib */
@@ -3921,6 +3927,16 @@ declare module "tls" {
   export function setDefaultCACertificates(certs: any): any;
 }
 
+declare module "trace_events" {
+  /** stdlib */
+  const _default: any;
+  export default _default;
+  /** stdlib */
+  export function createTracing(...args: any[]): any;
+  /** stdlib */
+  export function getEnabledCategories(...args: any[]): any;
+}
+
 declare module "tty" {
   /** stdlib */
   export class ReadStream { [key: string]: any; }
@@ -4375,11 +4391,11 @@ declare module "zlib" {
   /** stdlib */
   export function brotliCompress(buffer: any, options?: any, callback?: any): void;
   /** stdlib */
-  export function brotliCompressSync(p0: string): Buffer;
+  export function brotliCompressSync(buffer: any, options?: any): Buffer;
   /** stdlib */
   export function brotliDecompress(buffer: any, options?: any, callback?: any): void;
   /** stdlib */
-  export function brotliDecompressSync(p0: string): Buffer;
+  export function brotliDecompressSync(buffer: any, options?: any): Buffer;
   /** stdlib */
   export function crc32(p0: string, seed?: number): number;
   /** stdlib @perryStub params/quality options accepted but ignored, warns once (#4917) */

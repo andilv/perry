@@ -117,11 +117,15 @@ fn split_module() -> Module {
                 object: Box::new(Expr::LocalGet(100)),
                 property: "bar".to_string(),
                 value: Box::new(Expr::LocalGet(22)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::LocalGet(103)),
                 property: "x".to_string(),
                 value: Box::new(Expr::Number(7.0)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             let_stmt(
                 23,
@@ -132,6 +136,7 @@ fn split_module() -> Module {
                 24,
                 "r",
                 Expr::Call {
+                    byte_end: 0,
                     callee: Box::new(Expr::LocalGet(102)),
                     args: vec![Expr::LocalGet(22)],
                     type_args: Vec::new(),
@@ -277,6 +282,8 @@ fn read_site_memos_preserve_leaf_and_collecting_root_contracts() {
                 25,
                 "keyed",
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(100)),
                     index: Box::new(Expr::LocalGet(104)),
                 },

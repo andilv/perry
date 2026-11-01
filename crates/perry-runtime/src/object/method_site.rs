@@ -101,7 +101,7 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
     }
     let header = crate::value::addr_class::try_read_gc_header(addr)?;
     // An OBJECT header is not a closure (closures carry GC_TYPE_CLOSURE).
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+    if crate::object_lacks_meta_word!(header.obj_type)
         || !address_is_prime_stable(addr)
         || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
         || header._reserved & crate::gc::OBJ_FLAG_TYPED_ARRAY_PROTO != 0
@@ -122,7 +122,8 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
         || (*obj).class_id == super::native_module::NATIVE_MODULE_CLASS_ID
         || super::class_registry::is_class_object_ptr(obj.cast())
         || crate::array::object_prototype_addr_matches(addr)
-        || ((*obj).class_id == 0 && crate::url::is_url_object_shape(obj as *mut ObjectHeader))
+        || ((*obj).class_id == 0
+            && crate::object::url_layout::is_url_object_shape(obj as *mut ObjectHeader))
     {
         return None;
     }
@@ -130,7 +131,7 @@ unsafe fn ordinary_receiver(addr: usize) -> Option<*const ObjectHeader> {
     if !super::shapes::is_layout_word(stamp.0) {
         return None;
     }
-    let meta = (*obj).meta;
+    let meta = crate::meta_read!(crate::meta_obj_from_type!(obj as *mut _, header.obj_type));
     if !meta.is_null()
         && ((*meta).elements != 0
             || (*meta).flags & super::OBJECT_META_FLAG_EXOTIC_READ_RECEIVER != 0)

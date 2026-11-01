@@ -73,6 +73,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             callee,
             args,
             byte_offset,
+            ..
         } => {
             use perry_hir::CallArg;
             let new_byte_offset = *byte_offset;
@@ -206,6 +207,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             callee,
             args,
             byte_offset,
+            byte_end,
+            ..
         } => {
             // #5253: source location of this `new` for the not-a-constructor
             // throws below. `const X: any = undefined; new X()` lowers here
@@ -395,38 +398,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             // NewDynamic reroute of a native-module builtin ctor
                             // export: no HIR cap forwards are appended here.
                             return lower_new(ctx, "WebSocketServer", args, 0);
-                        }
-                    }
-                }
-            }
-
-            // `new crypto.Certificate()` is a legacy constructor in Node, but
-            // the implementation is a stateless namespace over the same SPKAC
-            // helper methods as `crypto.Certificate.*`. Represent instances as
-            // the `crypto.Certificate` native namespace so method calls dispatch
-            // through the existing native-module path.
-            if let Expr::PropertyGet {
-                object, property, ..
-            } = callee.as_ref()
-            {
-                if property == "Certificate" && args.is_empty() {
-                    if let Expr::NativeModuleRef(mod_name) = object.as_ref() {
-                        if mod_name == "crypto" {
-                            let module_name = "crypto.Certificate";
-                            let mod_idx = ctx.strings.intern(module_name);
-                            let mod_bytes_global =
-                                format!("@{}", ctx.strings.entry(mod_idx).bytes_global);
-                            let mod_len_str = module_name.len().to_string();
-                            let install_sym = crate::nm_install::nm_install_symbol(module_name);
-                            let blk = ctx.block();
-                            if let Some(s) = install_sym {
-                                blk.call_void(s, &[]);
-                            }
-                            return Ok(blk.call(
-                                DOUBLE,
-                                "js_create_native_module_namespace",
-                                &[(PTR, &mod_bytes_global), (I64, &mod_len_str)],
-                            ));
                         }
                     }
                 }
@@ -672,11 +643,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             } = callee.as_ref()
             {
                 let then_synth = Expr::NewDynamic {
+                    byte_end: *byte_end,
                     callee: then_expr.clone(),
                     args: args.clone(),
                     byte_offset: new_byte_offset,
                 };
                 let else_synth = Expr::NewDynamic {
+                    byte_end: *byte_end,
                     callee: else_expr.clone(),
                     args: args.clone(),
                     byte_offset: new_byte_offset,
@@ -927,6 +900,7 @@ mod tests {
         use perry_hir::{Expr, Module, Stmt};
         let mut module = Module::new("thread_construct_site.ts");
         module.init.push(Stmt::Expr(Expr::NewDynamic {
+            byte_end: 0,
             callee: Box::new(Expr::GlobalGet(100)),
             args: vec![],
             byte_offset: 0,
@@ -958,6 +932,7 @@ mod tests {
         use perry_hir::{Expr, Module, Stmt};
         let mut module = Module::new("imported_construct_site.ts");
         module.init.push(Stmt::Expr(Expr::New {
+            byte_end: 0,
             class_name: "Ctor".into(),
             args: vec![],
             type_args: vec![],
@@ -995,6 +970,7 @@ mod tests {
         use perry_hir::{Expr, Module, Stmt};
         let mut module = Module::new("construct_site.ts");
         module.init.push(Stmt::Expr(Expr::NewDynamic {
+            byte_end: 0,
             callee: Box::new(Expr::GlobalGet(100)),
             args: vec![],
             byte_offset: 0,

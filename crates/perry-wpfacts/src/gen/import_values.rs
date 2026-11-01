@@ -62,6 +62,23 @@ impl<'a> Gen<'a> {
                 "re-exported by {src}: no contract of {file} for it"
             ));
         }
+        // A back edge may read this binding before its exporting unit
+        // publishes a named contract in this round. Keep it unknown, but
+        // also track the owner's function when one is known. If this
+        // value reaches unknown code, escaping that stand-in exposes its
+        // result through the census. Merely reading/calling an import
+        // does not let unknown code retain the function itself.
+        let owner = format!("{}:{name}", crate::decl_units::module_of(path));
+        if let Some(c) = self.unit_in.and_then(|u| u.own_fn(&owner)) {
+            let f = self.stand_in_fn(mi, c);
+            let unknown = unresolved(self);
+            // Never add it to the shared TOP node, or use it as the
+            // binding's identity: the binding may have been rebound.
+            let n = self.m.node_l("unknown-import");
+            self.m.edge(unknown, n);
+            self.m.edge(f, n);
+            return n;
+        }
         unresolved(self)
     }
 
@@ -108,7 +125,8 @@ impl<'a> Gen<'a> {
             },
         );
         if open {
-            let fa = self.m.field_any(tok);
+            // Under every name (DECISIONS 215: a named key reads `named_any`).
+            let fa = self.m.named_any(tok);
             self.m.add_top(fa, |_| {
                 format!("namespace of {src}: export * from outside the program")
             });
@@ -243,6 +261,9 @@ impl<'a> Gen<'a> {
             } else if !ignores {
                 self.ns_whole(n);
             }
+        }
+        if let Some(d) = &mut self.diagnostic {
+            d.namespace_receivers.insert(n);
         }
         Some(n)
     }
@@ -444,6 +465,7 @@ impl<'a> Gen<'a> {
         if !(value.builtins.is_empty()
             && value.arrays.is_empty()
             && value.boxes.is_empty()
+            && value.indexed_owners.is_empty()
             && value.fns.is_empty())
         {
             let v = self.stand_in_value(mi, why, value);
@@ -580,7 +602,7 @@ impl<'a> Gen<'a> {
         c: &'a crate::units::FnContract,
         holder: Option<(TmplId, bool)>,
     ) -> NodeId {
-        use crate::model::{MARK_ESCAPE, MARK_TOUCH};
+        use crate::model::{MARK_ESCAPE, MARK_TOUCHES};
         let c = self.owner_fn(c);
         if let Some(&(n, _)) = self.stand_in_fns.get(&(c.name.clone(), holder)) {
             return n;
@@ -656,12 +678,53 @@ impl<'a> Gen<'a> {
         self.m.add_tok(n, tok);
         self.stand_in_fns.insert((c.name.clone(), holder), (n, tok));
         self.stand_in_fc.insert(tok, c);
+        // DECISIONS 210: a `new` of it constructs its owner's `new <name>`
+        // layout: its stand-in instance is held here once the owner
+        // published it (read like a cell, `other_layout`; a broken one is
+        // ⊤). Until then the construction's result is unknown and the
+        // construction is published, so the owner constructs and publishes
+        // the layout (`lib.rs` records the read once this unit constructs).
+        let d = format!("new {}", c.name);
+        let held = match self.unit_in {
+            Some(u) if u.layout(&d).is_some() || u.broken(&d) => self.other_layout(&d).map(|cc| {
+                self.stand_in_class(mi, cc);
+                let tm = self.stand_ins[&d].1;
+                let nv = self
+                    .m
+                    .node_named("newval", || format!("newval({})", c.name));
+                let inst = self.m.tok(TokKind::Obj(tm, NO_CTX));
+                self.m.add_tok(nv, inst);
+                (nv, tm)
+            }),
+            _ => None,
+        };
+        self.m.foreign_ctor.insert(fx, held);
         // What unknown code receives goes nowhere here.
         self.m.nodes[args_all as usize].sink = true;
         self.m.sink_node(args_all, r);
         if let Some(n) = rest {
             self.m.sink_node(n, r);
         }
+        // DECISIONS 212: a published method held as a value (a result, a
+        // field, an array element, the prototype's key) runs on the
+        // receivers this unit passes, as when it calls it on its class's
+        // stand-in: the method's unit assumes no other (`escape_this`, a
+        // contract-only receiver). Its class's instances are admitted and
+        // published (DECISIONS 107); any other receiver is this unit's
+        // census report (DECISIONS 85). With no one class named, none is
+        // admitted.
+        let holder = match holder {
+            None if c.method && !c.lexical_this => Some(
+                match c.this_class.as_deref().and_then(|d| self.other_layout(d)) {
+                    Some(cc) => {
+                        self.stand_in_class(mi, cc);
+                        (self.stand_ins[&cc.display].1, false)
+                    }
+                    None => (TmplId::MAX, false),
+                },
+            ),
+            h => h,
+        };
         match holder {
             _ if c.lexical_this => {}
             Some((tm, statics)) => {
@@ -677,8 +740,11 @@ impl<'a> Gen<'a> {
                             self.stored_value(mi, this, c, &params, u32::MAX, false, None, Some(k))
                         })
                         .collect();
+                    // No class to admit (`TmplId::MAX`): a receiver is a
+                    // use beyond the contract (`admit_this`).
+                    let none = if tm == TmplId::MAX { MARK_ESCAPE } else { 0 };
                     self.m.this_contracts.push(crate::model::ThisContract {
-                        uses: c.this_use,
+                        uses: c.this_use | none,
                         reach: c.this_reach,
                         stores: c.this_stores.clone(),
                         values,
@@ -718,17 +784,15 @@ impl<'a> Gen<'a> {
             let u = c.params[i];
             let ru = c.reach[i];
             if u & MARK_ESCAPE != 0 {
+                if let Some(d) = self.m.diagnostic.as_mut() {
+                    d.stand_in_params.push((p, c.name.clone(), i as u32, None));
+                }
                 self.m.sink_node(p, r);
                 continue;
             }
-            if u & MARK_TOUCH != 0 {
-                self.m.cons(
-                    p,
-                    Cons::Implicit {
-                        reason: r,
-                        proto: Protocol::Any,
-                    },
-                );
+            // The protocols the callee runs on it, each with its own keys.
+            for proto in Protocol::of_touches(u) {
+                self.m.cons(p, Cons::Implicit { reason: r, proto });
             }
             // The keys the callee stores into the argument (DECISIONS 84):
             // what it stores under each (DECISIONS 118), a store this unit
@@ -814,6 +878,14 @@ impl<'a> Gen<'a> {
             }
             for (key, ru) in buckets {
                 if ru & MARK_ESCAPE != 0 {
+                    if let Some(d) = self.m.diagnostic.as_mut() {
+                        let k = match key {
+                            crate::model::Key::Named(a) => self.m.atoms[a as usize].clone(),
+                            crate::model::Key::Any => String::new(),
+                        };
+                        d.stand_in_params
+                            .push((p, c.name.clone(), i as u32, Some(k)));
+                    }
                     let q = match self.reach_escape {
                         Some(q) => q,
                         None => {
@@ -825,11 +897,12 @@ impl<'a> Gen<'a> {
                         }
                     };
                     self.m.cons(p, Cons::Load { key, dst: q });
-                } else if ru & MARK_TOUCH != 0 {
-                    let q = match self.reach_touch {
-                        Some(q) => q,
+                } else if ru & MARK_TOUCHES != 0 {
+                    let touches = ru & MARK_TOUCHES;
+                    let q = match self.reach_touch.iter().find(|&&(b, _)| b == touches) {
+                        Some(&(_, q)) => q,
                         None => {
-                            let q = self.m.node_named("reach", || "reached(touch)".into());
+                            let q = self.m.node_named("reach", || format!("reached(touch {touches})"));
                             self.m.nodes[q as usize].sink = true;
                             self.m.cons(
                                 q,
@@ -838,14 +911,10 @@ impl<'a> Gen<'a> {
                                     dst: q,
                                 },
                             );
-                            self.m.cons(
-                                q,
-                                Cons::Implicit {
-                                    reason: r,
-                                    proto: Protocol::Any,
-                                },
-                            );
-                            self.reach_touch = Some(q);
+                            for proto in Protocol::of_touches(touches) {
+                                self.m.cons(q, Cons::Implicit { reason: r, proto });
+                            }
+                            self.reach_touch.push((touches, q));
                             q
                         }
                     };
@@ -933,6 +1002,14 @@ impl<'a> Gen<'a> {
                     .m
                     .node_named("arg", || format!("called{i}-arg{j}({})", c.name));
                 self.m.own(a);
+                // UEB: the call is the run's (DECISIONS 44 (b)): its
+                // arguments are temporaries of the run, as its result is, so
+                // what the run's parameters hand them stays relative to each
+                // call (the argument markers of this unit's values passed to
+                // the run) and the owner of those values describes them in
+                // its own contract (a function forwarded to a third unit's
+                // function that calls it, DECISIONS 140).
+                self.m.nodes[a as usize].frame = run;
                 let why = "argument from another unit's function";
                 self.fill_described(mi, c, d, &d.value, this, &params, a, why);
                 args.push(a);

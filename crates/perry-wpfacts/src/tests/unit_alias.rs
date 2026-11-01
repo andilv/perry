@@ -100,7 +100,7 @@ fn both(mods: &[(&str, &str)]) -> (ProgramFacts, ProgramFacts) {
     (run(mods, true, &cfg), run(mods, false, &cfg))
 }
 
-fn assert_not_stronger(mods: &[(&str, &str)]) -> (ProgramFacts, ProgramFacts) {
+pub(super) fn assert_not_stronger(mods: &[(&str, &str)]) -> (ProgramFacts, ProgramFacts) {
     let (u, w) = both(mods);
     let s = stronger(&u, &w);
     assert!(
@@ -657,8 +657,11 @@ fn a_layout_met_again_in_its_own_description_is_named_once() {
         ctor_fn: None,
         birth_keys: Vec::new(),
         definite: Vec::new(),
+        reserved: Vec::new(),
         ctor_leaks: true,
+        ctor_returns: false,
         binding_prim: 0,
+        fn_inst: false,
     };
     let with = |mut c: crate::units::ClassContract, inner: crate::units::ClassContract| {
         let vc = crate::units::ValueContract {

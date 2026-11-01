@@ -274,6 +274,12 @@ impl Model {
     }
 
     pub(crate) fn store_into(&mut self, t: Tok, key: Key, src: NodeId, site: SiteId) {
+        // An element store (`push`, `unshift`, `splice`: the element key) is
+        // an index store: on an Array it writes its elements only, which no
+        // named non-index key reads (`is_elem_array`); on anything else it
+        // is a store under a computed key.
+        let elem = self.is_elem_key(key);
+        let key = if elem { Key::Any } else { key };
         {
             self.virt_revoke(
                 t,
@@ -282,6 +288,19 @@ impl Model {
                     Key::Any => None,
                 },
             );
+        }
+        // DECISIONS 210: a store into another unit's function (a stand-in)
+        // under `prototype` (or a key that may be it) replaces the chain its
+        // owner's layout has: the census reports it. Its other properties
+        // left in the owner (`escape_props`).
+        if let TokKind::Func(f, _) = self.toks[t as usize] {
+            let proto = match key {
+                Key::Named(a) => self.atoms[a as usize] == "prototype",
+                Key::Any => true,
+            };
+            if proto && self.foreign_ctor.contains_key(&f) {
+                self.fn_touched.insert(t);
+            }
         }
         // A store into a builtin function value is decided once the
         // worklist is empty (`settle_bf_written`): `write_builtin_fns` notes it.
@@ -293,6 +312,7 @@ impl Model {
         {
             let k = match key {
                 Key::Named(a) => Some(self.atoms[a as usize].clone()),
+                Key::Any if elem => Some(NUM_KEY.to_string()),
                 Key::Any => None,
             };
             self.note_shared(SharedWrite::Store(s, k));
@@ -309,7 +329,12 @@ impl Model {
                 return;
             }
         }
-        self.note_fnproto_write(t, Some(key), "store");
+        // An element store writes an index of a builtin prototype at most.
+        let wkey = match elem {
+            true => Key::Named(self.atom(NUM_KEY)),
+            false => key,
+        };
+        self.note_fnproto_write(t, Some(wkey), "store");
         // Explain: the first store into ⊤ under a key names its site and why
         // the receiver is ⊤.
         let what = match (self.explain && t == TOP, self.store_at) {
@@ -326,12 +351,18 @@ impl Model {
             }
             _ => "store".to_string(),
         };
-        builtins::note_native_write(self, t, Some(key), &what);
+        // Not the boundary's store for other units' code: what they store
+        // into ⊤ they publish (`SharedWrite::Store(Top, _)`; a unit past the
+        // bound publishes every key), and every unit replays it under its key.
+        if !theirs {
+            builtins::note_native_write(self, t, Some(wkey), &what);
+        }
         if matches!(key, Key::Any)
             || matches!(key, Key::Named(a) if self.atoms[a as usize] == "__proto__")
         {
             self.super_relink.insert(t);
             if let TokKind::ClassObj(tm) = self.toks[t as usize] {
+                self.cons(src, Cons::ParentGiven { of: t });
                 let parent = self.proto_node(t);
                 self.edge(src, parent);
                 let instance = self.tok(TokKind::Obj(tm, NO_CTX));
@@ -388,7 +419,7 @@ impl Model {
                 return;
             }
             if key == Key::Any {
-                self.mark_use(t, crate::model::MARK_ESCAPE);
+                self.mark_escape_why(t, &|_| "store: under a computed key".into());
             }
             if self.arg_store_done.insert((t, key, src)) {
                 // DECISIONS 187/193: kept on `t` alone, where it was made,
@@ -483,7 +514,7 @@ impl Model {
                 return;
             }
         }
-        self.mark_use(t, crate::model::MARK_ESCAPE);
+        self.mark_escape_why(t, &|_| "store: into a marker".into());
         // A parameter marker stands for another unit's value (design §11.2):
         // it has no fields in this unit. The store is its contract's escape
         // (above), and the stored value goes where the receiver's other
@@ -522,10 +553,9 @@ impl Model {
                         k != "__proto__"
                             && !facts.fields.iter().any(|f| !f.data_field && &f.key == k)
                     }
-                    "class" => facts
-                        .fields
-                        .iter()
-                        .any(|f| f.data_field && &f.key == k && (f.definite || f.declared)),
+                    "class" => facts.fields.iter().any(|f| {
+                        f.data_field && &f.key == k && (f.definite || f.declared || f.reserved)
+                    }),
                     _ => false,
                 }
             }
@@ -603,11 +633,15 @@ impl Model {
                     // A store effect's key exists in the defining unit's layout.
                     if !self.tmpls[tm as usize].birth_keys.contains(&a) && !ctor && !effect {
                         *self.adds_keys.entry(tm).or_default() += 1;
+                        *self.adds_named.entry((tm, a)).or_default() += 1;
                     }
                 }
             }
             Key::Any => {
-                let f = self.field_any(t);
+                let f = match elem && self.is_elem_array(t) {
+                    true => self.field_any(t),
+                    false => self.any_key_node(t),
+                };
                 self.edge(src, f);
                 if let Some(tm) = tm {
                     let birth = self.stores[site as usize].birth;

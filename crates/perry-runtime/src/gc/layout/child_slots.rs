@@ -219,6 +219,12 @@ impl Iterator for HeapChildSlotIterator {
     type Item = HeapChildSlot;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.next_with::<{ cfg!(test) }>()
+    }
+}
+
+impl HeapChildSlotIterator {
+    pub(in crate::gc) fn next_with<const DIAGNOSTICS: bool>(&mut self) -> Option<HeapChildSlot> {
         if let Some(slot) = self.prefix_slot.take() {
             return Some(HeapChildSlot::Child(slot, HeapChildSlotReadKind::Prefix));
         }
@@ -239,14 +245,20 @@ impl Iterator for HeapChildSlotIterator {
                     None
                 } else {
                     *emitted = true;
-                    record_layout_pointer_free_range_skipped(self.payload.slot_count());
+                    if DIAGNOSTICS {
+                        record_layout_pointer_free_range_skipped(self.payload.slot_count())
+                    };
                     if *raw_numeric_array {
-                        record_layout_raw_numeric_array_range_skipped(self.payload.slot_count());
+                        if DIAGNOSTICS {
+                            record_layout_raw_numeric_array_range_skipped(self.payload.slot_count())
+                        };
                     }
                     if *raw_numeric_object_slots != 0 {
-                        record_layout_raw_numeric_object_field_range_skipped(
-                            *raw_numeric_object_slots,
-                        );
+                        if DIAGNOSTICS {
+                            record_layout_raw_numeric_object_field_range_skipped(
+                                *raw_numeric_object_slots,
+                            )
+                        };
                     }
                     Some(HeapChildSlot::PointerFreeRange(self.payload))
                 }
@@ -260,9 +272,11 @@ impl Iterator for HeapChildSlotIterator {
                 if !*raw_numeric_recorded {
                     *raw_numeric_recorded = true;
                     if *raw_numeric_object_slots != 0 {
-                        record_layout_raw_numeric_object_field_range_skipped(
-                            *raw_numeric_object_slots,
-                        );
+                        if DIAGNOSTICS {
+                            record_layout_raw_numeric_object_field_range_skipped(
+                                *raw_numeric_object_slots,
+                            )
+                        };
                     }
                 }
                 let index = mask.next_slot_at_or_after(*cursor, self.payload.slot_count())?;
@@ -473,6 +487,23 @@ impl GcMutableSlot {
             owner: GcSlotOwner::RuntimeRoot,
             ..Self::new(slot, None)
         }
+    }
+
+    /// RuntimeRoot slots are the shape's keys array, prototype identity or
+    /// evaluation holder. Only the keys array is an untagged word; the two
+    /// identities are NaN-boxed. Thus this exact descriptor proves that a
+    /// nonzero raw word is a live ArrayHeader, without a speculative header
+    /// read through an arbitrary JS value. An already marked, nonforwarded
+    /// array owes no further marking or rewrite; custody is with its runtime
+    /// root scanner, so there is no parent remembered-set work either.
+    #[inline(always)]
+    pub(in crate::gc) unsafe fn shared_keys_already_marked(self, bits: u64) -> bool {
+        if self.is_parent_owned() || bits == 0 || bits & TAG_MASK != 0 {
+            return false;
+        }
+        let header = header_from_user_ptr(bits as usize as *const u8);
+        debug_assert_eq!((*header).obj_type, GC_TYPE_ARRAY);
+        (*header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_FORWARDED) == GC_FLAG_MARKED
     }
 
     #[inline(always)]

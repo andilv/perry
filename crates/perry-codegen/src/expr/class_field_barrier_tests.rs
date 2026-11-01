@@ -62,6 +62,7 @@ pub(super) fn assert_default_barrier_env_not_disabled() {
 
 pub(super) fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -73,6 +74,7 @@ pub(super) fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -174,6 +176,8 @@ fn param_prologue_ctor() -> Function {
             object: Box::new(Expr::This),
             property: "v".to_string(),
             value: Box::new(Expr::LocalGet(PARAM_ID)),
+            byte_offset: 0,
+            byte_end: 0,
         })],
         is_async: false,
         is_generator: false,
@@ -243,6 +247,7 @@ fn probe_module() -> Module {
                 ty: Type::Named("Boxed".to_string()),
                 mutable: false,
                 init: Some(Expr::New {
+                    byte_end: 0,
                     class_name: "Boxed".to_string(),
                     args: vec![Expr::Number(1.0)],
                     type_args: Vec::new(),
@@ -254,6 +259,8 @@ fn probe_module() -> Module {
                 object: Box::new(Expr::LocalGet(BOXED_ID)),
                 property: "v".to_string(),
                 value: Box::new(Expr::LocalGet(STORED_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Return(Some(Expr::LocalGet(BOXED_ID))),
         ],
@@ -267,6 +274,7 @@ fn probe_module() -> Module {
         was_unrolled: false,
     }];
     m.init = vec![Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::FuncRef(1)),
         args: vec![Expr::Number(2.0)],
         type_args: Vec::new(),
@@ -305,6 +313,8 @@ pub(super) fn wide_prologue_ir() -> String {
                 object: Box::new(Expr::This),
                 property: name,
                 value: Box::new(Expr::LocalGet(PARAM_ID)),
+                byte_offset: 0,
+                byte_end: 0,
             }));
     }
     let mut opts = ir_opts();

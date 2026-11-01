@@ -11,6 +11,10 @@ use crate::gen::{variant_name, Fx, Gen};
 use crate::model::*;
 use perry_hir::{Expr, Stmt};
 
+#[path = "gen/accessor_descriptor.rs"]
+mod accessor_descriptor;
+mod nodes;
+
 fn kids(e: &Expr) -> Vec<&Expr> {
     let mut v = Vec::new();
     perry_hir::walker::walk_expr_children(e, &mut |c| v.push(c));
@@ -18,36 +22,6 @@ fn kids(e: &Expr) -> Vec<&Expr> {
 }
 
 impl<'a> Gen<'a> {
-    /// FVA 4.3a: `d` is an accessor descriptor literal: a closed literal
-    /// layout whose keys are within get/set/enumerable/configurable and
-    /// name a getter or a setter (no value, no writable).
-    fn accessor_descriptor(&self, mi: u32, d: &Expr) -> bool {
-        let Expr::New { class_name, .. } = d else {
-            return false;
-        };
-        let Some(&tm) = self.mods[mi as usize].classes.get(class_name) else {
-            return false;
-        };
-        let tpl = &self.m.tmpls[tm as usize];
-        if !matches!(
-            tpl.kind,
-            TmplKind::Class {
-                literal_shape: true,
-                ..
-            }
-        ) {
-            return false;
-        }
-        let keys: Vec<&str> = tpl
-            .birth_keys
-            .iter()
-            .map(|a| self.m.atoms[*a as usize].as_str())
-            .collect();
-        keys.iter()
-            .all(|k| matches!(*k, "get" | "set" | "enumerable" | "configurable"))
-            && keys.iter().any(|k| matches!(*k, "get" | "set"))
-    }
-
     /// An accessor descriptor literal (`accessor_descriptor`): its class, its
     /// constructor arguments, and which of them its own `get` and `set` are
     /// (a literal shape's constructor stores parameter i under its key).
@@ -80,6 +54,7 @@ impl<'a> Gen<'a> {
                     object,
                     property,
                     value,
+                    ..
                 }) if matches!(object.as_ref(), Expr::This) && property == key => {
                     match value.as_ref() {
                         Expr::LocalGet(p) => ctor.params.iter().position(|q| q.id == *p),
@@ -90,65 +65,6 @@ impl<'a> Gen<'a> {
             })
         };
         Some((class_name, args, arg("get"), arg("set")))
-    }
-
-    fn prim_kids(&mut self, fx: &Fx, e: &Expr, result: u16, why: &str, proto: Protocol) -> NodeId {
-        let ks = kids(e);
-        self.prim_op(fx, &ks, result, why, proto)
-    }
-
-    fn primbox_kids(&mut self, fx: &Fx, e: &Expr, why: &str, proto: Protocol) -> NodeId {
-        let ks = kids(e);
-        self.prim_box_op(fx, &ks, why, proto)
-    }
-
-    pub(crate) fn bobj(&mut self, mi: u32, what: &'static str) -> (Tok, NodeId) {
-        let tm = self.new_bobj_template(mi, what);
-        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
-        let n = self.tok_node(t);
-        (t, n)
-    }
-
-    pub(crate) fn new_arr_from(&mut self, mi: u32, what: &str, elems: &[NodeId]) -> NodeId {
-        let tm = self.new_arr_template(mi, what);
-        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
-        let fa = self.m.field_any(t);
-        for &e in elems {
-            self.m.edge(e, fa);
-        }
-        self.tok_node(t)
-    }
-
-    /// A builtin iterator object (`arr.values()`, `entries()`, `keys()`)
-    /// yielding `vals` through `next().value` (`builtins::iterator_method`).
-    pub(crate) fn new_iter_from(&mut self, mi: u32, vals: &[NodeId]) -> NodeId {
-        let (t, n) = self.bobj(mi, "Iterator");
-        let a = self.m.atom("#elems");
-        let e = self.m.field(t, a);
-        for &v in vals {
-            self.m.edge(v, e);
-        }
-        n
-    }
-
-    /// Store `v` into every element/entry of what `recv` holds.
-    fn elem_store(&mut self, fx: &Fx, recv: NodeId, v: NodeId, what: &str) {
-        self.store(fx, recv, Key::Any, v, what.to_string(), None, false);
-    }
-
-    /// Call `cb` with `args` (this = undefined); returns the result node.
-    fn callback(&mut self, cb: NodeId, args: Vec<NodeId>) -> NodeId {
-        self.call_value(cb, ThisArg::Undef, args, vec![])
-    }
-
-    fn array_cb(&mut self, fx: &Fx, array: &Expr, callback: &Expr) -> (NodeId, NodeId, NodeId) {
-        let a = self.expr(fx, array);
-        let cb = self.expr(fx, callback);
-        let ek = self.m.elem_key();
-        let elems = self.load(a, ek);
-        let num = self.prim_node(prim::NUM);
-        let ret = self.callback(cb, vec![elems, num, a]);
-        (a, elems, ret)
     }
 
     /// The class whose method home `home` reads, when it is that home.
@@ -193,8 +109,7 @@ impl<'a> Gen<'a> {
                     for n in o.into_iter().chain(a) {
                         self.to_sink(n, &why);
                     }
-                    self.m
-                        .top_val(&format!("result of native module {module}.{method}"))
+                    self.native_success_result(module, object.is_some(), method, args)
                 }
             }
             Expr::PrivateLexicalBrand(x) | Expr::PrivateLexicalBrandPush(x) => {
@@ -483,16 +398,10 @@ impl<'a> Gen<'a> {
             | Expr::BufferIsEncoding(..)
             | Expr::BufferByteLength { .. }
             | Expr::BufferToString { .. }
-            | Expr::BufferLength(..)
             | Expr::BufferCopy { .. }
             | Expr::BufferWrite { .. }
             | Expr::BufferFill { .. }
             | Expr::BufferEquals { .. }
-            | Expr::BufferIndexGet { .. }
-            | Expr::BufferIndexSet { .. }
-            | Expr::Uint8ArrayLength(..)
-            | Expr::Uint8ArrayGet { .. }
-            | Expr::Uint8ArraySet { .. }
             | Expr::PodLayoutSizeOf { .. }
             | Expr::PodLayoutAlignOf { .. }
             | Expr::PodLayoutOffsetOf { .. }
@@ -845,6 +754,7 @@ impl<'a> Gen<'a> {
                     birth_keys: vec![],
                     definite: vec![],
                     declared: Vec::new(),
+                    reserved: Vec::new(),
                     parent: None,
                     ctor: None,
                     native_parent: None,
@@ -854,6 +764,7 @@ impl<'a> Gen<'a> {
                     proto_members: vec![],
                     parent_value: None,
                     parent_links: Vec::new(),
+                    null_proto: false,
                 });
                 let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
                 let pn = self.m.proto_node(t);
@@ -989,13 +900,14 @@ impl<'a> Gen<'a> {
                 // read, a buffer/view argument is shared (B1, flow only).
                 let ks = kids(e);
                 let (t, n) = self.bobj(mi, "TypedArray");
-                if let Expr::TypedArrayNew { kind, .. } = e {
-                    if let TokKind::Obj(tm, _) = self.m.toks[t as usize] {
-                        self.m.ta_elem.insert(tm, *kind);
-                    }
-                }
+                let owner = self.begin_indexed_owner(mi, t, e);
                 for k in ks {
                     let v = self.expr(fx, k);
+                    if owner {
+                        if let TokKind::Obj(tm, _) = self.m.toks[t as usize] {
+                            self.m.ta_birth_input.insert(tm, v);
+                        }
+                    }
                     let r = self.m.reason("typed-array source");
                     self.m.cons(
                         v,
@@ -1088,6 +1000,21 @@ impl<'a> Gen<'a> {
                 self.m.edge(self.thrown, arg);
                 let b = self.prim_node(prim::BOOL);
                 self.callback(s, vec![arg, b])
+            }
+            Expr::AsyncStepResumeNow {
+                value,
+                step_closure,
+            } => {
+                // On admission the awaited value (promise unwrapped) is the
+                // expression's result, which the step uses as its next resume
+                // value; a decline yields the TDZ sentinel, never observed.
+                let v = self.expr(fx, value);
+                let _ = self.expr(fx, step_closure);
+                self.awaited(v)
+            }
+            Expr::AsyncStepDeclined(e) => {
+                let _ = self.expr(fx, e);
+                self.prim_node(prim::BOOL)
             }
             Expr::AsyncStepDone {
                 value,
@@ -1336,7 +1263,7 @@ impl<'a> Gen<'a> {
             }
             Expr::ArrayPop(id) | Expr::ArrayShift(id) => {
                 let a = self.local(mi, *id);
-                let out = self.load(a, Key::Any);
+                let out = self.elem_load(a);
                 self.m.add_prim(out, prim::UNDEF);
                 out
             }
@@ -1354,7 +1281,7 @@ impl<'a> Gen<'a> {
                 if let Some(x) = end {
                     let _ = self.prim_op(fx, &[x], prim::NUM, "slice index", Protocol::ToPrimitive);
                 }
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 self.new_arr_from(mi, "slice", &[el])
             }
             Expr::ArraySplice {
@@ -1379,7 +1306,7 @@ impl<'a> Gen<'a> {
                     let v = self.expr(fx, it);
                     self.elem_store(fx, a, v, "splice");
                 }
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 self.new_arr_from(mi, "splice", &[el])
             }
             Expr::ArrayForEach { array, callback } => {
@@ -1392,7 +1319,7 @@ impl<'a> Gen<'a> {
             }
             Expr::ArrayFlatMap { array, callback } => {
                 let (_, _, ret) = self.array_cb(fx, array, callback);
-                let inner = self.load(ret, Key::Any);
+                let inner = self.elem_load(ret);
                 self.new_arr_from(mi, "flatMap", &[ret, inner])
             }
             Expr::ArrayFilter { array, callback } => {
@@ -1418,7 +1345,7 @@ impl<'a> Gen<'a> {
             Expr::ArraySort { array, comparator } => {
                 let a = self.expr(fx, array);
                 let c = self.expr(fx, comparator);
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 let r = self.callback(c, vec![el, el]);
                 let why = self.m.reason("sort comparator result");
                 self.m.cons(
@@ -1432,7 +1359,7 @@ impl<'a> Gen<'a> {
             }
             Expr::ArrayToSorted { array, comparator } => {
                 let a = self.expr(fx, array);
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 if let Some(c) = comparator {
                     let cn = self.expr(fx, c);
                     let _ = self.callback(cn, vec![el, el]);
@@ -1451,7 +1378,7 @@ impl<'a> Gen<'a> {
             } => {
                 let a = self.expr(fx, array);
                 let cb = self.expr(fx, callback);
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 let acc = self.tmp("acc");
                 match initial {
                     Some(i) => {
@@ -1467,13 +1394,13 @@ impl<'a> Gen<'a> {
             }
             Expr::ArrayFlat { array } => {
                 let a = self.expr(fx, array);
-                let el = self.load(a, Key::Any);
-                let inner = self.load(el, Key::Any);
+                let el = self.elem_load(a);
+                let inner = self.elem_load(el);
                 self.new_arr_from(mi, "flat", &[el, inner])
             }
             Expr::ArrayToReversed { array } => {
                 let a = self.expr(fx, array);
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 self.new_arr_from(mi, "copy", &[el])
             }
             Expr::ArrayValues(array) => {
@@ -1496,7 +1423,7 @@ impl<'a> Gen<'a> {
                     "toSpliced index",
                     Protocol::ToPrimitive,
                 );
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 let mut parts = vec![el];
                 for it in items {
                     parts.push(self.expr(fx, it));
@@ -1511,13 +1438,13 @@ impl<'a> Gen<'a> {
                 let a = self.expr(fx, array);
                 let _ = self.prim_op(fx, &[index], prim::NUM, "with index", Protocol::ToPrimitive);
                 let v = self.expr(fx, value);
-                let el = self.load(a, Key::Any);
+                let el = self.elem_load(a);
                 self.new_arr_from(mi, "with", &[el, v])
             }
             Expr::ArrayAt { array, index } => {
                 let a = self.expr(fx, array);
                 let _ = self.prim_op(fx, &[index], prim::NUM, "at index", Protocol::ToPrimitive);
-                let out = self.load(a, Key::Any);
+                let out = self.elem_load(a);
                 self.m.add_prim(out, prim::UNDEF);
                 out
             }
@@ -1802,7 +1729,21 @@ impl<'a> Gen<'a> {
                     Expr::String(s) => Key::Named(self.m.atom(s)),
                     _ => Key::Any,
                 };
-                self.load(t, key)
+                // DECISIONS 217: a computed key is `o[k]`'s (`IdxLoad`: the
+                // key's values decide what it names). Under `__proto__`
+                // Object.prototype's getter runs on the receiver.
+                let out = match key {
+                    Key::Any => {
+                        let dst = self.tmp("reflect.get");
+                        self.m.cons(t, Cons::IdxLoad { idx: k, dst });
+                        dst
+                    }
+                    _ => self.load(t, key),
+                };
+                if self.m.is_proto_key(key) {
+                    self.m.cons(rv, Cons::ProtoOf { dst: out });
+                }
+                out
             }
             Expr::ReflectSet {
                 target,
@@ -1885,18 +1826,37 @@ impl<'a> Gen<'a> {
                 if let Some(o) = options {
                     let _ = self.expr(fx, o);
                 }
+                // DECISIONS 226: `paths` holds each specifier as written; the
+                // module's dynamic import entry for it names the module, as
+                // codegen's dispatch resolves it. A target outside this view
+                // (native, another unit) is the fallback's ⊤.
                 let out = self.tmp("dynimport");
-                let mut any = false;
                 for p in paths {
-                    if let Some(&t) = self.path_index.get(p) {
+                    self.dynimport_seen.insert((mi, p.clone()));
+                }
+                let imports = self.imports_of(mi as usize);
+                for p in paths {
+                    let loads = imports
+                        .iter()
+                        .find(|i| &i.source == p && (i.is_dynamic || i.is_dynamic_target))
+                        .and_then(|i| i.resolved_path.as_ref())
+                        .and_then(|r| self.path_index.get(r).copied());
+                    // The site loads its target: its body runs.
+                    if let Some(t) = loads.filter(|t| self.dynamic_only.contains(t)) {
+                        let f = self.init_fn_of[&t];
+                        self.m.activate(f, "import");
+                    }
+                    let target = loads.filter(|_| !self.dynimport_sabotage);
+                    if let Some(t) = target {
                         let ns = self.mods[t as usize].ns_tok;
                         self.m.add_tok(out, ns);
-                        any = true;
                     }
                 }
-                if !any {
-                    self.m.add_tok(out, TOP);
-                }
+                // Codegen always emits the no-match fallback (a builtin
+                // namespace, data, a data: URL module, a loader-hook redirect
+                // of any specifier): runtime-made values, never a compiled
+                // module outside `paths`.
+                self.m.add_tok(out, TOP);
                 self.promise_of(mi, out)
             }
 
@@ -1930,7 +1890,13 @@ impl<'a> Gen<'a> {
             | Expr::PropertyGet { .. }
             | Expr::PropertySet { .. }
             | Expr::PropertyUpdate { .. }
+            | Expr::BufferLength(..)
+            | Expr::Uint8ArrayLength(..)
+            | Expr::BufferIndexGet { .. }
+            | Expr::Uint8ArrayGet { .. }
             | Expr::IndexGet { .. }
+            | Expr::BufferIndexSet { .. }
+            | Expr::Uint8ArraySet { .. }
             | Expr::IndexSet { .. }
             | Expr::IndexUpdate { .. }
             | Expr::Object(..)

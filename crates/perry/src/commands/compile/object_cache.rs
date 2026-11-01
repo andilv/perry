@@ -518,6 +518,15 @@ fn compute_object_cache_key_with_env(
         "entry_source_path",
         opts.app_metadata.entry_source_path.as_deref().unwrap_or(""),
     );
+    // The declared format decides the entry's tick/microtask checkpoint.
+    h.field(
+        "entry_declared_esm",
+        match opts.app_metadata.entry_declared_esm {
+            Some(true) => "esm",
+            Some(false) => "cjs",
+            None => "",
+        },
+    );
     // Provider installs are calls baked into the entry prologue (#10428):
     // adding a `require('net')` elsewhere must not reuse an entry without it.
     h.field(
@@ -628,6 +637,13 @@ fn compute_object_cache_key_with_env(
             &v.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
         );
     }
+
+    // The self-namespace flag moves the populator from the tail of `__init` to
+    // before the body, so it changes the emitted IR and must key the cache.
+    h.field(
+        "self_ns",
+        if opts.namespace_self_import { "1" } else { "0" },
+    );
 
     // The owning namespace module can differ from all member origins (barrels).
     {

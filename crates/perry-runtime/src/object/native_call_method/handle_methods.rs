@@ -148,8 +148,8 @@ pub(super) unsafe fn dispatch_handle(
         // callback-bearing + immutable methods to the shared helper before the
         // GC_TYPE_ARRAY check below (which only matches plain arrays).
         // Issues #2797 / #2798 / #2799.
-        if crate::typedarray::lookup_typed_array_kind(raw_ptr).is_some() {
-            let ta = raw_ptr as *mut crate::typedarray::TypedArrayHeader;
+        if crate::typedarray_hook_slots::lookup_typed_array_kind(raw_ptr).is_some() {
+            let ta = raw_ptr as *mut crate::typedarray_hook_slots::TypedArrayHeader;
             if let Some(r) = dispatch_typed_array_method(ta, method_name, args_ptr, args_len) {
                 return Some(r);
             }
@@ -805,7 +805,7 @@ pub(super) unsafe fn dispatch_handle(
         // Validate GcHeader to confirm this is actually an object before reading class_id
         let gc_header =
             (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*gc_header).obj_type == crate::gc::GC_TYPE_OBJECT {
+        if crate::gc_type_is_object!((*gc_header).obj_type) {
             if (*obj).class_id == NATIVE_MODULE_CLASS_ID {
                 // #853: the `is_valid_obj_ptr` guard that used to live after
                 // this return was dead — the early return claims the path
@@ -856,7 +856,7 @@ pub(super) unsafe fn dispatch_handle(
                 ));
             }
             if let Some(result) =
-                crate::node_test::dispatch_object_method((*obj).class_id, method_name)
+                crate::node_test_hook_slots::dispatch_object_method((*obj).class_id, method_name)
             {
                 return Some(result);
             }
@@ -893,10 +893,7 @@ pub(super) unsafe fn dispatch_handle(
             if (*obj).class_id == crate::regex::REGEXP_STRING_ITERATOR_CLASS_ID
                 && crate::collection_iter_object::is_intrinsic_iterator_method(method_name)
             {
-                return Some(crate::regex::dispatch_regexp_string_iterator_method(
-                    obj as *mut ObjectHeader,
-                    method_name,
-                ));
+                return crate::regex::hooked_iterator_method(obj as *mut ObjectHeader, method_name);
             }
             // #2874: lazy iterator-helper objects (`Iterator.from(x)` and the
             // chain it produces: `.map`/`.filter`/`.take`/`.drop`/`.flatMap`/
@@ -910,33 +907,17 @@ pub(super) unsafe fn dispatch_handle(
                 ));
             }
 
-            // #2874: an iterator-helper method (`map`/`filter`/`take`/…) on a
-            // RAW iterator object — a generator, the runtime array/Map/Set
-            // iterators, or any `{ next() }`. Node resolves these on
-            // `Iterator.prototype`; wrap the iterator in an identity helper and
-            // dispatch there. Skipped when the object defines the name as an own
-            // callable field (the user's own method wins). Runs before the
-            // own-field scan so the cheap has-own check below stays in sync.
-            if crate::iterator_helpers::is_iterator_helper_method(method_name) {
-                let has_own = {
-                    let mk = crate::string::js_string_from_bytes(
-                        method_name.as_ptr(),
-                        method_name.len() as u32,
-                    );
-                    let fv = js_object_get_field_by_name(obj as *const _, mk);
-                    let fp =
-                        crate::value::js_nanbox_get_pointer(f64::from_bits(fv.bits())) as usize;
-                    !fv.is_undefined() && crate::closure::is_closure_ptr(fp)
-                };
-                if let Some(result) = crate::iterator_helpers::maybe_dispatch_helper_on_iterator(
-                    obj as *mut ObjectHeader,
-                    method_name,
-                    args_ptr,
-                    args_len,
-                    has_own,
-                ) {
-                    return Some(result);
-                }
+            // #2874: an iterator-helper method (`map`/`filter`/`take`/…) on an
+            // ordinary object. The builtin runs directly only when the name
+            // resolves to it; an override falls through to the scans below.
+            if let Some(result) = crate::iterator_helpers::maybe_dispatch_helper_on_iterator(
+                obj as *mut ObjectHeader,
+                method_name,
+                args_ptr,
+                args_len,
+                false,
+            ) {
+                return Some(result);
             }
 
             // Scan object fields for a callable property (closure stored via IndexSet)
@@ -948,7 +929,7 @@ pub(super) unsafe fn dispatch_handle(
                     let key_count = keys_view.count() as usize;
                     if key_count <= 65536 {
                         if let Some(slot) = super::own_slot::find_method_slot(
-                            keys,
+                            keys_view,
                             key_count as u32,
                             method_name.as_bytes(),
                         ) {

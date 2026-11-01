@@ -16,6 +16,7 @@ use perry_hir::{
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -27,6 +28,7 @@ fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -153,6 +155,8 @@ fn assigning_ctor(fields: &[ClassField]) -> perry_hir::Function {
                 object: Box::new(Expr::This),
                 property: p.name.clone(),
                 value: Box::new(Expr::LocalGet(p.id)),
+                byte_offset: 0,
+                byte_end: 0,
             })
         })
         .collect();
@@ -184,6 +188,7 @@ fn bump_stmt(recv_id: u32, strict: bool) -> Stmt {
         value: Box::new(Expr::Binary {
             op: BinaryOp::Add,
             left: Box::new(Expr::PropertyGet {
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(recv_id)),
                 property: "value".to_string(),
                 byte_offset: 0,
@@ -192,6 +197,8 @@ fn bump_stmt(recv_id: u32, strict: bool) -> Stmt {
         }),
         receiver: Box::new(Expr::LocalGet(recv_id)),
         strict,
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -208,6 +215,7 @@ fn method_calls_module(bound: Expr, extra_init: Vec<Stmt>, strict: bool) -> Modu
         ty: Type::Named("Counter".to_string()),
         mutable: false,
         init: Some(Expr::New {
+            byte_end: 0,
             class_name: "Counter".to_string(),
             args: Vec::new(),
             type_args: Vec::new(),
@@ -354,6 +362,7 @@ fn class_loop_replacement_restores_straight_line_receiver_proof() {
     module.init.push(Stmt::Expr(Expr::Binary {
         op: BinaryOp::Mul,
         left: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "value".to_string(),
             byte_offset: 0,

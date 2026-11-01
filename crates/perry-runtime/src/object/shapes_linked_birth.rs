@@ -25,7 +25,7 @@ use crate::codegen_abi::LayoutWord;
 /// allocates between the caller's slot stores and this call.
 pub(crate) unsafe fn stamp_linked_final_shape(
     obj: *mut crate::object::ObjectHeader,
-    keys: *mut ArrayHeader,
+    keys: impl Into<super::ShapeKeys>,
     count: u32,
     proto_id: u64,
     proto_bits: u64,
@@ -38,17 +38,20 @@ pub(crate) unsafe fn stamp_linked_final_shape(
 /// Requested ids are validated against the complete shape facts.
 pub(crate) unsafe fn stamp_linked_final_shape_requested(
     obj: *mut crate::object::ObjectHeader,
-    keys: *mut ArrayHeader,
+    keys: impl Into<super::ShapeKeys>,
     count: u32,
     proto_id: u64,
     proto_bits: u64,
     lane: impl Fn(u32) -> bool,
     requested: Option<crate::codegen_abi::PublishedShape>,
 ) -> bool {
+    let shape_keys: super::ShapeKeys = keys.into();
+    let keys = shape_keys.arr();
     if obj.is_null()
         || keys.is_null()
         || count == 0
-        || (requested.is_none() && !(*obj).meta.is_null())
+        || (requested.is_none()
+            && !crate::meta_read!(crate::meta_obj_from_kind!(obj as *mut _, proto_id)).is_null())
         || !shape_word_is_writable(obj)
     {
         return false;
@@ -82,7 +85,7 @@ pub(crate) unsafe fn stamp_linked_final_shape_requested(
     // identity, as in `transition_object_shape_prototype`.
     shapes_prototype::write_identity_word(proto_id, proto_bits);
     let Ok(id) = shape_descriptor_intern_with_special_mode(
-        keys,
+        shape_keys,
         count,
         count,
         if requested.is_some() {
@@ -105,8 +108,8 @@ pub(crate) unsafe fn stamp_linked_final_shape_requested(
     ) else {
         return false;
     };
-    if !(*obj).meta.is_null() {
-        let meta = (*obj).meta;
+    if !crate::meta_read!(crate::meta_obj_from_kind!(obj as *mut _, proto_id)).is_null() {
+        let meta = crate::meta_read!(crate::meta_obj_from_kind!(obj as *mut _, proto_id));
         (*meta).prototype = proto_bits;
         // GC_STORE_AUDIT(BARRIERED): the meta may have promoted while the
         // holder was marked. Its prototype slot must be rewritten by minors.

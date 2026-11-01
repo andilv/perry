@@ -72,6 +72,7 @@ REPO = Path(__file__).resolve().parent.parent
 # The authoritative side: where each runtime constant is DEFINED.
 # ---------------------------------------------------------------------------
 RUNTIME_SOURCES = [
+    "crates/perry-abi/src/lib.rs",
     "crates/perry-runtime/src/gc/types.rs",
     "crates/perry-runtime/src/gc/layout.rs",
     "crates/perry-runtime/src/string/mod.rs",
@@ -121,8 +122,6 @@ REGISTRY: list[Restatement] = [
     ("crates/perry-codegen/src/codegen/string_pool/image.rs", "STRING_IMAGE_MARKER",
      "STRING_IMAGE_MARKER", "immutable image header marker"),
     # --- the packed GcHeader word the inline `new` path bakes (#8122) --------
-    ("crates/perry-codegen/src/target_layout.rs", "GC_TYPE_OBJECT",
-     "GC_TYPE_OBJECT", "byte 0 of the baked header word"),
     ("crates/perry-codegen/src/target_layout.rs", "GC_FLAG_ARENA",
      "GC_FLAG_ARENA", "byte 1 of the baked header word"),
     ("crates/perry-codegen/src/target_layout.rs", "GC_TYPE_ARRAY",
@@ -172,9 +171,6 @@ REGISTRY: list[Restatement] = [
      "GC_TYPE_MAP", "Map find fast path: obj_type byte"),
     ("crates/perry-codegen/src/expr/arrays_finds.rs", "GC_FLAG_FORWARDED",
      "GC_FLAG_FORWARDED", "Map find fast path: not-forwarded"),
-    ("crates/perry-codegen/src/lower_call/method_override.rs", "GC_TYPE_OBJECT",
-     "GC_TYPE_OBJECT", "typed-f64 receiver method probe: obj_type byte"),
-
 ]
 
 # Declared constants this checker deliberately does not anchor, each with the

@@ -4,32 +4,58 @@ mod accessor_keys;
 mod array_ctor;
 mod array_elements;
 mod array_length;
+mod array_named_keys;
+mod array_numeric;
 mod array_record;
+mod binding_write_gap;
 mod birth_site;
+mod body_activation;
 mod body_identity;
+mod builtin_members;
+mod callable_contract;
 mod callback_origin;
 mod captured;
 mod cjs_require;
 mod class_statics;
 mod closed_world;
 mod closure_context;
+mod ctor_return;
+mod dead_dynamic_import;
+mod diagnostics;
+mod dynamic_code;
+mod dynamic_import;
+mod escaped_constructor;
+mod escaped_contract_result;
+mod escaped_method_this;
+mod export_star;
 mod for_in_keys;
 mod function_values;
 mod hub_tokens;
+mod indexed_owner;
+mod inherited_layout;
 mod layout_key;
+mod ledger;
 mod named_accessors;
+mod native_fs;
 mod native_proto;
+mod unknown_accessor_key;
 mod parent_value;
 mod prim_result;
+mod proof_receivers;
+mod proto_value;
 mod protocol_calls;
 mod protocol_keys;
+mod receiver_slots;
 mod receiver_this;
+mod relinked_parent;
+mod rest_element;
 mod run_once_closed;
 mod runtime_helpers;
 mod summary;
 mod super_heritage;
 mod unit_alias;
 mod unit_cjs;
+mod ctor_observed;
 mod unit_ctor;
 mod unit_effects;
 mod unit_extends;
@@ -404,7 +430,10 @@ fn bounds_hold_during_generation() {
              function f{i}(x: any) {{ return x.m() + x.m() + x.m() + new C{i}().m() + [x, x].length; }}\n"
         ));
     }
-    src.push_str("console.log(f0(new C1()));\n");
+    // Every body runs (DECISIONS 225: an uncalled body is not walked).
+    for i in 0..200 {
+        src.push_str(&format!("console.log(f{i}(new C{}()));\n", (i + 1) % 200));
+    }
     let full = facts(&src);
     assert!(!full.stats.aborted);
     // A node bound (max_pts / 8) far below what generation creates.
@@ -1047,6 +1076,68 @@ fn cjs_registry_summary_does_not_reach_every_module() {
 }
 
 #[test]
+fn cjs_cache_slot_holds_its_own_record() {
+    // CJL2: a static edge of a program that is not closed reads its target's
+    // cache slot by its literal path. The runtime caches a record under its
+    // own canonical path only, so that slot holds the record published under
+    // it (and whatever user code stores there), never every record the
+    // registry summary holds.
+    let pf = facts(
+        r#"
+        class A { x = 1; }
+        class B { x = 2; }
+        const cache = __perry_declared_keys("/cjsc-a.js", "/cjsc-b.js");
+        const ra = { exports: new A(), __perry_cjs_record: true };
+        const rb = { exports: new B(), __perry_cjs_record: true };
+        cache["/cjsc-a.js"] = ra;
+        cache["/cjsc-b.js"] = rb;
+        __perry_register_path_module("/cjsc-a.js", ra);
+        __perry_register_path_module("/cjsc-b.js", rb);
+        __perry_cjs_install(cache, undefined);
+        const cached = cache["/cjsc-a.js"];
+        console.log(cached.exports.x);
+    "#,
+    );
+    let site = pf.sites.iter().find(|s| s.key == "x").expect("site");
+    assert_eq!(site.receivers.len(), 1, "{}", pf.dump_text());
+    assert_eq!(site.verdict, Verdict::T0Mono, "{}", pf.dump_text());
+}
+
+/// `require.cache` (`__perry_declared_keys`) has a null prototype: a read by
+/// a computed key holds the records and `undefined`, never what
+/// `Object.prototype` holds (its `constructor`: `Object`, `Function`). A
+/// store on what such a read returns (the loader's `child.parent = module`)
+/// is then a store on a record, not on a builtin (E20), and a call of it is
+/// no `Function(...)` call (E14). With `Object.prototype` as the prototype
+/// (`__perry_declared_keys_object`) the same read reaches the builtins.
+fn null_proto_read(births: &str) -> Option<String> {
+    let pf = facts(&format!(
+        r#"
+        class Parent {{ x = 1; }}
+        class Child {{ y = 2; }}
+        const cache = {births}("/npr-a.js", "/npr-b.js");
+        cache["/npr-a.js"] = new Child();
+        function read(path) {{ return cache[path]; }}
+        const parent = new Parent();
+        const got = read(String(Math.random()));
+        if (got !== undefined) got.parent = parent;
+        console.log(parent.x);
+    "#
+    ));
+    tmpl(&pf, "Parent").escape.clone()
+}
+
+#[test]
+fn a_computed_read_of_a_null_prototype_record_stops_at_the_record() {
+    assert_eq!(null_proto_read("__perry_declared_keys"), None);
+    let escape = null_proto_read("__perry_declared_keys_object");
+    assert!(
+        escape.as_deref().is_some_and(|e| e.contains("E20")),
+        "{escape:?}"
+    );
+}
+
+#[test]
 fn cjs_main_is_one_record_and_does_not_alias_every_export() {
     let pf = facts(
         r#"
@@ -1622,3 +1713,4 @@ fn a_protocol_touch_of_an_argument_marker_reads_nothing() {
     let tj = m.marker_load(r, Some(a));
     assert!(m.marker_use.get(&tj).is_some_and(|&u| u & MARK_ESCAPE != 0));
 }
+mod constructor_values;

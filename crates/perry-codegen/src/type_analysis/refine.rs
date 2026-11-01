@@ -650,6 +650,11 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
                 .get(class_name.as_str())
                 .cloned()
                 .unwrap_or_else(|| class_name.clone());
+            // A constructor that returns a value yields an object whose layout
+            // is not the class's; the local keeps only the Object proof.
+            if crate::lower_call::ctor_chain_has_value_return(ctx.classes, &resolved) {
+                return Some(HirType::Object(Default::default()));
+            }
             Some(HirType::Named(resolved))
         }
         // Buffer / Uint8Array constructors all produce a Buffer instance.
@@ -710,7 +715,7 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
                 None
             }
         }
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index , .. } => {
             // arr[i] where arr is Array<T> → element type T.
             // Handles both LocalGet(arr) and PropertyGet(this, "field")
             // — the latter lets `this.parts[i]` get the right type
@@ -798,8 +803,10 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
                         "readdirSync" => {
                             return Some(HirType::Array(Box::new(HirType::String)));
                         }
-                        "realpathSync" | "mkdtempSync" | "readlinkSync"
-                        | "readFileSync" => {
+                        "readFileSync" if matches!(args.get(1), Some(Expr::String(enc)) if !enc.is_empty()) => {
+                            return Some(HirType::String);
+                        }
+                        "realpathSync" | "mkdtempSync" | "readlinkSync" => {
                             return Some(HirType::String);
                         }
                         _ => {}

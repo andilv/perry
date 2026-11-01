@@ -28,7 +28,9 @@ pub(super) fn materialize(cache_dir: &Path, specifier: &str) -> Result<PathBuf> 
         .collect::<String>();
     let path = cache_dir
         .join("synthetic-modules")
-        .join(format!("native-esm-{filename}.mjs"));
+        // This compiler-owned bridge is TypeScript source even when its generated
+        // directory sits under node_modules; it must never enter runtime JS.
+        .join(format!("native-esm-{filename}.ts"));
     let source = source(module);
     if std::fs::read_to_string(&path).ok().as_deref() != Some(source.as_str()) {
         std::fs::create_dir_all(path.parent().unwrap())
@@ -39,15 +41,19 @@ pub(super) fn materialize(cache_dir: &Path, specifier: &str) -> Result<PathBuf> 
     Ok(path)
 }
 
-fn source(module: &str) -> String {
-    // The public manifest already defines which bindings a static native named
-    // import may expose. Forward those exact bindings, rather than copying the
-    // mutable CommonJS object's properties or inventing a second export table.
-    let names: BTreeSet<_> = perry_api_manifest::entries_for_module(module)
+/// The public manifest already defines which bindings a static native named
+/// import may expose. Forward those exact bindings, rather than copying the
+/// mutable CommonJS object's properties or inventing a second export table.
+fn named_exports(module: &str) -> BTreeSet<&'static str> {
+    perry_api_manifest::entries_for_module(module)
         .filter(|entry| perry_api_manifest::module_has_public_named_export(module, entry.name))
         .map(|entry| entry.name)
         .filter(|name| *name != "default")
-        .collect();
+        .collect()
+}
+
+fn source(module: &str) -> String {
+    let names = named_exports(module);
     let specifier = serde_json::to_string(&format!("node:{module}")).unwrap();
     let mut source =
         format!("import __perry_default from {specifier};\nexport default __perry_default;\n");
@@ -221,6 +227,26 @@ mod tests {
                 rewrite_static(&ast, directory.path()).unwrap().is_some(),
                 "{expression}"
             );
+        }
+    }
+
+    /// The namespace forwards the manifest's public names, so every export the
+    /// runtime implements for a Node builtin submodule must be one of them;
+    /// otherwise `ns.<export>` reads undefined (node:trace_events once had no
+    /// manifest surface and `traceEvents.createTracing` was not a function).
+    #[test]
+    fn namespace_forwards_every_runtime_submodule_export() {
+        for (module, _, exports) in perry_dispatch::native_submodule_exports::SUBMODULE_EXPORTS {
+            if !is_builtin(module) {
+                continue;
+            }
+            let names = named_exports(module);
+            for (name, _) in exports.iter().filter(|(name, _)| *name != "default") {
+                assert!(
+                    names.contains(name),
+                    "node:{module} implements {name} but its ESM namespace does not forward it"
+                );
+            }
         }
     }
 

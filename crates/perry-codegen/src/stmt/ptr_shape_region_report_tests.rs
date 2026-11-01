@@ -29,6 +29,8 @@ fn fixture() -> Module {
         op: BinaryOp::Add,
         prefix: false,
         strict: false,
+        byte_offset: 0,
+        byte_end: 0,
     }));
     m
 }
@@ -108,7 +110,9 @@ fn shape_barrier_removes_proof_attribution_but_keeps_guarded_type_hint_route() {
     // Ptr<Shape> consumption row when no such proof was selected.
     m.init
         .push(Stmt::Expr(Expr::Delete(Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::New {
+                byte_end: 0,
                 class_name: "Counter".into(),
                 args: vec![Expr::Integer(0)],
                 type_args: Vec::new(),
@@ -175,10 +179,13 @@ fn straight_line_numeric_load_and_update_remain_live() {
         op: BinaryOp::Add,
         prefix: false,
         strict: false,
+        byte_offset: 0,
+        byte_end: 0,
     }));
     m.init.push(Stmt::Expr(Expr::Binary {
         op: BinaryOp::Mul,
         left: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "value".into(),
             byte_offset: 0,

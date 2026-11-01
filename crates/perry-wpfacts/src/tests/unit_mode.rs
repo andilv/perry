@@ -97,11 +97,24 @@ fn proven_set(pf: &ProgramFacts) -> std::collections::BTreeSet<String> {
 /// `C`'s unit reads through its override token (DECISIONS 59); what it
 /// costs shows in `lost`.
 fn assert_parity(mods: &[(&str, &str)]) {
+    assert_parity_but(mods, &[]);
+}
+
+/// `assert_parity` where per unit is known to prove exactly `gaps` less
+/// than the whole program (each named where it is used): it fails when
+/// more is lost, and when a gap closes.
+fn assert_parity_but(mods: &[(&str, &str)], gaps: &[&str]) {
     let (pf, wp) = (units_of(mods), whole_of(mods));
     let lost: Vec<_> = proven_set(&wp)
         .difference(&proven_set(&pf))
+        .filter(|s| !gaps.contains(&s.as_str()))
         .cloned()
         .collect();
+    let closed: Vec<_> = gaps
+        .iter()
+        .filter(|g| proven_set(&pf).contains(**g) || !proven_set(&wp).contains(**g))
+        .collect();
+    assert!(closed.is_empty(), "named gaps no longer lost: {closed:?}");
     let broken: Vec<_> = pf
         .broken
         .iter()
@@ -573,3 +586,28 @@ fn closed_chain(n: usize) -> [(&'static str, String); 2] {
     );
     [("a", a), ("b", b)]
 }
+
+#[path = "unit_mode/escaped_results.rs"]
+mod escaped_results;
+
+#[path = "unit_mode/return_transfers.rs"]
+mod return_transfers;
+
+#[path = "unit_mode/commonjs_helper.rs"]
+mod commonjs_helper;
+#[path = "unit_mode/forwarded_literal_copies.rs"]
+mod forwarded_literal_copies;
+#[path = "unit_mode/forwarded_fn_copies.rs"]
+mod forwarded_fn_copies;
+#[path = "unit_mode/pub_callable.rs"]
+mod pub_callable;
+
+#[path = "unit_mode/method_on_read.rs"]
+mod method_on_read;
+
+#[path = "unit_mode/fn_transfer.rs"]
+mod fn_transfer;
+#[path = "unit_mode/protocol_touch.rs"]
+mod protocol_touch;
+#[path = "unit_mode/unit_cycle_order.rs"]
+mod unit_cycle_order;

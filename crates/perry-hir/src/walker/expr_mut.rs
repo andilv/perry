@@ -224,6 +224,7 @@ where
         | Expr::EncodeURIComponent(v)
         | Expr::DecodeURIComponent(v)
         | Expr::QueueMicrotask(v)
+        | Expr::AsyncStepDeclined(v)
         | Expr::IterResultSet(v, _)
         | Expr::CryptoRandomBytes(v)
         | Expr::CryptoSha256(v)
@@ -686,7 +687,7 @@ where
         Expr::GetFunctionPrototypeMethod { func, .. } => {
             f(func);
         }
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index, .. } => {
             f(object);
             f(index);
         }
@@ -812,6 +813,7 @@ where
             object,
             index,
             value,
+            ..
         } => {
             f(object);
             f(index);
@@ -1185,6 +1187,13 @@ where
             f(replacement);
         }
         Expr::AsyncStepChain {
+            value,
+            step_closure,
+        } => {
+            f(value);
+            f(step_closure);
+        }
+        Expr::AsyncStepResumeNow {
             value,
             step_closure,
         } => {

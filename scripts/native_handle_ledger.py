@@ -76,11 +76,14 @@ NON_HANDLE_TABLES = {
     ("crates/perry-runtime/src/gc/barrier/mod.rs", "REMEMBERED_SET"),
     ("crates/perry-runtime/src/gc/barrier/mod.rs", "CONS_PINNED"),
     ("crates/perry-runtime/src/gc/barrier/mod.rs", "EVER_DIRTY_OLD_PAGES"),
+    # The realm image's remembered set (WRT): image cells holding heap children.
+    ("crates/perry-runtime/src/gc/image_cells.rs", "IMAGE_REMEMBERED"),
     ("crates/perry-runtime/src/gc/fromspace_scan.rs", "SNAPSHOT_PAGES"),
     ("crates/perry-runtime/src/gc/diag_sites.rs", "CHARGES"),
     # Compiled code/literal/site metadata, not heap object identity.
-    ("crates/perry-runtime/src/builtins/fn_metadata.rs", "REGISTRY"),
-    ("crates/perry-runtime/src/builtins/fn_metadata.rs", "OVERRIDES"),
+    # `builtins/fn_metadata.rs` used to hold `REGISTRY` and `OVERRIDES` here; #13442
+    # replaced both modules' tables with stable function-metadata identity, so the
+    # file declares no `static` at all and both classifications went stale.
     # Class ids are compiler metadata ids, not native-resource handles.
     ("crates/perry-runtime/src/object/class_constructors.rs", "CLASS_CAPTURE_VALUES"),
     ("crates/perry-runtime/src/object/class_env.rs", "CLASS_ENVS"),

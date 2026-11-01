@@ -43,7 +43,7 @@ fn for_in_shape<'s>(body: &'s [Stmt], keys_of: impl Fn(u32) -> Option<u32>) -> O
     let (bind, rest) = then_branch.split_first()?;
     let Stmt::Let {
         id,
-        init: Some(Expr::IndexGet { object, index }),
+        init: Some(Expr::IndexGet { object, index, .. }),
         ..
     } = bind
     else {
@@ -263,6 +263,7 @@ impl<'a> Gen<'a> {
             self.m.captures.insert((fx.this, g));
         }
         let bfx = Fx {
+            guard: None,
             f: g,
             this,
             ret,
@@ -402,7 +403,7 @@ impl<'a> Gen<'a> {
             for name in lits {
                 for n in self.literal_keys(mi, &name) {
                     let a = self.m.atom(&n);
-                    self.m.accessor_atoms.insert(a);
+                    self.m.add_accessor_atom(a);
                     self.m.for_in_define_keys.insert(a);
                 }
             }

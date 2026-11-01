@@ -231,7 +231,7 @@ fn proxy_named_key(name: &str) -> f64 {
 
 fn classify_pointer(recv: f64) -> Option<PtrKind> {
     let b = recv.to_bits();
-    if crate::proxy::js_proxy_is_proxy(recv) != 0 {
+    if crate::proxy_hooks::proxy_is_proxy(recv) != 0 {
         return Some(PtrKind::Proxy);
     }
     if top16(b) != 0x7FFD {
@@ -241,14 +241,14 @@ fn classify_pointer(recv: f64) -> Option<PtrKind> {
     // — classify BEFORE any address-based probe. All array-like ops route
     // through the proxy traps (so a revoked proxy's Get(length) throws —
     // test262 {map,filter,splice,concat}/create-revoked-proxy).
-    if crate::proxy::js_proxy_is_proxy(recv) != 0 {
+    if crate::proxy_hooks::proxy_is_proxy(recv) != 0 {
         return Some(PtrKind::Proxy);
     }
     let raw = (b & 0x0000_FFFF_FFFF_FFFF) as usize;
     // Typed arrays / buffers are `std::alloc`-backed (no GC header) — probe
     // their registries before any GC-header read.
     if crate::buffer::is_registered_buffer(raw)
-        || crate::typedarray::lookup_typed_array_kind(raw).is_some()
+        || crate::typedarray_hook_slots::lookup_typed_array_kind(raw).is_some()
     {
         return Some(PtrKind::IndexedNative);
     }
@@ -266,7 +266,7 @@ fn classify_pointer(recv: f64) -> Option<PtrKind> {
         let hdr = (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         (*hdr).obj_type
     };
-    if obj_type == crate::gc::GC_TYPE_OBJECT || obj_type == crate::gc::GC_TYPE_CLOSURE {
+    if crate::gc_type_is_object!(obj_type) || obj_type == crate::gc::GC_TYPE_CLOSURE {
         return Some(PtrKind::Object);
     }
     if let Some(kind) = crate::object::exotic_expando::exotic_expando_kind(raw) {
@@ -276,7 +276,7 @@ fn classify_pointer(recv: f64) -> Option<PtrKind> {
 }
 
 /// `LengthOfArrayLike(ToObject(recv))`.
-pub(super) fn al_length(recv: f64) -> i64 {
+pub(crate) fn al_length(recv: f64) -> i64 {
     let arr = as_real_array(recv);
     if !arr.is_null() {
         return unsafe { (*arr).length as i64 };
@@ -310,7 +310,7 @@ pub(super) fn al_length(recv: f64) -> i64 {
         Some(PtrKind::IndexedNative) => to_length(crate::value::js_value_length_f64(recv)),
         // Proxy: Get("length") through the `get` trap (throws on revoked).
         Some(PtrKind::Proxy) => to_length(crate::builtins::js_number_coerce(
-            crate::proxy::js_proxy_get(recv, proxy_named_key("length")),
+            crate::proxy_hooks::proxy_get(recv, proxy_named_key("length")),
         )),
         // Date/RegExp/Error expando receiver: `length` lives in the exotic
         // side table.
@@ -327,7 +327,7 @@ pub(super) fn al_length(recv: f64) -> i64 {
 }
 
 /// `Get(ToObject(recv), k)` (returns `undefined` for absent/out-of-range).
-pub(super) fn al_get(recv: f64, k: i64) -> f64 {
+pub(crate) fn al_get(recv: f64, k: i64) -> f64 {
     let arr = as_real_array(recv);
     if !arr.is_null() {
         if k < 0 {
@@ -397,7 +397,7 @@ pub(super) fn al_get(recv: f64, k: i64) -> f64 {
                 None => undef(),
             }
         }
-        Some(PtrKind::Proxy) => crate::proxy::js_proxy_get(recv, proxy_string_key(k)),
+        Some(PtrKind::Proxy) => crate::proxy_hooks::proxy_get(recv, proxy_string_key(k)),
         Some(PtrKind::Exotic) | None => undef(),
     }
 }
@@ -513,7 +513,8 @@ pub(super) fn al_has(recv: f64, k: i64) -> bool {
             crate::object::exotic_expando::exotic_has_own_property(kind, raw, &k.to_string())
         }
         Some(PtrKind::Proxy) => {
-            crate::value::js_is_truthy(crate::proxy::js_proxy_has(recv, proxy_string_key(k))) != 0
+            crate::value::js_is_truthy(crate::proxy_hooks::proxy_has(recv, proxy_string_key(k)))
+                != 0
         }
         Some(PtrKind::Exotic) | None => false,
     }
@@ -1323,7 +1324,7 @@ pub(crate) fn non_array_object_receiver(arr: *const ArrayHeader) -> Option<f64> 
         let hdr = (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
         (*hdr).obj_type
     };
-    if obj_type == crate::gc::GC_TYPE_OBJECT || obj_type == crate::gc::GC_TYPE_CLOSURE {
+    if crate::gc_type_is_object!(obj_type) || obj_type == crate::gc::GC_TYPE_CLOSURE {
         Some(f64::from_bits(JSValue::pointer(raw as *const u8).bits()))
     } else {
         None

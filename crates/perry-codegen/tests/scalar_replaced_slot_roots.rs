@@ -60,6 +60,7 @@ use perry_hir::{Expr, Module, ModuleInitKind, Stmt};
 
 fn entry_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -71,6 +72,7 @@ fn entry_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -195,6 +197,7 @@ fn heap_value() -> Expr {
 
 fn field_get(local: u32, field: &str) -> Expr {
     Expr::PropertyGet {
+        byte_end: 0,
         object: Box::new(Expr::LocalGet(local)),
         property: field.to_string(),
         byte_offset: 0,
@@ -203,7 +206,9 @@ fn field_get(local: u32, field: &str) -> Expr {
 
 fn console_log(args: Vec<Expr>) -> Stmt {
     Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::GlobalGet(0)),
             property: "log".to_string(),
             byte_offset: 0,
@@ -350,10 +355,14 @@ fn scalar_replaced_array_element_holding_a_heap_value_is_bound() {
             ),
             console_log(vec![
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     index: Box::new(Expr::Integer(0)),
                 },
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     index: Box::new(Expr::Integer(1)),
                 },
@@ -381,6 +390,8 @@ fn numeric_only_scalar_replaced_array_emits_no_rooting() {
                 Expr::Array(vec![Expr::Number(1.0), Expr::Number(2.0)], None),
             ),
             console_log(vec![Expr::IndexGet {
+                byte_offset: 0,
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(1)),
                 index: Box::new(Expr::Integer(0)),
             }]),
@@ -419,7 +430,9 @@ fn scalar_replaced_split_parts_are_bound() {
         init: Some(Expr::String("a,b,c".to_string())),
     };
     let split = Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1)),
             property: "split".to_string(),
             byte_offset: 0,
@@ -435,10 +448,14 @@ fn scalar_replaced_split_parts_are_bound() {
             let_stmt(2, "parts", split),
             console_log(vec![
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(2)),
                     index: Box::new(Expr::Integer(0)),
                 },
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(2)),
                     index: Box::new(Expr::Integer(1)),
                 },
@@ -477,6 +494,8 @@ fn later_store_into_a_scalar_replaced_field_is_bound() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             console_log(vec![field_get(1, "a")]),
         ],
@@ -525,11 +544,15 @@ fn repeated_stores_into_one_scalar_slot_bind_once() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             console_log(vec![field_get(1, "a")]),
         ],
@@ -565,11 +588,15 @@ fn every_store_into_a_hoisted_scalar_slot_uses_final_remark() {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             Stmt::Expr(Expr::PropertySet {
                 object: Box::new(Expr::LocalGet(1)),
                 property: "a".to_string(),
                 value: Box::new(heap_value()),
+                byte_offset: 0,
+                byte_end: 0,
             }),
             console_log(vec![field_get(1, "a")]),
         ],
@@ -697,10 +724,14 @@ fn scalar_replaced_array_element_slots_are_initialized_before_the_bind() {
             ),
             console_log(vec![
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     index: Box::new(Expr::Integer(0)),
                 },
                 Expr::IndexGet {
+                    byte_offset: 0,
+                    byte_end: 0,
                     object: Box::new(Expr::LocalGet(1)),
                     index: Box::new(Expr::Integer(1)),
                 },

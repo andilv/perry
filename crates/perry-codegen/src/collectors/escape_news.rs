@@ -254,6 +254,7 @@ fn collect_used_new_fields_in_expr(
             object,
             property,
             value,
+            ..
         } => {
             // #9460: a WRITE reserves the field's slot — see this function's
             // doc comment. Without it the store lowering finds no slot and
@@ -418,7 +419,7 @@ fn collect_used_new_fields_in_expr(
                 collect_used_new_fields_in_expr(arg, non_escaping_news, used);
             }
         }
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index, .. } => {
             collect_used_new_fields_in_expr(object, non_escaping_news, used);
             collect_used_new_fields_in_expr(index, non_escaping_news, used);
         }
@@ -426,6 +427,7 @@ fn collect_used_new_fields_in_expr(
             object,
             index,
             value,
+            ..
         } => {
             collect_used_new_fields_in_expr(object, non_escaping_news, used);
             collect_used_new_fields_in_expr(index, non_escaping_news, used);

@@ -201,7 +201,9 @@ impl Model {
                         // put into another function's marker or ⊤ goes there
                         // as before: ⊤ to the reader, and it escapes (below).
                         _ if dst == u32::MAX && reach && to == at => {
-                            self.mark_use(at, crate::model::MARK_ESCAPE);
+                            self.mark_escape_why(at, &|_| {
+                                "store: into the receiver's reach".into()
+                            });
                         }
                         // Another function's marker: another unit's value
                         // the reader cannot follow (DECISIONS 149b).
@@ -294,6 +296,23 @@ impl Model {
                     }
                 }
             }
+            Cons::Guard { test, from, dst } => {
+                let admits = prim & guard::prims(test) != 0
+                    || toks
+                        .into_iter()
+                        .any(|&t| t == TOP || guard::objects(test) || self.is_marker(t));
+                if admits {
+                    self.edge(from, dst);
+                }
+            }
+            Cons::Defined { dst } => {
+                for &t in toks {
+                    self.add_tok(dst, t);
+                }
+                if prim & !prim::UNDEF != 0 {
+                    self.add_prim(dst, prim & !prim::UNDEF);
+                }
+            }
             Cons::TopIfAny { dst, from, reason } => {
                 if !toks.is_empty() || prim != 0 {
                     if let Some(r) = reason {
@@ -301,6 +320,20 @@ impl Model {
                         self.add_prim(dst, prim::ALL);
                     }
                     self.edge(from, dst);
+                }
+            }
+            Cons::DeleteKey { key, reason } => {
+                for &t in toks {
+                    if t == TOP {
+                        // Deleting `key` of an unknown object changes that
+                        // key of whatever it is, a builtin prototype
+                        // included, and no other key.
+                        let k = Some(Key::Named(key));
+                        self.note_fnproto_write(TOP, k, Hard::E7Delete.code());
+                        builtins::note_native_write(self, TOP, k, "E7 delete");
+                    } else {
+                        self.mark_hard(t, Hard::E7Delete, reason);
+                    }
                 }
             }
             Cons::Hard { kind, reason } => {
@@ -354,6 +387,14 @@ impl Model {
                             if !ks.contains(&key) {
                                 ks.push(key);
                             }
+                        }
+                        // Defining `key` on an unknown object writes that key
+                        // of whatever it is, a builtin prototype included,
+                        // and no other key.
+                        _ if t == TOP => {
+                            let k = Some(Key::Named(key));
+                            self.note_fnproto_write(TOP, k, Hard::E5DefineProperty.code());
+                            builtins::note_native_write(self, TOP, k, "E5 Object.defineProperty");
                         }
                         _ => self.mark_hard(t, Hard::E5DefineProperty, reason),
                     }
@@ -424,7 +465,7 @@ impl Model {
                     }
                 }
             }
-            Cons::ChainUnion { key, dst } => {
+            Cons::ChainUnion { key, dst, of } => {
                 for &q in toks {
                     if q == TOP {
                         self.add_tok(dst, TOP);
@@ -443,7 +484,7 @@ impl Model {
                         Key::Any => self.all_fields(q),
                     };
                     self.edge(f, dst);
-                    self.with_b(|m| builtins::tok_load(m, q, key, dst));
+                    self.with_b(|m| builtins::chain_load(m, of, q, key, dst));
                     if self.stops_at(q, key) {
                         self.stopped_shared.entry(q).or_default().push((key, dst));
                     } else {
@@ -522,8 +563,17 @@ impl Model {
                 let owner_class = self.constructor_origin(class);
                 let owner = self.tok(TokKind::ClassObj(owner_class));
                 if self.super_relink.contains(&owner) || self.is_escaped(owner) {
-                    let reason = self.reason("E6 constructor follows live superclass");
-                    self.mark_hard(origin, Hard::E6SetPrototypeOf, reason);
+                    // The instance under construction follows the live
+                    // superclass. An unknown one (⊤: another unit's
+                    // subclass instance) is a fresh object or whatever the
+                    // superclass returned, whose prototype construction
+                    // never changes: no write of a builtin prototype.
+                    if origin == TOP {
+                        self.super_relink.insert(TOP);
+                    } else {
+                        let reason = self.reason("E6 constructor follows live superclass");
+                        self.mark_hard(origin, Hard::E6SetPrototypeOf, reason);
+                    }
                 }
                 for &parent in toks {
                     match self.toks[parent as usize] {
@@ -554,7 +604,7 @@ impl Model {
                     }
                     let f = match key {
                         Key::Named(a) => self.field(t, a),
-                        Key::Any => self.field_any(t),
+                        Key::Any => self.any_key_node(t),
                     };
                     self.edge(src, f);
                 }
@@ -580,16 +630,25 @@ impl Model {
                             self.cons(holder, Cons::AccessorInstall { key, f: t, setter });
                         }
                         TokKind::Top | TokKind::BuiltinFn | TokKind::Bound(_) => {
-                            // An unknown accessor: reads of any key on the
-                            // holder return ⊤ and stores escape.
+                            // An unknown accessor: the key it is installed
+                            // under (any key, when computed) reads ⊤ on the
+                            // holder, and the holder escapes to the code that
+                            // runs. It defines that one key: on a holder from
+                            // unmodeled code, a builtin prototype may hold it
+                            // under that key only.
                             let r = self.reason("accessor of unknown function value");
                             let fa = self.node_l("acc-unknown");
                             self.add_top(fa, |_| "accessor of unknown function value".into());
                             let site = self.anon_post_site("unknown accessor");
+                            let k = if self.atoms[key as usize] == crate::STAR_KEY {
+                                Key::Any
+                            } else {
+                                Key::Named(key)
+                            };
                             self.cons(
                                 holder,
                                 Cons::Store {
-                                    key: Key::Any,
+                                    key: k,
                                     src: fa,
                                     site,
                                 },
@@ -605,6 +664,13 @@ impl Model {
                 for &t in toks {
                     if let Some(s) = self.shared_of(t) {
                         let k = self.atoms[key as usize].clone();
+                        if self.explain && !self.shared_replay && s != Shared::Top {
+                            eprintln!(
+                                "perry: wpfacts explain: accessor {} on shared {} key {k:?}",
+                                self.tok_name(f),
+                                self.tok_name(t)
+                            );
+                        }
                         self.note_shared(SharedWrite::Accessor(s, k));
                     }
                     self.note_fnproto_write(t, Some(Key::Named(key)), "accessor");
@@ -628,7 +694,7 @@ impl Model {
                             self.reason("accessor under a computed key")
                         };
                         self.escape(f, r);
-                        let fa = self.field_any(t);
+                        let fa = self.any_key_node(t);
                         self.add_top(fa, |_| "accessor under a computed key".into());
                         self.add_prim(fa, prim::ALL);
                         let ks = self.accessor_keys.entry(t).or_default();
@@ -652,6 +718,13 @@ impl Model {
                         // Every lookup reaches Object.prototype: rather than
                         // replay them all, the derivation turns every fact
                         // off (an accessor on Object.prototype is E23).
+                        if self.explain && !self.objproto_accessor {
+                            eprintln!(
+                                "perry: wpfacts explain: E23 accessor {} on Object.prototype key {}",
+                                self.tok_name(f),
+                                self.atoms[key as usize]
+                            );
+                        }
                         self.objproto_accessor = true;
                     }
                     self.accessor_installed(t, key, f, setter, !objproto);
@@ -659,6 +732,9 @@ impl Model {
             }
             Cons::ProtoFrom { src } => {
                 for &t in toks {
+                    if t == TOP || matches!(self.toks[t as usize], TokKind::ClassObj(_)) {
+                        self.cons(src, Cons::ParentGiven { of: t });
+                    }
                     // `%Object.prototype%` is an immutable prototype exotic
                     // object: setting its [[Prototype]] to anything but its
                     // own (null) throws.
@@ -667,6 +743,9 @@ impl Model {
                     }
                     let pn = self.proto_node(t);
                     self.edge(src, pn);
+                    if self.given_proto.insert((src, pn)) {
+                        self.cons(src, Cons::ProtoGiven { protos: pn });
+                    }
                     if let TokKind::ClassObj(tm) = self.toks[t as usize] {
                         let instance = self.tok(TokKind::Obj(tm, NO_CTX));
                         let reason =
@@ -675,14 +754,99 @@ impl Model {
                     }
                 }
             }
+            // `ObjectProto` given as a prototype may be any builtin
+            // prototype, `Function.prototype` included: `seed_proto` no
+            // longer says what the chain's `ObjectProto` is.
+            Cons::ProtoGiven { protos } => {
+                if toks
+                    .iter()
+                    .any(|&t| matches!(self.toks[t as usize], TokKind::ObjectProto))
+                {
+                    self.add_tok(protos, TOP);
+                }
+            }
+            // A class given as the parent of class object `of`: `of`'s
+            // `super()` runs its constructor on `of`'s instances. A class of
+            // this unit given to a class it constructs runs there
+            // (`Cons::SuperCall` follows the live superclass); given to
+            // another unit's class or to ⊤, the code running `super()` is
+            // unknown here, so the class escapes to it. Another unit's class
+            // is that unit's to run on the receiver: the census reports it
+            // (`extends <class>`), and its unit publishes its constructor
+            // as it does for an `extends` naming it (DECISIONS 57).
+            Cons::ParentGiven { of } => {
+                let theirs = |m: &Self, t: Tok| match m.toks[t as usize] {
+                    TokKind::ClassObj(tm) => m.foreign.contains_key(&tm),
+                    _ => t == TOP,
+                };
+                for &p in toks {
+                    let TokKind::ClassObj(tm) = self.toks[p as usize] else {
+                        continue;
+                    };
+                    if self.foreign.contains_key(&tm) {
+                        self.relinked_parents.insert(tm);
+                    } else if theirs(self, of) {
+                        let reason = self
+                            .reason("class given as the parent of a class unknown code constructs");
+                        self.escape(p, reason);
+                    }
+                }
+            }
             Cons::ProtoOf { dst } => {
+                let pk = self.atom("__proto__");
                 for &t in toks {
-                    if t == TOP {
-                        self.add_tok(dst, TOP);
+                    // A parameter marker has no prototype here (DECISIONS
+                    // 119): the read is a `__proto__` step its reader
+                    // replays on the argument.
+                    if self.is_marker(t) && !self.virt_protos.contains_key(&t) {
+                        self.load_from(t, t, Key::Named(pk), dst);
                         continue;
                     }
-                    let pn = self.proto_node(t);
-                    self.edge(pn, dst);
+                    self.proto_value(t, dst);
+                }
+            }
+            Cons::ProtoValues { dst } => {
+                self.add_prim(dst, prim & prim::NULL);
+                for &p in toks {
+                    match self.toks[p as usize] {
+                        TokKind::Proto(tm)
+                            if matches!(
+                                self.tmpls[tm as usize].kind,
+                                TmplKind::Class {
+                                    literal_shape: true,
+                                    ..
+                                }
+                            ) =>
+                        {
+                            self.proto_value(p, dst)
+                        }
+                        _ => self.add_tok(dst, p),
+                    }
+                }
+            }
+            Cons::PlainKey { origin, act } => {
+                for &q in toks {
+                    match self.toks[q as usize] {
+                        TokKind::Top => match act {
+                            ChainAct::Load(dst) => self.add_tok(dst, TOP),
+                            ChainAct::Call(call) => self.call_tok(call, TOP, Some(origin)),
+                            ChainAct::Store(_) => {}
+                        },
+                        TokKind::ObjectProto
+                        | TokKind::NativeProto(_)
+                        | TokKind::Builtin(_)
+                        | TokKind::BuiltinFn => {
+                            self.with_b(|m| builtins::plain_key(m, origin, act));
+                        }
+                        _ => {
+                            let f = self.num_fields(q);
+                            match act {
+                                ChainAct::Load(dst) => self.edge(f, dst),
+                                ChainAct::Call(call) => self.bind_via(f, call, origin),
+                                ChainAct::Store(_) => {}
+                            }
+                        }
+                    }
                 }
             }
             Cons::IterNext { dst } => {
@@ -721,6 +885,7 @@ impl Model {
                     self.edge(all, dst);
                     self.add_prim(dst, prim::UNDEF);
                     if self.idx_done.insert((idx, t, dst, 0)) {
+                        self.plain_key(t, ChainAct::Load(dst));
                         self.cons(idx, Cons::IdxKey { obj: t, dst });
                     }
                 }
@@ -741,6 +906,83 @@ impl Model {
                             for k in keys {
                                 let a = self.atom(k);
                                 self.load_program_key(obj, a, dst);
+                            }
+                        }
+                    }
+                }
+            }
+            Cons::IdxMCall { idx, call } => {
+                // Primitive receivers (`MCall`'s rule): a number key calls
+                // a key a store into ⊤ wrote on their prototype.
+                if prim != 0 && !self.nodes[n as usize].pts.contains_tok(TOP) {
+                    self.with_b(|m| builtins::prim_plain_key(m, prim, call));
+                    let p = prim & !(prim::NULL | prim::UNDEF);
+                    if p != 0 && self.idx_done.insert((idx, TOP, call, 128 | p as u8)) {
+                        self.cons(
+                            idx,
+                            Cons::IdxKeyCall {
+                                obj: TOP,
+                                prim: p,
+                                call,
+                            },
+                        );
+                    }
+                }
+                for &t in toks {
+                    // ⊤ and a parameter marker take any key (the call
+                    // escapes; the marker's reader replays the call).
+                    if t == TOP || (self.is_marker(t) && !self.virt_protos.contains_key(&t)) {
+                        self.method_on(t, Key::Any, call);
+                        continue;
+                    }
+                    if self.idx_done.insert((idx, t, call, 0)) {
+                        self.mark_use(t, crate::model::MARK_ESCAPE);
+                        let own = self.all_fields(t);
+                        self.bind_via(own, call, t);
+                        self.plain_key(t, ChainAct::Call(call));
+                        self.cons(
+                            idx,
+                            Cons::IdxKeyCall {
+                                obj: t,
+                                prim: 0,
+                                call,
+                            },
+                        );
+                    }
+                }
+            }
+            Cons::IdxKeyCall {
+                obj,
+                prim: recv_prim,
+                call,
+            } => {
+                let named = prim & (prim::STR | prim::SYMBOL) != 0 || !toks.is_empty();
+                // One rule per receiver: a token, or (⊤) primitive kinds.
+                let rule = match obj {
+                    TOP => 128 | recv_prim as u8,
+                    _ => IDX_CALL_ANY,
+                };
+                if named && self.idx_done.insert((n, obj, call, rule)) {
+                    match obj {
+                        TOP => self.with_b(|m| builtins::prim_method(m, recv_prim, Key::Any, call)),
+                        _ => self.method_on(obj, Key::Any, call),
+                    }
+                }
+                // ToPropertyKey of `true`, `null`, `undefined` is a named key.
+                if !named && obj != TOP {
+                    for (bit, keys) in [
+                        (prim::BOOL, &["true", "false"][..]),
+                        (prim::NULL, &["null"][..]),
+                        (prim::UNDEF, &["undefined"][..]),
+                    ] {
+                        if prim & bit != 0
+                            && self
+                                .idx_done
+                                .insert((n, obj, call, IDX_CALL_NAMED + bit as u8))
+                        {
+                            for k in keys {
+                                let a = self.atom(k);
+                                self.method_on(obj, Key::Named(a), call);
                             }
                         }
                     }
@@ -861,7 +1103,7 @@ impl Model {
                     // Each receiver binds every call looked up through
                     // this node: solve work per call.
                     self.work += calls.len() as u64;
-                    self.this_to(t, origin);
+                    self.this_to(t, origin, &calls);
                     self.this_calls(t, origin, &calls);
                 }
             }
@@ -873,6 +1115,13 @@ impl Model {
             Cons::RetInto { call, run } => self.ret_into(call, run, toks, prim),
             Cons::ArgInto { call, run, i } => self.arg_into(call, run, i, toks),
             Cons::Spread { into, site } => {
+                // A primitive source copies no key surely (`null`,
+                // `undefined`: none at all).
+                if prim != 0 {
+                    if let Some(&tm) = self.lit_spread_site.get(&site) {
+                        self.spread_source(tm, site, Vec::new());
+                    }
+                }
                 for &s in toks {
                     self.cons(into, Cons::SpreadFrom { src: s, site });
                 }
@@ -941,6 +1190,18 @@ impl Model {
                         TokKind::ClassObj(tm) => {
                             let inst = self.tok(TokKind::Obj(tm, NO_CTX));
                             self.mark_hard(inst, Hard::E11ReflectConstruct, reason);
+                        }
+                        // DECISIONS 210: another unit's constructor function:
+                        // the hard mark lands on its owner's layout (a census
+                        // report); unpublished, the function escapes.
+                        TokKind::Func(f, _) if self.foreign_ctor.contains_key(&f) => {
+                            match self.foreign_ctor[&f] {
+                                Some((_, tm)) => {
+                                    let inst = self.tok(TokKind::Obj(tm, NO_CTX));
+                                    self.mark_hard(inst, Hard::E11ReflectConstruct, reason);
+                                }
+                                None => self.escape(t, reason),
+                            }
                         }
                         TokKind::Func(f, _) => {
                             let tm = self.fn_inst_template(f);

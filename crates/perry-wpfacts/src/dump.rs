@@ -114,6 +114,17 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
             pf.rounds, pf.round_work, pf.broken
         ));
     }
+    for (mi, bindings) in pf.bindings.iter().enumerate() {
+        for (id, b) in &bindings.locals {
+            if let Some(o) = &b.indexed_owner {
+                out.push_str(&format!("# indexed_owner module={mi} local={id} kind={} min_len={} exact_len={:?} allocations={:?}\n", o.kind, o.min_len, o.exact_len, o.allocations));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "# indexed_metadata_pristine {}\n",
+        pf.indexed_metadata_pristine()
+    ));
     for (path, u) in &pf.units {
         out.push_str(&format!(
             "# unit {path} nodes={} constraints={} tokens={} pts_entries={} instances={} gen_ms={:.1} solve_ms={:.1} derive_ms={:.1} pops={} work={} aborted={}\n",
@@ -128,6 +139,9 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
         "# interp_guard {}\n",
         pf.interp_guard.clone().unwrap_or_else(|| "none".into())
     ));
+    if let Some(a) = &pf.activation {
+        out.push_str(&format!("# activation {a}\n"));
+    }
     out.push_str(&format!("# top_calls {}\n", s.top_calls));
     for (k, n, ms) in &s.profile {
         out.push_str(&format!("# profile {k} {n} {ms:.1}\n"));
@@ -159,6 +173,7 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
     }
     for st in &pf.sites {
         let v = match &st.verdict {
+            Verdict::StringLength => "native:string-length".to_string(),
             Verdict::T0Mono => "T0".to_string(),
             Verdict::T0Set => "T0set".to_string(),
             Verdict::E0 => "E0".to_string(),
@@ -177,7 +192,78 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
             v
         ));
     }
+    let mut verdicts: std::collections::BTreeMap<&str, Vec<&crate::SiteFacts>> = Default::default();
+    for site in &pf.sites {
+        if let Some(unit) = &site.diagnostic_unit {
+            verdicts.entry(unit).or_default().push(site);
+        }
+    }
+    for (unit, lines) in &pf.diagnostics {
+        for site in verdicts.get(unit.as_str()).into_iter().flatten() {
+            let bodies: Vec<String> = site
+                .bodies
+                .iter()
+                .map(|(id, name)| format!("[{id},{}]", crate::diagnostics::quote(name)))
+                .collect();
+            out.push_str(&format!(
+                "D {{\"record\":\"verdict\",\"unit\":{},\"file\":{},\"start\":{},\"key\":{},\"call\":{},\"verdict\":{},\"cause\":{},\"bodies\":[{}]}}\n",
+                crate::diagnostics::quote(unit), crate::diagnostics::quote(&pf.module_paths[site.module as usize]),
+                site.byte_offset, crate::diagnostics::quote(&site.key), site.is_call,
+                crate::diagnostics::quote(&format!("{:?}", site.verdict)),
+                match crate::ledger::verdict_cause(&site.verdict) {
+                    None => "null".to_string(),
+                    Some(Ok(c)) => crate::diagnostics::quote(c.name()),
+                    Some(Err(_)) => crate::diagnostics::quote("unclassified"),
+                },
+                bodies.join(",")));
+            for (copy, v) in &site.diagnostic_copies {
+                out.push_str(&format!(
+                    "D {{\"record\":\"copy-verdict\",\"unit\":{},\"file\":{},\"start\":{},\"key\":{},\"call\":{},\"copy\":{},\"verdict\":{}}}\n",
+                    crate::diagnostics::quote(unit), crate::diagnostics::quote(&pf.module_paths[site.module as usize]),
+                    site.byte_offset, crate::diagnostics::quote(&site.key), site.is_call,
+                    crate::diagnostics::quote(copy), crate::diagnostics::quote(&format!("{v:?}"))));
+            }
+        }
+        // DECISIONS 225: the bodies the whole program can run, the
+        // exemption of the per-unit <= whole residual (`dead_site`).
+        for (file, id, name) in pf.active_bodies.iter().flatten() {
+            out.push_str(&format!(
+                "D {{\"record\":\"active\",\"unit\":{},\"file\":{},\"fn\":{id},\"name\":{}}}\n",
+                crate::diagnostics::quote(unit),
+                crate::diagnostics::quote(file),
+                crate::diagnostics::quote(name)
+            ));
+        }
+        for line in lines {
+            out.push_str("D {");
+            out.push_str(&format!("\"unit\":{},", crate::diagnostics::quote(unit)));
+            out.push_str(&line[1..]);
+            out.push('\n');
+        }
+    }
     out
+}
+
+/// Dump only: appends the diagnostic records that were streamed to the sidecar
+/// (`FactsConfig::diag_sidecar`) in unit order, then removes the sidecar.
+pub fn append_streamed(pf: &ProgramFacts, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let Some((path, spans)) = &pf.diag_stream else {
+        return Ok(());
+    };
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    for &(at, n) in spans {
+        if n == 0 {
+            continue;
+        }
+        buf.resize(n as usize, 0);
+        f.seek(SeekFrom::Start(at))?;
+        f.read_exact(&mut buf)?;
+        out.write_all(&buf)?;
+    }
+    drop(f);
+    std::fs::remove_file(path)
 }
 
 pub fn relations_text(pf: &ProgramFacts) -> Option<String> {

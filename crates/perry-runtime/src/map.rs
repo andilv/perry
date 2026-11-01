@@ -57,13 +57,20 @@ pub(crate) fn map_foreach_unwind_to(sp: usize) {
     });
 }
 
+#[cfg(any(test, target_os = "wasi"))]
+pub(crate) fn map_foreach_restore_depth(depth: usize) {
+    MAP_FOREACH_STACK.with(|stack| {
+        stack.borrow_mut().restore_depth(depth);
+    });
+}
+
 pub(crate) fn map_foreach_check_marks(sp: usize) {
     MAP_FOREACH_STACK.with(|stack| {
         crate::exception::marks::check_marks(stack.borrow().marks(), sp, "map_foreach")
     });
 }
 
-#[cfg(test)]
+#[cfg(any(test, target_os = "wasi"))]
 pub(crate) fn map_foreach_depth() -> usize {
     MAP_FOREACH_STACK.with(|stack| stack.borrow().len())
 }
@@ -306,6 +313,7 @@ pub(crate) fn test_map_side_deallocation_snapshot() -> (u64, u64) {
     )
 }
 
+mod entry;
 mod store;
 mod string_key;
 
@@ -698,16 +706,15 @@ fn is_safe_numeric_key(bits: u64) -> bool {
 // Numeric bits and string entry offsets survive moves. Pointer-key bits are
 // refreshed after GC rewrites; no header-address lookup is needed.
 
-/// FNV-1a 64-bit content hash for any string-like JSValue.
-/// Returns `None` for non-strings, `Some(FNV_OFFSET_BASIS)` for the empty
-/// string. SSO and heap STRING_TAG hash into the same space because both
+/// Map-local word digest for any string-like JSValue.
+/// Returns `None` for non-strings. SSO and heap STRING_TAG hash into the same space because both
 /// representations decode through `string_view_from_bits`.
 #[inline]
 fn string_content_hash(value_bits: u64) -> Option<u64> {
     let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     let (ptr, len) = string_view_from_bits(value_bits, &mut scratch)?;
     // SAFETY: a view that is not `scratch` is a validated heap string's payload.
-    Some(unsafe { string_key_hash(ptr, len, ptr != scratch.as_ptr()) })
+    Some(unsafe { string_key::map_content_hash(ptr, len) })
 }
 
 /// The content hash of a string key: FNV-1a over its bytes, the function
@@ -910,7 +917,7 @@ fn clean_map_ptr(map: *const MapHeader) -> *const MapHeader {
         // Genuine Map: `js_map_alloc` allocates the header with GC_TYPE_MAP.
         Some(header) if header.obj_type == crate::gc::GC_TYPE_MAP => map,
         // Only a plain object can be a Map subclass instance.
-        Some(header) if header.obj_type == crate::gc::GC_TYPE_OBJECT => {
+        Some(header) if crate::gc_type_is_object!(header.obj_type) => {
             crate::object::map_set_subclass::redirect_collection_receiver(
                 addr,
                 crate::object::map_set_subclass::CollectionKind::Map,
@@ -1178,7 +1185,7 @@ fn jsvalue_eq(a: f64, b: f64) -> bool {
             // A bigint never equals a non-bigint key.
             return false;
         }
-        return crate::bigint::js_bigint_eq(a_big, b_big) != 0;
+        return crate::bigint_hooks::js_bigint_eq(a_big, b_big) != 0;
     }
 
     if is_string_like(a_bits) && is_string_like(b_bits) {
@@ -1233,7 +1240,7 @@ pub extern "C" fn js_map_alloc(capacity: u32) -> *mut MapHeader {
         (*ptr).capacity = cap;
         (*ptr).entries = (*store).entries;
         (*ptr).store = store;
-        (*ptr).meta = ptr::null_mut();
+        *crate::object::cell_meta::map_cell_meta_slot(ptr) = ptr::null_mut();
         (*ptr).used = 0;
         (*ptr).compaction_epoch = 0;
         crate::gc::runtime_write_barrier_gc_slot(
@@ -1458,6 +1465,12 @@ unsafe fn find_key_index_hot(map: *const MapHeader, key: f64) -> Option<i32> {
         return is_plain_nonzero_number_bits(key_bits).then_some(-1);
     }
     if !is_plain_nonzero_number_bits(key_bits) {
+        let tag = key_bits >> 48;
+        if tag == crate::value::SHORT_STRING_TAG >> 48 || tag == crate::value::STRING_TAG >> 48 {
+            // The existing large-Map store owns the string index. Keep this
+            // admitted path out of the general numeric/pointer cold frame.
+            return Some(string_key::find_indexed(map, key_bits));
+        }
         return None;
     }
     let index = (*map).store.as_ref().map(|store| &store.numeric)?;
@@ -1516,9 +1529,10 @@ unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
             }
             return -1;
         }
-        if let Some(i) = find_identical_key(entries, used, key_bits) {
-            return i;
-        }
+        // No bit-identity pass here: every caller has already made one
+        // (`find_key_index_hot`, or `entry::identical_entry` before
+        // `find_entry_after_identity_miss`), and it missed. Running the scan
+        // again only repeated the whole extent on every general-path lookup.
         // A string key is decoded once and each entry rejected by tag and
         // length, instead of paying the generic comparison per entry (#10697).
         if let Some(skey) = StrKey::decode(key_bits) {
@@ -1562,19 +1576,18 @@ unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
     if is_string_like(key_bits) {
         let entries = entries_ptr(map);
         if let Some(slot) = (*map).store.as_ref().map(|store| &store.strings) {
-            // FNV-1a collisions are rare but possible; validate each
+            // Complete digest collisions are possible; validate each
             // candidate by content.
             if let Some(skey) = StrKey::decode(key_bits) {
-                for cand_idx in slot.candidates(skey.content_hash()) {
-                    if cand_idx >= used {
-                        continue;
-                    }
-                    let cand_bits = ptr::read(entries.add((cand_idx as usize) * 2)).to_bits();
-                    if skey.matches(key_bits, cand_bits) {
-                        return cand_idx as i32;
-                    }
-                }
-                return -1;
+                return slot
+                    .find(skey.content_hash(), |i| {
+                        i < used
+                            && skey.matches_indexed(
+                                key_bits,
+                                ptr::read(entries.add(i as usize * 2)).to_bits(),
+                            )
+                    })
+                    .map_or(-1, |i| i as i32);
             }
             // A pointer-tagged string-like key (a symbol among them) keeps
             // the generic comparison and its symbol guard.
@@ -1634,11 +1647,27 @@ unsafe fn find_key_index_cold(map: *const MapHeader, key: f64) -> i32 {
 /// or literal), and this pass finds those at a few instructions per entry
 /// before any entry pays for a content comparison (#10697). `key_bits` is
 /// already SameValueZero-normalized, as every stored key is.
+///
+/// The scan has no data-dependent exit. Every entry of the `used` extent is
+/// compared and the matches are collected as a bit per slot, so the position
+/// of the hit never reaches a branch: an early-exit scan over keys that are
+/// looked up in no fixed order mispredicts about once per lookup, and a
+/// mispredict costs far more than the few extra compares of a map this small.
+/// Only the found/missing split remains, and the caller's data decides it,
+/// not where the key sits. The lowest set bit is the first match, exactly
+/// what the early-exit scan returned.
 #[inline(always)]
 unsafe fn find_identical_key(entries: *const f64, used: u32, key_bits: u64) -> Option<i32> {
-    (0..used)
-        .find(|&i| ptr::read(entries.add((i as usize) * 2)).to_bits() == key_bits)
-        .map(|i| i as i32)
+    debug_assert!(used <= SIDE_TABLE_THRESHOLD);
+    let mut hit: u32 = 0;
+    for i in 0..used {
+        hit |= ((ptr::read(entries.add((i as usize) * 2)).to_bits() == key_bits) as u32) << i;
+    }
+    if hit == 0 {
+        None
+    } else {
+        Some(hit.trailing_zeros() as i32)
+    }
 }
 
 unsafe fn find_string_key_index(map: *const MapHeader, key: *const StringHeader) -> i32 {
@@ -1661,16 +1690,15 @@ unsafe fn find_string_key_index(map: *const MapHeader, key: *const StringHeader)
             return -1;
         }
         if let Some(slot) = (*map).store.as_ref().map(|store| &store.strings) {
-            for cand_idx in slot.candidates(skey.content_hash()) {
-                if cand_idx >= used {
-                    continue;
-                }
-                let cand_bits = ptr::read(entries.add((cand_idx as usize) * 2)).to_bits();
-                if skey.matches(key_bits, cand_bits) {
-                    return cand_idx as i32;
-                }
-            }
-            return -1;
+            return slot
+                .find(skey.content_hash(), |i| {
+                    i < used
+                        && skey.matches_indexed(
+                            key_bits,
+                            ptr::read(entries.add(i as usize * 2)).to_bits(),
+                        )
+                })
+                .map_or(-1, |i| i as i32);
         }
     }
 
@@ -1847,92 +1875,7 @@ fn map_op_returning_receiver(
 /// The map pointer is stable (never reallocated)
 #[no_mangle]
 pub extern "C" fn js_map_set(map: *mut MapHeader, key: f64, value: f64) -> *mut MapHeader {
-    map_op_returning_receiver(map, |map| map_set_resolved(map, key, value))
-}
-
-/// `js_map_set`'s body, on a receiver already resolved to a genuine `MapHeader`.
-fn map_set_resolved(map: *mut MapHeader, key: f64, value: f64) {
-    let key = normalize_zero(key);
-    unsafe {
-        // Check if key already exists (O(1) via the numeric side index)
-        let idx = find_key_index(map, key);
-
-        if idx >= 0 {
-            // Update existing value (key position unchanged → no index update)
-            let entries = entries_ptr_mut(map);
-            let value_slot = entries.add((idx as usize) * 2 + 1);
-            // GC_STORE_AUDIT(BARRIERED): exact heap slot belongs to the owned store.
-            crate::gc::runtime_store_gc_jsvalue_slot(
-                (*map).store as usize,
-                value_slot as usize,
-                value.to_bits(),
-            );
-            return;
-        }
-
-        // Key doesn't exist, append a new entry. `ensure_capacity` can fire a
-        // MOVING minor (via gc_note_external_side_alloc) — its "conservative +
-        // non-moving" comment is false under evacuation. `key`/`value` are held
-        // only in these native-stack params (a freshly-built, not-yet-inserted
-        // object is reachable via nothing else), which an evacuating minor does
-        // not scan, so root them across the grow and re-derive after. gh #6206.
-        let scope = crate::gc::RuntimeHandleScope::new();
-        let key_handle = scope.root_nanbox_f64(key);
-        let value_handle = scope.root_nanbox_f64(value);
-        let grew = ensure_capacity(map);
-        let key = key_handle.get_nanbox_f64();
-        let value = value_handle.get_nanbox_f64();
-        let size = (*map).size;
-        let used = (*map).used;
-        let entries = entries_ptr_mut(map);
-        if grew && used > 0 {
-            crate::gc::replay_old_parent_slot_range_barriers(
-                (*map).store as usize,
-                entries as *mut u64,
-                used as usize * 2,
-            );
-        }
-
-        let key_slot = entries.add((used as usize) * 2);
-        let value_slot = entries.add((used as usize) * 2 + 1);
-        // GC_STORE_AUDIT(EXTERNAL_BARRIERED): map append key/value slots use the shared external-slot helper.
-        crate::gc::runtime_store_gc_jsvalue_slot(
-            (*map).store as usize,
-            key_slot as usize,
-            key.to_bits(),
-        );
-        crate::gc::runtime_store_gc_jsvalue_slot(
-            (*map).store as usize,
-            value_slot as usize,
-            value.to_bits(),
-        );
-
-        (*map).size = size + 1;
-        (*map).used = used + 1;
-        (*(*map).store).used = (*map).used as usize;
-
-        // Update the O(1) side-tables: numeric keys by bits, string keys by
-        // content hash, pointer keys (objects/symbols/bigints) in the
-        // GC-rebuilt pointer index (#6084).
-        let key_bits = key.to_bits();
-        if is_safe_numeric_key(key_bits) {
-            if let Some(index) = (*map).store.as_mut().map(|store| &mut store.numeric) {
-                index.insert(NumericKey(key_bits), used);
-            }
-        } else if is_string_like(key_bits) {
-            // String key: content-hashed index bypasses the gen-GC stale-bits
-            // constraint by storing entry indexes (not pointers) keyed by
-            // FNV-1a 64-bit hash of the bytes.
-            if let Some(h) = string_content_hash(key_bits) {
-                (*(*map).store).strings.insert(h, used);
-            }
-        } else {
-            let index = &mut (*(*map).store).pointers;
-            let before = hash_index_bytes(index);
-            index.insert(MapPtrKey(key), used);
-            note_index_bytes_changed(before, hash_index_bytes(index));
-        }
-    }
+    entry::set(map, key, value)
 }
 
 /// Shared tail for the `js_map_set_string_*` specializations: store into the
@@ -2034,27 +1977,56 @@ pub extern "C" fn js_map_set_string_string(
 /// Returns the value, or TAG_UNDEFINED if not found
 #[no_mangle]
 pub extern "C" fn js_map_get(map: *const MapHeader, key: f64) -> f64 {
-    let map = clean_map_ptr(map);
-    if map.is_null() {
-        return f64::from_bits(TAG_UNDEFINED);
+    if let Some(map) = entry::plain_receiver(map) {
+        return map_get_resolved(map, key);
     }
-    map_get_resolved(map, key)
+    entry::get_receiver_fallback(map, key)
+}
+
+/// `m.get(k)` that also reports the entry's value slot (0 when absent) through
+/// `slot_out`, so a following `m.set(k, v)` on the same receiver and key bits
+/// can store straight into it. See [`entry::get_with_slot`].
+#[no_mangle]
+pub extern "C" fn js_map_get_entry(map: *const MapHeader, key: f64, slot_out: *mut u64) -> f64 {
+    entry::get_with_slot(map, key, slot_out)
 }
 
 #[inline(always)]
 fn map_get_resolved(map: *const MapHeader, key: f64) -> f64 {
-    let key = normalize_zero(key);
     unsafe {
-        let idx = find_key_index(map, key);
-
-        if idx >= 0 {
-            let entries = entries_ptr(map);
-            let value_slot = entries.add((idx as usize) * 2 + 1);
-            let value = ptr::read(value_slot);
-            return heal_forwarded_array_value(map, value_slot, value);
+        if let Some(index) = entry::identical_entry(map, key) {
+            return map_read_entry_value(map, index);
         }
+    }
+    map_get_resolved_fallback(map, key)
+}
 
-        f64::from_bits(TAG_UNDEFINED)
+#[inline(never)]
+fn map_get_resolved_fallback(map: *const MapHeader, key: f64) -> f64 {
+    unsafe {
+        // `map_get_resolved` reaches here only after `identical_entry`
+        // declined or missed, so the extent is not scanned again.
+        let index = entry::find_entry_after_identity_miss(map, key);
+        if index >= 0 {
+            return map_read_entry_value(map, index);
+        }
+    }
+    f64::from_bits(TAG_UNDEFINED)
+}
+
+#[inline(always)]
+unsafe fn map_read_entry_value(map: *const MapHeader, index: i32) -> f64 {
+    let slot = entries_ptr(map).add(index as usize * 2 + 1);
+    let value = ptr::read(slot);
+    if value.to_bits() & crate::value::TAG_MASK != crate::value::POINTER_TAG {
+        return value;
+    }
+    heal_forwarded_array_value(map, slot, value)
+}
+
+crate::entry_contracts::kind_entry! {
+    js_map_get_entry__Map, Map, fn(map: *const MapHeader, key: f64, slot_out: *mut u64) -> f64 {
+        entry::get_with_slot_resolved(map, key, slot_out)
     }
 }
 
@@ -2182,6 +2154,23 @@ pub extern "C" fn js_map_get_string_key(map: *const MapHeader, key: *const Strin
 /// Returns 1 if found, 0 if not found
 #[no_mangle]
 pub extern "C" fn js_map_has(map: *const MapHeader, key: f64) -> i32 {
+    if let Some(map) = entry::plain_receiver(map) {
+        // Same shape as `js_map_get`: the bit-identity pass answers a hit, and
+        // only a miss normalizes the key and decides it, without scanning the
+        // small extent again.
+        unsafe {
+            let index = match entry::identical_entry(map, key) {
+                Some(index) => index,
+                None => entry::find_entry_after_identity_miss(map, key),
+            };
+            return (index >= 0) as i32;
+        }
+    }
+    map_has_receiver_fallback(map, key)
+}
+
+#[inline(never)]
+fn map_has_receiver_fallback(map: *const MapHeader, key: f64) -> i32 {
     let map = clean_map_ptr(map);
     if map.is_null() {
         return 0;
@@ -2301,6 +2290,10 @@ static KEEP_JS_MAP_GET_STRING_KEY: extern "C" fn(*const MapHeader, *const String
     js_map_get_string_key;
 #[cfg(feature = "keepalive-anchors")]
 #[used(compiler)]
+static KEEP_JS_MAP_GET_ENTRY: extern "C" fn(*const MapHeader, f64, *mut u64) -> f64 =
+    js_map_get_entry;
+#[cfg(feature = "keepalive-anchors")]
+#[used(compiler)]
 static KEEP_JS_MAP_GET_NUMBER_KEY: extern "C" fn(*const MapHeader, f64) -> f64 =
     js_map_get_number_key;
 #[cfg(feature = "keepalive-anchors")]
@@ -2324,6 +2317,21 @@ static KEEP_JS_MAP_DELETE_NUMBER_KEY: extern "C" fn(*mut MapHeader, f64) -> i32 
 /// Returns 1 if deleted, 0 if key not found
 #[no_mangle]
 pub extern "C" fn js_map_delete(map: *mut MapHeader, key: f64) -> i32 {
+    if let Some(map) = entry::plain_receiver(map as *const MapHeader) {
+        let map = map as *mut MapHeader;
+        unsafe {
+            let index = match entry::identical_entry(map, key) {
+                Some(index) => index,
+                None => entry::find_entry_after_identity_miss(map, key),
+            };
+            return delete_entry_at_index(map, index);
+        }
+    }
+    map_delete_receiver_fallback(map, key)
+}
+
+#[inline(never)]
+fn map_delete_receiver_fallback(map: *mut MapHeader, key: f64) -> i32 {
     let map = clean_map_ptr_mut(map);
     if map.is_null() {
         return 0;
@@ -3136,6 +3144,102 @@ fn js_map_foreach_impl(
 mod tests {
     use super::*;
     use crate::string::js_string_from_bytes;
+
+    /// `find_identical_key` answers by bit identity over the whole `used`
+    /// extent with no early exit: a hit at every index of every extent, the
+    /// lowest index when the bits repeat, and a miss when none match.
+    #[test]
+    fn identical_key_scan_finds_each_index_and_misses() {
+        let mut entries = [0.0f64; 16];
+        for used in 0..=SIDE_TABLE_THRESHOLD {
+            for i in 0..SIDE_TABLE_THRESHOLD as usize {
+                entries[i * 2] = f64::from_bits(0x4000_0000_0000_0000 + 17 * (i as u64 + 1));
+            }
+            let base = entries.as_ptr();
+            for hit_at in 0..used {
+                let bits = entries[hit_at as usize * 2].to_bits();
+                assert_eq!(
+                    unsafe { find_identical_key(base, used, bits) },
+                    Some(hit_at as i32)
+                );
+            }
+            assert_eq!(unsafe { find_identical_key(base, used, 0x1234) }, None);
+            // A key stored beyond `used` is not part of the extent.
+            if used < SIDE_TABLE_THRESHOLD {
+                let beyond = entries[used as usize * 2].to_bits();
+                assert_eq!(unsafe { find_identical_key(base, used, beyond) }, None);
+            }
+        }
+        // Repeated bits (a hole key repeated by tombstones): first slot wins.
+        for i in [1usize, 3, 6] {
+            entries[i * 2] = f64::from_bits(MAP_HOLE_KEY_BITS);
+        }
+        assert_eq!(
+            unsafe { find_identical_key(entries.as_ptr(), 8, MAP_HOLE_KEY_BITS) },
+            Some(1)
+        );
+        assert_eq!(
+            unsafe { find_identical_key(entries.as_ptr(), 1, MAP_HOLE_KEY_BITS) },
+            None
+        );
+    }
+
+    /// Small-map lookups through the public entry points, at every slot, over
+    /// tombstones, and with the keys the bit-identity lane must not decide:
+    /// `-0` against `+0`, NaN, and string keys equal only by content.
+    #[test]
+    fn small_map_lookup_every_slot_tombstones_and_special_keys() {
+        for n in 1..=SIDE_TABLE_THRESHOLD {
+            let map = js_map_alloc(4);
+            for k in 0..n {
+                js_map_set(map, 100.0 + k as f64, k as f64);
+            }
+            for k in 0..n {
+                assert_eq!(
+                    js_map_get(map, 100.0 + k as f64),
+                    k as f64,
+                    "n={n} slot {k}"
+                );
+                assert_eq!(js_map_has(map, 100.0 + k as f64), 1);
+            }
+            assert_eq!(js_map_has(map, 99.0), 0);
+            assert_eq!(js_map_has(map, 100.0 + n as f64), 0);
+            // Delete each slot in turn: the tombstone neither matches nor
+            // hides the entries after it.
+            for k in 0..n {
+                assert_eq!(js_map_delete(map, 100.0 + k as f64), 1);
+                assert_eq!(js_map_has(map, 100.0 + k as f64), 0);
+                for r in (k + 1)..n {
+                    assert_eq!(js_map_get(map, 100.0 + r as f64), r as f64);
+                }
+            }
+        }
+        let map = js_map_alloc(4);
+        js_map_set(map, 0.0, 1.0);
+        js_map_set(map, f64::NAN, 2.0);
+        js_map_set(map, 5.0, 3.0);
+        assert_eq!(
+            js_map_get(map, -0.0),
+            1.0,
+            "-0 is SameValueZero-equal to +0"
+        );
+        assert_eq!(
+            js_map_get(map, f64::from_bits(0x7ff8_0000_0000_0001)),
+            2.0,
+            "any NaN"
+        );
+        assert_eq!(js_map_get(map, 5.0), 3.0);
+        let a = js_string_from_bytes(b"ab".as_ptr(), 2);
+        let b = js_string_from_bytes(b"ab".as_ptr(), 2);
+        let c = js_string_from_bytes(b"ac".as_ptr(), 2);
+        js_map_set_string_number(map, a, 9.0);
+        assert_eq!(
+            js_map_get_string_key(map, b),
+            9.0,
+            "content-equal, not identical"
+        );
+        assert_eq!(js_map_has_string_key(map, c), 0);
+    }
 
     #[test]
     fn string_number_specialized_helpers_use_string_content_keys() {

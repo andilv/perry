@@ -35,6 +35,7 @@ mod element_shape_loop;
 mod element_shape_loop_tests;
 mod element_shape_native;
 mod if_stmt;
+mod indexed_owner_loop;
 mod let_buffer_views;
 mod let_object_facts;
 mod let_scalar_new;
@@ -45,8 +46,11 @@ mod let_stmt_var_redeclare_tests;
 mod loops;
 mod masked_window_region;
 mod number_local_loop;
+pub(crate) use number_local_loop::numeric_callbacks;
 #[cfg(test)]
 mod number_local_loop_tests;
+#[cfg(test)]
+mod numeric_callback_contract_tests;
 #[cfg(test)]
 mod packed_range_global_cache_rooting_tests;
 #[cfg(test)]
@@ -64,6 +68,7 @@ mod switch_stmt;
 mod try_stmt;
 mod unused_expr;
 mod versioned_indexed_loop;
+mod wasm_eh;
 
 pub(crate) use if_stmt::lower_if;
 pub(crate) use let_stmt::lower_let;
@@ -202,10 +207,13 @@ fn lower_stmts_from(
     // The list's frame of cell roots its direct statements initialize
     // (`binding_cell::ReadyCellRoots`).
     ctx.ready_cell_roots.push_list();
+    ctx.numeric_order_ready.push_list();
     let lowered = lower_stmts_list(ctx, stmts, emit_shadow_clears, version_tails);
     // A class-guard run never outlives its statement list.
     crate::expr::class_guard_memo::close(ctx);
+    crate::expr::map_entry_fusion::close_list(ctx, stmts);
     ctx.ready_cell_roots.pop_list();
+    ctx.numeric_order_ready.pop_list();
     lowered
 }
 
@@ -323,16 +331,25 @@ fn lower_stmts_list(
             }
         }
         crate::expr::class_guard_memo::before_stmt(ctx, stmts, i);
+        crate::expr::map_entry_fusion::before_stmt(ctx, stmts, i);
         crate::layout_desc::create_families::before_stmt(ctx, stmts, i);
         let lowered = lower_stmt(ctx, &stmts[i]);
         crate::layout_desc::create_families::after_stmt(ctx);
         crate::expr::class_guard_memo::after_stmt(ctx);
+        crate::expr::map_entry_fusion::after_stmt(ctx, stmts, i);
         lowered?;
         if let Some(id) = ctx.born_let.take() {
             anyhow::bail!("closure birth table: declaration of local {id} was not lowered as born");
         }
         let declared = binding_cell::declared_cell_roots(ctx, &stmts[i]);
         ctx.ready_cell_roots.settle(declared);
+        if let Stmt::Let {
+            id, init: Some(_), ..
+        } = &stmts[i]
+        {
+            ctx.numeric_order_ready.note_stored(*id);
+            ctx.numeric_order_ready.settle([*id]);
+        }
         region_loop::after_stmt(ctx, &stmts[i]);
         // Representation-selection Phase 2: a TOP-LEVEL `Stmt::Let` of a
         // pre-pass-proven typed-array binding makes the binding "ready" — the
@@ -527,6 +544,8 @@ fn lower_stmt_inner(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
             if ctx.shared_super_scope_active {
                 ctx.block().call_void("js_derived_super_scope_pop", &[]);
             }
+            crate::expr::private_resume_frame::write_out_kind(ctx)?;
+            crate::expr::resume_locals::write_back(ctx)?;
             ctx.block().ret(DOUBLE, &final_v);
             Ok(())
         }
@@ -573,6 +592,7 @@ fn lower_stmt_inner(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 if ctx.shared_super_scope_active {
                     ctx.block().call_void("js_derived_super_scope_pop", &[]);
                 }
+                crate::expr::resume_locals::write_back(ctx)?;
                 ctx.block().ret(DOUBLE, &undef);
             }
             Ok(())
@@ -657,13 +677,16 @@ fn lower_stmt_inner(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
             // entry with an EMPTY cont slot (it is a break target only), so
             // `continue` inside a switch must resolve to the innermost real
             // LOOP, not the switch exit (#5989 — see switch_stmt.rs).
-            let (cont_label, target_depth) = ctx
+            let (loop_index, (cont_label, target_depth)) = ctx
                 .loop_targets
                 .iter()
+                .enumerate()
                 .rev()
-                .find(|(c, _b, _d)| !c.is_empty())
-                .map(|(c, _b, d)| (c.clone(), *d))
+                .find(|(_i, (c, _b, _d))| !c.is_empty())
+                .map(|(i, (c, _b, d))| (i, (c.clone(), *d)))
                 .ok_or_else(|| anyhow!("continue statement outside any loop"))?;
+            let cont_label = crate::expr::resume_locals::direct_dispatch_target(ctx, loop_index)
+                .unwrap_or(cont_label);
             // Pop try frames escaped by jumping back to the loop header
             // (see Stmt::Break / Stmt::Return for the balancing rationale).
             for _ in target_depth..ctx.try_depth {
@@ -800,6 +823,7 @@ fn lower_stmt_inner(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 let boxed = crate::expr::nanbox_pointer_inline_pub(blk, &handle);
                 blk.ret(DOUBLE, &boxed);
             } else {
+                crate::expr::resume_locals::write_back(ctx)?;
                 ctx.block().call_void("js_throw", &[(DOUBLE, &val)]);
                 ctx.block().unreachable();
             }

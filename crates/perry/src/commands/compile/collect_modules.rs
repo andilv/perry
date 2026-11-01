@@ -620,6 +620,9 @@ fn collect_module_one(
     let ast_module = forwarding_module.as_ref().unwrap_or(ast_module);
     let native_namespace_module = native_esm_namespace::rewrite_static(ast_module, &ctx.cache_dir)?;
     let ast_module = native_namespace_module.as_ref().unwrap_or(ast_module);
+    // Layer-1 DCE: summarized in the first walk, pruned in the second.
+    let demand_pruned = super::export_demand::visit(ctx, &canonical, ast_module, was_cjs_wrapped);
+    let ast_module = demand_pruned.as_ref().unwrap_or(ast_module);
     let file_loader_sources = file_loader_import_sources(ast_module);
     let source_file_path = canonical.to_string_lossy().to_string();
     if !perry_hir::source_remap::is_covered(&canonical) {
@@ -779,6 +782,10 @@ fn collect_module_one(
     let dynamic_ast = specialized_dynamic_code
         .as_ref()
         .unwrap_or(solid_module.as_ref().unwrap_or(ast_module));
+    ctx.realm_reach.merge(&perry_hir::realm_reach::scan(
+        dynamic_ast,
+        perry_codegen::realm_manifest::REALM,
+    ));
     let patched_before = ctx.patched_builtins.len();
     let guarded_before = ctx
         .patched_builtins
@@ -868,6 +875,13 @@ fn collect_module_one(
         }
     };
     hir_module.class_family_syntax = class_family_syntax;
+    // The CommonJS support module is the wrapper's own loader surface, like
+    // the wrapper text the census never sees (`cjs_link`).
+    if ctx.cjs_support_path.as_deref() == Some(canonical.as_path()) {
+        if let Some(syntax) = &mut hir_module.class_family_syntax {
+            syntax.module_capability_uses = 0;
+        }
+    }
     *next_class_id = new_next_class_id; // Update the global class_id counter
 
     // #9599: Bun platform mode is a real global mode, not merely a direct-call
@@ -880,12 +894,15 @@ fn collect_module_one(
             0,
             perry_hir::Stmt::Expr(perry_hir::Expr::PropertySet {
                 object: Box::new(perry_hir::Expr::PropertyGet {
+                    byte_end: 0,
                     object: Box::new(perry_hir::Expr::GlobalGet(0)),
                     property: "globalThis".to_string(),
                     byte_offset: 0,
                 }),
                 property: "Bun".to_string(),
                 value: Box::new(perry_hir::Expr::NativeModuleRef("bun".to_string())),
+                byte_offset: 0,
+                byte_end: 0,
             }),
         );
         // #10360: tell the runtime too, for Web APIs whose Bun behavior
@@ -1135,15 +1152,14 @@ fn collect_module_one(
             // object at lowering (authoritative; handles single-line sources and
             // doesn't misclassify multi-line filenames).
             let eval_mode = *is_eval;
-            let mut visiting: std::collections::HashSet<u32> = std::collections::HashSet::new();
             let (resolution, partial) = if eval_mode {
                 (
-                    perry_hir::resolve_import_path_with_context(
+                    perry_hir::resolve_worker_eval_source(
                         filename.as_ref(),
+                        &hir_module,
                         &module_const_locals,
                         &dynamic_param_literals,
                         &dynamic_local_literals,
-                        &mut visiting,
                     ),
                     false,
                 )
@@ -1427,19 +1443,6 @@ fn collect_module_one(
         {
             ctx.needs_stdlib = true;
             ctx.native_module_imports.insert("stream/web".to_string());
-        }
-
-        // `node:fs/promises` itself is runtime-backed, but
-        // FileHandle.readableWebStream() needs perry-stdlib's Web Streams
-        // factory even when user code never imports `node:stream/web`.
-        if import
-            .source
-            .strip_prefix("node:")
-            .unwrap_or(&import.source)
-            == "fs/promises"
-        {
-            ctx.needs_stdlib = true;
-            ctx.native_module_imports.insert("fs/promises".to_string());
         }
 
         // Refs #665: an opt-in via `perry.compilePackages` overrides the
@@ -1969,6 +1972,28 @@ fn collect_module_one(
     // Limited to Perry-compiled (`NativeCompiled`) targets — native stdlib /
     // V8 modules have their own init paths.
     {
+        let local_of = |s: &perry_hir::ImportSpecifier| match s {
+            perry_hir::ImportSpecifier::Default { local } => local.clone(),
+            perry_hir::ImportSpecifier::Namespace { local } => local.clone(),
+            perry_hir::ImportSpecifier::Named { local, .. } => local.clone(),
+        };
+        // A static CommonJS edge (design CJS_LINK §2.2) imports its target's
+        // record binding as `__perry_cjs_rec_N`: the target evaluates when an
+        // edge first runs, so no import of it is an init-order edge.
+        let edge_sources: HashSet<String> = if was_cjs_wrapped {
+            hir_module
+                .imports
+                .iter()
+                .filter(|i| {
+                    i.specifiers
+                        .iter()
+                        .any(|s| local_of(s).starts_with("__perry_cjs_rec_"))
+                })
+                .map(|i| i.source.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
         for import in &mut hir_module.imports {
             if import.type_only
                 || import.is_dynamic
@@ -1978,14 +2003,11 @@ fn collect_module_one(
             {
                 continue;
             }
-            let is_lazy = import.specifiers.iter().any(|s| {
-                let local = match s {
-                    perry_hir::ImportSpecifier::Default { local } => local,
-                    perry_hir::ImportSpecifier::Namespace { local } => local,
-                    perry_hir::ImportSpecifier::Named { local, .. } => local,
-                };
-                local.starts_with("_lazyreq_")
-            });
+            let is_lazy = edge_sources.contains(&import.source)
+                || import
+                    .specifiers
+                    .iter()
+                    .any(|s| local_of(s).starts_with("_lazyreq_"));
             if is_lazy {
                 import.is_deferred_require = true;
             }

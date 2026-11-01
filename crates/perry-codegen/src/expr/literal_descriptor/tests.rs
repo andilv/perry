@@ -25,6 +25,8 @@ fn fixture(records: usize, fields: usize) -> Module {
                     object: Box::new(Expr::This),
                     property: p.name.clone(),
                     value: Box::new(Expr::LocalGet(p.id)),
+                    byte_offset: 0,
+                    byte_end: 0,
                 })
             })
             .collect(),
@@ -86,6 +88,7 @@ fn fixture(records: usize, fields: usize) -> Module {
         init: Some(Expr::Array(
             (0..records)
                 .map(|r| Expr::New {
+                    byte_end: 0,
                     class_name: class_name.into(),
                     args: (0..fields).map(|i| Expr::Number((r + i) as f64)).collect(),
                     type_args: vec![],
@@ -177,6 +180,7 @@ fn a_narrow_shape_has_no_constructor_function() {
 
 fn literal_new() -> Expr {
     Expr::New {
+        byte_end: 0,
         class_name: "__AnonShape_descriptor_test".into(),
         args: vec![Expr::Number(1.0), Expr::Number(2.0)],
         type_args: vec![],
@@ -200,6 +204,8 @@ fn added_store(receiver: Expr, key: &str) -> Stmt {
         object: Box::new(receiver),
         property: key.into(),
         value: Box::new(Expr::Number(3.0)),
+        byte_offset: 0,
+        byte_end: 0,
     })
 }
 
@@ -210,9 +216,16 @@ fn assert_literal_width(module: &Module, width: u32) {
         .filter(|l| l.contains("call i64 @js_object_alloc_class_inline_keys_stamped("))
         .collect();
     if allocations.is_empty() {
-        let total =
-            crate::target_layout::inline_alloc_total_size_bytes("aarch64-apple-darwin", width);
-        let packed = crate::target_layout::inline_alloc_gc_packed("aarch64-apple-darwin", width);
+        let total = crate::target_layout::inline_alloc_total_size_bytes(
+            "aarch64-apple-darwin",
+            crate::target_layout::HeaderForm::Meta,
+            width,
+        );
+        let packed = crate::target_layout::inline_alloc_gc_packed(
+            "aarch64-apple-darwin",
+            crate::target_layout::HeaderForm::Meta,
+            width,
+        );
         assert!(
             text.contains("alloc.fast"),
             "fixture must emit a literal birth: {text}"
@@ -245,7 +258,11 @@ fn assert_literal_width(module: &Module, width: u32) {
             "wrong live bound: {}",
             mints[0]
         );
-        let packed = crate::target_layout::inline_alloc_gc_packed("aarch64-apple-darwin", width);
+        let packed = crate::target_layout::inline_alloc_gc_packed(
+            "aarch64-apple-darwin",
+            crate::target_layout::HeaderForm::Meta,
+            width,
+        );
         assert!(
             text.contains(&format!("<i64 {packed}, i64 ")),
             "wide allocation and image size must agree"
@@ -283,6 +300,7 @@ fn born_wide_factory_uses_return_shape_fact() {
     module.functions.push(producer);
     module.init = vec![
         literal_binding(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::FuncRef(2001)),
             args: vec![],
             type_args: vec![],
@@ -462,6 +480,8 @@ fn born_wide_global_binding_and_static_putvalue_key() {
         key: Box::new(Expr::String("z".into())),
         value: Box::new(Expr::Number(3.0)),
         strict: false,
+        byte_offset: 0,
+        byte_end: 0,
     })];
     // HIR globals may be materialized by an earlier pass; assert the capacity
     // evidence directly as well as emitting an ordinary birth of the class.
@@ -490,6 +510,7 @@ fn born_wide_closure_factory_uses_the_same_return_facts() {
             init: Some(producer),
         },
         literal_binding(Expr::Call {
+            byte_end: 0,
             callee: Box::new(Expr::LocalGet(2003)),
             args: vec![],
             type_args: vec![],
@@ -513,6 +534,7 @@ fn consumer_fixture(module: &mut Module, body: Vec<Stmt>) {
 
 fn consume_call(arg: Expr) -> Stmt {
     Stmt::Expr(Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::FuncRef(2004)),
         args: vec![arg],
         type_args: vec![],
@@ -572,6 +594,8 @@ fn born_wide_array_element_evidence() {
             field_writeback: None,
         }),
         literal_binding(Expr::IndexGet {
+            byte_offset: 0,
+            byte_end: 0,
             object: Box::new(Expr::LocalGet(1002)),
             index: Box::new(Expr::Number(0.0)),
         }),
@@ -590,6 +614,8 @@ fn born_wide_array_element_evidence() {
         },
         added_store(
             Expr::IndexGet {
+                byte_offset: 0,
+                byte_end: 0,
                 object: Box::new(Expr::LocalGet(1002)),
                 index: Box::new(Expr::Number(0.0)),
             },

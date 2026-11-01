@@ -28,6 +28,7 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use alloc::closure_allocs_on_this_thread;
+pub use alloc::closure_set_capture_word;
 pub use alloc::{
     closure_alloc_storage, closure_capture_slots_mut, closure_payload_size, js_closure_alloc,
     js_closure_alloc_empty, js_closure_alloc_fixed, js_closure_alloc_init,
@@ -40,7 +41,8 @@ pub use alloc::{
     CLOSURE_CAP_SINGLETON_HIT, CLOSURE_CAP_SINGLETON_MISS, CLOSURE_SHAPE_OFFSET,
 };
 pub(crate) use alloc::{
-    closure_install_boxed_captures, gc_capture_slot_range, singleton_closure_if_cached,
+    closure_install_boxed_captures, closure_set_code_word, gc_capture_slot_range,
+    singleton_closure_if_cached,
 };
 pub use body_call::{call_value, plain_call_receiver, JsThis};
 pub use shape::closure_kind_probe;
@@ -125,3 +127,23 @@ pub(crate) use alloc::{
     test_seed_captured_singleton_closure_cache, test_seed_singleton_closure_cache,
     test_singleton_closure_cache_entry,
 };
+
+/// Extract a raw ClosureHeader pointer from a NaN-boxed f64.
+pub(crate) fn extract_closure_ptr(v: f64) -> *const ClosureHeader {
+    let bits = v.to_bits();
+    let top16 = bits >> 48;
+    // An inline SSO string (0x7FF9) carries characters, not an address: its
+    // masked bits used to reach `is_closure_ptr` as a pointer (#11519).
+    let raw = if (0x7FF8..=0x7FFF).contains(&top16) && top16 != 0x7FF9 {
+        (bits & 0x0000_FFFF_FFFF_FFFF) as usize
+    } else if top16 == 0 {
+        bits as usize
+    } else {
+        return std::ptr::null();
+    };
+    if raw < 0x1000 || !crate::closure::is_closure_ptr(raw) {
+        std::ptr::null()
+    } else {
+        raw as *const ClosureHeader
+    }
+}

@@ -32,6 +32,12 @@ pub struct AppMetadata {
     /// `process.argv[1]` with the script path, matching Node/Bun's argv shape.
     /// It is compiler metadata rather than a user-configurable manifest field.
     pub entry_source_path: Option<String>,
+    /// The module format Node declares for the entry before looking at its
+    /// syntax: `Some(true)` for `.mjs`/`.mts` or a nearest package.json with
+    /// `"type": "module"`, `Some(false)` for `.cjs`/`.cts` or
+    /// `"type": "commonjs"`, `None` when nothing declares one (Node then
+    /// detects the format from module syntax). Set only on the entry module.
+    pub entry_declared_esm: Option<bool>,
     /// Install wrappers of the well-known native providers this program links
     /// (`js_ext_net_nm_install`, …; see `NativeRouting::wrapper_install_hooks`).
     /// Set only on the entry module, whose `main` / dylib initializer calls
@@ -51,6 +57,7 @@ impl Default for AppMetadata {
             app_group: None,
             update_config: None,
             entry_source_path: None,
+            entry_declared_esm: None,
             native_provider_installs: Vec::new(),
         }
     }
@@ -333,6 +340,14 @@ pub struct CompileOptions {
     /// Locals that are namespace imports (`import * as X from "./mod"`).
     /// Codegen uses this to know that `X.foo()` should be dispatched as
     /// a cross-module call rather than an object method call.
+    /// A module that namespace-imports ITSELF (`import * as Mod from
+    /// "./this-module.js"`). Its `@__perry_ns_<prefix>` populator must run
+    /// BEFORE the top-level body, because the body is itself a namespace
+    /// consumer: trails' activesupport does `import * as C from
+    /// "./calculations.js"` and then, at top level, `include(RubyTime, C)`,
+    /// which reads `Object.getOwnPropertyNames(C)`. Populating at the tail left
+    /// that read seeing the global's initial NaN-boxed `undefined`.
+    pub namespace_self_import: bool,
     pub namespace_imports: Vec<String>,
     /// Namespace local -> owning compiled module prefix, before following re-exports.
     pub namespace_source_prefixes: std::collections::HashMap<String, String>,
@@ -539,6 +554,11 @@ pub struct CompileOptions {
     /// `require(absolutePath)` can lazily trigger the module's init. Only
     /// populated for the entry module; empty otherwise.
     pub nextjs_path_init_modules: Vec<(String, String)>,
+    /// The same pairs for the on-demand CommonJS modules of a program that is
+    /// not closed (design CJS_LINK §2.2): registered by one generated
+    /// function the runtime runs at its first path lookup
+    /// (`js_register_path_inits_lazily`), not one by one at startup.
+    pub lazy_path_init_modules: Vec<(String, String)>,
 
     /// Issue #753: sanitized prefixes of modules whose init must NOT
     /// run as part of the entry module's eager init chain. Reachable
@@ -951,7 +971,9 @@ impl ImportedCtor {
 /// Cross-module import context, bundled into a single struct to avoid
 /// adding five more individual parameters to every compile_* function.
 /// Built once in `compile_module` from `CompileOptions`.
-pub(crate) struct CrossModuleCtx {
+pub(crate) struct CrossModuleCtx<'a> {
+    pub numeric_order_functions: &'a [perry_hir::Function],
+    pub numeric_order_closures: &'a [(u32, perry_hir::Expr)],
     /// Closure regions of the splitter (`split_regions`): one body each,
     /// typed by the parameter types its only caller proved.
     pub region_closures: std::collections::HashSet<u32>,
@@ -972,6 +994,8 @@ pub(crate) struct CrossModuleCtx {
     /// The class and method tables inverted (`class_hierarchy`). Set once
     /// both tables are final, before any function body is lowered.
     pub class_hierarchy: super::class_hierarchy::ClassHierarchy,
+    /// See `CompileOptions::namespace_self_import`.
+    pub namespace_self_import: bool,
     pub namespace_imports: std::collections::HashSet<String>,
     pub namespace_source_prefixes: std::collections::HashMap<String, String>,
     /// #7189: `(namespace local, member)` pairs whose member is itself a MODULE
@@ -1444,6 +1468,8 @@ pub(crate) struct CrossModuleCtx {
     /// entry's executable or dylib initializer emits one
     /// `js_register_path_init` per entry.
     pub nextjs_path_init_modules: Vec<(String, String)>,
+    /// See [`CompileOptions::lazy_path_init_modules`].
+    pub lazy_path_init_modules: Vec<(String, String)>,
     /// Issue #753: sanitized prefixes of modules reached only through
     /// dynamic `import()` edges. Their `<prefix>__init` is excluded
     /// from the entry-main eager init call sequence and fires lazily

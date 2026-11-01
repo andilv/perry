@@ -6,11 +6,13 @@ crate::perry_thread_local! {
     /// source. Both pointers are ordinary GC roots and are rewritten on a
     /// moving collection. The source length guards the only in-place string
     /// mutation Perry permits; equal-length string contents are immutable.
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static PARSE_STRING_CACHE: RefCell<Option<ParseStringCacheEntry>> = const { RefCell::new(None) };
 
     /// A bounded construction template for repeated parses of the same small
     /// object source. It owns only immutable strings, a canonical key shape,
     /// and inline scalar bits; every mutable object/array is born afresh.
+    #[cfg_attr(target_vendor = "apple", link_section = "__DATA,__perry_json")]
     static PARSE_OBJECT_TEMPLATE: RefCell<Option<ParseObjectTemplate>> = const { RefCell::new(None) };
 }
 
@@ -182,7 +184,8 @@ pub(crate) unsafe fn remember_parse_object_template(
     // The plan rebuilds fixed slots under one layout. A record with an
     // overflow (§3.4) keeps keys and values in that table, which no plan
     // describes, so such a record is never remembered.
-    if header.obj_type != crate::gc::GC_TYPE_OBJECT || crate::object::overflow::has_overflow(object)
+    if crate::gc_type_is_not_object!(header.obj_type)
+        || crate::object::overflow::has_overflow(object)
     {
         return;
     }
@@ -190,10 +193,9 @@ pub(crate) unsafe fn remember_parse_object_template(
     if len > PARSE_OBJECT_TEMPLATE_MAX_FIELDS {
         return;
     }
-    let fields = object
-        .cast::<u8>()
-        .add(std::mem::size_of::<crate::object::ObjectHeader>())
-        .cast::<JSValue>();
+    // A1_UNPROVEN: record-first: no proof of the object form at this slot read (kind-A/B question for S0f).
+    let fields =
+        crate::meta_slots_of!(crate::meta_obj_runtime_born!(object as *mut _)).cast::<JSValue>();
     let mut values = [EMPTY_PARSE_TEMPLATE_VALUE; PARSE_OBJECT_TEMPLATE_MAX_FIELDS];
     for (index, slot) in values[..len].iter_mut().enumerate() {
         let Some(value) = parse_template_value(*fields.add(index)) else {

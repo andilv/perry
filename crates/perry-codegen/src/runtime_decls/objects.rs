@@ -332,6 +332,38 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         DOUBLE,
         &[DOUBLE, DOUBLE],
     );
+    for &(source, properties) in perry_dispatch::native_callable_exports::CALLABLE_EXPORT_TABLE {
+        for &property in properties {
+            if let Some(symbol) =
+                perry_dispatch::native_callable_exports::export_value_symbol(source, property)
+            {
+                module.declare_function(&symbol, DOUBLE, &[I32]);
+            }
+        }
+    }
+    for entry in perry_api_manifest::API_MANIFEST {
+        if entry.name != "default"
+            && perry_api_manifest::is_node_core_module(entry.module)
+            && perry_api_manifest::module_has_public_named_export(entry.module, entry.name)
+            && perry_dispatch::native_callable_exports::export_bucket(entry.module).is_some()
+            && perry_dispatch::native_callable_exports::export_value_symbol(
+                entry.module,
+                entry.name,
+            )
+            .is_none()
+        {
+            let symbol = perry_dispatch::native_callable_exports::constant_value_symbol(
+                entry.module,
+                entry.name,
+            );
+            module.declare_function(&symbol, DOUBLE, &[I32]);
+        }
+    }
+    for (_, _, exports) in perry_dispatch::native_submodule_exports::SUBMODULE_EXPORTS {
+        for (_, symbol) in *exports {
+            module.declare_function(symbol, DOUBLE, &[I32]);
+        }
+    }
     // Issue #894: materialize a NATIVE_MODULE_CLASS_ID-tagged namespace
     // object for `Expr::NativeModuleRef` when it reaches the value-form
     // fallback path (the require-call-result-then-member-access shape
@@ -478,6 +510,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // Next.js wall 54 (part 2): register a Deferred module's `__init` address by
     // path so a runtime `require(absolutePath)` can trigger its lazy init.
     module.declare_function("js_register_path_init", VOID, &[PTR, I64, I64]);
+    module.declare_function("js_register_path_inits_lazily", VOID, &[PTR]);
     // Array alloc variant that pre-sets length to N (for exclude_keys array filling).
     module.declare_function("js_array_alloc_with_length", I64, &[I32]);
     // Unchecked array set (plain array, no buffer/Set/Map dispatch).

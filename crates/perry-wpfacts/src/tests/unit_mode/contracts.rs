@@ -299,9 +299,27 @@ pub(super) fn a_broken_namespace_field_function_resolves_only_the_units_that_see
     // function read through a value contract is its stand-in, not ⊤: the
     // units of `a` holding `util.get`, #u1 145 -> 181 and #u3 37 -> 62,
     // solve its contract and its escaped object; `b`, `c`, `m` and round 2
-    // unchanged) -> the pin below.
+    // unchanged) -> [709, 779, 956, 504, 428]; for DECISIONS 210 (a
+    // published function's properties leave with it but its `prototype`,
+    // whose template no longer escapes) -> [695, 772, 949, 497, 428]; for
+    // the intrinsic member descriptions and the static rule (a store into ⊤
+    // writes its key on every builtin prototype, the builtin namespaces'
+    // lookups reach `Object.prototype`; the unit boundary's stand-in store
+    // writes none, a stand-in class's prototype defines its contract's
+    // methods) -> the pin below.
     assert!(pf.round_work[1] < w("a.ts") + w("m.ts") + w("b.ts") + w("c.ts"));
-    assert_eq!(pf.round_work, [709, 779, 956, 504, 428], "{:?}", pf.units);
+    // DEC221: unknown construction sinks its fresh result, without the
+    // extra template-wide escape: the same five rounds do less work
+    // ([754, 879, 986, 543, 467]). SEH: a join of two descriptions keeps what
+    // each says of a field (`ClassContract::join`) where it made the field ⊤:
+    // round 2 builds what the readers held as ⊤, and the fixpoint ends one
+    // round earlier. A method called on a marker with values beside it
+    // reads its key's reach (`method_on`): [754, 1090, 948, 42] -> the pin
+    // below. DCE: a read of a key the object surely holds takes its chain
+    // through a relay that drops the chain end's `undefined`
+    // (`Cons::Defined`): a relay node for the read's own builtin members
+    // and a rule on the chain node, [758, 1094, 952, 42] -> the pin below.
+    assert_eq!(pf.round_work, [762, 1104, 960, 42], "{:?}", pf.units);
 }
 
 #[test]
@@ -381,9 +399,13 @@ pub(super) fn a_unit_over_the_bound_is_not_solved_again() {
         .filter(|(q, s)| crate::decl_units::module_of(q) == "o.ts" && !s.aborted)
         .map(|(_, s)| s.work)
         .sum();
-    assert_eq!(
-        pf.round_work[1],
-        module_work(&pf, "a.ts") + module_work(&pf, "m.ts") + small_o,
+    // Since the builtin namespaces have a prototype chain (`Map`'s lookups
+    // reach `Object.prototype`) a third round solves `a` and `m` again; no
+    // later round solves the unit of `o` over the bound. (The units report
+    // their last solve, so each later round is at most their sum.)
+    let small = module_work(&pf, "a.ts") + module_work(&pf, "m.ts") + small_o;
+    assert!(
+        pf.round_work[1..].iter().all(|&w| w <= small),
         "{:?} {:?}",
         pf.round_work,
         pf.units

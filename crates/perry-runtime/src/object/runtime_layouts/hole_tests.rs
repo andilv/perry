@@ -100,8 +100,9 @@ runtime_layout!(
     link_section = "perry_layouts"
 )]
 static mut CLASS_HOLEY: PerryLayoutDesc = PerryLayoutDesc {
+    image_keys: crate::object::image_keys::image_key_list!(HOLEY::KEYS),
     shape_id: 0,
-    _layout_pad: 0,
+    gc_plan: 0,
     family: 0x41574203,
     variant: 0,
     kind: 0,
@@ -117,6 +118,8 @@ static mut CLASS_HOLEY: PerryLayoutDesc = PerryLayoutDesc {
     class_id: 60895,
     parent_class_id: 0,
     methods: std::ptr::null(),
+    gc_header_word: crate::object::layout_desc::layout_gc_header_word(HOLEY::SLOT_COUNT as u32),
+    _tail_pad: [0; 32],
 };
 
 runtime_layout!(
@@ -136,8 +139,9 @@ runtime_layout!(
     link_section = "perry_literal_layouts"
 )]
 static mut LITERAL_FAMILY: PerryLayoutDesc = PerryLayoutDesc {
+    image_keys: crate::object::image_keys::image_key_list!(LITERAL_OPTIONAL::KEYS),
     shape_id: 0,
-    _layout_pad: 0,
+    gc_plan: 0,
     family: 0x7f000016,
     variant: 0,
     kind: 0,
@@ -153,6 +157,10 @@ static mut LITERAL_FAMILY: PerryLayoutDesc = PerryLayoutDesc {
     class_id: 0,
     parent_class_id: 0,
     methods: std::ptr::null(),
+    gc_header_word: crate::object::layout_desc::layout_gc_header_word(
+        LITERAL_OPTIONAL::SLOT_COUNT as u32,
+    ),
+    _tail_pad: [0; 32],
 };
 
 const TRUE: u64 = crate::value::TAG_TRUE;
@@ -652,6 +660,11 @@ fn classless_optional_family_keeps_shape_and_routes_unknown_keys_to_overflow() {
     });
     ordinary.with_const_ptr(|obj: *const ObjectHeader| unsafe {
         assert!(crate::object::layout_desc::family_desc_of(obj).is_none());
+        assert_eq!(
+            crate::object::layout_desc::family_own_key(obj, b"holes_a"),
+            None,
+            "an ordinary classless descriptor is not a family proof"
+        );
         assert!(!crate::object::layout_desc::is_family_layout_word(
             (*obj).parent_class_id
         ));
@@ -674,6 +687,11 @@ fn classless_optional_family_keeps_shape_and_routes_unknown_keys_to_overflow() {
         assert_eq!(
             crate::object::layout_desc::family_own_key(obj, b"holes_a"),
             Some(Some((0, 0)))
+        );
+        assert_eq!(
+            crate::object::layout_desc::family_own_key(obj, b"not_in_family"),
+            Some(None),
+            "a family proof can answer absence without an ordinary probe"
         );
         js_object_set_field_by_name(obj, H_A.string, 17.0);
         js_object_set_field_by_name(obj, H_B.string, 23.0);
@@ -810,8 +828,9 @@ mod first_birth {
         link_section = "perry_literal_layouts"
     )]
     static mut LITERAL: PerryLayoutDesc = PerryLayoutDesc {
+        image_keys: crate::object::image_keys::image_key_list!(KEYS),
         shape_id: 0,
-        _layout_pad: 0,
+        gc_plan: 0,
         family: 0x7f000015,
         variant: 0,
         kind: 0,
@@ -827,6 +846,8 @@ mod first_birth {
         class_id: 0,
         parent_class_id: 0,
         methods: std::ptr::null(),
+        gc_header_word: crate::object::layout_desc::layout_gc_header_word(2),
+        _tail_pad: [0; 32],
     };
 
     #[test]

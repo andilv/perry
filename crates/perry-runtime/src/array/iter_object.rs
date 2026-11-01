@@ -173,7 +173,7 @@ unsafe fn receiver_obj_type(arr: *const ArrayHeader) -> u8 {
 }
 
 unsafe fn fs_dir_entries_iter_obj(arr: *const ArrayHeader, kind: i32) -> Option<i64> {
-    if kind != KIND_ENTRIES || receiver_obj_type(arr) != crate::gc::GC_TYPE_OBJECT {
+    if kind != KIND_ENTRIES || crate::gc_type_is_not_object!(receiver_obj_type(arr)) {
         return None;
     }
     let obj = arr as *const crate::object::ObjectHeader;
@@ -263,9 +263,9 @@ fn typed_array_iter_arr(arr: *const ArrayHeader) -> *const ArrayHeader {
         return arr;
     }
     let addr = arr as usize;
-    if crate::typedarray::lookup_typed_array_kind(addr).is_some() {
-        return crate::typedarray::typed_array_to_array(
-            arr as *const crate::typedarray::TypedArrayHeader,
+    if crate::typedarray_hook_slots::lookup_typed_array_kind(addr).is_some() {
+        return crate::typedarray_hook_slots::typed_array_to_array(
+            arr as *const crate::typedarray_hook_slots::TypedArrayHeader,
         ) as *const ArrayHeader;
     }
     if crate::buffer::is_registered_buffer(addr)
@@ -402,11 +402,11 @@ unsafe fn collection_iter_obj_for_receiver(arr: *const ArrayHeader, kind: u8) ->
     // array and drive it with the standard array iterator object.
     {
         let obj = raw as *mut crate::object::ObjectHeader;
-        if crate::url::search_params::shape_is_url_search_params(obj) {
+        if crate::url_hooks::shape_is_url_search_params(obj) {
             let boxed = match kind {
-                1 => crate::url::js_url_search_params_keys_arr(obj),
-                2 => crate::url::js_url_search_params_entries_arr(obj),
-                _ => crate::url::js_url_search_params_values_arr(obj),
+                1 => crate::url_hooks::url_search_params_keys_arr(obj),
+                2 => crate::url_hooks::url_search_params_entries_arr(obj),
+                _ => crate::url_hooks::url_search_params_values_arr(obj),
             };
             let ptr = (boxed.to_bits() & 0x0000_FFFF_FFFF_FFFF) as *const ArrayHeader;
             if !ptr.is_null() {

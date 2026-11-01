@@ -295,7 +295,7 @@ pub fn check_escapes_in_expr(
         Expr::PropertySet {
             object,
             value,
-            property,
+            property, ..
         } => {
             if let Expr::LocalGet(id) = object.as_ref() {
                 if let Some(class_name) = candidates.get(id) {
@@ -621,14 +621,14 @@ pub fn check_escapes_in_expr(
                 check_escapes_in_expr(a, candidates, classes, escaped);
             }
         }
-        Expr::IndexGet { object, index } => {
+        Expr::IndexGet { object, index , .. } => {
             check_escapes_in_expr(object, candidates, classes, escaped);
             check_escapes_in_expr(index, candidates, classes, escaped);
         }
         Expr::IndexSet {
             object,
             index,
-            value,
+            value, ..
         } => {
             check_escapes_in_expr(object, candidates, classes, escaped);
             check_escapes_in_expr(index, candidates, classes, escaped);

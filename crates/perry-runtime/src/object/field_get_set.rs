@@ -63,7 +63,7 @@ pub(crate) unsafe fn fetch_subclass_handle_id(obj: usize) -> Option<i64> {
     let Some(gc_header) = crate::value::addr_class::try_read_gc_header(obj) else {
         return None;
     };
-    if gc_header.obj_type != crate::gc::GC_TYPE_OBJECT {
+    if crate::gc_type_is_not_object!(gc_header.obj_type) {
         return None;
     }
     // #7498: the key allocation below can trigger a copying minor, which moves
@@ -165,7 +165,7 @@ pub(crate) unsafe fn temporal_subclass_cell(obj: usize) -> Option<f64> {
         return None;
     }
     let gc_header = (obj as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    if (*gc_header).obj_type != crate::gc::GC_TYPE_OBJECT {
+    if crate::gc_type_is_not_object!((*gc_header).obj_type) {
         return None;
     }
     // #7498: same shape as `fetch_subclass_handle_id` above — `obj` must not
@@ -268,10 +268,14 @@ pub(crate) struct FieldLookupCaches {
 }
 
 impl FieldLookupCaches {
-    pub(crate) fn new() -> Self {
-        FieldLookupCaches {
-            field_cache: std::cell::UnsafeCell::new([(0usize, 0u32, 0u32); FIELD_CACHE_SIZE]),
-        }
+    /// Initializes the caches in place: an empty entry is `(0, 0, 0)`, so a
+    /// zero-filled slot already holds the empty cache and nothing is written.
+    ///
+    /// # Safety
+    ///
+    /// `slot` is valid for writes and zero-filled.
+    pub(crate) unsafe fn init_in(slot: *mut Self) {
+        let _ = slot;
     }
 }
 
@@ -329,13 +333,12 @@ pub(crate) use has_property::{
 pub use has_property::{js_in_operator, js_object_has_property};
 #[cfg(test)]
 pub(crate) use ic_miss::get_field_miss;
-#[cfg(feature = "regex-engine")]
 pub(crate) use ic_miss::intrinsic_private_add;
 #[cfg(feature = "regex-engine")]
 pub(crate) use ic_miss::intrinsic_private_set;
-#[cfg(test)]
+#[cfg(any(test, target_os = "wasi"))]
 pub(crate) use ic_miss::private_lexical_brand_depth;
-#[cfg(test)]
+#[cfg(any(test, target_os = "wasi"))]
 pub(crate) use ic_miss::private_member_access_hints_depth;
 pub(crate) use ic_miss::{
     bind_primitive_proto_method_static, cannot_be_private_member_name, class_evaluation_of,
@@ -458,3 +461,8 @@ mod buffer_ic_miss_tests {
 
 #[cfg(any(test, feature = "regex-engine"))]
 pub(crate) mod runtime_store_site;
+
+#[cfg(any(test, target_os = "wasi"))]
+pub(crate) use ic_miss::{
+    private_lexical_brand_restore_depth, private_member_access_hints_restore_depth,
+};

@@ -162,6 +162,7 @@ pub(crate) unsafe fn fs_open_sync_result(
 
 /// Register an opened file under a fresh synthetic fd.
 fn register_opened_file(file: fs::File, path_str: &str, append_mode: bool) -> i32 {
+    crate::fs_hook_slots::install_fd();
     let fd = allocate_synthetic_fd();
     FD_REGISTRY.with(|r| {
         r.borrow_mut().insert(fd, file);
@@ -852,6 +853,7 @@ pub extern "C" fn js_fs_statfs_sync_options(path_value: f64, options_value: f64)
 }
 
 pub(crate) fn alloc_dir_state(entries: Vec<f64>) -> usize {
+    crate::fs::install_handle_roots();
     let id = NEXT_DIR_ID.with(|n| {
         let mut n = n.borrow_mut();
         let id = *n;
@@ -996,7 +998,7 @@ pub(crate) fn dir_read_next(id: usize) -> f64 {
 
 pub(crate) fn make_dir_method(id: usize, func: *const crate::closure::JsFunctionInfo) -> f64 {
     let closure = crate::closure::js_closure_alloc(func, 1);
-    crate::closure::js_closure_set_capture_ptr(closure, 0, id as i64);
+    crate::closure::closure_set_capture_word(closure, 0, id as i64);
     f64::from_bits(crate::value::JSValue::pointer(closure as *const u8).bits())
 }
 
@@ -1070,7 +1072,7 @@ fn dir_pending_read_promise(id: usize, result: Result<Option<f64>, f64>) -> f64 
         crate::fn_info!(dir_finish_read_promise_impl, 0; with_declared(0)),
         4,
     );
-    crate::closure::js_closure_set_capture_ptr(closure, 0, id as i64);
+    crate::closure::closure_set_capture_word(closure, 0, id as i64);
     crate::closure::js_closure_set_capture_ptr(closure, 1, promise as i64);
     crate::closure::js_closure_set_capture_f64(closure, 2, value);
     crate::closure::js_closure_set_capture_f64(closure, 3, if is_error { 1.0 } else { 0.0 });
@@ -1132,7 +1134,7 @@ fn dir_schedule_read_callback(
         crate::fn_info!(dir_finish_read_callback_impl, 0; with_declared(0)),
         4,
     );
-    crate::closure::js_closure_set_capture_ptr(closure, 0, id as i64);
+    crate::closure::closure_set_capture_word(closure, 0, id as i64);
     crate::closure::js_closure_set_capture_ptr(closure, 1, callback as i64);
     crate::closure::js_closure_set_capture_f64(closure, 2, value);
     crate::closure::js_closure_set_capture_f64(closure, 3, kind);
@@ -1224,7 +1226,7 @@ fn dir_iterator_method(
     func: *const crate::closure::JsFunctionInfo,
 ) -> f64 {
     let closure = crate::closure::js_closure_alloc(func, 2);
-    crate::closure::js_closure_set_capture_ptr(closure, 0, id as i64);
+    crate::closure::closure_set_capture_word(closure, 0, id as i64);
     crate::closure::js_closure_set_capture_f64(closure, 1, self_value);
     f64::from_bits(crate::value::JSValue::pointer(closure as *const u8).bits())
 }

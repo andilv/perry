@@ -16,6 +16,7 @@ mod scalar_own_read_tests;
 
 fn ir_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -27,6 +28,7 @@ fn ir_opts() -> CompileOptions {
         non_entry_module_prefixes: Vec::new(),
         thread_literal_module_prefixes: Vec::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         import_function_prefixes: std::collections::HashMap::new(),
         import_function_ffi_aliases: std::collections::HashMap::new(),
         import_function_origin_names: std::collections::HashMap::new(),
@@ -168,6 +170,7 @@ fn length_plus_one(object: Expr) -> Expr {
     Expr::Binary {
         op: BinaryOp::Add,
         left: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(object),
             property: "length".to_string(),
             byte_offset: 0,
@@ -669,7 +672,9 @@ fn typed_param(id: u32, name: &str, ty: Type) -> Param {
 /// `recv.charCodeAt(index)`
 fn char_code_at(recv: Expr, index: Expr) -> Expr {
     Expr::Call {
+        byte_end: 0,
         callee: Box::new(Expr::PropertyGet {
+            byte_end: 0,
             object: Box::new(recv),
             property: "charCodeAt".to_string(),
             byte_offset: 0,
@@ -919,6 +924,8 @@ mod symbol_keyed_element_reads {
                     ty: Type::Any,
                     mutable: false,
                     init: Some(Expr::IndexGet {
+                        byte_offset: 0,
+                        byte_end: 0,
                         object: Box::new(Expr::LocalGet(1)),
                         index: Box::new(Expr::LocalGet(2)),
                     }),
@@ -977,6 +984,8 @@ mod symbol_keyed_element_reads {
                     ty: Type::Any,
                     mutable: false,
                     init: Some(Expr::IndexGet {
+                        byte_offset: 0,
+                        byte_end: 0,
                         object: Box::new(Expr::LocalGet(1)),
                         index: Box::new(Expr::LocalGet(2)),
                     }),
@@ -999,3 +1008,6 @@ mod symbol_keyed_element_reads {
         );
     }
 }
+
+#[path = "number_result_tests.rs"]
+mod number_result_tests;

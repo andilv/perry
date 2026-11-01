@@ -21,6 +21,7 @@ use perry_hir::{BinaryOp, CompareOp, Expr, Function, Module, ModuleInitKind, Par
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
+        namespace_self_import: false,
         static_shape_ids: Vec::new(),
         program_layout_ordinals: Default::default(),
         program_class_shape_ids: Default::default(),
@@ -81,6 +82,7 @@ fn empty_opts() -> CompileOptions {
         namespace_entries: Vec::new(),
         dynamic_import_path_to_prefix: std::collections::HashMap::new(),
         nextjs_path_init_modules: Vec::new(),
+        lazy_path_init_modules: Vec::new(),
         deferred_module_prefixes: Default::default(),
         module_init_deps: Vec::new(),
         is_dynamic_import_target: false,
@@ -119,6 +121,7 @@ fn ternary_recursive_fn(id: u32, name: &str, base: Expr) -> Function {
             }),
             then_expr: Box::new(base),
             else_expr: Box::new(Expr::Call {
+                byte_end: 0,
                 callee: Box::new(Expr::FuncRef(id)),
                 args: vec![Expr::Binary {
                     op: BinaryOp::Sub,

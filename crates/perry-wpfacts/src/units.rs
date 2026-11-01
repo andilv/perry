@@ -66,6 +66,13 @@ pub(crate) struct ClassContract {
     /// a unit holding its stand-in forwards it as an open class's (the next
     /// unit holds its stand-in too, its constructions publish there).
     pub forwards: bool,
+    /// DECISIONS 210: the layout of a constructor function's instances
+    /// (`new <f>`, `TmplKind::FnInst`): `ctor_fn` is the function's own
+    /// contract. A reader's `new` of the function constructs this layout
+    /// (`Model::foreign_ctor`) and publishes what it passes
+    /// (`ProgramFacts::ctor_runs_out`); the owner constructs it with the
+    /// union of every unit's arguments (`Gen::published_ctors`).
+    pub fn_inst: bool,
     /// The prototype methods with a function contract (key, contract), and
     /// the constructor's (DECISIONS 57): their receiver is a contract
     /// parameter, so another unit's subclass instance can run them.
@@ -78,7 +85,14 @@ pub(crate) struct ClassContract {
     /// the same unit does.
     pub birth_keys: Vec<String>,
     pub definite: Vec<String>,
+    /// The birth keys reserved for a constructor store that are not
+    /// definite (`Template::reserved`): known slots, present once stored.
+    pub reserved: Vec<String>,
     pub ctor_leaks: bool,
+    /// Its constructor, or one up its chain, may return an object other than
+    /// `this` (`return expr`): a reader's `new` then yields that value, not
+    /// the class's instance, which its own unit alone cannot name.
+    pub ctor_returns: bool,
     /// The primitive kinds the published binding may hold beside the
     /// class (DECISIONS 115): a nested class whose members name it binds
     /// itself through a one-element cell that holds `undefined` until the
@@ -215,11 +229,27 @@ pub(crate) struct HandOverArg {
 
 #[derive(Clone, Debug, PartialEq, Hash)]
 pub(crate) struct FnContract {
+    /// Emitted body identity, independent of this analysis unit's stand-in.
+    /// The defining source path prevents equal HIR ids in different modules
+    /// from becoming the same callable body. None for synthesized code.
+    pub compiled_body: Option<(String, u32, bool)>,
     pub name: String,
     /// DECISIONS 165: a method of a published class (its owner's prototype
     /// holds it): a unit calling it publishes what it passes
     /// (`ProgramFacts::method_runs_out`), however it got the function.
     pub method: bool,
+    /// DECISIONS 224: a function of its unit published to a known closed
+    /// callee (DECISIONS 223): as for a method, a unit calling it publishes
+    /// what it passes (`ProgramFacts::method_args_out`), however it got the
+    /// function.
+    pub callable: bool,
+    /// DECISIONS 212: the published class (its display) whose instances a
+    /// method runs on, when there is one: a unit holding the method as a
+    /// value (returned, read from a field, an array element or the
+    /// prototype) admits those as receivers and publishes them, as for a
+    /// method call on the class's stand-in (DECISIONS 107). `None` with
+    /// `method`: it admits no receiver (each one is a census report).
+    pub this_class: Option<String>,
     /// Per parameter: what the callee does to the argument itself
     /// (`model::MARK_*`), and to what the argument reaches (its fields,
     /// transitively). Two sets: reading `p.n` and converting it is no
@@ -287,6 +317,108 @@ pub(crate) struct FnContract {
     pub closed: Option<String>,
 }
 
+impl FnContract {
+    /// The function named, not described (DECISIONS 106): its identity,
+    /// and of its body only what makes no claim (every parameter, its
+    /// receiver and its result escape or are unknown). A reader holding it
+    /// calls the function through its owner's entry (`Gen::owner_fn`); with
+    /// no entry it runs this, which is sound.
+    pub(crate) fn named(&self) -> FnContract {
+        use crate::model::MARK_ESCAPE;
+        let n = self.params.len();
+        FnContract {
+            compiled_body: self.compiled_body.clone(),
+            name: self.name.clone(),
+            method: self.method,
+            callable: self.callable,
+            this_class: self.this_class.clone(),
+            params: vec![MARK_ESCAPE; n],
+            reach: vec![MARK_ESCAPE; n],
+            reach_keys: vec![Vec::new(); n],
+            variadic: self.variadic,
+            rest: self.rest,
+            ret: None,
+            ret_params: Vec::new(),
+            ret_reach: Vec::new(),
+            ret_reach_keys: Vec::new(),
+            ret_unknown: true,
+            ret_value: Default::default(),
+            ret_prim: crate::model::prim::ALL,
+            lexical_this: self.lexical_this,
+            this_use: MARK_ESCAPE,
+            this_reach: MARK_ESCAPE,
+            this_stores: None,
+            this_calls: Vec::new(),
+            param_stores: vec![None; n],
+            param_flows: Vec::new(),
+            param_calls: Vec::new(),
+            param_handovers: Vec::new(),
+            param_cells: Vec::new(),
+            closed: self.closed.clone(),
+        }
+    }
+}
+
+/// DECISIONS 106 for what a forwarded copy of another unit's function
+/// holds: every function described inside it whose owner publishes an entry
+/// (`owned`) is named (`FnContract::named`), as the reader takes that entry
+/// by name in any case. Copied whole, a description held the copies its
+/// owner's description held, which held it again: two units whose functions
+/// pass each other's closures (zod's `emitOwnKeys` and the record check it
+/// calls back) nested one more level every round, the contracts grew 4x
+/// per two rounds and the fixpoint never came. Named, a description holds
+/// only its own unit's functions and one level of copies: its size is
+/// bounded by the program's, whatever the rounds.
+pub(crate) fn name_owned_in_fn(fc: &mut FnContract, owned: &dyn Fn(&str) -> bool) {
+    name_owned_in_value(&mut fc.ret_value, owned);
+    for pc in &mut fc.param_calls {
+        for a in &mut pc.args {
+            name_owned_in_value(&mut a.value, owned);
+        }
+    }
+    for fl in &mut fc.param_flows {
+        if let Some(d) = &mut fl.value {
+            name_owned_in_value(&mut d.value, owned);
+        }
+    }
+}
+
+fn name_owned_fns(fns: &mut [FnContract], owned: &dyn Fn(&str) -> bool) {
+    for f in fns {
+        name_owned(f, owned);
+    }
+}
+
+fn name_owned(f: &mut FnContract, owned: &dyn Fn(&str) -> bool) {
+    if owned(&f.name) {
+        *f = f.named();
+    } else {
+        name_owned_in_fn(f, owned);
+    }
+}
+
+fn name_owned_in_value(vc: &mut ValueContract, owned: &dyn Fn(&str) -> bool) {
+    name_owned_fns(&mut vc.fns, owned);
+    for c in vc.layouts.iter_mut().chain(vc.classes.iter_mut()) {
+        name_owned_in_class(c, owned);
+    }
+}
+
+fn name_owned_in_class(c: &mut ClassContract, owned: &dyn Fn(&str) -> bool) {
+    for (_, fs) in &mut c.field_fns {
+        name_owned_fns(fs, owned);
+    }
+    for (_, vc) in c.field_values.iter_mut().chain(c.static_values.iter_mut()) {
+        name_owned_in_value(vc, owned);
+    }
+    for (_, f) in c.static_fns.iter_mut().chain(c.method_fns.iter_mut()) {
+        name_owned(f, owned);
+    }
+    if let Some(f) = &mut c.ctor_fn {
+        name_owned(f, owned);
+    }
+}
+
 /// A published module-scope value binding as its readers see it (design
 /// §11.2 "an object contract", generalized to every binding another
 /// declaration unit reads, §12): the layouts it may hold (literal-shape
@@ -295,12 +427,50 @@ pub(crate) struct FnContract {
 /// may hold, and whether it may hold an unknown value (⊤ to the reader).
 /// The layouts' fields hold unknown values for the reader; a store or an
 /// opening operation through them is the reader's census report.
+/// Dump-only: why a value contract is `unknown`, the first reason and the
+/// unit that published it (stamped when the dump is on). It takes no part in
+/// equality or hashing, so rounds and fingerprints are those of a run without
+/// it.
+#[derive(Clone, Default)]
+pub(crate) struct Why(pub Option<(&'static str, Option<std::sync::Arc<str>>)>);
+
+impl PartialEq for Why {
+    fn eq(&self, _: &Why) -> bool {
+        true
+    }
+}
+
+impl std::hash::Hash for Why {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+impl std::fmt::Debug for Why {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl Why {
+    /// The smaller of the two (reason, unit), so a join does not depend on
+    /// the order the units are folded in.
+    fn join(&mut self, o: &Why) {
+        let key = |w: &Why| w.0.as_ref().map(|(r, u)| (*r, u.clone()));
+        match (key(self), key(o)) {
+            (None, Some(_)) => self.0 = o.0.clone(),
+            (Some(a), Some(b)) if b < a => self.0 = o.0.clone(),
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Hash)]
 pub(crate) struct ValueContract {
     pub layouts: Vec<ClassContract>,
     pub classes: Vec<ClassContract>,
     pub fns: Vec<FnContract>,
     pub unknown: bool,
+    /// Why it is unknown (dump only, see `Why`).
+    pub why: Why,
     /// The runtime-owned objects it may hold (`Model::named_shared`), one
     /// object for the whole program: the reader holds them as well.
     pub shared: Vec<crate::model::Shared>,
@@ -316,6 +486,7 @@ pub(crate) struct ValueContract {
     /// hold, by name as `arrays`: their elements are cell `arr:<name>`; a
     /// reader's stand-in is a container of its own kind.
     pub boxes: Vec<String>,
+    pub indexed_owners: Vec<crate::bindings::IndexedOwner>,
 }
 
 /// Keeps the prefix `a` and `b` share.
@@ -369,7 +540,14 @@ impl FnContract {
     /// unknown result only grow; the result layouts grow, and a ⊤ result
     /// (`None`) absorbs them; the receiver is unused only if both say so.
     pub(crate) fn join(&mut self, o: &FnContract) {
+        if self.compiled_body != o.compiled_body {
+            self.compiled_body = None;
+        }
         self.method |= o.method;
+        self.callable |= o.callable;
+        if self.this_class != o.this_class {
+            self.this_class = None;
+        }
         for (v, w) in [(&mut self.params, &o.params), (&mut self.reach, &o.reach)] {
             if v.len() < w.len() {
                 v.resize(w.len(), 0);
@@ -482,6 +660,84 @@ enum StaticMember {
     Top,
 }
 
+/// What a reader builds of field `k` of layout `c` (`Gen::stand_in_class`):
+/// its typed arrays, its nested layouts and a value contract, each it
+/// has (a join may give several, `ClassContract::join`); else its field
+/// functions; else its facts. Empty: `c` has no such field.
+#[derive(Debug, PartialEq)]
+pub(crate) enum FieldView<'c> {
+    Ta(Option<u8>, u16),
+    Lay(Vec<String>, bool),
+    Val(&'c ValueContract),
+    Fns(&'c Vec<FnContract>),
+    Plain(&'c crate::derive::FieldFacts),
+}
+
+pub(crate) fn field_views<'c>(c: &'c ClassContract, k: &str) -> Vec<FieldView<'c>> {
+    let mut v = Vec::new();
+    if let Some((_, e, p)) = c.field_tas.iter().find(|(q, _, _)| q == k) {
+        v.push(FieldView::Ta(*e, *p));
+    }
+    if let Some((_, ds, p)) = c.field_layouts.iter().find(|(q, _, _)| q == k) {
+        v.push(FieldView::Lay(ds.clone(), *p));
+    }
+    if let Some((_, x)) = c.field_values.iter().find(|(q, _)| q == k) {
+        v.push(FieldView::Val(x));
+    }
+    if !v.is_empty() {
+        return v;
+    }
+    if let Some((_, fs)) = c.field_fns.iter().find(|(q, _)| q == k) {
+        return vec![FieldView::Fns(fs)];
+    }
+    c.facts
+        .fields
+        .iter()
+        .find(|f| f.key == k)
+        .map(FieldView::Plain)
+        .into_iter()
+        .collect()
+}
+
+/// A class's field holding only its own instances (and primitives,
+/// DECISIONS 110): the reader's instance of its stand-in.
+fn own_instances(c: &ClassContract, f: &crate::derive::FieldFacts) -> bool {
+    let k = &f.kind;
+    !c.literal_shape
+        && f.data_field
+        && !k.top
+        && k.funcs == 0
+        && k.builtin_objs == 0
+        && !k.objs.is_empty()
+        && k.objs.iter().all(|d| *d == c.display)
+}
+
+/// A field described by its facts alone, as a value contract: the
+/// primitives a data field holds (DECISIONS 74; `undefined` before a field
+/// not definite exists), else an unknown value (its owner sank it).
+fn plain_value(f: &crate::derive::FieldFacts) -> ValueContract {
+    use crate::model::prim;
+    let k = &f.kind;
+    if f.data_field
+        && !k.top
+        && k.objs.is_empty()
+        && k.funcs == 0
+        && k.builtin_objs == 0
+        && k.prims != 0
+    {
+        let undef = if f.definite { 0 } else { prim::UNDEF };
+        return ValueContract {
+            prim: k.prims | undef,
+            ..Default::default()
+        };
+    }
+    ValueContract {
+        unknown: true,
+        prim: prim::ALL,
+        ..Default::default()
+    }
+}
+
 impl ClassContract {
     /// The join of two descriptions of one layout or class (by `display`;
     /// its name, class id, shape and native parent are its identity):
@@ -491,22 +747,100 @@ impl ClassContract {
     /// value; a field holds contract functions only where both say so;
     /// open keys and open statics only grow.
     pub(crate) fn join(&mut self, o: &ClassContract) {
-        // Field functions: a field both describe holds the union of their
-        // functions; a field one side's facts have without field functions
-        // holds unknown values, so it has none in the join.
-        let plain = |c: &ClassContract, k: &str| {
-            c.facts.fields.iter().any(|f| f.key == k) && !c.field_fns.iter().any(|(q, _)| q == k)
-        };
-        let mut field_fns: Vec<(String, Vec<FnContract>)> = Vec::new();
-        for (k, fs) in self.field_fns.iter().chain(o.field_fns.iter()) {
-            if plain(self, k) || plain(o, k) {
-                continue;
-            }
-            match field_fns.iter_mut().find(|(q, _)| q == k) {
-                Some((_, v)) => join_keyed(v, fs, |f| f.name.clone(), FnContract::join),
-                None => field_fns.push((k.clone(), fs.clone())),
+        // Fields: each side's description of a field is what its reader
+        // builds of it (`field_view`, `Gen::stand_in_class`). A field both
+        // describe the same way keeps that description, joined: the union
+        // of their field functions or nested layouts (§18.7, primitives too
+        // if either says so), the join of their value contracts (DECISIONS
+        // 88), their typed arrays (DECISIONS 126; an element kind the two
+        // disagree on is none). A field they describe differently holds what
+        // each says: the reader builds every description given for it, field
+        // functions and plain facts as a value contract (`plain_value`). The
+        // join makes no unknown value of a field: what an owner described
+        // it did not sink, so a reader finding ⊤ there would store past its
+        // owner (a store into another unit's literal read back through a
+        // result: the reader's `r.v = ..` never reached `Box.v`).
+        let mut keys: Vec<&String> = Vec::new();
+        for k in [self, o].into_iter().flat_map(|c| {
+            c.facts
+                .fields
+                .iter()
+                .map(|f| &f.key)
+                .chain(c.field_fns.iter().map(|(k, _)| k))
+                .chain(c.field_layouts.iter().map(|(k, _, _)| k))
+                .chain(c.field_values.iter().map(|(k, _)| k))
+                .chain(c.field_tas.iter().map(|(k, _, _)| k))
+        }) {
+            if !keys.contains(&k) {
+                keys.push(k);
             }
         }
+        let mut field_fns: Vec<(String, Vec<FnContract>)> = Vec::new();
+        let mut field_layouts: Vec<(String, Vec<String>, bool)> = Vec::new();
+        let mut field_values: Vec<(String, ValueContract)> = Vec::new();
+        let mut field_tas: Vec<(String, Option<u8>, u16)> = Vec::new();
+        for k in keys {
+            let views: Vec<(&ClassContract, FieldView<'_>)> = [&*self, o]
+                .into_iter()
+                .flat_map(|c| field_views(c, k).into_iter().map(move |v| (c, v)))
+                .collect();
+            if views.iter().all(|(_, v)| matches!(v, FieldView::Plain(_))) {
+                continue;
+            }
+            let fns_only = views.iter().all(|(_, v)| matches!(v, FieldView::Fns(_)));
+            for (c, v) in views {
+                let v = match v {
+                    FieldView::Plain(f) if own_instances(c, f) => {
+                        FieldView::Lay(vec![c.display.clone()], f.kind.prims != 0)
+                    }
+                    v => v,
+                };
+                match v {
+                    FieldView::Fns(fs) if fns_only => {
+                        match field_fns.iter_mut().find(|(q, _)| q == k) {
+                            Some((_, x)) => join_keyed(x, fs, |f| f.name.clone(), FnContract::join),
+                            None => field_fns.push((k.clone(), fs.clone())),
+                        }
+                    }
+                    FieldView::Lay(ds, p) => {
+                        match field_layouts.iter_mut().find(|(q, _, _)| q == k) {
+                            Some((_, x, q)) => {
+                                union_into(x, &ds);
+                                *q |= p;
+                            }
+                            None => field_layouts.push((k.clone(), ds, p)),
+                        }
+                    }
+                    FieldView::Ta(e, p) => match field_tas.iter_mut().find(|(q, _, _)| q == k) {
+                        Some((_, f, q)) => {
+                            if *f != e {
+                                *f = None;
+                            }
+                            *q |= p;
+                        }
+                        None => field_tas.push((k.clone(), e, p)),
+                    },
+                    v => {
+                        let vc = match v {
+                            FieldView::Val(vc) => vc.clone(),
+                            FieldView::Fns(fs) => ValueContract {
+                                fns: fs.clone(),
+                                ..Default::default()
+                            },
+                            FieldView::Plain(f) => plain_value(f),
+                            _ => unreachable!("handled above"),
+                        };
+                        match field_values.iter_mut().find(|(q, _)| q == k) {
+                            Some((_, x)) => x.join(&vc),
+                            None => field_values.push((k.clone(), vc)),
+                        }
+                    }
+                }
+            }
+        }
+        field_layouts.sort();
+        field_values.sort_by(|x, y| x.0.cmp(&y.0));
+        field_tas.sort();
         // Statics, as the reader builds them.
         let member = |c: &ClassContract, k: &str| -> Option<StaticMember> {
             let (_, m) = c.statics.iter().find(|(q, _)| q == k)?;
@@ -561,64 +895,6 @@ impl ClassContract {
                 StaticMember::Top => statics.push((k.clone(), None)),
             }
         }
-        // Nested layouts (§18.7), as the field functions: a field both
-        // describe holds the union of their layouts (primitives too if
-        // either says so); a field one side's facts have without them holds
-        // unknown values, so it has none in the join.
-        let plain_l = |c: &ClassContract, k: &str| {
-            c.facts.fields.iter().any(|f| f.key == k)
-                && !c.field_layouts.iter().any(|(q, _, _)| q == k)
-        };
-        let mut field_layouts: Vec<(String, Vec<String>, bool)> = Vec::new();
-        for (k, ds, p) in self.field_layouts.iter().chain(o.field_layouts.iter()) {
-            if plain_l(self, k) || plain_l(o, k) {
-                continue;
-            }
-            match field_layouts.iter_mut().find(|(q, _, _)| q == k) {
-                Some((_, v, q)) => {
-                    union_into(v, ds);
-                    *q |= *p;
-                }
-                None => field_layouts.push((k.clone(), ds.clone(), *p)),
-            }
-        }
-        field_layouts.sort();
-        // Nested values (DECISIONS 94) and typed-array fields, as the
-        // layouts: a field one side's facts have without them holds unknown
-        // values; an element kind the two disagree on is none.
-        let plain_v = |c: &ClassContract, k: &str| {
-            c.facts.fields.iter().any(|f| f.key == k) && !c.field_values.iter().any(|(q, _)| q == k)
-        };
-        let mut field_values: Vec<(String, ValueContract)> = Vec::new();
-        for (k, v) in self.field_values.iter().chain(o.field_values.iter()) {
-            if plain_v(self, k) || plain_v(o, k) {
-                continue;
-            }
-            match field_values.iter_mut().find(|(q, _)| q == k) {
-                Some((_, x)) => x.join(v),
-                None => field_values.push((k.clone(), v.clone())),
-            }
-        }
-        field_values.sort_by(|x, y| x.0.cmp(&y.0));
-        let plain_t = |c: &ClassContract, k: &str| {
-            c.facts.fields.iter().any(|f| f.key == k) && !c.field_tas.iter().any(|(q, _, _)| q == k)
-        };
-        let mut field_tas: Vec<(String, Option<u8>, u16)> = Vec::new();
-        for (k, e, p) in self.field_tas.iter().chain(o.field_tas.iter()) {
-            if plain_t(self, k) || plain_t(o, k) {
-                continue;
-            }
-            match field_tas.iter_mut().find(|(q, _, _)| q == k) {
-                Some((_, f, q)) => {
-                    if f != e {
-                        *f = None;
-                    }
-                    *q |= *p;
-                }
-                None => field_tas.push((k.clone(), *e, *p)),
-            }
-        }
-        field_tas.sort();
         // The methods with a receiver contract and the constructor's
         // (DECISIONS 57): one function joined; two different ones, the
         // reader's stub.
@@ -642,8 +918,19 @@ impl ClassContract {
         // The layout prefix a subclass in another unit takes: the common
         // birth keys, definite in both; a leak in either leaks.
         common_prefix(&mut self.birth_keys, &o.birth_keys);
+        // A known slot whose presence one of them does not know.
+        let known = |c: &Self, k: &String| c.definite.contains(k) || c.reserved.contains(k);
+        let reserved: Vec<String> = self
+            .definite
+            .iter()
+            .chain(self.reserved.iter())
+            .filter(|k| known(o, k) && !(self.definite.contains(k) && o.definite.contains(k)))
+            .cloned()
+            .collect();
         self.definite.retain(|k| o.definite.contains(k));
+        self.reserved = reserved;
         self.ctor_leaks |= o.ctor_leaks;
+        self.ctor_returns |= o.ctor_returns;
         self.binding_prim |= o.binding_prim;
         self.field_values = field_values;
         self.field_tas = field_tas;
@@ -666,6 +953,31 @@ impl ClassContract {
 }
 
 impl ValueContract {
+    /// Unknown, for this reason unless it already has one.
+    pub(crate) fn unknown_because(&mut self, why: &'static str) {
+        self.unknown = true;
+        if self.why.0.is_none() {
+            self.why.0 = Some((why, None));
+        }
+    }
+
+    /// A contract that is unknown for this reason.
+    pub(crate) fn unknown_for(why: &'static str) -> ValueContract {
+        let mut vc = ValueContract {
+            prim: crate::model::prim::ALL,
+            ..Default::default()
+        };
+        vc.unknown_because(why);
+        vc
+    }
+
+    /// Names the publishing unit on a reason that has none yet.
+    pub(crate) fn stamp(&mut self, unit: &std::sync::Arc<str>) {
+        if let Some((_, u @ None)) = &mut self.why.0 {
+            *u = Some(unit.clone());
+        }
+    }
+
     /// The join of two value contracts: the layouts, classes and
     /// functions (each by identity, its description joined), an unknown
     /// value and the primitive kinds only grow.
@@ -684,6 +996,7 @@ impl ValueContract {
         );
         join_keyed(&mut self.fns, &o.fns, |f| f.name.clone(), FnContract::join);
         self.unknown |= o.unknown;
+        self.why.join(&o.why);
         union_into(&mut self.shared, &o.shared);
         self.shared.sort();
         self.prim |= o.prim;
@@ -691,6 +1004,8 @@ impl ValueContract {
         union_into(&mut self.builtins, &o.builtins);
         union_into(&mut self.arrays, &o.arrays);
         union_into(&mut self.boxes, &o.boxes);
+        union_into(&mut self.indexed_owners, &o.indexed_owners);
+        self.indexed_owners.sort();
         self.builtins.sort();
         self.arrays.sort();
         self.boxes.sort();
@@ -765,6 +1080,11 @@ pub(crate) struct Published {
     /// what the running units' calls pass, joined
     /// (`ProgramFacts::method_args_out`).
     pub(crate) method_args: FxHashMap<String, ArgContract>,
+    /// DECISIONS 210: per contract function some unit constructs (`new` of
+    /// its stand-in; contract name), what the constructing units pass,
+    /// joined (`ProgramFacts::ctor_runs_out`): its owner constructs it with
+    /// their union on its own `new <f>` layout and publishes that layout.
+    pub(crate) ctor_runs: FxHashMap<String, ArgContract>,
     /// The argument contracts of closed functions (decision 13), by
     /// (module path, name): the union over every unit's calls.
     pub(crate) args: FxHashMap<(String, String), ArgContract>,

@@ -61,9 +61,24 @@ pub struct FactsField {
     /// known, presence is not. A read pairs the load with the hole compare;
     /// stores stay on the checked route (an add orders the key).
     pub declared: bool,
+    /// A constructor-store reservation code can observe before the
+    /// constructor stores it: the slot is the class's own (codegen's layout),
+    /// presence is not. A read pairs the load with the hole compare; stores
+    /// stay on the checked route (filling the hole adds the key).
+    pub reserved: bool,
     /// The field holds only these bodies of this module (FVA): a call
     /// through it is a call of them. Empty when it may hold anything else.
     pub fns: Vec<FactsBody>,
+    /// Holder facts: every value any write of any unit stores into the field
+    /// is an instance of one of these prefix-stable classes, or (when
+    /// `nullable`) null/undefined. A read of the field is then a receiver the
+    /// facts prove (`wpfacts_access::receiver`): the field's proof travels
+    /// with its holder. Empty when the field can hold anything else (⊤, a
+    /// function, a builtin, another primitive, an instance of a class that
+    /// is not prefix-stable), when its presence is not known (`declared`),
+    /// or when interpreted code can run.
+    pub classes: Vec<u32>,
+    pub nullable: bool,
 }
 
 /// A plain compiled body of this module that a binding or a field holds
@@ -84,6 +99,85 @@ pub struct FactsClass {
     pub fields: Vec<FactsField>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FactsIndexedOwner {
+    pub kind: u8,
+    pub min_len: u32,
+    pub exact_len: Option<u32>,
+    pub allocations: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FactsNumericExpr {
+    Integer(i64),
+    Number(u64),
+    Param(u32),
+    Binary(perry_hir::BinaryOp, Box<Self>, Box<Self>),
+    Unary(perry_hir::UnaryOp, Box<Self>),
+    Sqrt(Box<Self>),
+}
+impl std::hash::Hash for FactsNumericExpr {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::mem::discriminant(self).hash(h);
+        match self {
+            Self::Integer(n) => n.hash(h),
+            Self::Number(n) => n.hash(h),
+            Self::Param(n) => n.hash(h),
+            Self::Binary(op, l, r) => {
+                std::mem::discriminant(op).hash(h);
+                l.hash(h);
+                r.hash(h);
+            }
+            Self::Unary(op, v) => {
+                std::mem::discriminant(op).hash(h);
+                v.hash(h);
+            }
+            Self::Sqrt(v) => v.hash(h),
+        }
+    }
+}
+impl FactsNumericExpr {
+    pub fn from_hir(e: &perry_hir::Expr) -> Option<Self> {
+        use perry_hir::Expr;
+        Some(match e {
+            Expr::Integer(n) => Self::Integer(*n),
+            Expr::Number(n) => Self::Number(n.to_bits()),
+            Expr::LocalGet(id) => Self::Param(*id),
+            Expr::Binary { op, left, right } => Self::Binary(
+                *op,
+                Box::new(Self::from_hir(left)?),
+                Box::new(Self::from_hir(right)?),
+            ),
+            Expr::Unary { op, operand } => Self::Unary(*op, Box::new(Self::from_hir(operand)?)),
+            Expr::MathSqrt(e) => Self::Sqrt(Box::new(Self::from_hir(e)?)),
+            _ => return None,
+        })
+    }
+    pub(crate) fn to_hir(&self) -> perry_hir::Expr {
+        use perry_hir::Expr;
+        match self {
+            Self::Integer(n) => Expr::Integer(*n),
+            Self::Number(n) => Expr::Number(f64::from_bits(*n)),
+            Self::Param(id) => Expr::LocalGet(*id),
+            Self::Binary(op, l, r) => Expr::Binary {
+                op: *op,
+                left: Box::new(l.to_hir()),
+                right: Box::new(r.to_hir()),
+            },
+            Self::Unary(op, v) => Expr::Unary {
+                op: *op,
+                operand: Box::new(v.to_hir()),
+            },
+            Self::Sqrt(v) => Expr::MathSqrt(Box::new(v.to_hir())),
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FactsNumericFunction {
+    pub params: Vec<u32>,
+    pub expression: FactsNumericExpr,
+}
+
 /// The slice-2 elision inputs of one module.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ElisionFacts {
@@ -98,6 +192,10 @@ pub struct ElisionFacts {
     /// Local id → the class id of the one class object it holds, when it
     /// holds nothing else (FVA 3.4): `x.k(...)` is `C.k(...)`.
     pub local_classes: std::collections::BTreeMap<u32, u32>,
+    pub indexed_owners: std::collections::BTreeMap<u32, FactsIndexedOwner>,
+    pub number_inputs: std::collections::BTreeSet<u32>,
+    pub indexed_metadata_pristine: bool,
+    pub numeric_functions: std::collections::BTreeMap<u32, FactsNumericFunction>,
     /// Class id → its own statics that hold their definition for the
     /// program's life (FVA 3.4): a call of one is its declaration, unguarded.
     pub class_statics: std::collections::BTreeMap<u32, Vec<String>>,
@@ -122,7 +220,9 @@ pub struct ElisionFacts {
 
 impl ElisionFacts {
     pub fn is_empty(&self) -> bool {
-        self.locals.is_empty()
+        self.indexed_owners.is_empty()
+            && self.number_inputs.is_empty()
+            && self.locals.is_empty()
             && self.this_of.is_empty()
             && self.local_bodies.is_empty()
             && self.local_classes.is_empty()
