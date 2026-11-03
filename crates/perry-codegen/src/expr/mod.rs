@@ -257,6 +257,8 @@ mod ek_prefix_tests;
 #[cfg(test)]
 mod entry_block_alloca_tests;
 #[cfg(test)]
+mod family_guard_tests;
+#[cfg(test)]
 mod hit_path_access_tests;
 #[cfg(test)]
 mod index_set_barrier_tests;
@@ -405,11 +407,6 @@ pub(crate) struct FnCtx<'a> {
     pub wpfacts_off: bool,
     pub program_has_worker: bool,
     pub program_has_thread_agents: bool,
-    /// The program's accessor names (`ClassAccessorNames`): a fixed-name read
-    /// owns a shape/slot memo only for a name some getter of the program is
-    /// declared under. `None` (a compile that did not collect them) gives
-    /// every fixed-name read its memo.
-    pub program_class_accessor_names: Option<std::sync::Arc<crate::codegen::ClassAccessorNames>>,
     /// Function being built (blocks, params, registers).
     pub func: &'a mut LlFunction,
     /// Stable slug for native-region ids derived from this module.
@@ -2648,18 +2645,22 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
 /// iteration reads `%Array.prototype%`'s fixed slot (and an array's own
 /// member); bit 1, `%ArrayIteratorPrototype%` may be named, so iteration also
 /// checks its `next`. Zero: iteration is the builtin element walk, unchecked.
-pub(crate) fn array_iteration_facts() -> u32 {
+/// The whole-program facts (#13645) clear a bit the census sets when compiled
+/// code provably never writes what it guards.
+pub(crate) fn array_iteration_facts(wpfacts: &crate::codegen::ElisionFacts) -> u32 {
     let names = crate::program_patched_proto_methods();
     let mut facts = 0;
-    if names
-        .iter()
-        .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_WRITABLE)
+    if !wpfacts.array_iteration_unwritten
+        && names
+            .iter()
+            .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_WRITABLE)
     {
         facts |= 1;
     }
-    if names
-        .iter()
-        .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_PROTO_REACHABLE)
+    if !wpfacts.array_iterator_close_unwritten
+        && names
+            .iter()
+            .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_PROTO_REACHABLE)
     {
         facts |= 2;
     }
@@ -2667,8 +2668,8 @@ pub(crate) fn array_iteration_facts() -> u32 {
 }
 
 /// Immutable whole-program array facts handed to the runtime at startup.
-pub(crate) fn array_program_facts() -> u32 {
-    array_iteration_facts()
+pub(crate) fn array_program_facts(wpfacts: &crate::codegen::ElisionFacts) -> u32 {
+    array_iteration_facts(wpfacts)
         | if crate::program_patched_proto_methods()
             .iter()
             .any(|name| name == perry_hir::patched_builtins::ARRAY_ELEMENT_DESCRIPTORS)

@@ -13,6 +13,7 @@ pub(crate) use export::UNDESCRIBED;
 mod for_in;
 mod glue;
 mod native_result;
+mod once;
 mod primitives;
 mod shared_closures;
 mod view;
@@ -238,6 +239,9 @@ pub struct Gen<'a> {
     pub(crate) binding_writes: FxHashMap<u32, NodeId>,
     pub(crate) write_top: crate::pts::FxHashSet<u32>,
     pub(crate) stand_in_fc: FxHashMap<Tok, &'a crate::units::FnContract>,
+    /// DECISIONS 241: stores on a published function no contract describes
+    /// (`contract_check`): sunk, published unknown.
+    pub(crate) fn_store_top: crate::pts::FxHashSet<NodeId>,
     /// Classes with a parent value (§17.2), fed after the bodies.
     pub(crate) parent_values: Vec<(u32, TmplId, Option<String>)>,
     /// Classes whose evaluated parent fed the parent value.
@@ -295,6 +299,12 @@ pub struct Gen<'a> {
     /// `FactsConfig::roots`: modules loaded whatever imports them.
     pub roots: Vec<String>,
     pub init_fn_of: FxHashMap<u32, FnIdx>,
+    /// RPG1b: per module, its once closures (`once::once_closures`).
+    pub once_ids: Vec<FxHashMap<u32, bool>>,
+    /// RPG1b: the walk is at a statement of a function body (`order_ok`),
+    /// inside that many loops of it (`StoreSite::in_loop`).
+    pub order_ok: bool,
+    pub loop_depth: u32,
     /// Object-literal IIFE parameter node → the literal template it births.
     pub iife_birth: FxHashMap<NodeId, TmplId>,
     /// Construction-phase analysis of plain functions used as constructors.
@@ -482,6 +492,7 @@ impl<'a> Gen<'a> {
             param_guard: FxHashMap::default(),
             param_ty: Vec::new(),
             class_contracts: Vec::new(),
+            fn_store_top: Default::default(),
             unit_in: None,
             view: None,
             stand_ins: FxHashMap::default(),
@@ -500,6 +511,9 @@ impl<'a> Gen<'a> {
             dynamic_only: Default::default(),
             roots: Vec::new(),
             init_fn_of: FxHashMap::default(),
+            once_ids: Vec::new(),
+            order_ok: false,
+            loop_depth: 0,
             iife_birth: FxHashMap::default(),
             fn_phase: FxHashMap::default(),
             rooted_stores: Default::default(),
@@ -881,7 +895,9 @@ impl<'a> Gen<'a> {
             let proto = m.tok_index.get(&TokKind::Proto(c)).copied();
             let mut keys: Vec<Atom> = tp.proto_members.clone();
             keys.extend(tp.birth_keys.iter().copied());
-            let mut open = tp.has_computed_members;
+            // DECISIONS 234: a key of its instances may disappear or be
+            // redefined (delete, defineProperty): no key of theirs is sure.
+            let mut open = tp.has_computed_members || m.keys_unsure.contains(&c);
             if let Some(pt) = proto {
                 keys.extend(held(pt));
                 open |= open_node(m.field_any.get(&pt));
@@ -1020,6 +1036,12 @@ impl<'a> Gen<'a> {
         if let Some(&f) = self.mods[mi as usize].funcs.get(&id) {
             return f;
         }
+        if is_closure {
+            if let Some(&reload) = self.once_ids.get(mi as usize).and_then(|o| o.get(&id)) {
+                let f = self.m.funcs.len() as FnIdx;
+                self.m.once_fns.insert(f, (mi, reload));
+            }
+        }
         let fx = self.m.funcs.len() as FnIdx;
         let tok = self.m.tok(TokKind::Func(fx, NO_CTX));
         if is_closure {
@@ -1041,12 +1063,26 @@ impl<'a> Gen<'a> {
             if p.is_rest {
                 // The rest local holds a fresh array whose elements are the
                 // extra arguments (and, for `arguments`, every argument).
-                let arr = self.new_arr_template(mi, "rest");
+                let arr = match &p.arguments_object {
+                    Some(_) => self.new_args_template(mi),
+                    None => self.new_arr_template(mi, "rest"),
+                };
                 let at = self.m.tok(TokKind::Obj(arr, NO_CTX));
                 self.m.add_tok(n, at);
                 let fa = self.m.field_any(at);
-                if p.arguments_object.is_some() {
+                if let Some(ao) = &p.arguments_object {
                     self.m.edge(args_all, fa);
+                    // Its own `length` is the argument count until code
+                    // stores another value; sloppy `callee` is the function
+                    // (strict `callee` is an accessor that throws).
+                    let la = self.m.atom("length");
+                    let lf = self.m.field(at, la);
+                    self.m.add_prim(lf, prim::NUM);
+                    if !ao.strict {
+                        let ca = self.m.atom("callee");
+                        let cf = self.m.field(at, ca);
+                        self.m.add_tok(cf, tok);
+                    }
                     // Sloppy mapped `arguments` aliases the params: writes
                     // through it reach them (E24). The synthetic parameter
                     // may come before the named ones, so the edges are added
@@ -1100,6 +1136,8 @@ impl<'a> Gen<'a> {
             lexical_this,
             no_summary: false,
             gen_step: false,
+            gen_async: false,
+            gen_reyields: false,
             captures: Vec::new(),
             forwards_super: false,
             parent: if is_closure { outer_fn } else { NO_FN },
@@ -1179,6 +1217,7 @@ impl<'a> Gen<'a> {
             parent_value: None,
             parent_links: Vec::new(),
             null_proto: c.declared_keys_null_proto(),
+            species: None,
         });
         self.mods[mi as usize].classes.insert(c.name.clone(), tm);
         for a in &c.aliases {
@@ -1335,6 +1374,8 @@ impl<'a> Gen<'a> {
             lexical_this: false,
             no_summary: false,
             gen_step: false,
+            gen_async: false,
+            gen_reyields: false,
             captures: Vec::new(),
             forwards_super: false,
             parent: NO_FN,
@@ -1484,6 +1525,43 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// The storage key of private field `name` (`#x`) declared by class `c`
+    /// of module `mi`: the class its private elements belong to, the one it
+    /// was specialized from (codegen `element_class_id_in`), names it.
+    pub(crate) fn private_field_key(&self, mi: u32, c: &Class, name: &str) -> String {
+        let module = self.modules[mi as usize].1;
+        let mut cur = c;
+        for _ in 0..module.classes.len() {
+            match cur
+                .specialized_from
+                .as_deref()
+                .and_then(|o| module.classes.iter().find(|k| k.name == o))
+            {
+                Some(o) => cur = o,
+                None => break,
+            }
+        }
+        perry_hir::private_names::private_value_key(cur.id, name)
+    }
+
+    /// The key of static field `field_name` of class `class_name`: a `#x`
+    /// is the class's private static (codegen `static_field_meta`).
+    pub(crate) fn static_field_atom(
+        &mut self,
+        mi: u32,
+        class_name: &str,
+        field_name: &str,
+    ) -> Atom {
+        if field_name.starts_with('#') {
+            let module = self.modules[mi as usize].1;
+            if let Some(c) = module.classes.iter().find(|c| c.name == class_name) {
+                let key = self.private_field_key(mi, c, field_name);
+                return self.m.private_atom(&key);
+            }
+        }
+        self.m.atom(field_name)
+    }
+
     /// A class name visible in module `mi`: its own classes, then imported
     /// bindings that hold exactly one class value.
     pub(crate) fn resolve_class_name(&mut self, mi: u32, name: &str) -> Option<TmplId> {
@@ -1626,10 +1704,26 @@ impl<'a> Gen<'a> {
 
     pub(crate) fn new_arr_template(&mut self, mi: u32, what: &str) -> TmplId {
         let site = self.next_site(mi);
+        self.new_indexed_template(mi, TmplKind::Arr { module: mi, site }, what, site)
+    }
+
+    /// A function's `arguments` object: not an Array (`TmplKind::Args`).
+    pub(crate) fn new_args_template(&mut self, mi: u32) -> TmplId {
+        let site = self.next_site(mi);
+        self.new_indexed_template(mi, TmplKind::Args { module: mi, site }, "arguments", site)
+    }
+
+    fn new_indexed_template(
+        &mut self,
+        mi: u32,
+        kind: TmplKind,
+        what: &str,
+        site: SiteId,
+    ) -> TmplId {
         let tm = self.m.tmpls.len() as TmplId;
         self.note_birth_fn(tm);
         self.m.tmpls.push(Template {
-            kind: TmplKind::Arr { module: mi, site },
+            kind,
             display: format!("{}:[{what}#{site}]", self.mods[mi as usize].path_short()),
             birth_keys: vec![],
             definite: vec![],
@@ -1645,6 +1739,7 @@ impl<'a> Gen<'a> {
             parent_value: None,
             parent_links: Vec::new(),
             null_proto: false,
+            species: None,
         });
         tm
     }
@@ -1682,6 +1777,7 @@ impl<'a> Gen<'a> {
             parent_value: None,
             parent_links: Vec::new(),
             null_proto: false,
+            species: None,
         });
         tm
     }

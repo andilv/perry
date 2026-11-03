@@ -99,6 +99,17 @@ impl Model {
                     }
                 }
             }
+            Cons::CallerValue { dst, reason } => {
+                self.add_prim(dst, prim);
+                for &t in toks {
+                    if self.is_marker(t) {
+                        self.add_top(dst, |m| m.reasons[reason as usize].clone());
+                        self.add_prim(dst, prim::ALL);
+                    } else {
+                        self.add_tok(dst, t);
+                    }
+                }
+            }
             Cons::HandOver { reason, ctor, arg } => {
                 for &t in toks {
                     if self.is_marker(t) {
@@ -111,7 +122,16 @@ impl Model {
                     // DECISIONS 149e: an array leaves by its element cell,
                     // a primitive method's container too (184).
                     let arr = self.is_cell_arr(t);
-                    if !stand_in && !arr {
+                    // A literal layout of this unit is handed over as one
+                    // handed to a closed function is: the argument contract
+                    // describes it key by key (`ctor_args_out`); it escapes
+                    // once a census report broke its layout
+                    // (`Gen::closed_ctor_literals`).
+                    let lit = !stand_in
+                        && matches!(self.toks[t as usize], TokKind::Obj(tm, _)
+                            if matches!(self.tmpls[tm as usize].kind,
+                                TmplKind::Class { literal_shape: true, .. }));
+                    if !stand_in && !arr && !lit {
                         self.escape(t, reason);
                     }
                 }
@@ -297,20 +317,38 @@ impl Model {
                 }
             }
             Cons::Guard { test, from, dst } => {
+                // A marker beside its values is no value (DECISIONS 74):
+                // the test waits for them, and fires if the marker leaves
+                // (75). A marker with none beside it holds anything.
                 let admits = prim & guard::prims(test) != 0
-                    || toks
-                        .into_iter()
-                        .any(|&t| t == TOP || guard::objects(test) || self.is_marker(t));
+                    || toks.iter().any(|&t| {
+                        t == TOP
+                            || if self.is_marker(t) {
+                                !self.beside_values(t)
+                            } else {
+                                guard::objects(test)
+                            }
+                    });
                 if admits {
                     self.edge(from, dst);
+                } else {
+                    for &t in toks {
+                        if self.beside_markers.contains(&t) {
+                            self.beside_guard.entry(t).or_default().push((from, dst));
+                        }
+                    }
                 }
             }
-            Cons::Defined { dst } => {
+            Cons::Defined { dst } | Cons::NotNullish { dst } => {
+                let strip = match c {
+                    Cons::Defined { .. } => prim::UNDEF,
+                    _ => prim::NULL | prim::UNDEF,
+                };
                 for &t in toks {
                     self.add_tok(dst, t);
                 }
-                if prim & !prim::UNDEF != 0 {
-                    self.add_prim(dst, prim & !prim::UNDEF);
+                if prim & !strip != 0 {
+                    self.add_prim(dst, prim & !strip);
                 }
             }
             Cons::TopIfAny { dst, from, reason } => {
@@ -331,6 +369,9 @@ impl Model {
                         let k = Some(Key::Named(key));
                         self.note_fnproto_write(TOP, k, Hard::E7Delete.code());
                         builtins::note_native_write(self, TOP, k, "E7 delete");
+                        self.top_reshape(Some(key));
+                        let k = self.atoms[key as usize].clone();
+                        self.note_shared(SharedWrite::Removed(Some(k)));
                     } else {
                         self.mark_hard(t, Hard::E7Delete, reason);
                     }
@@ -351,6 +392,9 @@ impl Model {
             }
             Cons::DefineKey { key, data, reason } => {
                 for &t in toks {
+                    if self.is_marker(t) {
+                        self.note_inst(t, true);
+                    }
                     // A key the layout already holds as data may move into an
                     // accessor pair in its slot, and a class instance's layout
                     // is the class's: E5 HARD, as any defineProperty was. (On
@@ -395,6 +439,14 @@ impl Model {
                             let k = Some(Key::Named(key));
                             self.note_fnproto_write(TOP, k, Hard::E5DefineProperty.code());
                             builtins::note_native_write(self, TOP, k, "E5 Object.defineProperty");
+                            self.reshape(Some(key));
+                            // DECISIONS 234: in every unit, as an accessor
+                            // through ⊤ under the key (a superset: what a
+                            // descriptor installs, a getter included).
+                            self.top_reshape(Some(key));
+                            let k = self.atoms[key as usize].clone();
+                            self.note_shared(SharedWrite::Accessor(Shared::Top, k.clone()));
+                            self.note_shared(SharedWrite::Removed(Some(k)));
                         }
                         _ => self.mark_hard(t, Hard::E5DefineProperty, reason),
                     }
@@ -465,8 +517,16 @@ impl Model {
                     }
                 }
             }
-            Cons::ChainUnion { key, dst, of } => {
+            Cons::ChainUnion {
+                key,
+                dst,
+                of,
+                builtin,
+            } => {
                 for &q in toks {
+                    if !builtin && self.is_builtin_proto(q) {
+                        continue;
+                    }
                     if q == TOP {
                         self.add_tok(dst, TOP);
                         if self.is_constructor_key(key) {
@@ -486,9 +546,10 @@ impl Model {
                     self.edge(f, dst);
                     self.with_b(|m| builtins::chain_load(m, of, q, key, dst));
                     if self.stops_at(q, key) {
-                        self.stopped_shared.entry(q).or_default().push((key, dst));
+                        let v = self.stopped_shared.entry(q).or_default();
+                        v.push((key, dst, builtin));
                     } else {
-                        let up = self.cv(q, key);
+                        let up = self.cv_of(q, key, builtin);
                         self.edge(up, dst);
                     }
                 }
@@ -674,7 +735,11 @@ impl Model {
                         self.note_shared(SharedWrite::Accessor(s, k));
                     }
                     self.note_fnproto_write(t, Some(Key::Named(key)), "accessor");
+                    self.note_array_member_write(t, Some(Key::Named(key)), None, "accessor");
                     builtins::note_native_write(self, t, Some(Key::Named(key)), "accessor");
+                    if t == TOP || self.is_chain_proto(t) {
+                        self.reshape(Some(key));
+                    }
                     if t == TOP {
                         continue;
                     }
@@ -734,6 +799,14 @@ impl Model {
                 for &t in toks {
                     if t == TOP || matches!(self.toks[t as usize], TokKind::ClassObj(_)) {
                         self.cons(src, Cons::ParentGiven { of: t });
+                    }
+                    // A runtime object (⊤ may be one; `ObjectProto` stands for
+                    // every builtin prototype) takes `src` as its prototype:
+                    // its lookups may reach the keys of `src`'s chain.
+                    if (t == TOP || self.shared_of(t).is_some_and(|s| s != Shared::BuiltinFn))
+                        && !self.native_given.contains(&(t, src))
+                    {
+                        self.native_given.push((t, src));
                     }
                     // `%Object.prototype%` is an immutable prototype exotic
                     // object: setting its [[Prototype]] to anything but its
@@ -881,8 +954,15 @@ impl Model {
                         self.add_tok(dst, TOP);
                         continue;
                     }
-                    let all = self.all_fields(t);
-                    self.edge(all, dst);
+                    // An object's own fields: by the key's values (`IdxKey`:
+                    // a number key names only its numeric fields). A
+                    // marker's fields are its reach markers under any key;
+                    // another value (the global object, a namespace) keeps
+                    // every field.
+                    if self.is_marker(t) || !matches!(self.toks[t as usize], TokKind::Obj(..)) {
+                        let all = self.all_fields(t);
+                        self.edge(all, dst);
+                    }
                     self.add_prim(dst, prim::UNDEF);
                     if self.idx_done.insert((idx, t, dst, 0)) {
                         self.plain_key(t, ChainAct::Load(dst));
@@ -894,6 +974,24 @@ impl Model {
                 let named = prim & (prim::STR | prim::SYMBOL) != 0 || !toks.is_empty();
                 if named && self.idx_done.insert((n, obj, dst, 1)) {
                     self.load_from(obj, obj, Key::Any, dst);
+                }
+                // ToPropertyKey of a Number or BigInt is a numeric string: the
+                // own fields a number key may name (DECISIONS 217); the chain
+                // is `plain_key`'s. A marker has no own fields (`Model::field`:
+                // its fields are its reach markers): what a number key reads
+                // from it is its `[]` path step, which `IdxLoad` edged in
+                // under the path's loop collapse (DECISIONS 158). An own-field
+                // node of a marker stands outside that collapse: in
+                // `x = x.next[0]` per unit it made a marker per iteration
+                // (CHB11: 27k markers and 25 GB on tssrc).
+                if !self.is_marker(obj)
+                    && prim & (prim::NUM | prim::BIGINT) != 0
+                    && self
+                        .idx_done
+                        .insert((n, obj, dst, crate::model::IDX_NUM_OWN))
+                {
+                    let f = self.num_fields(obj);
+                    self.edge(f, dst);
                 }
                 // ToPropertyKey of `true`, `null`, `undefined` is a named key.
                 if !named {
@@ -1012,6 +1110,8 @@ impl Model {
                 accessor,
             } => {
                 if let Some(k) = self.keyed_once(n, o, 0) {
+                    let dk = k.unwrap_or_else(|| self.atom(crate::STAR_KEY));
+                    self.define_on.insert((o, dk, !accessor));
                     match k {
                         Some(key) => self.cons(
                             o,
@@ -1037,6 +1137,28 @@ impl Model {
                     self.cons(o, Cons::Store { key, src, site });
                 }
             }
+            Cons::StoreIndexed { o, src, site } => {
+                // DECISIONS 217(c) for stores: a Number key (ToPropertyKey:
+                // its ToString, a numeric name, `numeric_key`) writes an
+                // array's elements, never a named non-index key of it; any
+                // other key value is a computed-key store.
+                if prim & prim::NUM != 0 && self.index_store_done.insert((n, site, true)) {
+                    let ek = self.elem_key();
+                    self.cons(o, Cons::Store { key: ek, src, site });
+                }
+                if (prim & !prim::NUM != 0 || !toks.is_empty())
+                    && self.index_store_done.insert((n, site, false))
+                {
+                    self.cons(
+                        o,
+                        Cons::Store {
+                            key: Key::Any,
+                            src,
+                            site,
+                        },
+                    );
+                }
+            }
             Cons::AccessorKeyed { holder, f, setter } => {
                 if let Some(k) = self.keyed_once(n, f, 2 + setter as u8) {
                     let key = k.unwrap_or_else(|| self.atom(crate::STAR_KEY));
@@ -1050,10 +1172,10 @@ impl Model {
                     );
                 }
             }
-            Cons::Arith { dst, add } => {
+            Cons::Arith { dst } => {
                 let mut out = 0u16;
                 // Objects go through ToPrimitive (user valueOf/toString).
-                let objs = prim::NUM | prim::BIGINT | if add { prim::STR } else { 0 };
+                let objs = prim::NUM | prim::BIGINT;
                 // A described parameter's marker is no value (DECISIONS 74);
                 // an argument marker is none while it stands for such
                 // markers alone, and adds the kinds if it leaves (75).
@@ -1069,14 +1191,44 @@ impl Model {
                 if prim & prim::BIGINT != 0 {
                     out |= prim::BIGINT;
                 }
-                if prim & (prim::NUM | prim::BOOL | prim::NULL | prim::UNDEF) != 0 {
+                if prim & (prim::NUM | prim::STR | prim::BOOL | prim::NULL | prim::UNDEF) != 0 {
                     out |= prim::NUM;
-                }
-                if prim & prim::STR != 0 {
-                    out |= if add { prim::STR } else { prim::NUM };
                 }
                 if out != 0 {
                     self.add_prim(dst, out);
+                }
+            }
+            Cons::Plus { str, num } => {
+                let mut s = 0u16;
+                let mut k = 0u16;
+                // Objects go through ToPrimitive (user valueOf/toString): a
+                // String or a numeric value. Markers as in `Arith`.
+                if toks.iter().any(|&t| !self.beside_values(t)) {
+                    s |= prim::STR;
+                    k |= prim::NUM | prim::BIGINT;
+                } else {
+                    for &t in toks {
+                        if self.beside_markers.contains(&t) {
+                            let later = self.beside_arith.entry(t).or_default();
+                            later.push((str, prim::STR));
+                            later.push((num, prim::NUM | prim::BIGINT));
+                        }
+                    }
+                }
+                if prim & prim::STR != 0 {
+                    s |= prim::STR;
+                }
+                if prim & prim::BIGINT != 0 {
+                    k |= prim::BIGINT;
+                }
+                if prim & (prim::NUM | prim::BOOL | prim::NULL | prim::UNDEF) != 0 {
+                    k |= prim::NUM;
+                }
+                if s != 0 {
+                    self.add_prim(str, s);
+                }
+                if k != 0 {
+                    self.add_prim(num, k);
                 }
             }
             Cons::ArrayLenArg { dst } => {

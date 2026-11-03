@@ -277,26 +277,39 @@ def level(pads, kind, n, am, ah):
     return True
 
 
-# .data.rel.ro lies in the RELRO region, which the linker anchors at its END (page aligned): a pad in it moves
-# the section start, not its end. The region also holds what follows the section (.dynamic, .got, the first
-# .got.plt slots), whose size differs between arms (link-time-resolved GOT slots; the 64-byte section alignment
-# turns 0x18 more .got into a 0x40 lower RW LOAD start, .tdata, .tbss, .init_array, .fini_array and .data.rel.ro).
-# So the section END differs between arms and equal section sizes do not give equal starts. Two knobs:
-#   end pad  lowers the marker (the runtime's bytes start at: section end - runtime tail - end pad)
-#   mid pad  lowers the section start and the RW start, and leaves the marker where it is
-# Equal markers first (end pad), then equal section starts (mid pad); the RELRO size then coincides as well.
+# .data.rel.ro lies in the RELRO region (.tdata, .tbss, .init_array, .fini_array, .data.rel.ro, .dynamic, .got,
+# the first .got.plt slots). GNU ld ends the region on a page boundary by placing its START: after the read-only
+# segment's page, at page + ((-relro_size) mod page). So the RW start follows the region's size modulo a page, and a
+# pad in the region moves the start (down, wrapping up a page when the start would leave that page), never the end.
+# A plan that moves the marker by an address difference therefore cannot converge once the difference exceeds the
+# page slack: every wrap gives the page back. (WRT3p-A1: the candidate's runtime .data.rel.ro is 0x11000 smaller,
+# the head end pad grew by ~0x1000 a round to 84 KB and the RW start still differed by 0xb00.) Both conditions are
+# instead measured inside each binary, where no wrap enters:
+#   mid pad  equalizes the bytes from the region start to the marker (what precedes the runtime's bytes)
+#   end pad  equalizes the region's size (what follows them: the runtime tail, .dynamic, .got)
+# Equal sizes give equal RW starts, equal starts plus equal leading bytes give equal markers, and the region end,
+# hence .data and everything after it, coincides as well.
 ANCHORED = ".data.rel.ro"
 
 
-def anchored(pads, mk_m, mk_h, st_m, st_h):
+def anchored(pads, lead_m, lead_h, size_m, size_h):
     n = ANCHORED
-    old = {a: (pads[a]["end"].get(n, 0), pads[a]["mid"].get(n, 0)) for a in pads}
-    for kind, i, diff in (("end", 0, mk_h - mk_m), ("mid", 1, st_h - st_m)):
+    for kind, diff in (("mid", lead_h - lead_m), ("end", size_h - size_m)):
         if diff:
-            d = old["head"][i] - old["main"][i] + diff
-            pads["head"][kind][n], pads["main"][kind][n] = max(d, 0), max(-d, 0)
+            # head carries diff more bytes: main's pad must exceed head's by diff more than it does now
+            d = pads["main"][kind].get(n, 0) - pads["head"][kind].get(n, 0) + diff
+            pads["main"][kind][n], pads["head"][kind][n] = max(d, 0), max(-d, 0)
             return True
     return False
+
+
+def comparable_names(secs_m, secs_h):
+    """Section names of both arms, in order, for the layout comparison. A perry_* records section that only one
+    arm has (an arm that adds one) is never padded: like the size difference of any records section, its bytes
+    are taken up by the next padded section, so it is left out of the order check."""
+    m, h = [s[0] for s in secs_m], [s[0] for s in secs_h]
+    one_arm = {n for n in set(m) ^ set(h) if n.startswith("perry_")}
+    return [n for n in m if n not in one_arm], [n for n in h if n not in one_arm]
 
 
 def plan(main_bin, head_bin, pads_json, pad_dir):
@@ -304,7 +317,7 @@ def plan(main_bin, head_bin, pads_json, pad_dir):
     pads = json.load(open(pads_json)) if os.path.exists(pads_json) else {"main": empty(), "head": empty()}
     secs_m, mk_m, cnt_m = marks(main_bin)
     secs_h, mk_h, cnt_h = marks(head_bin)
-    names_m, names_h = [s[0] for s in secs_m], [s[0] for s in secs_h]
+    names_m, names_h = comparable_names(secs_m, secs_h)
     if names_m != names_h:
         sys.exit(f"section order differs:\n main {names_m}\n head {names_h}")
     missing = [n for n in list(PADDABLE) + [EH] if n in names_m and n not in mk_m or n in names_h and n not in mk_h]
@@ -326,7 +339,8 @@ def plan(main_bin, head_bin, pads_json, pad_dir):
     for n in sorted(mk_m, key=lambda k: mk_m[k][0]) if not changed else ():
         (mm, em, sm), (mh, eh, sh) = mk_m[n], mk_h[n]
         if n == ANCHORED:
-            changed = anchored(pads, mm, mh, sm, sh)
+            rm, rh = segments(main_bin)["GNU_RELRO"], segments(head_bin)["GNU_RELRO"]
+            changed = anchored(pads, mm - rm[0], mh - rh[0], rm[1], rh[1])
         else:
             changed = level(pads, "mid", n, mm, mh)
             if not changed and em is not None:
@@ -358,7 +372,7 @@ def check(main_bin, head_bin, rt_lib=None):
     ok = True
     secs_m, mk_m, cnt_m = marks(main_bin)
     secs_h, mk_h, cnt_h = marks(head_bin)
-    names_m, names_h = [s[0] for s in secs_m], [s[0] for s in secs_h]
+    names_m, names_h = comparable_names(secs_m, secs_h)
     if names_m != names_h:
         print(f"section order differs:\n main {names_m}\n head {names_h}")
         print("LAYOUT-DIFFERS")

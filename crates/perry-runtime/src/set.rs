@@ -12,9 +12,19 @@ use std::ptr;
 mod index;
 #[cfg(test)]
 pub(crate) use index::{
-    test_erase_key_identity, test_index_buckets, test_key_identity,
+    test_erase_key_identity, test_has_index, test_index_buckets, test_key_identity,
     test_snapshot as test_index_snapshot,
 };
+
+#[cfg(test)]
+pub(crate) fn test_set_value(set: *mut SetHeader) -> f64 {
+    crate::value::js_nanbox_pointer(set as i64)
+}
+
+#[cfg(test)]
+pub(crate) fn test_string_value(string: *const StringHeader) -> f64 {
+    boxed_heap_string_value(string)
+}
 
 crate::perry_thread_local! {
     /// Backing Sets whose `forEach` raw-index walk is currently in flight.
@@ -1277,10 +1287,16 @@ pub unsafe extern "C-unwind" fn js_readonly_set_has(receiver: f64, value: f64) -
     let receiver_value = crate::value::JSValue::from_bits(receiver.to_bits());
     if receiver_value.is_pointer() {
         let raw = receiver_value.as_pointer::<SetHeader>();
+        // Metadata carries subclass brands, custom prototypes and own
+        // properties. Only an unmodified native receiver proves the builtin.
         if matches!(
             crate::value::addr_class::try_read_gc_header(raw as usize),
             Some(header) if header.obj_type == crate::gc::GC_TYPE_SET
-        ) {
+        ) && (*raw).meta.is_null()
+            && crate::object::builtin_proto::pristine(
+                crate::object::builtin_proto::BuiltinProto::Set,
+            )
+        {
             return f64::from_bits(
                 crate::value::JSValue::bool(set_has_resolved(raw, value) != 0).bits(),
             );
@@ -1297,16 +1313,21 @@ pub unsafe extern "C-unwind" fn js_readonly_set_has(receiver: f64, value: f64) -
 /// so the genuine-`Set` arm above is a leaf: with the handle scope inlined,
 /// every `componentTypeSet.has(type)` paid the fallback's full frame.
 #[cold]
+#[optimize(size)]
 #[inline(never)]
 unsafe fn readonly_set_has_structural(receiver: f64, value: f64) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let receiver_handle = scope.root_nanbox_f64(receiver);
     let value_handle = scope.root_nanbox_f64(value);
+    let method =
+        crate::object::method_call::spec_get_value(receiver_handle.get_nanbox_f64(), b"has");
+    // Get may run an accessor that collects. Refresh both operands before
+    // calling the selected value, including a borrowed builtin method.
+    let refreshed_receiver = receiver_handle.get_nanbox_f64();
     let refreshed_value = value_handle.get_nanbox_f64();
-    crate::object::js_native_call_method(
-        receiver_handle.get_nanbox_f64(),
-        b"has".as_ptr() as *const i8,
-        3,
+    crate::object::method_call::js_method_call_value(
+        method,
+        refreshed_receiver,
         &refreshed_value,
         1,
     )

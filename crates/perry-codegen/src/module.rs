@@ -61,6 +61,12 @@ pub struct LlModule {
     globals: Vec<String>,
     /// Globals whose same-named definitions own one linker COMDAT.
     comdat_globals: HashSet<String>,
+    /// The definition of every coalesced global in this module, by name. A
+    /// coalesced name is content-derived (an atom or image string spelled by
+    /// its bytes), so independent emitters of one module (its own literals,
+    /// the realm image, the runtime layouts) may define it again; the module
+    /// keeps one definition and rejects a different one under the same name.
+    coalesced_definitions: HashMap<String, String>,
     string_constants: Vec<String>,
     string_counter: u32,
     /// Module symbol prefix folded into every anonymous rodata constant this
@@ -175,6 +181,7 @@ impl LlModule {
             defined_names: HashSet::new(),
             globals: Vec::new(),
             comdat_globals: HashSet::new(),
+            coalesced_definitions: HashMap::new(),
             string_constants: Vec::new(),
             string_counter: 0,
             symbol_prefix: String::new(),
@@ -617,19 +624,39 @@ impl LlModule {
                 }
             }
         }
-        let entries = format!("{owner}_entries");
-        let values: Vec<_> = bodies.iter().enumerate().map(|(ordinal, body)| {
+        // One record per body, tied to the body's own section: the link keeps
+        // it exactly when it keeps the body (`fn_record_line`). No table names
+        // the bodies, so nothing here roots a function.
+        let format = crate::fn_record::RecordFormat::of(&self.target_triple);
+        for (ordinal, body) in bodies.iter().enumerate() {
             self.note_fn_info(body, |f| f.metadata = Some((owner.clone(), ordinal as u32)));
-            format!("i32 trunc (i64 sub (i64 ptrtoint (ptr @{} to i64), i64 ptrtoint (ptr @{entries} to i64)) to i32)", crate::fn_info::info_symbol(body))
-        }).collect();
-        self.add_raw_global(format!(
-            "@{entries} = private constant [{} x i32] [{}], align 4",
-            bodies.len(),
-            values.join(", ")
-        ));
+            self.add_raw_global(crate::fn_record::record_line(format, body));
+        }
+        if !bodies.is_empty() {
+            for (name, line) in crate::fn_record::image_lines(format) {
+                if is_external_global(&line) {
+                    self.add_raw_global(line);
+                } else {
+                    self.add_coalesced_global(&name, line);
+                }
+            }
+        }
         // One writable word per image; no per-function mutable allocation.
-        // The first two fields are immutable descriptor operands.
-        self.add_raw_global(format!("@{owner} = internal global {{ ptr, i32, i32, ptr }} {{ ptr @{entries}, i32 {}, i32 0, ptr null }}", bodies.len()));
+        // `count` bounds the ordinals assigned here (the link may drop some);
+        // the last field is the self-relative offset to the image's records
+        // (0: none), so registration passes nothing more than before.
+        let bounds = if bodies.is_empty() {
+            "i32 0".to_string()
+        } else {
+            format!(
+                "i32 trunc (i64 sub (i64 ptrtoint (ptr @{} to i64), i64 ptrtoint (ptr getelementptr inbounds ({{ i32, i32, ptr, i32 }}, ptr @{owner}, i32 0, i32 3) to i64)) to i32)",
+                crate::fn_record::BOUNDS_SYMBOL
+            )
+        };
+        self.add_raw_global(format!(
+            "@{owner} = internal global {{ i32, i32, ptr, i32 }} {{ i32 {}, i32 0, ptr null, {bounds} }}",
+            bodies.len()
+        ));
     }
 
     /// A defined function by symbol name.
@@ -879,11 +906,51 @@ impl LlModule {
         self.globals.push(line);
     }
 
+    /// The position the next global line takes. With `insert_raw_global` a
+    /// definition can precede globals that were pushed after this mark.
+    pub(crate) fn global_mark(&self) -> usize {
+        self.globals.len()
+    }
+
+    /// Put a definition at `mark`, ahead of every global pushed since. The
+    /// globals print in this order, and an assembler resolves a linked-to
+    /// (SHF_LINK_ORDER) symbol only once its definition has been seen.
+    pub(crate) fn insert_raw_global(&mut self, mark: usize, line: String) {
+        self.globals.insert(mark, line);
+    }
+
+    /// Declare an external global once: every key that names the same
+    /// runtime symbol shares the one declaration (LLVM rejects a second).
+    /// A name this module also defines keeps only its definition, in either
+    /// order (a runtime atom that the program's own literals define as well).
+    pub(crate) fn add_external_declaration(&mut self, line: String) {
+        debug_assert!(is_external_global(&line), "{line}");
+        let defined = global_symbol_name(&line).is_some_and(|name| {
+            self.coalesced_definitions
+                .contains_key(name.trim_start_matches('@'))
+        });
+        if !defined && !self.globals.iter().any(|existing| *existing == line) {
+            self.globals.push(line);
+        }
+    }
+
     /// Fold the entire same-named weak data definition, including its section
     /// bytes. Mach-O already coalesces weak symbols at subsection boundaries;
     /// ELF, COFF and Wasm need a COMDAT: resolving weak symbol references
     /// alone leaves duplicate bytes in a mixed live section.
     pub(crate) fn add_coalesced_global(&mut self, name: &str, mut line: String) {
+        if let Some(defined) = self.coalesced_definitions.get(name) {
+            assert_eq!(
+                defined, &line,
+                "coalesced global @{name} defined twice with different contents"
+            );
+            return;
+        }
+        self.coalesced_definitions
+            .insert(name.to_string(), line.clone());
+        let declaration = format!("@{name} = external ");
+        self.globals
+            .retain(|existing| !existing.starts_with(&declaration));
         if !self.target_triple.contains("apple") {
             self.comdat_globals.insert(format!("@{name}"));
             line.push_str(&format!(", comdat(${name})"));
@@ -1080,6 +1147,7 @@ impl LlModule {
             self.push_global_definition(&mut ir, g);
             ir.push('\n');
         }
+        crate::fn_record::push_compiler_used(&mut ir, self.globals.iter().map(String::as_str));
         ir.push('\n');
         let funcs = self.deduped_function_refs();
         let defined: HashSet<&str> = funcs.iter().map(|f| f.name.as_str()).collect();
@@ -1129,6 +1197,7 @@ impl LlModule {
             self.push_global_definition(&mut ir, g);
             ir.push('\n');
         }
+        crate::fn_record::push_compiler_used(&mut ir, self.globals.iter().map(String::as_str));
         ir.push('\n');
 
         let funcs = self.deduped_function_refs();
@@ -1558,6 +1627,33 @@ impl LlModule {
                 }
             }
         }
+        // A function record (`crate::fn_record`) is tied to its body's own
+        // section, which exists only in the body's object: it is owned by the
+        // body's unit, and what it names (the body's info) is needed there.
+        let body_unit: HashMap<&str, usize> = bucket_names
+            .iter()
+            .enumerate()
+            .flat_map(|(bi, names)| names.iter().map(move |n| (n.as_str(), bi)))
+            .collect();
+        for gi in 0..all_globals.len() {
+            let Some(&bi) =
+                crate::fn_record::record_body(all_globals[gi]).and_then(|body| body_unit.get(body))
+            else {
+                continue;
+            };
+            global_owners[gi] = bi;
+            let mut work = vec![gi];
+            bucket_needs[bi].insert(gi);
+            while let Some(gj) = work.pop() {
+                for nm in &global_refs[gj] {
+                    if let Some(&next) = global_index.get(nm.as_str()) {
+                        if bucket_needs[bi].insert(next) {
+                            work.push(next);
+                        }
+                    }
+                }
+            }
+        }
         // #10152: otherwise-unreferenced globals are retained in unit 0, but
         // their initializers were absent from the function-rooted closure
         // above. An orphaned string dispatch descriptor can still name bytes
@@ -1633,12 +1729,23 @@ impl LlModule {
                 pre.push_str("module asm \".no_dead_strip __LLVM_StackMaps\"\n\n");
             }
 
+            let mut unit_records: Vec<&str> = Vec::new();
             for (gi, def) in all_globals.iter().enumerate() {
                 let referenced = bucket_needs[bi].contains(&gi);
                 // Unreferenced globals (anchors, `llvm.*`, appending lists)
                 // keep a home in unit 0 so nothing is lost.
                 let owns = global_owners[gi] == bi;
                 let replicated = replicate_globals && alias_target(def).is_none();
+                if crate::fn_record::record_body(def).is_some() {
+                    // Exactly as written, in its body's unit only: nothing
+                    // else names a record.
+                    if owns {
+                        self.push_global_definition(&mut pre, def);
+                        pre.push('\n');
+                        unit_records.push(def);
+                    }
+                    continue;
+                }
                 if (replicated && referenced) || owns {
                     if replicated {
                         if !has_local_linkage(def) {
@@ -1665,6 +1772,7 @@ impl LlModule {
                     pre.push('\n');
                 }
             }
+            crate::fn_record::push_compiler_used(&mut pre, unit_records.into_iter());
             pre.push('\n');
 
             // Declares for everything this unit REFERENCES but does not

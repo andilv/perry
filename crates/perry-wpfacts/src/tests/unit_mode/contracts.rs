@@ -318,8 +318,23 @@ pub(super) fn a_broken_namespace_field_function_resolves_only_the_units_that_see
     // below. DCE: a read of a key the object surely holds takes its chain
     // through a relay that drops the chain end's `undefined`
     // (`Cons::Defined`): a relay node for the read's own builtin members
-    // and a rule on the chain node, [758, 1094, 952, 42] -> the pin below.
-    assert_eq!(pf.round_work, [762, 1104, 960, 42], "{:?}", pf.units);
+    // and a rule on the chain node, [758, 1094, 952, 42] -> [762, 1104,
+    // 960, 42]. DECISIONS 234: a read of an own definite key takes the
+    // chain's program values only (a chain node of its own) -> [763, 1103,
+    // 960, 42]. DECISIONS 231(c): a store of `a`'s code into an instance of
+    // a class a receiver marker stands for goes to the class's `virt-stored`
+    // node for that key (`virt_store`), which the marker's reads take as its
+    // own field: two such nodes (two keys) in each of the three rounds that
+    // solve `a` -> [765, 1105, 962, 42]. Helper protocols (builtin helper arms
+    // read their operands by protocol instead of escaping them) -> [767,
+    // 1102, 959, 42]. A load from a closed receiver marker adds no absence
+    // `undefined` (+2 in each round) and takes what the marker gives through
+    // a `Cons::Defined` rule (+4) -> the pin.
+    assert_eq!(pf.round_work, [773, 1108, 969, 42], "{:?}", pf.units);
+    // DECISIONS 241: `get` reaches unknown code (`m`s, the broken function in
+    // s units): each publishes an unknown computed-key store on it, and its
+    // holders read that join under its own keys in round 3 (before: top from
+    // the publication itself): +4 -> the pin above.
 }
 
 #[test]

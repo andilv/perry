@@ -578,7 +578,6 @@ pub(super) fn compile_method(
         numeric_order_ready: Default::default(),
         program_has_worker: cross_module.program_has_worker,
         program_has_thread_agents: cross_module.program_has_thread_agents,
-        program_class_accessor_names: cross_module.program_class_accessor_names.clone(),
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
         source_function: format!("{}.{}", class.name, method.name),
@@ -1702,6 +1701,7 @@ pub(super) fn compile_method(
             method.body.len(),
         ) {
             lowered.pre_statepoint_inline = true;
+            lowered.guarded_preinline = true;
         }
     }
     // The primary body of an ordinary method joins the early inliner when the

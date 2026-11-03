@@ -1027,6 +1027,20 @@ pub(super) fn compile_function(
                 .collect()
         })
         .unwrap_or_default();
+    // #13740: every TaPtr param, whatever its `const_len`. The #8619 Number-
+    // or-`undefined` read proof rests on the binding proof behind `TaPtr`
+    // (numeric kind, non-view, never reassigned, sealed), not on the length.
+    let spec_ta_params: HashSet<u32> = spec_entry
+        .map(|plan| {
+            f.params
+                .iter()
+                .zip(plan.reps.iter())
+                .filter_map(|(p, rep)| {
+                    matches!(rep, crate::collectors::SpecParamRep::TaPtr { .. }).then_some(p.id)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let spec_i32_params: HashSet<u32> = spec_entry
         .map(|plan| {
             f.params
@@ -1132,6 +1146,7 @@ pub(super) fn compile_function(
         &cross_module.compile_time_constants,
         &cross_module.module_dispatch,
         &spec_ta_lens,
+        &spec_ta_params,
         &spec_i32_params,
         &spec_numeric_params,
         &spec_number_array_params,
@@ -1294,7 +1309,6 @@ pub(super) fn compile_function(
         numeric_order_ready: Default::default(),
         program_has_worker: cross_module.program_has_worker,
         program_has_thread_agents: cross_module.program_has_thread_agents,
-        program_class_accessor_names: cross_module.program_class_accessor_names.clone(),
         func: lf,
         module_slug: crate::expr::native_region_slug(strings.module_prefix()),
         source_function: f.name.clone(),

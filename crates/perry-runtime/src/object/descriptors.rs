@@ -103,7 +103,7 @@ pub(crate) fn sort_property_names_ecma(names: &mut Vec<String>) {
             rest.push(name);
         }
     }
-    indexed.sort_by_key(|(index, _)| *index);
+    crate::cold_sort::sort_by_u64_key(&mut indexed, |(index, _)| u64::from(*index));
     names.extend(indexed.into_iter().map(|(_, name)| name));
     names.extend(rest);
 }
@@ -121,7 +121,7 @@ fn sort_property_name_bytes_ecma(names: &mut Vec<Vec<u8>>) {
             rest.push(name);
         }
     }
-    indexed.sort_by_key(|(index, _)| *index);
+    crate::cold_sort::sort_by_u64_key(&mut indexed, |(index, _)| u64::from(*index));
     names.extend(indexed.into_iter().map(|(_, name)| name));
     names.extend(rest);
 }
@@ -1483,8 +1483,23 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
                 // A constructor's (or a generator's) `prototype` is own from
                 // birth, materialized or not: created right after `length`
                 // and `name` (the bag's birth keys), before every later key.
-                if !in_bag("prototype")
-                    && crate::object::has_own_helpers::closure_own_key_present(ptr, "prototype")
+                // Materialized later (a read, a freeze, a redefinition), it
+                // is still that key: non-configurable, never deleted and
+                // created again, so its place is its birth place, wherever
+                // its bag slot was appended.
+                let intrinsic_in_bag = in_bag("prototype")
+                    && super::class_registry::function_would_have_own_prototype(
+                        crate::value::js_nanbox_pointer(ptr as i64),
+                    );
+                if intrinsic_in_bag {
+                    names.retain(|n| n != "prototype");
+                }
+                if intrinsic_in_bag
+                    || (!in_bag("prototype")
+                        && crate::object::has_own_helpers::closure_own_key_present(
+                            ptr,
+                            "prototype",
+                        ))
                 {
                     let at = names
                         .iter()
