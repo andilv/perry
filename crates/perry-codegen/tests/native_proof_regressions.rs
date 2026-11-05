@@ -169,6 +169,7 @@ fn module_with_classes_and_params(
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -176,6 +177,7 @@ fn module_with_classes_and_params(
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9032,6 +9034,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9039,6 +9042,7 @@ fn typed_f64_clone_test_module(use_any_param: bool) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9215,6 +9219,7 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9222,6 +9227,7 @@ fn typed_i1_clone_test_module_named(name: &str) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9314,6 +9320,7 @@ fn typed_string_clone_test_module(case: &str) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9321,6 +9328,7 @@ fn typed_string_clone_test_module(case: &str) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     };
     match case {
         "positive" => {}
@@ -9435,6 +9443,7 @@ fn typed_i1_numeric_predicate_module() -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9442,6 +9451,7 @@ fn typed_i1_numeric_predicate_module() -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9519,6 +9529,7 @@ fn typed_i1_i32_predicate_module() -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9526,6 +9537,7 @@ fn typed_i1_i32_predicate_module() -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -9652,6 +9664,7 @@ fn typed_i32_return_module(case: &str) -> Module {
         async_step_closures: std::collections::HashSet::new(),
         closure_display_names: std::collections::HashMap::new(),
         class_display_names: std::collections::HashMap::new(),
+        non_constructor_funcs: Default::default(),
         closure_source_text: std::collections::HashMap::new(),
         class_source_text: std::collections::HashMap::new(),
         async_generator_funcs: std::collections::HashSet::new(),
@@ -9659,6 +9672,7 @@ fn typed_i32_return_module(case: &str) -> Module {
         gen_param_prologue_len: std::collections::HashMap::new(),
         class_family_syntax: None,
         requested_modules: Vec::new(),
+        locally_redeclared_imports: Vec::new(),
     }
 }
 
@@ -16937,4 +16951,77 @@ fn static_method_shape_guard_retains_canonical_layout_clone() {
             && !caller.contains("js_native_call_method_by_id_learn"),
         "a detached validity/learned proof must not replace live shape authority: {caller}"
     );
+}
+
+/// `value <op> 3840`, where `value` is a number local that is reassigned
+/// (statically numeric, but read as a JS value: a loop counter such as `x` in
+/// `x < W`) or an unknown parameter.
+fn literal_compare_materializations(numeric: bool, op: CompareOp) -> Vec<serde_json::Value> {
+    let compare = Stmt::Return(Some(Expr::Compare {
+        op,
+        left: Box::new(local(1)),
+        right: Box::new(int(3840)),
+    }));
+    let (params, body) = if numeric {
+        let step = Stmt::Expr(Expr::LocalSet(
+            1,
+            Box::new(Expr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(local(1)),
+                right: Box::new(int(1)),
+            }),
+        ));
+        (
+            Vec::new(),
+            vec![number_let(1, "value", true, int(0)), step, compare],
+        )
+    } else {
+        (vec![param(1, "value", Type::Any)], vec![compare])
+    };
+    let module = module_with_classes_and_params(
+        "literal_compare_boundary.ts",
+        Vec::new(),
+        params,
+        Type::Boolean,
+        body,
+    );
+    let artifact = compile_artifact_json_for_module(module);
+    artifact["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            record["consumer"] == "materialize_js_value"
+                && record["native_value_state"] == "materialized"
+                && record["native_abi_transition"]["from_native_rep"] == "f64"
+                && record["native_abi_transition"]["to_native_rep"] == "js_value"
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_literal_compared_with_a_number_by_fcmp_is_not_materialized() {
+    for op in [CompareOp::Lt, CompareOp::Le, CompareOp::Eq, CompareOp::Ne] {
+        let materialized = literal_compare_materializations(true, op);
+        assert!(
+            materialized.is_empty(),
+            "`value {op:?} 3840` on a number is a bare fcmp of the literal's own \
+             constant; no JS-value materialization crosses a boundary:\n{materialized:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_compared_through_a_runtime_helper_is_materialized_at_that_boundary() {
+    for op in [CompareOp::Lt, CompareOp::Eq] {
+        let materialized = literal_compare_materializations(false, op);
+        assert!(
+            materialized
+                .iter()
+                .any(|record| record["materialization_reason"] == "runtime_api"),
+            "`value {op:?} 3840` on an unknown value can reach a runtime compare \
+             helper, so the literal's boxing records its runtime_api boundary:\n{materialized:#?}"
+        );
+    }
 }

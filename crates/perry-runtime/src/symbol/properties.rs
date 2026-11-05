@@ -159,7 +159,7 @@ pub(crate) unsafe fn reflect_symbol_getter_closure_bits(obj_f64: f64, sym_f64: f
 
 pub(crate) unsafe fn js_object_has_own_symbol_property(obj_f64: f64, sym_f64: f64) -> bool {
     let bits = obj_f64.to_bits();
-    if let Some(class_id) = crate::object::class_value::legacy_class_value_word(bits) {
+    if let Some(class_id) = crate::object::class_value::class_ref_word(bits) {
         return class_static_symbol_lookup(class_id, sym_f64).is_some();
     }
     let obj_key = obj_key_from_f64(obj_f64);
@@ -282,6 +282,18 @@ fn next_request_meta_sym_key() -> usize {
 }
 
 unsafe fn set_symbol_property(obj_f64: f64, sym_f64: f64, value_f64: f64) -> f64 {
+    // DEC 243(3): on an ordinary receiver a symbol store is the probe store,
+    // as a string key's is: an own plain entry in place, an absent key by the
+    // canonical key-add transition. Everything else takes the [[Set]] below.
+    if super::js_is_symbol(sym_f64) != 0
+        && crate::object::layout_probe::symbol_store(
+            obj_f64.to_bits(),
+            sym_f64.to_bits(),
+            value_f64,
+        )
+    {
+        return value_f64;
+    }
     if let Some(acc) = accessors::symbol_accessor_property(obj_f64, sym_f64) {
         // #10481: the setter runs with the object written to as `this`.
         return accessors::invoke_symbol_accessor_setter(acc.set, obj_f64, value_f64);
@@ -341,7 +353,7 @@ unsafe fn set_symbol_property(obj_f64: f64, sym_f64: f64, value_f64: f64) -> f64
     // below uses.
     if !has_own_data {
         let bits = obj_f64.to_bits();
-        if crate::object::class_value::legacy_class_value_word(bits).is_none() {
+        if crate::object::class_value::class_ref_word(bits).is_none() {
             let jsval = crate::value::JSValue::from_bits(bits);
             if jsval.is_pointer() {
                 let ptr = jsval.as_pointer::<crate::object::ObjectHeader>();
@@ -395,7 +407,7 @@ unsafe fn set_symbol_property(obj_f64: f64, sym_f64: f64, value_f64: f64) -> f64
     }
     if !has_own_data {
         let bits = obj_f64.to_bits();
-        if let Some(class_id) = crate::object::class_value::legacy_class_value_word(bits) {
+        if let Some(class_id) = crate::object::class_value::class_ref_word(bits) {
             if crate::object::class_symbol_setter_apply(class_id, sym_key, obj_f64, value_f64, true)
             {
                 return value_f64;
@@ -673,7 +685,7 @@ pub(crate) fn class_static_symbol_keys_for_class(class_id: u32) -> Vec<usize> {
 #[no_mangle]
 pub unsafe extern "C" fn js_object_has_own_symbol(obj_f64: f64, sym_f64: f64) -> bool {
     let bits = obj_f64.to_bits();
-    if let Some(class_id) = crate::object::class_value::legacy_class_value_word(bits) {
+    if let Some(class_id) = crate::object::class_value::class_ref_word(bits) {
         return class_static_symbol_lookup(class_id, sym_f64).is_some();
     }
     let obj_key = obj_key_from_f64(obj_f64);

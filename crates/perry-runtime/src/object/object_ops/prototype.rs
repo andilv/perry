@@ -295,6 +295,15 @@ unsafe fn default_link_prototype(obj: *const ObjectHeader) -> Option<f64> {
     shape_link_prototype(obj, true)
 }
 
+/// `%Promise.prototype%` of this realm, the [[Prototype]] of every
+/// unrelinked `GC_TYPE_PROMISE` cell.
+fn promise_intrinsic_prototype() -> Option<f64> {
+    let proto = crate::object::builtin_prototype_value("Promise");
+    crate::value::JSValue::from_bits(proto.to_bits())
+        .is_pointer()
+        .then_some(proto)
+}
+
 pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
     const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
     // #2820: `Object.getPrototypeOf(null | undefined)` throws TypeError
@@ -569,7 +578,7 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             crate::value::js_nanbox_pointer(parent as i64)
         };
     }
-    if let Some(class_id) = crate::object::class_value::legacy_class_value_word(bits) {
+    if let Some(class_id) = crate::object::class_value::class_ref_word(bits) {
         // An explicit `Object.setPrototypeOf(Ctor, obj)` wins over every
         // derived answer below — it IS the constructor's [[Prototype]].
         if super::super::class_prototype_ref_id(obj_value).is_none() {
@@ -713,6 +722,14 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
                 if (*gc).obj_type == crate::gc::GC_TYPE_ERROR {
                     let err = raw_addr as *const crate::error::ErrorHeader;
                     if let Some(proto) = error_kind_prototype_value((*err).error_kind) {
+                        return proto;
+                    }
+                }
+                // A promise cell inherits from the realm's `%Promise.prototype%`
+                // (a relinked one returned above), never from whatever the
+                // `constructor` probe below finds under `globalThis.Promise`.
+                if (*gc).obj_type == crate::gc::GC_TYPE_PROMISE {
+                    if let Some(proto) = promise_intrinsic_prototype() {
                         return proto;
                     }
                 }
@@ -970,6 +987,11 @@ pub(crate) fn get_prototype_of_resolved(obj_value: f64) -> f64 {
             if (*gc).obj_type == crate::gc::GC_TYPE_ERROR {
                 let err = bits as *const crate::error::ErrorHeader;
                 if let Some(proto) = error_kind_prototype_value((*err).error_kind) {
+                    return proto;
+                }
+            }
+            if (*gc).obj_type == crate::gc::GC_TYPE_PROMISE {
+                if let Some(proto) = promise_intrinsic_prototype() {
                     return proto;
                 }
             }

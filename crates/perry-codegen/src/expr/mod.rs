@@ -81,6 +81,7 @@ use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8, PTR};
 // (`perry_abi::AGENT_PTR_SLOTS`).
 #[allow(dead_code)]
 pub(crate) mod agent_ptr;
+pub(crate) mod borrowed_call;
 pub(crate) mod function_bind;
 pub(crate) mod layout_read;
 
@@ -174,7 +175,7 @@ pub(crate) use helpers::{
     store_needs_string_addref, unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
 };
 pub(crate) use i32_fast_path::{
-    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region,
+    can_lower_expr_as_i32, can_lower_expr_as_i32_in_current_region, flat_const_index_get_target,
     imul_operand_i32_lowerable_in_current_region, is_known_i32_range, lower_expr_as_i32,
     lower_expr_native, lower_imul_operand_i32, lower_packed_u32_loop_index_get,
     try_flat_const_2d_int, try_lower_flat_const_index_get,
@@ -247,6 +248,8 @@ mod array_push_own_tests;
 mod barrier_stem_census_tests;
 #[cfg(test)]
 mod bounded_array_hole_tests;
+#[cfg(test)]
+mod class_evaluation_owner_tests;
 #[cfg(test)]
 mod class_field_barrier_tests;
 #[cfg(test)]
@@ -417,6 +420,10 @@ pub(crate) struct FnCtx<'a> {
     pub source_function_slug: String,
     /// Stable id for the labeled loop currently being lowered.
     pub active_region_id: Option<String>,
+    /// Set by `stmt/byte_view_loop.rs` right before it lowers the original
+    /// (fallback) copy of a versioned loop; the next for-loop lowering takes
+    /// it and marks its latch (see `crate::inst::LoopTag`).
+    pub byte_view_fallback_loop: bool,
     /// Full native-region fact graph collected for this lowered HIR region.
     ///
     /// Existing fields below borrow individual subgraphs for compatibility
@@ -555,6 +562,12 @@ pub(crate) struct FnCtx<'a> {
     /// `continue inner` both resolve to that same loop's blocks. Stored
     /// outermost-first; the innermost label is `.last()`.
     pub pending_labels: Vec<String>,
+    /// A label that only names its loop's region: no `break`/`continue`
+    /// targets it (`Stmt::Labeled` checked). It is NOT a pending label, so
+    /// every loop tier lowers the loop exactly as without the label; the
+    /// generic loop lowerings read it (by the loop's body address) only to
+    /// tag their latch with the region ID. A label never changes codegen.
+    pub region_only_label: Option<(String, usize)>,
     /// Map from class name → HIR Class definition. Built once in
     /// `compile_module` from `hir.classes`. Used by `Expr::New` to look up
     /// the field count, constructor body, and (eventually) method table.
@@ -603,8 +616,8 @@ pub(crate) struct FnCtx<'a> {
     /// `class_stack` names the owning class in a static body too (it is what
     /// `super.x` resolves against), and `receiver_class_name(Expr::This)`
     /// reads `class_stack.last()`. That answer is right for an instance
-    /// method and wrong here: a static body's `this` is the INT32-tagged
-    /// class ref `0x7FFE_0000_0000_00cc`, never a heap instance of the class.
+    /// method and wrong here: a static body's `this` is the constructor
+    /// function object, never an instance of the class.
     /// Lowerings that turn a proven receiver class into an INSTANCE-shaped
     /// access — anything that strips the NaN-box to a raw `ObjectHeader*`, or
     /// loads a packed field slot — must consult this flag before trusting
@@ -1872,13 +1885,10 @@ pub(crate) struct FnCtx<'a> {
     /// Exposed only by statements of their own body: their views stay trusted
     /// until `lower_stmt` meets the first statement that may expose them.
     pub late_exposed_buffer_locals: &'a std::collections::HashSet<u32>,
-    /// Starting alias-scope id for buffers registered in this function.
-    /// Seeded from `LlModule::buffer_alias_counter` at FnCtx creation so
-    /// scope ids don't collide across functions in the same LLVM module.
-    /// New scopes are allocated as `base + buffer_data_slots.len()`;
-    /// after the function finishes lowering the caller bumps the module
-    /// counter by the number of slots it used (closes #71).
-    pub buffer_alias_base: u32,
+    /// Buffer alias scopes of this function: ids continue the module's
+    /// metadata id counter (`LlModule::buffer_alias_scope_allocator`) and
+    /// are committed back after the body lowers (closes #71).
+    pub buffer_alias_scopes: crate::module::BufferAliasScopes,
 }
 
 #[derive(Clone)]
@@ -2846,7 +2856,7 @@ mod inline_cache_name_tests {
 
 impl<'a> FnCtx<'a> {
     /// Is `e` the `this` of a STATIC class member — i.e. a receiver that holds
-    /// the class CONSTRUCTOR (an INT32 class ref) rather than an instance?
+    /// the class CONSTRUCTOR function object rather than an instance?
     ///
     /// `receiver_class_name` answers `Some(<owning class>)` for `Expr::This`
     /// in a static body just as it does in an instance body, because both read

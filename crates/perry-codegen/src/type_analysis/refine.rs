@@ -193,6 +193,12 @@ pub(crate) fn proven_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         return Some(kind);
     }
     match init {
+        // The flat-const element lowering yields a raw Number (issue #50).
+        Expr::IndexGet { object, index, .. }
+            if crate::expr::flat_const_index_get_target(ctx, object, index).is_some() =>
+        {
+            Some(HirType::Number)
+        }
         Expr::IndexGet { .. } | Expr::Uint8ArrayGet { .. } | Expr::BufferIndexGet { .. }
             if crate::expr::ta_element_read::byte_read_is_numeric(ctx, init) =>
         {
@@ -721,6 +727,12 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
                 None
             }
         }
+        // The flat-const element lowering yields a raw Number (issue #50).
+        Expr::IndexGet { object, index, .. }
+            if crate::expr::flat_const_index_get_target(ctx, object, index).is_some() =>
+        {
+            Some(HirType::Number)
+        }
         Expr::IndexGet { object, index , .. } => {
             // arr[i] where arr is Array<T> → element type T.
             // Handles both LocalGet(arr) and PropertyGet(this, "field")
@@ -1068,7 +1080,7 @@ pub(crate) fn compute_auto_captures_with_globals(
     let mut referenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
     crate::collectors::collect_free_ref_ids_in_stmts(body, &mut referenced);
     let mut inner_lets: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    crate::collectors::collect_let_ids(body, &mut inner_lets);
+    crate::collectors::collect_own_binding_ids(body, &mut inner_lets);
     let param_ids: std::collections::HashSet<u32> = params.iter().map(|p| p.id).collect();
     let already: std::collections::HashSet<u32> = out.iter().copied().collect();
     // Sort for determinism (HashSet iteration order is unspecified).

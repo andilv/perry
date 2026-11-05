@@ -28,6 +28,7 @@ pub(super) const COMPILE_ENV_VARS: &[&str] = &[
     "PERRY_ASSERT_CAPTURE_CELLS",
     "PERRY_B4_SABOTAGE",
     "PERRY_BOX_CAPTURE_ENTRY_CELLS",
+    "PERRY_BYTE_VIEW_LOOP",
     "PERRY_CALLEE_BINDING_RESOLUTION",
     "PERRY_CALL_DEVIRT",
     "PERRY_CANONICAL_I32_LOCALS",
@@ -233,6 +234,8 @@ pub(super) fn compile_env_value(name: &str) -> Option<String> {
 
 #[cfg(test)]
 const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
+    ("PERRY_TEST_RUN_ONCE_PROOF_CHILD", "Test-only marker that tells a perry-codegen unit test it is the re-executed child; the compiler never reads it."),
+    ("PERRY_PARSE_IR_TEXT_LEAK_PROBE", "Set only by the IR-text leak probe test to mark its own child process; the compile path never reads it."),
     ("PERRY_DYNAMIC_REACH_REPORT", "Writes the dynamic-reach report file only; no pruning decision or emitted code depends on it."),
     ("PERRY_EXPORT_DEMAND_REPORT", "Writes the export-demand report file only; no pruning decision or emitted code depends on it."),
     ("PERRY_REALM_REACH", "Compiler-only diagnostic of source facts; changes no emitted bytes, runtime state or archive selection."),
@@ -396,6 +399,10 @@ const COMPILE_ENV_EXCLUSIONS: &[(&str, &str)] = &[
     (
         "PERRY_EVAL_DIAG",
         "Prints lowering diagnostics; no emitted instructions depend on the report.",
+    ),
+    (
+        "PERRY_FACTS_ACTIVATION_CHECK",
+        "Activation-invariant detector: facts run their own pass over the final HIR for comparison; emitted code does not depend on it.",
     ),
     (
         "PERRY_FACTS_CONSUMED",
