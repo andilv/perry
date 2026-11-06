@@ -292,7 +292,7 @@ cause_test!(
     "intrinsic-prototype-top-store",
     "property",
     "q",
-    r#"const g: any = (globalThis as any).hostFn; (Array.prototype as any)[g()] = g(); const m: any = [1].map; console.log(m.q);"#
+    r#"const g: any = (globalThis as any).hostFn; (Array.prototype as any)[g()] = g(); const m: any = ([1] as any).zz; console.log(m.q);"#
 );
 /// A read on a ⊤ receiver names the receiver's own root, even when a key
 /// written onto a builtin prototype through ⊤ is also a member the primitive
@@ -359,8 +359,8 @@ cause_test!(
     r#"const g: any = JSON.parse("0"); const r = g(); console.log(r.z);"#
 );
 cause_test!(
-    function_without_identity,
-    "function-without-identity",
+    unknown_accessor_function,
+    "unknown-accessor-function",
     "property",
     "x",
     r#"const g: any = (globalThis as any).hostFn; const o: any = {}; Object.defineProperty(o, "p", { get: g }); console.log(o.p.x);"#
@@ -417,12 +417,14 @@ verdict_test!(
 );
 
 // Interpreted code: `Function.call` runs the Function constructor (E14).
+// A spread may be the runtime's depd shape, which makes a function also
+// without an interpreter (`builtins::function_ctor_runs_code`).
 cause_test!(
     dynamic_code,
     "dynamic-code",
     "property",
     "x",
-    r#"const r: any = (Function as any).call(null, "return 1"); console.log(r.x);"#
+    r#"const p = ["return 1"]; const r: any = (Function as any).call(null, ...p); console.log(r.x);"#
 );
 
 /// B-codes mark a typed array hard, and a typed array is no fact unit, so

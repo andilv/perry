@@ -201,6 +201,9 @@ impl Model {
         // prototype, as whole-program facts hold of ⊤ from unknown code. The
         // global object takes no part: escaped, it already puts ⊤ in reach
         // of stores into ⊤ (`global_in_top`).
+        if self.chain_escape && builtins::builtin_function(self, t) {
+            return;
+        }
         if !self.chain_escape {
             if let Some(s) = self
                 .shared_of(t)
@@ -214,13 +217,17 @@ impl Model {
         // operations) or E14 (interpreted code), never a side effect of some
         // value reaching unknown code; its user-stored members escape where
         // they are stored (`builtins::tok_store`).
-        if matches!(
-            self.toks[t as usize],
-            TokKind::ObjectProto
-                | TokKind::BuiltinFn
-                | TokKind::Builtin(_)
-                | TokKind::NativeProto(_)
-        ) {
+        if !builtins::builtin_function(self, t)
+            && matches!(
+                self.toks[t as usize],
+                TokKind::ObjectProto | TokKind::Builtin(_) | TokKind::NativeProto(_)
+            )
+        {
+            // Handed to unknown code (not reached along a chain): the
+            // program fields rule R1 gave it may be read there.
+            if !self.chain_escape {
+                self.builtin_fields_sink(t, Some(reason));
+            }
             // Unknown code given `process` (or the global object) may write
             // the array `process.argv` holds.
             if matches!(
@@ -270,6 +277,20 @@ impl Model {
     }
 
     pub(super) fn mark_escaped(&mut self, t: Tok, reason: u32) {
+        // A few hard/contract paths mark directly rather than entering escape.
+        // Retain those actual events too; this data never feeds the solver.
+        if let Some(d) = &mut self.diagnostic {
+            if let Some(c) = &mut d.census {
+                c.escapes.insert((
+                    t,
+                    d.cause_node.unwrap_or(NO_NODE),
+                    d.cur_call.unwrap_or(u32::MAX),
+                    d.escaping.last().copied().unwrap_or(u32::MAX),
+                    reason,
+                    c.active_gate,
+                ));
+            }
+        }
         self.escaped.insert(t, reason);
         if matches!(self.toks[t as usize], TokKind::ClassObj(_)) {
             self.flush_shadowed(Some(t));
@@ -432,6 +453,7 @@ impl Model {
             parent_links: Vec::new(),
             null_proto: false,
             chain_miss: false,
+            chain_miss_open: false,
             species: None,
             per_evaluation: false,
             static_methods: Vec::new(),
@@ -723,10 +745,10 @@ impl Model {
             )
         });
         self.add_prim(w, prim::ALL);
-        self.accessor_walk(t, t, Key::Any, ChainAct::Store(w));
+        self.accessor_walk(t, t, Key::any(), ChainAct::Store(w));
         let r = self.node_l("escaped-load");
         self.sink_node(r, reason);
-        self.accessor_walk(t, t, Key::Any, ChainAct::Load(r));
+        self.accessor_walk(t, t, Key::any(), ChainAct::Load(r));
     }
 
     /// A named property `n` of function `t` whose properties left
@@ -882,6 +904,16 @@ impl Model {
         if matches!(self.toks[t as usize], TokKind::Func(..)) {
             self.fn_props_top.insert(t);
         }
+        // Overlapping abstract native tokens contribute read values, never
+        // writes into each other's storage: the overlap is not transitive.
+        if builtins::builtin_function(self, t) {
+            let read = self.node_l("escaped-native-fields");
+            self.builtin_field_use(t, Key::any(), ChainAct::Load(read));
+            if !self.unit_mode {
+                self.proto_value(t, read);
+            }
+            self.sink_node(read, reason);
+        }
         // Unknown code reads every field and can write any key.
         let all = self.all_fields(t);
         self.cons(all, Cons::TopSink { reason });
@@ -925,10 +957,10 @@ impl Model {
             )
         });
         self.add_prim(w, prim::ALL);
-        self.accessor_walk(t, t, Key::Any, ChainAct::Store(w));
+        self.accessor_walk(t, t, Key::any(), ChainAct::Store(w));
         let r = self.node_l("escaped-load");
         self.sink_node(r, reason);
-        self.accessor_walk(t, t, Key::Any, ChainAct::Load(r));
+        self.accessor_walk(t, t, Key::any(), ChainAct::Load(r));
         match self.toks[t as usize].clone() {
             TokKind::Func(f, _) => {
                 let fi = self.funcs[f as usize].clone();
@@ -1010,6 +1042,17 @@ impl Model {
     }
 
     pub fn mark_hard(&mut self, t: Tok, kind: Hard, reason: u32) {
+        // DEC 250: a delete that reaches the runtime's prototypes (the
+        // collapsed `ObjectProto`) removes only a key the lock admits: the
+        // runtime refuses (TypeError) to delete a member the image gives a
+        // locked family, except `constructor` (`builtin_proto::
+        // locked_violation`), and a family it leaves open may lose any key.
+        // That is a native write of every key (below), which a final read
+        // never sees (`members::locked_read`, the same decision). It removes
+        // no key of a program object and installs no setter: no layout on a
+        // chain through it changes, no own key stops shadowing it.
+        let lock_delete =
+            kind == Hard::E7Delete && matches!(self.toks[t as usize], TokKind::ObjectProto);
         self.virt_revoke(t, None);
         // DECISIONS 234: under a computed key, a defineProperty on a
         // prototype of the runtime, or through ⊤ (which may be one), may
@@ -1030,7 +1073,9 @@ impl Model {
                 self.top_reshape(None);
                 self.note_shared(SharedWrite::Removed(None));
             } else if self.is_chain_proto(t) {
-                self.reshape(None);
+                if !lock_delete {
+                    self.reshape(None);
+                }
             } else {
                 self.note_inst(t, true);
             }
@@ -1110,6 +1155,9 @@ impl Model {
         // not own (derive), never as a HARD chain.
         if kind == Hard::E5DefineProperty && matches!(self.toks[t as usize], TokKind::ObjectProto) {
             self.objproto_any_accessor();
+            return;
+        }
+        if lock_delete {
             return;
         }
         if self.hard.contains_key(&t) {

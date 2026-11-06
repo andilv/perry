@@ -43,7 +43,6 @@ fn empty_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         imported_classes: Vec::new(),
         constructor_param_counts: Default::default(),
-        short_spread_method_candidates: std::sync::Arc::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),
@@ -136,7 +135,12 @@ fn key_changes_with_gc_effects_table() {
             ("other", perry_gc_effects::Class::Reenters, true),
         ]
         .into_iter()
-        .map(|(sym, class, throws)| (sym.to_string(), perry_gc_effects::Entry { class, throws }))
+        .map(|(sym, class, throws)| {
+            (
+                sym.to_string(),
+                perry_gc_effects::Entry::unknown(class, throws),
+            )
+        })
         .collect();
         std::sync::Arc::new(perry_codegen::GcEffects::from_sidecar(&table))
     };

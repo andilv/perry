@@ -12,11 +12,13 @@ use std::cell::{Cell, RefCell};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::RwLock;
-/// Minimum number of inline field slots every object is allocated with, even
-/// when it has fewer fields. This is a corruption-critical invariant: allocation,
-/// every field get/set bounds check, and every direct-slot read MUST use the
-/// SAME floor, or a write/read past the allocated slots corrupts the heap. It is
-/// centralized here so all sites move in lockstep. (Also mirrored in
+/// Minimum number of inline field slots an ordinary allocation (`js_object_alloc`
+/// and the inline `new`) reserves, even when it has fewer fields. A birth on a
+/// compiler-fixed layout (`object/layout_desc.rs`) has exactly its declared
+/// slots, so no reader may assume the floor: a positional slot read or write is
+/// bounded by the object's own allocation, `object_inline_capacity` (a read
+/// past it walks into the next arena object). It is centralized here so the
+/// allocators move in lockstep. (Also mirrored in
 /// perry-codegen `lower_call/new_alloc.rs` MIN_FIELD_SLOTS for the inline-`new`
 /// path and `expr::inline_slot_floor::INLINE_SLOT_FLOOR` for the emitted bounds
 /// checks; paired by `inline_slot_floor_matches_codegen` here and
@@ -166,6 +168,7 @@ pub(crate) mod builtin_namespace;
 pub mod builtin_proto;
 mod builtin_proto_entries;
 pub mod handle_expando;
+pub(crate) mod http_handle_prototype;
 pub(crate) mod owned_state_bag;
 pub(crate) mod prop_plan;
 pub(crate) mod proto_validity;
@@ -325,7 +328,7 @@ mod with_env;
 // helpers that lived directly in `object/mod.rs`.
 mod class_meta_registry;
 pub(crate) mod descriptor_state;
-mod this_binding;
+pub(crate) mod this_binding;
 mod to_string_tag;
 pub use alloc::*;
 pub use arguments::*;
@@ -413,9 +416,9 @@ pub(crate) use descriptor_state::{
     reflect_getter_closure_bits, set_accessor_descriptor, set_builtin_accessor_descriptor,
     set_builtin_property_attrs, set_property_attrs, AccessorDescriptor, PropertyAttrs,
 };
-#[cfg(any(test, target_os = "wasi"))]
+#[cfg(test)]
 pub(crate) use field_get_set::private_lexical_brand_depth;
-#[cfg(any(test, target_os = "wasi"))]
+#[cfg(test)]
 pub(crate) use field_get_set::private_member_access_hints_depth;
 pub(crate) use field_get_set::FieldLookupCaches;
 pub(crate) use field_get_set::{
@@ -427,7 +430,7 @@ pub(crate) use field_get_set::{
 };
 #[cfg(test)]
 pub(crate) use this_binding::derived_super_scope_push_at;
-#[cfg(any(test, target_os = "wasi"))]
+#[cfg(test)]
 pub(crate) use this_binding::static_private_owner_depth;
 #[cfg(test)]
 pub(crate) use this_binding::static_private_owner_push_at;
@@ -749,7 +752,7 @@ pub(crate) use keys_lookup::*;
 
 pub(crate) mod array_tail_transition;
 mod call_method_depth;
-#[cfg(any(test, target_os = "wasi"))]
+#[cfg(test)]
 pub(crate) use call_method_depth::call_method_depth;
 #[cfg(test)]
 pub(crate) use call_method_depth::test_enter_catch_method;
@@ -1955,5 +1958,7 @@ pub(crate) use field_get_set::{
     private_lexical_brand_restore_depth, private_member_access_hints_restore_depth,
 };
 
+#[cfg(test)]
+pub(crate) use native_call_method::namespace_override_depth;
 #[cfg(any(test, target_os = "wasi"))]
-pub(crate) use native_call_method::{namespace_override_depth, namespace_override_restore_depth};
+pub(crate) use native_call_method::namespace_override_restore_depth;

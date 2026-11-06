@@ -1,16 +1,16 @@
 //! Unit tests: small programs lowered from source, facts checked directly.
 
+mod absent_key;
 mod accessor_keys;
 mod accessor_receiver;
+mod annexb_accessors;
 mod arguments_object;
 mod array_ctor;
 mod array_elements;
+mod array_helper_nodes;
+mod array_holes;
 mod array_index_store;
 mod array_iteration;
-mod absent_key;
-mod host_objects;
-mod array_holes;
-mod for_of_yield;
 mod array_length;
 mod array_named_keys;
 mod array_numeric;
@@ -22,7 +22,11 @@ mod birth_site;
 mod body_activation;
 mod body_identity;
 mod bound_in_summary;
+mod builtin_fn_identity;
+mod builtin_fn_keys;
 mod builtin_members;
+mod builtin_program_fields;
+mod builtin_spread;
 mod call_shadow;
 mod callable_contract;
 mod callback_origin;
@@ -36,7 +40,9 @@ mod const_key_set_store;
 mod ctor_observed;
 mod ctor_return;
 mod dead_dynamic_import;
+mod declared_effects;
 mod default_params;
+pub(crate) mod delivery_boundaries;
 mod diagnostics;
 mod dynamic_code;
 mod dynamic_import;
@@ -45,19 +51,27 @@ mod escaped_contract_result;
 mod escaped_method_this;
 mod export_star;
 mod field_array_push;
-mod rest_elements;
 mod for_in_keys;
+mod for_of_yield;
+mod function_ctor_without_interp;
 mod function_values;
 mod getter_contract;
 mod global_gc;
 mod global_namespace_store;
+mod host_objects;
 mod hub_tokens;
+mod indexed_callees;
 mod indexed_owner;
 mod inherited_layout;
 mod interp_from_facts;
 mod layout_key;
 mod ledger;
 mod lit_accessor;
+mod locked_builtins;
+mod locked_delete;
+mod locked_store;
+mod logical_and;
+mod map_identity_ops;
 mod memo_context;
 mod named_accessors;
 mod native_fs;
@@ -65,6 +79,8 @@ mod native_given_proto;
 mod native_member;
 mod native_proto;
 mod num_key;
+mod own_guarded_read;
+mod own_helper_guard;
 mod own_key_shadow;
 mod own_length;
 mod parent_value;
@@ -73,6 +89,7 @@ mod prim_result;
 mod private_field;
 mod process_argv;
 mod proof_receivers;
+mod proto_lock_keys;
 mod proto_value;
 mod protocol_calls;
 mod protocol_keys;
@@ -82,11 +99,13 @@ mod receiver_this;
 mod regexp_exec;
 mod relinked_parent;
 mod rest_element;
+mod rest_elements;
 mod run_once_closed;
 mod runtime_helpers;
 mod spread_elements;
 mod summary;
 mod super_heritage;
+mod tdz_seed;
 mod top_element_key;
 mod type_export;
 mod typed_array_exact;
@@ -103,7 +122,7 @@ mod unit_this;
 mod unknown_accessor_key;
 mod unrun_param_call;
 
-use crate::{compute, FactsConfig, ProgramFacts, Verdict};
+use crate::{compute, FactsConfig, ProgramFacts, SiteFacts, Verdict};
 
 fn facts(src: &str) -> ProgramFacts {
     facts_with(src, FactsConfig::default())
@@ -1148,8 +1167,10 @@ fn cjs_cache_slot_holds_its_own_record() {
 /// store on what such a read returns (the loader's `child.parent = module`)
 /// is then a store on a record, not on a builtin (E20), and a call of it is
 /// no `Function(...)` call (E14). With `Object.prototype` as the prototype
-/// (`__perry_declared_keys_object`) the same read reaches the builtins.
-fn null_proto_read(births: &str) -> Option<String> {
+/// (`__perry_declared_keys_object`) the same read reaches the builtins: a
+/// store under a key they declare (`name`) sinks the value (E20); one under
+/// a key they do not declare (`parent`) is their field (rule R1).
+fn null_proto_read(births: &str, key: &str) -> Option<String> {
     let pf = facts(&format!(
         r#"
         class Parent {{ x = 1; }}
@@ -1159,7 +1180,7 @@ fn null_proto_read(births: &str) -> Option<String> {
         function read(path) {{ return cache[path]; }}
         const parent = new Parent();
         const got = read(String(Math.random()));
-        if (got !== undefined) got.parent = parent;
+        if (got !== undefined) got.{key} = parent;
         console.log(parent.x);
     "#
     ));
@@ -1168,11 +1189,16 @@ fn null_proto_read(births: &str) -> Option<String> {
 
 #[test]
 fn a_computed_read_of_a_null_prototype_record_stops_at_the_record() {
-    assert_eq!(null_proto_read("__perry_declared_keys"), None);
-    let escape = null_proto_read("__perry_declared_keys_object");
+    assert_eq!(null_proto_read("__perry_declared_keys", "parent"), None);
+    assert_eq!(null_proto_read("__perry_declared_keys", "name"), None);
+    let escape = null_proto_read("__perry_declared_keys_object", "name");
     assert!(
         escape.as_deref().is_some_and(|e| e.contains("E20")),
         "{escape:?}"
+    );
+    assert_eq!(
+        null_proto_read("__perry_declared_keys_object", "parent"),
+        None
     );
 }
 
@@ -1375,6 +1401,7 @@ fn a_parameter_node_holds_its_argument_marker() {
         ret,
         args_all: args,
         has_arguments: false,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
@@ -1382,6 +1409,7 @@ fn a_parameter_node_holds_its_argument_marker() {
         gen_step: false,
         gen_async: false,
         gen_reyields: false,
+        proto: None,
         captures: Vec::new(),
         forwards_super: false,
         parent: NO_FN,
@@ -1441,6 +1469,7 @@ fn a_store_into_a_marker_makes_no_field_of_it() {
         ret,
         args_all: args,
         has_arguments: false,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
@@ -1448,6 +1477,7 @@ fn a_store_into_a_marker_makes_no_field_of_it() {
         gen_step: false,
         gen_async: false,
         gen_reyields: false,
+        proto: None,
         captures: Vec::new(),
         forwards_super: false,
         parent: NO_FN,
@@ -1496,6 +1526,7 @@ fn an_argument_marker_leaves_beside_when_a_valued_member_links() {
         ret,
         args_all: args,
         has_arguments: false,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
@@ -1503,6 +1534,7 @@ fn an_argument_marker_leaves_beside_when_a_valued_member_links() {
         gen_step: false,
         gen_async: false,
         gen_reyields: false,
+        proto: None,
         captures: Vec::new(),
         forwards_super: false,
         parent: NO_FN,
@@ -1545,6 +1577,7 @@ fn marker_model() -> crate::model::Model {
         ret,
         args_all: args,
         has_arguments: false,
+        own_test: crate::model::OwnTestBody::Unknown,
         token,
         ctor_of: None,
         lexical_this: false,
@@ -1552,6 +1585,7 @@ fn marker_model() -> crate::model::Model {
         gen_step: false,
         gen_async: false,
         gen_reyields: false,
+        proto: None,
         forwards_super: false,
         parent: NO_FN,
         captures: Vec::new(),
@@ -1761,14 +1795,18 @@ fn a_protocol_touch_of_an_argument_marker_reads_nothing() {
     assert!(m.marker_use.get(&tj).is_some_and(|&u| u & MARK_ESCAPE != 0));
 }
 mod collection_entries;
+mod console_protocol;
 mod constructor_values;
 mod date_methods;
 mod delegate_step;
 mod generator_results;
 mod helper_protocols;
 mod host_helpers;
+mod key_shape;
 mod method_this_escape;
+mod native_proto_member;
 mod native_push;
+mod native_value_call;
 mod proto_own_call;
 mod receiver_param_call;
 mod regexp_results;
@@ -1816,3 +1854,14 @@ fn borrowed_function_method_fact_fails_closed_on_alias_and_top_writes() {
         .fnproto_borrow_written
         .is_none());
 }
+
+mod builtin_fn_storage;
+mod numeric_property_store;
+mod shared_sets;
+
+mod builtin_missing_member;
+
+mod annexb_alias;
+mod uri_coercion;
+
+mod accessor_lookup_values;

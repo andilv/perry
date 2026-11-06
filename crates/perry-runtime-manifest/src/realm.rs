@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 #[path = "realm_layout_facts.rs"]
 mod realm_layout_facts;
 pub use realm_layout_facts::*;
+#[path = "realm_effect.rs"]
+mod realm_effect;
+pub use realm_effect::*;
 
 pub use perry_runtime_manifest::realm_source::REALM_MANIFEST_VERSION;
 
@@ -190,6 +193,27 @@ pub struct RealmDeclaration {
     pub constructor: Option<ConstructorFacts>,
     #[serde(default)]
     pub storage: Option<RealmStorageFacts>,
+    /// What the body does to its inputs; empty = undeclared (unknown code).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<RealmEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub throws: Vec<RealmThrowOperand>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RealmThrowOperand {
+    pub source: Option<String>,
+    pub argument: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RealmThrowDeclaration {
+    pub symbol: String,
+    pub source: String,
+    pub line: usize,
+    pub operands: Vec<RealmThrowOperand>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -197,6 +221,8 @@ pub struct RealmDeclaration {
 pub struct RealmManifest {
     pub version: u32,
     pub declarations: Vec<RealmDeclaration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub throw_declarations: Vec<RealmThrowDeclaration>,
 }
 
 /// Borrowed projection in the generated compiler table. `facts` preserves
@@ -208,6 +234,8 @@ pub struct RealmEntry {
     pub births: &'static [&'static str],
     pub module: Option<&'static str>,
     pub facts: &'static str,
+    /// The declared effects of the body (empty: undeclared, unknown code).
+    pub effects: &'static [RealmEffect],
 }
 
 impl RealmManifest {
@@ -269,6 +297,15 @@ impl RealmManifest {
             }
         }
         for d in &self.declarations {
+            if !d.effects.is_empty() {
+                if d.body.is_none() {
+                    return Err(format!(
+                        "{}: effects on a declaration without a body",
+                        d.name
+                    ));
+                }
+                validate_effects(&d.name, &d.effects, &|name| names.contains(name))?;
+            }
             if let Some(RealmStorageFacts::RuntimeLayout(layout)) = &d.storage {
                 for owner in &layout.owners {
                     let birth = self

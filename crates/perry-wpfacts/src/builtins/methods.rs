@@ -6,9 +6,13 @@ use super::*;
 /// that names none of its members (a number, DECISIONS 217): only a number
 /// key a store into ⊤ wrote there, now or later in the solve
 /// (`native_written` of `NUM_KEY`), as a program prototype gives its
-/// numeric fields (`Model::num_fields`).
+/// numeric fields (`Model::num_fields`). None where the chain refuses the
+/// add (`locked_chain_read` of `NUM_KEY`, DEC 250): the key is absent.
 pub fn plain_key(m: &mut Model, origin: Tok, act: ChainAct) {
     let num = m.atom(NUM_KEY);
+    if locked_chain_read(m, origin, num) {
+        return;
+    }
     match act {
         ChainAct::Load(dst) => {
             if !intrinsic_miss(m, num, NativeMiss::Load(dst)) {
@@ -22,7 +26,7 @@ pub fn plain_key(m: &mut Model, origin: Tok, act: ChainAct) {
                 m.cur_this = prev;
             }
         }
-        ChainAct::Store(_) => {}
+        ChainAct::Store(_) | ChainAct::Lookup { .. } => {}
     }
 }
 
@@ -45,14 +49,14 @@ pub fn tok_store(m: &mut Model, t: Tok, _key: Key, src: NodeId) {
         // runtime handles: unknown code may call them with any receiver.
         TokKind::ObjectProto
         | TokKind::Builtin(_)
-        | TokKind::BuiltinFn
+        | TokKind::BuiltinFn(_)
         | TokKind::ModNs(_)
         | TokKind::NativeProto(_) => {
             // E20: stored where the runtime / unmodeled code reads it.
             if m.explain && !m.shared_replay {
                 let kn = match _key {
                     Key::Named(a) => m.atoms[a as usize].clone(),
-                    Key::Any => "[computed]".into(),
+                    Key::Any(_) => "[computed]".into(),
                 };
                 eprintln!(
                     "perry: wpfacts explain: E20 store on {} key {kn}",
@@ -65,7 +69,7 @@ pub fn tok_store(m: &mut Model, t: Tok, _key: Key, src: NodeId) {
             if matches!(m.toks[t as usize], TokKind::Builtin(BuiltinNs::Process))
                 && match _key {
                     Key::Named(a) => m.atoms[a as usize] == "argv",
-                    Key::Any => true,
+                    Key::Any(_) => true,
                 }
             {
                 let a = m.process_argv;
@@ -99,8 +103,10 @@ pub fn prim_method(m: &mut Model, prim: u16, key: Key, call: CallId) {
     };
     let name = m.atoms[a as usize].clone();
     // A key a store into ⊤ may have written onto the chain: the call runs
-    // what was stored (a described method may be replaced too).
-    if !intrinsic_miss(m, a, NativeMiss::PrimCall(prim, call)) {
+    // what was stored (a described method may be replaced too), unless the
+    // read is final on every kind of the mask (DEC 250).
+    let locked = members::prim_families(prim).all(|f| members::locked_read(f, None, &name));
+    if !locked && !intrinsic_miss(m, a, NativeMiss::PrimCall(prim, call)) {
         unknown_method(
             m,
             call,
@@ -127,7 +133,7 @@ pub fn prim_method(m: &mut Model, prim: u16, key: Key, call: CallId) {
         // program runs.
         Some(Mem::Fn) if name == "__defineGetter__" || name == "__defineSetter__" => {}
         Some(Mem::Fn) if name == "__lookupGetter__" || name == "__lookupSetter__" => {
-            ret_prim(m, call, prim::UNDEF)
+            annexb_lookup(m, None, call, name == "__lookupSetter__");
         }
         Some(Mem::Fn) if string_methods::string_method(m, call, &name) => {}
         Some(Mem::Fn) => prim_method_generic(m, call),
@@ -170,7 +176,7 @@ pub(super) fn undescribed_method(
         None if members::member(Family::Object, name).is_some() => {}
         None => {
             let a = m.atom(name);
-            if !intrinsic_miss(m, a, NativeMiss::Call(t, call)) {
+            if !intrinsic_unwritten(m, fam, None, a, NativeMiss::Call(t, call)) {
                 unknown_method(m, call, why);
             }
         }
@@ -187,14 +193,12 @@ pub fn own_method(m: &mut Model, t: Tok, key: Key, call: CallId) {
 pub(super) fn own_method_inner(m: &mut Model, t: Tok, key: Key, call: CallId) {
     let name = match key {
         Key::Named(a) => Some(m.atoms[a as usize].clone()),
-        Key::Any => None,
+        Key::Any(_) => None,
     };
     // A builtin function's `constructor` is the Function constructor (E14);
     // a computed key may name it.
     if let TokKind::Builtin(ns) = m.toks[t as usize] {
-        if members::ns_chain(ns) == Family::Function
-            && matches!(name.as_deref(), Some("constructor") | None)
-        {
+        if members::ns_chain(ns) == Family::Function && m.key_may_name_str(key, "constructor") {
             return call_builtin_ns(m, BuiltinNs::Function, call);
         }
     }
@@ -227,13 +231,27 @@ pub(super) fn own_method_inner(m: &mut Model, t: Tok, key: Key, call: CallId) {
         n => n,
     };
     // A described receiver's method under a key a store into ⊤ may have
-    // written onto its chain runs what was stored, beside the description.
+    // written onto its chain runs what was stored, beside the description,
+    // unless the read is final (DEC 250).
     if let (true, Some(n), Key::Named(a)) = (described, name.as_deref(), key) {
-        if !intrinsic_miss(m, a, NativeMiss::Call(t, call)) {
+        if !locked_chain_read(m, t, a) && !intrinsic_miss(m, a, NativeMiss::Call(t, call)) {
             unknown_method(m, call, &format!("argument of a written method {n}"));
         }
     }
     match m.toks[t as usize].clone() {
+        // Inherited Annex B methods run through the prototype-chain
+        // summary. An opaque own-method summary beside it would also
+        // hand the installed callback to unknown code.
+        TokKind::Builtin(ns)
+            if name.as_deref().is_some_and(|n| {
+                matches!(n, "__defineGetter__" | "__defineSetter__")
+                    && matches!(members::ns_member(ns, n), Some(Some(Mem::Fn)))
+            }) => {}
+        TokKind::BuiltinFn(_)
+            if matches!(
+                name.as_deref(),
+                Some("__defineGetter__" | "__defineSetter__")
+            ) => {}
         // `Function.prototype.call/apply/bind` of a described builtin
         // method: its call, the receiver given.
         TokKind::Builtin(BuiltinNs::ObjectProtoOwn(_))
@@ -246,7 +264,20 @@ pub(super) fn own_method_inner(m: &mut Model, t: Tok, key: Key, call: CallId) {
         // A builtin function value's methods are `Function.prototype`'s
         // (and `Object.prototype`'s): what one does with its arguments is
         // unknown (`push.call(o, v)` stores). Any other name is absent.
-        TokKind::BuiltinFn => match name.as_deref() {
+        // `Function.prototype.call/apply/bind` of a named native: the
+        // native runs with the receiver given, as a program function does
+        // (unless the program wrote the key onto `Function.prototype`).
+        TokKind::BuiltinFn(Native::Member { .. })
+            if matches!(name.as_deref(), Some("call" | "apply" | "bind")) =>
+        {
+            let Key::Named(a) = key else { unreachable!() };
+            let n = name.as_deref().unwrap_or_default();
+            if !locked_chain_read(m, t, a) && !intrinsic_miss(m, a, NativeMiss::Call(t, call)) {
+                unknown_method(m, call, &format!("argument of a written method {n}"));
+            }
+            function_method(m, t, Some(n), call)
+        }
+        TokKind::BuiltinFn(_) => match name.as_deref() {
             None => {}
             Some(n) => {
                 let why = format!("method {n} of an opaque builtin function");
@@ -363,7 +394,7 @@ pub(super) const OBJECT_PROTO_METHODS: [&str; 5] = [
 pub(super) fn proto_method_inner(m: &mut Model, p: Tok, origin: Tok, key: Key, call: CallId) {
     let name = match key {
         Key::Named(a) => m.atoms[a as usize].clone(),
-        Key::Any => return,
+        Key::Any(_) => return,
     };
     if name.starts_with(WK_PREFIX) {
         return;
@@ -383,42 +414,106 @@ pub(super) fn proto_method_inner(m: &mut Model, p: Tok, origin: Tok, key: Key, c
                 if m.calls[call as usize].args.len() < 2
                     && m.calls[call as usize].spread.is_empty() => {}
             "__defineGetter__" | "__defineSetter__" => {
-                let r = m.reason("E5 __defineGetter__/__defineSetter__");
-                m.mark_hard(origin, Hard::E5DefineProperty, r);
-                // An accessor under a key not known here.
-                let star = m.atom(crate::STAR_KEY);
-                let ks = m.accessor_keys.entry(origin).or_default();
-                if !ks.contains(&star) {
-                    ks.push(star);
-                }
-                m.escape(origin, r);
-                // ToPropertyKey of the key; the function becomes an accessor
-                // of the escaped receiver, which unknown code runs.
-                let c = m.calls[call as usize].clone();
-                if let Some(&k) = c.args.first() {
-                    let reason = m.reason("ToPropertyKey");
-                    m.cons(
-                        k,
-                        Cons::Implicit {
-                            reason,
-                            proto: Protocol::ToPrimitive,
-                        },
-                    );
-                }
-                let r = m.reason("E5 __defineGetter__ argument");
-                for &a in c.args.iter().skip(1).take(1).chain(&c.spread) {
-                    m.sink_node(a, r);
-                }
+                annexb_define(m, origin, call, name == "__defineSetter__");
                 ret_prim(m, call, prim::UNDEF);
             }
             "__lookupGetter__" | "__lookupSetter__" => {
-                implicit_args(m, call, "ToPropertyKey", Protocol::ToPrimitive);
-                m.implicit(origin, 0, Protocol::Any);
-                ret_tok(m, call, TOP);
+                annexb_lookup(m, Some(origin), call, name == "__lookupSetter__");
             }
             _ => {}
         },
         TokKind::NativeProto(name_of) => native_method(m, p, &name_of, origin, &name, call),
         _ => {}
+    }
+}
+
+/// Annex B defines a descriptor; only an unmodeled receiver keeps the
+/// reflective escape fallback. Known holders use the descriptor accessor flow.
+pub(crate) fn annexb_define(m: &mut Model, origin: Tok, call: CallId, setter: bool) {
+    let c = m.calls[call as usize].clone();
+    if c.args.len() < 2 && c.spread.is_empty() {
+        return;
+    }
+    if let Some(&k) = c.args.first() {
+        let reason = m.reason("ToPropertyKey");
+        m.cons(
+            k,
+            Cons::Implicit {
+                reason,
+                proto: Protocol::ToPrimitive,
+            },
+        );
+    }
+    let key = c
+        .spread
+        .is_empty()
+        .then(|| m.call_lit.get(&call).copied())
+        .flatten()
+        .unwrap_or_else(|| m.atom(crate::STAR_KEY));
+    if accessor_receiver(m, origin, key) {
+        let holder = m.node_l("annexb-holder");
+        m.add_tok(holder, origin);
+        // Spread positions are not retained in CallSite: any direct or
+        // spread value may be argument 1, and its key is not known here.
+        let direct = if c.spread.is_empty() {
+            &c.args[1..2]
+        } else {
+            &c.args[..]
+        };
+        for &f in direct {
+            m.cons(
+                f,
+                Cons::Accessor {
+                    holder,
+                    key,
+                    setter,
+                },
+            );
+        }
+        for &spread in &c.spread {
+            let f = m.node_l("annexb-spread-function");
+            let key = m.atom(crate::STAR_KEY);
+            let elem = m.elem_key();
+            m.cons(spread, Cons::Load { key: elem, dst: f });
+            m.cons(
+                f,
+                Cons::Accessor {
+                    holder,
+                    key,
+                    setter,
+                },
+            );
+        }
+    } else {
+        let r = m.reason("E5 __defineGetter__/__defineSetter__");
+        m.mark_hard(origin, Hard::E5DefineProperty, r);
+        let star = m.atom(crate::STAR_KEY);
+        let ks = m.accessor_keys.entry(origin).or_default();
+        if !ks.contains(&star) {
+            ks.push(star);
+        }
+        m.escape(origin, r);
+        let r = m.reason("E5 __defineGetter__ argument");
+        for &f in c.args.iter().skip(1).take(1).chain(&c.spread) {
+            m.sink_node(f, r);
+        }
+    }
+}
+
+/// Receiver shapes for which descriptor accessors have modeled holder groups.
+pub(crate) fn accessor_receiver(m: &Model, t: Tok, key: Atom) -> bool {
+    !m.is_marker(t)
+        && (matches!(
+            m.toks[t as usize],
+            TokKind::Obj(..) | TokKind::Func(..) | TokKind::Proto(_) | TokKind::ClassObj(_)
+        ) || super::undeclared(m, t, key))
+}
+
+/// Callable values whose bodies the accessor groups cannot bind precisely.
+pub(crate) fn unknown_accessor_callable(m: &Model, t: Tok) -> bool {
+    match m.toks[t as usize] {
+        TokKind::Top | TokKind::BuiltinFn(_) | TokKind::Bound(_) | TokKind::ClassObj(_) => true,
+        TokKind::Builtin(ns) => members::ns_chain(ns) == Family::Function,
+        _ => false,
     }
 }

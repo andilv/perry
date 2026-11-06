@@ -33,6 +33,7 @@ fn arr(m: &mut Model, hole_free: bool) -> Tok {
         parent_links: Vec::new(),
         null_proto: false,
         chain_miss: false,
+        chain_miss_open: false,
         species: None,
         per_evaluation: false,
         static_methods: Vec::new(),
@@ -123,7 +124,7 @@ fn index_length_and_computed_stores_may_leave_a_hole() {
         m.solve();
         assert!(!holds_undef(&m, d), "{k}: dense before the store");
         let key = match k {
-            "*any" => Key::Any,
+            "*any" => Key::any(),
             _ => Key::Named(m.atom(k)),
         };
         store(&mut m, t, key);

@@ -32,6 +32,7 @@ mod gen_expr;
 mod gen_rest;
 mod ledger;
 pub mod model;
+pub mod native_effects;
 pub mod pts;
 mod rooted;
 mod solve;
@@ -144,6 +145,9 @@ pub struct Stats {
     pub pts_entries: u64,
     /// The largest points-to sets: (node label, size, token-kind mix).
     pub big_nodes: Vec<(String, usize, String)>,
+    /// Rule R1: how many program fields of built-in objects, the largest
+    /// first (`holder.key`, set size), the sinks (`Model::r1_sinks`).
+    pub builtin_fields: (usize, Vec<(String, usize)>, [u64; 4]),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -330,7 +334,7 @@ use contracts::open_templates;
 use contracts::unnamed_methods;
 use contracts::value_contract_of;
 use contracts::value_contract_of_toks;
-use program_facts::big_nodes;
+use program_facts::{big_nodes, builtin_fields};
 
 /// Generation and the summaries for one analysis of `sorted` (with `act`,
 /// DECISIONS 225: only the bodies that can run are walked; an unfixed set
@@ -344,12 +348,31 @@ fn generate<'a>(
     t0: std::time::Instant,
 ) -> (gen::Gen<'a>, f64, std::time::Instant) {
     let loud = act.as_ref().is_none_or(|a| a.fixed);
-    let mut g = gen::Gen::new(sorted.to_vec(), cfg.relations && loud, cfg.explain && loud);
+    // Node IDs name the final observed model. Never apply its diagnostic
+    // suppression selector to intermediate liveness models with other IDs.
+    let birth_census =
+        cfg.diagnostics && loud && std::env::var_os("PERRY_FACTS_BIRTH_CENSUS").is_some();
+    let mut g = gen::Gen::new_observed(
+        sorted.to_vec(),
+        cfg.relations && loud,
+        cfg.explain && loud,
+        birth_census,
+    );
     // DECISIONS 225: a body is walked once its function can run.
     g.m.act = act;
     if cfg.diagnostics && loud {
         g.diagnostic = Some(Default::default());
-        g.m.diagnostic = Some(Default::default());
+        g.m.diagnostic.get_or_insert_with(Default::default);
+        if std::env::var_os("PERRY_FACTS_BIRTH_CENSUS").is_some()
+            && g.m.diagnostic.as_ref().unwrap().census.is_none()
+        {
+            g.m.diagnostic.as_mut().unwrap().census = Some(crate::diagnostics::BirthCensus {
+                suppress: (std::env::var("PERRY_FACTS_ONLY").ok().as_deref() == Some("1"))
+                    .then(|| std::env::var("PERRY_FACTS_SUPPRESS_BIRTH").ok())
+                    .flatten(),
+                ..Default::default()
+            });
+        }
     }
     g.export_sources = cfg.export_sources.clone();
     g.roots = cfg.roots.clone();
@@ -444,6 +467,18 @@ fn generate<'a>(
             f.no_summary = true;
         }
     }
+    // An unwalked body is no evidence, even if its token reached a guard.
+    let pending: Vec<_> =
+        g.m.funcs
+            .iter()
+            .filter_map(|f| match f.own_test {
+                model::OwnTestBody::Pending(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+    for n in pending {
+        g.m.refute_own_test(n);
+    }
     g.m.summarize_and_replay();
     g.m.prof_mark(crate::model::NO_NODE, "summaries");
     if (cfg.profile || cfg.explain) && loud {
@@ -487,8 +522,11 @@ impl Activation {
     /// them, so no active key names them).
     fn over(self, sorted: &[(&str, &Module)]) -> Option<model::Act> {
         let mut act = self.act?;
-        let index: std::collections::HashMap<&str, u32> =
-            sorted.iter().enumerate().map(|(i, (p, _))| (*p, i as u32)).collect();
+        let index: std::collections::HashMap<&str, u32> = sorted
+            .iter()
+            .enumerate()
+            .map(|(i, (p, _))| (*p, i as u32))
+            .collect();
         let modules = &self.modules;
         let to = |s: crate::pts::FxHashSet<(u32, u32, String)>| {
             s.into_iter()
@@ -570,7 +608,9 @@ fn activation_pass<'a>(
     if g.m.aborted {
         return None;
     }
-    let seen = (0..g.m.funcs.len() as u32).map(|f| g.m.act_key(f)).collect();
+    let seen = (0..g.m.funcs.len() as u32)
+        .map(|f| g.m.act_key(f))
+        .collect();
     let mut a = g.m.act.take()?;
     a.fixed = true;
     a.queue.clear();
@@ -673,7 +713,7 @@ fn compute_act<'a>(
             .map(|((h, k), gr)| {
                 let ng = match k {
                     model::Key::Named(a) => m.accessors.get(&(*h, *a)).map_or(0, |x| x.0.len()),
-                    model::Key::Any => m.accessor_keys.get(h).map_or(0, |x| x.len()),
+                    model::Key::Any(_) => m.accessor_keys.get(h).map_or(0, |x| x.len()),
                 };
                 (
                     m.nodes[gr.ar as usize].pts.len(),
@@ -695,6 +735,8 @@ fn compute_act<'a>(
         }
     }
     g.m.dump_meta();
+    #[cfg(test)]
+    tests::delivery_boundaries::record(&g.m);
     if g.m.explain && !g.m.bf_mints.is_empty() {
         let mut v: Vec<(&str, u32)> = g.m.bf_mints.iter().map(|(k, n)| (*k, *n)).collect();
         v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
@@ -780,6 +822,7 @@ fn compute_act<'a>(
         checks,
         pts_entries: g.m.pts_entries,
         big_nodes: big_nodes(&g.m),
+        builtin_fields: builtin_fields(&g.m),
         top_calls: g.m.top_calls,
         profile: {
             let mut v: Vec<(String, u64, f64)> =

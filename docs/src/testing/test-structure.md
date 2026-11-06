@@ -14,7 +14,7 @@ Ask what the assertion needs to see.
 
 | The assertion is… | It is… | It lives in |
 |---|---|---|
-| what a program prints or exits with, and Node can produce it | a `.ts` program diffed against Node | `test-parity/<subject>/` |
+| what a program prints or exits with, and Node can produce it | a program diffed against Node | `test-parity/<subject>/` |
 | the same, but only meaningful under a GC mode | a `.ts` program run by the GC matrix | `test-parity/<subject>/`, modes declared in its header |
 | what Perry prints for a Perry-only API | a `.ts` program with committed expected output | `test-parity/perry/<api>/` |
 | an internal invariant: rooting, layout, ordering, allocation, private state | a Rust unit test | beside the code |
@@ -45,6 +45,32 @@ test-parity/
 A case that exists to drive an optimization path still lives under the
 subject whose behavior it observes. Its purpose belongs in its header, not in
 its directory.
+
+Legacy and subject roots accept `.ts`, `.cts`, `.mts` and `test_*.cjs`. Keep
+source extensions during migration: Node uses them to select the module mode.
+Case ids omit TypeScript-family suffixes and retain `.cjs`. Helpers remain in
+`fixtures/`, excluded regardless of their extension.
+
+The GC representation-selection corpus keeps its stable bare-basename IDs in
+`test-parity/gc_repsel_corpus.txt`. The matrix resolves each ID to exactly one
+runnable `.ts` case, whether it is still top-level in `test-files/` or has moved
+under a subject root. Fixtures are not cases; unknown or duplicate source IDs
+fail before the oracle or compiler runs. This keeps GC report names and flat
+artifacts stable while the case itself moves with its subject.
+
+The root-dominance corpus and GC registration guards use the same source
+resolver's basename-pattern lookup across all roots. Pattern order and repeated
+matches remain intact; fixtures never become corpus inputs. Strict corpus
+patterns fail when empty, while optional registration categories may be empty.
+
+The WASI acceptance runner's `gap` suite and `scripts/wasi_ir_check.sh` resolve
+their fixed sample basenames through the same resolver. Moving a sample does
+not change its order, report name or output directory. Repeated acceptance
+filters select a union before lookup; missing unselected samples do not block
+that selection. An existing legacy source takes precedence; canonical-only
+duplicates fail closed. A missing selected source keeps its legacy locator:
+acceptance lets the oracle report its failure, while the IR gate reports its
+missing-sample diagnostic before compiling.
 
 `expected/` mirrors the test's path. A lookup by basename lets two subjects
 with the same case name overwrite each other.
@@ -102,6 +128,12 @@ nightly run executes every subject.
 
 `test-files/test_gap_*` keeps running on every pull request until it is empty.
 Nothing leaves it before its subject directory gates pull requests.
+
+Legacy leftovers need classification, not a blanket move: a helper can still
+be enrolled in the gap lane, and a skipped interactive case can still belong
+to compile smoke. Preserve those independent gates before changing discovery.
+Perry-only cases need committed expected output or an explicit Node oracle
+loader; a missing oracle is not a reason to invent a passing baseline.
 
 1. **One runner** lands beside the old one and takes over each gate in turn,
    without moving a file.

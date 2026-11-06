@@ -2883,7 +2883,7 @@ msgid ""
 msgstr ""
 "`perry compile` esegue il passaggio `codegen`, ajv emette `generated/"
 "validator.cjs` (senza `new Function`), e Perry lo compila nativamente. Vedi "
-"`test-files/test_ajv_standalone.ts` per un esempio eseguibile con test di "
+"`test-parity/npm/ajv/test_ajv_standalone.ts` per un esempio eseguibile con test di "
 "parità byte."
 
 #: src/getting-started/project-config.md:162
@@ -64909,7 +64909,7 @@ msgstr ""
 
 #: src/testing/http2-conformance.md:3
 msgid ""
-"Fourteen gap fixtures under `test-files/test_gap_http2_*.ts`, plus the "
+"Fourteen gap fixtures under `test-parity/node-suite/http2/test_gap_http2_*.ts`, plus the "
 "shared wire codec `test-files/_helpers/h2_wire.ts`, that pin what Perry's "
 "`node:http2` has to do — measured against **Node 26.5.1**, the `.node-"
 "version` pin, never against Perry's current output."

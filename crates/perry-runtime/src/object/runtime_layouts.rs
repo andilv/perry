@@ -348,6 +348,9 @@ pub(crate) mod intrinsic_private_atoms {
         "#<perry:private-value:0:@0:[[WorkerId]]>",
         "233c70657272793a707269766174652d76616c75653a303a40303a5b5b576f726b657249645d5d3e"
     );
+    runtime_atom!(BROADCAST_CHANNEL_ID, "#<perry:private-value:0:@0:[[BroadcastChannelId]]>", "233c70657272793a707269766174652d76616c75653a303a40303a5b5b42726f6164636173744368616e6e656c49645d5d3e");
+    runtime_atom!(BROADCAST_CHANNEL_NAME, "#<perry:private-value:0:@0:[[BroadcastChannelName]]>", "233c70657272793a707269766174652d76616c75653a303a40303a5b5b42726f6164636173744368616e6e656c4e616d655d5d3e");
+    runtime_atom!(BROADCAST_CHANNEL_CLOSED, "#<perry:private-value:0:@0:[[BroadcastChannelClosed]]>", "233c70657272793a707269766174652d76616c75653a303a40303a5b5b42726f6164636173744368616e6e656c436c6f7365645d5d3e");
     runtime_atom!(MESSAGE_PORT_ID, "#<perry:private-value:0:@0:[[MessagePortId]]>", "233c70657272793a707269766174652d76616c75653a303a40303a5b5b4d657373616765506f727449645d5d3e");
     runtime_atom!(
         REGEXP_MATCHER,
@@ -1381,15 +1384,19 @@ const fn runtime_layout_word(name: &str) -> u32 {
     if same(name, "ARRAY_LATE") {
         return 0x80000085;
     }
+    #[cfg(test)]
+    if same(name, "DEFINED_HOLE") {
+        return 0x80000086;
+    }
     panic!("runtime descriptor absent from native catalog");
 }
 
 /// The rows of the runtime layouts only perry-runtime's own tests declare
-/// (`HOLEY` … `ARRAY_LATE` above): the band right after the native
+/// (`HOLEY` … `DEFINED_HOLE` above): the band right after the native
 /// rows. They are runtime layouts like the native ones, so their shape is
 /// installed at their first birth; no startup walk sees them.
 #[cfg(test)]
-const TEST_LAYOUT_ROWS: u32 = 9;
+const TEST_LAYOUT_ROWS: u32 = 10;
 #[cfg(not(test))]
 const TEST_LAYOUT_ROWS: u32 = 0;
 

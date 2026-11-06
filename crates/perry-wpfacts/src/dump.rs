@@ -150,6 +150,15 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
     for (l, n, mix) in &s.big_nodes {
         out.push_str(&format!("# bignode {l} {n} {mix}\n"));
     }
+    out.push_str(&format!("# r1fields {}\n", s.builtin_fields.0));
+    let k = s.builtin_fields.2;
+    out.push_str(&format!(
+        "# r1sinks ns={} ns_with_fields={} fn={} fn_with_fields={}\n",
+        k[0], k[1], k[2], k[3]
+    ));
+    for (l, n) in &s.builtin_fields.1 {
+        out.push_str(&format!("# r1field {l} {n}\n"));
+    }
     out.push_str(&format!(
         "# sabotage {}\n",
         pf.sabotage.clone().unwrap_or_else(|| "none".into())
@@ -476,4 +485,34 @@ pub fn apply_sabotage(ts: &mut [TemplateFacts], spec: &str) {
         }
         t.sabotaged = true;
     }
+}
+
+/// Complete bounded-test solver output, including primitive and activation state.
+#[cfg(test)]
+pub(crate) fn solver_state(m: &crate::model::Model) -> String {
+    use std::fmt::Write;
+    let mut out = format!("solve work={} aborted={}\n", m.work, m.aborted);
+    for (i, n) in m.nodes.iter().enumerate() {
+        writeln!(
+            out,
+            "node {i} prim={} dropped={} pts={:?}",
+            n.prim,
+            n.dropped,
+            n.pts.to_sorted()
+        )
+        .unwrap();
+    }
+    if let Some(a) = &m.act {
+        let mut on: Vec<_> = a.on.iter().collect();
+        on.sort();
+        let mut walked: Vec<_> = a.walked.iter().collect();
+        walked.sort();
+        writeln!(
+            out,
+            "activation fixed={} on={on:?} walked={walked:?}",
+            a.fixed
+        )
+        .unwrap();
+    }
+    out
 }

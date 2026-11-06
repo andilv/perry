@@ -8,25 +8,40 @@
 //! for values leaving into it). The rules here are the executable form of
 //! design section 3.2; `scripts/wpfacts_recompute.py` re-implements them.
 
+mod accessor_lookup;
 mod copy;
 mod define;
 mod lookup;
+mod own_read;
 
 use crate::builtins;
 mod call_and_construct;
+mod native_value;
 mod shared;
-use crate::delta::{Targets, Tokens};
+use crate::delta::Tokens;
 use crate::model::*;
 
 #[path = "solve/apply.rs"]
 mod apply;
+mod builtin_fields;
 
 #[path = "solve/store.rs"]
 mod store;
 
 mod escape;
 mod fields;
+mod shaped_keys;
 mod virt;
+
+// Property-key ranges come from value deltas, not source annotations. Keep
+// computed reads and calls on the same partition of ToPropertyKey's inputs.
+fn index_needs_general_key(toks: Tokens<'_>, prim: u16) -> bool {
+    prim & (prim::STR | prim::SYMBOL) != 0 || !toks.is_empty()
+}
+
+fn index_has_numeric_key(prim: u16) -> bool {
+    prim & (prim::NUM | prim::BIGINT) != 0
+}
 
 impl Model {
     // ---------------------------------------------------------------- nodes
@@ -36,6 +51,15 @@ impl Model {
         self.add_tokens(n, Tokens::Slice(toks), prim);
     }
     fn add_tokens(&mut self, n: NodeId, toks: Tokens<'_>, prim: u16) {
+        if let Some(c) = self.diagnostic.as_mut().and_then(|d| d.census.as_mut()) {
+            if !c.injecting
+                && self.cur_src != NO_NODE
+                && self.cur_src != n
+                && toks.iter().any(|&t| t == TOP)
+            {
+                c.top_edges.insert((self.cur_src, n));
+            }
+        }
         let mut later: Vec<Tok> = Vec::new();
         // A marker crossing into the node arrives as a member of the node's
         // own marker (MRK, `Model::crosses`; DECISIONS 44 for parameters):
@@ -58,13 +82,26 @@ impl Model {
                 }
                 false => None,
             };
-        let targets = if toks.is_empty() {
-            Targets::Empty
-        } else {
-            Targets::capture(
-                &self.nodes[n as usize].succ,
-                self.nodes[n as usize].succ_set.as_ref(),
-            )
+        let boundary = self.nodes[n as usize].succ.len() as u32;
+        // Delta tokens are distinct; a slice may repeat one.
+        let distinct =
+            crossed.is_none() && matches!(toks, Tokens::Pending(_) | Tokens::Delivery(..));
+        let mut fresh = std::mem::take(&mut self.fresh);
+        let mut seen = std::mem::take(&mut self.fresh_seen);
+        fresh.clear();
+        seen.clear();
+        // Is `t` already among the new members?
+        let is_fresh = |fresh: &[Tok], seen: &mut crate::pts::FxHashSet<Tok>, t: Tok| {
+            if distinct {
+                return false;
+            }
+            if fresh.len() <= 16 {
+                return fresh.contains(&t);
+            }
+            if seen.len() < fresh.len() {
+                seen.extend(fresh[seen.len()..].iter().copied());
+            }
+            seen.contains(&t)
         };
         let node = &mut self.nodes[n as usize];
         let mut changed = false;
@@ -84,8 +121,9 @@ impl Model {
                 later.push(t);
                 continue;
             }
-            if node.pts.insert(t) {
-                node.delta.push_to(t, &targets);
+            if !node.pts.contains_tok(t) && !is_fresh(&fresh, &mut seen, t) {
+                fresh.push(t);
+                self.pending.push_to(&mut node.delta, t, boundary);
                 changed = true;
                 self.pts_entries += 1;
                 top_new |= t == TOP;
@@ -95,18 +133,27 @@ impl Model {
         // to the marker, and the readers after the solve read it as ⊤. Left
         // out, it never floods the unit. Without ⊤ it is delivered as before.
         if !later.is_empty() {
-            if node.pts.contains_tok(TOP) {
+            if top_new || node.pts.contains_tok(TOP) {
                 node.dropped = true;
             } else {
                 for t in later {
-                    if node.pts.insert(t) {
-                        node.delta.push_to(t, &targets);
+                    if !node.pts.contains_tok(t) && !is_fresh(&fresh, &mut seen, t) {
+                        fresh.push(t);
+                        self.pending.push_to(&mut node.delta, t, boundary);
                         changed = true;
                         self.pts_entries += 1;
                     }
                 }
             }
         }
+        // One step from the old set to the new one: a shared set is never
+        // copied in place (`SetTable::extend`).
+        if !fresh.is_empty() {
+            let old = std::mem::take(&mut node.pts);
+            node.pts = self.sets.extend(old, &fresh);
+        }
+        self.fresh = fresh;
+        self.fresh_seen = seen;
         if top_new && self.diagnostic.is_some() {
             self.diagnostic_predecessor(n, self.cur_src, self.cur_why);
         }
@@ -180,6 +227,26 @@ impl Model {
             "perry: wpfacts work total={} in pops={in_pops} phases={ph:?} steps pop-charge={} fast-copy={} copy={} copy-extra={}",
             self.work, p.step[0], p.step[1], p.step[2], p.step[3]
         );
+        let [sites, shaped, no_ctor] = self.key_shape_census;
+        eprintln!(
+            "perry: wpfacts key shapes sites={sites} shaped={shaped} no_constructor={no_ctor} distinct={}",
+            self.key_shapes.len().saturating_sub(1)
+        );
+        let [own, gated, obj_key] = self.own_read_census;
+        eprintln!("perry: wpfacts own reads generated={own} gated={gated} object_key={obj_key}");
+        let (logical, stored, distinct) = self.pts_storage();
+        eprintln!(
+            "perry: wpfacts sets logical={logical} stored={stored} distinct={distinct} copies={}",
+            self.sets.copies
+        );
+        let mut natives: Vec<_> = p.natives.iter().collect();
+        natives.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, (runs, sites)) in natives {
+            eprintln!(
+                "perry: wpfacts native-effects {name} runs={runs} sites={}",
+                sites.len()
+            );
+        }
         let mut ks: Vec<_> = p.kind.iter().collect();
         ks.sort_by(|a, b| (b.1 .1 + b.1 .3).cmp(&(a.1 .1 + a.1 .3)));
         for (k, (n, w, rn, rw)) in ks.iter().take(25) {
@@ -229,12 +296,8 @@ impl Model {
             .map(|p| p * 4096 / (1 << 20))
             .unwrap_or(0);
         let succ_cap: usize = self.nodes.iter().map(|n| n.succ.capacity()).sum();
-        let delta_cap: usize = self.nodes.iter().map(|n| n.delta.capacity()).sum();
-        let big: usize = self
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.pts, crate::pts::Pts::Big(_)))
-            .count();
+        let delta_cap = self.pending.retained_bytes() / std::mem::size_of::<u32>();
+        let big: usize = self.nodes.iter().filter(|n| n.pts.is_hashed()).count();
         let mut hubs: Vec<(usize, usize)> = self
             .nodes
             .iter()
@@ -288,7 +351,42 @@ impl Model {
     }
 
     /// Seed a token (an input fact outside the solver rules: logged).
+    #[track_caller]
     pub fn add_tok(&mut self, n: NodeId, t: Tok) {
+        if t == TOP
+            && self.diagnostic.as_ref().is_some_and(|d| d.census.is_some())
+            && !self
+                .nodes
+                .get(self.cur_src as usize)
+                .is_some_and(|v| v.pts.contains_tok(TOP))
+        {
+            if let Some(d) = &mut self.diagnostic {
+                if let Some(c) = &mut d.census {
+                    if !c.injecting {
+                        let at = std::panic::Location::caller();
+                        let gate = c.node_gate(n);
+                        c.inject_at = Some((n, gate));
+                        c.injections.insert((
+                            n,
+                            at.file().into(),
+                            at.line(),
+                            "direct TOP token".into(),
+                            d.cause_node.unwrap_or(NO_NODE),
+                            d.cur_call.unwrap_or(u32::MAX),
+                            d.escaping.last().copied().unwrap_or(u32::MAX),
+                            self.cur_fn,
+                            gate,
+                        ));
+                        if c.suppress.as_deref()
+                            == Some(format!("{}:{}:{n}", at.file(), at.line()).as_str())
+                        {
+                            c.suppressed += 1;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if self.rel_phase != b'S' {
             self.rel(|| format!("addr {n} {t}"));
         }
@@ -304,7 +402,45 @@ impl Model {
 
     /// Seed ⊤ into `n` as an ORIGIN (not a propagation): `why` names the
     /// unmodeled thing; only interned in explain mode (diagnostics).
+    #[track_caller]
     pub fn add_top(&mut self, n: NodeId, why: impl FnOnce(&Self) -> String) {
+        if self.diagnostic.as_ref().is_some_and(|d| d.census.is_some()) {
+            let w = why(self);
+            let at = std::panic::Location::caller();
+            let d = self.diagnostic.as_mut().unwrap();
+            let c = d.census.as_mut().unwrap();
+            let gate = c.node_gate(n);
+            c.inject_at = Some((n, gate));
+            c.injections.insert((
+                n,
+                at.file().into(),
+                at.line(),
+                w.clone(),
+                d.cause_node.unwrap_or(NO_NODE),
+                d.cur_call.unwrap_or(u32::MAX),
+                d.escaping.last().copied().unwrap_or(u32::MAX),
+                self.cur_fn,
+                gate,
+            ));
+            let key = format!("{}:{}:{n}", at.file(), at.line());
+            if c.suppress.as_deref() == Some(key.as_str()) {
+                c.suppressed += 1;
+                return;
+            }
+            let saved = std::mem::replace(&mut c.injecting, true);
+            self.add_top_inner(n, |_| w);
+            self.diagnostic
+                .as_mut()
+                .unwrap()
+                .census
+                .as_mut()
+                .unwrap()
+                .injecting = saved;
+            return;
+        }
+        self.add_top_inner(n, why);
+    }
+    fn add_top_inner(&mut self, n: NodeId, why: impl FnOnce(&Self) -> String) {
         if self.explain || self.diagnostic.is_some() {
             let w = why(self);
             if !self.nodes[n as usize].pts.contains_tok(TOP) {
@@ -328,6 +464,7 @@ impl Model {
     }
 
     /// A node holding only ⊤ (all kinds) for one named unmodeled origin.
+    #[track_caller]
     pub fn top_val(&mut self, why: &str) -> NodeId {
         // Explain and the dump name each origin: its own node.
         if !self.explain && self.diagnostic.is_none() {
@@ -364,8 +501,13 @@ impl Model {
     /// Attach a complex constraint and apply it to what the node holds now.
     pub fn cons(&mut self, n: NodeId, c: Cons) {
         self.stats_cons += 1;
-        if self.diagnostic.is_some() && matches!(c, Cons::TopSink { .. }) {
-            self.diagnostic_sink(n);
+        if matches!(c, Cons::IdxOwnLoad { .. }) {
+            self.own_read_census[0] += 1;
+        }
+        if self.diagnostic.is_some() {
+            if let Cons::TopSink { reason } = c {
+                self.diagnostic_sink(n, reason);
+            }
         }
         if self.relations.is_some()
             && !matches!(
@@ -375,6 +517,7 @@ impl Model {
                     | Cons::RetInto { .. }
                     | Cons::ArgInto { .. }
                     | Cons::ThisInst { .. }
+                    | Cons::NativeThis { .. }
                     | Cons::BuiltinCallee
                     | Cons::HolderStep { .. }
                     | Cons::VisitHolders { .. }
@@ -391,6 +534,7 @@ impl Model {
         if self.aborted {
             return;
         }
+        self.own_refuted_cons(n, c);
         let prim = self.nodes[n as usize].prim;
         if self.nodes[n as usize].pts.is_empty() && prim == 0 {
             return;
@@ -421,9 +565,16 @@ impl Model {
     }
 
     pub fn solve(&mut self) {
+        self.solve_fixpoint();
+        // The interned sets stay with their nodes; their index is the solve's.
+        self.sets.clear();
+    }
+
+    fn solve_fixpoint(&mut self) {
         self.rel_phase = b'S';
         self.mark_params();
         self.members_settled.get_mut().clear();
+        let mut delta = crate::delta::Delta::default();
         loop {
             self.prof_mark(NO_NODE, "instances");
             self.fill_instances();
@@ -433,7 +584,6 @@ impl Model {
             let Some(n) = self.wl.pop_front() else {
                 if self.sum.pending.is_empty()
                     && self.marker_links.is_empty()
-                    && !self.settle_bf_written()
                     && !self.settle_for_in()
                     && !self.settle_define()
                     && !crate::builtins::settle_native_given(self)
@@ -459,17 +609,20 @@ impl Model {
                     return;
                 }
             }
-            let (mut delta, dprim) = {
+            let dprim = {
                 let node = &mut self.nodes[n as usize];
                 node.in_wl = false;
-                (
-                    std::mem::take(&mut node.delta),
-                    std::mem::take(&mut node.dprim),
-                )
+                self.pending.take(&mut node.delta, &mut delta);
+                std::mem::take(&mut node.dprim)
             };
             if delta.is_empty() && dprim == 0 {
                 continue;
             }
+            // Sets change interned (`SetTable::extend`); one made outside
+            // this solve (an earlier solve, whose index is gone) is interned
+            // here, so covering below stays a pointer test.
+            let own = std::mem::take(&mut self.nodes[n as usize].pts);
+            self.nodes[n as usize].pts = self.sets.intern(own);
             delta.prepare();
             let delivery_overhead = delta.delivery_overhead();
             // Index loops (no clone of the lists): successors and
@@ -493,7 +646,7 @@ impl Model {
             let mut i = 0;
             while i < self.nodes[n as usize].succ.len() {
                 let s = self.nodes[n as usize].succ[i];
-                if self.try_copy_delivery(n, s, &delta, dprim) {
+                if self.try_copy_delivery(n, s, i as u32, &delta, dprim) {
                     self.work += 1 + delivery_overhead;
                     if let Some(p) = self.prof.as_mut() {
                         p.step[1] += 1 + delivery_overhead;
@@ -508,12 +661,12 @@ impl Model {
                 let (covered, checks) = if delta.is_empty() {
                     (true, 1)
                 } else {
-                    self.copy_coverage(n, s)
+                    self.copy_coverage(n, s, Tokens::Delivery(&delta, i as u32))
                 };
                 let toks = if covered {
                     Tokens::Slice(&[])
                 } else {
-                    Tokens::Delivery(&delta, s)
+                    Tokens::Delivery(&delta, i as u32)
                 };
                 let visits = toks.len() as u64;
                 self.work += visits + checks + delivery_overhead;
@@ -552,13 +705,7 @@ impl Model {
                 self.cur_why = u32::MAX;
                 self.apply_tokens(n, &c, Tokens::Pending(&delta), dprim);
             }
-            // Hand the delta's storage back to the node (no reallocation).
-            let mut delta = delta;
             delta.clear();
-            let node = &mut self.nodes[n as usize];
-            if node.delta.is_empty() && delta.capacity() <= 256 {
-                node.delta = delta;
-            }
         }
         self.cur_src = NO_NODE;
         self.cur_why = u32::MAX;
@@ -628,9 +775,10 @@ impl Model {
             // A builtin namespace's prototype is `Function.prototype` (a
             // constructor's) or `Object.prototype` (`Math`, `JSON`, the
             // global object's chain): `ObjectProto` stands for both.
-            TokKind::Func(_, _) | TokKind::Bound(_) | TokKind::BuiltinFn | TokKind::Builtin(_) => {
-                self.add_tok(n, objproto)
-            }
+            TokKind::Func(_, _)
+            | TokKind::Bound(_)
+            | TokKind::BuiltinFn(_)
+            | TokKind::Builtin(_) => self.add_tok(n, objproto),
             TokKind::ClassObj(tm) => match self.tmpls[tm as usize].parent {
                 Some(p) => {
                     let pc = self.tok(TokKind::ClassObj(p));
@@ -994,8 +1142,8 @@ impl Model {
             .iter()
             .map(|k| Key::Named(self.atom(k)))
             .collect();
-        if proto == Protocol::Json {
-            reads.push(Key::Any);
+        if proto.reads_all() {
+            reads.push(Key::any());
         }
         let calls = keys.as_ref().is_none_or(|k| !k.is_empty());
         if !calls && reads.is_empty() {
@@ -1020,7 +1168,7 @@ impl Model {
                     }
                 }
             }
-            if proto == Protocol::Json {
+            if proto.reads_all() {
                 let r = self.reach_of(t);
                 self.mark_use(r, crate::model::MARK_TOUCH);
             }
@@ -1041,7 +1189,7 @@ impl Model {
             self.nodes[dst as usize].frame = home;
             self.nodes[dst as usize].sink = true;
             self.cons(recv, Cons::Load { key, dst });
-            if proto == Protocol::Json {
+            if proto.reads_all() {
                 self.cons(dst, Cons::Implicit { reason, proto });
             }
             self.add_tok(recv, t);
@@ -1071,7 +1219,7 @@ impl Model {
         self.protocol_calls.insert(call);
         self.rel(|| format!("implicitcall {call} {t} {ret} {arg}"));
         match keys {
-            None => self.method_on(t, Key::Any, call),
+            None => self.method_on(t, Key::any(), call),
             Some(ks) => {
                 for a in ks {
                     self.method_on(t, Key::Named(a), call);
@@ -1095,6 +1243,9 @@ impl Model {
     pub fn cons_line(&self, n: NodeId, c: &Cons) -> String {
         match c {
             Cons::Load { key, dst } => format!("load {n} {} {dst}", self.key_name(*key)),
+            Cons::ProtoKey { key, dst } => {
+                format!("protokey {n} {} {dst}", self.key_name(Key::Named(*key)))
+            }
             Cons::OwnValues { dst } => format!("ownvalues {n} {dst}"),
             Cons::IndexHole => format!("indexhole {n}"),
             Cons::CjsPublish { dst } => format!("cjspublish {n} {dst}"),
@@ -1145,6 +1296,7 @@ impl Model {
             Cons::Guard { test, from, dst } => format!("guard {n} {test} {from} {dst}"),
             Cons::Defined { dst } => format!("defined {n} {dst}"),
             Cons::NotNullish { dst } => format!("notnullish {n} {dst}"),
+            Cons::Falsy { dst } => format!("falsy {n} {dst}"),
             Cons::NotUndefined { dst } => format!("notundefined {n} {dst}"),
             Cons::TopIfAny { dst, from, reason } => format!(
                 "topifany {n} {dst} {from} {}",
@@ -1226,6 +1378,8 @@ impl Model {
                     *setter as u8
                 )
             }
+            Cons::AnnexBDefine { call, setter } => format!("annexbdefine {n} {call} {setter}"),
+            Cons::AnnexBLookup { call, setter } => format!("annexblookup {n} {call} {setter}"),
             Cons::AccessorInstall { key, f, setter } => {
                 format!(
                     "accinstall {n} {} {} {}",
@@ -1247,10 +1401,18 @@ impl Model {
             Cons::Arith { dst } => format!("arith {n} {dst}"),
             Cons::Plus { str, num } => format!("plus {n} {str} {num}"),
             Cons::ArrayLenArg { dst } => format!("arraylenarg {n} {dst}"),
-            Cons::IdxLoad { idx, dst } => format!("idxload {n} {idx} {dst}"),
-            Cons::IdxKey { obj, dst } => format!("idxkey {n} {obj} {dst}"),
-            Cons::IdxMCall { idx, call } => format!("idxmcall {n} {idx} {call}"),
-            Cons::IdxKeyCall { obj, prim, call } => format!("idxkeycall {n} {obj} {prim} {call}"),
+            Cons::IdxLoad { idx, dst, .. } => format!("idxload {n} {idx} {dst}"),
+            Cons::IdxKey { obj, dst, .. } => format!("idxkey {n} {obj} {dst}"),
+            Cons::IdxOwnLoad { idx, dst, .. } => format!("idxownload {n} {idx} {dst}"),
+            Cons::IdxOwnKey { obj, dst, .. } => format!("idxownkey {n} {obj} {dst}"),
+            Cons::OwnTest { dst, at } => format!("owntest {n} {dst} {at:?}"),
+            Cons::OwnGate { obj, idx, dst, .. } => {
+                format!("owngate {n} {obj} {idx} {dst}")
+            }
+            Cons::IdxMCall { idx, call, .. } => format!("idxmcall {n} {idx} {call}"),
+            Cons::IdxKeyCall {
+                obj, prim, call, ..
+            } => format!("idxkeycall {n} {obj} {prim} {call}"),
             Cons::ForInBody { obj, call } => format!("forinbody {n} {obj} {call}"),
             Cons::ForInKeys { ft, call } => format!("forinkeys {n} {ft} {call}"),
             Cons::DefineKeyed {
@@ -1259,7 +1421,7 @@ impl Model {
                 accessor,
             } => format!("definekeyed {n} {o} {reason} {}", *accessor as u8),
             Cons::StoreKeyed { o, src, site } => format!("storekeyed {n} {o} {src} {site}"),
-            Cons::StoreIndexed { o, src, site } => format!("storeindexed {n} {o} {src} {site}"),
+            Cons::StoreIndexed { o, src, site, .. } => format!("storeindexed {n} {o} {src} {site}"),
             Cons::AccessorKeyed { holder, f, setter } => {
                 format!("accessorkeyed {n} {holder} {f} {}", *setter as u8)
             }
@@ -1270,6 +1432,7 @@ impl Model {
             Cons::Spread { into, site } => format!("spread {n} {into} {site}"),
             Cons::SpreadFrom { src, site } => format!("spreadfrom {n} {src} {site}"),
             Cons::ThisInst { call, ft } => format!("thisinst {n} {call} {ft}"),
+            Cons::NativeThis { call, f } => format!("nativethis {n} {call} {f}"),
             Cons::BuiltinCallee => format!("builtincallee {n}"),
             Cons::HolderStep { key, pass, stop } => {
                 format!("holderstep {n} {} {pass} {stop}", self.key_name(*key))

@@ -960,6 +960,10 @@ pub fn run_with_parse_cache(
             Vec::new()
         };
 
+    // Declared addons can be reached by computed loaders, with no literal
+    // graph edge. Admit them before settling the lowering census as well.
+    collect_modules::collect_declared_addons(&mut ctx, args.target.as_deref())?;
+
     rerun_collect_with_class_field_types(
         &args,
         &mut ctx,
@@ -1266,10 +1270,9 @@ pub fn run_with_parse_cache(
         Vec::new()
     };
     // Object model step 3: prototype slots written once are constants.
-    if std::env::var_os("PERRY_PROTO_CENSUS_REPORT").is_some() {
-        eprintln!("{}", ctx.proto_census.summary());
-    }
-    perry_codegen::set_program_proto_census(Some(ctx.proto_census.clone()));
+    let proto_census = super::foreign_native_census::census(&ctx).into_owned();
+    super::foreign_native_census::report(&proto_census);
+    perry_codegen::set_program_proto_census(Some(proto_census));
     // Object model §3.6: the program's export facts (constant keys, literal
     // keys) that prototype images in importing modules read.
     {
@@ -1317,10 +1320,22 @@ pub fn run_with_parse_cache(
     // the runtime creates itself (a CommonJS `require('net')` goes through
     // `createRequire`, not codegen). A `tls` import counts as `net`
     // (`well_known_iteration_set`): `tls.connect` is perry-ext-net's.
-    let program_modules = optimized_libs::well_known_iteration_set(&ctx);
+    // A `child_process` import links perry-ext-net without calling its hook
+    // here: the runtime installs it at the first pipe socket.
+    let program_modules = optimized_libs::program_module_set(&ctx);
     let mut native_provider_installs: Vec<String> = ctx
         .native_routing
         .wrapper_install_hooks(program_modules.iter().map(String::as_str));
+    // `net`'s hook is `node:net` alone; a program that reaches TLS also
+    // registers perry-ext-net's `tls.connect` and its sockets' TLS members,
+    // so a net-only program links no TLS.
+    if native_provider_installs
+        .iter()
+        .any(|hook| hook == "js_ext_net_nm_install")
+        && optimized_libs::reaches_tls(&ctx)
+    {
+        native_provider_installs.push("js_ext_net_tls_install".to_string());
+    }
     // A program that names `dns` arms the router for the lookup/resolve
     // exports a CommonJS `require('node:dns')` reaches through the dynamic
     // native module dispatch (`js_dns_install_exports`); one that does not
@@ -3594,33 +3609,6 @@ pub fn run_with_parse_cache(
             )
         })
         .collect();
-    // #8772: harvest producer-authored concrete method capabilities across
-    // the final whole-program HIR before parallel codegen. This is a reverse
-    // flow as well as an import flow: a generic library can own
-    // `value.reset(...args)` while an adapter that imports that library owns
-    // every concrete `reset` implementation. Arc keeps the whole-program map
-    // shared rather than cloning it once per module job.
-    let mut short_spread_method_candidates: std::collections::HashMap<
-        String,
-        Vec<perry_codegen::ShortSpreadMethodCandidate>,
-    > = std::collections::HashMap::new();
-    for hir_module in ctx.native_modules.values() {
-        for candidate in perry_codegen::short_spread_method_capabilities(hir_module) {
-            short_spread_method_candidates
-                .entry(candidate.method_name.clone())
-                .or_default()
-                .push(candidate);
-        }
-    }
-    for candidates in short_spread_method_candidates.values_mut() {
-        candidates.sort_unstable_by(|a, b| {
-            a.class_id
-                .cmp(&b.class_id)
-                .then_with(|| a.target.cmp(&b.target))
-        });
-        candidates.dedup_by(|a, b| a.class_id == b.class_id && a.target == b.target);
-    }
-    let short_spread_method_candidates = std::sync::Arc::new(short_spread_method_candidates);
     // #8775: a generic library module can receive an exported adapter object
     // through a parameter without importing its defining module. Publish the
     // producer's exact immutable object/method facts to every codegen job so a
@@ -3723,6 +3711,18 @@ pub fn run_with_parse_cache(
         }
     }
     let program_providers = std::sync::Arc::new(program_providers);
+    // A module the program links without importing it (`net` for a program
+    // that reaches `child_process`, whose stdio pipes are net sockets:
+    // `optimized_libs::well_known_iteration_set`) carries its own stdlib
+    // requirement, as an import of it would (`perry_hir::requires_stdlib`):
+    // perry-ext-net resolves against perry-stdlib (perry-ffi's promise shims,
+    // the TLS client preflight).
+    if optimized_libs::well_known_iteration_set(&ctx)
+        .iter()
+        .any(|module| perry_hir::requires_stdlib(module))
+    {
+        ctx.needs_stdlib = true;
+    }
 
     // A standalone WASI build links against the wasm32 runtime after
     // codegen and has no native link set.
@@ -6236,7 +6236,6 @@ pub fn run_with_parse_cache(
             program_facts: Default::default(),
             program_layouts: Default::default(),
             gc_effects: std::sync::Arc::clone(&gc_effects),
-            short_spread_method_candidates: std::sync::Arc::clone(&short_spread_method_candidates),
             object_literal_method_candidates: std::sync::Arc::clone(
                 &object_literal_method_candidates,
             ),
@@ -6678,13 +6677,7 @@ pub fn run_with_parse_cache(
         opts.program_layout_ordinals = std::sync::Arc::clone(&program_layout_ordinals);
         if let Some((ids, class_ids)) = static_shape_ids_by_module.get(path) {
             opts.static_shape_ids = ids.clone();
-            let foreign: BTreeSet<u32> = opts
-                .short_spread_method_candidates
-                .values()
-                .flatten()
-                .map(|c| c.class_id)
-                .collect();
-            for cid in class_ids.iter().chain(foreign.iter()) {
+            for cid in class_ids.iter() {
                 if let Some(finals) = class_final_shapes.get(cid) {
                     opts.static_shape_ids.extend(finals.iter().cloned());
                 }
@@ -6692,7 +6685,7 @@ pub fn run_with_parse_cache(
             opts.static_shape_ids.sort();
             opts.static_shape_ids.dedup();
             opts.program_class_shape_ids =
-                program_class_shape_ids.restricted_to(class_ids.iter().copied().chain(foreign));
+                program_class_shape_ids.restricted_to(class_ids.iter().copied());
         }
     };
     let prepared_options: Vec<_> = module_pool.install(|| {
@@ -6735,7 +6728,6 @@ pub fn run_with_parse_cache(
         std::sync::Arc::clone(&program_layouts),
         constructor_contracts,
         static_shape_ids,
-        short_spread_method_candidates,
         object_literal_method_candidates,
     ));
     let mut owned_modules = std::mem::take(&mut ctx.native_modules);
@@ -7501,6 +7493,14 @@ pub fn run_with_parse_cache(
             )?;
             obj_cleanup_paths.push(installer.clone());
             obj_paths.push(installer);
+            for input in
+                super::link::wasi::addon_link_inputs(flavour, &ctx, &object_output_dir, verbose)?
+            {
+                if input.starts_with(&object_output_dir) {
+                    obj_cleanup_paths.push(input.clone());
+                }
+                obj_paths.push(input);
+            }
             obj_cleanup_paths.push(seed_path.clone());
             obj_paths.push(seed_path);
             if is_staticlib {

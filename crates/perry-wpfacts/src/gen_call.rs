@@ -74,9 +74,15 @@ impl<'a> Gen<'a> {
             }
         }
         let a: Vec<NodeId> = args.iter().map(|x| self.expr(fx, x)).collect();
-        self.call_lit_arg = match args.first().map(|x| self.const_eval(fx.module, x)) {
-            Some(Some(crate::gen_const::Const::Str(s))) => Some(self.m.atom(&s)),
-            _ => None,
+        self.call_lit_arg = if matches!(callee, Expr::PropertyGet { .. } | Expr::IndexGet { .. }) {
+            args.first()
+                .and_then(|x| self.const_property_key(fx.module, x))
+                .map(|s| self.m.atom(&s))
+        } else {
+            match args.first().and_then(|x| self.const_eval(fx.module, x)) {
+                Some(crate::gen_const::Const::Str(s)) => Some(self.m.atom(&s)),
+                _ => None,
+            }
         };
         if let Expr::ExternFuncRef { name, .. } = callee {
             if self.is_runtime_extern(fx.module, name) {
@@ -84,6 +90,13 @@ impl<'a> Gen<'a> {
                     .iter()
                     .map(|x| match x {
                         Expr::String(s) => Some(s.clone()),
+                        _ if matches!(
+                            name.as_str(),
+                            "js_object_define_getter" | "js_object_define_setter"
+                        ) =>
+                        {
+                            self.const_property_key(fx.module, x)
+                        }
                         _ => None,
                     })
                     .collect();
@@ -123,6 +136,7 @@ impl<'a> Gen<'a> {
                     Some(o) => o,
                     None => self.expr(fx, object),
                 };
+                self.own_test_recv = Some(o);
                 let a = self.member_atom(object, property);
                 let off = if *pb != 0 { *pb } else { byte_offset };
                 if off != 0 {
@@ -136,7 +150,18 @@ impl<'a> Gen<'a> {
                         func: fx.f,
                     });
                 }
-                self.mcall(o, Key::Named(a), args, spread)
+                let (call, ret) = self.new_call(ThisArg::Node(o), args, spread);
+                if let Some(a) = lit {
+                    self.m.call_lit.insert(call, a);
+                }
+                self.m.cons(
+                    o,
+                    Cons::MCall {
+                        key: Key::Named(a),
+                        call,
+                    },
+                );
+                ret
             }
             Expr::IndexGet { object, index, .. } => {
                 let o = self.expr(fx, object);
@@ -149,13 +174,33 @@ impl<'a> Gen<'a> {
                         proto: Protocol::ToPrimitive,
                     },
                 );
+                let (call, ret) = self.new_call(ThisArg::Node(o), args, spread);
+                if let Some(a) = lit {
+                    self.m.call_lit.insert(call, a);
+                }
                 match self.read_key(index) {
-                    Key::Named(a) => self.mcall(o, Key::Named(a), args, spread),
+                    Key::Named(a) => {
+                        self.m.cons(
+                            o,
+                            Cons::MCall {
+                                key: Key::Named(a),
+                                call,
+                            },
+                        );
+                        ret
+                    }
                     // DECISIONS 217: the key's values decide which members
                     // it may name (`Cons::IdxMCall`).
-                    Key::Any => {
-                        let (call, ret) = self.new_call(ThisArg::Node(o), args, spread);
-                        self.m.cons(o, Cons::IdxMCall { idx: i, call });
+                    Key::Any(_) => {
+                        let shape = self.m.key_shape(index);
+                        self.m.cons(
+                            o,
+                            Cons::IdxMCall {
+                                idx: i,
+                                call,
+                                shape,
+                            },
+                        );
                         ret
                     }
                 }
@@ -185,6 +230,7 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let c = self.expr(fx, callee);
+                self.own_test_recv = Some(c);
                 // A call through a value is a site: the bodies the callee
                 // node holds. A function named by the source (a declaration,
                 // an import binding, a closure expression) is no value call.
@@ -260,7 +306,23 @@ impl<'a> Gen<'a> {
             // functions (decision 23): the name carries the function id.
             .map(|n| format!("{n}#{func_id}"))
             .unwrap_or_else(|| format!("closure{func_id}"));
-        let f = self.register_fn(mi, *func_id, &name, params, *is_arrow, true);
+        let Expr::Closure {
+            is_async,
+            is_generator,
+            ..
+        } = canonical
+        else {
+            unreachable!()
+        };
+        let module = self.modules[mi as usize].1;
+        let kind = perry_hir::fn_proto::FnProtoKind::of_closure(
+            module,
+            *func_id,
+            *is_async,
+            *is_generator,
+            body,
+        );
+        let f = self.register_fn(mi, *func_id, &name, params, *is_arrow, true, Some(kind));
         let info = self.m.funcs[f as usize].clone();
         // An arrow captures the enclosing `this` only when its body (or an
         // arrow nested in it) reads `this` or `super` (design §14.2 rule
@@ -329,7 +391,9 @@ impl<'a> Gen<'a> {
                 .add_top(ret, |_| "async/generator closure result".into());
         }
         self.order_ok = true;
+        let own = self.own_helper_shape(params, body, *is_async || *is_generator);
         self.stmts(cfx, body);
+        self.own_helper_finish(f, own);
         (self.order_ok, self.loop_depth) = saved;
         let _: &Vec<Stmt> = body;
     }
@@ -551,7 +615,7 @@ impl<'a> Gen<'a> {
                     ("js_object_literal_define" | "js_object_set_method_by_name", Some(k)) => {
                         Key::Named(self.m.atom(&k))
                     }
-                    _ => Key::Any,
+                    _ => Key::any(),
                 };
                 if let Key::Named(a) = key {
                     if let Some(tm) = birth_tm {
@@ -625,7 +689,7 @@ impl<'a> Gen<'a> {
                 let (Some(o), Some(s)) = (arg(0), arg(1)) else {
                     return self.extern_fail(name, &args, &spread);
                 };
-                let vals = self.load(s, Key::Any);
+                let vals = self.load(s, Key::any());
                 if let Some(tm) = birth_tm {
                     self.m.tmpls[tm as usize].birth_keys.clear();
                     self.m.tmpls[tm as usize].definite.clear();
@@ -634,7 +698,7 @@ impl<'a> Gen<'a> {
                 self.store(
                     fx,
                     o,
-                    Key::Any,
+                    Key::any(),
                     vals,
                     name.to_string(),
                     birth_tm,
@@ -661,9 +725,28 @@ impl<'a> Gen<'a> {
                 }
                 self.prim_node(prim::UNDEF)
             }
-            "js_object_define_getter" | "js_object_define_setter" | "js_object_define_property" => {
+            "js_object_define_getter" | "js_object_define_setter" => {
+                let (Some(o), Some(k), Some(f)) = (arg(0), arg(1), arg(2)) else {
+                    return self.prim_node(prim::UNDEF);
+                };
+                let (call, ret) = self.new_call(ThisArg::Node(o), vec![k, f], spread);
+                if let Some(k) = lit(1) {
+                    let a = self.m.atom(&k);
+                    self.m.call_lit.insert(call, a);
+                }
+                self.m.cons(
+                    o,
+                    Cons::AnnexBDefine {
+                        call,
+                        setter: name == "js_object_define_setter",
+                    },
+                );
+                self.m.add_prim(ret, prim::UNDEF);
+                ret
+            }
+            "js_object_define_property" => {
                 // E5 on the target.
-                let r = self.m.reason("E5 defineProperty/__defineGetter__");
+                let r = self.m.reason("E5 defineProperty");
                 if let Some(o) = arg(0) {
                     let star = self.m.atom(crate::STAR_KEY);
                     self.m.define_on.insert((o, star, false));
@@ -682,17 +765,22 @@ impl<'a> Gen<'a> {
                 arg(0).unwrap_or(self.m.top_tok_node)
             }
             "js_object_lookup_getter" | "js_object_lookup_setter" => {
-                let r = self.m.reason("__lookupGetter__ result");
-                for a in &args {
-                    self.m.cons(
-                        *a,
-                        Cons::Implicit {
-                            reason: r,
-                            proto: Protocol::Any,
-                        },
-                    );
+                let Some(o) = arg(0) else {
+                    return self.m.top_val("accessor lookup without a receiver");
+                };
+                let (call, ret) = self.new_call(ThisArg::Node(o), args[1..].to_vec(), spread);
+                if let Some(k) = lit(1) {
+                    let a = self.m.atom(&k);
+                    self.m.call_lit.insert(call, a);
                 }
-                self.m.top_val("__lookupGetter__ result")
+                self.m.cons(
+                    o,
+                    Cons::AnnexBLookup {
+                        call,
+                        setter: name == "js_object_lookup_setter",
+                    },
+                );
+                ret
             }
             "js_tdz_check_binding" | "js_tdz_check_binding_then" => {
                 let out = self.tmp("tdz");
@@ -758,7 +846,7 @@ impl<'a> Gen<'a> {
                 self.m.cons(
                     mp,
                     Cons::Store {
-                        key: Key::Any,
+                        key: Key::any(),
                         src: v,
                         site,
                     },
@@ -769,7 +857,7 @@ impl<'a> Gen<'a> {
                 let Some(mp) = arg(0) else {
                     return self.extern_fail(name, &args, &spread);
                 };
-                let out = self.load(mp, Key::Any);
+                let out = self.load(mp, Key::any());
                 self.m.add_prim(out, prim::UNDEF);
                 out
             }
@@ -777,7 +865,7 @@ impl<'a> Gen<'a> {
                 let Some(mp) = arg(0) else {
                     return self.extern_fail(name, &args, &spread);
                 };
-                let out = self.load(mp, Key::Any);
+                let out = self.load(mp, Key::any());
                 self.m.add_prim(out, prim::ALL);
                 out
             }

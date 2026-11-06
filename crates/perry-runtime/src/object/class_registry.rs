@@ -20,18 +20,19 @@
 pub use super::class_handles::{
     fetch_handle_kind_probe, handle_method_dispatch, handle_own_property_names_dispatch,
     handle_property_dispatch, handle_property_set_dispatch, handle_prototype_dispatch,
-    handle_receiver_value, http_agent_handle_probe, js_register_fetch_handle_kind_probe,
-    js_register_handle_method_dispatch, js_register_handle_own_property_names_dispatch,
-    js_register_handle_property_dispatch, js_register_handle_property_set_dispatch,
-    js_register_handle_prototype_dispatch, js_register_http_agent_handle_probe,
+    handle_receiver_value, http_agent_handle_probe, http_server_handle_kind_probe,
+    js_register_fetch_handle_kind_probe, js_register_handle_method_dispatch,
+    js_register_handle_own_property_names_dispatch, js_register_handle_property_dispatch,
+    js_register_handle_property_set_dispatch, js_register_handle_prototype_dispatch,
+    js_register_http_agent_handle_probe, js_register_http_server_handle_kind_probe,
     js_register_net_socket_handle_probe, js_register_stream_expando_set,
     js_register_stream_handle_kind_probe, js_register_stream_handle_probe,
     js_register_tls_handle_kind_probe, net_socket_handle_probe, stream_expando_set,
     stream_handle_id, stream_handle_kind_probe, stream_handle_probe, tls_handle_kind_probe,
     FetchHandleKindProbeFn, HandleMethodDispatchFn, HandleOwnPropertyNamesDispatchFn,
     HandlePropertyDispatchFn, HandlePropertySetDispatchFn, HandlePrototypeDispatchFn,
-    HttpAgentHandleProbeFn, NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn,
-    TlsHandleKindProbeFn,
+    HttpAgentHandleProbeFn, HttpServerHandleKind, HttpServerHandleKindProbeFn,
+    NetSocketHandleProbeFn, StreamHandleKindProbeFn, StreamHandleProbeFn, TlsHandleKindProbeFn,
 };
 use super::*;
 
@@ -232,6 +233,7 @@ pub(crate) use parent_static::{
     class_object_owns_key_bytes, class_object_pinned_parent, class_own_static_method_code,
     class_own_static_method_code_bytes, class_own_static_method_entry,
     class_own_symbol_accessor_ptrs, class_own_symbol_member_keys, class_own_symbol_method,
+    class_table_symbol_member_keys,
     class_private_instance_getter_value, class_private_instance_setter_apply,
     class_static_accessor_getter_value, class_static_accessor_getter_value_bytes,
     class_static_accessor_setter_apply, class_static_accessor_setter_apply_bytes,

@@ -7,7 +7,7 @@
 //! `Stmt::Let` — cannot see them, and nothing bound them. A collection landing
 //! between the store and the read swept the value out from under the alloca.
 //!
-//! The end-to-end proof is `test-files/test_gap_repsel_scalar_replaced_locals.ts`
+//! The end-to-end proof is `test-parity/language/object/test_gap_repsel_scalar_replaced_locals.ts`
 //! on the `cons_scan_off` arm of `scripts/gc_repsel_matrix.sh` — the only
 //! configuration where the bug is observable, because every automatic
 //! collection otherwise forces a conservative native-stack scan that pins the
@@ -91,7 +91,6 @@ fn entry_opts() -> CompileOptions {
         cjs_interop_namespaces: Vec::new(),
         constructor_param_counts: Default::default(),
         imported_classes: Vec::new(),
-        short_spread_method_candidates: std::sync::Arc::default(),
         object_literal_method_candidates: std::sync::Arc::default(),
         imported_enums: Vec::new(),
         imported_async_funcs: std::collections::HashSet::new(),

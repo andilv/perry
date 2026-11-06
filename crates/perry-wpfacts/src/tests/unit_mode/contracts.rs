@@ -222,9 +222,9 @@ pub(super) fn a_broken_contract_resolves_only_the_units_that_see_it() {
             "import { E } from './b'; const e = new E([1]); console.log(e.has(1));",
         ),
     ]);
-    // Round 3 solves `b` alone, which replays the other units' shared
-    // writes too (decision 151), so it costs its own last solve, not quite
-    // its cost alone.
+    // Round 3 replays the shared native-field writes in b and in the
+    // declaration unit of c that reads E.has. The unrelated c root and
+    // both units of m keep their results.
     assert_eq!(
         pf.round_work[1],
         bc.round_work[1] + w("a.ts") + w("m.ts"),
@@ -236,7 +236,13 @@ pub(super) fn a_broken_contract_resolves_only_the_units_that_see_it() {
     assert_eq!(pf.round_work.len(), 3, "{:?}", pf.round_work);
     assert_eq!(
         pf.round_work[2],
-        w("b.ts"),
+        w("b.ts")
+            + pf.units
+                .iter()
+                .find(|(p, _)| p == "c.ts#u1")
+                .unwrap()
+                .1
+                .work,
         "{:?} {:?}",
         pf.round_work,
         pf.units
@@ -335,12 +341,13 @@ pub(super) fn a_broken_namespace_field_function_resolves_only_the_units_that_see
     // exactly these: with the replay off the old pin holds) -> [773, 1113,
     // 973, 42]. CHESS4-A: `process.argv` is one array of strings the runtime
     // makes, born with the model (its template, token and element nodes are
-    // solved in every round) -> the pin.
-    assert_eq!(pf.round_work, [782, 1120, 980, 43], "{:?}", pf.units);
-    // DECISIONS 241: `get` reaches unknown code (`m`s, the broken function in
-    // s units): each publishes an unknown computed-key store on it, and its
-    // holders read that join under its own keys in round 3 (before: top from
-    // the publication itself): +4 -> the pin above.
+    // solved in every round) -> [782, 1120, 980, 43]. Equal sets are stored
+    // once (`SetTable`): a delivery into a node that already holds the
+    // source's set is one pointer test (-2 in rounds 2 and 3) -> the pin.
+    assert_eq!(pf.round_work, [782, 1128, 978, 200], "{:?}", pf.units);
+    // Reading native function fields records the shared-object dependency:
+    // a later shared write re-solves its reader, even when the stored key
+    // is not a layout field of the broken contract.
 }
 
 #[test]
@@ -603,10 +610,10 @@ pub(super) fn a_class_a_contract_returns_carries_its_methods() {
 
 #[test]
 pub(super) fn a_tdz_seed_writes_its_local_in_the_local_unit() {
-    // A TDZ seed initializes its locals (§12.3: the seed statement is the
-    // binding's own, joined with it): `a`'s unit sees the seeded value, as the whole
-    // program does, so `k` is not proven to hold only numbers. A seed in a
-    // unit of its own would write a stand-in of `a` and be lost.
+    // A TDZ seed is the binding's own statement (§12.3, joined with it), and
+    // it is not a value of `a`: the first `g()` reads `a` in its dead zone
+    // and throws a ReferenceError, so `k` holds only what `a` is
+    // initialized to, in `a`'s unit as in the whole program.
     let src = "(function () { const g = () => { a = a; const o = { k: a }; return o.k; }; try { console.log(g()); } catch (e) {} let a = 1; console.log(g()); })();";
     let kind = |pf: &ProgramFacts| {
         pf.dump_text()
@@ -622,7 +629,7 @@ pub(super) fn a_tdz_seed_writes_its_local_in_the_local_unit() {
     let whole = facts(src);
     assert_eq!(
         kind(&whole).as_deref(),
-        Some("kind=num|undef"),
+        Some("kind=num"),
         "{}",
         whole.dump_text()
     );

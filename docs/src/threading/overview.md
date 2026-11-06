@@ -8,6 +8,23 @@ Use `parallelMap`, `parallelFilter` and `spawn` to run native work on OS threads
 
 Perry workers run native code on OS threads, each with its own arena and collector. Ordinary captures and results are serialized between heaps; this has a cost proportional to the transferred data. SharedArrayBuffer and supported ownership transfers are explicit exceptions, not permission to share arbitrary heap pointers.
 
+## BroadcastChannel names
+
+`BroadcastChannel` requires a name argument. Explicit `undefined` is a valid name
+and becomes `"undefined"`; omission throws `TypeError` with `ERR_MISSING_ARGS`.
+Names use implicit string conversion, including a string hint for object
+conversion. Symbols (including an object's conversion result) throw before a
+channel is registered. A throwing conversion propagates its original value.
+
+`BroadcastChannel.prototype` owns the read-only `name` getter and the core
+`postMessage`, `close`, `ref` and `unref` methods. Borrowing one channel's method
+operates on the actual receiver, including a transparent proxy or an object
+inheriting from a genuine channel;
+other receivers throw `TypeError` with `ERR_INVALID_THIS`. Closing a channel does
+not discard its name. Receiver validation precedes message-argument validation,
+and a closed channel rejects a supplied message before cloning it. Listener and
+handler APIs are separate from this core-operation surface.
+
 ## Message events
 
 `MessageEvent` extends `Event`. Its constructor accepts `data`, `origin`,
@@ -323,6 +340,13 @@ throws `TypeError` with code `ERR_MISSING_ARGS`, but explicit `undefined` is a
 valid message. Rejected calls do not enqueue a message. Worker method calls use
 the ordinary method lookup, including own replacements and getters.
 
+For Node-compatible DOM-style delivery on BroadcastChannel and MessagePort
+(including `parentPort`), an explicit `undefined` becomes `null` in
+`MessageEvent.data`, matching the public constructor default. Raw
+`on("message")` callbacks and `receiveMessageOnPort` retain `undefined`.
+Perry-only Worker web-style and worker-global delivery keep their existing
+lossless data behavior.
+
 ### Messaging constructor errors
 
 `MessageChannel` requires `new` (`ERR_CONSTRUCT_CALL_REQUIRED`). `MessagePort`
@@ -337,3 +361,9 @@ constructor identity, including aliases named like another constructor.
 Worker aliases retain child-entry discovery and the same options/eval lowering
 as canonical imports. Lexical bindings, namespace imports and explicit global
 constructors keep their existing resolution rules.
+
+Worker module functions can be captured from named imports or CommonJS and
+invoked through `call`, `apply` or spread arguments. These callable values use
+the same environment, clone-marker, `receiveMessageOnPort` and
+`postMessageToThread` implementations as direct calls. Realm movement through
+`moveMessagePortToContext` remains unsupported on this callable path.

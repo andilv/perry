@@ -14,7 +14,6 @@
 //!
 //! A stored TAG_NULL distinguishes an explicit null from the unset word 0.
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set when `Object.setPrototypeOf` has retargeted a REAL ARRAY's
@@ -30,16 +29,17 @@ pub(crate) fn array_static_proto_recorded() -> bool {
 
 const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
 
-crate::perry_thread_local! {
-    /// Owners currently walking a recorded prototype chain. Although
-    /// `Object.setPrototypeOf` normally rejects cycles, residual/native owners
-    /// and custom-construction links can still expose a malformed chain. Keep
-    /// recursive property lookup bounded and stop on a repeated owner. These
-    /// are NaN-boxed root slots, not raw addresses: an accessor or Proxy trap
-    /// can collect and move an owner before re-entering property resolution.
-    static PROTOTYPE_RESOLUTION_STACK: RefCell<crate::exception::CatchStack<u64>> =
-        const { RefCell::new(crate::exception::CatchStack::new()) };
-}
+/// Owners currently walking a recorded prototype chain. Although
+/// `Object.setPrototypeOf` normally rejects cycles, residual/native owners
+/// and custom-construction links can still expose a malformed chain. Keep
+/// recursive property lookup bounded and stop on a repeated owner. These
+/// are NaN-boxed root slots, not raw addresses: an accessor or Proxy trap
+/// can collect and move an owner before re-entering property resolution.
+///
+/// A field of the per-thread record of frame-marked stacks
+/// ([`crate::exception::marks::CatchStacks`]).
+static PROTOTYPE_RESOLUTION_STACK: crate::exception::marks::CatchStackKey<u64> =
+    crate::exception::marks::CatchStackKey::new(|stacks| &stacks.prototype_resolution);
 const MAX_PROTOTYPE_RESOLUTION_DEPTH: usize = 64;
 /// From this resolution depth on, an inherited read first skips every
 /// prototype whose shape proves it lacks the key
@@ -378,7 +378,11 @@ fn object_set_static_prototype_impl_with(
     // when the first array takes a named property) are the runtime's own
     // definitions and do not count.
     if matches!(link_kind, PrototypeLinkKind::UserOverride) {
-        super::builtin_proto::note_write_addr(obj_ptr, "[[Prototype]] link");
+        super::builtin_proto::note_write_addr(
+            obj_ptr,
+            super::builtin_proto::Mutation::Relink,
+            "[[Prototype]] link",
+        );
         // Object model step 3 (§3.6): every chain a binding site proved
         // through this object changed.
         super::shadow::note_relink(obj_ptr);
@@ -449,7 +453,11 @@ fn object_set_static_prototype_impl_with(
                 crate::array::invalidate_array_index_fast_path();
                 // Every array's chain runs through `%Array.prototype%`'s
                 // holder: its shadow bit now says the chain left its layout.
-                crate::object::builtin_proto::note_array_prototype_write(obj_ptr, "relink");
+                crate::object::builtin_proto::note_array_prototype_write(
+                    obj_ptr,
+                    crate::object::builtin_proto::Mutation::Relink,
+                    "relink",
+                );
             }
         } else if obj_type == crate::gc::GC_TYPE_LAZY_ARRAY {
             // A lazy JSON array becomes the ordinary array in place, keeping

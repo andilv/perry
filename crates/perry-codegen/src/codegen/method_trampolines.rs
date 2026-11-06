@@ -198,11 +198,13 @@ pub(super) fn emit_guarded_nonnegative_index(
     // disappear at their direct call sites while keeping large mutation bodies
     // behind one native call boundary.
     let statements = method.body.len();
-    let preinline = llmod
-        .function_estimated_ir_bytes(&clone_name)
-        .is_some_and(|ir_bytes| {
-            super::helpers::guarded_specialization_admits_preinline(ir_bytes, statements)
-        });
+    let callable_worker = llmod.callable_worker;
+    let preinline = !callable_worker
+        && llmod
+            .function_estimated_ir_bytes(&clone_name)
+            .is_some_and(|ir_bytes| {
+                super::helpers::guarded_specialization_admits_preinline(ir_bytes, statements)
+            });
     let target_triple = llmod.target_triple.clone();
     let mut params: Vec<(LlvmType, String)> = Vec::with_capacity(method.params.len() + 1);
     params.push((DOUBLE, "%this_arg".to_string()));
@@ -211,6 +213,9 @@ pub(super) fn emit_guarded_nonnegative_index(
     }
     let wf = llmod.define_function(public_name, DOUBLE, params);
     wf.pre_statepoint_inline = preinline;
+    if callable_worker {
+        wf.defer_body_preinline(statements, clone_name.clone());
+    }
     let _ = wf.create_block("entry");
 
     let fast_idx = wf.num_blocks();
@@ -319,7 +324,11 @@ pub(super) fn emit_guarded_nonnegative_index(
             let obj_ptr = blk.inttoptr(I64, &recv_handle);
             let gc_header_ptr = blk.gep(crate::types::I8, &obj_ptr, &[(I64, "-8")]);
             let gc_header = blk.load(I32, &gc_header_ptr);
-            let guarded_gc = blk.and(I32, &gc_header, "134250751");
+            let guarded_gc = blk.and(
+                I32,
+                &gc_header,
+                crate::lower_call::method_override::GC_OBJECT_METHOD_GUARD_MASK_I32,
+            );
             let gc_ok = blk.icmp_eq(I32, &guarded_gc, "2");
             let class_shape = blk.load(I64, &obj_ptr);
             let expected_shape = crate::typed_shape::class_shape_id_operand_on_block(

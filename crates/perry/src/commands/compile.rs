@@ -44,6 +44,7 @@ mod export_analysis;
 mod export_demand;
 mod fallback_diag;
 mod fn_infer;
+mod foreign_native_census;
 mod gc_effects_sidecar;
 mod geisterhand;
 mod harmonyos_shim;

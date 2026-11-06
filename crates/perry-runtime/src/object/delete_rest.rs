@@ -16,8 +16,7 @@ pub extern "C" fn js_delete_result(deleted: i32, strict: i32) -> f64 {
         if strict != 0 {
             let message = "Cannot delete property";
             let msg = crate::string::js_string_from_bytes(message.as_ptr(), message.len() as u32);
-            let err = crate::error::js_typeerror_new(msg);
-            crate::exception::js_throw(crate::value::js_nanbox_pointer(err as i64));
+            crate::exception::throw_core(crate::error::CoreError::type_error(msg));
         }
         return f64::from_bits(crate::value::TAG_FALSE);
     }
@@ -38,6 +37,7 @@ pub extern "C" fn js_object_delete_field(
     }
     super::builtin_proto::note_write_addr(
         (obj as u64 & crate::value::POINTER_MASK) as usize,
+        super::builtin_proto::Mutation::Delete(super::builtin_proto::Key::Str(key)),
         "delete",
     );
     if !key.is_null() {
@@ -1140,6 +1140,7 @@ unsafe fn try_delete_stable_sso(obj: *mut ObjectHeader, key: JSValue) -> Option<
 pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> i32 {
     super::builtin_proto::note_write_addr(
         (obj as u64 & crate::value::POINTER_MASK) as usize,
+        super::builtin_proto::Mutation::Delete(super::builtin_proto::Key::Value(key)),
         "delete",
     );
     #[cfg(perry_contract_checks)]

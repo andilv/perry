@@ -54,7 +54,7 @@ impl Model {
         let hits = match key {
             // A computed store's key is decided when the solve is done (its
             // site may record the key node only after this store applied).
-            Some(Key::Any) if site.is_some() => {
+            Some(Key::Any(_)) if site.is_some() => {
                 let s = site.unwrap();
                 if !self.array_keyed_stores.iter().any(|&(x, _)| x == s) {
                     let on = self.tok_name(t);
@@ -63,7 +63,7 @@ impl Model {
                 }
                 false
             }
-            None | Some(Key::Any) => true,
+            None | Some(Key::Any(_)) => true,
             Some(Key::Named(a)) => matches!(
                 self.atoms[a as usize].as_str(),
                 crate::builtins::WK_ITERATOR | "__proto__" | crate::STAR_KEY
@@ -271,6 +271,7 @@ impl Model {
     }
 
     pub fn tok(&mut self, k: TokKind) -> Tok {
+        let k = crate::builtins::canonical_native(k);
         if let Some(&t) = self.tok_index.get(&k) {
             return t;
         }
@@ -282,6 +283,7 @@ impl Model {
         }
         self.toks.push(k.clone());
         self.tok_index.insert(k, t);
+        self.builtin_token_created(t);
         t
     }
 
@@ -333,7 +335,7 @@ impl Model {
     pub fn key_name(&self, k: Key) -> String {
         match k {
             Key::Named(a) => esc_key(&self.atoms[a as usize]),
-            Key::Any => "*".to_string(),
+            Key::Any(_) => "*".to_string(),
         }
     }
 
@@ -355,7 +357,10 @@ impl Model {
             TokKind::Proto(tm) => format!("proto:{}", self.tmpls[*tm as usize].display),
             TokKind::ObjectProto => "Object.prototype".into(),
             TokKind::Builtin(b) => format!("builtin:{b:?}"),
-            TokKind::BuiltinFn => "builtin-fn".into(),
+            TokKind::BuiltinFn(crate::model::Native::Member { identity }) => {
+                format!("builtin-fn:{identity}")
+            }
+            TokKind::BuiltinFn(_) => "builtin-fn".into(),
             TokKind::ModNs(m) => format!("ns:{m}"),
             TokKind::NativeProto(n) => format!("native:{n}"),
         }
@@ -364,13 +369,13 @@ impl Model {
     /// What this solve can observe of the shared objects ([`SharedReads`]).
     pub fn shared_reads(&self) -> SharedReads {
         let mut r = SharedReads::default();
-        // An object's writes reach this solve through its field nodes, by
-        // key (its any-key field: every key); a builtin function value has
-        // none: through its property reads, any of which a write of any
-        // builtin function value turns opaque (`write_builtin_fns`).
+        // Shared objects expose their writes through ordinary field nodes.
         for (k, &t) in &self.tok_index {
             let read = match k {
-                TokKind::ObjectProto | TokKind::Builtin(_) | TokKind::NativeProto(_) => {
+                TokKind::ObjectProto
+                | TokKind::Builtin(_)
+                | TokKind::BuiltinFn(_)
+                | TokKind::NativeProto(_) => {
                     if self.field_any.contains_key(&t) {
                         Some(None)
                     } else {
@@ -379,7 +384,6 @@ impl Model {
                         })
                     }
                 }
-                TokKind::BuiltinFn => (!self.bf_reads.is_empty()).then_some(None),
                 _ => None,
             };
             if let (Some(s), Some(keys)) = (self.shared_of(t), read) {
@@ -451,7 +455,7 @@ impl Model {
                 TokKind::Proto(t) => format!("proto {t}"),
                 TokKind::ObjectProto => "objectproto -".into(),
                 TokKind::Builtin(b) => format!("builtin {b:?}"),
-                TokKind::BuiltinFn => "builtinfn -".into(),
+                TokKind::BuiltinFn(_) => "builtinfn -".into(),
                 TokKind::ModNs(m) => format!("modns {m}"),
                 TokKind::NativeProto(n) => format!("nativeproto {n}"),
             };
@@ -1724,6 +1728,7 @@ impl Model {
             parent_links: Vec::new(),
             null_proto: false,
             chain_miss: false,
+            chain_miss_open: false,
             species: None,
             per_evaluation: false,
             static_methods: Vec::new(),
@@ -1758,6 +1763,7 @@ impl Model {
             parent_links: Vec::new(),
             null_proto: false,
             chain_miss: false,
+            chain_miss_open: false,
             species: None,
             per_evaluation: false,
             static_methods: Vec::new(),
@@ -1798,6 +1804,7 @@ impl Model {
             parent_links: Vec::new(),
             null_proto: false,
             chain_miss: false,
+            chain_miss_open: false,
             species: None,
             per_evaluation: false,
             static_methods: Vec::new(),

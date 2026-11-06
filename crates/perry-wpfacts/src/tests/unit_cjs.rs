@@ -395,7 +395,14 @@ fn richards_per_unit_proves_what_the_whole_program_proves() {
     );
     // CJL2: whole-program 22 -> 129 with static edges (the records no
     // longer meet in the dispatch); per unit the dispatch's 4 sites go.
-    assert_cjs_per_unit(&w, &u, 3);
+    // DEC 250 (solver half): per unit 3 -> 19. After the computed store
+    // into ⊤ (`createTask`'s `this.taskTable[identity] = t`) a `push` call
+    // whose lookup reached Object.prototype ran as an opaque member there
+    // (`argument of native Object.prototype.push`), so the module records
+    // escaped and their `exports`/`parent`/`children` reads read ⊤. No
+    // key is added to Object.prototype (Q2): the miss is final, the
+    // records keep their layout (whole-program proves all 19).
+    assert_cjs_per_unit(&w, &u, 19);
 }
 
 #[test]
@@ -555,16 +562,11 @@ const T9: [(&str, &str); 3] = [
 
 #[test]
 fn a_broken_function_is_still_the_callee_of_a_call_by_its_name() {
-    // The getters hand `isId`, `filter` and `user` to unknown code, so the
-    // census breaks their contracts and their owners run them on ⊤
-    // arguments. A call by name still calls that function: whole-program
-    // proves the callees of `user`'s calls (other units of `t.js`). Before,
-    // a broken function read through a value contract was ⊤ ("broken
-    // function of another unit"): no target, and typescript.js's top-level
-    // helpers (`isIdentifier`, `visitNode`, `some`, ...) lost 22,115 call
-    // sites per unit. The arguments still escape and the result is unknown
-    // (the escaped function's contract, `fn_named`).
-    let (w, u) = both(&T9);
+    // Explicitly hand the functions to unknown code: descriptor installs
+    // alone do not break their contracts. Calls by name must retain targets.
+    let module = format!("{}\n(globalThis as any).host(isId, filter);", T9[1].1);
+    let sources = [T9[0], (T9[1].0, module.as_str()), T9[2]];
+    let (w, u) = both(&sources);
     for f in ["isId", "filter"] {
         assert!(
             u.broken
