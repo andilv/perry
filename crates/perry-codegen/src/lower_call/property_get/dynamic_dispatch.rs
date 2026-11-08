@@ -54,6 +54,9 @@ struct TowerPshapeRoute {
     /// layout; `delete` swaps in a freshly cloned array, which is exactly what
     /// the inline compare catches.
     keys_global: String,
+    /// The index argument positions and clone parameter ids when the case's
+    /// index arguments are proven Numbers (`lower_call::index_split`).
+    number_index: Option<(Vec<usize>, Vec<u32>)>,
 }
 
 /// Build the exact direct-call ABI for one concrete method implementation.
@@ -496,7 +499,10 @@ fn lower_instance_method_call(
             // `arms`: the implementors a selection names (one per switch arm);
             // `None` for a proven site, whose switch lists every class.
             let (selected, arms) = if let Some((_, nullable)) = &proven {
-                (crate::expr::wpfacts_access::emit_class_id(ctx, &recv, *nullable), None)
+                (
+                    crate::expr::wpfacts_access::emit_class_id(ctx, &recv, *nullable),
+                    None,
+                )
             } else if cased.contains(&true) {
                 let (selected, arms) = select::select(ctx, &recv, property, &implementors, &cased);
                 (selected, Some(arms))
@@ -551,6 +557,7 @@ fn lower_instance_method_call(
                 // facts-verification build lists every class and its default
                 // is the witness.
                 Some((map, nullable)) => {
+                    crate::verify_facts::tick(ctx);
                     let label_of = |i: usize| {
                         case_idxs
                             .iter()
@@ -616,6 +623,13 @@ fn lower_instance_method_call(
                 );
                 let case_arg_slices: Vec<(crate::types::LlvmType, &str)> =
                     case_args.iter().map(|s| (DOUBLE, s.as_str())).collect();
+                // The facts prove the receiver is this arm's class (`proven`)
+                // and that class's layout never changes (`fixed_layout`): the
+                // arm needs no recheck.
+                let layout_proven = proven.is_some()
+                    && impl_owner[i]
+                        .as_deref()
+                        .is_some_and(|owner| tower_layout_proven(ctx, owner, implementors[i].0));
                 let v = match tower_pshape_route(
                     ctx,
                     impl_owner[i].as_deref(),
@@ -625,12 +639,7 @@ fn lower_instance_method_call(
                 ) {
                     Some(route) => {
                         let recv_handle = unbox_to_i64(ctx.block(), &recv_box);
-                        // The facts prove the receiver is this arm's class
-                        // (`proven`) and that class's layout never changes
-                        // (`fixed_layout`): the arm needs no recheck.
                         let owner = impl_owner[i].as_deref().unwrap_or_default();
-                        let layout_proven =
-                            proven.is_some() && tower_layout_proven(ctx, owner, implementors[i].0);
                         emit_tower_pshape_call(
                             ctx,
                             i,
@@ -649,7 +658,25 @@ fn lower_instance_method_call(
                                 closed_bodies.len(),
                             );
                         }
-                        ctx.block().call(DOUBLE, fname, &case_arg_slices)
+                        // An index the site proves a Number takes the
+                        // clone split instead of the public dispatcher.
+                        let split = impl_owner[i].as_deref().and_then(|owner| {
+                            crate::lower_call::index_split::number_index_positions(
+                                ctx, owner, property, args,
+                            )
+                        });
+                        match split {
+                            Some((positions, params)) => {
+                                crate::lower_call::index_split::emit_number_index_split(
+                                    ctx,
+                                    fname,
+                                    &positions,
+                                    &params,
+                                    &case_arg_slices,
+                                )
+                            }
+                            None => ctx.block().call(DOUBLE, fname, &case_arg_slices),
+                        }
                     }
                 };
                 let after = ctx.block().label.clone();
@@ -668,14 +695,19 @@ fn lower_instance_method_call(
                         .as_ref()
                         .map(|(map, _)| map.iter().map(|&(cid, _)| cid).collect())
                         .unwrap_or_default();
+                    crate::expr::wpfacts_access::receiver_checked(ctx, object);
                     let site = crate::verify_facts::site_arg(
                         ctx,
                         &format!("method .{property} receiver class_ids={ids:?}"),
+                        crate::verify_facts::Fact::Receiver,
+                        &ids,
                     );
-                    let _ = ctx.block().call(
+                    let _ = crate::verify_facts::check(
+                        ctx,
                         I32,
                         "perry_wpfacts_check_miss",
-                        &[(DOUBLE, &recv_box), (I64, &site)],
+                        &[(DOUBLE, &recv_box)],
+                        &site,
                     );
                 }
                 ctx.block().unreachable();
@@ -1709,7 +1741,32 @@ fn lower_instance_method_call(
                     // already proven here — no guard is emitted on this path at
                     // all. Same ABI, so the call is unchanged apart from the
                     // callee name.
-                    let direct = ctx.block().call(DOUBLE, generic_target, &arg_slices);
+                    // An index the site proves a Number takes the clone
+                    // split here instead of the public dispatcher's guard.
+                    let split = (nonnegative_index_direct_name.is_none()
+                        && (Some(generic_target) == pshape_target.as_deref()
+                            || generic_target == fallback_fn.as_str()))
+                    .then(|| {
+                        crate::lower_call::index_split::number_index_positions(
+                            ctx,
+                            &class_name,
+                            property,
+                            args,
+                        )
+                    })
+                    .flatten();
+                    let direct = match split {
+                        Some((positions, params)) => {
+                            crate::lower_call::index_split::emit_number_index_split(
+                                ctx,
+                                generic_target,
+                                &positions,
+                                &params,
+                                &arg_slices,
+                            )
+                        }
+                        None => ctx.block().call(DOUBLE, generic_target, &arg_slices),
+                    };
                     super::super::method_override::publish_constructive_method_truthy(
                         ctx,
                         &fallback_fn,

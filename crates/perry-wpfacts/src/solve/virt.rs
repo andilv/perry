@@ -29,7 +29,7 @@ impl Model {
         }
         if let Some(&pn) = self.proto_node.get(&t) {
             for &p in &fresh {
-                let pt = self.tok(TokKind::Proto(p));
+                let pt = self.tok(TokKind::Proto(self.constructor_origin(p)));
                 self.add_tok(pn, pt);
             }
         }
@@ -172,8 +172,11 @@ impl Model {
             self.atoms[a as usize], self.tmpls[tm as usize].display
         );
         self.funcs.push(FuncInfo {
+            #[cfg(test)]
+            body_packet: Default::default(),
             module: 0,
             func_id: u32::MAX,
+            raise: u32::MAX,
             name,
             params: Vec::new(),
             rest: None,
@@ -186,7 +189,8 @@ impl Model {
             ctor_of: None,
             lexical_this: false,
             no_summary: true,
-            gen_step: false,
+            gen_proto: None,
+            gen_fn_protos: None,
             gen_async: false,
             gen_reyields: false,
             proto: None,

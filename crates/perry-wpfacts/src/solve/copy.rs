@@ -14,6 +14,10 @@ impl Model {
 
     /// Copy edge a → b (pts(a) ⊆ pts(b)).
     pub fn edge(&mut self, a: NodeId, b: NodeId) {
+        #[cfg(test)]
+        if self.packet_emit(crate::summary::packet::Emission::Edge(a, b)) {
+            return;
+        }
         self.edge_impl(a, b, true);
     }
 
@@ -93,7 +97,7 @@ impl Model {
         toks.clear();
         self.nodes[a as usize].pts.sorted_into(&mut toks);
         // Registration sends what `a` holds: solve work.
-        self.work += toks.len() as u64;
+        self.charge_work(toks.len() as u64);
         let saved = (self.cur_src, self.cur_why);
         self.cur_src = a;
         self.cur_why = u32::MAX;
@@ -198,9 +202,10 @@ impl Model {
         let boundary = self.nodes[dst as usize].succ.len() as u32;
         let old = std::mem::replace(&mut self.nodes[dst as usize].pts, pts);
         self.sets.release(old);
-        self.work += self
+        let extra = self
             .pending
             .append_to(&mut self.nodes[dst as usize].delta, batch, boundary);
+        self.charge_work(extra);
         let before = self.pts_entries;
         self.pts_entries += batch.len() as u64;
         if top && self.diagnostic.is_some() {

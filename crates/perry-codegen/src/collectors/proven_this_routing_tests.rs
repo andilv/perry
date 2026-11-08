@@ -500,6 +500,7 @@ fn array_registry_class() -> Class {
                         op: BinaryOp::Add,
                         left: Box::new(Expr::LocalGet(111)),
                         right: Box::new(Expr::IndexGet {
+                            element_offset: 0,
                             byte_offset: 0,
                             byte_end: 0,
                             object: Box::new(this_get("vals")),
@@ -662,6 +663,7 @@ fn bitset_truthiness_site_module(proven_index: bool) -> Module {
     let bitset_test = Expr::Binary {
         op: BinaryOp::BitAnd,
         left: Box::new(Expr::IndexGet {
+            element_offset: 0,
             byte_offset: 0,
             byte_end: 0,
             object: Box::new(Expr::LocalGet(MASK_ID)),
@@ -1046,7 +1048,10 @@ fn guarded_pshape_call_site_is_preceded_by_a_shape_id_guard() {
                 bs.iter().any(|(_, body)| {
                     body.iter().any(|line| {
                         line.starts_with("  br i1 ")
-                            && line.contains(&format!("label %{call_block}"))
+                            && line.split("label %").skip(1).any(|part| {
+                                let to = part.split([',', ' ']).next().unwrap();
+                                through_stack_check(&probe, to) == *call_block
+                            })
                     }) && body.iter().any(|line| line.contains("icmp eq i64"))
                 })
             };
@@ -1444,12 +1449,10 @@ fn indexed_tower_site_module() -> Module {
         Type::Any,
         vec![Stmt::Return(Some(Expr::Binary {
             op: BinaryOp::Add,
-            left: Box::new(Expr::IndexGet {
-                byte_offset: 0,
-                byte_end: 0,
-                object: Box::new(this_get("values")),
-                index: Box::new(Expr::LocalGet(INDEX_ID)),
-            }),
+            left: Box::new(Expr::synthetic_index_get(
+                Box::new(this_get("values")),
+                Box::new(Expr::LocalGet(INDEX_ID)),
+            )),
             right: Box::new(this_get("id")),
         }))],
     ));
@@ -1473,6 +1476,41 @@ fn indexed_tower_site_module() -> Module {
 
 /// Split rendered IR into `(label, body_lines)` — block labels render
 /// unindented and colon-terminated, every instruction is indented.
+/// The block an edge into `label` really enters: a body's moved stack check
+/// (`stack_guard::move_check_to_call_sites`) sits in front of a calling block
+/// as `stack_guard.*` blocks, which this follows to the one block they lead to.
+fn through_stack_check(ir: &str, label: &str) -> String {
+    let mut work = vec![label.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    let mut exits = std::collections::BTreeSet::new();
+    while let Some(l) = work.pop() {
+        if !l.starts_with("stack_guard.") {
+            exits.insert(l);
+            continue;
+        }
+        if !seen.insert(l.clone()) {
+            continue;
+        }
+        let start = format!("{l}:");
+        for line in ir
+            .lines()
+            .skip_while(|line| *line != start)
+            .skip(1)
+            .take_while(|line| !line.ends_with(':'))
+        {
+            if line.trim_start().starts_with("br ") {
+                for part in line.split("label %").skip(1) {
+                    work.push(part.split([',', ' ']).next().unwrap().to_string());
+                }
+            }
+        }
+    }
+    match exits.len() {
+        1 => exits.into_iter().next().unwrap(),
+        _ => label.to_string(),
+    }
+}
+
 fn blocks(ir: &str) -> Vec<(String, Vec<&str>)> {
     let mut out: Vec<(String, Vec<&str>)> = Vec::new();
     for line in ir.lines() {
@@ -1780,12 +1818,7 @@ fn polymorphic_array_site_module() -> Module {
     m.classes.extend([derived, inherited]);
     m.functions[0].params[0].ty = Type::Array(Box::new(Type::Named("Counter".into())));
     m.functions[0].body = vec![Stmt::Expr(call(
-        Expr::IndexGet {
-            byte_offset: 0,
-            byte_end: 0,
-            object: Box::new(Expr::LocalGet(2)),
-            index: Box::new(Expr::Integer(0)),
-        },
+        Expr::synthetic_index_get(Box::new(Expr::LocalGet(2)), Box::new(Expr::Integer(0))),
         "bump",
         Vec::new(),
     ))];

@@ -1,4 +1,4 @@
-//! Saved base solver dumps cover every node, not just proven sites.
+//! Saved solver dumps cover every node, not just proven sites.
 use crate::model::{prim, Model, TokKind};
 use std::cell::RefCell;
 thread_local! {
@@ -11,8 +11,9 @@ pub(crate) fn record(m: &Model) {
         }
     });
 }
+// The first program's `key` is an unseen module's global.
 const PROGRAMS: &[&str] = &[
-    r#"class A { x = 1; } class B { y = 's'; }
+    r#"import "unseen-host"; class A { x = 1; } class B { y = 's'; }
     const a: any = new A(); const b: any = new B();
     const key = (globalThis as any).key; a[key] = b;
     function get(o: any) { return o.x; }
@@ -118,7 +119,7 @@ fn drained_event_storage_is_pending_only() {
     }
     m.solve();
     assert!(!m.aborted);
-    assert!(m.work >= 1000);
+    assert!(m.work.get() >= 1000);
     assert_eq!(
         m.nodes.iter().filter(|n| n.pts.contains_tok(t)).count(),
         2000

@@ -247,9 +247,9 @@ mod ctor_arity;
 pub use ctor_arity::{
     context_free_ctor_abi, context_free_ctor_param_count, CtorAbi, UNRESOLVED_PARENT_FWD_ARITY,
 };
-mod checked_integer;
 #[cfg(test)]
 mod buffer_alias_metadata_tests;
+mod checked_integer;
 #[cfg(test)]
 mod declared_string_add_tests;
 #[cfg(test)]
@@ -257,6 +257,9 @@ mod emission_order_tests;
 mod entry;
 pub mod entry_outline;
 mod export_value_wrappers;
+pub(crate) mod facts_number_locals;
+#[cfg(test)]
+mod facts_number_locals_tests;
 pub(crate) mod fresh_class_templates;
 pub(crate) mod func_registry;
 mod function;
@@ -376,15 +379,16 @@ pub(crate) use param_guard::scalar_descriptor_rep;
 pub(crate) use spec_abi::{spec_abi_enabled, spec_function_name, SpecDispatch, SpecFnPlan};
 pub(crate) use typed_abi::{
     emit_typed_arg_guard, emit_typed_arg_to_raw, emit_typed_f64_guard,
-    emit_typed_f64_to_raw_guarded, emit_typed_i1_guard, emit_typed_string_guard,
-    generic_closure_body_name, generic_function_body_name, generic_method_body_name,
-    nonnegative_index_fast_array_method_name, nonnegative_index_fast_array_params,
-    nonnegative_index_method_name, typed_arg_is_guard_candidate, typed_f64_closure_name,
-    typed_f64_function_name, typed_f64_method_name, typed_f64_receiver_method_info,
-    typed_f64_receiver_method_name, typed_i1_closure_name, typed_i1_function_name,
-    typed_i1_method_name, typed_i32_closure_name, typed_i32_function_name, typed_i32_method_name,
-    typed_param_reps_match_args, typed_string_closure_name, typed_string_function_name,
-    typed_string_method_name, TypedParamRep, TypedReceiverMethodInfo,
+    emit_typed_f64_to_raw_guarded, emit_typed_i1_guard, emit_typed_i32_plain_guard_and_raw,
+    emit_typed_string_guard, generic_closure_body_name, generic_function_body_name,
+    generic_method_body_name, nonnegative_index_fast_array_method_name,
+    nonnegative_index_fast_array_params, nonnegative_index_method_name,
+    typed_arg_is_guard_candidate, typed_f64_closure_name, typed_f64_function_name,
+    typed_f64_method_name, typed_f64_receiver_method_info, typed_f64_receiver_method_name,
+    typed_i1_closure_name, typed_i1_function_name, typed_i1_method_name, typed_i32_closure_name,
+    typed_i32_function_name, typed_i32_method_name, typed_param_reps_match_args,
+    typed_string_closure_name, typed_string_function_name, typed_string_method_name, TypedParamRep,
+    TypedReceiverMethodInfo,
 };
 
 use artifact_context::ModuleArtifactsCtx;
@@ -486,66 +490,8 @@ pub fn user_function_symbol(module_name: &str, function_name: &str) -> String {
     helpers::scoped_fn_name(&module_prefix, function_name)
 }
 
-/// Compile a Perry HIR module to an object file via LLVM IR.
-///
-/// CRITICAL (#686): `hir` MUST be `&HirModule` (shared reference), never
-/// `&mut`. The caller computes `perry_hir::stable_hash::hash_module(hir)`
-/// just before this call to derive the per-module object cache key. If
-/// codegen ever mutated the HIR mid-compile, the cached `.o` would no
-/// longer correspond to the hashed input and stale entries would be
-/// served on subsequent builds. The `&` here is the load-bearing
-/// guarantee — do not change to `&mut` without also moving the cache
-/// hash to AFTER codegen.
-pub fn compile_module(hir: &HirModule, mut opts: CompileOptions) -> Result<Vec<u8>> {
-    ensure_layout_plan(hir, &mut opts)?;
-    crate::facts_consumed::begin_module(&hir.name);
-    crate::verify_facts::begin_module(
-        &hir.name,
-        opts.module_source.as_deref(),
-        opts.debug_source_line_offset,
-    );
-    let _fallback = crate::fallback_diag::begin(
-        &hir.name,
-        opts.module_source.as_deref(),
-        opts.debug_source_line_offset,
-        opts.program_facts.fallback.clone(),
-    );
-    match lower_module(hir, opts, None)? {
-        Some(lowered) => emit_lowered_module(lowered),
-        None => unreachable!("normal lowering produces a module"),
-    }
-}
-
-/// Compile an owned HIR input, releasing it at the lowering/LLVM boundary.
-/// Lowering only borrows the input, preserving its object-cache identity.
-pub fn compile_module_owned(hir: HirModule, mut opts: CompileOptions) -> Result<Vec<u8>> {
-    ensure_layout_plan(&hir, &mut opts)?;
-    crate::facts_consumed::begin_module(&hir.name);
-    crate::verify_facts::begin_module(
-        &hir.name,
-        opts.module_source.as_deref(),
-        opts.debug_source_line_offset,
-    );
-    let _fallback = crate::fallback_diag::begin(
-        &hir.name,
-        opts.module_source.as_deref(),
-        opts.debug_source_line_offset,
-        opts.program_facts.fallback.clone(),
-    );
-    let lowered = lower_module(&hir, opts, None)?;
-    drop(hir);
-    emit_lowered_module(lowered.expect("normal lowering produces a module"))
-}
-
-/// Design step 4's pre-pass: the content of every class birth this module's
-/// string pool mints (local classes and imported stubs), from the SAME code
-/// codegen runs — `compile_module` up to the header-image table, then an early
-/// return. `opts` must be the options the module's codegen will get.
-pub fn module_birth_shapes(hir: &HirModule, opts: CompileOptions) -> Result<Vec<ModuleBirth>> {
-    let mut births = Vec::new();
-    lower_module(hir, opts, Some(&mut births))?;
-    Ok(births)
-}
+mod module_compile;
+pub use module_compile::{compile_module, compile_module_owned, module_birth_shapes};
 
 fn ensure_layout_plan(hir: &HirModule, opts: &mut CompileOptions) -> Result<()> {
     if !opts.program_layout_ordinals.entries.is_empty() {
@@ -3183,6 +3129,7 @@ fn lower_module(
         scope_map: Default::default(),
         string_accumulator_locals: Default::default(),
         contents_stable_bindings: Default::default(),
+        loop_pushed_arrays: Default::default(),
         definite_init: Default::default(),
         disable_buffer_fast_path,
         program_shadows_buffer_read_method:
@@ -3407,6 +3354,7 @@ fn lower_module(
         crate::scope_env::ScopeMap::build(hir, &module_boxed_vars, &module_globals);
     cross_module.string_accumulator_locals = crate::collectors::string_accumulator_locals(hir);
     cross_module.contents_stable_bindings = crate::collectors::contents_stable_bindings(hir);
+    cross_module.loop_pushed_arrays = crate::collectors::loop_pushed_arrays(hir);
     cross_module.capture_type_proofs =
         crate::collectors::typed_locals::capture_proofs(hir, &module_boxed_vars, &module_globals);
     cross_module.definite_init = crate::collectors::definite_init::collect(hir);
@@ -3719,7 +3667,8 @@ fn lower_module(
     // Bounded: one entry per function (the dominant tuple),
     // `PERRY_SPECIALIZED_ABI_MAX` per module.
     if spec_abi::spec_abi_enabled() {
-        let spec_facts = crate::collectors::collect_spec_abi_facts_with(hir, &cross_module.definite_init);
+        let spec_facts =
+            crate::collectors::collect_spec_abi_facts_with(hir, &cross_module.definite_init);
         let spec_budget = spec_abi::spec_abi_max();
         let mut spec_emitted = 0usize;
         for f in &hir.functions {
@@ -4521,6 +4470,7 @@ fn emit_lowered_module(lowered: LoweredModule) -> Result<Vec<u8>> {
     crate::root_reload::apply_to_module(&mut llmod);
 
     crate::typed_feedback_profile::finish_module(&mut llmod.native_rep_records);
+    crate::verify_facts::finish(&mut llmod);
 
     let verify_native_regions = opts.verify_native_regions
         || std::env::var("PERRY_VERIFY_NATIVE_REGIONS").ok().as_deref() == Some("1");

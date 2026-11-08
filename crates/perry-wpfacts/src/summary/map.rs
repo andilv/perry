@@ -46,6 +46,16 @@ pub fn map_cons(
             this,
         },
         New { call } => New { call: k(call) },
+        NewProgram { call } => NewProgram { call: k(call) },
+        FromArrayLike { dst } => FromArrayLike { dst: n(dst) },
+        ReflectNew { call, new_target } => ReflectNew {
+            call: k(call),
+            new_target: n(new_target),
+        },
+        ReflectNewTarget { call, target } => ReflectNewTarget {
+            call: k(call),
+            target,
+        },
         NewNamed { name, call } => NewNamed {
             name,
             call: k(call),
@@ -57,6 +67,8 @@ pub fn map_cons(
             act: act_map(act, &mut n, &mut k),
         },
         TopSink { reason } => TopSink { reason },
+        Raise { region } => Raise { region: n(region) },
+        RuntimeStore { reason, retained } => RuntimeStore { reason, retained },
         HandOver { reason, ctor, arg } => HandOver { reason, ctor, arg },
         OwnOnly { f, dst } => OwnOnly { f, dst: n(dst) },
         CallerValue { dst, reason } => CallerValue {
@@ -138,6 +150,7 @@ pub fn map_cons(
             reason,
         },
         Implicit { reason, proto } => Implicit { reason, proto },
+        HasInstance { reason, arg } => HasInstance { reason, arg: n(arg) },
         CreateProto { reason } => CreateProto { reason },
         ChainUnion {
             key,
@@ -162,6 +175,7 @@ pub fn map_cons(
             origin,
             act: act_map(act, &mut n, &mut k),
         },
+        UnnamedSet { target } => UnnamedSet { target },
         PlainKey { origin, act } => PlainKey {
             origin,
             act: act_map(act, &mut n, &mut k),
@@ -172,6 +186,11 @@ pub fn map_cons(
         },
         Super { start, key, act } => Super {
             start,
+            key,
+            act: act_map(act, &mut n, &mut k),
+        },
+        SuperFrom { recv, key, act } => SuperFrom {
+            recv: n(recv),
             key,
             act: act_map(act, &mut n, &mut k),
         },
@@ -213,6 +232,15 @@ pub fn map_cons(
         ProtoValues { dst } => ProtoValues { dst: n(dst) },
         IterNext { dst } => IterNext { dst: n(dst) },
         NewTargetHard { reason } => NewTargetHard { reason },
+        NativeParent {
+            tm,
+            expected,
+            reason,
+        } => NativeParent {
+            tm,
+            expected,
+            reason,
+        },
         IdxLoad { idx, dst, shape } => IdxLoad {
             idx: n(idx),
             dst: n(dst),
@@ -348,6 +376,7 @@ pub fn map_call(c: &CallSite, mut n: impl FnMut(NodeId) -> NodeId) -> CallSite {
         spread: c.spread.iter().map(|&x| n(x)).collect(),
         ret: n(c.ret),
         site: c.site,
+        region: n(c.region),
     }
 }
 
@@ -391,10 +420,15 @@ pub(super) fn gen_kind(c: &Cons) -> bool {
             | Store { .. }
             | Call { .. }
             | New { .. }
+            | NewProgram { .. }
+            | FromArrayLike { .. }
+            | ReflectNew { .. }
             | NewNamed { .. }
             | SuperCtor { .. }
             | MCall { .. }
             | TopSink { .. }
+            | Raise { .. }
+            | RuntimeStore { .. }
             | HandOver { .. }
             | ContractThis { .. }
             | OverrideThis { .. }
@@ -410,6 +444,7 @@ pub(super) fn gen_kind(c: &Cons) -> bool {
             | DefineAll { .. }
             | AddsKeys
             | Implicit { .. }
+            | HasInstance { .. }
             | IdxLoad { .. }
             | IdxKey { .. }
             | IdxOwnLoad { .. }
@@ -432,6 +467,7 @@ pub(super) fn gen_kind(c: &Cons) -> bool {
             | BirthField { .. }
             | CreateProto { .. }
             | NewTargetHard { .. }
+            | NativeParent { .. }
             | ShareBuffer { .. }
             | AnnexBDefine { .. }
             | AnnexBLookup { .. }
@@ -458,6 +494,7 @@ pub(super) fn read_dst(c: &Cons) -> Option<NodeId> {
         | Arith { dst }
         | ArrayLenArg { dst }
         | IterNext { dst }
+        | FromArrayLike { dst }
         | ProtoOf { dst }
         | ProtoValues { dst } => Some(dst),
         _ => None,

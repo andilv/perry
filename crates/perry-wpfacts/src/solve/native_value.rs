@@ -5,6 +5,7 @@
 //! or with none, it is the call of an unknown function value it was before.
 
 use crate::builtins;
+use crate::builtins::Family;
 use crate::model::*;
 use crate::solve::Tokens;
 
@@ -26,7 +27,19 @@ impl Model {
         let TokKind::BuiltinFn(Native::Member { identity }) = self.toks[t as usize] else {
             return false;
         };
-        let Some((fam, what, name)) = builtins::native_model(identity) else {
+        // A module member whose effects the runtime declares at the body
+        // its dispatch arm calls: the declaration runs, whatever `this`.
+        if let Some(e) = builtins::declared_member(identity) {
+            if self.bind_done.insert((call, t, u32::MAX - 7)) {
+                self.diagnostic_callee(call, t);
+                self.with_b(|m| builtins::run_native(m, e, t, call));
+            }
+            return true;
+        }
+        if builtins::native_namespace_call(self, t, call, this_tok) {
+            return true;
+        }
+        let Some((fam, what, name)) = builtins::native_model(self, t) else {
             return false;
         };
         let key = self.atom(&name.replace("@@", builtins::WK_PREFIX));
@@ -42,11 +55,27 @@ impl Model {
             (None, ThisArg::Undef) => return false,
         };
         if !builtins::native_receiver(self, fam, what, r) {
-            return false;
+            return fam == Family::Str && r != TOP && self.string_this(call, t, r, key);
         }
         if self.bind_done.insert((call, t, r)) {
             self.diagnostic_callee(call, t);
-            self.with_b(|m| builtins::own_method(m, r, Key::Named(key), call));
+            self.with_b(|m| builtins::native_prototype_call(m, fam, r, key, call));
+        }
+        true
+    }
+
+    /// A `String.prototype` method called with a receiver `r` of another
+    /// kind (`String.prototype.replace.call(o, ...)`): the method starts with
+    /// `ToString(RequireObjectCoercible(this))` (ES 22.1.3), which runs `r`'s
+    /// own ToPrimitive and nothing else on it; the rest is the method on that
+    /// string. `r` is not handed to unknown code. (`toString` and `valueOf`
+    /// throw on such an `r` instead: the model is a superset of that.)
+    fn string_this(&mut self, call: CallId, t: Tok, r: Tok, key: Atom) -> bool {
+        if self.bind_done.insert((call, t, r)) {
+            self.diagnostic_callee(call, t);
+            let why = self.reason("ToString(this) of a String.prototype method");
+            self.implicit(r, why, Protocol::ToPrimitive);
+            self.with_b(|m| builtins::prim_method(m, prim::STR, Key::Named(key), call));
         }
         true
     }
@@ -92,15 +121,26 @@ impl Model {
     /// `Cons::NativeThis`: the receiver values of `call` into named native
     /// `f`. A primitive of the member's family runs the primitive's method;
     /// `undefined` / `null` throw (no intrinsic prototype method accepts
-    /// them as `this`); any other primitive is an unknown callee's call.
+    /// them as `this`).
+    ///
+    /// Another primitive on a primitive family's method runs no program
+    /// code: a `String.prototype` method starts with `ToString(this)` (ES
+    /// 22.1.3), which for a number, boolean or bigint is the realm's own
+    /// conversion, so the method runs on a string (`string_this` minus the
+    /// ToPrimitive; `toString` / `valueOf` throw instead: a superset); on a
+    /// symbol it throws. A `Number`, `Boolean`, `Symbol` or `BigInt` method
+    /// starts with `thisNumberValue(this)` (and the like), which throws on a
+    /// foreign primitive: no callee, nothing escapes. On any other family's
+    /// method (generic `ToObject(this)`) the primitive is an unknown
+    /// callee's call.
     pub(super) fn native_this(&mut self, call: CallId, f: Tok, toks: Tokens<'_>, prim: u16) {
         for &r in toks {
             self.call_tok(call, f, Some(r));
         }
-        let TokKind::BuiltinFn(Native::Member { identity }) = self.toks[f as usize] else {
+        let TokKind::BuiltinFn(Native::Member { .. }) = self.toks[f as usize] else {
             return;
         };
-        let Some((fam, _, name)) = builtins::native_model(identity) else {
+        let Some((fam, _, name)) = builtins::native_model(self, f) else {
             return;
         };
         let key = self.atom(&name.replace("@@", builtins::WK_PREFIX));
@@ -108,10 +148,20 @@ impl Model {
         if own != 0 {
             self.with_b(|m| builtins::prim_method(m, own, Key::Named(key), call));
         }
-        if prim & !own & !(prim::UNDEF | prim::NULL) != 0
-            && self.bind_done.insert((call, f, u32::MAX - 2))
+        let foreign = prim & !own & !(prim::UNDEF | prim::NULL);
+        if foreign == 0 {
+            return;
+        }
+        if builtins::native_prims(fam) == 0 {
+            if self.bind_done.insert((call, f, u32::MAX - 2)) {
+                self.unknown_callee_args(call, f, false);
+            }
+        } else if fam == Family::Str
+            && foreign & (prim::NUM | prim::BOOL | prim::BIGINT) != 0
+            && self.bind_done.insert((call, f, u32::MAX - 6))
         {
-            self.unknown_callee_args(call, f, false);
+            self.diagnostic_callee(call, f);
+            self.with_b(|m| builtins::prim_method(m, prim::STR, Key::Named(key), call));
         }
     }
 }

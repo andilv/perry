@@ -17,6 +17,7 @@ pub fn new_builtin_ns(m: &mut Model, ns: BuiltinNs, call: CallId) {
             spread: vec![],
             ret: c.ret,
             site: c.site,
+            region: m.thrown,
         });
         return new_builtin_ns(m, ns, c2);
     }
@@ -64,6 +65,7 @@ pub fn new_builtin_ns(m: &mut Model, ns: BuiltinNs, call: CallId) {
                         spread: vec![],
                         ret,
                         site: call2,
+                        region: m.thrown,
                     },
                 );
                 m.cons(ex, Cons::Call { call: call2 });
@@ -265,6 +267,21 @@ pub fn construct_named(m: &mut Model, name: &str, call: CallId) {
             }
             unknown_method(m, call, "E9 Proxy");
         }
-        _ => unknown_method(m, call, &format!("argument of unknown constructor {name}")),
+        _ => match super::effects::declared_ctor(name) {
+            // The realm's constructor, while the global holds it: what its
+            // declaration says. A write under the name (now, or later in the
+            // solve: the replay) is the unknown constructor again.
+            Some(e) if !m.unit_mode => {
+                let g = m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
+                let a = m.atom(name);
+                if native_written(m, g, a) {
+                    unknown_method(m, call, &format!("argument of written constructor {name}"));
+                } else {
+                    m.native_missing.push((g, a, NativeMiss::New(call)));
+                    super::effects::run_construct(m, e, call);
+                }
+            }
+            _ => unknown_method(m, call, &format!("argument of unknown constructor {name}")),
+        },
     }
 }

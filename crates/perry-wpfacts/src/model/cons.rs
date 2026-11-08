@@ -71,6 +71,16 @@ pub enum Cons {
     CallThis { call: CallId, this: Tok },
     /// The node is a `new` callee.
     New { call: CallId },
+    /// The node holds the constructor a built-in makes its result with
+    /// (the `this` of `Array.from`/`Array.of`, an array's species): a
+    /// program constructor (a class or function of the program's code) is
+    /// constructed by `call`. The realm's own constructors, `%Array%` among
+    /// them, make the built-in's own array, which the built-in's rule makes.
+    NewProgram { call: CallId },
+    /// The target of Reflect.construct; allocation is selected by new_target.
+    ReflectNew { call: CallId, new_target: NodeId },
+    /// New-target values paired with one target, rebuilt from ReflectNew.
+    ReflectNewTarget { call: CallId, target: Tok },
     /// `new Name(...)` of a builtin constructor named in the source: runs
     /// once per call (the holder holds one marker token), so an instance
     /// that renames the call constructs its own object.
@@ -85,6 +95,13 @@ pub enum Cons {
     },
     /// Every token escapes (goes to ⊤), with the reason.
     TopSink { reason: u32 },
+    /// An operation on the node runs in throw region `region` (DESIGN SEEDE
+    /// section 8): once ⊤ is here, unknown code may run (a getter, a trap,
+    /// ToPrimitive, a callee) and throw anything into the region.
+    Raise { region: NodeId },
+    /// A realm field already retains its canonical value. Storing it again
+    /// exposes no new reach; every other alternative takes the usual sink.
+    RuntimeStore { reason: u32, retained: Tok },
     /// A parameter of a closed class's stand-in constructor (design §18.13,
     /// DECISIONS 109): an instance of another unit's contract (a stand-in)
     /// goes to the defining unit's constructor through the argument
@@ -212,6 +229,10 @@ pub enum Cons {
     AddsKeys,
     /// Builtin protocol touch: what `proto` reads on every token.
     Implicit { reason: u32, proto: Protocol },
+    /// InstanceofOperator (13.10.2) with the node as its right-hand side:
+    /// `GetMethod(C, @@hasInstance)` on every token, called with `arg`, the
+    /// left-hand side value (`Call(instOfHandler, C, « V »)`).
+    HasInstance { reason: u32, arg: NodeId },
     /// The node holds `Object.create` prototype arguments (E10).
     CreateProto { reason: u32 },
     /// The node is `ProtoNode(of)`: dst ⊇ the values of `key` on each
@@ -241,12 +262,20 @@ pub enum Cons {
     /// The node is the prototype closure of `origin`: accessors of every
     /// holder on it run for a computed-key lookup with `origin` as `this`.
     AnyAccessors { origin: Tok, act: ChainAct },
+    /// The node is a copy source's unnamed-key field (`field_any`): once it
+    /// holds a value the source has an own key the model does not name, a
+    /// [[Set]] of some key on `target` (Object.assign, `spread_into`).
+    UnnamedSet { target: Tok },
     /// The node is the prototype closure of `origin`: an unknown (⊤)
     /// prototype may hold a setter, so the stored value and `origin` escape.
     StoreTopProto { origin: Tok, src: NodeId },
     /// The node is `this`: continue a `super.key` lookup at `start` with
     /// each `this` token as the receiver.
     Super { start: Tok, key: Key, act: ChainAct },
+    /// The node holds the prototypes of a `super` access's home object
+    /// (its [[GetPrototypeOf]] at the access): continue the lookup at each
+    /// (`Cons::Super`), with each token of `recv` as the receiver.
+    SuperFrom { recv: NodeId, key: Key, act: ChainAct },
     /// The node is `this` of a constructor of `class`: run the parent
     /// constructor chain for each instance (`super(...)`).
     SuperCtor { class: TmplId, call: CallId },
@@ -293,8 +322,24 @@ pub enum Cons {
     PlainKey { origin: Tok, act: ChainAct },
     /// dst ⊇ the `next` method of each iterator in the node.
     IterNext { dst: NodeId },
+    /// The node holds the source of `Array.from`: a program object whose
+    /// `@@iterator` may be nullish is read as an array-like (ECMA-262
+    /// 23.1.2.1 step 5: `length`, then each index), its elements into
+    /// `dst`. Iteration is `Gen::iterate`'s.
+    FromArrayLike { dst: NodeId },
     /// The node holds `Reflect.construct` new-targets (E11).
     NewTargetHard { reason: u32 },
+    /// The node is the evaluated `extends` value of class `tm`, linked by
+    /// name to a built-in parent whose summary `super()` runs: any value
+    /// other than `expected`, the global object's declared constructor
+    /// (⊤, a program-written global, `null`), runs as the parent
+    /// constructor with `this` = the instance: it escapes, and the instance
+    /// escapes with hard E11.
+    NativeParent {
+        tm: TmplId,
+        expected: Tok,
+        reason: u32,
+    },
     /// The node is the object of `o[idx]` with a computed key: dst ⊇ its
     /// elements/fields; the full keyed lookup (prototype chain, builtin
     /// members) runs only if `idx` can hold a non-number key (`IdxKey`).
@@ -493,10 +538,15 @@ impl Cons {
             Cons::Call { .. } => "call",
             Cons::CallThis { .. } => "callthis",
             Cons::New { .. } => "new",
+            Cons::NewProgram { .. } => "newprogram",
+            Cons::FromArrayLike { .. } => "fromarraylike",
+            Cons::ReflectNew { .. } => "reflectnew",
+            Cons::ReflectNewTarget { .. } => "reflectnewtarget",
             Cons::NewNamed { .. } => "newnamed",
             Cons::MCall { .. } => "mcall",
             Cons::Chain { .. } => "chain",
-            Cons::TopSink { .. } => "top",
+            Cons::TopSink { .. } | Cons::RuntimeStore { .. } => "top",
+            Cons::Raise { .. } => "raise",
             Cons::HandOver { .. } => "handover",
             Cons::OwnOnly { .. } => "ownonly",
             Cons::CallerValue { .. } => "callervalue",
@@ -517,6 +567,7 @@ impl Cons {
             Cons::DefineAll { .. } => "defineall",
             Cons::DefineDesc { .. } => "definedesc",
             Cons::Implicit { .. } => "implicit",
+            Cons::HasInstance { .. } => "hasinstance",
             Cons::CreateProto { .. } => "createproto",
             Cons::ChainUnion { .. } => "chainunion",
             Cons::ProtoGiven { .. } => "protogiven",
@@ -524,8 +575,10 @@ impl Cons {
             Cons::ProtoClosure { .. } => "protoclosure",
             Cons::ProtoMethods { .. } => "protomethods",
             Cons::AnyAccessors { .. } => "anyaccessors",
+            Cons::UnnamedSet { .. } => "unnamedset",
             Cons::StoreTopProto { .. } => "storetopproto",
             Cons::Super { .. } => "super",
+            Cons::SuperFrom { .. } => "super-from",
             Cons::SuperCtor { .. } => "superctor",
             Cons::SuperCtorParent { .. } => "superctorparent",
             Cons::ThisFrom { .. } => "thisfrom",
@@ -540,6 +593,7 @@ impl Cons {
             Cons::PlainKey { .. } => "plainkey",
             Cons::IterNext { .. } => "iternext",
             Cons::NewTargetHard { .. } => "newtargethard",
+            Cons::NativeParent { .. } => "nativeparent",
             Cons::Arith { .. } => "arith",
             Cons::Plus { .. } => "plus",
             Cons::ArrayLenArg { .. } => "arraylenarg",

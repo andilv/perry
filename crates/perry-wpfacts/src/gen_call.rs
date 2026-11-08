@@ -55,14 +55,29 @@ impl<'a> Gen<'a> {
                     }
                     None => self.expr(fx, seed),
                 };
-                let tm = self.m.nodes[lit as usize]
-                    .pts
-                    .to_sorted()
-                    .into_iter()
-                    .find_map(|t| self.m.tmpl_of(t));
+                #[cfg(test)]
+                let direct_birth = self
+                    .m
+                    .packet_scope
+                    .as_ref()
+                    .map(|_| self.m.packet_direct_template(lit));
+                #[cfg(not(test))]
+                let direct_birth: Option<Option<TmplId>> = None;
+                let tm = direct_birth.unwrap_or_else(|| {
+                    self.m.nodes[lit as usize]
+                        .pts
+                        .to_sorted()
+                        .into_iter()
+                        .find_map(|t| self.m.tmpl_of(t))
+                });
                 if let Some(tm) = tm {
                     let pn = self.local(fx.module, params[0].id);
                     self.iife_birth.insert(pn, tm);
+                }
+                #[cfg(test)]
+                if let Expr::Closure { func_id, .. } = callee {
+                    self.m
+                        .packet_shared_birth(self.modules[fx.module as usize].0, *func_id, lit);
                 }
                 let c = self.expr(fx, callee);
                 if let Expr::Closure { func_id, .. } = callee {
@@ -137,6 +152,7 @@ impl<'a> Gen<'a> {
                     None => self.expr(fx, object),
                 };
                 self.own_test_recv = Some(o);
+                let private = self.private_method_callee(fx.module, object);
                 let a = self.member_atom(object, property);
                 let off = if *pb != 0 { *pb } else { byte_offset };
                 if off != 0 {
@@ -144,9 +160,9 @@ impl<'a> Gen<'a> {
                         module: fx.module,
                         byte_offset: off,
                         key: a,
-                        recv: o,
+                        recv: private.unwrap_or(o),
                         is_call: true,
-                        value_call: false,
+                        value_call: private.is_some(),
                         func: fx.f,
                     });
                 }
@@ -154,13 +170,16 @@ impl<'a> Gen<'a> {
                 if let Some(a) = lit {
                     self.m.call_lit.insert(call, a);
                 }
-                self.m.cons(
-                    o,
-                    Cons::MCall {
-                        key: Key::Named(a),
-                        call,
-                    },
-                );
+                match private {
+                    Some(callee) => self.m.cons(callee, Cons::Call { call }),
+                    None => self.m.cons(
+                        o,
+                        Cons::MCall {
+                            key: Key::Named(a),
+                            call,
+                        },
+                    ),
+                }
                 ret
             }
             Expr::IndexGet { object, index, .. } => {
@@ -174,11 +193,14 @@ impl<'a> Gen<'a> {
                         proto: Protocol::ToPrimitive,
                     },
                 );
+                let key = self.read_key(fx.module, index);
+                let idx = self.for_in_key_of(fx.module, index).unwrap_or(i);
+                self.element_site(fx, callee, o, idx, key, crate::derive::ElementOp::Call);
                 let (call, ret) = self.new_call(ThisArg::Node(o), args, spread);
                 if let Some(a) = lit {
                     self.m.call_lit.insert(call, a);
                 }
-                match self.read_key(index) {
+                match self.read_key(fx.module, index) {
                     Key::Named(a) => {
                         self.m.cons(
                             o,
@@ -192,7 +214,7 @@ impl<'a> Gen<'a> {
                     // DECISIONS 217: the key's values decide which members
                     // it may name (`Cons::IdxMCall`).
                     Key::Any(_) => {
-                        let shape = self.m.key_shape(index);
+                        let shape = self.key_shape(fx.module, index);
                         self.m.cons(
                             o,
                             Cons::IdxMCall {
@@ -207,17 +229,12 @@ impl<'a> Gen<'a> {
             }
             // Direct host timer calls use the same guarded global lookup
             // as globalThis.setTimeout. Import/module bindings shadow them.
+            // Unit contracts retain their direct model. The whole-program
+            // path below reads the same value an alias reads.
             Expr::ExternFuncRef { name, .. }
-                if matches!(
-                    name.as_str(),
-                    "setTimeout"
-                        | "setInterval"
-                        | "setImmediate"
-                        | "clearTimeout"
-                        | "clearInterval"
-                        | "clearImmediate"
-                        | "queueMicrotask"
-                ) && !self.is_import(fx.module, name)
+                if self.m.unit_mode
+                    && crate::builtins::global_function(&self.m, name)
+                    && !self.is_import(fx.module, name)
                     && !self.mods[fx.module as usize].scope.contains_key(name) =>
             {
                 let t = self.m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
@@ -275,6 +292,13 @@ impl<'a> Gen<'a> {
         }
         if let Some(&n) = self.mods[mi as usize].scope.get(name) {
             return n;
+        }
+        if !self.m.unit_mode && crate::builtins::global_function(&self.m, name) {
+            let t = self.m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
+            let dst = self.m.node_l("global-function-value");
+            let key = Key::Named(self.m.atom(name));
+            self.m.load_from(t, t, key, dst);
+            return dst;
         }
         self.m.top_val(&format!("extern value {name}"))
     }
@@ -354,7 +378,26 @@ impl<'a> Gen<'a> {
             // DECISIONS 225: its body is walked once the closure can run.
             let deferred = match self.emitted_closure(mi, *func_id) {
                 Some(c) => self.defer_walk(f, crate::gen::PendingWalk::Closure(cfx.clone(), c)),
-                None => false,
+                None => {
+                    #[cfg(test)]
+                    {
+                        if self.m.packets_inert {
+                            self.pending_walk.entry(f).or_default().push(
+                                crate::gen::PendingWalk::OwnedClosure(
+                                    cfx.clone(),
+                                    Box::new(canonical.clone()),
+                                ),
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    #[cfg(not(test))]
+                    {
+                        false
+                    }
+                }
             };
             if !deferred {
                 self.walk_closure_body(&cfx, canonical);
@@ -365,6 +408,16 @@ impl<'a> Gen<'a> {
 
     /// The body of closure `e` in its context `cfx` (once per function).
     pub(crate) fn walk_closure_body(&mut self, cfx: &Fx, e: &Expr) {
+        if self.walked.contains(&cfx.f) {
+            return;
+        }
+        let r = self.m.raise_of(cfx.f);
+        let region = std::mem::replace(&mut self.m.gen_region, Some(r));
+        self.walk_closure_body_region(cfx, e);
+        self.m.gen_region = region;
+    }
+
+    fn walk_closure_body_region(&mut self, cfx: &Fx, e: &Expr) {
         let f = cfx.f;
         if !self.walked.insert(f) {
             return;
@@ -385,6 +438,12 @@ impl<'a> Gen<'a> {
         // default is not.
         let saved = (self.order_ok, self.loop_depth);
         (self.order_ok, self.loop_depth) = (false, 0);
+        #[cfg(test)]
+        let packet_prior = self.m.packet_body(f);
+        #[cfg(test)]
+        let packet_read_start = self.read_sites.len();
+        #[cfg(test)]
+        self.m.packet_declarations(body);
         self.params(cfx, params);
         if *is_async || *is_generator {
             self.m
@@ -394,6 +453,11 @@ impl<'a> Gen<'a> {
         let own = self.own_helper_shape(params, body, *is_async || *is_generator);
         self.stmts(cfx, body);
         self.own_helper_finish(f, own);
+        #[cfg(test)]
+        {
+            self.packet_reads(packet_read_start);
+            self.m.packet_end(packet_prior, true);
+        }
         (self.order_ok, self.loop_depth) = saved;
         let _: &Vec<Stmt> = body;
     }
@@ -409,7 +473,19 @@ impl<'a> Gen<'a> {
         let mi = fx.module;
         let callee = if let Some(&tm) = self.mods[mi as usize].classes.get(name) {
             let t = self.m.tok(TokKind::ClassObj(tm));
-            Some(self.tok_node(t))
+            let c = self.tok_node(t);
+            // A default-derived specialization may be constructed as the
+            // class it was specialized from (codegen `super_constructor::new`
+            // constructs that class value when the heritage is live): the
+            // program then builds an instance of the class as written and
+            // runs its default constructor and field initializers. Which of
+            // the two the program builds is decided by facts about the
+            // heritage, so the callee holds both.
+            for origin in self.written_classes(mi, name) {
+                let o = self.m.tok(TokKind::ClassObj(origin));
+                self.m.add_tok(c, o);
+            }
+            Some(c)
         } else if let Some(n) = self.import_value(mi, name) {
             Some(n)
         } else {
@@ -423,6 +499,28 @@ impl<'a> Gen<'a> {
             }
             None => self.new_builtin(fx, name, args, spread),
         }
+    }
+
+    /// The classes a default-derived specialization `name` of module `mi`
+    /// was specialized from, nearest first (`Class::is_default_derived`).
+    fn written_classes(&self, mi: u32, name: &str) -> Vec<TmplId> {
+        let module = self.modules[mi as usize].1;
+        let mut out = Vec::new();
+        let mut cur = module.classes.iter().find(|c| c.name == name);
+        for _ in 0..module.classes.len() {
+            let Some(c) = cur.filter(|c| c.is_default_derived()) else {
+                break;
+            };
+            let Some(origin) = c.specialized_from.as_deref() else {
+                break;
+            };
+            let Some(&tm) = self.mods[mi as usize].classes.get(origin) else {
+                break;
+            };
+            out.push(tm);
+            cur = module.classes.iter().find(|k| k.name == origin);
+        }
+        out
     }
 
     /// `new Name(...)` of a name that is not a program class: a builtin.
@@ -454,6 +552,17 @@ impl<'a> Gen<'a> {
             return n;
         }
         self.m.top_val(&format!("unresolved class value {name}"))
+    }
+
+    /// The class value of `instanceof Name` when `Name` is a user class
+    /// (local, or imported): codegen tests against that value
+    /// (`js_instanceof_dynamic`), not a class id. `None`: a builtin name.
+    pub(crate) fn instanceof_class(&mut self, mi: u32, name: &str) -> Option<NodeId> {
+        if let Some(&tm) = self.mods[mi as usize].classes.get(name) {
+            let t = self.m.tok(TokKind::ClassObj(tm));
+            return Some(self.tok_node(t));
+        }
+        self.import_value(mi, name)
     }
 
     /// One captured value of a class body (a slot of the class's capture
@@ -518,31 +627,32 @@ impl<'a> Gen<'a> {
         self.m.tmpls[tm as usize].has_computed_members = true;
     }
 
-    pub(crate) fn super_starts(&mut self, fx: &Fx) -> Vec<Tok> {
+    /// The home objects of a `super` access in a method of `fx`'s class:
+    /// its prototype and its class object (`Fx` does not say whether the
+    /// method is static); ⊤ outside a known class.
+    pub(crate) fn super_homes(&mut self, fx: &Fx) -> NodeId {
+        let n = self.tmp("super.home");
         match fx.class {
-            Some(tm) => self.super_starts_of(tm),
-            None => vec![TOP],
+            Some(tm) => {
+                let p = self.m.tok(TokKind::Proto(tm));
+                self.m.add_tok(n, p);
+                let c = self.m.tok(TokKind::ClassObj(tm));
+                self.m.add_tok(n, c);
+            }
+            None => self.m.add_tok(n, TOP),
         }
+        n
     }
 
-    pub(crate) fn super_starts_of(&mut self, tm: TmplId) -> Vec<Tok> {
-        match self.m.tmpls[tm as usize].parent {
-            Some(p) => vec![
-                self.m.tok(TokKind::Proto(p)),
-                self.m.tok(TokKind::ClassObj(p)),
-            ],
-            None => {
-                // A parent value (§17.2): `super.x` starts at a prototype
-                // the solve computes; unknown here.
-                if self.m.tmpls[tm as usize].native_parent.is_some()
-                    || self.m.tmpls[tm as usize].parent_value.is_some()
-                {
-                    vec![TOP]
-                } else {
-                    vec![self.m.tok(TokKind::ObjectProto)]
-                }
-            }
-        }
+    /// `super[key]` (a read, store or call) in a method whose home object
+    /// is in `homes`: the lookup starts at the home object's
+    /// [[GetPrototypeOf]] at the access (`Cons::ProtoOf`: its declared
+    /// parent and what `Object.setPrototypeOf` of the home wrote), with each
+    /// token of `recv` as the receiver.
+    pub(crate) fn super_access(&mut self, homes: NodeId, recv: NodeId, key: Key, act: ChainAct) {
+        let base = self.tmp("super.base");
+        self.m.cons(homes, Cons::ProtoOf { dst: base });
+        self.m.cons(base, Cons::SuperFrom { recv, key, act });
     }
 
     pub(crate) fn super_ctor(&mut self, fx: &Fx, args: Vec<NodeId>, spread: Vec<NodeId>) -> NodeId {
@@ -574,16 +684,8 @@ impl<'a> Gen<'a> {
     ) -> NodeId {
         let (call, ret) = self.new_call(ThisArg::Node(fx.this), args, spread);
         let a = self.m.atom(method);
-        for start in self.super_starts(fx) {
-            self.m.cons(
-                fx.this,
-                Cons::Super {
-                    start,
-                    key: Key::Named(a),
-                    act: ChainAct::Call(call),
-                },
-            );
-        }
+        let homes = self.super_homes(fx);
+        self.super_access(homes, fx.this, Key::Named(a), ChainAct::Call(call));
         ret
     }
 
@@ -870,8 +972,9 @@ impl<'a> Gen<'a> {
                 out
             }
             n if n.starts_with("js_throw_") => {
+                let r = self.region();
                 for a in &args {
-                    self.m.edge(*a, self.thrown);
+                    self.m.edge(*a, r);
                 }
                 self.prim_node(prim::UNDEF)
             }
@@ -942,6 +1045,20 @@ impl<'a> Gen<'a> {
                 let key = Key::Named(self.m.atom(&k));
                 self.store(fx, recv, key, v, name.to_string(), None, false);
                 v
+            }
+            // Rule G: an unresolved identifier is `[[Get]](globalThis, NAME)`
+            // (`perry-runtime` `error/global_ref.rs`; absent = ReferenceError,
+            // `typeof` = "undefined"), as the load `globalThis.NAME` is.
+            // Whole-program mode only: in per-unit mode another unit's
+            // stores are unseen, so the read stays unknown.
+            "js_global_get_or_throw_unresolved" | "js_global_get_optional" if !self.m.unit_mode => {
+                let Some(k) = lit(0) else {
+                    return self.extern_fail(name, &args, &spread);
+                };
+                let t = self.m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
+                let recv = self.tok_node(t);
+                let key = Key::Named(self.m.atom(&k));
+                self.load(recv, key)
             }
             "js_vm_module_call" => {
                 crate::builtins::set_dyn_eval(&mut self.m, "E14 node:vm");

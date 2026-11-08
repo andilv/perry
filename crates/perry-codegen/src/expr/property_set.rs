@@ -38,7 +38,7 @@ use crate::type_analysis::{
 use crate::types::{DOUBLE, I1, I32, I64, PTR};
 
 use super::{
-    class_field_store_needs_string_addref, emit_jsvalue_slot_store_pointer_tested,
+    class_field_store_needs_string_addref, emit_jsvalue_slot_store_pointer_tested_known,
     emit_typed_feedback_register_site, expr_produces_non_pointer_bits_by_construction, lower_expr,
     lower_expr_native, raw_f64_layout_fact, try_lower_pod_field_set,
     typed_feedback_emission_enabled, unbox_to_i64, FnCtx, TypedFeedbackContract, TypedFeedbackKind,
@@ -434,7 +434,7 @@ pub(crate) fn emit_nullish_write_guard(
 /// own-property store that skipped the prototype walk; see the helper.
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -> Result<String> {
     let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
-    let _consumed = crate::facts_consumed::enter(expr);
+    let _consumed = crate::facts_consumed::enter(expr, &ctx.func.name);
     match expr {
         Expr::PropertySet {
             object,
@@ -1214,14 +1214,20 @@ fn emit_proven_class_field_store(
             // into a pointer-masked slot is deliberately
             // NOT elided, is on
             // `class_field_store_needs_layout_note`.
+            // A literal the pool atomises (or a choice of two) is a property
+            // atom on every lowering path (`js_string_pool_atom`, the image
+            // records), and every atom is born `refcount = 0`, already shared:
+            // the addref would find nothing to demote. The write barrier
+            // stays: an atom minted earlier at runtime can be young.
             let string_addref_needed = class_field_store_needs_string_addref(ctx, value)
-                && wpf.is_none_or(|w| w.proof.may_hold_string());
+                && wpf.is_none_or(|w| w.proof.may_hold_string())
+                && !super::helpers::expr_is_pool_atom_literal(value);
             let field_addr = ctx.block().ptrtoint(&field_ptr, I64);
             // #7511: whatever these three flags could not
             // be proved away statically is decided by ONE
             // live test of the stored bits — see
             // `emit_jsvalue_slot_store_pointer_tested`.
-            emit_jsvalue_slot_store_pointer_tested(
+            emit_jsvalue_slot_store_pointer_tested_known(
                 ctx,
                 &field_ptr,
                 &val_double,
@@ -1231,6 +1237,7 @@ fn emit_proven_class_field_store(
                 &field_addr,
                 field_set_barrier_needed,
                 "class_field_set",
+                super::helpers::expr_is_pool_atom_literal(value),
             );
         }
         let (semantic, rep) = if requires_raw_f64 {

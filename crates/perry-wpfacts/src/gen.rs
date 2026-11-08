@@ -15,8 +15,10 @@ mod glue;
 mod native_result;
 mod once;
 mod own_guard;
+mod own_store;
 pub(crate) use own_guard::Region;
 mod primitives;
+mod private_methods;
 mod shared_closures;
 mod view;
 mod walk;
@@ -35,6 +37,17 @@ pub struct ReadSite {
     /// the atom `()`.
     pub value_call: bool,
     pub func: FnIdx,
+}
+
+/// A computed member operation over nodes already generated for the solve.
+#[derive(Clone, Debug)]
+pub(crate) struct ElementSite {
+    pub module: u32,
+    pub byte_offset: u32,
+    pub op: crate::derive::ElementOp,
+    pub recv: NodeId,
+    pub idx: NodeId,
+    pub key: Key,
 }
 
 /// Another unit's module namespace object as this unit holds it (§18.2,
@@ -110,6 +123,8 @@ pub(crate) enum PendingWalk<'a> {
     Fields(u32, &'a perry_hir::Class),
     /// A closure's body (its emitted definition) in its creation context.
     Closure(crate::gen::Fx, &'a perry_hir::Expr),
+    #[cfg(test)]
+    OwnedClosure(crate::gen::Fx, Box<perry_hir::Expr>),
     /// A module only `import()` loads: its body runs once an `import()`
     /// site a body that can run holds names it (or a module it loads
     /// imports it).
@@ -132,6 +147,7 @@ pub struct Gen<'a> {
     /// Nonliteral publications may replace any named path.
     pub cjs_unknown_path: NodeId,
     pub read_sites: Vec<ReadSite>,
+    pub(crate) element_sites: Vec<ElementSite>,
     /// Exports whose value is a class declaration (design §11.2).
     pub export_class: FxHashMap<(u32, Atom), TmplId>,
     /// Exports whose value is a function declaration, and the published
@@ -247,6 +263,11 @@ pub struct Gen<'a> {
     /// While a for-of binding is walked (`Gen::stmts`): its value local
     /// reads the value the loop's `arrayRecordForValue` just wrote.
     pub(crate) for_binding: Option<(u32, u32, NodeId)>,
+    /// The counted walks HIR lowers a for-of over an ordinary array to
+    /// (`perry_hir::lower::for_of_guard`, `Gen::stmt`): (module, array
+    /// local, counter local). Their `array[k]` binding is what the
+    /// iteration yields, as the IteratorRecord loop's element is.
+    pub(crate) for_of_walks: crate::pts::FxHashSet<(u32, u32, u32)>,
     /// The `const` bindings walked with an initializer (module, HIR id).
     pub(crate) initialized_consts: crate::pts::FxHashSet<(u32, u32)>,
     pub(crate) write_top: crate::pts::FxHashSet<u32>,
@@ -326,7 +347,7 @@ pub struct Gen<'a> {
     pub rooted_stores: std::collections::BTreeMap<usize, bool>,
     /// Locals holding a class method's lexical home (`ClassMethodHome`):
     /// (module, local) → the class. `super` through such a home starts at
-    /// that class's parent, exactly like `SuperPropertyGet`.
+    /// the home's prototypes, exactly like `SuperPropertyGet`.
     pub class_homes: FxHashMap<(u32, u32), TmplId>,
     /// The unpublished object of each enclosing chunked literal birth
     /// (`Expr::LiteralChunks`), innermost last: what its chunk calls'
@@ -348,6 +369,9 @@ pub struct Gen<'a> {
     /// Reads guarded by an own-property test (the `IndexGet`'s address)
     /// and the invalidation node watched by `Cons::OwnGate`.
     pub(crate) own_reads: FxHashMap<usize, NodeId>,
+    /// Reads after a store of the same object and key (`gen/own_store.rs`,
+    /// the `IndexGet`'s address).
+    pub(crate) own_store_reads: crate::pts::FxHashSet<usize>,
     /// The last call's callee (`f(o,k)`), or method receiver (`H` of
     /// `H.call(o,k)`, `o` of `o.hasOwnProperty(k)`).
     pub(crate) own_test_recv: Option<NodeId>,
@@ -392,6 +416,42 @@ mod class_values;
 mod indexed_owner;
 
 impl<'a> Gen<'a> {
+    #[cfg(test)]
+    pub(crate) fn packet_generator_effect(
+        &mut self,
+        f: FnIdx,
+        object: NodeId,
+        is_async: bool,
+        publish: impl FnOnce(&mut Self),
+    ) {
+        let mode = self.m.packet_generator_action(f, object, is_async);
+        if mode.unwrap_or(true) {
+            publish(self);
+        }
+        if mode.is_some() {
+            self.m.packet_protocol_depth -= 1;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn packet_class_effect(
+        &mut self,
+        mi: u32,
+        name: &str,
+        action: crate::summary::packet::ClassAction<NodeId>,
+        publish: impl FnOnce(&mut Self),
+    ) {
+        let mode = self
+            .m
+            .packet_class_action(self.modules[mi as usize].0, name, action);
+        if mode.unwrap_or(true) {
+            publish(self);
+        }
+        if mode.is_some() {
+            self.m.packet_protocol_depth -= 1;
+        }
+    }
+
     pub fn new(modules: Vec<(&'a str, &'a Module)>, relations: bool, explain: bool) -> Self {
         Self::new_observed(modules, relations, explain, false)
     }
@@ -451,10 +511,25 @@ impl<'a> Gen<'a> {
         m.add_prim(all, prim::ALL);
         m.all_prim_node = all;
         let thrown = m.node_l("THROWN");
-        // Runtime-thrown errors are runtime objects: ⊤-origin.
-        m.add_top(thrown, |_| "thrown value (runtime errors)".into());
-        m.add_prim(thrown, prim::ALL);
+        // What a `catch` (or a rejection handler) receives beside the values
+        // the program throws (edges): the error object a failed runtime
+        // operation makes (`exception::throw_core`; codegen inserts such
+        // throws the model never sees, so every program can catch one). It is
+        // also the region of every call made outside generation (DESIGN SEEDE
+        // section 8); ⊤ reaches it only through such a region.
+        let rterr = m.runtime_error();
+        m.add_tok(thrown, rterr);
         m.thrown = thrown;
+        let esc = m.node_l("ESCRAISE");
+        let r = m.reason("thrown into unknown code");
+        m.sink_node(esc, r);
+        m.esc_raise = esc;
+        let acc = m.node_l("ESCACCESSORS");
+        let r = m.reason("accessor function of a value unknown code holds");
+        m.sink_node(acc, r);
+        m.esc_accessors = acc;
+        m.lazy_raise = m.node_l("LAZYRAISE");
+        m.escaped_classes = m.node_l("ESCCLASSES");
         let cjs_registry = m.node_l("CJSREG");
         let cjs_unknown_path = m.node_l("CJSUNKNOWNPATH");
         m.cjs_union = cjs_registry;
@@ -464,9 +539,7 @@ impl<'a> Gen<'a> {
         // An ESM entry installs no main record: `require.main` is undefined.
         m.cjs_main = m.node_l("CJSMAIN");
         m.add_prim(m.cjs_main, prim::UNDEF);
-        m.process_argv_tok = m.process_argv_array();
-        m.process_argv = m.node_l("PROCESSARGV");
-        m.add_tok(m.process_argv, m.process_argv_tok);
+        m.process_arrays = m.process_string_arrays();
         let _ = m.tok(TokKind::ObjectProto);
         let mut path_index = FxHashMap::default();
         for (i, (p, _)) in modules.iter().enumerate() {
@@ -485,6 +558,7 @@ impl<'a> Gen<'a> {
             cjs_paths: Default::default(),
             cjs_unknown_path,
             read_sites: Vec::new(),
+            element_sites: Vec::new(),
             export_class: FxHashMap::default(),
             export_fn: FxHashMap::default(),
             fn_contracts: Vec::new(),
@@ -529,6 +603,7 @@ impl<'a> Gen<'a> {
             effect_bad: Default::default(),
             binding_writes: FxHashMap::default(),
             for_binding: None,
+            for_of_walks: Default::default(),
             initialized_consts: Default::default(),
             write_top: Default::default(),
             stand_in_fc: FxHashMap::default(),
@@ -572,6 +647,7 @@ impl<'a> Gen<'a> {
             default_args: FxHashMap::default(),
             call_lit_arg: None,
             own_reads: FxHashMap::default(),
+            own_store_reads: Default::default(),
             own_test_recv: None,
             for_in_keys_of: FxHashMap::default(),
             for_in_key: Vec::new(),
@@ -684,6 +760,18 @@ impl<'a> Gen<'a> {
                     .resolved_path
                     .as_ref()
                     .and_then(|p| self.path_index.get(p).copied());
+                // A module outside the program that is no builtin is unseen
+                // code run at load: it may write any key of the global
+                // object (rule G reads an unresolved global as `native_written`
+                // then). In per-unit mode a missing target is another unit.
+                if target.is_none()
+                    && !self.m.unit_mode
+                    && !crate::builtins::is_builtin_module(&imp.source)
+                {
+                    let t = self.m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
+                    let what = format!("module {} runs unseen", imp.source);
+                    crate::builtins::note_native_write(&mut self.m, t, None, &what);
+                }
                 for spec in &imp.specifiers {
                     let (local, node) = match (spec, target) {
                         (ImportSpecifier::Named { imported, local }, Some(t)) => {
@@ -1101,6 +1189,12 @@ impl<'a> Gen<'a> {
             }
         }
         let fx = self.m.funcs.len() as FnIdx;
+        #[cfg(test)]
+        let packet_prior = self.m.packet_header(
+            fx,
+            crate::summary::packet::Identity(self.modules[mi as usize].0.into(), id, String::new()),
+            params,
+        );
         let tok = self.m.tok(TokKind::Func(fx, NO_CTX));
         if is_closure {
             self.m.closures.insert(fx);
@@ -1121,7 +1215,10 @@ impl<'a> Gen<'a> {
         let mut mapped = None;
         for p in params {
             let n = self.local(mi, p.id);
-            if p.is_rest {
+            // `arguments` beside a user rest parameter is no rest itself
+            // (the HIR appends it after `...r`), but the same object: every
+            // argument, never a positional one.
+            if p.is_rest || p.arguments_object.is_some() {
                 // The rest local holds a fresh array whose elements are the
                 // extra arguments (and, for `arguments`, every argument).
                 let arr = match &p.arguments_object {
@@ -1152,7 +1249,9 @@ impl<'a> Gen<'a> {
                         mapped = Some((fa, self.m.all_fields(at)));
                     }
                 }
-                rest = Some(n);
+                if p.is_rest {
+                    rest = Some(n);
+                }
             } else if rest.is_some() && params.iter().all(|q| q.arguments_object.is_none()) {
                 // A parameter after a rest parameter is a capture slot the
                 // HIR appends to a class constructor (`...a, cap`): the rest
@@ -1193,8 +1292,11 @@ impl<'a> Gen<'a> {
             }
         }
         self.m.funcs.push(FuncInfo {
+            #[cfg(test)]
+            body_packet: Default::default(),
             module: mi,
             func_id: id,
+            raise: u32::MAX,
             name: format!("{}:{}", self.mods[mi as usize].path_short(), name),
             params: ps,
             rest,
@@ -1207,7 +1309,8 @@ impl<'a> Gen<'a> {
             ctor_of: None,
             lexical_this,
             no_summary: false,
-            gen_step: false,
+            gen_proto: None,
+            gen_fn_protos: None,
             gen_async: false,
             gen_reyields: false,
             proto,
@@ -1216,6 +1319,8 @@ impl<'a> Gen<'a> {
             parent: if is_closure { outer_fn } else { NO_FN },
             forwarded: false,
         });
+        #[cfg(test)]
+        self.m.packet_end(packet_prior, false);
         self.mods[mi as usize].funcs.insert(id, fx);
         fx
     }
@@ -1226,7 +1331,7 @@ impl<'a> Gen<'a> {
         let display = format!("{}:{}", self.mods[mi as usize].path_short(), c.name);
         let mut accessor_keys = Vec::new();
         for (n, _) in c.getters.iter().chain(c.setters.iter()) {
-            let a = self.m.atom(n);
+            let a = self.accessor_atom(mi, c, n);
             if !accessor_keys.contains(&a) {
                 accessor_keys.push(a);
             }
@@ -1310,16 +1415,25 @@ impl<'a> Gen<'a> {
             self.m.funcs[f as usize].ctor_of = Some(tm);
             self.m.funcs[f as usize].forwards_super = forwards_super(ctor);
             self.m.tmpls[tm as usize].ctor = Some(f);
-            // Its hidden capture parameters (DECISIONS 117): slot `i` of the
-            // class environment, in the order the HIR appends them.
+            // Only an environment-publishing constructor takes its hidden
+            // arguments from that environment. Instance captures forward the
+            // actual argument, which their ClassCaptureValue rebind prefers
+            // over the declaration snapshot (including an unseeded snapshot).
+            let publishes_environment = ctor.body.iter().any(|s| {
+                matches!(s, perry_hir::Stmt::Expr(perry_hir::Expr::ClassEnvSet {
+                    class_name, publish: true, ..
+                }) if class_name == &c.name)
+            });
             let caps = ctor
                 .params
                 .iter()
                 .rev()
                 .take_while(|p| perry_hir::cap_fields::is_cap_field_name(&p.name))
                 .count();
-            self.m.funcs[f as usize].captures =
-                (0..caps).map(|i| self.class_env(mi, &c.name, i)).collect();
+            if publishes_environment {
+                self.m.funcs[f as usize].captures =
+                    (0..caps).map(|i| self.class_env(mi, &c.name, i)).collect();
+            }
         }
         let proto = self.m.tok(TokKind::Proto(tm));
         let cobj = self.m.tok(TokKind::ClassObj(tm));
@@ -1386,13 +1500,20 @@ impl<'a> Gen<'a> {
                 false,
                 Some(perry_hir::fn_proto::FnProtoKind::of_function(module, g)),
             );
-            let this = self.m.funcs[f as usize].this;
-            self.m.this_class.insert(this, tm);
-            let a = self.m.atom(name);
+            // A static accessor is an own property of the class object;
+            // its `this` is whatever reads it (a subclass, `Object.create`).
+            let holder = if c.is_static_accessor(g) {
+                cobj
+            } else {
+                let this = self.m.funcs[f as usize].this;
+                self.m.this_class.insert(this, tm);
+                proto
+            };
+            let a = self.accessor_atom(mi, c, name);
             self.m.add_accessor_atom(a);
             let ft = self.m.funcs[f as usize].token;
-            self.m.accessors.entry((proto, a)).or_default().0.push(ft);
-            push_unique(self.m.accessor_keys.entry(proto).or_default(), a);
+            self.m.accessors.entry((holder, a)).or_default().0.push(ft);
+            push_unique(self.m.accessor_keys.entry(holder).or_default(), a);
         }
         for (name, s) in &c.setters {
             let fname = format!("{}::set {name}", c.name);
@@ -1405,13 +1526,20 @@ impl<'a> Gen<'a> {
                 false,
                 Some(perry_hir::fn_proto::FnProtoKind::of_function(module, s)),
             );
-            let this = self.m.funcs[f as usize].this;
-            self.m.this_class.insert(this, tm);
-            let a = self.m.atom(name);
+            // A static accessor is an own property of the class object;
+            // its `this` is whatever reads it (a subclass, `Object.create`).
+            let holder = if c.is_static_accessor(s) {
+                cobj
+            } else {
+                let this = self.m.funcs[f as usize].this;
+                self.m.this_class.insert(this, tm);
+                proto
+            };
+            let a = self.accessor_atom(mi, c, name);
             self.m.add_accessor_atom(a);
             let ft = self.m.funcs[f as usize].token;
-            self.m.accessors.entry((proto, a)).or_default().1.push(ft);
-            push_unique(self.m.accessor_keys.entry(proto).or_default(), a);
+            self.m.accessors.entry((holder, a)).or_default().1.push(ft);
+            push_unique(self.m.accessor_keys.entry(holder).or_default(), a);
         }
         for (cm, named) in c.computed_members.iter().zip(named) {
             let f = self.register_fn(
@@ -1427,14 +1555,20 @@ impl<'a> Gen<'a> {
                 )),
             );
             if let Some((a, setter)) = named {
-                // Under a constant key: that key's accessor.
-                let this = self.m.funcs[f as usize].this;
-                self.m.this_class.insert(this, tm);
+                // Under a constant key: that key's accessor, on the class
+                // object when it is static.
+                let holder = if cm.is_static {
+                    cobj
+                } else {
+                    let this = self.m.funcs[f as usize].this;
+                    self.m.this_class.insert(this, tm);
+                    proto
+                };
                 self.m.add_accessor_atom(a);
                 let ft = self.m.funcs[f as usize].token;
-                let e = self.m.accessors.entry((proto, a)).or_default();
+                let e = self.m.accessors.entry((holder, a)).or_default();
                 if setter { &mut e.1 } else { &mut e.0 }.push(ft);
-                push_unique(self.m.accessor_keys.entry(proto).or_default(), a);
+                push_unique(self.m.accessor_keys.entry(holder).or_default(), a);
                 continue;
             }
             let holder = if cm.is_static { cobj } else { proto };
@@ -1453,6 +1587,15 @@ impl<'a> Gen<'a> {
                 let inst = self.m.tok(TokKind::Obj(tm, NO_CTX));
                 self.m.add_tok(this, inst);
                 self.m.funcs[f as usize].no_summary = true;
+                #[cfg(test)]
+                if self.m.packets_enabled {
+                    std::rc::Rc::make_mut(&mut self.m.funcs[f as usize].body_packet)
+                        .header
+                        .shared
+                        .push(crate::summary::packet::SharedEntry::ComputedAccessor {
+                            class: self.m.tmpls[tm as usize].display.clone(),
+                        });
+                }
                 let fa = self.m.field_any(proto);
                 let ret = self.m.funcs[f as usize].ret;
                 self.m.edge(ret, fa);
@@ -1470,13 +1613,26 @@ impl<'a> Gen<'a> {
 
     pub(crate) fn synthetic_fn(&mut self, mi: u32, name: &str) -> FnIdx {
         let fx = self.m.funcs.len() as FnIdx;
+        #[cfg(test)]
+        let packet_prior = self.m.packet_header(
+            fx,
+            crate::summary::packet::Identity(
+                self.modules[mi as usize].0.into(),
+                u32::MAX,
+                name.into(),
+            ),
+            &[],
+        );
         let tok = self.m.tok(TokKind::Func(fx, NO_CTX));
         let this = self.m.node_named("this", || format!("this({name})"));
         let ret = self.m.node_named("ret", || format!("ret({name})"));
         let args_all = self.m.node_named("args", || format!("args({name})"));
         self.m.funcs.push(FuncInfo {
+            #[cfg(test)]
+            body_packet: Default::default(),
             module: mi,
             func_id: u32::MAX,
+            raise: u32::MAX,
             name: format!("{}:{}", self.mods[mi as usize].path_short(), name),
             params: vec![],
             rest: None,
@@ -1489,7 +1645,8 @@ impl<'a> Gen<'a> {
             ctor_of: None,
             lexical_this: false,
             no_summary: false,
-            gen_step: false,
+            gen_proto: None,
+            gen_fn_protos: None,
             gen_async: false,
             gen_reyields: false,
             proto: None,
@@ -1498,6 +1655,8 @@ impl<'a> Gen<'a> {
             parent: NO_FN,
             forwarded: false,
         });
+        #[cfg(test)]
+        self.m.packet_end(packet_prior, false);
         fx
     }
 
@@ -1572,6 +1731,7 @@ impl<'a> Gen<'a> {
     /// no parent value (its `extends` resolved statically, or none) cannot
     /// take one: its instances escape and `v` is sunk, as before.
     pub(crate) fn feed_parent(&mut self, v: NodeId, tm: Option<TmplId>, why: &str) {
+        let native = tm.and_then(|tm| crate::builtins::native_parent_value(&mut self.m, tm));
         match tm.and_then(|tm| Some((tm, self.m.tmpls[tm as usize].parent_value?))) {
             Some((tm, (pv, _))) => {
                 self.m.edge(v, pv);
@@ -1586,6 +1746,40 @@ impl<'a> Gen<'a> {
                 let chk = self.m.node_l("parent-check");
                 self.m.edge(v, chk);
                 self.m.parent_checks.push((tm, chk));
+            }
+            // A class linked by name to a built-in parent (`extends Error`):
+            // `super()` runs the evaluated `extends` value with `this` = the
+            // instance. The native summary (`native_parent_ctor`) is that run
+            // only when the value is the constructor the global object
+            // declares under the name; whether it is depends on what the
+            // solve finds (a program or an unseen module may write the
+            // global, rule G), and anything else runs before the solve ends,
+            // so the value is checked during the solve (`Cons::NativeParent`).
+            None if native.is_some() => {
+                let tm = tm.unwrap();
+                // The evaluated value is a built-in constructor, no class:
+                // no static construction through a parent is published
+                // (`super_unrelinked`); `super()` follows the live edge,
+                // which is where the native run happens.
+                self.m.parent_unsettled.insert(tm);
+                let chk = self.m.node_l("native-parent-check");
+                self.m.edge(v, chk);
+                // The class object's [[Prototype]] is the evaluated `extends`
+                // value (ClassDefinitionEvaluation), as for any parent value:
+                // a static read or call on the class (`X.g()`) reaches what
+                // the program stored on that constructor.
+                let c = self.m.tok(TokKind::ClassObj(tm));
+                let cp = self.m.proto_node(c);
+                self.m.edge(v, cp);
+                let reason = self.m.reason(why);
+                self.m.cons(
+                    chk,
+                    Cons::NativeParent {
+                        tm,
+                        expected: native.unwrap(),
+                        reason,
+                    },
+                );
             }
             None => {
                 self.to_sink(v, why);
@@ -1642,10 +1836,21 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// The storage key of private field `name` (`#x`) declared by class `c`
-    /// of module `mi`: the class its private elements belong to, the one it
-    /// was specialized from (codegen `element_class_id_in`), names it.
-    pub(crate) fn private_field_key(&self, mi: u32, c: &Class, name: &str) -> String {
+    /// The key accessor `name` of class `c` is held under: a private one
+    /// (`get #x()`) under the dispatch key its guarded access reads
+    /// (`Expr::PrivateGuard` keeps the `perry_hir::private_names` key), named
+    /// by the class it was specialized from, as its fields are.
+    fn accessor_atom(&mut self, mi: u32, c: &Class, name: &str) -> Atom {
+        if !name.starts_with('#') {
+            return self.m.atom(name);
+        }
+        let k = perry_hir::private_names::private_member_key(self.private_class_id(mi, c), name);
+        self.m.atom(&k)
+    }
+
+    /// The class whose private elements class `c` of module `mi` carries:
+    /// the one it was specialized from (codegen `element_class_id_in`).
+    fn private_class_id(&self, mi: u32, c: &Class) -> u32 {
         let module = self.modules[mi as usize].1;
         let mut cur = c;
         for _ in 0..module.classes.len() {
@@ -1658,7 +1863,14 @@ impl<'a> Gen<'a> {
                 None => break,
             }
         }
-        perry_hir::private_names::private_value_key(cur.id, name)
+        cur.id
+    }
+
+    /// The storage key of private field `name` (`#x`) declared by class `c`
+    /// of module `mi`: the class its private elements belong to, the one it
+    /// was specialized from (codegen `element_class_id_in`), names it.
+    pub(crate) fn private_field_key(&self, mi: u32, c: &Class, name: &str) -> String {
+        perry_hir::private_names::private_value_key(self.private_class_id(mi, c), name)
     }
 
     /// The key of static field `field_name` of class `class_name`: a `#x`
@@ -1746,6 +1958,8 @@ impl<'a> Gen<'a> {
             return self.extern_value(mi, name);
         }
         if let Some(&n) = self.mods[mi as usize].locals.get(&id) {
+            #[cfg(test)]
+            self.m.packet_cell(n, id);
             if self.m.node_fn[n as usize] != self.m.cur_fn {
                 if self.m.cur_fn != NO_FN {
                     let f = self.m.cur_fn;
@@ -1757,6 +1971,8 @@ impl<'a> Gen<'a> {
         let n = self.m.node_named("local", || format!("local({mi},{id})"));
         self.m.own(n);
         self.mods[mi as usize].locals.insert(id, n);
+        #[cfg(test)]
+        self.m.packet_cell(n, id);
         n
     }
 
@@ -1911,6 +2127,15 @@ impl<'a> Gen<'a> {
 
     /// A generation-time birth template belongs to the body making it.
     pub(crate) fn note_birth_fn(&mut self, tm: TmplId) {
+        #[cfg(test)]
+        if let Some(b) = &mut self.m.packet_scope {
+            b.packet.births.push(crate::summary::packet::Birth {
+                template: tm,
+                module: String::new(),
+                kind: None,
+                keys: Vec::new(),
+            });
+        }
         if self.m.cur_fn != NO_FN {
             let f = self.m.cur_fn;
             self.m.tmpl_fn.insert(tm, f);

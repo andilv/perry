@@ -236,7 +236,7 @@ pub fn dump_text(pf: &ProgramFacts) -> String {
         }
         // DECISIONS 225: the bodies the whole program can run, the
         // exemption of the per-unit <= whole residual (`dead_site`).
-        for (file, id, name) in pf.active_bodies.iter().flatten() {
+        for (file, id, name) in &pf.body_reach.bodies {
             out.push_str(&format!(
                 "D {{\"record\":\"active\",\"unit\":{},\"file\":{},\"fn\":{id},\"name\":{}}}\n",
                 crate::diagnostics::quote(unit),
@@ -491,7 +491,7 @@ pub fn apply_sabotage(ts: &mut [TemplateFacts], spec: &str) {
 #[cfg(test)]
 pub(crate) fn solver_state(m: &crate::model::Model) -> String {
     use std::fmt::Write;
-    let mut out = format!("solve work={} aborted={}\n", m.work, m.aborted);
+    let mut out = format!("solve work={} aborted={}\n", m.work.get(), m.aborted);
     for (i, n) in m.nodes.iter().enumerate() {
         writeln!(
             out,

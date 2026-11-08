@@ -1,6 +1,11 @@
 //! Derived facts F1–F6 read off the solved graph (design section 2), and
 //! the per-site verdicts the precision report uses.
 
+mod element;
+pub(crate) use element::element_facts;
+use element::receiver_set;
+pub use element::{ElementFacts, ElementKey, ElementOp, ReceiverValue};
+
 use crate::gen::Gen;
 use crate::model::*;
 use crate::pts::{FxHashMap, FxHashSet};
@@ -163,6 +168,9 @@ pub struct SiteFacts {
     pub key: String,
     pub is_call: bool,
     pub receivers: Vec<String>,
+    /// The unguarded solved values, before a verdict's entry-guard refinement.
+    pub receiver_values: Vec<ReceiverValue>,
+    pub receiver_prims: u16,
     pub top: bool,
     pub verdict: Verdict,
     pub fixed_shape: bool,
@@ -419,14 +427,16 @@ fn plain_chain(m: &Model, tm: TmplId) -> bool {
     if m.tmpl_toks(tm).iter().any(|t| m.super_relink.contains(t)) {
         return false;
     }
-    chain_tokens(m, tm).iter().all(|&p| match &m.toks[p as usize] {
-        TokKind::ObjectProto => true,
-        TokKind::Proto(c) => {
-            let c = &m.tmpls[*c as usize];
-            c.native_parent.is_none() && c.parent_value.is_none()
-        }
-        _ => false,
-    })
+    chain_tokens(m, tm)
+        .iter()
+        .all(|&p| match &m.toks[p as usize] {
+            TokKind::ObjectProto => true,
+            TokKind::Proto(c) => {
+                let c = &m.tmpls[*c as usize];
+                c.native_parent.is_none() && c.parent_value.is_none()
+            }
+            _ => false,
+        })
 }
 
 /// RPG1b: per key of template `tm` (`keys`, birth keys first): is it a
@@ -634,7 +644,15 @@ fn template_facts(
     let hard = ts
         .iter()
         .find_map(|t| m.hard.get(t))
-        .map(|(k, r)| format!("{} {}", k.code(), m.reasons[*r as usize]));
+        .map(|(k, r)| format!("{} {}", k.code(), m.reasons[*r as usize]))
+        .or_else(|| {
+            ts.iter().find_map(|&t| layout_exit(m, tm, t)).map(|a| {
+                format!(
+                    "accessor defined on the layout key {} (layout exit)",
+                    m.atoms[a as usize]
+                )
+            })
+        });
     // The prototype chain must be stable: no HARD op or escape on any
     // prototype object, no accessor named after a birth key, no computed
     // accessor anywhere.
@@ -934,10 +952,22 @@ fn template_facts(
     }
 }
 
-/// The field holds only typed-array objects, none exposed, transferred,
-/// resized or escaped.
-/// The compiled bodies field `a` holds over every token of a layout, when
-/// it holds nothing else (`bindings::bodies_of`); empty otherwise.
+/// An accessor defined on a key the object's layout holds leaves the layout.
+/// A literal's layout holds its birth keys and every key a program store
+/// writes (an optional slot, the hole until the store runs); the runtime
+/// gives an object that is defined an accessor under such a key its
+/// overflow, and it leaves its layout for good (class id 0:
+/// `layout_desc::prepare_hole_define`, `object_ops::define_property`), so no
+/// layout claim of the template survives it. (An accessor on a birth key is
+/// E5 HARD at the definition already: `Cons::DefineKey`.)
+fn layout_exit(m: &Model, tm: TmplId, t: Tok) -> Option<Atom> {
+    m.accessor_keys.get(&t)?.iter().copied().find(|&a| {
+        m.writers
+            .get(&(tm, a))
+            .is_some_and(|w| !w.ctor.is_empty() || !w.post.is_empty())
+    })
+}
+
 fn field_bodies(m: &Model, ts: &[Tok], a: Atom) -> Vec<crate::bindings::BodyRef> {
     let mut out = Vec::new();
     for &t in ts {
@@ -1055,6 +1085,7 @@ fn private_own_slot(m: &Model, tf: &TemplateFacts, t: Tok, key: &str, a: Atom) -
     if m.foreign.contains_key(&tf.id)
         || m.is_escaped(t)
         || m.hard.contains_key(&t)
+        || layout_exit(m, tf.id, t).is_some()
         || m.objproto_accessor
         || tf.sabotaged
     {
@@ -1131,21 +1162,13 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
     }
     // The verdict of one site over the receiver nodes `recvs`.
     let verdict_of = |s: &crate::gen::ReadSite, recvs: &[u32]| {
-        let mut toks: Vec<Tok> = recvs
-            .iter()
-            .flat_map(|&r| m.nodes[r as usize].pts.to_sorted())
-            .collect();
-        toks.sort_unstable();
-        toks.dedup();
-        let prim = recvs.iter().fold(0, |p, &r| p | m.nodes[r as usize].prim);
-        let top_recv = recvs
-            .iter()
-            .copied()
-            .find(|&r| m.nodes[r as usize].pts.to_sorted().contains(&TOP))
-            .unwrap_or(s.recv);
+        let set = receiver_set(m, recvs);
+        let toks = &set.toks;
+        let prim = set.prims;
+        let top_recv = set.top_recv;
         let key = &m.atoms[s.key as usize];
         let (mut receivers, mut top, mut verdict, mut fixed_shape, mut targets) =
-            judge(m, &by_id, &runtime, s, &key, &toks, prim, top_recv);
+            judge(m, &by_id, &runtime, s, &key, toks, prim, top_recv);
         // Design §11.4: a site whose receiver is the `this` of a method of
         // class C runs, in the typed body behind the entry guard
         // `class_id(this) == C`, on C's instances only: E0 when it is T0
@@ -1187,12 +1210,30 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
                 }
             }
         }
-        (receivers, top, verdict, fixed_shape, targets, guard_keys)
+        (
+            receivers,
+            top,
+            verdict,
+            fixed_shape,
+            targets,
+            guard_keys,
+            set.values(m),
+            prim,
+        )
     };
     for (i, recvs, funcs) in &groups {
         let s = &g.read_sites[*i];
         let key = m.atoms[s.key as usize].clone();
-        let (receivers, top, verdict, fixed_shape, targets, guard_keys) = verdict_of(s, recvs);
+        let (
+            receivers,
+            top,
+            verdict,
+            fixed_shape,
+            targets,
+            guard_keys,
+            receiver_values,
+            receiver_prims,
+        ) = verdict_of(s, recvs);
         // Observational only (the facts dump): the verdict of each function
         // copy holding the site (an inlined body is a copy of its own), so a
         // dump compares a copy with the same copy of another run. Never read
@@ -1242,6 +1283,8 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
             key,
             is_call: s.is_call,
             receivers,
+            receiver_values,
+            receiver_prims,
             top,
             verdict,
             fixed_shape,
@@ -1383,8 +1426,20 @@ fn judge(
     // the predicate the solver's host calls and loads read).
     if let Some(r) = host_member(m, s, toks, prim) {
         return match r {
-            Ok(receivers) => (receivers, false, Verdict::NativeMember, true, FxHashMap::default()),
-            Err(why) => (Vec::new(), false, Verdict::No(why), true, FxHashMap::default()),
+            Ok(receivers) => (
+                receivers,
+                false,
+                Verdict::NativeMember,
+                true,
+                FxHashMap::default(),
+            ),
+            Err(why) => (
+                Vec::new(),
+                false,
+                Verdict::No(why),
+                true,
+                FxHashMap::default(),
+            ),
         };
     }
     let mut receivers = Vec::new();
@@ -1469,7 +1524,10 @@ fn judge(
                     }
                     continue;
                 }
-                let row = tf.fields.iter().find(|f| f.is(key, m.is_private_atom(s.key)));
+                let row = tf
+                    .fields
+                    .iter()
+                    .find(|f| f.is(key, m.is_private_atom(s.key)));
                 // No store names the key: a row only a read made, or none.
                 let unwritten = row.is_none_or(|f| {
                     f.writers_ctor + f.writers_post == 0 && !tf.birth_keys.contains(&f.key)

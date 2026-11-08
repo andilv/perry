@@ -6,6 +6,29 @@ use perry_hir::Expr;
 impl<'a> Gen<'a> {
     // ----------------------------------------------------------- walking
 
+    #[cfg(test)]
+    pub(crate) fn packet_reads(&mut self, start: usize) {
+        let Some(scope) = &self.m.packet_scope else {
+            return;
+        };
+        let f = scope.f;
+        let reads: Vec<_> = self.read_sites[start..]
+            .iter()
+            .filter(|s| s.func == f)
+            .cloned()
+            .collect();
+        for site in reads {
+            let key = self.m.atoms[site.key as usize].clone();
+            self.m.packet_observe(
+                site.byte_offset,
+                format!("read call={} value={}", site.is_call, site.value_call),
+                key,
+                site.recv,
+                None,
+            );
+        }
+    }
+
     pub fn walk_all(&mut self) {
         let modules = self.modules.clone();
         // RPG1b: the once closures and the evaluation order (`derive`'s
@@ -189,6 +212,54 @@ impl<'a> Gen<'a> {
     /// and classes. A module it loads statically, by an import or a
     /// re-export, loads with it (`dynamic_only_modules` counts both).
     pub(crate) fn walk_module(&mut self, mi: u32, init_fn: FnIdx) {
+        // The module body's throw region: uncaught at evaluation, except a
+        // dynamically imported module's, which rejects the import.
+        let r = self.m.raise_of(init_fn);
+        if self.dynamic_only.contains(&mi) {
+            self.m.edge(r, self.thrown);
+        }
+        // A target this module requires lazily (a deferred CommonJS require)
+        // runs its body when the require runs, through the path registry.
+        for i in self.imports_of(mi as usize) {
+            if !i.is_deferred_require {
+                continue;
+            }
+            let t = i.resolved_path.as_ref().and_then(|p| self.path_index.get(p).copied());
+            if let Some(t) = t {
+                let rt = self.module_raise(t);
+                self.m.edge(rt, self.m.lazy_raise);
+            }
+        }
+        let region = std::mem::replace(&mut self.m.gen_region, Some(r));
+        self.walk_module_inner(mi, init_fn);
+        self.m.gen_region = region;
+    }
+
+    /// The throw region of module `t`'s body (its `<init>` function's).
+    pub(crate) fn module_raise(&mut self, t: u32) -> NodeId {
+        let f = match self.init_fn_of.get(&t) {
+            Some(&f) => f,
+            None => {
+                let f = self.synthetic_fn(t, "<init>");
+                self.init_fn_of.insert(t, f);
+                f
+            }
+        };
+        self.m.raise_of(f)
+    }
+
+    fn walk_module_inner(&mut self, mi: u32, init_fn: FnIdx) {
+        #[cfg(test)]
+        let packet_prior = self.m.packet_body(init_fn);
+        #[cfg(test)]
+        let packet_read_start = self.read_sites.len();
+        #[cfg(test)]
+        {
+            let body = self.init_of(mi as usize);
+            for stmt in body {
+                self.m.packet_declarations(std::slice::from_ref(stmt));
+            }
+        }
         if !self.dynamic_only.is_empty() {
             for i in self.imports_of(mi as usize) {
                 if i.is_dynamic || i.type_only || i.runtime_erased {
@@ -264,6 +335,11 @@ impl<'a> Gen<'a> {
                 return;
             }
             self.walk_class(mi, c, &fx);
+        }
+        #[cfg(test)]
+        {
+            self.packet_reads(packet_read_start);
+            self.m.packet_end(packet_prior, true);
         }
     }
 
@@ -504,6 +580,11 @@ impl<'a> Gen<'a> {
     /// DECISIONS 225: whether the body of `f` waits (it is not active):
     /// kept for `walk_activated`, or, with the set final, never walked.
     pub(crate) fn defer_walk(&mut self, f: FnIdx, w: PendingWalk<'a>) -> bool {
+        #[cfg(test)]
+        if self.m.packets_inert && self.m.packet_scope.as_ref().is_some_and(|b| b.f != f) {
+            self.pending_walk.entry(f).or_default().push(w);
+            return true;
+        }
         if self.m.body_active(f) {
             return false;
         }
@@ -534,6 +615,8 @@ impl<'a> Gen<'a> {
                         }
                         PendingWalk::Fields(mi, c) => self.walk_fields_body(mi, c),
                         PendingWalk::Closure(cfx, e) => self.walk_closure_body(&cfx, e),
+                        #[cfg(test)]
+                        PendingWalk::OwnedClosure(cfx, e) => self.walk_closure_body(&cfx, &e),
                         PendingWalk::Module(mi) => {
                             let f = self.init_fn_of[&mi];
                             self.walk_module(mi, f);
@@ -556,7 +639,21 @@ impl<'a> Gen<'a> {
     ) {
         let saved = (self.order_ok, self.loop_depth);
         (self.order_ok, self.loop_depth) = (false, 0);
+        #[cfg(test)]
+        let packet_prior = self.m.packet_body(fxi);
+        #[cfg(test)]
+        let packet_read_start = self.read_sites.len();
+        #[cfg(test)]
+        self.m.packet_declarations(&f.body);
+        let r = self.m.raise_of(fxi);
+        let region = std::mem::replace(&mut self.m.gen_region, Some(r));
         self.walk_fn_body_inner(mi, fxi, f, class, ctor_of);
+        self.m.gen_region = region;
+        #[cfg(test)]
+        {
+            self.packet_reads(packet_read_start);
+            self.m.packet_end(packet_prior, true);
+        }
         (self.order_ok, self.loop_depth) = saved;
     }
 
@@ -604,6 +701,7 @@ impl<'a> Gen<'a> {
             return;
         }
         let own = self.own_helper_shape(&f.params, &f.body, f.is_async || f.is_generator);
+        self.note_own_stores(f);
         self.stmts(&fx, &f.body);
         self.own_helper_finish(fxi, own);
     }
@@ -657,9 +755,28 @@ impl<'a> Gen<'a> {
 
     /// Field initializers run per construction: unordered (RPG1b).
     fn walk_fields_body(&mut self, mi: u32, c: &'a Class) {
+        // Field initializers run inside the constructor call: the shared
+        // cell, which every catch reads.
+        let region = std::mem::replace(&mut self.m.gen_region, Some(self.thrown));
+        self.walk_fields_body_region(mi, c);
+        self.m.gen_region = region;
+    }
+
+    fn walk_fields_body_region(&mut self, mi: u32, c: &'a Class) {
         let saved = (self.order_ok, self.loop_depth);
         (self.order_ok, self.loop_depth) = (false, 0);
+        #[cfg(test)]
+        let packet_prior = self
+            .m
+            .packet_body(self.field_init_fn[&self.mods[mi as usize].classes[&c.name]]);
+        #[cfg(test)]
+        let packet_read_start = self.read_sites.len();
         self.walk_fields_body_inner(mi, c);
+        #[cfg(test)]
+        {
+            self.packet_reads(packet_read_start);
+            self.m.packet_end(packet_prior, true);
+        }
         (self.order_ok, self.loop_depth) = saved;
     }
 
@@ -751,6 +868,10 @@ impl<'a> Gen<'a> {
         // Static fields and static blocks: `this` is the class object.
         let si = self.static_init_fn[&tm];
         self.m.note_walked(si);
+        #[cfg(test)]
+        let packet_prior = self.m.packet_body(si);
+        #[cfg(test)]
+        let packet_read_start = self.read_sites.len();
         let sfx = Fx {
             guard: None,
             module: mi,
@@ -797,6 +918,11 @@ impl<'a> Gen<'a> {
                 None => self.m.field(cobj, named),
             };
             self.m.edge(v, fl);
+        }
+        #[cfg(test)]
+        {
+            self.packet_reads(packet_read_start);
+            self.m.packet_end(packet_prior, true);
         }
         for d in &c.decorators {
             for a in &d.args {
@@ -895,7 +1021,9 @@ impl<'a> Gen<'a> {
                 // the binding reads the value just written, not every write
                 // of the value local (its `undefined` initializer and
                 // release, the step's output).
-                let Stmt::Expr(set) = &ss[i] else { unreachable!() };
+                let Stmt::Expr(set) = &ss[i] else {
+                    unreachable!()
+                };
                 let prev = std::mem::replace(&mut self.m.cur_fn, fx.f);
                 let n = self.expr(fx, set);
                 self.m.cur_fn = prev;
@@ -912,6 +1040,9 @@ impl<'a> Gen<'a> {
     }
 
     pub(crate) fn stmt(&mut self, fx: &Fx, s: &Stmt) {
+        if let Some((array, counter)) = guarded_for_of_walk(s) {
+            self.for_of_walks.insert((fx.module, array, counter));
+        }
         let prev = std::mem::replace(&mut self.m.cur_fn, fx.f);
         self.stmt_inner(fx, s);
         self.m.cur_fn = prev;
@@ -1059,20 +1190,30 @@ impl<'a> Gen<'a> {
             }
             Stmt::Throw(e) => {
                 let v = self.expr(fx, e);
-                self.m.edge(v, self.thrown);
+                let r = self.region();
+                self.m.edge(v, r);
             }
             Stmt::Try {
                 body,
                 catch,
                 finally,
             } => {
+                // The try body is a throw region of its own; its catch and
+                // finally run in the enclosing one.
+                let rt = self.m.node_l("RAISE-try");
+                let outer = std::mem::replace(&mut self.m.gen_region, Some(rt));
                 self.stmts(fx, body);
+                self.m.gen_region = outer;
                 if let Some(c) = catch {
                     if let Some((id, _)) = &c.param {
                         let n = self.local(fx.module, *id);
+                        self.m.edge(rt, n);
                         self.m.edge(self.thrown, n);
                     }
                     self.stmts(fx, &c.body);
+                } else {
+                    let r = self.region();
+                    self.m.edge(rt, r);
                 }
                 if let Some(f) = finally {
                     self.stmts(fx, f);
@@ -1093,6 +1234,13 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+    }
+}
+
+impl<'a> Gen<'a> {
+    /// The throw region generation is in (`thrown` outside a body).
+    pub(crate) fn region(&self) -> NodeId {
+        self.m.gen_region.unwrap_or(self.thrown)
     }
 }
 
@@ -1119,6 +1267,137 @@ pub(crate) fn variant_name(e: &Expr) -> String {
     let mut h = Head(String::new(), false);
     let _ = std::fmt::write(&mut h, format_args!("{e:?}"));
     h.0
+}
+
+/// The counted walk of a for-of source that is an ordinary array
+/// (`perry_hir::lower::for_of_guard`): `for (let __forof_lit_k_N = 0;
+/// __forof_lit_k_N < a.length; __forof_lit_k_N++) { const x =
+/// a[__forof_lit_k_N]; body }`, where nothing in the body writes the
+/// counter or the array binding. Its array and counter locals. The whole
+/// shape is checked, not only the temp's name, because the binding read is
+/// then taken to lie below the length.
+fn for_of_walk(s: &Stmt) -> Option<(u32, u32)> {
+    let Stmt::For {
+        init: Some(init),
+        condition: Some(condition),
+        update: Some(update),
+        body,
+    } = s
+    else {
+        return None;
+    };
+    let Stmt::Let {
+        id: k,
+        name,
+        init: Some(Expr::Integer(0)),
+        ..
+    } = init.as_ref()
+    else {
+        return None;
+    };
+    let k = *k;
+    if !name.starts_with("__forof_lit_k_") {
+        return None;
+    }
+    let Some(Stmt::Let {
+        init: Some(Expr::IndexGet { object, index, .. }),
+        ..
+    }) = body.first()
+    else {
+        return None;
+    };
+    let (Expr::LocalGet(a), Expr::LocalGet(i)) = (object.as_ref(), index.as_ref()) else {
+        return None;
+    };
+    let a = *a;
+    if *i != k {
+        return None;
+    }
+    let bounded = matches!(condition, Expr::Compare {
+        op: perry_hir::CompareOp::Lt,
+        left,
+        right,
+    } if matches!(left.as_ref(), Expr::LocalGet(l) if *l == k)
+        && matches!(right.as_ref(), Expr::PropertyGet { object, property, .. }
+            if property == "length" && matches!(object.as_ref(), Expr::LocalGet(o) if *o == a)));
+    let stepped = matches!(update, Expr::Update {
+        id,
+        op: perry_hir::UpdateOp::Increment,
+        ..
+    } if *id == k);
+    let untouched = !body
+        .iter()
+        .any(|s| perry_hir::walker::stmt_any_expr(s, &mut |e| writes_local(e, k, a)));
+    (bounded && stepped && untouched).then_some((a, k))
+}
+
+/// The proven arm of a for-of over a source that is not a literal
+/// (`perry_hir::lower::for_of_guard::source_for_of`):
+/// `if (arrayRecordNeedsIterator(t) === false) { [const a = t;] walk }`.
+/// The runtime test holds only for an ordinary Array whose iteration
+/// members nobody replaced, so inside the arm `a` is an Array and the walk's
+/// element is what iterating it yields. A loop of the walk's shape outside
+/// that arm (over an array-like, say) is not a walk.
+fn guarded_for_of_walk(s: &Stmt) -> Option<(u32, u32)> {
+    let Stmt::If {
+        condition:
+            Expr::Compare {
+                op: perry_hir::CompareOp::Eq,
+                left,
+                right,
+            },
+        then_branch,
+        ..
+    } = s
+    else {
+        return None;
+    };
+    let Expr::NativeMethodCall {
+        module,
+        method,
+        args,
+        object: None,
+        ..
+    } = left.as_ref()
+    else {
+        return None;
+    };
+    let (Some(Expr::LocalGet(t)), Expr::Bool(false)) = (args.first(), right.as_ref()) else {
+        return None;
+    };
+    if module != "__perry_runtime" || method != "arrayRecordNeedsIterator" {
+        return None;
+    }
+    let (array, walk) = match then_branch.as_slice() {
+        [walk] => (*t, walk),
+        [Stmt::Let {
+            id,
+            init: Some(Expr::LocalGet(src)),
+            ..
+        }, walk]
+            if src == t =>
+        {
+            (*id, walk)
+        }
+        _ => return None,
+    };
+    for_of_walk(walk).filter(|(a, _)| *a == array)
+}
+
+/// `e` writes local `k` or `a`, or holds a closure that may (a mutable
+/// capture of either).
+fn writes_local(e: &Expr, k: u32, a: u32) -> bool {
+    match e {
+        Expr::LocalSet(id, _) | Expr::Update { id, .. } if *id == k || *id == a => true,
+        Expr::Closure {
+            mutable_captures, ..
+        } if mutable_captures.iter().any(|id| *id == k || *id == a) => true,
+        _ => {
+            let mut hit = false;
+            perry_hir::walker::walk_expr_children(e, &mut |c| hit = hit || writes_local(c, k, a));
+            hit
+        }
+    }
 }
 
 /// The head of a for-of body as HIR lowers it (`IteratorRecord::drive`,

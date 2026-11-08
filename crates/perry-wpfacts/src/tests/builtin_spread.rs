@@ -35,7 +35,17 @@ console.log(obj.len(), typeof r);
 
 /// (the read `o.a` proven, the call `obj.len()` proven)
 fn verdicts(source: &str, copy: &str) -> (bool, bool) {
-    let pf = facts(&fixture(source, copy));
+    verdicts_of(&fixture(source, copy))
+}
+
+/// The same with an unseen module loaded: its code may supply the global the
+/// source reads.
+fn verdicts_unseen(source: &str, copy: &str) -> (bool, bool) {
+    verdicts_of(&unseen(&fixture(source, copy)))
+}
+
+fn verdicts_of(program: &str) -> (bool, bool) {
+    let pf = facts(program);
     (
         proven(&site(&pf, "a").verdict),
         proven(&call_of(&pf, "len").verdict),
@@ -74,8 +84,8 @@ fn a_spread_of_an_unmodelled_builtin_object_stays_unproven() {
 #[test]
 fn a_spread_of_an_unknown_value_stays_unproven() {
     let top = "(globalThis as any).ext";
-    assert!(!verdicts(top, "{ a: obj, ...src }").1);
-    assert!(!verdicts(top, "Object.assign({ a: obj }, src)").1);
+    assert!(!verdicts_unseen(top, "{ a: obj, ...src }").1);
+    assert!(!verdicts_unseen(top, "Object.assign({ a: obj }, src)").1);
 }
 
 /// Sabotage twin: the parsed value is handed to unknown code first, which
@@ -91,8 +101,8 @@ fn json_data_handed_to_unknown_code_stays_unproven() {
 #[test]
 fn a_program_getter_result_is_copied() {
     let unknown = "{ get cb() { return (globalThis as any).g; } }";
-    assert!(!verdicts(unknown, "{ a: obj, ...src }").1);
-    assert!(!verdicts(unknown, "Object.assign({ a: obj }, src)").1);
+    assert!(!verdicts_unseen(unknown, "{ a: obj, ...src }").1);
+    assert!(!verdicts_unseen(unknown, "Object.assign({ a: obj }, src)").1);
 }
 
 /// Twin: the parsed data may hold any key, `b` among them; the copy's `b`
@@ -122,8 +132,8 @@ fn a_computed_key_write_into_json_data_is_copied() {
         "((x: any) => {{ x[String(Math.random())] = (globalThis as any).g; return x; }})({})",
         json()
     );
-    assert!(!verdicts(&source, "{ a: obj, ...src }").1);
-    assert!(!verdicts(&source, "Object.assign({ a: obj }, src)").1);
+    assert!(!verdicts_unseen(&source, "{ a: obj, ...src }").1);
+    assert!(!verdicts_unseen(&source, "Object.assign({ a: obj }, src)").1);
 }
 
 /// Sabotage twin: a primitive method's container (`"ab".match("a")`, an
@@ -142,4 +152,61 @@ console.log(v.len());
 "#;
     let pf = facts(src);
     assert!(!proven(&call_of(&pf, "len").verdict));
+}
+
+/// A namespace or constructor of the realm has no enumerable own property
+/// (ECMA-262 18): a spread or `Object.assign` of it copies only what the
+/// program stored on it, here nothing, so the copy's `cb` is no unknown
+/// function and `obj` stays the program's.
+#[test]
+fn a_spread_of_a_realm_namespace_copies_no_unknown_value() {
+    for ns in ["Object", "Math", "JSON", "Map", "Object.prototype.hasOwnProperty"] {
+        assert!(verdicts(ns, "{ a: obj, ...src }").1, "spread of {ns}");
+        assert!(verdicts(ns, "Object.assign({ a: obj }, src)").1, "assign of {ns}");
+    }
+}
+
+/// What the program stored on a realm namespace is copied, under its key.
+#[test]
+fn a_program_store_on_a_realm_namespace_is_copied() {
+    let src = r#"
+class V { k = 1; len() { return this.k; } }
+const obj = new V();
+(Object as any).cb = (x: any) => x.len();
+const o: any = { a: obj, ...(Object as any) };
+const f = o.cb;
+if (typeof f === "function") f(obj);
+console.log(obj.len(), typeof o.a);
+"#;
+    let pf = facts(src);
+    assert!(proven(&call_of(&pf, "len").verdict));
+}
+
+/// Sabotage twin: an unknown value stored on the namespace is copied, and
+/// the copy calls it with `obj`.
+#[test]
+fn an_unknown_value_stored_on_a_realm_namespace_stays_unproven() {
+    let program = unseen(
+        r#"
+class V { k = 1; len() { return this.k; } }
+const obj = new V();
+(Object as any).cb = (globalThis as any).ext;
+const o: any = { a: obj, ...(Object as any) };
+const f = o.cb;
+if (typeof f === "function") f(obj);
+console.log(obj.len(), typeof o.a);
+"#,
+    );
+    let pf = facts(&program);
+    assert!(!proven(&call_of(&pf, "len").verdict));
+}
+
+/// Controls: `Error` has the enumerable `stackTraceLimit` (V8), `console`
+/// and `process` are host objects with enumerable own members: the copy
+/// stays unknown.
+#[test]
+fn a_spread_of_error_or_a_host_namespace_stays_unproven() {
+    for ns in ["Error", "console", "process"] {
+        assert!(!verdicts(ns, "{ a: obj, ...src }").1, "spread of {ns}");
+    }
 }

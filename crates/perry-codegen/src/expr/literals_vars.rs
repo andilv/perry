@@ -548,6 +548,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(value);
                 }
             }
+            // A packed clone's element binding has no local slot until the
+            // slow clone declares one; inside the clone it lives only in its
+            // F64 alloca (`stmt::let_stmt`).
+            if !ctx.locals.contains_key(id) {
+                if let Some(f64_slot) = ctx.numeric_accumulator_f64_slots.get(id).cloned() {
+                    return Ok(ctx.block().load(DOUBLE, &f64_slot));
+                }
+            }
             // Repsel Phase 1: a canonical-i32 local's ONLY storage is the i32
             // slot — materialize the boxed view (`sitofp`/`uitofp`) here, at
             // the boxed use site.
@@ -1381,6 +1389,7 @@ pub(crate) fn bind_lowered_value_to_local(
     v: &str,
     value: &Expr,
 ) -> Result<()> {
+    let v = &crate::codegen::facts_number_locals::accept_let_value(ctx, id, value, v.to_string());
     crate::codegen::arguments::note_arguments_assignment(ctx, id);
     // `target = source` creates the same string-buffer alias as a
     // `let target = source` initializer. The declaration path has

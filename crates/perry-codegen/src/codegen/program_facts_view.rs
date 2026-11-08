@@ -21,6 +21,11 @@ pub struct ProgramFactsView {
     /// Observational diagnostics; excluded from every emitted-code digest.
     pub fallback: std::sync::Arc<crate::fallback_diag::Facts>,
     pub digest: u64,
+    /// Known body classifications; absent without the verification mode.
+    pub verification_bodies:
+        Option<std::sync::Arc<std::collections::BTreeMap<(u32, String), bool>>>,
+    pub verification_module: Option<String>,
+    pub verification_sites: Option<std::sync::Arc<Vec<crate::verify_facts::SiteClaim>>>,
     pub dynamic_code_reach: perry_hir::dynamic_code::DynamicCodeReach,
     /// The program's realm reach R, on the entry module only: its `main`
     /// emits the runtime layouts R reaches (DESIGN §3.2 item 9). Other
@@ -198,6 +203,9 @@ pub struct ElisionFacts {
     pub local_classes: std::collections::BTreeMap<u32, u32>,
     pub indexed_owners: std::collections::BTreeMap<u32, FactsIndexedOwner>,
     pub number_inputs: std::collections::BTreeSet<u32>,
+    /// Local id → it holds only strings and ordinary Arrays: `x.length` is a
+    /// Number.
+    pub length_number_inputs: std::collections::BTreeSet<u32>,
     pub indexed_metadata_pristine: bool,
     pub numeric_functions: std::collections::BTreeMap<u32, FactsNumericFunction>,
     /// Class id → its own statics that hold their definition for the
@@ -234,17 +242,25 @@ pub struct ElisionFacts {
     pub super_unrelinked: std::collections::BTreeMap<u32, Option<u32>>,
     /// Compiled code cannot replace Function.prototype.call/apply.
     pub fnproto_borrow_unwritten: bool,
+    /// The source offsets (the callee read's, as the solver records a call
+    /// site) of this module's method calls whose verdict is
+    /// `Verdict::NativeMember`: the member they read is proven to be the
+    /// intrinsic. A host-object call (`console.log(...)`) binds to the
+    /// intrinsic only here; every other one reads the property and calls it.
+    pub native_member_calls: std::collections::BTreeSet<u32>,
 }
 
 impl ElisionFacts {
     pub fn is_empty(&self) -> bool {
         self.indexed_owners.is_empty()
             && self.number_inputs.is_empty()
+            && self.length_number_inputs.is_empty()
             && self.locals.is_empty()
             && self.this_of.is_empty()
             && self.local_bodies.is_empty()
             && self.local_classes.is_empty()
             && self.class_statics.is_empty()
+            && self.native_member_calls.is_empty()
     }
 
     pub fn field(&self, class_id: u32, key: &str) -> Option<&FactsField> {

@@ -706,8 +706,11 @@ impl<'a> Gen<'a> {
         }
         self.m.nodes[ret as usize].result = true;
         self.m.funcs.push(FuncInfo {
+            #[cfg(test)]
+            body_packet: Default::default(),
             module: mi,
             func_id: u32::MAX,
+            raise: u32::MAX,
             name: c.name.clone(),
             params: params.clone(),
             rest,
@@ -720,7 +723,8 @@ impl<'a> Gen<'a> {
             ctor_of: None,
             lexical_this: false,
             no_summary: true,
-            gen_step: false,
+            gen_proto: None,
+            gen_fn_protos: None,
             gen_async: false,
             gen_reyields: false,
             proto: None,

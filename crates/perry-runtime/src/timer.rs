@@ -260,6 +260,12 @@ pub extern "C" fn js_interval_timer_has_pending() -> i32 {
 /// a check callback runs on the very next turn instead of after a park.
 #[no_mangle]
 pub extern "C" fn js_immediate_has_pending() -> i32 {
+    // A parked EOF is check-phase work too: it is delivered when the next
+    // check phase ends, so the loop must not park ahead of it.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::turnloop_net::eof_parked() {
+        return 1;
+    }
     i32::from(store::check_pending())
 }
 
@@ -782,6 +788,7 @@ pub extern "C" fn js_set_timeout_callback(callback: i64, delay_ms: f64) -> i64 {
 
 #[no_mangle]
 pub extern "C" fn js_set_immediate_callback(callback: i64) -> i64 {
+    crate::effect!(host_write, timer);
     schedule_js_timer(
         callback,
         0.0,
@@ -964,6 +971,7 @@ pub unsafe extern "C" fn js_set_immediate_callback_args(
     args_ptr: *const f64,
     n_args: i32,
 ) -> i64 {
+    crate::effect!(host_write, timer);
     schedule_js_timer(
         callback,
         0.0,

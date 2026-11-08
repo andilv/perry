@@ -105,6 +105,7 @@ pub(crate) mod hot_tls;
 pub(crate) mod inline_birth;
 pub(crate) mod literal_chunks;
 mod literal_descriptor;
+pub(crate) mod snap_env_site;
 /// A worker program's literal-descriptor IR, for the dialect reader's round trip.
 #[cfg(test)]
 pub(crate) fn literal_descriptor_worker_ir() -> String {
@@ -112,7 +113,11 @@ pub(crate) fn literal_descriptor_worker_ir() -> String {
 }
 #[cfg(test)]
 mod map_entry_at_tests;
+#[cfg(test)]
+mod member_update_class_field_tests;
 pub(crate) mod stack_guard;
+#[cfg(test)]
+mod stack_guard_leaf_tests;
 pub(crate) mod tdz_module_check;
 pub(crate) use bitset_test::is_u32_bitset_test;
 mod buffer_access;
@@ -223,6 +228,7 @@ pub(crate) use v8_interop::{
 pub(crate) use write_barrier::{
     emit_array_numeric_write_note_on_block, emit_gated_root_nanbox_store,
     emit_jsvalue_slot_store_on_block, emit_jsvalue_slot_store_pointer_tested,
+    emit_jsvalue_slot_store_pointer_tested_known,
     emit_jsvalue_slot_store_scalar_aware_on_block, emit_jsvalue_slot_store_with_flags_on_block,
     emit_jsvalue_slot_store_with_value_bits_on_block, emit_layout_note_slot_on_block,
     emit_may_carry_heap_pointer_check, emit_root_nanbox_store_for_expr,
@@ -251,7 +257,7 @@ mod bounded_array_hole_tests;
 #[cfg(test)]
 mod class_evaluation_owner_tests;
 #[cfg(test)]
-mod class_field_barrier_tests;
+pub(crate) mod class_field_barrier_tests;
 #[cfg(test)]
 mod class_field_get_shape_tests;
 mod dispatch;
@@ -832,6 +838,12 @@ pub(crate) struct FnCtx<'a> {
     /// (`collectors::contents_stable_bindings`): the only bindings that may
     /// keep a proof about their object's contents (`admits_contents_proof`).
     pub contents_stable_bindings: &'a std::collections::HashSet<u32>,
+    /// Empty-literal bindings a later loop pushes into
+    /// (`collectors::loop_pushed_arrays`): their `[]` is born with the larger
+    /// append reserve.
+    pub loop_pushed_arrays: &'a crate::collectors::PushedArrays,
+    /// Set by `lower_let` while it lowers such a binding's `[]` initializer.
+    pub pushed_array_birth: bool,
     /// Set while lowering `<id>.length`: that read of `id` cannot hand the
     /// string anywhere, so it skips the unique-owner demote.
     pub string_length_read_of: Option<u32>,
@@ -1136,6 +1148,11 @@ pub(crate) struct FnCtx<'a> {
     /// `js_number_coerce`. Structural, never a declared type — see
     /// `collectors::collect_number_by_construction_locals`.
     pub number_by_construction_locals: &'a std::collections::HashSet<u32>,
+    /// `let` bindings the whole-program facts prove hold only Numbers
+    /// (`codegen/facts_number_locals.rs`). A read is a Number; unlike
+    /// `number_by_construction_locals` this says nothing about the operands
+    /// of the writes, which keep their own lowering.
+    pub facts_number_locals: &'a std::collections::HashSet<u32>,
 
     /// Gen-GC Phase A sub-phase 3a: pointer-typed local → shadow-
     /// frame slot index. Empty on native statepoint targets.
@@ -2300,6 +2317,13 @@ pub(crate) struct MaskedWindowArrayFact {
     /// the i32 tier's all-slots-i32 materialization proof, and the TA tiers'
     /// hoisted data pointers serve reads only.
     pub allows_stores: bool,
+    /// Plain-array tiers: an entry `i64` slot caching the array's element
+    /// base (`array_elements_addr` of the validated handle). Written once
+    /// after the guard and re-derived from the refreshed handle at every
+    /// fired back-edge poll (`emit_armed_gc_loop_safepoint`), the clone's only
+    /// collection point; nothing in the call-free clone can move the backing.
+    /// `None` keeps the per-read derivation.
+    pub elements_slot: Option<String>,
 }
 
 /// Read-only masked-index window over a plain array of boxed strings.
@@ -2648,6 +2672,9 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
     inline_cache_global_name_for_prefix(ctx.strings.module_prefix(), site_id)
 }
 
+mod array_iteration;
+pub(crate) use array_iteration::{array_iteration_facts, array_program_facts};
+
 /// The definition emitted for every name in `FnCtx::ic_globals`.
 ///
 /// #9708: an inline-cache site owns an 8-byte pointer **slot**, not its cache
@@ -2660,47 +2687,6 @@ pub(crate) fn inline_cache_global_name(ctx: &FnCtx<'_>, site_id: u32) -> String 
 /// inline hit path loads the slot through [`emit_inline_cache_slot`] and
 /// proves it non-null before reading a cache word; every runtime miss entry
 /// takes the slot's address.
-/// The program's array-iteration facts (object model step 7), from the
-/// whole-program write census fixed before module codegen starts: bit 0, a
-/// write may reach a `Symbol.iterator` member (or re-parent an array), so
-/// iteration reads `%Array.prototype%`'s fixed slot (and an array's own
-/// member); bit 1, `%ArrayIteratorPrototype%` may be named, so iteration also
-/// checks its `next`. Zero: iteration is the builtin element walk, unchecked.
-/// The whole-program facts (#13645) clear a bit the census sets when compiled
-/// code provably never writes what it guards.
-pub(crate) fn array_iteration_facts(wpfacts: &crate::codegen::ElisionFacts) -> u32 {
-    let names = crate::program_patched_proto_methods();
-    let mut facts = 0;
-    if !wpfacts.array_iteration_unwritten
-        && names
-            .iter()
-            .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_WRITABLE)
-    {
-        facts |= 1;
-    }
-    if !wpfacts.array_iterator_close_unwritten
-        && names
-            .iter()
-            .any(|n| n == perry_hir::patched_builtins::ARRAY_ITERATOR_PROTO_REACHABLE)
-    {
-        facts |= 2;
-    }
-    facts
-}
-
-/// Immutable whole-program array facts handed to the runtime at startup.
-pub(crate) fn array_program_facts(wpfacts: &crate::codegen::ElisionFacts) -> u32 {
-    array_iteration_facts(wpfacts)
-        | if crate::program_patched_proto_methods()
-            .iter()
-            .any(|name| name == perry_hir::patched_builtins::ARRAY_ELEMENT_DESCRIPTORS)
-        {
-            4
-        } else {
-            0
-        }
-}
-
 pub(crate) fn inline_cache_global_definition(name: &str) -> String {
     format!("@{name} = private global ptr null")
 }
@@ -4460,7 +4446,7 @@ fn lower_compare_value(
 /// when an existing caller still expects the generic JSValue/`double` ABI.
 pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Option<LoweredValue>> {
     let _fallback = crate::fallback_diag::enter_expr(ctx, expr);
-    let _consumed = crate::facts_consumed::enter(expr);
+    let _consumed = crate::facts_consumed::enter(expr, &ctx.func.name);
     match expr {
         Expr::Bool(value) => {
             let lowered = LoweredValue::i1(if *value { "true" } else { "false" });

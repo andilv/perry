@@ -89,6 +89,8 @@ pub(in crate::codegen) fn compile_static_method(
     let this_shadow_slot_idx = shadow_slot_map.len() as u32;
 
     let _ = lf.create_block("entry");
+    let _verify_body = crate::verify_facts::body_scope(&lf.name);
+    crate::verify_facts::raw_body_entry(lf, f.id);
 
     let current_closure_slot = if generator_owner {
         lf.reserve_shadow_slot().map(|idx| {
@@ -352,6 +354,8 @@ pub(in crate::codegen) fn compile_static_method(
         scope_map: &cross_module.scope_map,
         string_accumulator_locals: &cross_module.string_accumulator_locals,
         contents_stable_bindings: &cross_module.contents_stable_bindings,
+        loop_pushed_arrays: &cross_module.loop_pushed_arrays,
+        pushed_array_birth: false,
         string_length_read_of: None,
         closure_rest_params,
         local_closure_func_ids: HashMap::new(),
@@ -409,6 +413,7 @@ pub(in crate::codegen) fn compile_static_method(
         int_valued_i64_locals: native_facts.int_valued_i64_locals(),
         not_bigint_locals: native_facts.not_bigint_locals(),
         number_by_construction_locals: native_facts.number_by_construction_locals(),
+        facts_number_locals: crate::codegen::facts_number_locals::none(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
         // Conservative: treat every slot as possibly-bound (param binds are
         // emitted before FnCtx exists here), so clears never get skipped.
@@ -570,7 +575,7 @@ pub(in crate::codegen) fn compile_static_method(
     );
     // #10812: throw a catchable RangeError before the native stack runs out.
     crate::expr::numeric_order::parameters_ready(&mut ctx, &f.params);
-    crate::expr::stack_guard::emit_stack_guard(&mut ctx);
+    let stack_guard_site = crate::expr::stack_guard::emit_stack_guard(&mut ctx);
     if f.is_async {
         stmt::lower_async_rejecting_stmts(&mut ctx, &f.body).with_context(|| {
             format!("lowering async body of static '{}::{}'", class.name, f.name)
@@ -592,6 +597,7 @@ pub(in crate::codegen) fn compile_static_method(
             ctx.block().ret(DOUBLE, &undef);
         }
     }
+    crate::expr::stack_guard::finish_stack_guard(&mut ctx, stack_guard_site);
     let artifacts = take_lowered_fn_artifacts(&mut ctx);
     drop(ctx);
     publish_lowered_fn_artifacts(llmod, artifacts);

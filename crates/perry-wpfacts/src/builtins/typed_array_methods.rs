@@ -48,6 +48,7 @@ fn species(m: &mut Model, t: Tok, call: CallId, args: Vec<NodeId>) {
             spread: vec![],
             ret: c.ret,
             site: c.site,
+            region: m.thrown,
         },
     );
     m.cons(sp, Cons::New { call: made });
@@ -211,6 +212,7 @@ pub(super) fn method(m: &mut Model, t: Tok, name: &str, call: CallId) -> bool {
                     spread: vec![],
                     ret: r,
                     site: nested,
+                    region: m.thrown,
                 },
             );
             m.cons(
@@ -235,6 +237,7 @@ pub(super) fn method(m: &mut Model, t: Tok, name: &str, call: CallId) -> bool {
                     spread: vec![],
                     ret: c.ret,
                     site: nested,
+                    region: m.thrown,
                 },
             );
             m.cons(
@@ -254,7 +257,7 @@ pub(super) fn method(m: &mut Model, t: Tok, name: &str, call: CallId) -> bool {
             } else {
                 elem
             };
-            let it = super::collections::iter_over(m, call, vals);
+            let it = super::collections::iter_over(m, call, members::ARRAY_ITERATOR, vals);
             ret_tok(m, call, it);
         }
         _ => return false,

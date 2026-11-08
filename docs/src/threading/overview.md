@@ -347,6 +347,29 @@ For Node-compatible DOM-style delivery on BroadcastChannel and MessagePort
 Perry-only Worker web-style and worker-global delivery keep their existing
 lossless data behavior.
 
+### BroadcastChannel EventTarget listeners
+
+BroadcastChannel inherits EventTarget. Borrowed `addEventListener` and
+`removeEventListener` use the actual receiver, including its prototype, derived
+objects and transparent proxies; invalid receivers throw `ERR_INVALID_THIS`.
+Listeners share EventTarget's capture matching, `once`, AbortSignal removal and
+listener-object `handleEvent` dispatch. `events.getEventListeners` observes the
+same registrations used by delivery and manual `dispatchEvent`.
+
+`onmessage` and `onmessageerror` occupy stable positions in that listener list.
+Replacing a handler keeps its position; assigning `null` silences the wrapper
+without removing it. Closing a channel discards its transport inbox, not its
+EventTarget listeners: manual dispatch remains available after close. The provider
+releases the closed transport immediately; only ordinary references to the channel
+retain its listeners.
+
+Dispatch supports callable Proxy listeners and removes `once` records before
+invocation, even if another callback changes the receiver's constructor. A listener
+removed and re-added during dispatch does not run from the old snapshot. Persistent
+listener traversal is linear in the listener count. Exceptions from callbacks or
+`handleEvent` getters are reported asynchronously through `uncaughtException`;
+they do not skip later listeners or property handlers.
+
 ### Messaging constructor errors
 
 `MessageChannel` requires `new` (`ERR_CONSTRUCT_CALL_REQUIRED`). `MessagePort`
@@ -367,3 +390,37 @@ invoked through `call`, `apply` or spread arguments. These callable values use
 the same environment, clone-marker, `receiveMessageOnPort` and
 `postMessageToThread` implementations as direct calls. Realm movement through
 `moveMessagePortToContext` remains unsupported on this callable path.
+
+### CommonJS worker entry discovery
+
+Perry includes literal file paths passed to immutable CommonJS Worker bindings
+(`const { Worker } = require("node:worker_threads")`, including renamed bindings)
+and immutable namespace bindings (`const threads = require("worker_threads")`).
+These paths are compiled as worker entries, not executed as ordinary imports.
+The constructor and its arguments still evaluate at runtime.
+
+Automatic discovery requires an unshadowed, unreassigned `require`, a literal
+relative or absolute filename, and no options or a plain file-mode options object.
+Eval workers, opaque options, spread arguments, and forwarded or mutable
+constructor bindings are not inferred by this analysis. A literal
+`new URL("./child.cjs", import.meta.url)` can explicitly include an entry when
+the runtime constructor is obtained indirectly.
+
+### Error stack accessors
+
+Message cloning reads an Error's `stack` property, including non-enumerable
+accessors. A throwing getter aborts `structuredClone` or `postMessage` with the
+original exception; no message is delivered. An undefined stack remains
+undefined in the recipient rather than exposing a newly captured stack.
+
+Uncaught worker exceptions use best-effort diagnostic delivery: a throwing stack
+getter does not replace the original error or prevent its `error` and `exit`
+events. This does not provide support for custom `Error.prepareStackTrace` hooks.
+
+Message cloning preserves an Error's own data `cause`, including non-enumerable
+and explicitly undefined values, within the existing clone graph. Shared causes,
+back-references and self-references keep their identity. The data cause is
+captured before reentrant stack accessors run. Cause accessors are
+ignored without invoking their getters. Uncaught Worker diagnostic accessor and
+circular-reference formatting have a separate policy; this does not add support
+for those diagnostic cases.
