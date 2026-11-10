@@ -108,6 +108,14 @@ pub struct FieldFacts {
     /// (`bindings::bodies_of` over every token of the layout); empty when
     /// it may hold anything else.
     pub fns: Vec<crate::bindings::BodyRef>,
+    /// The field's representation (DESIGN-p4l1 §3.1, finding 8): `Arr` of
+    /// what the field holds over every token of the template
+    /// (`bindings::arr_rep`) when it is definite, a data field, and the
+    /// template is neither escaped nor hard (a `delete` or a
+    /// `setPrototypeOf` on an instance can make the read `undefined`
+    /// without the field node holding it); Boxed otherwise. No consumer
+    /// yet (PR-C3 reads it).
+    pub rep: crate::bindings::Rep,
 }
 
 #[derive(Clone, Debug, PartialEq, Hash)]
@@ -177,6 +185,9 @@ pub struct SiteFacts {
     /// A call site: the bodies its callee set holds (every body, sorted;
     /// empty when the set holds anything that is not a body).
     pub targets: Vec<String>,
+    /// The HIR identity `(module, function id)` of each body in `targets`,
+    /// sorted (`field_read_calls`).
+    pub(crate) target_fns: Vec<(u32, u32)>,
     /// Per-unit run: the receiver is a parameter whose TS object type
     /// names these keys; its verdict is decided after the census
     /// (`units::typed_param_verdicts`).
@@ -250,6 +261,8 @@ impl FieldFacts {
         self.writers_post = self.writers_post.max(o.writers_post);
         self.kind.join(&o.kind);
         self.ta_stable &= o.ta_stable;
+        // The join, not the meet: the row must hold for either class.
+        self.rep = crate::bindings::Rep::join(self.rep, o.rep);
         if self.ta_kind != o.ta_kind {
             self.ta_kind = None;
         }
@@ -886,7 +899,20 @@ fn template_facts(
         } else {
             Vec::new()
         };
+        let rep = if definite && !is_accessor && escape.is_none() && hard.is_none() {
+            // The field nodes of the tokens that have one, as `field_kind`
+            // reads them.
+            let nodes: Vec<NodeId> = ts
+                .iter()
+                .filter_map(|t| m.fields.get(&(*t, a)).copied())
+                .collect();
+            crate::bindings::arr_rep(m, &nodes)
+                .map_or(crate::bindings::Rep::Boxed, crate::bindings::Rep::Arr)
+        } else {
+            crate::bindings::Rep::Boxed
+        };
         fields.push(FieldFacts {
+            rep,
             fns,
             ta_stable,
             ta_kind,
@@ -1006,7 +1032,7 @@ fn ta_only_sealed(m: &Model, ts: &[Tok], a: Atom) -> bool {
 
 fn ta_sealed_tok(m: &Model, x: Tok) -> bool {
     matches!(m.toks[x as usize], TokKind::Obj(tm, _)
-        if matches!(m.tmpls[tm as usize].kind, TmplKind::BObj { what: "TypedArray", .. }))
+        if m.tmpls[tm as usize].kind.typed_storage())
         && !m.hard.contains_key(&x)
         && !m.escaped.contains_key(&x)
 }
@@ -1143,10 +1169,16 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
     // twice) unite their receivers.
     let mut first: FxHashMap<(u32, u32, u32, bool, bool), usize> = FxHashMap::default();
     let mut groups: Vec<(usize, Vec<u32>, Vec<FnIdx>)> = Vec::new();
-    // The functions only the runtime has (a promise's resolvers). Every
-    // other function token is a body: compiled here, or another unit's,
-    // held by its contract (a stand-in, a foreign class's method).
-    let runtime: FxHashSet<FnIdx> = m.resolvers.values().map(|&t| m.tok_fn(t)).collect();
+    // The functions only the runtime has (a promise's resolvers, a promise
+    // capability's executor). Every other function token is a body:
+    // compiled here, or another unit's, held by its contract (a stand-in, a
+    // foreign class's method).
+    let runtime: FxHashSet<FnIdx> = m
+        .resolvers
+        .values()
+        .chain(m.executors.values())
+        .map(|&t| m.tok_fn(t))
+        .collect();
     for (i, s) in g.read_sites.iter().enumerate() {
         let k = (s.module, s.byte_offset, s.key, s.is_call, s.value_call);
         match first.get(&k) {
@@ -1259,6 +1291,12 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
                 })
                 .collect::<Vec<_>>()
         });
+        let mut target_fns: Vec<(u32, u32)> = targets
+            .keys()
+            .map(|&f| (m.funcs[f as usize].module, m.funcs[f as usize].func_id))
+            .collect();
+        target_fns.sort_unstable();
+        target_fns.dedup();
         let mut t: Vec<String> = targets.into_values().collect();
         t.sort();
         t.dedup();
@@ -1289,6 +1327,7 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
             verdict,
             fixed_shape,
             targets: t,
+            target_fns,
             guard_keys,
         });
     }

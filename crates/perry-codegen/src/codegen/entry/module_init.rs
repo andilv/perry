@@ -54,10 +54,15 @@ pub(super) fn compile_module_init(
     // `classify_heap_generation` is `Unknown`, so the object reads back
     // with no keys. Node and bun evaluate the module graph once per
     // worker; a thread-local flag is what makes that happen here.
+    //
+    // The guard is the low byte of an eight-byte global. The bytes above it
+    // belong to the runtime, which numbers the module record there on first
+    // evaluation (`js_run_module_init_guarded`), so the record is named by its
+    // evaluation order and not by where the linker put the global.
     if llmod.program_has_worker {
-        llmod.add_internal_thread_local_global(&done_global, I8, "0");
+        llmod.add_internal_thread_local_global(&done_global, I64, "0");
     } else {
-        llmod.add_internal_global(&done_global, I8, "0");
+        llmod.add_internal_global(&done_global, I64, "0");
     }
     let init_name = format!("{}__init", module_prefix);
     let init_body_name = format!("{}__init_body", module_prefix);
@@ -218,6 +223,7 @@ pub(super) fn compile_module_init(
         // too — passing an empty map kept top-level accumulator loops on
         // the rooted/guarded path while in-function ones were clean.
         &cross_module.module_global_proven_types,
+        crate::codegen::facts_int32_locals::none(),
     );
     // #9363: the same redundant-shadow-slot pruning `codegen/function.rs`
     // does, which module init never got. The shadow map is built above
@@ -431,6 +437,7 @@ pub(super) fn compile_module_init(
         not_bigint_locals: init_native_facts.not_bigint_locals(),
         number_by_construction_locals: init_native_facts.number_by_construction_locals(),
         facts_number_locals: crate::codegen::facts_number_locals::none(),
+        facts_int32_locals: crate::codegen::facts_int32_locals::none(),
         unsigned_i32_locals: init_native_facts.unsigned_i32_locals(),
         shadow_slots_bound: init_shadow_slot_map.values().copied().collect(),
         temp_roots: crate::rooting::TempRootPool::default(),
@@ -481,6 +488,8 @@ pub(super) fn compile_module_init(
         spec_ta_ready: std::collections::HashSet::new(),
         spec_i32_params: std::collections::HashSet::new(),
         spec_bool_params: std::collections::HashSet::new(),
+        sig_return: None,
+        typed_methods: &cross_module.typed_methods,
         typed_element_locals: std::collections::HashSet::new(),
         create_families: Default::default(),
         class_guard_window: None,

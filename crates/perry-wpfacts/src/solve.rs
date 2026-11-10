@@ -24,6 +24,7 @@ use crate::model::*;
 
 #[path = "solve/apply.rs"]
 mod apply;
+mod arr_len;
 mod builtin_fields;
 
 #[path = "solve/store.rs"]
@@ -32,6 +33,7 @@ mod store;
 mod escape;
 mod fields;
 mod shaped_keys;
+pub(crate) mod strs;
 mod virt;
 
 // Property-key ranges come from value deltas, not source annotations. Keep
@@ -62,6 +64,20 @@ impl Model {
         }
         self.add_tokens(n, Tokens::Slice(toks), prim);
     }
+
+    /// `add` with the string constants `strs` for a string in `prim` (a
+    /// copy of another node's value: `Node::strs`).
+    pub(crate) fn add_s(&mut self, n: NodeId, toks: &[Tok], prim: u16, strs: StrSet) {
+        #[cfg(test)]
+        if self.packet_emit(crate::summary::packet::Emission::Seed(
+            n,
+            toks.to_vec(),
+            prim,
+        )) {
+            return;
+        }
+        self.add_tokens_s(n, Tokens::Slice(toks), prim, strs);
+    }
     /// The work bound (`FactsConfig::max_work`, 0 = none). Past it a
     /// whole-program solve (`Model::widen`) is widened (`bind_layout`: no
     /// new calling contexts) and goes on to its fixpoint; past `WIDENED_WORK` times it, or past it
@@ -80,7 +96,13 @@ impl Model {
         self.aborted
     }
 
+    /// A string that is no copy of another node's is any string
+    /// (`Node::strs`).
     fn add_tokens(&mut self, n: NodeId, toks: Tokens<'_>, prim: u16) {
+        self.add_tokens_s(n, toks, prim, STRS_TOP);
+    }
+
+    fn add_tokens_s(&mut self, n: NodeId, toks: Tokens<'_>, prim: u16, strs: StrSet) {
         if let Some(c) = self.diagnostic.as_mut().and_then(|d| d.census.as_mut()) {
             if !c.injecting
                 && self.cur_src != NO_NODE
@@ -201,6 +223,7 @@ impl Model {
                 self.aborted = true;
             }
         }
+        let iv = self.cur_range.unwrap_or(crate::model::Rg::TOP);
         let node = &mut self.nodes[n as usize];
         let newp = prim & !node.prim;
         if newp != 0 {
@@ -208,6 +231,20 @@ impl Model {
             node.dprim |= newp;
             changed = true;
         }
+        // A Number brings its interval: the delivering edge's, else ⊤. A
+        // rule's result takes its interval from the rule only.
+        if prim & prim::NUM != 0 && !node.ruled {
+            changed |= grow_range(node, iv.num);
+        }
+        // A String brings its code interval the same way.
+        if prim & prim::STR != 0 && !node.cruled {
+            changed |= grow_crange(node, iv.chr);
+        }
+        if prim & prim::STR != 0 {
+            let strs = if strs == STRS_NONE { STRS_TOP } else { strs };
+            changed |= self.join_strs(n, strs);
+        }
+        let node = &mut self.nodes[n as usize];
         if changed && !node.in_wl {
             node.in_wl = true;
             self.wl.push_back(n);
@@ -623,6 +660,23 @@ impl Model {
             let line = self.cons_line(n, &c);
             self.rel(|| line);
         }
+        if let Cons::Range { dst, op, .. } = c {
+            // The rule's result is every Number (String, for a code rule)
+            // the node can hold: what reached it before (an instance's
+            // seeds) is subsumed.
+            let d = &mut self.nodes[dst as usize];
+            if matches!(op, RangeOp::SClip(_)) {
+                if !d.cruled {
+                    d.cruled = true;
+                    d.crange = Iv::EMPTY;
+                    d.csteps = 0;
+                }
+            } else if !d.ruled {
+                d.ruled = true;
+                d.range = Iv::EMPTY;
+                d.rsteps = 0;
+            }
+        }
         self.nodes[n as usize].cons.push(c);
         if let Some(region) = self.gen_region.filter(|_| Self::may_run_code(&c)) {
             let cs = &self.nodes[n as usize].cons;
@@ -712,15 +766,33 @@ impl Model {
                     return;
                 }
             }
-            let dprim = {
+            let (dprim, dstrs, drange) = {
                 let node = &mut self.nodes[n as usize];
                 node.in_wl = false;
                 self.pending.take(&mut node.delta, &mut delta);
-                std::mem::take(&mut node.dprim)
+                (
+                    std::mem::take(&mut node.dprim),
+                    std::mem::take(&mut node.dstrs),
+                    std::mem::take(&mut node.drange) && node.prim & (prim::NUM | prim::STR) != 0,
+                )
             };
-            if delta.is_empty() && dprim == 0 {
+            if delta.is_empty() && dprim == 0 && !dstrs && !drange {
                 continue;
             }
+            // Only a node's string constants (`Node::strs`) and/or its
+            // intervals (`model::range`: a Number's, a String's code) grew:
+            // re-deliver them along the edges (STR with the constants, the
+            // interval's kinds with it) and re-run only the rules that read
+            // them (`Cons::carries_strs`, `Cons::carries_range`). Each lattice
+            // keeps its own predicate.
+            let meta_only = delta.is_empty() && dprim == 0;
+            let rprim = if drange {
+                self.nodes[n as usize].prim & (prim::NUM | prim::STR)
+            } else {
+                0
+            };
+            let sprim = dprim | rprim | if dstrs { prim::STR } else { 0 };
+            let sstrs = self.nodes[n as usize].strs;
             // Sets change interned (`SetTable::extend`); one made outside
             // this solve (an earlier solve, whose index is gone) is interned
             // here, so covering below stays a pointer test.
@@ -745,10 +817,13 @@ impl Model {
             if self.past_work_bound() {
                 return;
             }
+            // A value-copy edge delivers the source's Numbers with their
+            // interval (`add_tokens`).
+            self.cur_range = Some(self.rg(n));
             let mut i = 0;
             while i < self.nodes[n as usize].succ.len() {
                 let s = self.nodes[n as usize].succ[i];
-                if self.try_copy_delivery(n, s, i as u32, &delta, dprim) {
+                if self.try_copy_delivery(n, s, i as u32, &delta, sprim, sstrs) {
                     self.charge_work(1 + delivery_overhead);
                     if let Some(p) = self.prof.as_mut() {
                         p.step[1] += 1 + delivery_overhead;
@@ -784,9 +859,9 @@ impl Model {
                     return;
                 }
                 if covered {
-                    self.add_tokens(s, toks, dprim);
+                    self.add_tokens_s(s, toks, sprim, sstrs);
                 } else {
-                    let extra = self.copy_to(n, s, toks, dprim);
+                    let extra = self.copy_to(n, s, toks, sprim, sstrs);
                     self.charge_work(extra);
                     if let Some(p) = self.prof.as_mut() {
                         p.step[3] += extra;
@@ -797,12 +872,23 @@ impl Model {
                 }
                 i += 1;
             }
+            self.cur_range = None;
             let ncons = self.nodes[n as usize].cons.len();
             for i in 0..ncons {
                 let c = self.nodes[n as usize].cons[i];
+                let mut p = dprim;
+                if !meta_only || c.carries_range() {
+                    p |= rprim;
+                }
+                if dstrs && c.carries_strs() {
+                    p |= prim::STR;
+                }
+                if meta_only && p == 0 {
+                    continue;
+                }
                 self.cur_src = n;
                 self.cur_why = u32::MAX;
-                self.apply_tokens(n, &c, Tokens::Pending(&delta), dprim);
+                self.apply_tokens(n, &c, Tokens::Pending(&delta), p);
             }
             delta.clear();
         }
@@ -903,6 +989,25 @@ impl Model {
                 }
                 self.add_tok(n, objproto);
             }
+            // A builtin constructor whose [[Prototype]] is another one
+            // (`TypeError`'s is `Error`): that namespace.
+            TokKind::Builtin(ns) if crate::builtins::ns_parent(ns).is_some() => {
+                let p = self.tok(TokKind::Builtin(crate::builtins::ns_parent(ns).unwrap()));
+                self.add_tok(n, p);
+            }
+            // A realm constructor whose declared [[Prototype]] is another
+            // realm constructor (`Readable` -> `Stream` -> `EventEmitter`,
+            // node's legacy stream chain): that constructor's value, so a
+            // lookup on it reaches what the program gave or stored up the
+            // chain (`Object.setPrototypeOf(EventEmitter, p)` then
+            // `Readable.apply`).
+            TokKind::BuiltinFn(Native::Member { identity, holder: None })
+                if crate::builtins::realm_parent_constructor(identity).is_some() =>
+            {
+                let parent = crate::builtins::realm_parent_constructor(identity).unwrap();
+                let p = self.tok(TokKind::BuiltinFn(Native::Member { identity: parent, holder: None }));
+                self.add_tok(n, p);
+            }
             TokKind::Func(_, _)
             | TokKind::Bound(_)
             | TokKind::BuiltinFn(_)
@@ -915,7 +1020,26 @@ impl Model {
                 None => match self.tmpls[tm as usize].parent_value {
                     // `S.__proto__` is the value of the `extends` expression.
                     Some((pv, _)) => self.edge(pv, n),
-                    None => self.add_tok(n, objproto),
+                    None => match self.tmpls[tm as usize].native_parent.clone() {
+                        // `class C extends EventEmitter` over a named import
+                        // of a node module: the heritage reads the import's
+                        // binding, which holds what key `EventEmitter` of the
+                        // module object reads (the named ESM export value,
+                        // `js_native_module_named_esm_export_value`).
+                        Some((module, name)) if !self.unit_mode => {
+                            match crate::builtins::node_module_ns(&module) {
+                                Some(ns) => {
+                                    let mt = self.tok(TokKind::Builtin(ns));
+                                    let mn = self.node_l("native-parent-module");
+                                    self.add_tok(mn, mt);
+                                    let key = Key::Named(self.atom(&name));
+                                    self.cons(mn, Cons::Load { key, dst: n });
+                                }
+                                None => self.add_tok(n, objproto),
+                            }
+                        }
+                        _ => self.add_tok(n, objproto),
+                    },
                 },
             },
             _ => {}
@@ -1264,9 +1388,8 @@ impl Model {
     /// modeled (⊤, a marker's run, a bound function's target), `lhs` is
     /// passed to unknown code: it escapes.
     pub fn has_instance(&mut self, t: Tok, reason: u32, lhs: NodeId) {
-        let unknown = t == TOP
-            || self.is_marker(t)
-            || matches!(self.toks[t as usize], TokKind::Bound(_));
+        let unknown =
+            t == TOP || self.is_marker(t) || matches!(self.toks[t as usize], TokKind::Bound(_));
         if unknown {
             self.sink_node(lhs, reason);
             match self.toks[t as usize] {
@@ -1444,6 +1567,8 @@ impl Model {
             }
             Cons::OwnValues { dst } => format!("ownvalues {n} {dst}"),
             Cons::IndexHole => format!("indexhole {n}"),
+            Cons::LenIndex { lo, hi } => format!("lenindex {n} {lo} {hi}"),
+            Cons::LenPermuted { t } => format!("lenpermuted {n} {t}"),
             Cons::CjsPublish { dst } => format!("cjspublish {n} {dst}"),
             Cons::Store { key, src, site } => {
                 format!("store {n} {} {src} {site}", self.key_name(*key))
@@ -1591,7 +1716,7 @@ impl Model {
             }
             Cons::AnnexBDefine { call, setter } => format!("annexbdefine {n} {call} {setter}"),
             Cons::AnnexBLookup { call, setter } => format!("annexblookup {n} {call} {setter}"),
-            Cons::AccessorInstall { key, f, setter } => {
+            Cons::AccessorInstall { key, f, setter, .. } => {
                 format!(
                     "accinstall {n} {} {} {}",
                     self.key_name(Key::Named(*key)),
@@ -1615,10 +1740,17 @@ impl Model {
             } => format!("nativeparent {n} {tm} {expected} {reason}"),
             Cons::ShareBuffer { ta } => format!("sharebuffer {n} {ta}"),
             Cons::Arith { dst } => format!("arith {n} {dst}"),
+            Cons::Range {
+                op,
+                other,
+                dst,
+                right,
+            } => format!("range {n} {} {other} {dst} {}", op.name(), *right as u8),
             Cons::Plus { str, num } => format!("plus {n} {str} {num}"),
             Cons::ArrayLenArg { dst } => format!("arraylenarg {n} {dst}"),
             Cons::IdxLoad { idx, dst, .. } => format!("idxload {n} {idx} {dst}"),
             Cons::IdxKey { obj, dst, .. } => format!("idxkey {n} {obj} {dst}"),
+            Cons::ElemUndef { obj, key, dst } => format!("elemundef {n} {obj} {key} {dst}"),
             Cons::IdxOwnLoad { idx, dst, .. } => format!("idxownload {n} {idx} {dst}"),
             Cons::IdxOwnKey { obj, dst, .. } => format!("idxownkey {n} {obj} {dst}"),
             Cons::OwnTest { dst, at } => format!("owntest {n} {dst} {at:?}"),
@@ -1646,7 +1778,7 @@ impl Model {
             Cons::RetInto { call, run } => format!("retinto {n} {call} {run}"),
             Cons::ArgInto { call, run, i } => format!("arginto {n} {call} {run} {i}"),
             Cons::Spread { into, site } => format!("spread {n} {into} {site}"),
-            Cons::SpreadFrom { src, site } => format!("spreadfrom {n} {src} {site}"),
+            Cons::SpreadFrom { src, site, .. } => format!("spreadfrom {n} {src} {site}"),
             Cons::ThisInst { call, ft } => format!("thisinst {n} {call} {ft}"),
             Cons::NativeThis { call, f } => format!("nativethis {n} {call} {f}"),
             Cons::BuiltinCallee => format!("builtincallee {n}"),
@@ -1693,4 +1825,106 @@ impl Model {
 /// is safe: such a key reads the elements as well.
 pub(crate) fn numeric_key(name: &str) -> bool {
     name.parse::<f64>().is_ok() || matches!(name, "NaN" | "Infinity" | "-Infinity")
+}
+
+impl Model {
+    /// An operand's interval for `range::eval`: its own while it holds only
+    /// Numbers (nothing to coerce), empty while it holds nothing, else ⊤.
+    /// What a value-copy delivery from `n` carries beside its values.
+    pub(crate) fn rg(&self, n: NodeId) -> crate::model::Rg {
+        let nd = &self.nodes[n as usize];
+        crate::model::Rg {
+            num: nd.range,
+            chr: nd.crange,
+        }
+    }
+
+    /// The code interval of `x`'s Strings when it holds only Strings
+    /// (else ⊤; nothing: empty).
+    pub(crate) fn crange_input(&self, x: NodeId) -> Iv {
+        let nd = &self.nodes[x as usize];
+        if nd.pts.is_empty() && nd.prim == 0 {
+            Iv::EMPTY
+        } else if nd.pts.is_empty() && nd.prim == prim::STR {
+            nd.crange
+        } else {
+            Iv::TOP
+        }
+    }
+
+    /// `Number(x)` over everything `x` holds (`RangeOp::ToNumber`).
+    pub(crate) fn to_number_range(&self, x: NodeId) -> Iv {
+        let nd = &self.nodes[x as usize];
+        if !nd.pts.is_empty() || nd.prim & (prim::UNDEF | prim::BIGINT) != 0 {
+            return Iv::TOP;
+        }
+        let mut out = Iv::EMPTY;
+        if nd.prim & prim::NUM != 0 {
+            out = out.join(nd.range);
+        }
+        if nd.prim & prim::STR != 0 {
+            out = out.join(crate::model::range::chars_to_number(nd.crange));
+        }
+        if nd.prim & prim::BOOL != 0 {
+            out = out.join(Iv { lo: 0, hi: 1 });
+        }
+        if nd.prim & prim::NULL != 0 {
+            out = out.join(Iv { lo: 0, hi: 0 });
+        }
+        let known = prim::NUM | prim::STR | prim::BOOL | prim::NULL;
+        if nd.prim & !known != 0 {
+            return Iv::TOP;
+        }
+        out
+    }
+
+    pub(crate) fn range_input(&self, x: NodeId) -> Iv {
+        let nd = &self.nodes[x as usize];
+        if nd.pts.is_empty() && nd.prim == 0 {
+            Iv::EMPTY
+        } else if nd.pts.is_empty() && nd.prim == prim::NUM {
+            nd.range
+        } else {
+            Iv::TOP
+        }
+    }
+}
+
+/// Join `iv` into the node's interval; widen to ⊤ past `WIDEN_STEPS`
+/// growths. Whether it grew.
+/// Join `iv` into the node's code interval; past `WIDEN_STEPS` growths it
+/// is every one-unit String (`CHAR_ANY`), unless ⊤.
+pub(crate) fn grow_crange(node: &mut Node, iv: Iv) -> bool {
+    let joined = node.crange.join(iv);
+    if joined == node.crange {
+        return false;
+    }
+    node.csteps = node.csteps.saturating_add(1);
+    node.crange = if joined.is_top() || node.csteps <= crate::model::range::WIDEN_STEPS {
+        joined
+    } else if joined.within(crate::model::range::CHAR_ANY) {
+        crate::model::range::CHAR_ANY
+    } else {
+        Iv::TOP
+    };
+    node.drange = true;
+    true
+}
+
+pub(crate) fn grow_range(node: &mut Node, iv: Iv) -> bool {
+    let joined = node.range.join(iv);
+    if joined == node.range {
+        return false;
+    }
+    use crate::model::range::{widen, WIDEN_LIMIT, WIDEN_STEPS};
+    node.rsteps = node.rsteps.saturating_add(1);
+    node.range = if node.rsteps > WIDEN_LIMIT {
+        Iv::TOP
+    } else if node.rsteps > WIDEN_STEPS {
+        widen(node.range, joined)
+    } else {
+        joined
+    };
+    node.drange = true;
+    true
 }

@@ -257,9 +257,12 @@ mod emission_order_tests;
 mod entry;
 pub mod entry_outline;
 mod export_value_wrappers;
+pub(crate) mod facts_const_length;
+pub(crate) mod facts_int32_locals;
 pub(crate) mod facts_number_locals;
 #[cfg(test)]
 mod facts_number_locals_tests;
+pub(crate) mod facts_rep;
 pub(crate) mod fresh_class_templates;
 pub(crate) mod func_registry;
 mod function;
@@ -272,6 +275,7 @@ mod guarded_undefined_method_tests;
 mod hoisted_callback_method_tests;
 #[cfg(test)]
 mod imported_global_order_tests;
+pub(crate) mod index_entry;
 #[cfg(test)]
 mod index_method_clone_tests;
 mod indexed_method_artifacts;
@@ -279,6 +283,7 @@ mod integer_contract;
 #[cfg(test)]
 mod literal_method_this_tests;
 mod ordinary_method_artifacts;
+pub(crate) mod signature_entry;
 pub mod split_regions;
 #[cfg(test)]
 mod split_regions_literal_tests;
@@ -307,8 +312,9 @@ mod number_exactness_tests;
 mod opts;
 mod program_facts_view;
 pub use program_facts_view::{
-    ElisionFacts, FactsBody, FactsClass, FactsField, FactsIndexedOwner, FactsNumericExpr,
-    FactsNumericFunction, FactsRecv, ProgramFactsView,
+    ElisionFacts, FactsArrRep, FactsBody, FactsClass, FactsElemRep, FactsElementRead, FactsEnc,
+    FactsField, FactsFieldReadCall, FactsIndexedOwner, FactsNumericExpr, FactsNumericFunction,
+    FactsRecv, FactsRep, FactsSignature, ProgramFactsView,
 };
 #[cfg(test)]
 mod ordinary_param_guard_tests;
@@ -355,8 +361,8 @@ mod typed_abi;
 mod typed_abi_opt_report;
 mod typed_entry;
 pub(crate) use typed_entry::{
-    emit_int32_box_test, emit_ordered_number_test, emit_plain_number_bits_test,
-    emit_plain_number_test, typed_entry_arg_guard,
+    emit_int32_bits_test, emit_int32_box_test, emit_ordered_number_test,
+    emit_plain_number_bits_test, emit_plain_number_test, typed_entry_arg_guard,
 };
 #[cfg(test)]
 mod unknown_func_tests;
@@ -376,10 +382,13 @@ pub use opts::{
 };
 pub(crate) use opts::{CrossModuleCtx, ImportedCtor};
 pub(crate) use param_guard::scalar_descriptor_rep;
-pub(crate) use spec_abi::{spec_abi_enabled, spec_function_name, SpecDispatch, SpecFnPlan};
+pub(crate) use spec_abi::{
+    spec_abi_enabled, spec_entry_name, spec_function_name, SpecDispatch, SpecFnPlan,
+};
 pub(crate) use typed_abi::{
     emit_typed_arg_guard, emit_typed_arg_to_raw, emit_typed_f64_guard,
-    emit_typed_f64_to_raw_guarded, emit_typed_i1_guard, emit_typed_i32_plain_guard_and_raw,
+    emit_typed_f64_to_raw_guarded, emit_typed_i1_guard, emit_typed_i32_guard_and_raw,
+    emit_typed_i32_plain_guard_and_raw, emit_typed_i32_raw_assuming_guarded,
     emit_typed_string_guard, generic_closure_body_name, generic_function_body_name,
     generic_method_body_name, nonnegative_index_fast_array_method_name,
     nonnegative_index_fast_array_params, nonnegative_index_method_name,
@@ -3099,6 +3108,7 @@ fn lower_module(
         // Phase 2 spec-ABI plans are selected AFTER the i64-specialization
         // pass (mutual exclusion), below; start empty here.
         spec_abi_functions: std::collections::HashMap::new(),
+        typed_methods: std::collections::HashMap::new(),
         spec_return_proofs: std::collections::HashMap::new(),
         spec_ta_bindings: std::collections::HashMap::new(),
         typed_f64_functions,
@@ -3667,8 +3677,17 @@ fn lower_module(
     // Bounded: one entry per function (the dominant tuple),
     // `PERRY_SPECIALIZED_ABI_MAX` per module.
     if spec_abi::spec_abi_enabled() {
-        let spec_facts =
-            crate::collectors::collect_spec_abi_facts_with(hir, &cross_module.definite_init);
+        let no_int32 = std::collections::BTreeSet::new();
+        let proven_int32 = if facts_int32_locals::enabled() {
+            &cross_module.wpfacts.int32_inputs
+        } else {
+            &no_int32
+        };
+        let spec_facts = crate::collectors::collect_spec_abi_facts_with(
+            hir,
+            &cross_module.definite_init,
+            proven_int32,
+        );
         let spec_budget = spec_abi::spec_abi_max();
         let mut spec_emitted = 0usize;
         for f in &hir.functions {
@@ -3889,6 +3908,9 @@ fn lower_module(
                         reps,
                         dispatch,
                         guards,
+                        signature: None,
+                        sig_defaults: Vec::new(),
+                        sig_public: Default::default(),
                     }
                 }
                 None => {
@@ -3911,6 +3933,9 @@ fn lower_module(
                             reps,
                             dispatch: SpecDispatch::Guarded,
                             guards,
+                            signature: None,
+                            sig_defaults: Vec::new(),
+                            sig_public: Default::default(),
                         }
                     } else {
                         reject(
@@ -3941,6 +3966,16 @@ fn lower_module(
             &cross_module.spec_abi_functions,
             &cross_module.type_aliases,
         );
+        // P2 (DESIGN-p2 §3.2, T2/T3): every selector above ran exactly as on
+        // main; the typed set is decided once, here, before any body or site
+        // is lowered.
+        signature_entry::select(
+            hir,
+            &mut cross_module,
+            &func_synthetic_arguments,
+            &llmod.target_triple,
+        );
+        signature_entry::select_methods(hir, &mut cross_module, &class_ids);
 
         // The descriptor is immutable rodata, not a GC object. Emit in HIR
         // order (never HashMap order) so cache/object bytes stay deterministic.
@@ -3987,7 +4022,7 @@ fn lower_module(
                 .filter_map(|f| {
                     let plan = cross_module.spec_abi_functions.get(&f.id)?;
                     let public = func_names.get(&f.id)?;
-                    Some(spec_function_name(public, &plan.reps))
+                    Some(spec_entry_name(public, plan))
                 })
                 .collect();
             preserve_none.sort_unstable();
@@ -4048,6 +4083,14 @@ fn lower_module(
         let Some(plan) = cross_module.spec_abi_functions.get(&f.id).cloned() else {
             continue;
         };
+        // P2: `F$sig` compiles F without the literal defaults its callers
+        // apply (§4.1).
+        let sig_body = plan
+            .signature
+            .is_some()
+            .then(|| signature_entry::sig_function(f, &plan.sig_defaults))
+            .flatten();
+        let f = sig_body.as_ref().unwrap_or(f);
         compile_function(
             &mut llmod,
             f,

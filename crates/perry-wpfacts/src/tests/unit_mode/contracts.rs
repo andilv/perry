@@ -320,8 +320,26 @@ pub(super) fn a_broken_namespace_field_function_resolves_only_the_units_that_see
     // so the bodies holding them keep their summaries: [1482, 1763, 1479,
     // 395]. Every escaped value's accessor functions escape (descriptor
     // reads, ESCACCESSORS): a getter and a setter descriptor walk per
-    // escaped value, charged in each round that escapes it.
-    assert_eq!(pf.round_work, [1719, 2122, 1854, 449], "{:?}", pf.units);
+    // escaped value, charged in each round that escapes it. SEEDKV: a
+    // string literal is its own source node holding its constant
+    // (`Gen::str_literal`), popped once: `a` and `m` hold "get" and "g",
+    // solved in rounds 0-2 (was [1719, 2122, 1854, 449]). NUMBIG: `BigInt`
+    // is its own namespace, one more declared shape on the realm's linear
+    // namespace and family searches (charged per step) (was [1721, 2124,
+    // 1856, 449]). MULTINS: `Error`, the six NativeErrors and
+    // `AggregateError` are eight namespaces, the NativeErrors' chain
+    // `Error`: seven more declared shapes on the same charged searches
+    // (was [1732, 2133, 1864, 452]). WPNS: `%TypedArray%`, the twelve
+    // concrete typed arrays, `DataView`, `ArrayBuffer`, `SharedArrayBuffer`
+    // (and `%BufferSpeciesConstructor%`) are namespaces of their own, more
+    // declared shapes on the same charged searches (was [1799, 2188, 1913,
+    // 470]). A function expression whose body may complete returns
+    // `undefined` (`narrow::may_complete`): the `util` IIFE's result is one
+    // more popped kind in rounds 1-2 (was [1962, 2323, 2034, 512]). The
+    // changed-holder accessor lookup no longer adds a ⊤-token edge beside
+    // its own ⊤ (census attribution): two fewer deliveries in rounds 1-2
+    // (was [1962, 2326, 2037, 512]).
+    assert_eq!(pf.round_work, [1962, 2324, 2035, 512], "{:?}", pf.units);
     // Reading native function fields records the shared-object dependency:
     // a later shared write re-solves its reader, even when the stored key
     // is not a layout field of the broken contract.

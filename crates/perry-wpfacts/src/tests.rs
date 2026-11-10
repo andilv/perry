@@ -7,9 +7,11 @@ mod accessor_reach;
 mod accessor_receiver;
 mod activation_paths;
 mod annexb_accessors;
+mod annexb_known_accessor;
 mod annexb_method_value;
 mod args_beside_rest;
 mod arguments_object;
+mod arr_floor;
 mod array_ctor;
 mod array_elements;
 mod array_helper_nodes;
@@ -20,6 +22,7 @@ mod array_length;
 mod array_named_keys;
 mod array_numeric;
 mod array_record;
+mod array_reps;
 mod array_search;
 mod binding_write_gap;
 mod birth_elements;
@@ -33,8 +36,8 @@ mod box_chain;
 mod builtin_fn_identity;
 mod builtin_fn_keys;
 mod builtin_members;
-mod builtin_proto_value;
 mod builtin_program_fields;
+mod builtin_proto_value;
 mod builtin_spread;
 mod call_shadow;
 mod callable_contract;
@@ -49,6 +52,8 @@ mod closure_context;
 mod computed_table_fn;
 mod const_key_read;
 mod const_key_set_store;
+pub(crate) mod computed_key_members;
+mod key_strings;
 mod ctor_observed;
 mod ctor_return;
 mod dce_reach;
@@ -56,37 +61,42 @@ mod dead_dynamic_import;
 mod declared_effects;
 mod default_params;
 pub(crate) mod delivery_boundaries;
+mod descriptor_reads;
 mod diagnostics;
 mod dynamic_code;
 mod dynamic_import;
+mod elem_undef;
+mod element_reads;
 mod element_sites;
+mod enum_member_type;
 mod escaped_constructor;
 mod escaped_contract_result;
 mod escaped_method_this;
 mod export_star;
 mod field_array_push;
+mod fn_inst_default_proto;
+mod fn_intrinsic_proto;
 mod folded_call_own;
 mod for_in_keys;
 mod for_of_yield;
+mod fresh_static_blocks;
 mod function_ctor_without_interp;
 mod indirect_eval_call;
+mod int_demand;
 mod function_values;
 mod getter_contract;
 mod global_gc;
-mod gopd_key;
-mod fn_intrinsic_proto;
-mod private_method_read;
-mod fn_inst_default_proto;
-mod descriptor_reads;
-mod super_key;
-mod super_home_proto;
+mod global_sentinel;
 mod global_namespace_store;
+mod gopd_key;
 mod host_objects;
 mod hub_tokens;
 mod idx_prim_call;
 mod indexed_callees;
 mod indexed_owner;
 mod inherited_layout;
+mod instanceof_class_has_instance;
+mod int_ranges;
 mod interp_from_facts;
 mod layout_key;
 mod ledger;
@@ -100,15 +110,15 @@ mod memo_context;
 mod named_accessors;
 mod native_accessor_get;
 mod native_array_proto;
+mod native_regexp_proto;
 mod native_coercion;
 mod native_construct;
-mod native_given_runtime;
 mod native_fs;
 mod native_given_proto;
+mod native_given_runtime;
 mod native_member;
 mod native_proto;
 mod native_target_accessor;
-mod private_accessor_reach;
 mod native_user_code;
 mod own_values_proto;
 mod num_key;
@@ -121,8 +131,10 @@ mod own_store_read;
 mod parent_value;
 mod plus_string;
 mod prim_result;
+mod private_accessor_reach;
 mod private_field;
 mod private_method_flow;
+mod private_method_read;
 mod process_argv;
 mod proof_receivers;
 mod proto_lock_keys;
@@ -132,6 +144,7 @@ mod protocol_keys;
 mod reach_accessor;
 mod receiver_slots;
 mod receiver_this;
+mod recv_call_cycle;
 mod runtime_errors;
 mod reflect_construct;
 mod regexp_exec;
@@ -140,14 +153,16 @@ mod rest_element;
 mod rest_elements;
 mod run_once_closed;
 mod runtime_helpers;
-mod fresh_static_blocks;
-mod instanceof_class_has_instance;
 mod specialized_prototype;
 mod spread_arguments;
 mod spread_elements;
 mod spread_iterable_args;
 mod summary;
+mod member_heritage;
 mod super_heritage;
+mod super_home_proto;
+mod super_key;
+mod sync_require;
 mod tdz_seed;
 mod top_element_key;
 mod type_export;
@@ -1222,8 +1237,9 @@ fn cjs_cache_slot_holds_its_own_record() {
 /// is then a store on a record, not on a builtin (E20), and a call of it is
 /// no `Function(...)` call (E14). With `Object.prototype` as the prototype
 /// (`__perry_declared_keys_object`) the same read reaches the builtins: a
-/// store under a key they declare (`name`) sinks the value (E20); one under
-/// a key they do not declare (`parent`) is their field (rule R1).
+/// store of `__proto__` relinks one and the value's members escape (E6); a
+/// store under a key the realm does not read back (`name`, `parent`) is
+/// their own field (rule R1, `realm_reads_store`).
 fn null_proto_read(births: &str, key: &str) -> Option<String> {
     let pf = facts(&format!(
         r#"
@@ -1245,9 +1261,11 @@ fn null_proto_read(births: &str, key: &str) -> Option<String> {
 fn a_computed_read_of_a_null_prototype_record_stops_at_the_record() {
     assert_eq!(null_proto_read("__perry_declared_keys", "parent"), None);
     assert_eq!(null_proto_read("__perry_declared_keys", "name"), None);
-    let escape = null_proto_read("__perry_declared_keys_object", "name");
+    assert_eq!(null_proto_read("__perry_declared_keys", "__proto__"), None);
+    assert_eq!(null_proto_read("__perry_declared_keys_object", "name"), None);
+    let escape = null_proto_read("__perry_declared_keys_object", "__proto__");
     assert!(
-        escape.as_deref().is_some_and(|e| e.contains("E20")),
+        escape.as_deref().is_some_and(|e| e.contains("E6")),
         "{escape:?}"
     );
     assert_eq!(
@@ -1866,12 +1884,18 @@ fn a_protocol_touch_of_an_argument_marker_reads_nothing() {
 }
 mod array_iter_lock;
 mod cycle_e20_own_field;
+mod realm_read_static;
+mod builtin_ctor_statics;
+mod promise_capability_executor;
+mod async_result;
 mod cycle_locked_member;
 mod collection_entries;
 mod concat_elements;
 mod console_protocol;
 mod constructor_values;
 mod date_methods;
+mod declared_constructor;
+mod declared_global_write;
 mod delegate_step;
 mod gen_proto_lock;
 mod gen_proto_members;
@@ -1884,21 +1908,23 @@ mod iter_result_array;
 mod key_fn_shape;
 mod key_shape;
 mod method_this_escape;
+mod native_parent;
 mod native_proto_member;
+mod param_key_shape;
 mod native_push;
 mod native_value_call;
-mod declared_constructor;
-mod declared_global_write;
-mod native_parent;
 mod static_native_parent;
 mod ns_receiver;
+mod primitive_this;
 mod proto_own_call;
 mod receiver_param_call;
 mod regexp_results;
-mod primitive_this;
-mod string_this;
 mod string_methods;
 mod string_results;
+mod string_this;
+mod guard_presence;
+mod field_read_calls;
+mod signatures;
 mod typed_array_methods;
 mod web_timer_methods;
 
@@ -1955,7 +1981,24 @@ mod shaped_key_proto_methods;
 mod uri_coercion;
 
 mod accessor_lookup_values;
+mod buffer_iterator_absent;
 mod native_fs_effects;
+mod native_util_types_effects;
 mod native_module_ref;
+mod fresh_proto_chain;
+mod host_browser_effects;
+mod host_performance_intl;
 mod host_fs_effects;
+mod native_fs_watch;
+mod host_inspector_effects;
+mod host_fs_read_effects;
 mod native_process;
+mod number_bigint_ns;
+mod buffer_namespaces;
+mod error_namespaces;
+
+mod given_proto_census;
+mod spread_from_census;
+mod accessor_from_census;
+mod navigator_decl;
+mod navigator_store;

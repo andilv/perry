@@ -48,6 +48,9 @@ mod let_stmt_facts;
 mod let_stmt_var_redeclare_tests;
 mod loops;
 pub(crate) use loops::this_field_fast_off;
+pub(crate) use crate::expr::index_get::descriptor_read;
+pub(crate) use crate::expr::index_get::descriptor_read::scoped as cold_scoped;
+pub(crate) use loops::create_poll_refreshed_receiver_cache;
 mod masked_window_region;
 mod number_local_loop;
 pub(crate) use number_local_loop::numeric_callbacks;
@@ -285,7 +288,11 @@ fn lower_stmts_list(
                 crate::expr::try_match_channel_reduction(&stmts[..limit], i, ctx.integer_locals)
             {
                 if ctx.buffer_data_slots.contains_key(&reduction.array_id) {
-                    crate::expr::lower_channel_reduction(ctx, &reduction)?;
+                    crate::expr::lower_channel_reduction(
+                        ctx,
+                        &reduction,
+                        &stmts[i..i + reduction.acc_ids.len()],
+                    )?;
                     let last_lowered_idx = i + reduction.acc_ids.len() - 1;
                     i += reduction.acc_ids.len();
                     if emit_shadow_clears && !ctx.block().is_terminated() {
@@ -566,6 +573,15 @@ fn lower_stmt_inner(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
             }
             crate::expr::private_resume_frame::write_out_kind(ctx)?;
             crate::expr::resume_locals::write_back(ctx)?;
+            if let Some(rep) = ctx.sig_return {
+                // P2: a typed entry returns in its signature's `ret`.
+                crate::codegen::signature_entry::witness_return(ctx, rep, &final_v);
+                if rep == crate::codegen::FactsRep::I32 {
+                    let raw = ctx.block().fptosi(DOUBLE, &final_v, crate::types::I32);
+                    ctx.block().ret(crate::types::I32, &raw);
+                    return Ok(());
+                }
+            }
             ctx.block().ret(DOUBLE, &final_v);
             Ok(())
         }
@@ -613,6 +629,16 @@ fn lower_stmt_inner(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                     ctx.block().call_void("js_derived_super_scope_pop", &[]);
                 }
                 crate::expr::resume_locals::write_back(ctx)?;
+                if ctx.sig_return == Some(crate::codegen::FactsRep::I32) {
+                    // The facts prove no `return;` completes an I32 entry.
+                    crate::codegen::signature_entry::witness_return(
+                        ctx,
+                        crate::codegen::FactsRep::I32,
+                        &undef,
+                    );
+                    ctx.block().unreachable();
+                    return Ok(());
+                }
                 ctx.block().ret(DOUBLE, &undef);
             }
             Ok(())

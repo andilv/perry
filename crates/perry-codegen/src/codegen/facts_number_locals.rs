@@ -142,7 +142,7 @@ pub(crate) fn accept_let_value(
     source: &perry_hir::Expr,
     value: String,
 ) -> String {
-    if !ctx.facts_number_locals.contains(&id) {
+    if !ctx.facts_number_locals.contains(&id) && !ctx.facts_int32_locals.contains(&id) {
         return value;
     }
     // The HIR's release of an initialized const (`IteratorRecordPlan::release`
@@ -152,6 +152,10 @@ pub(crate) fn accept_let_value(
     // Any other `undefined` write would have put UNDEF in the binding's node,
     // so a proven binding meets a literal `undefined` only here.
     if matches!(source, perry_hir::Expr::Undefined) {
+        return value;
+    }
+    super::facts_int32_locals::witness(ctx, &value, id);
+    if !ctx.facts_number_locals.contains(&id) {
         return value;
     }
     note_consumed(id);
@@ -167,7 +171,16 @@ pub(crate) fn none() -> &'static HashSet<u32> {
 
 /// The plain double of a Number argument: an INT32 box converts, every other
 /// Number is its own bits.
+///
+/// P3 B1, C4 (DESIGN-p3 rev 3.1 §2.3): a Number the facts prove is a plain
+/// double (every value reaching the parameter is a program Number or an
+/// audited builtin NUM, `perry-wpfacts/NUM_SEEDS.md`), so with
+/// `PERRY_FACTS_CANONICAL_NUMBERS` on the argument is taken as it is. The
+/// entry witness (`emit_param_witnesses`) checks it in check mode.
 pub(crate) fn emit_entry_number(blk: &mut crate::block::LlBlock, arg: &str) -> String {
+    if crate::expr::facts_canonical::enabled() {
+        return arg.to_string();
+    }
     let is_int = super::typed_entry::emit_int32_box_test(blk, arg);
     let bits = blk.bitcast_double_to_i64(arg);
     let low = blk.trunc(I64, &bits, I32);

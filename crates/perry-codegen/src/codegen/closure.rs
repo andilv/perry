@@ -927,6 +927,7 @@ pub(super) fn compile_closure(
         &cross_module.module_dispatch,
         // #9363: a closure body reads the same module-scope views.
         &cross_module.module_global_proven_types,
+        crate::codegen::facts_int32_locals::none(),
     );
     if !versioned_loop_callback {
         if let Some(callback_shapes) = cross_module.array_callback_shapes.get(&func_id) {
@@ -1323,6 +1324,7 @@ pub(super) fn compile_closure(
         not_bigint_locals: native_facts.not_bigint_locals(),
         number_by_construction_locals: native_facts.number_by_construction_locals(),
         facts_number_locals: crate::codegen::facts_number_locals::none(),
+        facts_int32_locals: crate::codegen::facts_int32_locals::none(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
         // Conservative: treat every slot as possibly-bound (param binds are
         // emitted before FnCtx exists here), so clears never get skipped.
@@ -1374,6 +1376,8 @@ pub(super) fn compile_closure(
         ),
         spec_i32_params: std::collections::HashSet::new(),
         spec_bool_params: std::collections::HashSet::new(),
+        sig_return: None,
+        typed_methods: &cross_module.typed_methods,
         typed_element_locals: std::collections::HashSet::new(),
         create_families: Default::default(),
         class_guard_window: None,

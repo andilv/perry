@@ -159,6 +159,11 @@ pub struct Inst {
     pub params: Vec<NodeId>,
     pub ret: NodeId,
     pub this: NodeId,
+    /// The instance's first fresh slot node (`NO_NODE`: none). Its fresh
+    /// slots, the summary's slots outside `Summary::outer` in slot order,
+    /// are the nodes from here on: the copy of slot `i` is a run of the
+    /// shared node `Summary::orig[i]` (`Inst::copies`).
+    pub fresh: NodeId,
 }
 
 #[derive(Default)]
@@ -531,6 +536,24 @@ impl Model {
         }
     }
 
+    /// Every (shared node, this instance's copy of it) pair of instance
+    /// `inst`'s fresh slots (`Inst::fresh`).
+    pub(crate) fn inst_copies(&self, inst: u32, mut f: impl FnMut(NodeId, NodeId)) {
+        let it = &self.sum.insts[inst as usize];
+        if it.fresh == NO_NODE {
+            return;
+        }
+        let s = &self.sum.of[&it.f];
+        let mut next = it.fresh;
+        for (i, &orig) in s.orig.iter().enumerate() {
+            if s.outer.contains(&(i as u32)) {
+                continue;
+            }
+            f(orig, next);
+            next += 1;
+        }
+    }
+
     pub(crate) fn summarized(&self, f: FnIdx) -> bool {
         self.sum.of.contains_key(&f)
     }
@@ -554,6 +577,7 @@ impl Model {
         for (j, &sl) in s.outer.iter().enumerate() {
             outer_at[sl as usize] = j as u32;
         }
+        let fresh = self.nodes.len() as NodeId;
         let base: Vec<NodeId> = (0..s.nslots)
             .map(|i| match outer_at[i as usize] {
                 u32::MAX => {
@@ -619,6 +643,11 @@ impl Model {
             params: s.params.iter().map(|&p| tr(p)).collect(),
             ret,
             this,
+            fresh: if (self.nodes.len() as NodeId) > fresh {
+                fresh
+            } else {
+                NO_NODE
+            },
         });
         self.sum.inst_key.insert(key, inst);
         self.sum.pending.push((inst, base));
@@ -774,7 +803,13 @@ impl Model {
             let saved = (self.cur_src, self.cur_why);
             self.cur_src = s.orig.get(slot as usize).copied().unwrap_or(NO_NODE);
             self.cur_why = u32::MAX;
+            // The seed's Numbers are values its original node held when the
+            // summary was built: that node's interval covers them (it only
+            // grows).
+            let saved_range = self.cur_range;
+            self.cur_range = (self.cur_src != NO_NODE).then(|| self.rg(self.cur_src));
             self.add(base[slot as usize], toks, prim);
+            self.cur_range = saved_range;
             if refuted {
                 self.refute_own_test(base[slot as usize]);
             }

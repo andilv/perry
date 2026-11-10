@@ -40,6 +40,8 @@ impl Model {
             Cons::Load { key, dst } => format!("Load key={:?} dst={:?}", self.packet_key(key), dst),
             Cons::OwnValues { dst } => format!("OwnValues dst={:?}", dst),
             Cons::IndexHole => format!("IndexHole"),
+            Cons::LenIndex { lo, hi } => format!("LenIndex {lo} {hi}"),
+            Cons::LenPermuted { t } => format!("LenPermuted {t}"),
             Cons::CjsPublish { dst } => format!("CjsPublish dst={:?}", dst),
             Cons::Store { key, src, site } => format!(
                 "Store key={:?} src={:?} site={:?}",
@@ -271,7 +273,7 @@ impl Model {
                 self.atoms[key as usize].clone(),
                 setter
             ),
-            Cons::AccessorInstall { key, f, setter } => format!(
+            Cons::AccessorInstall { key, f, setter, .. } => format!(
                 "AccessorInstall key={:?} f={:?} setter={:?}",
                 self.atoms[key as usize].clone(),
                 self.packet_token(f, packet),
@@ -314,6 +316,12 @@ impl Model {
                     self.packet_shape(shape)
                 )
             }
+            Cons::ElemUndef { obj, key, dst } => format!(
+                "ElemUndef obj={:?} key={:?} dst={:?}",
+                self.packet_token(obj, packet),
+                key,
+                dst
+            ),
             Cons::IdxKey { obj, dst, shape } => format!(
                 "IdxKey obj={:?} dst={:?} shape={:?}",
                 self.packet_token(obj, packet),
@@ -410,6 +418,18 @@ impl Model {
                 holder, f, setter
             ),
             Cons::Arith { dst } => format!("Arith dst={:?}", dst),
+            Cons::Range {
+                op,
+                other,
+                dst,
+                right,
+            } => format!(
+                "Range op={} other={:?} dst={:?} right={}",
+                op.name(),
+                other,
+                dst,
+                right
+            ),
             Cons::Plus { str, num } => format!("Plus str={:?} num={:?}", str, num),
             Cons::ArrayLenArg { dst } => format!("ArrayLenArg dst={:?}", dst),
             Cons::ShareBuffer { ta } => {
@@ -430,7 +450,7 @@ impl Model {
                     .get(site as usize)
                     .map(|s| (&s.desc, s.birth, s.rooted))
             ),
-            Cons::SpreadFrom { src, site } => format!(
+            Cons::SpreadFrom { src, site, .. } => format!(
                 "SpreadFrom src={:?} site={:?}",
                 self.packet_token(src, packet),
                 self.stores

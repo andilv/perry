@@ -34,6 +34,8 @@ pub fn map_cons(
         ProtoKey { key, dst } => ProtoKey { key, dst: n(dst) },
         OwnValues { dst } => OwnValues { dst: n(dst) },
         IndexHole => IndexHole,
+        LenIndex { lo, hi } => LenIndex { lo, hi },
+        LenPermuted { t } => LenPermuted { t },
         CjsPublish { dst } => CjsPublish { dst: n(dst) },
         Store { key, src, site } => Store {
             key,
@@ -150,7 +152,10 @@ pub fn map_cons(
             reason,
         },
         Implicit { reason, proto } => Implicit { reason, proto },
-        HasInstance { reason, arg } => HasInstance { reason, arg: n(arg) },
+        HasInstance { reason, arg } => HasInstance {
+            reason,
+            arg: n(arg),
+        },
         CreateProto { reason } => CreateProto { reason },
         ChainUnion {
             key,
@@ -218,7 +223,17 @@ pub fn map_cons(
             key,
             setter,
         },
-        AccessorInstall { key, f, setter } => AccessorInstall { key, f, setter },
+        AccessorInstall {
+            key,
+            f,
+            setter,
+            from,
+        } => AccessorInstall {
+            key,
+            f,
+            setter,
+            from: if from == NO_NODE { NO_NODE } else { n(from) },
+        },
         AnnexBDefine { call, setter } => AnnexBDefine {
             call: k(call),
             setter,
@@ -250,6 +265,11 @@ pub fn map_cons(
             obj,
             dst: n(dst),
             shape,
+        },
+        ElemUndef { obj, key, dst } => ElemUndef {
+            obj,
+            key: n(key),
+            dst: n(dst),
         },
         IdxOwnLoad { idx, dst, shape } => IdxOwnLoad {
             idx: n(idx),
@@ -325,6 +345,17 @@ pub fn map_cons(
             setter,
         },
         Arith { dst } => Arith { dst: n(dst) },
+        Range {
+            op,
+            other,
+            dst,
+            right,
+        } => Range {
+            op,
+            other: if other == NO_NODE { NO_NODE } else { n(other) },
+            dst: n(dst),
+            right,
+        },
         Plus { str, num } => Plus {
             str: n(str),
             num: n(num),
@@ -343,7 +374,11 @@ pub fn map_cons(
             into: n(into),
             site,
         },
-        SpreadFrom { src, site } => SpreadFrom { src, site },
+        SpreadFrom { src, site, from } => SpreadFrom {
+            src,
+            site,
+            from: if from == NO_NODE { NO_NODE } else { n(from) },
+        },
         ThisInst { call, ft } => ThisInst { call: k(call), ft },
         NativeThis { call, f } => NativeThis { call: k(call), f },
         BuiltinCallee => BuiltinCallee,
@@ -459,6 +494,8 @@ pub(super) fn gen_kind(c: &Cons) -> bool {
             | StoreIndexed { .. }
             | AccessorKeyed { .. }
             | Arith { .. }
+            | Range { .. }
+            | LenIndex { .. }
             | Plus { .. }
             | ArrayLenArg { .. }
             | IterNext { .. }
@@ -488,10 +525,12 @@ pub(super) fn read_dst(c: &Cons) -> Option<NodeId> {
         | CjsPublish { dst }
         | IdxLoad { dst, .. }
         | IdxKey { dst, .. }
+        | ElemUndef { dst, .. }
         | IdxOwnLoad { dst, .. }
         | IdxOwnKey { dst, .. }
         | OwnTest { dst, .. }
         | Arith { dst }
+        | Range { dst, .. }
         | ArrayLenArg { dst }
         | IterNext { dst }
         | FromArrayLike { dst }

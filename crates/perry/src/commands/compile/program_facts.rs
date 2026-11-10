@@ -131,6 +131,34 @@ pub(crate) fn run(
         diagnostics: dump.is_some(),
         birth_census: std::env::var_os("PERRY_FACTS_BIRTH_CENSUS").is_some(),
         relations,
+        no_int_ranges: matches!(
+            std::env::var("PERRY_FACTS_INT_RANGES").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_array_lengths: matches!(
+            std::env::var("PERRY_FACTS_ARRAY_LENGTHS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_array_floor: matches!(
+            std::env::var("PERRY_FACTS_ARRAY_FLOOR").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_array_reps: matches!(
+            std::env::var("PERRY_FACTS_ARRAY_REPS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_elem_undef: matches!(
+            std::env::var("PERRY_FACTS_ELEM_UNDEF").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_guard_ranges: matches!(
+            std::env::var("PERRY_FACTS_GUARD_RANGES").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_guard_presence: matches!(
+            std::env::var("PERRY_FACTS_GUARD_PRESENCE").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
         sabotage: std::env::var("PERRY_FACTS_SABOTAGE")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -511,6 +539,63 @@ fn elision_for(pf: &perry_wpfacts::ProgramFacts, path: &str) -> perry_codegen::E
             })
             .collect()
     };
+    if !interp {
+        for (offset, iv) in &mb.call_arg_ranges {
+            out.call_arg_ranges.insert(*offset, iv.clone());
+        }
+        out.number_calls.extend(mb.number_calls.iter().copied());
+        out.number_element_reads
+            .extend(mb.number_element_reads.iter().copied());
+        out.element_floors.extend(mb.element_floors.iter().copied());
+        let rep = |r: &perry_wpfacts::Rep| facts_rep(*r);
+        for (id, sig) in &mb.signatures {
+            out.signatures.insert(
+                *id,
+                perry_codegen::FactsSignature {
+                    params: sig.params.iter().map(rep).collect(),
+                    ranges: sig.ranges.clone(),
+                    ret: rep(&sig.ret),
+                    this_class: sig.this_class,
+                },
+            );
+        }
+        // Same-module typed calls only (DESIGN-p2 rev 2.2 §2).
+        let module_index = pf.module_paths.iter().position(|p| p == path);
+        for (offset, (callee_module, func_id)) in &mb.typed_calls {
+            if Some(*callee_module as usize) == module_index {
+                out.typed_calls.insert(*offset, *func_id);
+            }
+        }
+        for (offset, c) in &mb.field_read_calls {
+            let default = match &c.default {
+                None => None,
+                Some(perry_wpfacts::FieldReadDefault::Number(bits)) => Some(*bits),
+                // Codegen applies a Number default only.
+                Some(_) => continue,
+            };
+            out.field_read_calls.insert(
+                *offset,
+                perry_codegen::FactsFieldReadCall {
+                    field: c.field.clone(),
+                    index_arg: c.index_arg,
+                    default,
+                    element_offset: c.element_offset,
+                    field_offset: c.field_offset,
+                },
+            );
+        }
+        if element_reads_enabled() {
+            for (offset, r) in &mb.element_reads {
+                out.element_reads.insert(
+                    *offset,
+                    perry_codegen::FactsElementRead {
+                        len: r.len,
+                        key_in_bounds: r.key_in_bounds,
+                    },
+                );
+            }
+        }
+    }
     for (id, b) in &mb.locals {
         if !interp {
             if let Some(o) = &b.indexed_owner {
@@ -526,9 +611,23 @@ fn elision_for(pf: &perry_wpfacts::ProgramFacts, path: &str) -> perry_codegen::E
             }
             if !b.other && b.class_ids.is_empty() && b.prims == prim::NUM {
                 out.number_inputs.insert(*id);
+                // A Number binding whose interval proof lies in the int32
+                // range: every value it holds is an int32 (never -0).
+                if b.int_range
+                    .is_some_and(|(lo, hi)| lo >= i64::from(i32::MIN) && hi <= i64::from(i32::MAX))
+                {
+                    out.int32_inputs.insert(*id);
+                    if b.int_range.is_some_and(|(lo, _)| lo >= 0) {
+                        out.nonneg_int32_inputs.insert(*id);
+                    }
+                }
             }
+            out.local_reps.insert(*id, facts_rep(b.rep));
             if b.length_number {
                 out.length_number_inputs.insert(*id);
+            }
+            if let Some(n) = b.const_length {
+                out.const_length_inputs.insert(*id, n);
             }
         }
         if let Some(r) = recv(b) {
@@ -765,6 +864,34 @@ pub(crate) fn activation(
     let cfg = perry_wpfacts::FactsConfig {
         roots,
         // The facts' negative controls act on this pass (it is theirs).
+        no_int_ranges: matches!(
+            std::env::var("PERRY_FACTS_INT_RANGES").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_array_lengths: matches!(
+            std::env::var("PERRY_FACTS_ARRAY_LENGTHS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_array_floor: matches!(
+            std::env::var("PERRY_FACTS_ARRAY_FLOOR").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_array_reps: matches!(
+            std::env::var("PERRY_FACTS_ARRAY_REPS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_elem_undef: matches!(
+            std::env::var("PERRY_FACTS_ELEM_UNDEF").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_guard_ranges: matches!(
+            std::env::var("PERRY_FACTS_GUARD_RANGES").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
+        no_guard_presence: matches!(
+            std::env::var("PERRY_FACTS_GUARD_PRESENCE").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        ),
         sabotage: std::env::var("PERRY_FACTS_SABOTAGE")
             .ok()
             .filter(|s| !s.is_empty()),
@@ -866,4 +993,35 @@ fn verification_sites(
             })
         })
         .collect()
+}
+
+/// `PERRY_WP_ELEMENT_READS=0` withholds wpfacts' proven element reads
+/// (`ModuleBindings::element_reads`): every element read keeps its guarded
+/// tier (representation RFC §10.7, P4).
+fn element_reads_enabled() -> bool {
+    !matches!(
+        std::env::var("PERRY_WP_ELEMENT_READS").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
+/// wpfacts `Rep` as codegen's `FactsRep`, one to one.
+fn facts_rep(r: perry_wpfacts::Rep) -> perry_codegen::FactsRep {
+    use perry_codegen::{FactsArrRep, FactsElemRep, FactsRep};
+    use perry_wpfacts::{ElemRep, Rep};
+    match r {
+        Rep::Boxed => FactsRep::Boxed,
+        Rep::F64 => FactsRep::F64,
+        Rep::I32 => FactsRep::I32,
+        Rep::Arr(a) => FactsRep::Arr(FactsArrRep {
+            elem: match a.elem {
+                ElemRep::Boxed => FactsElemRep::Boxed,
+                ElemRep::F64 => FactsElemRep::F64,
+                ElemRep::I32 => FactsElemRep::I32,
+            },
+            floor: a.floor,
+            dense: a.dense,
+            fixed: a.fixed,
+        }),
+    }
 }

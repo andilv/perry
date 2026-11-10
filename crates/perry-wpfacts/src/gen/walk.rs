@@ -224,7 +224,10 @@ impl<'a> Gen<'a> {
             if !i.is_deferred_require {
                 continue;
             }
-            let t = i.resolved_path.as_ref().and_then(|p| self.path_index.get(p).copied());
+            let t = i
+                .resolved_path
+                .as_ref()
+                .and_then(|p| self.path_index.get(p).copied());
             if let Some(t) = t {
                 let rt = self.module_raise(t);
                 self.m.edge(rt, self.m.lazy_raise);
@@ -645,7 +648,13 @@ impl<'a> Gen<'a> {
         let packet_read_start = self.read_sites.len();
         #[cfg(test)]
         self.m.packet_declarations(&f.body);
-        let r = self.m.raise_of(fxi);
+        // An async function body that runs untransformed throws into its
+        // promise (`async_body`), never into its caller.
+        let r = if f.is_async && !f.is_generator {
+            self.thrown
+        } else {
+            self.m.raise_of(fxi)
+        };
         let region = std::mem::replace(&mut self.m.gen_region, Some(r));
         self.walk_fn_body_inner(mi, fxi, f, class, ctor_of);
         self.m.gen_region = region;
@@ -668,7 +677,7 @@ impl<'a> Gen<'a> {
         self.m.note_walked(fxi);
         let info = self.m.funcs[fxi as usize].clone();
         let fn_ctor = class.is_none() && ctor_of.is_none();
-        let fx = Fx {
+        let mut fx = Fx {
             guard: None,
             module: mi,
             f: fxi,
@@ -679,8 +688,17 @@ impl<'a> Gen<'a> {
             new_target: self.m.all_prim_node,
             fn_ctor,
         };
+        if !f.is_strict && fn_ctor && crate::ctor_phase::body_mentions_this(&f.body) {
+            // The view belongs to the function's body, like its parameters.
+            let prev = std::mem::replace(&mut self.m.cur_fn, fxi);
+            fx.this = self.sloppy_this(info.this);
+            self.m.cur_fn = prev;
+        }
+        if f.is_async && !f.is_generator {
+            fx = self.async_body(&fx).0;
+        }
         self.params(&fx, &f.params);
-        if f.is_async || f.is_generator {
+        if f.is_generator {
             // Not transformed (rare at this point): results are runtime
             // objects.
             self.m.add_top(info.ret, |_| {
@@ -702,8 +720,42 @@ impl<'a> Gen<'a> {
         }
         let own = self.own_helper_shape(&f.params, &f.body, f.is_async || f.is_generator);
         self.note_own_stores(f);
+        let scope = self.narrow_enter_body(fx.module, fxi, &f.params, &f.body, &f.captures);
         self.stmts(&fx, &f.body);
+        if ctor_of.is_none() && narrow::may_complete(&f.body) {
+            // The body's normal completion returns `undefined` (a class
+            // constructor's completion is never its result: `new` and
+            // `super()` yield `this`).
+            self.m.add_prim(fx.ret, prim::UNDEF);
+        }
+        self.narrow_exit_body(scope);
         self.own_helper_finish(fxi, own);
+    }
+
+    /// The `this` a sloppy function's body reads: its callers' `this`,
+    /// where a nullish one is the global object and a primitive one is
+    /// boxed, an object the model does not hold (anything). The function's
+    /// own `this` node, its interface, stays what callers pass.
+    pub(crate) fn sloppy_this(&mut self, this: NodeId) -> NodeId {
+        let view = self.m.node_l("sloppy-this");
+        self.m.own(view);
+        self.m.edge(this, view);
+        let global_tok = self.m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
+        let global = self.tok_node(global_tok);
+        for (test, from) in [
+            (crate::model::guard::NULLISH, global),
+            (crate::model::guard::BOXED, self.m.top_tok_node),
+        ] {
+            self.m.cons(
+                view,
+                Cons::Guard {
+                    test,
+                    from,
+                    dst: view,
+                },
+            );
+        }
+        view
     }
 
     pub(crate) fn params(&mut self, fx: &Fx, params: &[perry_hir::Param]) {
@@ -1014,6 +1066,7 @@ impl<'a> Gen<'a> {
     // ---------------------------------------------------------- statements
 
     pub(crate) fn stmts(&mut self, fx: &Fx, ss: &[Stmt]) {
+        let mut pushed = 0;
         let mut i = 0;
         while i < ss.len() {
             if let Some(value) = for_of_binding(&ss[i..]) {
@@ -1035,8 +1088,24 @@ impl<'a> Gen<'a> {
                 continue;
             }
             self.stmt(fx, &ss[i]);
+            // An `if` whose one branch always leaves: what follows runs
+            // under the other outcome of its test (`narrow_guard`).
+            if let Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+            } = &ss[i]
+            {
+                let else_exits = else_branch.as_deref().is_some_and(narrow::always_exits);
+                if narrow::always_exits(then_branch) && !else_exits {
+                    pushed += self.narrow_guard(fx, condition, false);
+                } else if else_exits && !narrow::always_exits(then_branch) {
+                    pushed += self.narrow_guard(fx, condition, true);
+                }
+            }
             i += 1;
         }
+        self.narrow_pop(pushed);
     }
 
     pub(crate) fn stmt(&mut self, fx: &Fx, s: &Stmt) {
@@ -1137,17 +1206,31 @@ impl<'a> Gen<'a> {
                     guard: Some((t, then_test)),
                     ..fx.clone()
                 };
+                let k = self.narrow_guard(fx, condition, true);
                 self.stmts(&then_fx, then_branch);
+                self.narrow_pop(k);
                 self.own_guard_done(own);
                 if let Some(e) = else_branch {
                     let else_fx = Fx {
                         guard: Some((t, else_test)),
                         ..fx.clone()
                     };
+                    let k = self.narrow_guard(fx, condition, false);
                     self.stmts(&else_fx, e);
+                    self.narrow_pop(k);
                 }
             }
-            Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+            Stmt::While { condition, body } => {
+                self.narrow_enter_loop(s);
+                self.loop_depth += 1;
+                let _ = self.expr(fx, condition);
+                let k = self.narrow_guard(fx, condition, true);
+                self.stmts(fx, body);
+                self.narrow_pop(k);
+                self.loop_depth -= 1;
+            }
+            Stmt::DoWhile { body, condition } => {
+                self.narrow_enter_loop(s);
                 self.loop_depth += 1;
                 let _ = self.expr(fx, condition);
                 self.stmts(fx, body);
@@ -1159,6 +1242,7 @@ impl<'a> Gen<'a> {
                 update,
                 body,
             } => {
+                self.narrow_enter_loop(s);
                 if let Some(i) = init {
                     self.stmt(fx, i);
                 }
@@ -1166,12 +1250,29 @@ impl<'a> Gen<'a> {
                 if let Some(c) = condition {
                     let _ = self.expr(fx, c);
                 }
+                // The update runs after the body: it reads the end node.
+                let narrowed = self.narrow_for(
+                    fx,
+                    init.as_deref(),
+                    condition.as_ref(),
+                    update.as_ref(),
+                    body,
+                );
+                if narrowed {
+                    self.narrow_in_update(true);
+                }
                 if let Some(u) = update {
                     let _ = self.expr(fx, u);
+                }
+                if narrowed {
+                    self.narrow_in_update(false);
                 }
                 match self.for_in_of(fx, body) {
                     Some(f) => self.for_in_body(fx, &f),
                     None => self.stmts(fx, body),
+                }
+                if narrowed {
+                    self.narrow_end();
                 }
                 self.loop_depth -= 1;
             }

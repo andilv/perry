@@ -97,18 +97,18 @@ impl<'a> Gen<'a> {
                 // `require("process") === globalThis.process`); HIR names
                 // the value of `require("process")` and of a namespace
                 // import `process.namespace`.
-                if matches!(name, "process" | "process.namespace") {
-                    let t = self.m.tok(TokKind::Builtin(BuiltinNs::Process));
-                    return self.tok_node(t);
-                }
                 // node:module as a value hands out `Module._cache`.
                 if name == "module" {
                     let cache = self.m.cjs_cache;
                     self.to_sink(cache, "node:module names Module._cache");
                 }
                 // A module the realm declares is its namespace object.
-                if let Some(ns) = crate::builtins::node_module_ns(m) {
-                    let t = self.m.tok(TokKind::Builtin(ns));
+                let name = if name == "process.namespace" {
+                    "process"
+                } else {
+                    name
+                };
+                if let Some(t) = crate::builtins::builtin_module_tok(&mut self.m, name) {
                     return self.tok_node(t);
                 }
                 self.m.top_val(&format!("native module ref {m}"))
@@ -156,6 +156,59 @@ impl<'a> Gen<'a> {
                         }
                     }
                     self.prim_node(prim::NUM)
+                } else if let Some(recv) =
+                    o.filter(|_| perry_hir::folded_call::fs_receiver_dispatch(module, method))
+                {
+                    // A folded fs receiver's method no stream arm lowers is
+                    // the runtime dispatch on the receiver value: the method
+                    // call `recv.method(..args)`. The dispatch returns 0 for
+                    // a nullish receiver (no TypeError), reads a member of a
+                    // string or host handle for a call without arguments,
+                    // and gives undefined where it resolves no callee.
+                    let key = Key::Named(self.m.atom(method));
+                    let ret = self.mcall(recv, key, a, vec![]);
+                    let num = self.prim_node(prim::NUM);
+                    self.m.cons(
+                        recv,
+                        Cons::Guard {
+                            test: guard::NULLISH,
+                            from: num,
+                            dst: ret,
+                        },
+                    );
+                    if args.is_empty() {
+                        let member = self.load(recv, key);
+                        self.m.edge(member, ret);
+                    }
+                    self.m.add_prim(ret, prim::UNDEF);
+                    ret
+                } else if let Some(ctor) = object
+                    .is_none()
+                    .then(|| self.native_construct_fold(module, method))
+                    .flatten()
+                {
+                    // The HIR's fold of `new <module>.<method>(..args)`:
+                    // `new` of the realm constructor itself, whatever the
+                    // program stored under the name (codegen calls its
+                    // runtime function directly). The construct runs what
+                    // the constructor's declaration says (`construct`).
+                    let callee = self.tok_node(ctor);
+                    let (call, ret) = self.new_call(ThisArg::Undef, a, vec![]);
+                    self.m.cons(callee, Cons::New { call });
+                    ret
+                } else if let Some(t) = object
+                    .is_none()
+                    .then(|| self.namespace_member_callee(m0, method))
+                    .flatten()
+                {
+                    // A member the HIR calls directly (`import { createHook }
+                    // from "async_hooks"`) whose call the solver models by
+                    // its token: the call of that native value, as a call
+                    // through the namespace member runs.
+                    let callee = self.tok_node(t);
+                    let (call, ret) = self.new_call(ThisArg::Undef, a, vec![]);
+                    self.m.cons(callee, Cons::Call { call });
+                    ret
                 } else {
                     if module == "vm" || module == "node:vm" {
                         crate::builtins::set_dyn_eval(&mut self.m, "E14 node:vm");
@@ -524,21 +577,33 @@ impl<'a> Gen<'a> {
                 let a = self.m.atom("size");
                 self.load(recv, Key::Named(a))
             }
+            // A Math function with an integer rule: the Number result's
+            // interval (`model::range`).
+            Expr::MathAbs(x) => self.math_range(fx, crate::model::RangeOp::Abs, &[x.as_ref()]),
+            Expr::MathFloor(x) | Expr::MathCeil(x) | Expr::MathRound(x) | Expr::MathTrunc(x) => {
+                self.math_range(fx, crate::model::RangeOp::Integral, &[x.as_ref()])
+            }
+            Expr::MathSign(x) => self.math_range(fx, crate::model::RangeOp::Sign, &[x.as_ref()]),
+            Expr::MathClz32(x) => self.math_range(fx, crate::model::RangeOp::Clz32, &[x.as_ref()]),
+            Expr::MathImul(a, b) => {
+                self.math_range(fx, crate::model::RangeOp::Imul, &[a.as_ref(), b.as_ref()])
+            }
+            Expr::MathMin(xs) if !xs.is_empty() => {
+                let xs: Vec<&Expr> = xs.iter().collect();
+                self.math_range(fx, crate::model::RangeOp::Min, &xs)
+            }
+            Expr::MathMax(xs) if !xs.is_empty() => {
+                let xs: Vec<&Expr> = xs.iter().collect();
+                self.math_range(fx, crate::model::RangeOp::Max, &xs)
+            }
             // Every Math function returns a Number (ECMA-262 Math).
-            Expr::MathFloor(..)
-            | Expr::MathCeil(..)
-            | Expr::MathRound(..)
-            | Expr::MathTrunc(..)
-            | Expr::MathSign(..)
-            | Expr::MathAbs(..)
-            | Expr::MathSqrt(..)
+            Expr::MathSqrt(..)
             | Expr::MathLog(..)
             | Expr::MathLog2(..)
             | Expr::MathLog10(..)
             | Expr::MathPow(..)
             | Expr::MathMin(..)
             | Expr::MathMax(..)
-            | Expr::MathImul(..)
             | Expr::MathRandom
             | Expr::MathSin(..)
             | Expr::MathCos(..)
@@ -551,7 +616,6 @@ impl<'a> Gen<'a> {
             | Expr::MathHypot(..)
             | Expr::MathFround(..)
             | Expr::MathF16round(..)
-            | Expr::MathClz32(..)
             | Expr::MathExpm1(..)
             | Expr::MathLog1p(..)
             | Expr::MathSinh(..)
@@ -569,6 +633,23 @@ impl<'a> Gen<'a> {
             ),
             // The global conversions and predicates: the operation fixes the
             // kind of its result (ECMA-262; the HIR operation's contract).
+            // `Number(x)`: its interval follows the operand's Numbers and
+            // one-unit Strings (`RangeOp::ToNumber`).
+            Expr::NumberCoerce(x) if self.guard_ranges => {
+                let r = self.m.reason("ToNumber of a Number() operand");
+                let v = self.expr(fx, x);
+                self.m.cons(
+                    v,
+                    Cons::Implicit {
+                        reason: r,
+                        proto: Protocol::ToPrimitive,
+                    },
+                );
+                let out = self.tmp("primop");
+                self.range_rule(crate::model::RangeOp::ToNumber, v, None, out);
+                self.m.add_prim(out, prim::NUM);
+                out
+            }
             Expr::ParseInt { .. } | Expr::ParseFloat(..) | Expr::NumberCoerce(..) => self
                 .prim_kids(
                     fx,

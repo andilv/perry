@@ -382,7 +382,10 @@ pub(crate) fn is_fs_stats_instance_value(value: f64) -> bool {
 
 pub(crate) fn is_fs_stream_instance_value(value: f64, constructor_name: &str) -> bool {
     match constructor_name {
-        "ReadStream" | "FileReadStream" => object_class_id(value) == Some(CLASS_ID_FS_READ_STREAM),
+        "ReadStream" | "FileReadStream" => {
+            object_class_id(value) == Some(CLASS_ID_FS_READ_STREAM)
+                || stream::is_read_stream_instance(value)
+        }
         "WriteStream" | "FileWriteStream" => {
             object_class_id(value) == Some(CLASS_ID_FS_WRITE_STREAM)
         }
@@ -905,16 +908,47 @@ fn apply_dir_mode(path: &str, mode: Option<u32>) {
     }
 }
 
-/// Create a directory synchronously.
+/// Create a directory synchronously (no options: never recursive, so the
+/// result is always undefined; codegen discards the status).
 #[no_mangle]
 pub extern "C" fn js_fs_mkdir_sync(path_value: f64) -> i32 {
-    js_fs_mkdir_sync_options(path_value, f64::from_bits(crate::value::TAG_UNDEFINED))
+    let _ = js_fs_mkdir_sync_options(path_value, f64::from_bits(crate::value::TAG_UNDEFINED));
+    1
 }
 
+/// The directory node's recursive mkdir creates first, spelled as node's
+/// MKDirpSync spells it: the path itself, or a prefix of it cut at a path
+/// separator, walking up while the OS parent is missing. None when the path
+/// already exists (node returns undefined then).
+fn mkdirp_first_created(path: &str) -> Option<String> {
+    if Path::new(path).exists() {
+        return None;
+    }
+    #[cfg(windows)]
+    let is_sep = |c: char| c == '/' || c == '\\';
+    #[cfg(not(windows))]
+    let is_sep = |c: char| c == '/';
+    let mut cur = path;
+    loop {
+        let parent_missing = Path::new(cur)
+            .parent()
+            .is_some_and(|p| !p.as_os_str().is_empty() && !p.exists());
+        if !parent_missing {
+            return Some(cur.to_string());
+        }
+        match cur.rfind(is_sep) {
+            Some(i) if i > 0 => cur = &cur[..i],
+            _ => return Some(cur.to_string()),
+        }
+    }
+}
+
+/// `Ok(Some(path))`: recursive mkdir created `path` first (node's return
+/// value); `Ok(None)`: undefined.
 pub(crate) unsafe fn js_fs_mkdir_result(
     path_value: f64,
     options_value: f64,
-) -> Result<(), crate::error::CoreError> {
+) -> Result<Option<String>, crate::error::CoreError> {
     validate::validate_path("path", path_value);
     validate::validate_mkdir_options(options_value);
     let path_str = match decode_path_value(path_value) {
@@ -923,25 +957,36 @@ pub(crate) unsafe fn js_fs_mkdir_result(
     };
     let recursive = options_bool_field(options_value, b"recursive");
     let mode = mkdir_mode_from_options(options_value);
-    let result = if recursive {
-        fs::create_dir_all(&path_str)
+    let (result, first) = if recursive {
+        let first = mkdirp_first_created(&path_str);
+        (fs::create_dir_all(&path_str), first)
     } else {
-        fs::create_dir(&path_str)
+        (fs::create_dir(&path_str), None)
     };
     match result {
         Ok(_) => {
             apply_dir_mode(&path_str, mode);
-            Ok(())
+            Ok(first)
         }
         Err(err) => Err(fs_error(&err, "mkdir", &path_str)),
     }
 }
 
+/// The JS value of a mkdir result: the first created directory or undefined.
+pub(crate) fn mkdir_result_value(first: Option<String>) -> f64 {
+    match first {
+        Some(p) => dir_glob_watch::string_value(p.as_bytes()),
+        None => f64::from_bits(crate::value::TAG_UNDEFINED),
+    }
+}
+
+/// `fs.mkdirSync(path, options)`: undefined, or with `recursive` the first
+/// directory created.
 #[no_mangle]
-pub extern "C" fn js_fs_mkdir_sync_options(path_value: f64, options_value: f64) -> i32 {
+pub extern "C" fn js_fs_mkdir_sync_options(path_value: f64, options_value: f64) -> f64 {
     unsafe {
         match js_fs_mkdir_result(path_value, options_value) {
-            Ok(()) => 1,
+            Ok(first) => mkdir_result_value(first),
             Err(err) => crate::exception::throw_core(err),
         }
     }
@@ -1718,6 +1763,9 @@ pub extern "C" fn js_fs_realpath_sync_options(path_value: f64, options_value: f6
     encoded_string_ptr(&bytes, &enc) as i64
 }
 
+// The path; the options (a string is the encoding) [[Get]] `encoding`; the
+// result is a string, or a Buffer for `encoding: "buffer"`.
+crate::realm_decl! { "node:fs.realpathSync", effects = { path(arg(0)); reads(field(arg(1), encoding)); stores(fresh); returns(prim(str) | fresh(Buffer.prototype)) } }
 #[no_mangle]
 pub extern "C" fn js_fs_realpath_dispatch(path_value: f64, options_value: f64) -> f64 {
     validate::validate_path("path", path_value);
