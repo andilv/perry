@@ -36,29 +36,36 @@ There are no non-test callers of `JSValue::int32` in perry-runtime or perry-stdl
 | `solve.rs:1828` | read/map | read: tests or masks the fact, seeds nothing |
 | `solve.rs:1840` | read/map | read: tests or masks the fact, seeds nothing |
 | `solve.rs:1851` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:193` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:224` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:392` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:470` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:589` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:682` | read/map | read: tests or masks the fact, seeds nothing |
-| `bindings.rs:683` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:440` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:471` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:758` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:777` | read/map | read: `number_range_of` refuses an instance copy that may hold anything but a Number, seeds nothing (#14524, binding facts read off the shared node and its summary instance copies) |
+| `bindings.rs:1032` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:1033` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:1079` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:1106` | read/map | read: tests or masks the fact, seeds nothing |
+| `bindings.rs:1233` | read/map | read: tests or masks the fact, seeds nothing (I32 at rest: a Number field's rep) |
+| `bindings.rs:1386` | read/map | read: tests or masks the fact, seeds nothing (I32 at rest: the `# rest` probe) |
 | `signatures.rs:389` | read/map | read: tests or masks the fact, seeds nothing |
 | `dump.rs:470` | read/map | read: tests or masks the fact, seeds nothing |
+| `records.rs:448` | read/map | read: R3's immediate-field mask (value records), seeds nothing |
 | `solve/arr_len.rs:42` | seed | array birth length `new Array(k)`: the header length `uitofp` |
 | `solve/lookup.rs:1289` | seed | array `.length` through the chain: header length `uitofp` (array/indexing.rs js_array_length -> u32) |
 | `solve/fields.rs:40` | seed | RegExp `lastIndex` at birth: the Number 0 |
 | `solve/native_value.rs:171` | read/map | read: tests or masks the fact, seeds nothing |
-| `solve/apply.rs:1309` | read/map | read: tests or masks the fact, seeds nothing |
-| `solve/apply.rs:1337` | read/map | read: tests or masks the fact, seeds nothing |
-| `solve/apply.rs:1456` | read/map | read: tests or masks the fact, seeds nothing |
-| `solve/apply.rs:1472` | read/map | read: tests or masks the fact, seeds nothing |
-| `solve/apply.rs:1473` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
-| `solve/apply.rs:1486` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
-| `solve/apply.rs:1492` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
-| `solve/apply.rs:1502` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
-| `solve/apply.rs:1503` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
-| `solve/apply.rs:1513` | read/map | read: tests or masks the fact, seeds nothing |
+| `solve/apply.rs:1412` | read/map | read: tests or masks the fact, seeds nothing |
+| `solve/apply.rs:1440` | read/map | read: tests or masks the fact, seeds nothing |
+| `solve/apply.rs:1470` | read/map | read: an index store keeps no hole only when its key node is Number-only (`Cons::IndexKept` vs `Cons::IndexHole`), seeds nothing (#14504, in-bounds index stores) |
+| `solve/apply.rs:1604` | read/map | read: tests or masks the fact, seeds nothing |
+| `solve/apply.rs:1620` | read/map | read: tests or masks the fact, seeds nothing |
+| `solve/apply.rs:1621` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
+| `solve/apply.rs:1634` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
+| `solve/apply.rs:1640` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
+| `solve/apply.rs:1650` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
+| `solve/apply.rs:1651` | seed | numeric result of an arithmetic or `+` operator: codegen expr/binary.rs and expr/unary.rs lower it inline (fadd/fsub/fmul/fdiv, toint32 + sitofp), and the dynamic arm calls perry-runtime value/dynamic_arith.rs js_dynamic_string_or_number_add / dynamic_add_non_plain, which decodes an INT32 operand (`as_int32() as f64`) and returns `a_num + b_num` (f64) |
+| `solve/apply.rs:1661` | read/map | read: tests or masks the fact, seeds nothing |
+| `quiet_sites.rs:136` | read/map | read: `number` tests that a key node holds Numbers and nothing else (`key:not-number`), seeds nothing (#14537, quiet sites) |
+| `family_reach.rs:517` | read/map | read: `primitive` tests whether a primitive load or call may see a Number to mark `Number.prototype` members live (family reach), seeds nothing (#14563, family_reach) |
 | `gen/primitives.rs:64` | read/map | family/realm/const mapping: no value of its own; the seeds that use it are audited at their own rows |
 | `gen/primitives.rs:100` | seed | computed enum member: NUM|STR, not NUM-only (no consumer drops a test) |
 | `gen/primitives.rs:101` | seed | numeric enum member: a double constant |
@@ -136,6 +143,8 @@ There are no non-test callers of `JSValue::int32` in perry-runtime or perry-stdl
 | `gen_rest/collections.rs:213` | seed | callback index (from/forEach): as above |
 | `canonical_numbers.rs:49` | read/map | read: tests or masks the fact, seeds nothing (P3 B1's element-value test) |
 | `canonical_numbers.rs:50` | read/map | read: tests or masks the fact, seeds nothing (P3 B1's element-value test) |
+| `zero_sign.rs:420` | read/map | read: a node holding Numbers whose uses the generator does not see is a zero-sign seed; seeds nothing (PR D) |
+| `zero_sign.rs:527` | read/map | read: counts the tolerated Number nodes; seeds nothing (PR D) |
 
 ## INT32-box producers claimed by code comments (CWN, P3 B1)
 Two runtime comments claimed live INT32-tagged Number producers. Neither is live: no code path writes an INT32 word for

@@ -33,9 +33,12 @@ mod index_uses;
 mod int_valued_i64_locals;
 mod int_valued_ta_locals;
 mod integer_locals;
+pub(crate) mod life_census;
+pub(crate) mod life_claims;
 mod literal_method_home;
 mod local_refs;
 mod loop_bounded_i32;
+pub(crate) use loop_bounded_i32::collect_written_locals;
 mod loop_pushed_arrays;
 #[cfg(test)]
 mod loop_pushed_arrays_tests;
@@ -148,7 +151,7 @@ pub(crate) use ptr_shape_callbacks::collect_array_callback_shapes;
 pub(crate) use ptr_shape_returns::collect_exported_return_shapes;
 pub(crate) use receiver_regions::{region_enders_in_expr, region_enders_in_stmts_classified};
 pub(crate) use receiver_regions::{
-    region_enders_in_stmts_with_trusted_operations, ByteViewParamAccess,
+    region_enders_in_stmts_with_trusted_operations, ByteViewParamAccess, FieldBase,
     ReceiverArrayValidationKind, ReceiverDescriptorTable, RegionEnder,
 };
 pub(crate) use refs::{
@@ -157,8 +160,8 @@ pub(crate) use refs::{
 };
 pub(crate) use safepoint_sites::{count_body_nodes, count_safepoint_sites};
 pub(crate) use scalar_method_dispatch::{
-    collect_module_dispatch_facts, for_each_expr_in_stmts, mark_unstable_scalar_method_receivers,
-    ModuleDispatchFacts,
+    collect_module_dispatch_facts, collect_module_dispatch_facts_with, for_each_expr_in_stmts,
+    mark_unstable_scalar_method_receivers, ModuleDispatchFacts,
 };
 pub(crate) use scalar_methods::simple_scalar_method_summary;
 pub(crate) use shadow_slots::{

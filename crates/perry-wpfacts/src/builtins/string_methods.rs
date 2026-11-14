@@ -210,6 +210,9 @@ pub(super) fn string_method(m: &mut Model, call: CallId, name: &str) -> bool {
             for &a in &c.args {
                 to_prim(m, a, "string method operand");
             }
+            // −0 tolerance (`Model::with_native`): ToString and
+            // ToIntegerOrInfinity give `-0` and `0` the same result.
+            m.zs_absorbing = true;
             let r = match name {
                 "at" => prim::STR | prim::UNDEF,
                 "charCodeAt" | "indexOf" | "lastIndexOf" => prim::NUM,
@@ -217,11 +220,17 @@ pub(super) fn string_method(m: &mut Model, call: CallId, name: &str) -> bool {
                 _ => prim::STR,
             };
             // `charAt` and `at` read one code unit (or none: `""`,
-            // `undefined`).
+            // `undefined`); `"lit".indexOf(..)` is in `[-1, len]` (PR D,
+            // `Model::str_index_len`).
             let one_unit = matches!(name, "charAt" | "at");
-            let saved = one_unit.then(|| {
+            let index_len = m
+                .str_index_len
+                .get(&call)
+                .copied()
+                .filter(|_| matches!(name, "indexOf" | "lastIndexOf"));
+            let saved = (one_unit || index_len.is_some()).then(|| {
                 m.cur_range.replace(crate::model::Rg {
-                    num: crate::model::Iv::TOP,
+                    num: index_len.map_or(crate::model::Iv::TOP, |l| crate::model::Iv::int(-1, l)),
                     chr: crate::model::range::CHAR_ANY,
                 })
             });
@@ -312,7 +321,7 @@ pub(super) fn regexp_described(name: &str) -> bool {
 /// constructor and runs that splitter's `exec`; `@@matchAll` keeps the
 /// generic summary.
 pub(super) fn regexp_method(m: &mut Model, t: Tok, name: &str, call: CallId) {
-    let c = m.calls[call as usize].clone();
+    let c = m.positional(call, 2);
     let recv = m.node_l("regexp");
     m.add_tok(recv, t);
     if let Some(s) = c.args.first().copied() {
@@ -396,7 +405,7 @@ pub(super) fn regexp_method(m: &mut Model, t: Tok, name: &str, call: CallId) {
 /// the captures are String or undefined; a program constructor or `exec`
 /// is code the solve runs, and what it returns is a capture.
 fn split(m: &mut Model, call: CallId, recv: NodeId) {
-    let c = m.calls[call as usize].clone();
+    let c = m.positional(call, 2);
     read_prim(m, recv, "flags", "RegExp flags ToString");
     let k = m.atom("constructor");
     let cn = m.node_l("species-constructor");

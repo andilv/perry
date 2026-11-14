@@ -2,6 +2,10 @@
     if module == "__perry_runtime" && class_name.is_none() && object.is_none() {
         if let Some(result) = crate::array_record_stack::lower(ctx, method, args)? { return Ok(result); }
         if let Some(result) = crate::expr::private_resume_frame::lower(ctx, method, args)? { return Ok(result); }
+        // DESIGN-p4l4 VR-4b: the record-array intrinsics.
+        if let Some(result) = crate::codegen::record_array::try_lower_value(ctx, method, args)? {
+            return Ok(result);
+        }
         match method {
             "importMetaResolve" | "importMetaResolveValue" => {
                 // #11789 sweep: `import.meta.resolve(specifier, parent)` holds
@@ -421,6 +425,17 @@ return crate::lower_array_record_length::lower(ctx, &args[0]);
                     ctx.block().call_void("js_snap_require_edge", &[(crate::types::I32, "0")]);
                 }
                 return lower_expr(ctx, &args[0]);
+            }
+            // The admission of a for-of over a source annotated as a numeric
+            // typed array (`for_of_guard::source_for_of`).
+            "typedArrayForOfAdmits" => {
+                let value = args.first().map_or_else(
+                    || Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED))),
+                    |arg| lower_expr(ctx, arg),
+                )?;
+                return Ok(ctx
+                    .block()
+                    .call(DOUBLE, "js_typed_array_for_of_admits", &[(DOUBLE, &value)]));
             }
             "isBuiltin" => {
                 let specifier = args.first().map_or_else(

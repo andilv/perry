@@ -12,6 +12,7 @@ mod accessor_lookup;
 mod copy;
 mod define;
 mod lookup;
+pub(crate) mod map_vals;
 mod own_read;
 
 use crate::builtins;
@@ -38,6 +39,22 @@ mod virt;
 
 // Property-key ranges come from value deltas, not source annotations. Keep
 // computed reads and calls on the same partition of ToPropertyKey's inputs.
+/// An escaped value (unknown code holds it) that is no parameter or
+/// argument marker: beside ⊤ it is that ⊤, since every rule does to ⊤ at
+/// least what it does to the value. The one predicate of the arrival rule
+/// (`add_tokens_s`, with the markers that read as ⊤, DECISIONS 42), of ⊤'s
+/// arrival at a node that lists the value, and of a ⊤ node's pop.
+pub(crate) fn escaped_beside_top<V>(
+    esc_bits: &[u64],
+    param_marker: &crate::pts::FxHashMap<Tok, V>,
+    arg_bits: &[u64],
+    t: Tok,
+) -> bool {
+    t != TOP
+        && marker_top_bit(esc_bits, t)
+        && !(param_marker.contains_key(&t) || marker_top_bit(arg_bits, t))
+}
+
 fn index_needs_general_key(toks: Tokens<'_>, prim: u16) -> bool {
     prim & (prim::STR | prim::SYMBOL) != 0 || !toks.is_empty()
 }
@@ -167,9 +184,9 @@ impl Model {
             // other tokens, once it is known whether ⊤ arrived with them. So
             // is an escaped value (`Model::top_beside`): unknown code holds
             // it, so beside ⊤ it is that ⊤.
-            let escaped_value = marker_top_bit(&self.esc_bits, t)
-                && !(self.param_marker.contains_key(&t) || marker_top_bit(&self.arg_bits, t));
-            if marker_top_bit(&self.marker_top, t) || escaped_value {
+            if marker_top_bit(&self.marker_top, t)
+                || escaped_beside_top(&self.esc_bits, &self.param_marker, &self.arg_bits, t)
+            {
                 later.push(t);
                 continue;
             }
@@ -203,6 +220,21 @@ impl Model {
         if !fresh.is_empty() {
             let old = std::mem::take(&mut node.pts);
             node.pts = self.sets.extend(old, &fresh);
+        }
+        // ⊤ arrived: a member listed before it and escaped since is that ⊤
+        // now, and leaves (the set is rebuilt). One still in the node's
+        // delta leaves at the node's pop, which follows (top_new queued it).
+        if top_new {
+            let (esc, pm, ab) = (&self.esc_bits, &self.param_marker, &self.arg_bits);
+            let old = std::mem::take(&mut node.pts);
+            let before = old.len();
+            node.pts = self
+                .sets
+                .retain(old, |t| !escaped_beside_top(esc, pm, ab, t));
+            if node.pts.len() != before {
+                node.dropped = true;
+                self.charge_work(before as u64);
+            }
         }
         self.fresh = fresh;
         self.fresh_seen = seen;
@@ -257,10 +289,13 @@ impl Model {
         !matches!(
             c,
             Cons::Raise { .. }
+                | Cons::Identity { .. }
                 | Cons::Guard { .. }
                 | Cons::Defined { .. }
                 | Cons::NotNullish { .. }
+                | Cons::Fulfil { .. }
                 | Cons::Falsy { .. }
+                | Cons::Objects { .. }
                 | Cons::NotUndefined { .. }
                 | Cons::TopSink { .. }
                 | Cons::RuntimeStore { .. }
@@ -645,7 +680,9 @@ impl Model {
         if self.relations.is_some()
             && !matches!(
                 c,
-                Cons::ThisTo { .. }
+                // No flow: the recomputation has nothing to check.
+                Cons::Identity { .. }
+                    | Cons::ThisTo { .. }
                     | Cons::CallArgs { .. }
                     | Cons::RetInto { .. }
                     | Cons::ArgInto { .. }
@@ -680,7 +717,11 @@ impl Model {
         self.nodes[n as usize].cons.push(c);
         if let Some(region) = self.gen_region.filter(|_| Self::may_run_code(&c)) {
             let cs = &self.nodes[n as usize].cons;
-            let seen = cs.iter().rev().take(4).any(|x| matches!(x, Cons::Raise { region: r } if *r == region));
+            let seen = cs
+                .iter()
+                .rev()
+                .take(4)
+                .any(|x| matches!(x, Cons::Raise { region: r } if *r == region));
             if !seen {
                 self.cons(n, Cons::Raise { region });
             }
@@ -776,6 +817,23 @@ impl Model {
                     std::mem::take(&mut node.drange) && node.prim & (prim::NUM | prim::STR) != 0,
                 )
             };
+            // A node that holds ⊤ delivers no member that escaped after it
+            // was listed: beside ⊤ it is that ⊤, which the node delivered.
+            // It leaves the delta and the set (both rebuilt, not changed in
+            // shared storage).
+            if !delta.is_empty() && self.nodes[n as usize].pts.contains_tok(TOP) {
+                let (esc, pm, ab) = (&self.esc_bits, &self.param_marker, &self.arg_bits);
+                let cover = |t: Tok| escaped_beside_top(esc, pm, ab, t);
+                if delta.iter().any(|&t| cover(t)) {
+                    delta.retain(|t| !cover(t));
+                    let node = &mut self.nodes[n as usize];
+                    let old = std::mem::take(&mut node.pts);
+                    let before = old.len() as u64;
+                    node.pts = self.sets.retain(old, |t| !cover(t));
+                    node.dropped = true;
+                    self.charge_work(before);
+                }
+            }
             if delta.is_empty() && dprim == 0 && !dstrs && !drange {
                 continue;
             }
@@ -1001,11 +1059,15 @@ impl Model {
             // lookup on it reaches what the program gave or stored up the
             // chain (`Object.setPrototypeOf(EventEmitter, p)` then
             // `Readable.apply`).
-            TokKind::BuiltinFn(Native::Member { identity, holder: None })
-                if crate::builtins::realm_parent_constructor(identity).is_some() =>
-            {
+            TokKind::BuiltinFn(Native::Member {
+                identity,
+                holder: None,
+            }) if crate::builtins::realm_parent_constructor(identity).is_some() => {
                 let parent = crate::builtins::realm_parent_constructor(identity).unwrap();
-                let p = self.tok(TokKind::BuiltinFn(Native::Member { identity: parent, holder: None }));
+                let p = self.tok(TokKind::BuiltinFn(Native::Member {
+                    identity: parent,
+                    holder: None,
+                }));
                 self.add_tok(n, p);
             }
             TokKind::Func(_, _)
@@ -1374,7 +1436,11 @@ impl Model {
     pub fn sink_node(&mut self, n: NodeId, reason: u32) {
         if let Some(c) = self.cur_native_call {
             let region = self.calls[c as usize].region;
-            self.raise_top(region, n, "a native hands a value to unknown code, which may throw");
+            self.raise_top(
+                region,
+                n,
+                "a native hands a value to unknown code, which may throw",
+            );
         }
         if self.sunk_nodes.insert(n) {
             self.cons(n, Cons::TopSink { reason });
@@ -1420,6 +1486,8 @@ impl Model {
     /// chain runs with `this` = `t` and unknown primitive arguments, or for
     /// `@@hasInstance` the `instanceof` left-hand sides (`has_instance`).
     pub fn implicit(&mut self, t: Tok, reason: u32, proto: Protocol) {
+        // I32 at rest (PR B): a protocol touch reads elements undecoded.
+        self.rest_used(t);
         // The touch looks up and calls the protocol's keys and reads its
         // values, nothing else.
         let keys: Option<Vec<Atom>> = proto
@@ -1561,12 +1629,14 @@ impl Model {
 
     pub fn cons_line(&self, n: NodeId, c: &Cons) -> String {
         match c {
+            Cons::Identity { route } => format!("identity {n} {}", route.name()),
             Cons::Load { key, dst } => format!("load {n} {} {dst}", self.key_name(*key)),
             Cons::ProtoKey { key, dst } => {
                 format!("protokey {n} {} {dst}", self.key_name(Key::Named(*key)))
             }
             Cons::OwnValues { dst } => format!("ownvalues {n} {dst}"),
             Cons::IndexHole => format!("indexhole {n}"),
+            Cons::IndexKept => format!("indexkept {n}"),
             Cons::LenIndex { lo, hi } => format!("lenindex {n} {lo} {hi}"),
             Cons::LenPermuted { t } => format!("lenpermuted {n} {t}"),
             Cons::CjsPublish { dst } => format!("cjspublish {n} {dst}"),
@@ -1627,12 +1697,16 @@ impl Model {
             Cons::Guard { test, from, dst } => format!("guard {n} {test} {from} {dst}"),
             Cons::Defined { dst } => format!("defined {n} {dst}"),
             Cons::NotNullish { dst } => format!("notnullish {n} {dst}"),
+            Cons::Fulfil { dst } => format!("fulfil {n} {dst}"),
             Cons::Falsy { dst } => format!("falsy {n} {dst}"),
             Cons::NotUndefined { dst } => format!("notundefined {n} {dst}"),
+            Cons::Objects { dst } => format!("objects {n} {dst}"),
             Cons::TopIfAny { dst, from, reason } => format!(
                 "topifany {n} {dst} {from} {}",
                 reason.map_or(-1, |r| r as i64)
             ),
+            Cons::RequireSpec { call } => format!("requirespec {n} {call}"),
+            Cons::TopIfTop { dst, reason } => format!("topiftop {n} {dst} {reason}"),
             Cons::Hard { kind, reason } => format!("hard {n} {} {reason}", kind.code()),
             Cons::DeleteKey { key, reason } => {
                 format!(
@@ -1866,10 +1940,10 @@ impl Model {
             out = out.join(crate::model::range::chars_to_number(nd.crange));
         }
         if nd.prim & prim::BOOL != 0 {
-            out = out.join(Iv { lo: 0, hi: 1 });
+            out = out.join(Iv::int(0, 1));
         }
         if nd.prim & prim::NULL != 0 {
-            out = out.join(Iv { lo: 0, hi: 0 });
+            out = out.join(Iv::int(0, 0));
         }
         let known = prim::NUM | prim::STR | prim::BOOL | prim::NULL;
         if nd.prim & !known != 0 {
@@ -1921,6 +1995,39 @@ pub(crate) fn grow_range(node: &mut Node, iv: Iv) -> bool {
     node.range = if node.rsteps > WIDEN_LIMIT {
         Iv::TOP
     } else if node.rsteps > WIDEN_STEPS {
+        widen(node.range, joined)
+    } else {
+        joined
+    };
+    node.drange = true;
+    true
+}
+
+/// Join `iv` into the result of a [`Cons::Range`] rule (R1, sum widening).
+///
+/// The rule's result is `op` over its operands' intervals at each
+/// evaluation, and every operand only grows, so the join is the rule over
+/// the operands' last intervals: a rule result needs no widening of its own.
+/// The operands are what widen: a loop counter (a copy target, `grow_range`)
+/// climbs the ladder and the loop test clips it back (`gen::narrow`), so
+/// `r * 16 + f` over `r, f` in `[0, 7]` is `[0, 119]`, where widening the
+/// sum after `WIDEN_STEPS` of its operands' growths jumped to a rung (127,
+/// then 255).
+///
+/// Termination: the rule results form no cycle among themselves (each
+/// rule's operands exist before its result node is ruled, and a result has
+/// one rule), so every cycle passes a copy target, which widens, and a
+/// result grows at most once per operand growth. Past `WIDEN_LIMIT` growths
+/// it still climbs the ladder (a backstop that bounds even a cycle the
+/// argument missed).
+pub(crate) fn grow_rule_range(node: &mut Node, iv: Iv) -> bool {
+    use crate::model::range::{widen, WIDEN_LIMIT};
+    let joined = node.range.join(iv);
+    if joined == node.range {
+        return false;
+    }
+    node.rsteps = node.rsteps.saturating_add(1);
+    node.range = if node.rsteps > WIDEN_LIMIT {
         widen(node.range, joined)
     } else {
         joined

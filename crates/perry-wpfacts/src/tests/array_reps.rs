@@ -9,7 +9,7 @@ use crate::{ElementOp, FactsConfig};
 use std::collections::HashMap;
 
 /// `name -> rep` of every `let`/`const` of `t.ts` under `cfg`.
-fn reps_with(src: &str, cfg: FactsConfig) -> HashMap<String, Rep> {
+pub(super) fn reps_with(src: &str, cfg: FactsConfig) -> HashMap<String, Rep> {
     let pf = facts_with(src, cfg);
     let module = perry_parser::parse_typescript(src, "t.ts").expect("parses");
     let hir = perry_hir::lower_module(&module, "t", "t.ts").expect("lowers");
@@ -60,24 +60,32 @@ const SAMPLES: [Rep; 7] = [
         floor: 8,
         dense: true,
         fixed: true,
+        im: false,
+        at_rest: false,
     }),
     Rep::Arr(ArrRep {
         elem: ElemRep::F64,
         floor: 3,
         dense: false,
         fixed: true,
+        im: false,
+        at_rest: false,
     }),
     Rep::Arr(ArrRep {
         elem: ElemRep::Boxed,
         floor: 0,
         dense: false,
         fixed: false,
+        im: false,
+        at_rest: false,
     }),
     Rep::Arr(ArrRep {
         elem: ElemRep::I32,
         floor: 128,
         dense: true,
         fixed: false,
+        im: false,
+        at_rest: false,
     }),
 ];
 
@@ -117,6 +125,8 @@ fn two_arrays_join_to_what_both_have() {
             floor: 8,
             dense: true,
             fixed: false,
+            im: false,
+            at_rest: false,
         })
     );
     let j = Rep::join(SAMPLES[3], SAMPLES[4]);
@@ -127,6 +137,8 @@ fn two_arrays_join_to_what_both_have() {
             floor: 3,
             dense: false,
             fixed: true,
+            im: false,
+            at_rest: false,
         })
     );
 }
@@ -138,6 +150,7 @@ fn an_array_slot_is_encoded_boxed() {
             Rep::F64 => Enc::F64,
             Rep::I32 => Enc::I32,
             Rep::Boxed | Rep::Arr(_) => Enc::Boxed,
+            Rep::Record(_) => Enc::Record,
         };
         assert_eq!(r.encoding(), want);
     }
@@ -227,7 +240,49 @@ fn a_json_array_is_not_plain() {
 fn a_runtime_born_array_is_not_plain() {
     let src = "const o = { a: 1, b: 2 };\nconst K = Object.keys(o);\nconsole.log(K[0]);";
     assert_eq!(rep(src, "K"), Rep::Boxed);
-    let src = "const L = [3, 1, 2];\nconst K = L.slice();\nconsole.log(K[0]);";
+    let src = "const L = [3, 1, 2];\nconst K = L.concat([4]);\nconsole.log(K[0]);";
+    assert_eq!(rep(src, "K"), Rep::Boxed);
+    let src = "const L = [3, 1, 2];\nconst K = L.toReversed();\nconsole.log(K[0]);";
+    assert_eq!(rep(src, "K"), Rep::Boxed);
+}
+
+/// A `slice` of an Array bears a plain Array (`builtins::site_slice_arr`):
+/// floor 0, not dense, not fixed, with the elements it holds.
+#[test]
+fn a_slice_of_an_array_is_plain() {
+    let src = "const L = [3, 1, 2];\nconst K = L.slice();\nK[1] = 7;\nconsole.log(K[0]);";
+    let k = arr(src, "K");
+    assert_eq!(
+        (k.floor, k.dense, k.fixed, k.im, k.at_rest),
+        (0, false, false, false, false)
+    );
+    assert_ne!(k.elem, ElemRep::Boxed);
+    // A string stored into the copy makes its elements Boxed; the source's
+    // stay Numbers.
+    let src = "const L = [3, 1, 2];\nconst K: any[] = L.slice();\nK[1] = \"s\";\nconsole.log(K[0], L[0]);";
+    assert_eq!(arr(src, "K").elem, ElemRep::Boxed);
+    assert_ne!(arr(src, "L").elem, ElemRep::Boxed);
+}
+
+/// Negative controls: a species constructor that is not `%Array%` (the
+/// result may be no Array), an array-like receiver, an escaped copy, and the
+/// switch's sabotage.
+#[test]
+fn a_slice_with_another_species_or_receiver_is_not_plain() {
+    let src = "const L: any = [3, 1, 2];\nL.constructor = { [Symbol.species]: Object };\n\
+               const K = L.slice();\nconsole.log(K[0]);";
+    assert_eq!(rep(src, "K"), Rep::Boxed);
+    let cfg = FactsConfig {
+        sabotage: Some("slicebirth".to_string()),
+        ..Default::default()
+    };
+    assert!(matches!(rep_with(src, "K", cfg), Rep::Arr(_)));
+    let src = "const o: any = { length: 2, 0: 1, 1: 2 };\n\
+               const K = Array.prototype.slice.call(o);\nconsole.log(K[0]);";
+    assert_eq!(rep(src, "K"), Rep::Boxed);
+    let src = "const L = [3, 1, 2];\nconst K = L.slice();\n(globalThis as any).hostTake(K);\nconsole.log(K[0]);";
+    assert_eq!(rep(src, "K"), Rep::Boxed);
+    let src = "const L = [3, 1, 2];\nconst K = Object.freeze(L.slice());\nconsole.log(K[0]);";
     assert_eq!(rep(src, "K"), Rep::Boxed);
 }
 
@@ -394,4 +449,291 @@ fn a_packet_birth_names_a_plain_array() {
         "{:?}",
         packet.births
     );
+}
+
+/// PR-C2: the key interval of the read whose object starts at `at`
+/// (`ModuleBindings::element_keys`; SWC offsets are 1-based).
+fn key_at(src: &str, at: &str, cfg: FactsConfig) -> Option<(i64, i64)> {
+    let offset = src.find(at).expect("read in source") as u32 + 1;
+    let pf = facts_with(src, cfg);
+    let mb = pf.bindings_for("t.ts").expect("module bindings");
+    mb.element_keys
+        .iter()
+        .find(|(o, _)| *o == offset)
+        .map(|(_, k)| *k)
+}
+
+const TABLE: &str =
+    "const K = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];\n";
+
+#[test]
+fn an_element_read_exports_its_key_interval() {
+    // A masked key is an integer in the mask's interval.
+    let src = format!(
+        "{TABLE}export function f(i: number): number {{ return K[i & 7] ?? 0; }}\n\
+         console.log(f(3) + f(12));"
+    );
+    assert_eq!(
+        key_at(&src, "K[i & 7]", FactsConfig::default()),
+        Some((0, 7))
+    );
+    // A key that may be a fraction is no integer interval.
+    let src = format!(
+        "{TABLE}export function f(i: number): number {{ return K[i / 2] ?? 0; }}\n\
+         console.log(f(3));"
+    );
+    assert_eq!(key_at(&src, "K[i / 2]", FactsConfig::default()), None);
+    // A string key is no Number.
+    let src = format!(
+        "{TABLE}export function f(k: string): unknown {{ return (K as any)[k]; }}\n\
+         console.log(f(\"length\"));"
+    );
+    assert_eq!(key_at(&src, "(K as any)[k]", FactsConfig::default()), None);
+}
+
+#[test]
+fn a_key_interval_is_the_hull_over_every_caller() {
+    // The parameter joins both callers' arguments, and may be negative.
+    let src = format!(
+        "{TABLE}function at(i: number): number {{ return K[i] ?? 0; }}\n\
+         console.log(at(2) + at(-1) + at(19));"
+    );
+    assert_eq!(key_at(&src, "K[i]", FactsConfig::default()), Some((-1, 19)));
+}
+
+#[test]
+fn the_switch_off_exports_no_key_interval() {
+    let src = format!(
+        "{TABLE}export function f(i: number): number {{ return K[i & 7] ?? 0; }}\n\
+         console.log(f(3));"
+    );
+    let off = FactsConfig {
+        no_array_reps: true,
+        ..Default::default()
+    };
+    assert_eq!(key_at(&src, "K[i & 7]", off), None);
+}
+
+#[test]
+fn a_shift_takes_the_floor_away_unless_sabotaged() {
+    // `shift` moves the front of the storage: the length is no longer
+    // defined, so the rep keeps no floor (the tier then addresses the slot
+    // through the header). The negative control `arrfront` keeps it.
+    let src = format!("{TABLE}K.shift();{READ}");
+    let a = arr(&src, "K");
+    assert_eq!((a.floor, a.dense, a.fixed), (0, false, false));
+    let sabotaged = FactsConfig {
+        sabotage: Some("arrfront".into()),
+        ..Default::default()
+    };
+    match rep_with(&src, "K", sabotaged) {
+        Rep::Arr(a) => assert_eq!((a.floor, a.fixed), (20, true)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_redefined_or_deleted_element_gives_no_array_rep() {
+    // The tier reads the slot itself: an element descriptor or a deleted
+    // element must leave no `Arr` (a hard marker, `arr_rep`).
+    for stmt in [
+        "Object.defineProperty(K, 0, { get() { return 7; } });",
+        "delete (K as any)[1];",
+        "Object.freeze(K);",
+    ] {
+        let src = format!("{TABLE}{stmt}{READ}");
+        assert_eq!(rep(&src, "K"), Rep::Boxed, "{stmt}");
+    }
+}
+
+// ---- PR-C3 (DESIGN-p4l1 §3, §2.8): the field's rep and the in-floor call ----
+
+/// The chess shape: a board born dense with 128 elements, stored into at
+/// keys that leave it, and read behind `at` by calls with their own keys.
+const FIELD_BOARD: &str = r#"
+class Chess {
+  board: number[] = new Array(128).fill(0);
+  ep: number = -1;
+  at(square: number): number { return this.board[square] ?? 0; }
+  set(square: number, piece: number): void { this.board[square] = piece; }
+  ranks(): number {
+    let s = 0;
+    for (let r = 7; r >= 0; r--) s += this.at(r * 16);
+    return s;
+  }
+  masked(move: number): number { return this.at(move & 127); }
+  capture(move: number): number { return this.at((move & 127) - 16); }
+  past(): number { return this.at(this.ep + 16); }
+}
+const c = new Chess();
+for (let i = -16; i < 144; i++) c.set(i, i & 7);
+c.ep = process.argv.length > 100 ? 40 : 20;
+let t = 0;
+for (let i = 0; i < 1000; i++) t += c.masked(i) + c.capture(i);
+console.log(c.ranks(), t, c.past());
+"#;
+
+/// The field read calls of `src` by the source text of their call.
+fn b1(src: &str, cfg: FactsConfig) -> Vec<(String, crate::FieldReadCall)> {
+    let pf = facts_with(src, cfg);
+    pf.bindings
+        .iter()
+        .flat_map(|b| b.field_read_calls.iter())
+        .map(|(offset, c)| {
+            // Offsets are 1-based.
+            let rest = &src[*offset as usize - 1..];
+            let end = rest.find(')').map_or(rest.len(), |e| e + 1);
+            (rest[..end].to_string(), c.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn a_stored_into_board_field_keeps_its_dense_floor() {
+    let pf = facts(FIELD_BOARD);
+    let f = field(tmpl(&pf, "Chess"), "board");
+    // Growable: a store key reaches past the birth length.
+    assert!(
+        matches!(f.rep, Rep::Arr(a) if a.floor == 128 && a.dense && !a.fixed && a.elem != ElemRep::Boxed),
+        "{:?}",
+        f.rep
+    );
+}
+
+#[test]
+fn a_field_read_call_is_in_the_floor_by_its_own_key() {
+    let calls = b1(FIELD_BOARD, FactsConfig::default());
+    let of = |text: &str| {
+        calls
+            .iter()
+            .find(|(t, _)| t.starts_with(text))
+            .unwrap_or_else(|| panic!("no call {text}: {calls:?}"))
+            .1
+            .clone()
+    };
+    // Every call reads from the same arrays.
+    for (_, c) in &calls {
+        assert!(
+            matches!(c.array, Some(a) if a.floor == 128 && a.dense),
+            "{c:?}"
+        );
+    }
+    assert!(of("this.at(r * 16)").in_floor);
+    assert!(of("this.at(move & 127)").in_floor);
+    // `[-16, 111]` leaves the floor below; `[15, 56]` is inside.
+    assert!(!of("this.at((move & 127)").in_floor);
+    assert!(of("this.at(this.ep + 16").in_floor);
+}
+
+#[test]
+fn a_key_past_the_floor_is_not_in_it_unless_sabotaged() {
+    let src = FIELD_BOARD.replace("this.at(this.ep + 16)", "this.at(this.ep + 100)");
+    let past = |cfg| {
+        b1(&src, cfg)
+            .into_iter()
+            .find(|(t, _)| t.starts_with("this.at(this.ep + 100"))
+            .expect("the call is a field read")
+            .1
+            .in_floor
+    };
+    assert!(!past(FactsConfig::default()));
+    assert!(past(FactsConfig {
+        sabotage: Some("arrb1".into()),
+        ..Default::default()
+    }));
+}
+
+#[test]
+fn the_fields_switch_off_gives_no_field_rep_and_no_floor() {
+    let off = || FactsConfig {
+        no_array_fields: true,
+        ..Default::default()
+    };
+    let pf = facts_with(FIELD_BOARD, off());
+    assert_eq!(field(tmpl(&pf, "Chess"), "board").rep, Rep::Boxed);
+    let calls = b1(FIELD_BOARD, off());
+    assert!(!calls.is_empty());
+    for (_, c) in &calls {
+        assert!(c.array.is_none() && !c.in_floor, "{c:?}");
+    }
+    // A local keeps its rep: the switch is the field's.
+    let pf = facts_with("const K = [1, 2, 3];\nconsole.log(K[1]);", off());
+    assert!(pf
+        .bindings
+        .iter()
+        .flat_map(|b| b.locals.iter())
+        .any(|(_, b)| matches!(b.rep, Rep::Arr(_))));
+}
+
+#[test]
+fn a_call_into_a_holey_or_undefined_holding_field_is_not_in_the_floor() {
+    // No fused fill: holes below the length.
+    let holey = FIELD_BOARD.replace("new Array(128).fill(0)", "new Array(128)");
+    for (_, c) in b1(&holey, FactsConfig::default()) {
+        assert!(!c.in_floor, "{c:?}");
+    }
+    // A `delete` of an element makes the array hard: no rep at all.
+    let deleted = FIELD_BOARD.replace("c.ep = ", "delete c.board[3];\nc.ep = ");
+    for (_, c) in b1(&deleted, FactsConfig::default()) {
+        assert!(c.array.is_none() && !c.in_floor, "{c:?}");
+    }
+    // A length store takes the floor away.
+    let cut = FIELD_BOARD.replace("c.ep = ", "c.board.length = 4;\nc.ep = ");
+    for (_, c) in b1(&cut, FactsConfig::default()) {
+        assert!(!c.in_floor, "{c:?}");
+    }
+    // A stored `undefined` is a present element: the call stays in the
+    // floor, and the elements are Boxed (the `??` stays in codegen).
+    let undef = FIELD_BOARD.replace("c.ep = ", "(c.board as any)[5] = undefined;\nc.ep = ");
+    let calls = b1(&undef, FactsConfig::default());
+    assert!(calls.iter().any(|(_, c)| c.in_floor));
+    for (_, c) in &calls {
+        assert!(
+            matches!(c.array, Some(a) if a.elem == ElemRep::Boxed),
+            "{c:?}"
+        );
+    }
+}
+
+#[test]
+fn the_arrfield_control_ignores_a_null_in_the_field() {
+    let src = r#"class B {
+  items: number[] | null = null;
+  fill(): void { this.items = [1, 2, 3, 4]; }
+}
+const b = new B();
+b.fill();
+console.log(b.items);"#;
+    assert_eq!(field(tmpl(&facts(src), "B"), "items").rep, Rep::Boxed);
+    let pf = facts_with(
+        src,
+        FactsConfig {
+            sabotage: Some("arrfield".into()),
+            ..Default::default()
+        },
+    );
+    assert!(matches!(field(tmpl(&pf, "B"), "items").rep, Rep::Arr(_)));
+}
+
+#[test]
+fn the_dump_prints_each_field_read_call_with_its_key_and_verdict() {
+    let pf = facts(FIELD_BOARD);
+    let dump = pf.dump_text();
+    let lines: Vec<&str> = dump
+        .lines()
+        .filter(|l| l.starts_with("# field_read_call "))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("key=[0,127]") && l.ends_with("in_floor=1")),
+        "{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("key=[-16,111]") && l.ends_with("in_floor=0")),
+        "{lines:#?}"
+    );
+    assert!(lines.iter().all(|l| l.contains("rep=arr<")), "{lines:#?}");
 }

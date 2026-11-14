@@ -125,6 +125,7 @@ mod locale;
 pub(crate) mod normalize_hooked;
 mod pad;
 mod provenance;
+pub(crate) mod short_pair;
 use provenance::{combine_string_flags, raw_string_metadata};
 pub(crate) mod literal_replace;
 #[cfg(test)]

@@ -11,6 +11,7 @@ use perry_abi::lock::LockHolder;
 mod collections;
 mod constructors;
 mod effects;
+mod gen_members;
 #[cfg(test)]
 pub(crate) mod effects_for_tests {
     pub(crate) use super::effects::interpretable;
@@ -20,7 +21,7 @@ pub(crate) mod effects_for_tests {
     }
 }
 pub use constructors::{construct_named, new_builtin_ns};
-mod members;
+pub(crate) mod members;
 pub(crate) use members::realm_parent_constructor;
 mod native_protocol;
 mod realm_declared;
@@ -34,8 +35,8 @@ pub(crate) mod string_methods;
 pub(crate) mod typed_array_methods;
 pub(crate) use collections::construct_into;
 pub(crate) use effects::{
-    declared_construct, declared_member, declared_proto_method, declared_static, run_construct, run_function,
-    run_member,
+    declared_construct, declared_member, declared_proto_method, declared_static, run_construct,
+    run_function, run_member,
 };
 
 use collections::{array_method, array_method_on, bobj_method, function_method, iterate};
@@ -221,7 +222,9 @@ pub fn async_resource(m: &mut Model, n: NodeId, name: &'static str) {
         m.async_resources.push((n, name));
         return;
     };
-    let r = m.reason(&format!("{name} hands its resource to async_hooks init ({why})"));
+    let r = m.reason(&format!(
+        "{name} hands its resource to async_hooks init ({why})"
+    ));
     m.sink_node(n, r);
 }
 
@@ -329,6 +332,8 @@ enum Recv {
 }
 
 fn unknown_method_at(m: &mut Model, call: CallId, why: &str, proto: Option<usize>, recv: Recv) {
+    // −0 tolerance: unknown code receives the arguments.
+    m.zs_call_args(call);
     if m.diagnostic.as_ref().is_some_and(|d| d.census.is_some()) {
         let d = m.diagnostic.as_mut().unwrap();
         let c = d.census.as_mut().unwrap();
@@ -441,8 +446,8 @@ fn ret_tok(m: &mut Model, call: CallId, t: Tok) {
     m.add_tok(ret, t);
 }
 
-fn arg(m: &Model, call: CallId, i: usize) -> Option<NodeId> {
-    m.calls[call as usize].args.get(i).copied()
+fn arg(m: &mut Model, call: CallId, i: usize) -> Option<NodeId> {
+    m.positional(call, i + 1).args.get(i).copied()
 }
 
 /// The elements of every array argument plus every spread array.
@@ -470,6 +475,32 @@ fn site_tmpl(m: &mut Model, call: CallId, what: &'static str) -> Tok {
 /// mark their own holes as on any array.
 fn site_dense_arr(m: &mut Model, call: CallId) -> Tok {
     site_tmpl_born(m, call, "DenseArray", true, false)
+}
+
+/// The Array `Array.prototype.slice` bears from an Array receiver, with
+/// `Model::array_reps` on a plain one (`TmplKind::Arr::plain`): the default
+/// species arm of `js_array_slice` (`array::species::
+/// array_species_create`) allocates a fresh `GC_TYPE_ARRAY` with its elements
+/// at the front (`js_array_alloc_with_length`), never a lazy header, never
+/// frozen, and copies the receiver's slots (its holes with them). A program
+/// species constructor's result is another value of the call
+/// (`species_from`), with its own token; a realm constructor other than
+/// `%Array%` makes this token's value itself, so `bindings::arr_rep` admits
+/// the token only while `derive::exact_array` holds. No birth length is
+/// recorded: the rep's floor is 0. `PERRY_FACTS_SLICE_BIRTHS=0` keeps the
+/// dense, not plain, birth.
+fn site_slice_arr(m: &mut Model, call: CallId) -> Tok {
+    let reps = m.array_reps;
+    site_tmpl_born(m, call, "DenseArray", true, reps)
+}
+
+/// `PERRY_FACTS_SLICE_BIRTHS=0` (`off`, `false`): a `slice` result is no
+/// plain Array (`site_slice_arr`).
+pub(crate) fn slice_births_enabled() -> bool {
+    !matches!(
+        std::env::var("PERRY_FACTS_SLICE_BIRTHS").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
 }
 
 /// The Array `new Array(...)` or `Array(...)` births (`BuiltinNs::Array`):
@@ -551,6 +582,10 @@ fn site_tmpl_born(
         if let Some(k) = m.arr_len_at_site.get(&site).and_then(|b| b.len) {
             m.arr_birth_len.insert(tm, k);
         }
+        // A push-filled `new Array()` is born with its final length.
+        if let Some(&fill) = m.push_fill_new_sites.get(&site) {
+            crate::push_fills::born(m, tm, fill);
+        }
     }
     let t = m.tok(TokKind::Obj(tm, NO_CTX));
     m.site_tmpls.insert(key, t);
@@ -559,25 +594,97 @@ fn site_tmpl_born(
     t
 }
 
-/// A synthetic resolver function: its first parameter flows into `dst`.
-pub fn resolver(m: &mut Model, dst: NodeId) -> Tok {
+/// ToObject(`v`) (ECMA-262 7.1.18) into a new node (`to_object_into`).
+pub(crate) fn to_object(m: &mut Model, v: NodeId, wrapper: Tok) -> NodeId {
+    let w = m.node_l("to-object-wrapper");
+    m.add_tok(w, wrapper);
+    let to = m.node_l("to-object");
+    to_object_into(m, v, wrapper, w, to);
+    to
+}
+
+/// `to` ⊇ ToObject(`v`) (ECMA-262 7.1.18): `v`'s objects as they are
+/// (`Cons::Objects`), and `wrapper` (a token of the `Object()` family,
+/// which node `w` holds) once `v` may hold a primitive but `undefined` /
+/// `null` (those throw). The primitive itself never reaches `to`. A String
+/// wrapper's own indices hold its characters: the wrapper's elements are
+/// strings.
+pub(crate) fn to_object_into(m: &mut Model, v: NodeId, wrapper: Tok, w: NodeId, to: NodeId) {
+    let fa = m.field_any(wrapper);
+    m.add_prim(fa, prim::STR);
+    m.cons(v, Cons::Objects { dst: to });
+    m.cons(
+        v,
+        Cons::Guard {
+            test: guard::BOXED,
+            from: w,
+            dst: to,
+        },
+    );
+}
+
+/// A synthetic resolve function of the promise whose settled value is
+/// `dst` (ECMA-262 27.2.1.3.2): its first parameter is adopted into `dst`
+/// (`adopt`), so a thenable passes on what it resolves, never itself.
+pub fn resolver(m: &mut Model, by: CallId, dst: NodeId) -> Tok {
+    if !m.reach_thenable {
+        return plain_resolver(m, dst);
+    }
     if let Some(&t) = m.resolvers.get(&dst) {
         return t;
     }
+    // Memoized before `adopt`, which asks for this resolver again.
+    let (tok, p) = settle_fn(m, "<resolver>", dst, false);
+    m.resolvers.insert(dst, tok);
+    adopt(m, by, p, dst);
+    tok
+}
+
+/// A synthetic reject function (27.2.1.3.1): its first parameter is the
+/// reason, as it is (a reject function adopts nothing).
+pub fn rejecter(m: &mut Model, dst: NodeId) -> Tok {
+    if !m.reach_thenable {
+        return plain_resolver(m, dst);
+    }
+    if let Some(&t) = m.rejecters.get(&dst) {
+        return t;
+    }
+    let (tok, _) = settle_fn(m, "<rejecter>", dst, true);
+    m.rejecters.insert(dst, tok);
+    tok
+}
+
+/// `PERRY_FACTS_REACH_THENABLE=0` (`reach::thenable`): the previous model,
+/// one synthetic function for both sides whose first parameter flows into
+/// `dst` as it is.
+pub(crate) fn plain_resolver(m: &mut Model, dst: NodeId) -> Tok {
+    if let Some(&t) = m.resolvers.get(&dst) {
+        return t;
+    }
+    let (tok, _) = settle_fn(m, "<resolver>", dst, true);
+    m.resolvers.insert(dst, tok);
+    tok
+}
+
+/// A resolve or reject function's token and first parameter; `plain`: the
+/// parameter flows into `dst` as it is.
+fn settle_fn(m: &mut Model, name: &str, dst: NodeId, plain: bool) -> (Tok, NodeId) {
     let fx = m.funcs.len() as FnIdx;
     let tok = m.tok(TokKind::Func(fx, NO_CTX));
     let this = m.node_l("this(resolver)");
     let ret = m.node_l("ret(resolver)");
     let args_all = m.node_l("args(resolver)");
     let p = m.node_l("resolver-param");
-    m.edge(p, dst);
+    if plain {
+        m.edge(p, dst);
+    }
     m.funcs.push(FuncInfo {
         #[cfg(test)]
         body_packet: Default::default(),
         module: 0,
         func_id: u32::MAX,
         raise: u32::MAX,
-        name: "<resolver>".into(),
+        name: name.into(),
         params: vec![p],
         rest: None,
         this,
@@ -600,8 +707,7 @@ pub fn resolver(m: &mut Model, dst: NodeId) -> Tok {
         forwarded: false,
     });
     m.add_prim(ret, prim::UNDEF);
-    m.resolvers.insert(dst, tok);
-    tok
+    (tok, p)
 }
 
 /// Another unit's accessor on a shared object (`Model::replay_shared`), a
@@ -664,7 +770,11 @@ fn promise_value(m: &mut Model, p: Tok) -> NodeId {
 /// `v` adopted by a promise: the value, the settled value of promise
 /// tokens in it, and whatever a thenable's `then` resolves.
 pub fn adopt(m: &mut Model, by: CallId, v: NodeId, dst: NodeId) {
-    m.edge(v, dst);
+    if m.reach_thenable {
+        m.cons(v, Cons::Fulfil { dst });
+    } else {
+        m.edge(v, dst);
+    }
     let a = m.atom("#value");
     m.cons(
         v,
@@ -673,9 +783,9 @@ pub fn adopt(m: &mut Model, by: CallId, v: NodeId, dst: NodeId) {
             dst,
         },
     );
-    let res = resolver(m, dst);
+    let res = resolver(m, by, dst);
     let thrown = m.thrown;
-    let rej = resolver(m, thrown);
+    let rej = rejecter(m, thrown);
     let rn = m.node_l("resolver");
     m.add_tok(rn, res);
     let jn = m.node_l("rejecter");
@@ -719,14 +829,22 @@ pub(crate) enum NativeFamily {
     /// solve's RegExp call model describes (`regexp_described`): the one
     /// predicate both read.
     RegExp,
+    /// Buffers. Only the methods the realm declares OWN on
+    /// `Buffer.prototype` (`buffer_own_method`: the numeric readers,
+    /// `equals`): the runtime's Buffer name dispatch runs them while that
+    /// prototype's own shadow bit is clear, which a write onto it sets.
+    Buffer,
 }
 
 /// Does the intrinsic chain of every value of `fam` define `name` before
 /// the program writes anything (`members`): a function for a call (`call`),
 /// a function or a data member for a read? `constructor` and `__proto__`
 /// are no member here (their value is no builtin function or primitive).
-pub(crate) fn native_described(fam: NativeFamily, name: &str, call: bool) -> bool {
+pub(crate) fn native_described(m: &Model, fam: NativeFamily, name: &str, call: bool) -> bool {
     let mem = match fam {
+        // A method call only: a read of the member is the runtime's bound
+        // closure, no value the description names.
+        NativeFamily::Buffer => return call && buffer_own_method(m, name),
         NativeFamily::Str => members::intrinsic_member(Family::Str, name),
         NativeFamily::Array => members::intrinsic_member(Family::Array, name),
         NativeFamily::Collection(what) => members::collection_member(what, name),
@@ -737,6 +855,16 @@ pub(crate) fn native_described(fam: NativeFamily, name: &str, call: bool) -> boo
         Some(Mem::Prim(_)) => !call,
         _ => false,
     }
+}
+
+/// A method the realm declares an OWN data member of `Buffer.prototype`
+/// (its native, no accessor). A method past it is %TypedArray%'s, which
+/// another prototype's writes decide: no Buffer NativeMember.
+fn buffer_own_method(m: &Model, name: &str) -> bool {
+    m.declarations
+        .named("Buffer.prototype", m)
+        .and_then(|h| m.declarations.property(h, name, m))
+        .is_some_and(|p| p.native.is_some() && p.get.is_none() && p.set.is_none())
 }
 
 /// `Object.prototype`'s intrinsic description (`members`) lacks `name`
@@ -846,6 +974,15 @@ pub(crate) fn locked_chain_read(m: &Model, t: Tok, a: Atom) -> bool {
     lock_family(m, t).is_some_and(|f| members::locked_read(f, what, &m.atoms[a as usize]))
 }
 
+/// The read of named key `a` on builtin receiver `t` is final
+/// (`locked_chain_read`) and its intrinsic chain defines `a`: a locked
+/// native member is found, never the chain end's `undefined`
+/// (`Promise.prototype.then` on a promise).
+pub(crate) fn locked_chain_defines(m: &Model, t: Tok, a: Atom) -> bool {
+    locked_chain_read(m, t, a)
+        && lock_family(m, t).is_some_and(|f| members::member(f, &m.atoms[a as usize]).is_some())
+}
+
 /// Is a read of `name` on the declared intrinsic prototype `holder` final?
 /// `holder` is its realm-table name (`%GeneratorPrototype%`,
 /// `%MapIteratorPrototype%` …, the same declaration the runtime seals) and
@@ -928,12 +1065,16 @@ pub(crate) fn native_locked(m: &Model, fam: NativeFamily, a: Atom) -> bool {
         // predicate for a RegExp object).
         NativeFamily::RegExp => members::image_locked_prototype("RegExp")
             .is_some_and(|holder| image_member(m, holder, name)),
+        // `Buffer.prototype` is a host prototype the program may write: its
+        // writes are obligation 4's (`derive::builtin_protos_unwritten`).
+        NativeFamily::Buffer => false,
     }
 }
 
 /// The opaque builtin function value; in explain mode, counted by the
 /// arm that minted it (`perry: wpfacts explain: builtin-fn minted`).
 fn builtin_fn(m: &mut Model, why: &'static str) -> Tok {
+    crate::family_reach::generic(m, why);
     if m.explain {
         *m.bf_mints.entry(why).or_insert(0) += 1;
     }
@@ -942,6 +1083,47 @@ fn builtin_fn(m: &mut Model, why: &'static str) -> Tok {
 
 /// Resolve the member's object reference before interning its token. The
 /// receiver family locates the holder, but is never part of value identity.
+/// The realm prototype a builtin object of family `fam` (`what`) reads its
+/// members from (past a Buffer's own prototype, `member_native`).
+fn realm_holder(m: &Model, fam: Family, what: Option<&'static str>) -> Option<usize> {
+    match what {
+        Some("TypedArray" | "Buffer") => m.declarations.named("%TypedArray%.prototype", m),
+        // Every iterator kind resolves its members as `Iterator.prototype`'s.
+        Some(w) if members::bobj_family(w) == Family::Iterator => {
+            m.declarations.named("Iterator.prototype", m)
+        }
+        // The prototype of an object a declaration made.
+        Some(w) if w.ends_with(".prototype") => m.declarations.named(w, m),
+        Some(w) => m.declarations.named(&format!("{w}.prototype"), m),
+        None => m.declarations.family(fam, m),
+    }
+}
+
+/// Whether the realm declares key `name` an accessor (`accessor` row) where
+/// a builtin object of family `fam` (`what`) reads it: a load runs the
+/// getter, so its value is the getter's result, never a function of the
+/// chain (`Response.prototype.body`).
+fn realm_accessor(m: &Model, fam: Family, what: Option<&'static str>, name: &str) -> bool {
+    let own = (what == Some("Buffer"))
+        .then(|| m.declarations.named("Buffer.prototype", m))
+        .flatten();
+    [own, realm_holder(m, fam, what)]
+        .into_iter()
+        .flatten()
+        .find_map(|h| m.declarations.property(h, name, m))
+        .is_some_and(|p| p.get.is_some())
+}
+
+/// What a load of an accessor whose getter the realm does not declare
+/// (`realm_accessor`; a declared one: `effects::getter_load`) reads: the
+/// host's result of the getter, unknown.
+fn undeclared_getter_result(m: &mut Model, dst: NodeId) {
+    m.add_top(dst, |_| {
+        "result of a getter the realm does not declare".into()
+    });
+    m.add_prim(dst, prim::ALL);
+}
+
 fn member_native(m: &Model, fam: Family, what: Option<&'static str>, name: &str) -> Option<Native> {
     // A Buffer's own prototype first: past it the chain is a typed array's.
     if what == Some("Buffer") {
@@ -950,7 +1132,10 @@ fn member_native(m: &Model, fam: Family, what: Option<&'static str>, name: &str)
             .named("Buffer.prototype", m)
             .and_then(|h| m.declarations.property(h, name, m))
         {
-            return p.native.map(|identity| Native::Member { identity, holder: None });
+            return p.native.map(|identity| Native::Member {
+                identity,
+                holder: None,
+            });
         }
     }
     // The prototype of an object a declaration made
@@ -963,17 +1148,12 @@ fn member_native(m: &Model, fam: Family, what: Option<&'static str>, name: &str)
             .named(w, m)
             .and_then(|h| m.declarations.property(h, name, m))?
             .native?;
-        return Some(Native::Member { identity, holder: None });
+        return Some(Native::Member {
+            identity,
+            holder: None,
+        });
     }
-    let holder = match what {
-        Some("TypedArray" | "Buffer") => m.declarations.named("%TypedArray%.prototype", m),
-        // Every iterator kind resolves its members as `Iterator.prototype`'s.
-        Some(w) if members::bobj_family(w) == Family::Iterator => {
-            m.declarations.named("Iterator.prototype", m)
-        }
-        Some(w) => m.declarations.named(&format!("{w}.prototype"), m),
-        None => m.declarations.family(fam, m),
-    }?;
+    let holder = realm_holder(m, fam, what)?;
     let identity = m
         .declarations
         .property(holder, name, m)
@@ -985,7 +1165,10 @@ fn member_native(m: &Model, fam: Family, what: Option<&'static str>, name: &str)
             let object = m.declarations.family(Family::Object, m)?;
             m.declarations.property(object, name, m)?.native
         })?;
-    Some(Native::Member { identity, holder: None })
+    Some(Native::Member {
+        identity,
+        holder: None,
+    })
 }
 
 /// Canonical coordinates are resolved with the value's shape, once.
@@ -1337,6 +1520,17 @@ pub(crate) fn builtin_proto_value(m: &mut Model, ns: Option<BuiltinNs>, dst: Nod
     }
 }
 
+/// An ordinary object a builtin makes (`members::box_chain` Object: a
+/// `JSON.parse` object, a property descriptor, an `Object.fromEntries`
+/// result): its chain is `Object.prototype`, or a prototype the program
+/// gave it, never another builtin prototype.
+pub(crate) fn ordinary_box(m: &Model, t: Tok) -> bool {
+    matches!(m.toks[t as usize], TokKind::Obj(tm, _)
+        if matches!(m.tmpls[tm as usize].kind, TmplKind::BObj { what, .. }
+            if members::bobj_family(what) == Family::Box
+                && members::box_chain(what) == members::BoxChain::Object))
+}
+
 fn is_site_builtin(m: &Model, t: Tok) -> bool {
     matches!(m.toks[t as usize], TokKind::Obj(tm, _)
         if matches!(m.tmpls[tm as usize].kind, TmplKind::BObj { .. }))
@@ -1485,7 +1679,10 @@ pub(crate) fn native_own_load(
             } else {
                 m.native_missing.push((holder, a, NativeMiss::Load(dst)));
                 if let Some(identity) = value {
-                    let value = m.tok(TokKind::BuiltinFn(Native::Member { identity, holder: None }));
+                    let value = m.tok(TokKind::BuiltinFn(Native::Member {
+                        identity,
+                        holder: None,
+                    }));
                     m.add_tok(dst, value);
                 } else {
                     opaque_member(m, dst);
@@ -1507,7 +1704,10 @@ pub(crate) fn native_constructible(m: &Model, t: Tok) -> bool {
 /// Read the function reference from this receiver's declared property shape.
 pub(crate) fn namespace_native(m: &Model, t: Tok, ns: BuiltinNs, name: &str) -> Option<Native> {
     if let Some(identity) = m.native_property(t, name).and_then(|p| p.native) {
-        return Some(Native::Member { identity, holder: None });
+        return Some(Native::Member {
+            identity,
+            holder: None,
+        });
     }
     matches!(members::ns_member(ns, name), Some(Some(Mem::Fn)))
         .then(|| member_native(m, members::ns_chain(ns), None, name))
@@ -1538,7 +1738,7 @@ pub(crate) fn native_namespace_call(
     {
         m.diagnostic_callee(call, t);
         let prev = std::mem::replace(&mut m.cur_this, this_tok);
-        m.with_b(|m| ns_method_inner(m, ns, Some(name), call, true));
+        m.with_native(call, |m| ns_method_inner(m, ns, Some(name), call, true));
         m.cur_this = prev;
     }
     true
@@ -1663,6 +1863,7 @@ fn console_args(m: &mut Model, call: CallId) {
 }
 
 fn ns_method(m: &mut Model, ns: BuiltinNs, name: Option<&str>, call: CallId) {
+    crate::family_reach::namespace(m, ns, name);
     ns_method_inner(m, ns, name, call, false)
 }
 
@@ -1858,7 +2059,15 @@ fn ns_method_inner(
                 m.edge(o, ret);
             }
         }
-        (BuiltinNs::Object, "isFrozen" | "isSealed" | "isExtensible" | "is" | "hasOwn") => {
+        (BuiltinNs::Object, "is") => {
+            for i in 0..2 {
+                if let Some(a) = arg(m, call, i) {
+                    m.identity(a, IdentityRoute::ObjectIs);
+                }
+            }
+            ret_prim(m, call, prim::BOOL);
+        }
+        (BuiltinNs::Object, "isFrozen" | "isSealed" | "isExtensible" | "hasOwn") => {
             ret_prim(m, call, prim::BOOL);
         }
         (BuiltinNs::Object, "create") => {
@@ -1879,7 +2088,11 @@ fn ns_method_inner(
         }
         (BuiltinNs::Object, "assign") => {
             let c = m.calls[call as usize].clone();
-            if let Some(&t) = c.args.first() {
+            if let Some(&target) = c.args.first() {
+                // ECMA-262 20.1.2.1 step 1: `to` is ToObject(target), the
+                // result; the sources copy into it.
+                let wrapper = site_tmpl(m, call, "Object()");
+                let t = to_object(m, target, wrapper);
                 let site = m.anon_post_site("Object.assign (value call)");
                 for &s in c.args.iter().skip(1) {
                     m.cons(s, Cons::Spread { into: t, site });
@@ -1987,6 +2200,11 @@ fn ns_method_inner(
                         proto: Protocol::Any,
                     },
                 );
+            }
+            // A replacer function is called back (`json_replacer_calls`).
+            if m.reach_json_replacer && (c.args.len() > 1 || !c.spread.is_empty()) {
+                let holder = site_tmpl(m, call, "json");
+                m.json_replacer_builtin_call(call, holder);
             }
             ret_prim(m, call, prim::STR | prim::UNDEF);
         }
@@ -2200,141 +2418,132 @@ pub(crate) fn solved_namespace_call(module: &str, method: &str) -> Option<&'stat
         .map(|e| e.name)
 }
 
+/// What `require(spec)` returns for one value of its specifier (R-SPEC):
+/// `spec` a string constant, resolved as the loader resolves it (Node
+/// resolves builtins first, then paths), or `None`, a value no constant
+/// spells (any string, a token, ⊤), which may name anything. A literal call
+/// is the one-value case; `Cons::RequireSpec` runs it per value that reaches
+/// a computed specifier.
+pub(crate) fn require_by_spec(m: &mut Model, call: CallId, spec: Option<Atom>) {
+    let name = spec.map(|a| m.atoms[a as usize].clone());
+    // `require('module')` is the node:module namespace, which hands out
+    // `Module._cache`: the cache reaches code nothing models. A value no
+    // constant spells may name it too.
+    if name
+        .as_deref()
+        .is_none_or(|s| matches!(s, "module" | "node:module"))
+    {
+        let r = m.reason("node:module namespace hands out Module._cache");
+        let cache = m.cjs_cache;
+        m.sink_node(cache, r);
+    }
+    // A compiled module named by a constant path: its exports (the
+    // registry record's `exports`, as `require.cache[path]` holds).
+    let rec = spec.and_then(|a| m.cjs_paths.get(&a)).copied();
+    if m.explain && rec.is_none() {
+        let known: Vec<String> = m
+            .cjs_paths
+            .keys()
+            .map(|a| m.atoms[*a as usize].clone())
+            .collect();
+        eprintln!("perry: wpfacts explain: require call spec {name:?} not in {known:?}");
+    }
+    if let Some(rec) = rec {
+        let ret = m.calls[call as usize].ret;
+        let ea = m.atom("exports");
+        // As requirePathModule: the named path, or a record the
+        // runtime published under a path it computed.
+        let unknown = m.cjs_unknown;
+        // The path node holds what `require` returns.
+        m.edge(rec, ret);
+        m.cons(
+            unknown,
+            Cons::Load {
+                key: Key::Named(ea),
+                dst: ret,
+            },
+        );
+        m.add_prim(ret, prim::UNDEF);
+        return;
+    }
+    // The runtime loader never interprets code: a specifier no compiled
+    // path resolves names a registered record (its live exports or a raw
+    // publication), a native module namespace, a manifest addon or parsed
+    // JSON. Only the last three are opaque.
+    // All of it only once a specifier reaches the call: a shared loader
+    // body no computed specifier reaches yields nothing.
+    implicit_args(m, call, "require specifier", Protocol::ToPrimitive);
+    let ret = m.calls[call as usize].ret;
+    // Besides the opaque ⊤, the result is a registered record's exports, as
+    // `requirePathModule` reads them: a ⊤ callee runs only what escaped, and
+    // registering a module's exports does not escape them. A relative
+    // literal (`createRequire(import.meta.url)("./l.cjs")`) names no
+    // registered path either. Per unit the registry is another unit's
+    // value, ⊤, as in `requirePathModule`.
+    if !m.unit_mode {
+        let reg = m.cjs_union;
+        m.cons(reg, Cons::CjsPublish { dst: ret });
+    }
+    // The loader resolves builtins first: the result is also the builtin
+    // module object of each name the value may be, a constant's own or,
+    // for a value no constant spells, every one. A member read then
+    // resolves per key.
+    let names: Vec<&'static str> = match name.as_deref() {
+        Some(s) => builtin_module_names()
+            .filter(|n| same_builtin(n, s))
+            .collect(),
+        None => builtin_module_names().collect(),
+    };
+    let mods = m.node_l("require: builtin module objects");
+    for n in names {
+        if let Some(t) = builtin_module_tok(m, n) {
+            m.add_tok(mods, t);
+        }
+    }
+    if let Some(a0) = m.calls[call as usize].args.first().copied() {
+        m.cons(
+            a0,
+            Cons::TopIfAny {
+                dst: ret,
+                from: mods,
+                reason: None,
+            },
+        );
+    }
+    // It caches the registry records it loads.
+    let r = m.reason("module loaded by a computed specifier");
+    let (cache, _) = require_parts(m);
+    let fa = m.field_any(cache);
+    let reg = m.cjs_union;
+    m.edge(reg, fa);
+    if let Some(a0) = m.calls[call as usize].args.first().copied() {
+        m.cons(
+            a0,
+            Cons::TopIfAny {
+                dst: ret,
+                from: ret,
+                reason: Some(r),
+            },
+        );
+    }
+}
+
 pub fn call_builtin_ns(m: &mut Model, ns: BuiltinNs, call: CallId) {
+    crate::family_reach::namespace(m, ns, None);
     m.diagnostic_builtin(call, |_| format!("{ns:?}"));
     match ns {
         BuiltinNs::Require => {
             // The path registry may run a lazy module body inside the call.
             let (lazy, region) = (m.lazy_raise, m.calls[call as usize].region);
             m.edge(lazy, region);
-            // `require('module')` is the node:module namespace, which hands
-            // out `Module._cache`: the cache reaches code nothing models. A
-            // specifier that is no literal may name it too (the loader
-            // resolves builtins first), once a specifier reaches the call.
-            let lit = m
-                .call_lit
-                .get(&call)
-                .map(|a| matches!(m.atoms[*a as usize].as_str(), "module" | "node:module"));
-            let spec = m.calls[call as usize].args.first().copied();
-            if lit.unwrap_or(spec.is_some()) {
-                let r = m.reason("node:module namespace hands out Module._cache");
-                let cache = m.cjs_cache;
-                match (lit, spec) {
-                    (None, Some(a0)) => {
-                        let s = m.node_l("require(computed) may be node:module");
-                        m.sink_node(s, r);
-                        m.cons(
-                            a0,
-                            Cons::TopIfAny {
-                                dst: s,
-                                from: cache,
-                                reason: None,
-                            },
-                        );
-                    }
-                    _ => m.sink_node(cache, r),
-                }
-            }
-            // A compiled module named by a constant path: its exports (the
-            // registry record's `exports`, as `require.cache[path]` holds).
-            let rec = m
-                .call_lit
-                .get(&call)
-                .and_then(|a| m.cjs_paths.get(a))
-                .copied();
-            if m.explain && rec.is_none() {
-                let lit = m.call_lit.get(&call).map(|a| m.atoms[*a as usize].clone());
-                let known: Vec<String> = m
-                    .cjs_paths
-                    .keys()
-                    .map(|a| m.atoms[*a as usize].clone())
-                    .collect();
-                eprintln!("perry: wpfacts explain: require call lit {lit:?} not in {known:?}");
-            }
-            match rec {
-                Some(rec) => {
-                    let ret = m.calls[call as usize].ret;
-                    let ea = m.atom("exports");
-                    // As requirePathModule: the named path, or a record the
-                    // runtime published under a path it computed.
-                    let unknown = m.cjs_unknown;
-                    // The path node holds what `require` returns.
-                    m.edge(rec, ret);
-                    m.cons(
-                        unknown,
-                        Cons::Load {
-                            key: Key::Named(ea),
-                            dst: ret,
-                        },
-                    );
-                    m.add_prim(ret, prim::UNDEF);
-                }
+            // R-SPEC: the call resolves per value of its specifier. A
+            // literal is the one-value case; a computed specifier resolves
+            // each value that reaches it (`Cons::RequireSpec`).
+            match m.call_lit.get(&call).copied() {
+                Some(a) => require_by_spec(m, call, Some(a)),
                 None => {
-                    // The runtime loader never interprets code: a computed
-                    // specifier resolves to a registered record (its live
-                    // exports or a raw publication), a native module
-                    // namespace, a manifest addon or parsed JSON. Only the
-                    // last three are opaque.
-                    // All of it only once a specifier reaches the call: a
-                    // shared loader body no computed specifier reaches
-                    // yields nothing.
-                    implicit_args(m, call, "require specifier", Protocol::ToPrimitive);
-                    let ret = m.calls[call as usize].ret;
-                    // Besides the opaque ⊤, the result is a registered
-                    // record's exports, as `requirePathModule` reads them: a
-                    // ⊤ callee runs only what escaped, and registering a
-                    // module's exports does not escape them. A relative
-                    // literal (`createRequire(import.meta.url)("./l.cjs")`)
-                    // names no registered path either. Per unit the registry
-                    // is another unit's value, ⊤, as in `requirePathModule`.
-                    if !m.unit_mode {
-                        let reg = m.cjs_union;
-                        m.cons(reg, Cons::CjsPublish { dst: ret });
-                    }
-                    // The loader resolves builtins first: the result is also
-                    // the builtin module object of each name the specifier
-                    // may be, a literal's own or, for a computed specifier,
-                    // every one. A member read then resolves per key.
-                    let names: Vec<&'static str> = match m.call_lit.get(&call) {
-                        Some(a) => {
-                            let s = m.atoms[*a as usize].clone();
-                            builtin_module_names()
-                                .filter(|n| same_builtin(n, &s))
-                                .collect()
-                        }
-                        None => builtin_module_names().collect(),
-                    };
-                    let mods = m.node_l("require: builtin module objects");
-                    for n in names {
-                        if let Some(t) = builtin_module_tok(m, n) {
-                            m.add_tok(mods, t);
-                        }
-                    }
                     if let Some(a0) = m.calls[call as usize].args.first().copied() {
-                        m.cons(
-                            a0,
-                            Cons::TopIfAny {
-                                dst: ret,
-                                from: mods,
-                                reason: None,
-                            },
-                        );
-                    }
-                    // It caches the registry records it loads.
-                    let r = m.reason("module loaded by a computed specifier");
-                    let (cache, _) = require_parts(m);
-                    let fa = m.field_any(cache);
-                    let reg = m.cjs_union;
-                    m.edge(reg, fa);
-                    if let Some(a0) = m.calls[call as usize].args.first().copied() {
-                        m.cons(
-                            a0,
-                            Cons::TopIfAny {
-                                dst: ret,
-                                from: ret,
-                                reason: Some(r),
-                            },
-                        );
+                        m.cons(a0, Cons::RequireSpec { call });
                     }
                 }
             }

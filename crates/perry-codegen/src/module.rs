@@ -21,6 +21,8 @@ use crate::native_value::NativeRepRecord;
 use crate::types::LlvmType;
 
 mod linkage;
+mod unit_graph;
+mod unit_locality;
 pub(crate) use linkage::*;
 mod metadata;
 pub use metadata::BufferAliasScopes;
@@ -598,13 +600,19 @@ impl LlModule {
             })
             .map(|f| f.name.clone())
             .collect();
-        let bodies: Vec<_> = self
+        let mut bodies: Vec<_> = self
             .fn_infos
             .borrow()
             .entry_bodies(&exported)
             .into_iter()
             .filter(|body| self.has_function(body))
             .collect();
+        // Module frames append to the existing callable inventory so their
+        // publication cannot change a callable's owner ordinal.
+        bodies.sort_by_key(|body| self.fn_infos.borrow().facts(body).module_frame);
+        let publishes_callables = bodies
+            .iter()
+            .any(|body| !self.fn_infos.borrow().facts(body).module_frame);
         // The bodies the runtime names in a stack trace (a published info
         // with a non-empty name) are the JS text section's functions.
         let named: std::collections::HashSet<&str> = bodies
@@ -622,9 +630,9 @@ impl LlModule {
         for function in &mut self.functions {
             function.js_text = named.contains(function.name.as_str());
         }
-        if bodies.is_empty() {
-            // Publishing an empty descriptor cannot make any metadata visible.
-            // Omit the dead registration at the same final inventory boundary.
+        if !publishes_callables {
+            // Stack-only records are read through static image bounds on demand;
+            // they do not create a startup registration for an empty owner.
             for function in &mut self.functions {
                 for block in function.blocks_mut() {
                     block.insts_mut().retain(|inst| !matches!(inst, crate::inst::LlInst::Call { callee, .. } if callee == "js_register_function_metadata"));
@@ -1431,32 +1439,15 @@ impl LlModule {
             })
         };
         let n = n.min(funcs.len());
-        // Balance units by estimated byte size, not function count: minified
-        // bundles have a few enormous functions (a 68MB IIFE in the cli.js
-        // case), so contiguous count-chunking can clump them into one outsized
-        // unit whose LLVM optimization time dominates. Greedy largest-first bin-packing
-        // assigns each function to the currently-smallest unit, isolating big
-        // functions and keeping the rest even. (A single function larger than
-        // total/n is irreducible here; that requires structured outlining inside
-        // codegen, not something inter-function partitioning can divide.)
+        // Which unit each function compiles in: `module/unit_locality.rs`.
         let sizes: Vec<usize> = funcs
             .iter()
             .map(|f| f.borrow().estimated_ir_bytes())
             .collect();
-        let mut order: Vec<usize> = (0..funcs.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse(sizes[i]));
-        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); n];
-        let mut bucket_bytes = vec![0usize; n];
-        for &i in &order {
-            let target = bucket_bytes
-                .iter()
-                .enumerate()
-                .min_by_key(|&(_, &b)| b)
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-            buckets[target].push(i);
-            bucket_bytes[target] += sizes[i];
-        }
+        let buckets = {
+            let refs: Vec<&LlFunction> = funcs.iter().map(|f| f.borrow()).collect();
+            unit_graph::assign_units(&self.symbol_prefix, &refs, &sizes, n)
+        };
         let bucket_names: Vec<Vec<String>> = buckets
             .iter()
             .map(|bucket| {
@@ -1729,7 +1720,7 @@ impl LlModule {
             })
             .collect();
 
-        let mut parts = Vec::with_capacity(n);
+        let mut parts = Vec::with_capacity(buckets.len());
         for (bi, items) in bucket_items.into_iter().enumerate() {
             let defined: HashSet<&str> = bucket_names[bi].iter().map(String::as_str).collect();
             let mut pre = String::new();

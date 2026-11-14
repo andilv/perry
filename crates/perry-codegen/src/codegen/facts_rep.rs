@@ -12,21 +12,20 @@
 //!
 //! `PERRY_WP_REP_P1=0` restores the collectors' decision everywhere.
 //!
-//! Phase P3 (§10.5): a proven Number is a canonical double. Proven code never
-//! creates an INT32 box, and an INT32 box from native code reaches only a ⊤
-//! node, never a proven one, so a proven Number's reader does not test the
-//! INT32 tag. `PERRY_WP_REP_P3=0` restores the tag test.
+//! Phase P3 (§10.5): a Number is a canonical double, its one encoding. No
+//! reader tests for another.
 //!
 //! Phase P2 (§10.4), first slice: a parameter is a local like any other, so
 //! one the facts give `I32` takes the canonical-i32 slot at entry
-//! (`bind_params`). Its arguments are already a plain double there
-//! (`facts_number_locals::emit_entry_number`), and the I32 interval is
+//! (`bind_params`). Its arguments are already a plain double there, and the I32 interval is
 //! exact, so the slot's value is one `fptosi`. The calling convention does
-//! not change yet. A method call whose every callee returns only Numbers
+//! not change yet. A call whose every callee returns only Numbers
 //! (wpfacts `ModuleBindings::number_calls`, the call's return
-//! representation) is a Number: a canonical double (P3), so its readers do
-//! not test the INT32 tag (`number_call`). `PERRY_WP_REP_P2=0` keeps
-//! parameters in their double slots and call results unproven.
+//! representation) is a Number (`number_call`): a method call, and a direct
+//! call of a function or of any other callee value
+//! (`PERRY_FACTS_DIRECT_NUMBER_CALLS=0` keeps those unproven).
+//! `PERRY_WP_REP_P2=0` keeps parameters in their double slots and call
+//! results unproven.
 
 use std::collections::HashSet;
 
@@ -51,17 +50,6 @@ pub(crate) fn local(ctx: &crate::expr::FnCtx<'_>, id: u32) -> Option<FactsRep> {
     ctx.wpfacts.local_reps.get(&id).copied()
 }
 
-/// Phase P3: proven Numbers are canonical doubles (module docs).
-pub(crate) fn canonical_numbers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("PERRY_WP_REP_P3").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    })
-}
-
 /// Phase P2 (module docs).
 pub(crate) fn typed_params() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -73,10 +61,28 @@ pub(crate) fn typed_params() -> bool {
     })
 }
 
-/// The method call whose callee is `callee` is a Number by the facts: a
-/// canonical double (module docs).
-pub(crate) fn number_call(ctx: &crate::expr::FnCtx<'_>, callee: &perry_hir::Expr) -> bool {
-    let Some(byte_offset) = claimed_call(ctx, callee) else {
+/// `PERRY_FACTS_DIRECT_NUMBER_CALLS=0` (`off`, `false`): only a method
+/// call's result is a Number by the facts; the result of a direct call of a
+/// function (`f(a)`), or of any other callee value, stays unproven.
+pub(crate) fn direct_number_calls() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_FACTS_DIRECT_NUMBER_CALLS").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
+/// The call through `callee`, whose own source offset is `call_offset`, is
+/// a Number by the facts: a canonical double (module docs). A method call
+/// is keyed by its member offset, every other call by the call's.
+pub(crate) fn number_call(
+    ctx: &crate::expr::FnCtx<'_>,
+    callee: &perry_hir::Expr,
+    call_offset: u32,
+) -> bool {
+    let Some(byte_offset) = claimed_call(ctx, callee, call_offset) else {
         return false;
     };
     crate::verify_facts::consumed(
@@ -87,24 +93,29 @@ pub(crate) fn number_call(ctx: &crate::expr::FnCtx<'_>, callee: &perry_hir::Expr
     true
 }
 
-/// The site offset of the method call through `callee` when the facts
-/// prove it a Number call and this body may use that proof.
-fn claimed_call(ctx: &crate::expr::FnCtx<'_>, callee: &perry_hir::Expr) -> Option<u32> {
-    let perry_hir::Expr::PropertyGet { byte_offset, .. } = callee else {
-        return None;
+/// The site offset of the call through `callee` when the facts prove it a
+/// Number call and this body may use that proof.
+fn claimed_call(
+    ctx: &crate::expr::FnCtx<'_>,
+    callee: &perry_hir::Expr,
+    call_offset: u32,
+) -> Option<u32> {
+    let byte_offset = match callee {
+        perry_hir::Expr::PropertyGet { byte_offset, .. } => *byte_offset,
+        _ if direct_number_calls() => call_offset,
+        _ => return None,
     };
     let usable = typed_params()
-        && canonical_numbers()
         && !ctx.wpfacts_off
         && !ctx.wpfacts.interp_guard
-        && *byte_offset != 0
-        && ctx.wpfacts.number_calls.contains(byte_offset);
-    usable.then_some(*byte_offset)
+        && byte_offset != 0
+        && ctx.wpfacts.number_calls.contains(&byte_offset);
+    usable.then_some(byte_offset)
 }
 
 /// Check mode: `value`, the result of the call through `callee` that
-/// `number_call` proves a Number, is a canonical double, neither a tagged
-/// value nor an INT32 box. A miss reports the false proof and exits 86.
+/// `number_call` proves a Number, is a plain double, not a tagged value. A
+/// miss reports the false proof and exits 86.
 pub(crate) fn witness_number_call(
     ctx: &mut crate::expr::FnCtx<'_>,
     callee: &perry_hir::Expr,
@@ -113,7 +124,9 @@ pub(crate) fn witness_number_call(
     if !crate::verify_facts::enabled() {
         return;
     }
-    let Some(byte_offset) = claimed_call(ctx, callee) else {
+    // The call being lowered is the innermost `with_direct_call`.
+    let call_offset = super::signature_entry::direct_call_offset();
+    let Some(byte_offset) = claimed_call(ctx, callee, call_offset) else {
         return;
     };
     crate::verify_facts::covered(

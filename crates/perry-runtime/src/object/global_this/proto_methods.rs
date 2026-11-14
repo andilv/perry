@@ -198,10 +198,20 @@ fn install_buffer_proto_getter(
 /// spec descriptor. Mirrors `collection_proto_thunks::install_collection_iterator_symbol`;
 /// kept here because `Array.prototype` is populated in this module.
 fn install_builtin_iterator_symbol(proto_obj: *mut ObjectHeader, value: f64) {
+    install_builtin_well_known_symbol_method(proto_obj, "iterator", value);
+}
+
+/// `proto[Symbol.<symbol_name>] = value` as a method alias (`{ writable,
+/// configurable }`): the same function object as the named member.
+pub(crate) fn install_builtin_well_known_symbol_method(
+    proto_obj: *mut ObjectHeader,
+    symbol_name: &str,
+    value: f64,
+) {
     if proto_obj.is_null() || value.to_bits() == crate::value::TAG_UNDEFINED {
         return;
     }
-    let iter = crate::symbol::well_known_symbol("iterator");
+    let iter = crate::symbol::well_known_symbol(symbol_name);
     if iter.is_null() {
         return;
     }
@@ -441,7 +451,16 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 crate::fn_info!(#[realm(Array.prototype.toString)] export crate::object::global_this::array_error::array_prototype_to_string_thunk, 0; with_declared(0), with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                 0,
             );
-            install_noop_proto_methods(proto_obj, &[("toLocaleString", realm_noop_tolocalestring_0_metadata!(length)), ("toSpliced", realm_noop_tospliced_2_metadata!(length))]);
+            install_noop_proto_methods(proto_obj, &[("toLocaleString", realm_noop_tolocalestring_0_metadata!(length))]);
+            // A real thunk: the no-op one re-dispatched `toSpliced` by name on
+            // `this` and answered `{}` for every receiver that is no plain
+            // Array (an Array-subclass instance, an array-like, a Proxy).
+            install_proto_method(
+                proto_obj,
+                "toSpliced",
+                crate::fn_info!(#[realm(Array.prototype.toSpliced, spec = {length = 2}, emit = metadata(realm_array_prototype_to_spliced_metadata))] export native_args crate::object::global_this::array_error::array_prototype_to_spliced_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                realm_array_prototype_to_spliced_metadata!(length),
+            );
             install_proto_method(
                 proto_obj,
                 "entries",
@@ -624,7 +643,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 ),
                 (
                     "indexOf",
-                    crate::fn_info!(#[realm(Array.prototype.indexOf, effects = { reads(this); coerce(arg(1), ToPrimitive); stores(fresh); returns(prim(num)) })] export native_args crate::object::global_this::array_error::array_proto_indexOf_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.indexOf, effects = { reads(this); coerce(arg(1), ToPrimitive); identity(arg(0)); identity(elems(this)); stores(fresh); returns(prim(num)) })] export native_args crate::object::global_this::array_error::array_proto_indexOf_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
                 (
@@ -634,7 +653,7 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
                 ),
                 (
                     "includes",
-                    crate::fn_info!(#[realm(Array.prototype.includes, effects = { reads(this); coerce(arg(1), ToPrimitive); stores(fresh); returns(prim(bool)) })] export native_args crate::object::global_this::array_error::array_proto_includes_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
+                    crate::fn_info!(#[realm(Array.prototype.includes, effects = { reads(this); coerce(arg(1), ToPrimitive); identity(arg(0)); identity(elems(this)); stores(fresh); returns(prim(bool)) })] export native_args crate::object::global_this::array_error::array_proto_includes_thunk, 1; with_flags(crate::closure::FN_BUILTIN | crate::closure::FN_NON_CONSTRUCTOR)),
                     1,
                 ),
             ];
@@ -1237,6 +1256,15 @@ fn make_proto_member_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
         }
         // Node's getters, installed only for a program that reaches navigator.
         "Navigator" => crate::navigator::populate_prototype(proto_obj),
+        // External families (members from their provider), then the fixed tag.
+        "ReadableStream"
+        | "ReadableStreamDefaultController"
+        | "ReadableStreamDefaultReader"
+        | "ReadableByteStreamController"
+        | "ReadableStreamBYOBReader"
+        | "ReadableStreamBYOBRequest" => {
+            unsafe { install_web_builtin_to_string_tag(proto_obj, builtin_name) };
+        }
         "AbortController" | "AbortSignal" | "EventTarget" | "Event" | "CustomEvent"
         | "DOMException" | "MessageEvent" => {
             let _gc = crate::gc::GcSuppressScope::new();

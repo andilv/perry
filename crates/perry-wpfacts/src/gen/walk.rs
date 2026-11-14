@@ -46,6 +46,24 @@ impl<'a> Gen<'a> {
                 self.ctor_phase.insert(tm, ph);
             }
         }
+        // The push-filled births (`push_fills`), with the birth lengths.
+        if self.m.push_fills
+            && self.m.rest_elems
+            && self.m.array_reps
+            && self.arr_lengths
+            && !self.m.unit_mode
+            && !self.m.arr_floor_off
+            // A direct eval in the constructor reaches `this` without naming it.
+            && !self.m.interp_linked
+        {
+            for mi in 0..modules.len() {
+                for c in self.classes_of(mi) {
+                    let fills = crate::push_fills::analyze(c, self.m.push_fill_sabotage);
+                    self.push_fill.add(fills);
+                }
+            }
+            self.m.push_fill_lens = self.push_fill.lens.clone();
+        }
         // Parent leaks close the child's phase at `super()`.
         let tms: Vec<TmplId> = self.ctor_phase.keys().copied().collect();
         for tm in tms.iter().copied() {
@@ -321,11 +339,20 @@ impl<'a> Gen<'a> {
         }
         let saved = (self.order_ok, self.loop_depth);
         (self.order_ok, self.loop_depth) = (true, 0);
+        let list_saved = self.list_enter_body();
         for s in self.init_of(mi as usize) {
             self.stmt(&fx, s);
             self.name_enum_object(mi, s);
         }
         (self.order_ok, self.loop_depth) = saved;
+        self.list_body = list_saved;
+        // Codegen invokes this owned body when the module evaluates. Follow
+        // that explicit FuncId edge only after the owning init is activated.
+        if let Some(id) = self.modules[mi as usize].1.async_init_function {
+            if let Some(&f) = self.mods[mi as usize].funcs.get(&id) {
+                self.m.activate(f, "module-init");
+            }
+        }
         for f in self.functions_of(mi as usize) {
             if self.m.aborted {
                 return;
@@ -387,6 +414,11 @@ impl<'a> Gen<'a> {
         // before the solve, when a parent value not yet settled counts as a
         // leak; `settle_parent_layouts` recomputes these keys once it is.
         let parent_leaks = !self.parent_pending(tm) && self.parent_chain_leaks(tm);
+        // A parent constructor that may add a key out of the layout's order
+        // leaves the instance ordered by an overflow: every key this class
+        // adds then gets an entry there, so none is created by a bare store
+        // (`CtorPhase::disordered`).
+        let parent_disordered = self.parent_chain_disordered(tm);
         // The keys in the order construction defines them
         // (`perry_hir::private_names::construction_entries`): a private
         // field's entry is claimed at its declaration, so it holds the next
@@ -412,6 +444,7 @@ impl<'a> Gen<'a> {
                 // then it is a reservation like a constructor store.
                 perry_hir::ClassFieldOrigin::Definition | perry_hir::ClassFieldOrigin::Capture
                     if parent_leaks
+                        || parent_disordered
                         || phase
                             .as_ref()
                             .is_some_and(|ph| ph.late_fields.contains(&f.name)) =>
@@ -429,7 +462,7 @@ impl<'a> Gen<'a> {
                 let a = self.m.atom(k);
                 push_unique(&mut keys, a);
             }
-            if !parent_leaks {
+            if !parent_leaks && !parent_disordered {
                 for k in &ph.definite {
                     let a = self.m.atom(k);
                     push_unique(&mut definite, a);
@@ -515,6 +548,19 @@ impl<'a> Gen<'a> {
         false
     }
 
+    /// Some constructor up the chain may leave the instance with an
+    /// out-of-order add behind it (`CtorPhase::disordered`).
+    fn parent_chain_disordered(&self, tm: TmplId) -> bool {
+        let mut cur = self.m.tmpls[tm as usize].parent;
+        while let Some(p) = cur {
+            if self.ctor_phase.get(&p).is_some_and(|ph| ph.disordered) {
+                return true;
+            }
+            cur = self.m.tmpls[p as usize].parent;
+        }
+        false
+    }
+
     fn parent_chain_leaks(&self, tm: TmplId) -> bool {
         if self.m.tmpls[tm as usize].native_parent.is_some() || self.parent_pending(tm) {
             return true;
@@ -593,6 +639,8 @@ impl<'a> Gen<'a> {
         }
         if !self.m.act.as_ref().is_some_and(|a| a.fixed) {
             self.pending_walk.entry(f).or_default().push(w);
+        } else if self.m.family_reach.on {
+            self.unwalked.push(w);
         }
         true
     }
@@ -642,6 +690,7 @@ impl<'a> Gen<'a> {
     ) {
         let saved = (self.order_ok, self.loop_depth);
         (self.order_ok, self.loop_depth) = (false, 0);
+        let list_saved = self.list_enter_body();
         #[cfg(test)]
         let packet_prior = self.m.packet_body(fxi);
         #[cfg(test)]
@@ -664,6 +713,7 @@ impl<'a> Gen<'a> {
             self.m.packet_end(packet_prior, true);
         }
         (self.order_ok, self.loop_depth) = saved;
+        self.list_body = list_saved;
     }
 
     fn walk_fn_body_inner(
@@ -817,6 +867,7 @@ impl<'a> Gen<'a> {
     fn walk_fields_body_region(&mut self, mi: u32, c: &'a Class) {
         let saved = (self.order_ok, self.loop_depth);
         (self.order_ok, self.loop_depth) = (false, 0);
+        let list_saved = self.list_enter_body();
         #[cfg(test)]
         let packet_prior = self
             .m
@@ -830,6 +881,7 @@ impl<'a> Gen<'a> {
             self.m.packet_end(packet_prior, true);
         }
         (self.order_ok, self.loop_depth) = saved;
+        self.list_body = list_saved;
     }
 
     fn walk_fields_body_inner(&mut self, mi: u32, c: &'a Class) {
@@ -862,7 +914,29 @@ impl<'a> Gen<'a> {
         for f in &c.fields {
             let site = self.store_site(mi, fi, format!("field {}", f.name), Some(tm), true);
             let v = match &f.init {
-                Some(e) => self.expr(&ffx, e),
+                Some(e) => {
+                    // A push-filled `new Array()`: the builtin's birth at
+                    // its call site is the fill's (`new_builtin` names the
+                    // site before the call exists: the solve is online).
+                    if matches!(e, Expr::New { .. }) {
+                        self.push_fill_new = self
+                            .push_fill
+                            .births
+                            .get(&(e as *const Expr as usize))
+                            .copied();
+                    }
+                    if matches!(e, Expr::Array(x, _) if x.is_empty())
+                        && f.key_expr.is_none()
+                        && !f.is_private
+                    {
+                        self.direct_arr =
+                            Some(crate::records::ArrBirth::Field(mi, c.id, f.name.clone()));
+                    }
+                    let v = self.expr(&ffx, e);
+                    self.push_fill_new = None;
+                    self.direct_arr = None;
+                    v
+                }
                 // `x: T;` defines `undefined` first; when the constructor
                 // assigns it before anyone can observe the instance, that
                 // `undefined` is never seen.
@@ -1068,6 +1142,9 @@ impl<'a> Gen<'a> {
     pub(crate) fn stmts(&mut self, fx: &Fx, ss: &[Stmt]) {
         let mut pushed = 0;
         let mut i = 0;
+        // A local derived below a guarded counter in this block
+        // (`gen/in_bounds.rs`) is one until the block ends.
+        let derived = self.in_bounds.derived.len();
         while i < ss.len() {
             if let Some(value) = for_of_binding(&ss[i..]) {
                 // `value = arrayRecordForValue(…); state = n; let s = value`:
@@ -1105,6 +1182,7 @@ impl<'a> Gen<'a> {
             }
             i += 1;
         }
+        self.in_bounds.derived.truncate(derived);
         self.narrow_pop(pushed);
     }
 
@@ -1157,9 +1235,24 @@ impl<'a> Gen<'a> {
                 init,
                 ty,
                 mutable,
+                name,
                 ..
             } => {
                 let n = self.local(fx.module, *id);
+                if [
+                    "__forof_lit_src_",
+                    "__forof_lit_arr_",
+                    "__iterator_record_",
+                    "__arr_",
+                ]
+                .iter()
+                .any(|p| name.starts_with(p))
+                {
+                    self.m.for_of_relays.insert(n);
+                }
+                if matches!(init, Some(perry_hir::Expr::Array(x, _)) if x.is_empty()) {
+                    self.direct_arr = Some(crate::records::ArrBirth::Local(fx.module, *id));
+                }
                 if !*mutable && init.is_some() {
                     self.initialized_consts.insert((fx.module, *id));
                 }
@@ -1170,13 +1263,23 @@ impl<'a> Gen<'a> {
                 {
                     self.class_homes.insert((fx.module, *id), tm);
                 }
+                let list_tmpl = self.m.tmpls.len() as TmplId;
                 match init {
                     Some(e) => {
-                        let v = self.expr(fx, e);
+                        let v = self.expr_zs(fx, e);
                         self.m.edge(v, n);
                     }
                     None => self.m.add_prim(n, prim::UNDEF),
                 }
+                self.in_bounds_let(fx, *id, init.as_ref());
+                // `let id = []`: a list birth (`list_caps`). The empty literal
+                // bore one template, the first made since the statement began.
+                if matches!(init, Some(perry_hir::Expr::Array(x, _)) if x.is_empty())
+                    && self.m.tmpls.len() as TmplId > list_tmpl
+                {
+                    self.list_birth(fx.module, *id, list_tmpl);
+                }
+                self.direct_arr = None;
                 if let Some(perry_hir::Expr::ForInKeys(o)) = init {
                     if let perry_hir::Expr::LocalGet(obj) = o.as_ref() {
                         self.for_in_keys_of.insert((fx.module, *id), *obj);
@@ -1184,11 +1287,11 @@ impl<'a> Gen<'a> {
                 }
             }
             Stmt::Expr(e) => {
-                let _ = self.expr(fx, e);
+                let _ = self.expr_zs(fx, e);
             }
             Stmt::Return(e) => {
                 if let Some(e) = e {
-                    let v = self.expr(fx, e);
+                    let v = self.expr_zs(fx, e);
                     self.m.edge(v, fx.ret);
                 } else {
                     self.m.add_prim(fx.ret, prim::UNDEF);
@@ -1206,34 +1309,44 @@ impl<'a> Gen<'a> {
                     guard: Some((t, then_test)),
                     ..fx.clone()
                 };
+                // A branch that always leaves: its writes reach only where
+                // it jumps to (`narrow_leave`).
+                let pre = self.narrow_snapshot();
                 let k = self.narrow_guard(fx, condition, true);
                 self.stmts(&then_fx, then_branch);
                 self.narrow_pop(k);
+                self.narrow_leave(then_branch, pre);
                 self.own_guard_done(own);
                 if let Some(e) = else_branch {
                     let else_fx = Fx {
                         guard: Some((t, else_test)),
                         ..fx.clone()
                     };
+                    let pre = self.narrow_snapshot();
                     let k = self.narrow_guard(fx, condition, false);
                     self.stmts(&else_fx, e);
                     self.narrow_pop(k);
+                    self.narrow_leave(e, pre);
                 }
             }
             Stmt::While { condition, body } => {
                 self.narrow_enter_loop(s);
                 self.loop_depth += 1;
-                let _ = self.expr(fx, condition);
+                self.jumps += 1;
+                let _ = self.expr_zs(fx, condition);
                 let k = self.narrow_guard(fx, condition, true);
                 self.stmts(fx, body);
                 self.narrow_pop(k);
+                self.jumps -= 1;
                 self.loop_depth -= 1;
             }
             Stmt::DoWhile { body, condition } => {
                 self.narrow_enter_loop(s);
                 self.loop_depth += 1;
-                let _ = self.expr(fx, condition);
+                self.jumps += 1;
+                let _ = self.expr_zs(fx, condition);
                 self.stmts(fx, body);
+                self.jumps -= 1;
                 self.loop_depth -= 1;
             }
             Stmt::For {
@@ -1247,8 +1360,9 @@ impl<'a> Gen<'a> {
                     self.stmt(fx, i);
                 }
                 self.loop_depth += 1;
+                self.jumps += 1;
                 if let Some(c) = condition {
-                    let _ = self.expr(fx, c);
+                    let _ = self.expr_zs(fx, c);
                 }
                 // The update runs after the body: it reads the end node.
                 let narrowed = self.narrow_for(
@@ -1262,7 +1376,7 @@ impl<'a> Gen<'a> {
                     self.narrow_in_update(true);
                 }
                 if let Some(u) = update {
-                    let _ = self.expr(fx, u);
+                    let _ = self.expr_zs(fx, u);
                 }
                 if narrowed {
                     self.narrow_in_update(false);
@@ -1274,6 +1388,7 @@ impl<'a> Gen<'a> {
                 if narrowed {
                     self.narrow_end();
                 }
+                self.jumps -= 1;
                 self.loop_depth -= 1;
             }
             Stmt::Labeled { body, .. } => self.stmt(fx, body),
@@ -1303,6 +1418,7 @@ impl<'a> Gen<'a> {
                 // finally run in the enclosing one.
                 let rt = self.m.node_l("RAISE-try");
                 let outer = std::mem::replace(&mut self.m.gen_region, Some(rt));
+                self.tries += 1;
                 self.stmts(fx, body);
                 self.m.gen_region = outer;
                 if let Some(c) = catch {
@@ -1319,20 +1435,26 @@ impl<'a> Gen<'a> {
                 if let Some(f) = finally {
                     self.stmts(fx, f);
                 }
+                self.tries -= 1;
             }
             Stmt::Switch {
                 discriminant,
                 cases,
             } => {
-                let d = self.expr(fx, discriminant);
-                // `===` against case values: no coercion.
-                let _ = d;
+                let d = self.expr_zs(fx, discriminant);
+                // `===` against case values: no coercion, identity.
+                self.jumps += 1;
+                self.m.identity(d, IdentityRoute::Switch);
                 for c in cases {
                     if let Some(t) = &c.test {
-                        let _ = self.expr(fx, t);
+                        let tv = self.expr_zs(fx, t);
+                        self.m.identity(tv, IdentityRoute::Switch);
+                        // N1: a case test is the strict equality it means.
+                        self.equality_demand(discriminant, t, d, tv);
                     }
                     self.stmts(fx, &c.body);
                 }
+                self.jumps -= 1;
             }
         }
     }

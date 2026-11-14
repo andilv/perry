@@ -70,9 +70,10 @@ impl<'a> Gen<'a> {
     ) -> Option<NodeId> {
         let e = crate::builtins::declared_member(member)?;
         let args = args.iter().map(|a| self.expr(fx, a)).collect();
-        let t = self
-            .m
-            .tok(TokKind::BuiltinFn(Native::Member { identity: e.name, holder: None }));
+        let t = self.m.tok(TokKind::BuiltinFn(Native::Member {
+            identity: e.name,
+            holder: None,
+        }));
         let callee = self.tok_node(t);
         let (call, ret) = self.new_call(ThisArg::Undef, args, vec![]);
         self.m.cons(callee, Cons::Call { call });
@@ -93,7 +94,10 @@ impl<'a> Gen<'a> {
                 .filter(|e| e.kind != perry_hir::realm_manifest::RealmKind::Constructor)
                 .map(|e| e.name)
         })?;
-        Some(self.m.tok(TokKind::BuiltinFn(Native::Member { identity, holder: None })))
+        Some(self.m.tok(TokKind::BuiltinFn(Native::Member {
+            identity,
+            holder: None,
+        })))
     }
 
     /// Operands only ever read as primitives by the runtime: objects get the
@@ -159,12 +163,12 @@ impl<'a> Gen<'a> {
                     _ => None,
                 };
                 if let Some((then_test, else_test)) = tests {
-                    let v = self.expr(fx, x);
+                    let v = self.expr_zs(fx, x);
                     return (v, then_test, else_test);
                 }
             }
         }
-        (self.expr(fx, condition), TRUTHY, FALSY)
+        (self.expr_zs(fx, condition), TRUTHY, FALSY)
     }
 
     pub(crate) fn fail_closed(&mut self, fx: &Fx, e: &Expr, name: &str) -> NodeId {
@@ -284,7 +288,7 @@ impl<'a> Gen<'a> {
         key_value: NodeId,
         src: NodeId,
         desc: &str,
-    ) {
+    ) -> SiteId {
         let site = self.store_site(fx.module, fx.f, desc.into(), None, false);
         self.m.stores[site as usize].key_value = Some(key_value);
         self.mark_rooted(e, site);
@@ -301,6 +305,7 @@ impl<'a> Gen<'a> {
                 },
             ),
         }
+        site
     }
 
     /// A `this.k = v` store in a function `new` may call, before `this`
@@ -575,125 +580,13 @@ impl<'a> Gen<'a> {
         (tm, t)
     }
 
-    /// `await v` / promise adoption: the value itself (non-thenables), the
-    /// settled value of promise objects, and for thenables whatever their
-    /// `then` passes to the resolve function.
-    pub(crate) fn awaited(&mut self, v: NodeId) -> NodeId {
-        let out = self.tmp("awaited");
-        self.m.edge(v, out);
-        let pa = self.m.atom("#value");
-        self.m.cons(
-            v,
-            Cons::Load {
-                key: Key::Named(pa),
-                dst: out,
-            },
-        );
-        // Thenables: `then(resolve, reject)` with runtime resolvers.
-        let resolver = self.resolver_fn(out);
-        let rej = self.resolver_fn(self.thrown);
-        let then = self.m.atom("then");
-        let (call, ret) = self.new_call(ThisArg::Node(v), vec![resolver, rej], vec![]);
-        self.m.cons(
-            v,
-            Cons::MCall {
-                key: Key::Named(then),
-                call,
-            },
-        );
-        let _ = ret;
-        out
-    }
-
-    /// A synthetic function whose first parameter flows into `dst` (a
-    /// promise resolver handed to user code).
-    pub(crate) fn resolver_fn(&mut self, dst: NodeId) -> NodeId {
-        let t = crate::builtins::resolver(&mut self.m, dst);
-        self.tok_node(t)
-    }
-
-    /// The body of an async function that runs untransformed: one without
-    /// `await`, which `async_to_generator` leaves `is_async` and codegen
-    /// lowers direct (`lower_async_rejecting_stmts`): a call returns a fresh
-    /// promise (`js_async_fn_result`) settled with what the body returns, a
-    /// returned thenable adopted, and rejected with what the body throws; a
-    /// call never throws. Returns the body's context, whose `ret` is the
-    /// settled value, and its throw region, the realm's rejection cell (as
-    /// for the async-step driver's step closure, `async_callback`).
-    pub(crate) fn async_body(&mut self, fx: &Fx) -> (Fx, NodeId) {
-        let settled = self.tmp("async-settled");
-        let p = self.promise_of(fx.module, settled);
-        self.m.edge(p, fx.ret);
-        (
-            Fx {
-                ret: settled,
-                ..fx.clone()
-            },
-            self.thrown,
-        )
-    }
-
-    /// A fresh promise template whose settled value is `value`.
-    pub(crate) fn promise_of(&mut self, mi: u32, value: NodeId) -> NodeId {
-        let tm = self.new_bobj_template(mi, "Promise");
-        let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
-        let a = self.m.atom("#value");
-        let f = self.m.field(t, a);
-        let aw = self.awaited(value);
-        self.m.edge(aw, f);
-        self.tok_node(t)
-    }
-
-    /// The values produced by iterating whatever `v` holds: elements of
-    /// arrays/collections/primitive boxes, and for iterables the protocol:
-    /// `v[Symbol.iterator]()`, then `.next()` on the result and on `v`
-    /// itself, then `.value`.
-    pub(crate) fn iterate(&mut self, v: NodeId) -> NodeId {
-        let out = self.tmp("iterated");
-        let ik = self.m.iter_key();
-        self.m.cons(v, Cons::Load { key: ik, dst: out });
-        let it = self.iterator_of(v);
-        let na = self.m.atom("next");
-        let r1 = self.mcall(it, Key::Named(na), vec![], vec![]);
-        // The step of `v` itself: the runtime's (`js_get_iterator` returns a
-        // value it finds no iterator for unchanged), a protocol call as in
-        // `builtins::iterate`.
-        let (sc, r2) = self.new_call(ThisArg::Node(v), vec![], vec![]);
-        self.m.protocol_calls.insert(sc);
-        self.m.cons(
-            v,
-            Cons::MCall {
-                key: Key::Named(na),
-                call: sc,
-            },
-        );
-        // Only results seen not done: `Model::yield_key`.
-        let va = self.m.yield_key();
-        self.m.cons(r1, Cons::Load { key: va, dst: out });
-        self.m.cons(r2, Cons::Load { key: va, dst: out });
-        out
-    }
-
-    /// What `v[Symbol.iterator]()` returns (GetIterator, ECMA-262 7.4.3):
-    /// a protocol call.
-    pub(crate) fn iterator_of(&mut self, v: NodeId) -> NodeId {
-        let (pc, it) = self.new_call(ThisArg::Node(v), vec![], vec![]);
-        let wk = Key::Named(self.m.atom(crate::builtins::WK_ITERATOR));
-        self.m.protocol_calls.insert(pc);
-        self.m.rel(|| format!("protocolcall {pc}"));
-        self.m.cons(v, Cons::MCall { key: wk, call: pc });
-        it
-    }
-
     /// Every node an expression makes belongs to the function walking it.
     pub(crate) fn expr(&mut self, fx: &Fx, e: &Expr) -> NodeId {
         let prev = std::mem::replace(&mut self.m.cur_fn, fx.f);
+        let zs_ok = std::mem::take(&mut self.zs_ok);
         let n = self.expr_inner(fx, e);
-        if let Expr::IndexGet { element_offset, .. } = e {
-            if *element_offset != 0 {
-                self.element_values.push((fx.module, *element_offset, n));
-            }
-        }
+        self.zs_mark(n, zs_ok);
+        self.note_element_value(fx, e, n);
         if self.diagnostic.is_some() {
             self.diagnostic_expr(fx, e, n);
         }
@@ -735,7 +628,11 @@ impl<'a> Gen<'a> {
                 self.prim_node(prim::UNDEF)
             }
             Expr::LocalSet(id, v) => {
-                let vn = self.expr(fx, v);
+                if matches!(v.as_ref(), Expr::Array(x, _) if x.is_empty()) {
+                    self.direct_arr = Some(crate::records::ArrBirth::Local(mi, *id));
+                }
+                let vn = self.expr_zs(fx, v);
+                self.direct_arr = None;
                 let l = self.local_write(mi, *id);
                 match fx.guard {
                     Some((t, test)) => self.m.cons(
@@ -752,10 +649,10 @@ impl<'a> Gen<'a> {
                 vn
             }
             Expr::ScopedTemp { id, value, body } => {
-                let vn = self.expr(fx, value);
+                let vn = self.expr_zs(fx, value);
                 let l = self.local(mi, *id);
                 self.m.edge(vn, l);
-                self.expr(fx, body)
+                self.expr_zs(fx, body)
             }
             Expr::GlobalGet(id) => {
                 let has_real = self.modules[mi as usize]
@@ -863,8 +760,8 @@ impl<'a> Gen<'a> {
                 let shift = matches!(op, perry_hir::BinaryOp::UShr);
                 let out = self.tmp("binary");
                 let r = self.m.reason("ToPrimitive operand");
-                let l = self.expr(fx, left);
-                let rv = self.expr(fx, right);
+                let l = self.expr_zs(fx, left);
+                let rv = self.expr_zs(fx, right);
                 {
                     use crate::model::RangeOp as R;
                     use perry_hir::BinaryOp as B;
@@ -935,14 +832,14 @@ impl<'a> Gen<'a> {
             }
             Expr::Unary { op, operand } => match op {
                 UnaryOp::Not => {
-                    let _ = self.expr(fx, operand);
+                    let _ = self.expr_zs(fx, operand);
                     self.prim_node(prim::BOOL)
                 }
                 UnaryOp::Pos => {
                     self.prim_op(fx, &[operand], prim::NUM, "ToNumber", Protocol::ToPrimitive)
                 }
                 _ => {
-                    let v = self.expr(fx, operand);
+                    let v = self.expr_zs(fx, operand);
                     let r = self.m.reason("ToNumeric");
                     self.m.cons(
                         v,
@@ -961,23 +858,7 @@ impl<'a> Gen<'a> {
                     out
                 }
             },
-            Expr::Compare { op, left, right } => match op {
-                CompareOp::Eq | CompareOp::Ne => {
-                    // IsLooselyEqual runs ToPrimitive on an object operand.
-                    let l = self.expr(fx, left);
-                    let r = self.expr(fx, right);
-                    self.raise_on(l);
-                    self.raise_on(r);
-                    self.prim_node(prim::BOOL)
-                }
-                _ => self.prim_op(
-                    fx,
-                    &[left, right],
-                    prim::BOOL,
-                    "ToPrimitive compare",
-                    Protocol::ToPrimitive,
-                ),
-            },
+            Expr::Compare { op, left, right } => self.compare_expr(fx, op, left, right),
             Expr::Logical { op, left, right } => {
                 let plan = match op {
                     LogicalOp::And => self.own_guard_plan(left, crate::gen::Region::Expr(right)),
@@ -990,14 +871,14 @@ impl<'a> Gen<'a> {
                     },
                     _ => None,
                 };
-                let l = self.expr(fx, left);
+                let l = self.expr_zs(fx, left);
                 let own = self.own_guard_arm(plan, l);
                 let k = match op {
                     LogicalOp::And => self.narrow_guard(fx, left, true),
                     LogicalOp::Or => self.narrow_guard(fx, left, false),
                     LogicalOp::Coalesce => 0,
                 };
-                let r = self.expr(fx, right);
+                let r = self.expr_zs(fx, right);
                 self.narrow_pop(k);
                 self.own_guard_done(own);
                 let out = self.tmp("logical");
@@ -1034,11 +915,11 @@ impl<'a> Gen<'a> {
                 let (t, then_test, else_test) = self.guard_test(fx, condition);
                 let own = self.own_guard_arm(plan, t);
                 let k = self.narrow_guard(fx, condition, true);
-                let a = self.expr(fx, then_expr);
+                let a = self.expr_zs(fx, then_expr);
                 self.narrow_pop(k);
                 self.own_guard_done(own);
                 let k = self.narrow_guard(fx, condition, false);
-                let b = self.expr(fx, else_expr);
+                let b = self.expr_zs(fx, else_expr);
                 self.narrow_pop(k);
                 let out = self.tmp("cond");
                 self.m.cons(
@@ -1060,17 +941,17 @@ impl<'a> Gen<'a> {
                 out
             }
             Expr::TypeOf(x) => {
-                let _ = self.expr(fx, x);
+                let _ = self.expr_zs(fx, x);
                 self.prim_node(prim::STR)
             }
             Expr::Void(x) => {
-                let _ = self.expr(fx, x);
+                let _ = self.expr_zs(fx, x);
                 self.prim_node(prim::UNDEF)
             }
             Expr::Sequence(es) => {
                 let mut last = self.prim_node(prim::UNDEF);
                 for x in es {
-                    last = self.expr(fx, x);
+                    last = self.expr_zs(fx, x);
                 }
                 last
             }
@@ -1174,7 +1055,12 @@ impl<'a> Gen<'a> {
                 if let Some(callee) = self.private_method_callee(mi, object) {
                     return callee;
                 }
-                self.load(o, Key::Named(a))
+                let dst = self.load(o, Key::Named(a));
+                self.field_reads.push(dst);
+                if *byte_offset != 0 {
+                    self.load_sites.push((mi, *byte_offset, a, dst));
+                }
+                dst
             }
             Expr::PropertySet {
                 object,
@@ -1183,7 +1069,7 @@ impl<'a> Gen<'a> {
                 ..
             } => {
                 let o = self.expr(fx, object);
-                let v = self.expr(fx, value);
+                let v = self.expr_zs(fx, value);
                 let a = self.member_atom(object, property);
                 let owner = self.phase_owner(fx, e, object);
                 self.store_phased(
@@ -1207,7 +1093,7 @@ impl<'a> Gen<'a> {
                 ..
             } => {
                 let t = self.expr(fx, target);
-                let k = self.expr(fx, key);
+                let k = self.expr_zs(fx, key);
                 let r = self.m.reason("ToPropertyKey");
                 self.m.cons(
                     k,
@@ -1216,7 +1102,19 @@ impl<'a> Gen<'a> {
                         proto: Protocol::ToPrimitive,
                     },
                 );
-                let v = self.expr(fx, value);
+                if let (
+                    Expr::Array(v, _),
+                    Expr::String(_),
+                    Expr::PutValueSet { element_offset, .. },
+                ) = (value.as_ref(), key.as_ref(), e)
+                {
+                    if *element_offset != 0 && v.is_empty() {
+                        self.direct_arr =
+                            Some(crate::records::ArrBirth::Store(mi, *element_offset));
+                    }
+                }
+                let v = self.expr_zs(fx, value);
+                self.direct_arr = None;
                 let rv = self.expr(fx, receiver);
                 let owner = self.phase_owner(fx, e, target);
                 if let Some(kp) = self.for_in_key_of(fx.module, key) {
@@ -1257,6 +1155,7 @@ impl<'a> Gen<'a> {
                         self.mark_fn_phase(fx, e, target, site);
                         self.mark_rooted(e, site);
                         self.m.stores[site as usize].key_value = Some(k);
+                        self.in_bounds_site(fx, e, o, key, site);
                         match key {
                             Key::Named(_) => self.m.cons(o, Cons::Store { key, src: v, site }),
                             // The key's values decide: an index or any key.
@@ -1294,6 +1193,7 @@ impl<'a> Gen<'a> {
                 let o = self.expr(fx, object);
                 let a = self.member_atom(object, property);
                 let cur = self.load(o, Key::Named(a));
+                self.field_reads.push(cur);
                 let r = self.m.reason("ToNumeric");
                 self.m.cons(
                     cur,
@@ -1333,7 +1233,7 @@ impl<'a> Gen<'a> {
                 index,
             } => {
                 let o = self.expr(fx, object);
-                let i = self.expr(fx, index);
+                let i = self.expr_zs(fx, index);
                 self.m.nodes[i as usize].int_use = true;
                 let r = self.m.reason("ToPropertyKey");
                 self.m.cons(
@@ -1409,7 +1309,7 @@ impl<'a> Gen<'a> {
                 value,
             } => {
                 let o = self.expr(fx, object);
-                let i = self.expr(fx, index);
+                let i = self.expr_zs(fx, index);
                 self.m.nodes[i as usize].int_use = true;
                 let r = self.m.reason("ToPropertyKey");
                 self.m.cons(
@@ -1419,7 +1319,7 @@ impl<'a> Gen<'a> {
                         proto: Protocol::ToPrimitive,
                     },
                 );
-                let v = self.expr(fx, value);
+                let v = self.expr_zs(fx, value);
                 if let Some(kp) = self.for_in_key_of(fx.module, index) {
                     // A for-in run's key decides the stored key (FVA 4.3b);
                     // rooted as any element store (DECISIONS 149b).
@@ -1439,7 +1339,8 @@ impl<'a> Gen<'a> {
                         Key::Any(_) => Key::Any(self.key_shape(fx.module, index)),
                         k => k,
                     };
-                    self.store_elem(fx, e, o, key, i, v, "[]=");
+                    let site = self.store_elem(fx, e, o, key, i, v, "[]=");
+                    self.in_bounds_site(fx, e, o, key, site);
                 }
                 let key = match index.as_ref() {
                     Expr::String(s) => Key::Named(self.m.atom_index[s]),
@@ -1451,7 +1352,7 @@ impl<'a> Gen<'a> {
             }
             Expr::IndexUpdate { object, index, .. } => {
                 let o = self.expr(fx, object);
-                let i = self.expr(fx, index);
+                let i = self.expr_zs(fx, index);
                 self.m.nodes[i as usize].int_use = true;
                 let r = self.m.reason("ToPropertyKey");
                 self.m.cons(
@@ -1528,7 +1429,7 @@ impl<'a> Gen<'a> {
                 let (tm, t) = self.new_lit(mi, e, &keys);
                 let obj = self.tok_node(t);
                 for (k, v) in props {
-                    let vn = self.expr(fx, v);
+                    let vn = self.expr_zs(fx, v);
                     if k == "__proto__" {
                         // E6 literal form: a proto-carrying literal template.
                         let pn = self.m.proto_node(t);
@@ -1624,8 +1525,13 @@ impl<'a> Gen<'a> {
                 obj
             }
             Expr::ObjectAssign { target, sources } => {
-                // E4: a writer of every key the sources can carry.
-                let t = self.expr(fx, target);
+                // E4: a writer of every key the sources can carry. The
+                // result, and what the sources copy into, is ToObject(target)
+                // (ECMA-262 20.1.2.1 step 1): never a primitive.
+                let target = self.expr(fx, target);
+                let (wrapper, w) = self.bobj(mi, "Object(prim)");
+                let t = self.tmp("to-object");
+                crate::builtins::to_object_into(&mut self.m, target, wrapper, w, t);
                 for s in sources {
                     let sv = self.expr(fx, s);
                     let site = self.store_site(mi, fx.f, "Object.assign".into(), None, false);
@@ -1643,13 +1549,23 @@ impl<'a> Gen<'a> {
             }
             Expr::Array(elems, _) => {
                 let tm = self.new_arr_birth(mi, "lit", true, true);
+                if let Some(h) = self.direct_arr.take() {
+                    self.m.arr_birth_holder.insert(tm, h);
+                }
                 if self.arr_lengths {
                     self.m.arr_birth_len.insert(tm, elems.len() as i64);
+                }
+                // A push-filled birth is born with its final length.
+                let filled = crate::push_fills::born_at(self, e, tm);
+                if self.m.const_arrays && !filled {
+                    if let Some(c) = crate::const_arrays::literal_elems(mi, elems) {
+                        self.m.arr_const.insert(tm, c);
+                    }
                 }
                 let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
                 let fa = self.m.field_any(t);
                 for el in elems {
-                    let v = self.expr(fx, el);
+                    let v = self.expr_zs(fx, el);
                     self.m.edge(v, fa);
                 }
                 self.tok_node(t)
@@ -1683,7 +1599,14 @@ impl<'a> Gen<'a> {
                 byte_offset,
                 byte_end,
                 ..
-            } => self.call_expr(fx, callee, args, &[], *byte_offset, *byte_end),
+            } => {
+                let result = self.call_expr(fx, callee, args, &[], *byte_offset, *byte_end);
+                if *byte_offset != 0 {
+                    self.call_kinds_at
+                        .push((fx.module, *byte_offset, *byte_end, result));
+                }
+                result
+            }
             Expr::CallSpread { callee, args, .. } => {
                 let (a, s) = self.call_args(fx, args);
                 let _ = (&a, &s);
@@ -1724,7 +1647,7 @@ impl<'a> Gen<'a> {
                         if i >= caps {
                             self.snapshot_read(fx, e)
                         } else {
-                            self.expr(fx, e)
+                            self.expr_zs(fx, e)
                         }
                     })
                     .collect();

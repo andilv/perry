@@ -23,9 +23,58 @@ pub enum OwnGateAt {
     Value,
 }
 
+/// Where a program observes the identity of what a node holds
+/// (`Cons::Identity`; DESIGN-p4l4 §2.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityRoute {
+    /// `===` / `!==` between two values neither of which is a primitive
+    /// literal (a comparison with one is a presence test).
+    StrictEq,
+    /// `==` / `!=`: object against object is identity.
+    LooseEq,
+    /// A `switch` discriminant and its case expressions (`===`).
+    Switch,
+    /// `Object.is`.
+    ObjectIs,
+    /// `Object.prototype.isPrototypeOf`: the receiver against each object on
+    /// the argument's chain.
+    IsPrototypeOf,
+    /// A Map/Set/WeakMap/WeakSet key (SameValueZero, or identity).
+    Collection,
+    /// `structuredClone` keeps the sharing of what it copies.
+    Clone,
+    /// A realm declaration's `identity(slot)`.
+    Native,
+    /// `JSON.stringify` with a replacer that is no literal `null`,
+    /// `undefined` or array: the replacer receives every value serialized,
+    /// unseen by the model (DESIGN-p4l4 finding 14).
+    JsonReplacer,
+}
+
+impl IdentityRoute {
+    pub fn name(self) -> &'static str {
+        match self {
+            IdentityRoute::StrictEq => "===",
+            IdentityRoute::LooseEq => "==",
+            IdentityRoute::Switch => "switch",
+            IdentityRoute::ObjectIs => "Object.is",
+            IdentityRoute::IsPrototypeOf => "isPrototypeOf",
+            IdentityRoute::Collection => "collection-key",
+            IdentityRoute::Clone => "structuredClone",
+            IdentityRoute::Native => "native",
+            IdentityRoute::JsonReplacer => "JSON replacer",
+        }
+    }
+}
+
 /// Complex constraints, attached to the node whose new tokens trigger them.
 #[derive(Clone, Copy, Debug)]
 pub enum Cons {
+    /// The program observes the identity of every object the node holds
+    /// (`route`). No flow and no effect on the solve: a fact the value-record
+    /// derive reads (DESIGN-p4l4 R4). Generated only under
+    /// `PERRY_FACTS_VALUE_RECORDS=1` (`Model::value_records`).
+    Identity { route: IdentityRoute },
     /// The node is the value a contract function `f` stores under `key`
     /// into its parameter `dst`'s argument (`reach`: into what it reaches)
     /// (DECISIONS 118; `dst` `u32::MAX`: into what its receiver reaches,
@@ -58,6 +107,11 @@ pub enum Cons {
     /// A store under an index of each Array in the node: it may leave a
     /// hole (`Model::mark_hole`); an append never does.
     IndexHole,
+    /// A store under an index of each Array in the node, at a site whose
+    /// key gen proved at most the Array's length there
+    /// (`Model::inbounds_sites`): it leaves no hole in an Array whose length
+    /// never shrinks (`Model::index_kept`), and may leave one in any other.
+    IndexKept,
     /// `registerPathModule`: dst ⊇ a CommonJS record's live `exports` (the
     /// wrapper's record literal carries `__perry_cjs_record` at birth), or
     /// the published value itself for a raw publication.
@@ -157,6 +211,17 @@ pub enum Cons {
         from: NodeId,
         reason: Option<u32>,
     },
+    /// The specifier of `require` call `call` (R-SPEC): each string
+    /// constant that reaches the node resolves as that literal does
+    /// (`builtins::require_by_spec`); a value no constant spells (any
+    /// string, a token, ⊤) resolves as anything. Other primitives resolve
+    /// to nothing: the loader throws on a specifier that is no string.
+    RequireSpec { call: CallId },
+    /// Once ⊤ reaches the node, `dst` holds ⊤ (all kinds) for `reason`; a
+    /// data value or a marker leaves it inert (an instance's ⊤ arrives as
+    /// ⊤). The result of a rule that is unknown only when the node is: an
+    /// accessor walk over a holder whose any-key node holds ⊤.
+    TopIfTop { dst: NodeId, reason: u32 },
     /// `from` flows into `dst` once the node may hold a value `test`
     /// admits (`guard`): a conditional's branch, a logical operator's right
     /// operand, a destructuring default reach the result only when their
@@ -173,6 +238,18 @@ pub enum Cons {
     /// of the program text, so a summary replays it per call; `Defined` is
     /// the solver's, decided for the values one solve saw.
     NotNullish { dst: NodeId },
+    /// A value a promise is resolved with (Promise Resolve Functions,
+    /// ECMA-262 27.2.1.3.2 steps 7-15; a then-callback's result,
+    /// `Promise.resolve`, `await`): it fulfils the promise as itself only
+    /// when its `then` read is not callable. Its primitives, ⊤ and markers
+    /// flow into `dst`; an object token flows once its read of `then` (own
+    /// field, chain, accessor; `Model::load_from`) may hold a value no call
+    /// takes (`guard::NOT_CALLABLE`: a primitive, `undefined` of a missing
+    /// key, a non-function object, ⊤), re-checked as the read grows
+    /// (monotone). A token whose `then` is callable is adopted instead
+    /// (`builtins::adopt`: its settled value, its `then` called with
+    /// resolve functions). One predicate for every resolution.
+    Fulfil { dst: NodeId },
     /// The left operand of `l && r`: its falsy part flows into `dst` (the
     /// result is `l` only when it is falsy, and every object is truthy):
     /// its primitive kinds that have a falsy value, ⊤ as those kinds only,
@@ -184,6 +261,13 @@ pub enum Cons {
     /// `undefined`, a `Guard` on the argument). A rule of the program text,
     /// like `NotNullish`.
     NotUndefined { dst: NodeId },
+    /// ToObject of the node's values (ECMA-262 7.1.18) for what is an
+    /// object already: its object and function tokens, ⊤ and its markers
+    /// flow into `dst`; no primitive does (ToObject never returns one). A
+    /// primitive's wrapper is a separate `Guard` (`guard::BOXED`) of the
+    /// caller (`builtins::to_object`). A rule of the program text, like
+    /// `NotNullish`.
+    Objects { dst: NodeId },
     /// Every object token reaches a HARD operation.
     Hard { kind: Hard, reason: u32 },
     /// DECISIONS 242 (contract half): another unit's function reads `key`
@@ -576,8 +660,10 @@ impl Cons {
         matches!(
             self,
             Cons::StoreIndexed { .. }
+                | Cons::RequireSpec { .. }
                 | Cons::Defined { .. }
                 | Cons::NotNullish { .. }
+                | Cons::Fulfil { .. }
                 | Cons::NotUndefined { .. }
         )
     }
@@ -595,6 +681,7 @@ impl Cons {
                 | Cons::RetInto { .. }
                 | Cons::Defined { .. }
                 | Cons::NotNullish { .. }
+                | Cons::Fulfil { .. }
                 | Cons::NotUndefined { .. }
                 | Cons::Falsy { .. }
         )
@@ -602,10 +689,12 @@ impl Cons {
 
     pub fn kind_name(&self) -> &'static str {
         match self {
+            Cons::Identity { .. } => "identity",
             Cons::Load { .. } => "load",
             Cons::ProtoKey { .. } => "protokey",
             Cons::OwnValues { .. } => "ownvalues",
             Cons::IndexHole => "indexhole",
+            Cons::IndexKept => "indexkept",
             Cons::CjsPublish { .. } => "cjspublish",
             Cons::Store { .. } => "store",
             Cons::Call { .. } => "call",
@@ -627,11 +716,15 @@ impl Cons {
             Cons::ContractThis { .. } => "contractthis",
             Cons::OverrideThis { .. } => "overridethis",
             Cons::TopIfAny { .. } => "topifany",
+            Cons::RequireSpec { .. } => "requirespec",
+            Cons::TopIfTop { .. } => "topiftop",
             Cons::Guard { .. } => "guard",
             Cons::Defined { .. } => "defined",
             Cons::NotNullish { .. } => "notnullish",
+            Cons::Fulfil { .. } => "fulfil",
             Cons::Falsy { .. } => "falsy",
             Cons::NotUndefined { .. } => "notundefined",
+            Cons::Objects { .. } => "objects",
             Cons::Hard { .. } => "hard",
             Cons::Miss { .. } => "miss",
             Cons::DeleteKey { .. } => "deletekey",

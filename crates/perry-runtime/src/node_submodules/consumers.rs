@@ -149,9 +149,6 @@ fn raw_ptr_from_value(value: f64) -> usize {
     if jsval.is_pointer() || jsval.is_string() || jsval.is_bigint() {
         return (bits & crate::value::POINTER_MASK) as usize;
     }
-    if bits != 0 && bits < 0x0001_0000_0000_0000 {
-        return bits as usize;
-    }
     0
 }
 
@@ -332,7 +329,7 @@ fn append_chunk_bytes_for_consumer(
 
     unsafe {
         match gc_type_for_ptr(raw) {
-            Some(crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY) => {
+            Some(crate::gc_array_type_pat!() | crate::gc::GC_TYPE_LAZY_ARRAY) => {
                 append_array_chunk_bytes(raw, out, mode, depth)
             }
             Some(crate::gc_object_type_pat!()) => {

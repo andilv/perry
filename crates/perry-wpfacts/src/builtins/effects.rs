@@ -206,7 +206,9 @@ fn names_root(effects: &[RealmEffect], root: RealmSlotRoot) -> bool {
             slot(callee) || operand(this) || args.iter().any(operand)
         }
         RealmEffect::Stores { src, dst } => slot(src) || slot(dst),
-        RealmEffect::Escapes(s) | RealmEffect::AsyncResource(s) => slot(s),
+        RealmEffect::Escapes(s) | RealmEffect::AsyncResource(s) | RealmEffect::Identity(s) => {
+            slot(s)
+        }
         RealmEffect::Returns(o) => operand(o),
         RealmEffect::StoresFresh | RealmEffect::Open => false,
     })
@@ -245,52 +247,36 @@ pub(crate) fn declared_proto_method(identity: &str) -> Option<&'static RealmEntr
 }
 
 /// The declaration of getter `key` of `proto` (`AbortController.prototype`,
-/// `signal`), when it only returns primitives and slots of its receiver:
-/// a load reads its value directly (`getter_value`), no call runs.
+/// `signal`), when the runtime declares what a call of it does in forms
+/// `run_native` runs: a load of the key reads the getter's declared result
+/// (`getter_load`), never the getter function.
 pub(super) fn declared_getter(proto: &str, key: &str) -> Option<&'static RealmEntry> {
-    fn simple(o: &RealmOperand) -> bool {
-        match o {
-            RealmOperand::Prim(_) => true,
-            RealmOperand::Slot(s) => {
-                s.root == RealmSlotRoot::This
-                    && s.steps.iter().all(|st| !matches!(st, RealmSlotStep::Elems))
-            }
-            RealmOperand::Union(us) => us.iter().all(simple),
-            _ => false,
-        }
-    }
-    let e = declared_at(&format!("{proto}.{key}"), "<get>")?;
-    e.effects
-        .iter()
-        .all(|f| matches!(f, RealmEffect::Returns(o) if simple(o)))
-        .then_some(e)
+    declared_at(&format!("{proto}.{key}"), "<get>")
 }
 
-/// What getter `e` (`declared_getter`) returns on receiver `t`, into `dst`.
-pub(super) fn getter_value(m: &mut Model, e: &'static RealmEntry, t: Tok, dst: NodeId) {
-    fn operand(m: &mut Model, o: &RealmOperand, t: Tok, dst: NodeId) {
-        match o {
-            RealmOperand::Prim(ps) => m.add_prim(dst, prim_bits(ps)),
-            RealmOperand::Slot(s) => {
-                let mut at = m.node_l("native-get-this");
-                m.add_tok(at, t);
-                for st in s.steps.iter() {
-                    let key = step_key(m, st);
-                    let next = m.node_l("native-get");
-                    m.cons(at, Cons::Load { key, dst: next });
-                    at = next;
-                }
-                m.edge(at, dst);
-            }
-            RealmOperand::Union(us) => us.iter().for_each(|u| operand(m, u, t, dst)),
-            _ => unreachable!("declared_getter() takes primitives and receiver slots only"),
-        }
+/// `PERRY_FACTS_DECLARED_GETTER_RESULTS=0`: a load of an accessor whose
+/// getter the runtime declares, on a builtin object whose realm holder
+/// locks it (a RegExp's `flags`), reads an unknown value as before
+/// (`loads::bobj_declared_getter`); a declared object's own prototype
+/// (`AbortController.prototype`) keeps its declared results.
+pub(super) fn declared_getter_results() -> bool {
+    !matches!(
+        std::env::var("PERRY_FACTS_DECLARED_GETTER_RESULTS").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
+/// `dst` ⊇ what getter `e` (`declared_getter`) of key `a` returns on
+/// receiver `t`: its declaration runs as a member call's does (`run_native`,
+/// one evaluator of declared results), in the one getter call on `t`
+/// (`collections::getter_call`); a `fresh` result is born at that call.
+pub(super) fn getter_load(m: &mut Model, e: &'static RealmEntry, t: Tok, a: Atom, dst: NodeId) {
+    let (call, made) = super::collections::getter_call(m, t, a);
+    if made {
+        run_native(m, e, t, call);
     }
-    for f in e.effects.iter() {
-        if let RealmEffect::Returns(o) = f {
-            operand(m, o, t, dst);
-        }
-    }
+    let ret = m.calls[call as usize].ret;
+    m.edge(ret, dst);
 }
 
 /// The declaration of setter `key` of `proto` (`AbortSignal.prototype`,
@@ -423,6 +409,8 @@ pub(crate) fn interpretable(effects: &[RealmEffect]) -> bool {
             }
             RealmEffect::Stores { src, dst } => slot(src) && slot(dst),
             RealmEffect::StoresFresh => true,
+            // An observation of the slot's values: no flow to model.
+            RealmEffect::Identity(_) => true,
             RealmEffect::Escapes(s) => slot(s),
             RealmEffect::AsyncResource(s) => slot(s),
             RealmEffect::Returns(RealmOperand::Bound) => true,
@@ -804,7 +792,8 @@ impl Run {
     fn held(&mut self, m: &mut Model, o: &RealmOperand, holder: Tok) -> NodeId {
         match o {
             RealmOperand::Native(path) => {
-                let e = declared_member(path).expect("interpretable() takes a declared native only");
+                let e =
+                    declared_member(path).expect("interpretable() takes a declared native only");
                 if !names_callee(e.effects) {
                     return self.operand(m, o);
                 }
@@ -1008,6 +997,7 @@ fn run(
     callee: Option<Tok>,
     call: CallId,
 ) {
+    crate::family_reach::run(m, entry.name);
     if let Some(p) = m.prof.as_mut() {
         let site = m.calls[call as usize].site;
         let (runs, sites) = p.natives.entry(entry.name).or_default();
@@ -1050,6 +1040,27 @@ fn run(
                 }
             }
             RealmEffect::StoresFresh => {}
+            // The body compares the slot's values by identity (DESIGN-p4l4
+            // §2.2): recorded for the value-record derive only.
+            RealmEffect::Identity(s) if m.value_records => {
+                let v = run.slot(m, s);
+                for n in v.nodes {
+                    m.identity(n, IdentityRoute::Native);
+                }
+                if !v.spread.is_empty() {
+                    let n = m.node_l("native-identity");
+                    flow(
+                        m,
+                        &Vals {
+                            nodes: vec![],
+                            spread: v.spread,
+                        },
+                        n,
+                    );
+                    m.identity(n, IdentityRoute::Native);
+                }
+            }
+            RealmEffect::Identity(_) => {}
             RealmEffect::AsyncResource(s) => {
                 if let Some(n) = run.node(m, s) {
                     super::async_resource(m, n, entry.name);
@@ -1111,7 +1122,9 @@ fn run(
                 let Some(value) = run.node(m, src) else {
                     continue;
                 };
-                if let (RealmSlotRoot::Callee, [], RealmSlotStep::Internal(k)) = (dst.root, inner, st) {
+                if let (RealmSlotRoot::Callee, [], RealmSlotStep::Internal(k)) =
+                    (dst.root, inner, st)
+                {
                     if k != CALLEE_SELF {
                         let at = run.callee_slot(m, k);
                         m.edge(value, at);
@@ -1141,6 +1154,11 @@ fn run(
                 }
             }
             RealmEffect::Stores { src, dst } => {
+                // A store into the receiver's elements writes the Array.
+                if let (RealmSlotRoot::This, Some(t)) = (dst.root, run.t) {
+                    m.arr_written(t);
+                    m.len_event(t, run.call, true);
+                }
                 let v = run.slot(m, src);
                 if let Some(d) = run.node(m, dst) {
                     flow(m, &v, d);

@@ -82,9 +82,6 @@ fn raw_ptr_from_value(value: f64) -> usize {
     if jsval.is_pointer() || jsval.is_string() || jsval.is_bigint() {
         return (bits & POINTER_MASK) as usize;
     }
-    if bits != 0 && bits < 0x0001_0000_0000_0000 {
-        return bits as usize;
-    }
     0
 }
 
@@ -162,7 +159,7 @@ fn pending_promise_values(session: f64) -> Vec<f64> {
     let raw = raw_ptr_from_value(value);
     if !JSValue::from_bits(value.to_bits()).is_pointer()
         || !crate::value::addr_class::is_plausible_heap_addr(raw)
-        || unsafe { gc_type_for_ptr(raw) } != Some(crate::gc::GC_TYPE_ARRAY)
+        || unsafe { gc_type_for_ptr(raw) } != Some(crate::gc_array_type_pat!())
     {
         return Vec::new();
     }
