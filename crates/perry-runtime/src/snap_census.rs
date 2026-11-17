@@ -794,7 +794,7 @@ impl Drop for HostValueScope {
     }
 }
 
-/// Open a SNAPK2a host-value scope (1 argv, 2 execPath) for the rest of the
+/// Open a host-value scope (1 argv, 2 execPath, 3 argv0) for the rest of the
 /// enclosing block, in the instrumented Linux cohort only.
 #[macro_export]
 macro_rules! snap_host_value {
@@ -990,3 +990,7 @@ macro_rules! census_inputs {
 pub(crate) fn record_scope() -> impl Drop {
     runner::input_record::Scope::enter()
 }
+
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+#[path = "snap_census/inventory.rs"]
+mod inventory;

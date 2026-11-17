@@ -222,6 +222,15 @@ pub extern "C" fn js_fs_close_sync(fd_value: f64) -> i32 {
     })
 }
 
+// `readSync(fd, buffer, offset, length, position)` and the options form
+// `readSync(fd, buffer, { offset, length, position })`
+// (`js_fs_read_sync_options`, whose fields are [[Get]]): the numbers are
+// read as they are (`number_arg`, `position_arg`: a non-Number is absent, a
+// bigint position is read too; no ToNumber, so no `valueOf` runs); the fd is
+// a number (`validate_fd_open`). The bytes go into the buffer's backing
+// store (`bytes_mut`); a value that is no byte view gets nothing. The result
+// is the byte count.
+crate::realm_decl! { "node:fs.readSync", effects = { reads(field(arg(2), offset)); reads(field(arg(2), length)); reads(field(arg(2), position)); stores_bytes(arg(1)); returns(prim(num)) } }
 /// `fs.readSync(fd, buffer, offset, length, position)` — Buffer subset.
 #[no_mangle]
 pub extern "C" fn js_fs_read_sync(
@@ -501,9 +510,7 @@ fn position_arg(value: f64) -> Option<u64> {
 /// A number argument as an f64, whether it is a plain double or an int32.
 fn number_arg(value: f64) -> Option<f64> {
     let jv = crate::value::JSValue::from_bits(value.to_bits());
-    if jv.is_int32() {
-        Some(jv.as_int32() as f64)
-    } else if jv.is_number() {
+    if jv.is_number() {
         Some(value)
     } else {
         None
@@ -1058,8 +1065,7 @@ extern "C" fn dir_finish_read_promise_impl(
     _this: crate::closure::JsThis,
 ) -> f64 {
     let id = dir_id_of(closure);
-    let promise =
-        crate::closure::js_closure_get_capture_ptr(closure, 1) as *mut crate::promise::Promise;
+    let promise = crate::closure::closure_capture_ref(closure, 1) as *mut crate::promise::Promise;
     let value = crate::closure::js_closure_get_capture_f64(closure, 2);
     let is_error = crate::closure::js_closure_get_capture_f64(closure, 3) != 0.0;
     dir_clear_operation_pending(id);
@@ -1087,7 +1093,7 @@ fn dir_pending_read_promise(
         4,
     );
     crate::closure::closure_set_capture_word(closure, 0, id as i64);
-    crate::closure::js_closure_set_capture_ptr(closure, 1, promise as i64);
+    crate::closure::closure_set_capture_ref(closure, 1, promise as i64);
     crate::closure::js_closure_set_capture_f64(closure, 2, value);
     crate::closure::js_closure_set_capture_f64(closure, 3, if is_error { 1.0 } else { 0.0 });
     crate::builtins::js_queue_microtask(closure as i64);
@@ -1100,7 +1106,7 @@ extern "C" fn dir_finish_read_callback_impl(
 ) -> f64 {
     const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
     let id = dir_id_of(closure);
-    let callback = crate::closure::js_closure_get_capture_ptr(closure, 1) as *const ClosureHeader;
+    let callback = crate::closure::closure_capture_ref(closure, 1) as *const ClosureHeader;
     let value = crate::closure::js_closure_get_capture_f64(closure, 2);
     let kind = crate::closure::js_closure_get_capture_f64(closure, 3) as i32;
     match kind {
@@ -1149,7 +1155,7 @@ fn dir_schedule_read_callback(
         4,
     );
     crate::closure::closure_set_capture_word(closure, 0, id as i64);
-    crate::closure::js_closure_set_capture_ptr(closure, 1, callback as i64);
+    crate::closure::closure_set_capture_ref(closure, 1, callback as i64);
     crate::closure::js_closure_set_capture_f64(closure, 2, value);
     crate::closure::js_closure_set_capture_f64(closure, 3, kind);
     crate::builtins::js_queue_microtask(closure as i64);

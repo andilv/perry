@@ -188,7 +188,8 @@ pub(crate) use helpers::{
     emit_string_addref_if_heap_string, expr_has_numeric_pointer_free_array_layout,
     expr_produces_fresh_heap_allocation, expr_produces_non_pointer_bits_by_construction,
     is_global_this_builtin_name, lower_expr_with_expected_type, lower_js_args_array,
-    store_needs_string_addref, unbox_ffi_str_arg, unbox_str_handle, unbox_to_i64,
+    store_needs_string_addref, unbox_ffi_str_arg, unbox_pointer_or_null, unbox_str_handle,
+    unbox_to_i64,
 };
 pub(crate) use i32_fast_path::temps as i32_temps;
 pub(crate) use i32_fast_path::{
@@ -284,6 +285,8 @@ mod entry_block_alloca_tests;
 mod family_guard_tests;
 #[cfg(test)]
 mod hit_path_access_tests;
+#[cfg(test)]
+mod index_append_layout_note_tests;
 #[cfg(test)]
 mod index_set_barrier_tests;
 #[cfg(test)]
@@ -3383,6 +3386,7 @@ mod fs_await;
 mod hit_path_tests;
 pub(crate) mod index_get;
 pub(crate) use index_get::guarded_array::emit_spread_stack_admission;
+pub(crate) mod booleans;
 pub(crate) mod held_len;
 #[cfg(test)]
 mod index_get_claim_tests;

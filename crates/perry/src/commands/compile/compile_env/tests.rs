@@ -620,6 +620,16 @@ fn number_store_arm_switch_is_a_cache_input() {
     );
 }
 
+/// Proven Numbers are born raw (P3 B4b): the switch decides which births
+/// test a raw-`f64` lane's value, so `=0` must never reuse an `=1` object.
+#[test]
+fn number_births_switch_is_a_cache_input() {
+    assert!(
+        COMPILE_ENV_VARS.contains(&"PERRY_FACTS_NUMBER_BIRTHS"),
+        "PERRY_FACTS_NUMBER_BIRTHS must key the compile caches"
+    );
+}
+
 /// The rep-keyed element store: the switch changes every runtime-key store
 /// into an Array the facts give Number elements, so `=0` must never reuse an
 /// `=1` object.
@@ -652,6 +662,27 @@ fn slice_births_switch_is_a_cache_input() {
     );
 }
 
+/// Booleans: the switch changes how the truthiness of a proven Boolean is
+/// lowered, so `=0` must never reuse an `=1` object.
+#[test]
+fn booleans_switch_is_a_cache_input() {
+    assert!(
+        COMPILE_ENV_VARS.contains(&"PERRY_FACTS_BOOLEANS"),
+        "PERRY_FACTS_BOOLEANS must key the compile caches"
+    );
+}
+
+/// In-bounds reads: the switch changes which reads may yield `undefined`
+/// and which reads lose their bound and hole tests, so `=0` must never
+/// reuse an `=1` object.
+#[test]
+fn inbounds_read_switch_is_a_cache_input() {
+    assert!(
+        COMPILE_ENV_VARS.contains(&"PERRY_FACTS_INBOUNDS_READ"),
+        "PERRY_FACTS_INBOUNDS_READ must key the compile caches"
+    );
+}
+
 /// In-bounds index stores: the switch changes which Arrays iterate without
 /// `undefined`, and with it the exported reps and typed signatures, so `=0`
 /// must never reuse an `=1` object.
@@ -681,6 +712,31 @@ fn signed_index_switch_is_a_cache_input() {
     assert!(
         COMPILE_ENV_VARS.contains(&"PERRY_SIG_SIGNED_INDEX"),
         "PERRY_SIG_SIGNED_INDEX must key the compile caches"
+    );
+}
+
+/// The number-index switch decides whether a method with an F64 index
+/// parameter gets a typed body in place of its index clones, and its
+/// companion how `a[k] ?? <int32>` is lowered for a Number key, so `=0` must
+/// never reuse an `=1` object.
+#[test]
+fn number_index_switches_are_cache_inputs() {
+    for name in ["PERRY_SIG_NUMBER_INDEX", "PERRY_REST_DEFAULT_NUMBER_KEY"] {
+        assert!(
+            COMPILE_ENV_VARS.contains(&name),
+            "{name} must key the compile caches"
+        );
+    }
+}
+
+/// The two-phase realm switch decides which runtime entry a static global
+/// read calls and whether the entry announces the mode, so an object compiled
+/// with it must never be reused without it.
+#[test]
+fn realm_two_phase_switch_is_a_cache_input() {
+    assert!(
+        COMPILE_ENV_VARS.contains(&"PERRY_REALM_TWO_PHASE"),
+        "PERRY_REALM_TWO_PHASE must key the compile caches"
     );
 }
 

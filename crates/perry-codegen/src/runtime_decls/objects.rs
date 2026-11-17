@@ -384,6 +384,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_nm_install_child_process", VOID, &[]);
     module.declare_function("js_nm_install_cluster", VOID, &[]);
     module.declare_function("js_nm_install_console", VOID, &[]);
+    module.declare_function("js_nm_install_constants", VOID, &[]);
     module.declare_function("js_nm_install_crypto", VOID, &[]);
     module.declare_function("js_nm_install_dgram", VOID, &[]);
     module.declare_function("js_nm_install_dns", VOID, &[]);
@@ -426,6 +427,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_nm_install_zlib", VOID, &[]);
     module.declare_function("js_nm_install_worker_threads", VOID, &[]);
     module.declare_function("js_nm_install_all", VOID, &[]);
+    module.declare_function("js_nm_install_all_constants", VOID, &[]);
     module.declare_function("js_nm_enable_install_all", VOID, &[]);
     module.declare_function("js_dns_install_exports", VOID, &[]);
     // The named read's entries behind the probe (`object/field_get_set/
@@ -456,11 +458,6 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         "js_object_get_field_value_site",
         DOUBLE,
         &[I64, I64, I64, PTR],
-    );
-    module.declare_function(
-        "js_object_get_keyed_site_slow",
-        DOUBLE,
-        &[DOUBLE, DOUBLE, I64, I32, PTR],
     );
     // The store probe (`expr/put_value_store_ic.rs`): 1 when it stored.
     module.declare_function("perry_probe_set", I32, &[PTR, I64, I64, I64, DOUBLE]);
@@ -667,7 +664,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function(
         "js_put_value_set_dynamic",
         DOUBLE,
-        &[DOUBLE, DOUBLE, DOUBLE, I32],
+        &[PTR, DOUBLE, DOUBLE, DOUBLE, I32],
     );
     // The per-agent pointer block (`expr/agent_ptr.rs`), read inline on ELF
     // executables (where `use_local_exec_tls` turns this model into

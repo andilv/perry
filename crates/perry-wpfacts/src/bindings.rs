@@ -131,6 +131,33 @@ pub(crate) fn bodies_of(m: &Model, n: NodeId) -> Vec<BodyRef> {
     out
 }
 
+/// ONCHG2: functions `fs` as bodies, when every one is a compiled closure or
+/// function declaration with a HIR id (no method, no function only another
+/// unit or the runtime has). Empty otherwise.
+pub(crate) fn bodies_of_fns(
+    m: &Model,
+    fs: impl Iterator<Item = crate::model::FnIdx>,
+) -> Vec<BodyRef> {
+    let mut out: Vec<BodyRef> = Vec::new();
+    for f in fs {
+        let fi = &m.funcs[f as usize];
+        let closure = m.closures.contains(&f);
+        if fi.func_id == u32::MAX || !(closure || m.decls.contains(&f)) {
+            return Vec::new();
+        }
+        out.push(BodyRef {
+            module: fi.module,
+            func_id: fi.func_id,
+            params: fi.params.len() as u32,
+            plain: fi.rest.is_none() && !fi.has_arguments,
+            closure,
+        });
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// A stand-in describes another declaration unit's code, but still names
 /// the original emitted body. Consume that identity only in the defining
 /// source module: the native consumer cannot call a foreign module's HIR id.
@@ -405,6 +432,12 @@ pub struct BindingFacts {
     /// program string literal (`literal_strings`): born shared, never
     /// appended to in place.
     pub literal_strings: bool,
+    /// Every value it holds is `true` or `false` (`booleans`): the slot's
+    /// word is `TAG_TRUE` or `TAG_FALSE`.
+    pub booleans: bool,
+    /// Every value it holds is `true`, `false`, `undefined` or `null`
+    /// (`booleans::holds_or_nullish`): its truthiness is `word == TAG_TRUE`.
+    pub nullish_booleans: bool,
     /// It holds only plain Arrays whose length nothing changes while its
     /// function runs (`held_lengths`): a loop of that function may hold
     /// `x.length` across its calls.
@@ -417,6 +450,9 @@ pub struct BindingFacts {
     /// this name (`named_lengths`): a loop without calls that walks it
     /// need not fear a store through another name.
     pub named_length: bool,
+    /// It holds only sync generator objects whose for-of protocol is the
+    /// intrinsic one (`gen_sources`): for-of over it resumes their bodies.
+    pub generator_source: bool,
 }
 
 /// Storage proof over all values a binding can hold. Allocation identities
@@ -444,10 +480,12 @@ pub(crate) fn owner_metadata_written(m: &Model, tm: u32) -> bool {
                         .all(|v| v != TOP && m.beside_values(v))
             })
     };
-    if m.any_writers
-        .get(&tm)
-        .is_some_and(|w| w.ctor.iter().chain(&w.post).any(|s| !numeric_key(s)))
-    {
+    if m.any_writers.get(&tm).is_some_and(|w| {
+        w.ctor
+            .iter()
+            .chain(w.post.iter().map(|(s, _)| s))
+            .any(|s| !numeric_key(s))
+    }) {
         return true;
     }
     m.writers.keys().any(|(owner, key)| {
@@ -660,6 +698,12 @@ pub struct ModuleBindings {
     /// most the Array's length (`gen/in_bounds.rs`): check mode tests the
     /// claim at the store. Sorted, unique.
     pub inbounds_stores: Vec<u32>,
+    /// In-bounds reads by `element_offset` (`gen/in_bounds.rs`,
+    /// `collect_reads`): at every copy the receiver holds only Arrays of
+    /// this unit that never shrink and the key is an index below the
+    /// length the Array has at the read. `true`: none of them may hold a
+    /// hole either, so the slot is a present element. Sorted by offset.
+    pub inbounds_reads: Vec<(u32, bool)>,
     /// I32 at rest, PR B (`rest_elems`): element reads and element stores
     /// by `element_offset` whose every receiver holds only Arrays of at-rest
     /// templates, with the least floor of those Arrays; the `fill` call
@@ -899,6 +943,8 @@ fn facts_of(g: &Gen, nodes: &[NodeId]) -> BindingFacts {
     out.bodies = bodies_with_contracts(g, nodes);
     out.class_object = class_object_of(m, nodes);
     out.literal_strings = crate::literal_strings::holds(m, nodes);
+    out.booleans = crate::booleans::holds(m, nodes);
+    out.nullish_booleans = crate::booleans::holds_or_nullish(m, nodes);
     out.rep = match arr_rep(m, nodes) {
         Some(r) => Rep::Arr(r),
         None => match record_rep(m, nodes) {
@@ -1038,6 +1084,21 @@ pub(crate) fn tok_arr_rep(m: &Model, t: Tok, tm: u32, hole_free: bool) -> ArrRep
             if m.arr_elem_sabotage && node.prim & crate::model::prim::NUM != 0 {
                 ElemRep::F64
             } else if !numbers {
+                // PERRY_FACTS_ARR_WHY=1: which element node keeps a plain
+                // Array boxed (feed `n<id>` to PERRY_FACTS_WHY_AT).
+                if std::env::var_os("PERRY_FACTS_ARR_WHY").is_some() {
+                    let pts = node.pts.to_sorted();
+                    eprintln!(
+                        "ARRWHY tok={t} {} elem=n{e} prim={:#x} pts={} first={:?}",
+                        m.tok_name(t),
+                        node.prim,
+                        pts.len(),
+                        pts.iter()
+                            .take(4)
+                            .map(|&p| m.tok_name(p))
+                            .collect::<Vec<_>>()
+                    );
+                }
                 ElemRep::Boxed
             } else if int32 && elem_demand(m, t, node) {
                 ElemRep::I32
@@ -1204,6 +1265,7 @@ pub(crate) fn rep_probe(g: &Gen) -> Vec<String> {
     out.extend(g.m.map_values_probe());
     out.extend(crate::element_keys::probe(g));
     out.extend(crate::gen::in_bounds::probe(g));
+    out.extend(crate::gen::in_bounds::read_probe(g));
     out
 }
 

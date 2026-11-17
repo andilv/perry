@@ -232,6 +232,7 @@ def main():
         ("rep-default-negative", "arrelem", "array rep"),
         ("slice-birth-negative", "slicebirth", "array rep"),
         ("inbounds-store-negative", "inbounds", "array rep"),
+        ("inbounds-read-negative", "inread", "array rep"),
         # A false "no hole" claim made at its source (not at a store) is
         # reported where the for-of reads the slot.
         ("forof-hole-negative", "nohole", "array rep"),
@@ -251,6 +252,7 @@ def main():
         ("key-sign-negative", "keysign", "key sign"),
         ("wide-key-negative", "widekey", "wide key"),
         ("literal-string-negative", "litstr", "literal string"),
+        ("boolean-negative", "bools", "boolean"),
         ("held-length-negative", "heldlen", "held length"),
         ("instance-literal-negative", "instlit", "array constant length"),
         ("named-length-negative", "namedlen", "named length"),
@@ -385,6 +387,24 @@ def main():
         assert value["predicate"] == "array rep", value
         save("canonical-number-negative-false-array-rep", status=86)
 
+    # P3 B4b: a birth stores a proven Number into a raw f64 lane with no
+    # number test. The same runtime sabotage hands the birth an INT32-tagged
+    # word; the canonical-number witness at the birth reports it, and with
+    # the consumer off (`PERRY_FACTS_NUMBER_BIRTHS=0`) the birth's own test
+    # sends the word to the ordinary constructor, so nothing is claimed.
+    source = fixtures / "number-birth-negative.ts"
+    exe, e = compile_(source, "number-birth-negative-correct")
+    observed = observe(exe, e)
+    assert observed.returncode == 0 and observed.stdout == oracle(source), observed
+    save("number-birth-negative-correct", status=0)
+    if args.canonnum_runtime:
+        runtime = str(args.canonnum_runtime.resolve())
+        exe, e = compile_(source, "number-birth-negative-false", PERRY_RUNTIME_DIR=runtime)
+        value = report(observe(exe, e))
+        assert value["predicate"] == "canonical number", value
+        assert "birth lane" in value["expectation"], value
+        save("number-birth-negative-false", status=86)
+
     # An interval rule's bounds are those of doubles (`model::range`): the
     # repro of the false int32 claim is right and unreported, and the rule
     # before it (`PERRY_FACTS_INT_BOUNDS=0`: a product past 2^60 is the empty
@@ -406,6 +426,24 @@ def main():
     inventory = [json.loads(line) for line in Path(str(exe) + ".facts.jsonl").read_text().splitlines() if line]
     assert any(row.get("check") and row.get("emitted_checks") for row in inventory), inventory
     save("parallel-bodies", status=0)
+
+    # Two-phase realm (`PERRY_REALM_TWO_PHASE=1`): a slot phase B binds is born
+    # holding the poison word in check mode. With the compiler told to read
+    # the phase-B name `Intl` through the core entry, the read's shape site
+    # hits an unbound slot and the check after it reports; the unchanged
+    # compiler reads it through the full entry and the program equals node.
+    source = fixtures / "realm-phase-negative.ts"
+    exe, e = compile_(source, "realm-phase-false", PERRY_REALM_TWO_PHASE="1",
+                      PERRY_FACTS_SABOTAGE="realm_core:Intl")
+    observed = observe(exe, e)
+    assert observed.returncode == 86, observed
+    assert observed.stderr.startswith(b"PERRY_FALSE_PROOF realm-phase: a compiled global read"), observed
+    assert observed.stdout == b"core 1\n", observed
+    for arm, extra in [("realm-phase-correct", {"PERRY_REALM_TWO_PHASE": "1"}), ("realm-phase-off", {})]:
+        exe, e = compile_(source, arm, **extra)
+        observed = observe(exe, e)
+        assert observed.returncode == 0 and observed.stdout == oracle(source), (arm, observed)
+    save("realm-phase", status=86)
 
     source = fixtures / "slot-key.ts"
     exe, e = compile_(source, "slot-key-false", PERRY_FACTS_SABOTAGE="fixed_layout:Box")

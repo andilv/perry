@@ -236,8 +236,7 @@ mod get_slow;
 pub(crate) use get_slow::get_field_by_name_of_value;
 pub use get_slow::{
     js_object_get_field_nonptr, js_object_get_field_site_slow, js_object_get_field_slow,
-    js_object_get_field_value, js_object_get_field_value_site, js_object_get_keyed_site_slow,
-    js_object_get_keyed_slow,
+    js_object_get_field_value, js_object_get_field_value_site, js_object_get_keyed_slow,
 };
 #[cfg(test)]
 mod get_field_by_name_probe_tests;
@@ -479,3 +478,8 @@ pub(crate) mod runtime_store_site;
 pub(crate) use ic_miss::{
     private_lexical_brand_restore_depth, private_member_access_hints_restore_depth,
 };
+
+/// The next class-template thread token (image run).
+pub(crate) fn snap_image_next_token() -> u64 {
+    class_object_template::snap_image_next_token()
+}

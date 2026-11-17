@@ -1923,3 +1923,9 @@ pub(crate) fn life_collect_full() {
     let _ =
         gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(GcTriggerKind::Direct));
 }
+
+#[cfg(all(perry_gc_instruments, target_os = "linux", target_arch = "x86_64"))]
+pub(crate) use layout_slot_visit::visit_traced_slots;
+
+#[cfg(perry_gc_instruments)]
+pub(crate) use roots::census_visit_roots;

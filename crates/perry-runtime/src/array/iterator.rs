@@ -254,8 +254,6 @@ pub(crate) fn iter_bt_dump(tag: &str, value: f64) {
     let raw = crate::value::js_nanbox_get_pointer(value) as usize;
     let kind = if jv.is_number() {
         "number"
-    } else if jv.is_int32() {
-        "int32"
     } else if jv.is_bool() {
         "bool"
     } else if jv.is_undefined() {
@@ -318,8 +316,7 @@ extern "C" fn async_from_sync_fulfilled(
     let done = crate::closure::js_closure_get_capture_f64(closure, 1) != 0.0;
     let result = async_from_sync_iter_result(value, done);
     let closure = closure_h.get_raw_const_ptr::<crate::closure::ClosureHeader>();
-    let promise =
-        crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut crate::promise::Promise;
+    let promise = crate::closure::closure_capture_ref(closure, 0) as *mut crate::promise::Promise;
     if !promise.is_null() {
         crate::promise::js_promise_resolve(promise, result);
     }
@@ -345,8 +342,7 @@ extern "C" fn async_from_sync_rejected_value(
         async_from_sync_close(iter_h.get_nanbox_f64());
     }
     let closure = closure_h.get_raw_const_ptr::<crate::closure::ClosureHeader>();
-    let promise =
-        crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut crate::promise::Promise;
+    let promise = crate::closure::closure_capture_ref(closure, 0) as *mut crate::promise::Promise;
     if !promise.is_null() {
         crate::promise::js_promise_reject(promise, reason_h.get_nanbox_f64());
     }
@@ -402,9 +398,9 @@ fn async_from_sync_continue(iter: f64, step_result: f64, close_on_rejection: boo
         let outer = outer_h.get_raw_mut_ptr::<crate::promise::Promise>();
         let on_fulfilled = on_fulfilled_h.get_raw_mut_ptr::<crate::closure::ClosureHeader>();
         let on_rejected = on_rejected_h.get_raw_mut_ptr::<crate::closure::ClosureHeader>();
-        crate::closure::js_closure_set_capture_ptr(on_fulfilled, 0, outer as i64);
+        crate::closure::closure_set_capture_ref(on_fulfilled, 0, outer as i64);
         crate::closure::js_closure_set_capture_f64(on_fulfilled, 1, if done { 1.0 } else { 0.0 });
-        crate::closure::js_closure_set_capture_ptr(on_rejected, 0, outer as i64);
+        crate::closure::closure_set_capture_ref(on_rejected, 0, outer as i64);
         crate::closure::js_closure_set_capture_f64(on_rejected, 1, iter_h.get_nanbox_f64());
         crate::closure::js_closure_set_capture_f64(
             on_rejected,

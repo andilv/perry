@@ -381,7 +381,16 @@ fn another_body_interning_key_shapes_does_not_change_transfer() {
         let idx = m.node_l("index");
         let obj = m.node_l("object");
         let dst = m.funcs[0].ret;
-        m.cons(obj, Cons::IdxLoad { idx, dst, shape });
+        m.cons(
+            obj,
+            Cons::IdxLoad {
+                idx,
+                dst,
+                shape,
+                enumerable: false,
+                kept: false,
+            },
+        );
         m.packet_end(None, true);
         m.funcs[0].body_packet.bytes()
     }
@@ -448,6 +457,7 @@ fn token_receiver_remains_an_explicit_call_input() {
         let callee = m.node_l("callee");
         let ret = m.funcs[0].ret;
         m.calls.push(crate::model::CallSite {
+            first_arg_fixed: false,
             this: crate::model::ThisArg::Tok(value),
             args: vec![],
             spread: vec![],

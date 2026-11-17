@@ -121,7 +121,8 @@ fn winsize_impl(fd: i32) -> Option<(i32, i32)> {
             crate::effect!(host_read, tty);
             unsafe {
                 let mut ws: libc::winsize = std::mem::zeroed();
-                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                if libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0
+                {
                     Some((ws.ws_col as i32, ws.ws_row as i32))
                 } else {
                     None
@@ -220,10 +221,6 @@ fn validate_fd_number(fd: f64) -> i32 {
 
 fn tty_isatty_fd_arg(value: f64) -> Option<i32> {
     let js_value = JSValue::from_bits(value.to_bits());
-    if js_value.is_int32() {
-        let fd = js_value.as_int32();
-        return (fd >= 0).then_some(fd);
-    }
     if !js_value.is_number() {
         return None;
     }
@@ -318,9 +315,6 @@ fn this_object(this: crate::closure::JsThis) -> Option<*mut ObjectHeader> {
 fn fd_from_object(obj: *mut ObjectHeader) -> Option<i32> {
     let fd = crate::object::js_object_get_field_by_name_f64(obj, named_key(b"fd"));
     let jsval = JSValue::from_bits(fd.to_bits());
-    if jsval.is_int32() {
-        return Some(jsval.as_int32());
-    }
     if jsval.is_number() && fd.is_finite() && fd.fract() == 0.0 {
         return Some(fd as i32);
     }
@@ -504,9 +498,6 @@ impl ColorEnv<'_> {
             if jsval.is_bool() {
                 return Some(jsval.as_bool().to_string());
             }
-            if jsval.is_int32() {
-                return Some(jsval.as_int32().to_string());
-            }
             if jsval.is_number() && value.is_finite() {
                 return Some(value.to_string());
             }
@@ -675,9 +666,6 @@ fn has_colors_for_depth(count: f64, depth: u8) -> bool {
 
 fn count_value(count: f64) -> Result<f64, &'static str> {
     let jsval = JSValue::from_bits(count.to_bits());
-    if jsval.is_int32() {
-        return Ok(jsval.as_int32() as f64);
-    }
     if jsval.is_number() {
         return Ok(jsval.as_number());
     }
@@ -1091,9 +1079,6 @@ fn write_all_fd(fd: i32, bytes: &[u8]) -> bool {
 
 fn numeric_arg(value: f64, default: i32) -> i32 {
     let jsval = JSValue::from_bits(value.to_bits());
-    if jsval.is_int32() {
-        return jsval.as_int32();
-    }
     if jsval.is_number() && value.is_finite() {
         return value as i32;
     }

@@ -187,13 +187,6 @@ pub(crate) unsafe fn bind_node_sqlite_value(
                 (ptr as *const u8).add(std::mem::size_of::<StringHeader>()) as *const c_char;
             ffi::sqlite3_bind_text(raw_stmt, index, data_ptr, len, ffi::SQLITE_TRANSIENT())
         }
-    } else if js.is_int32() {
-        // Node binds every JS number via sqlite3_bind_double — even
-        // integral values (a column with no affinity stores them as REAL,
-        // and `stmt.expandedSQL` renders `5.0`). Match that instead of
-        // promoting integral numbers to SQLite INTEGERs (#6561); only
-        // BigInt binds as INTEGER.
-        ffi::sqlite3_bind_double(raw_stmt, index, js.as_int32() as f64)
     } else if js.is_bigint() {
         let Some(value) = bigint_to_i64(js.as_bigint_ptr()) else {
             return Err(BindError::ArgValue(
@@ -533,8 +526,6 @@ pub(crate) unsafe fn node_sqlite_result_value(ctx: *mut ffi::sqlite3_context, va
     let js = value_from_f64(value);
     if js.is_null() || js.is_undefined() {
         ffi::sqlite3_result_null(ctx);
-    } else if js.is_int32() {
-        ffi::sqlite3_result_double(ctx, js.as_int32() as f64);
     } else if js.is_number() {
         ffi::sqlite3_result_double(ctx, js.as_number());
     } else if js.is_any_string() {
@@ -671,6 +662,9 @@ mod tests {
 
     #[test]
     fn typed_arrays_are_not_named_parameter_objects() {
+        // A typed array is born only once its runtime family is installed;
+        // the empty constructor slot aborts (`family_never`).
+        perry_runtime::feature_hooks::js_runtime_install_typedarray();
         let typed_array = perry_runtime::typedarray_hook_slots::js_typed_array_new_empty(
             perry_runtime::typedarray_hook_slots::KIND_UINT8 as i32,
             1,

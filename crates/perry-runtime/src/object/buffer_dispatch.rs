@@ -32,12 +32,7 @@ fn buffer_dispatch_string_ptr(value: f64) -> *const crate::string::StringHeader 
 }
 
 fn buffer_dispatch_i32(value: f64) -> i32 {
-    let jsval = JSValue::from_bits(value.to_bits());
-    if jsval.is_int32() {
-        jsval.as_int32()
-    } else {
-        value as i32
-    }
+    value as i32
 }
 
 /// `buf.write(string, offset?, length?, encoding?)` argument handling,
@@ -347,12 +342,12 @@ fn fixed_slice_write_encoding(method_name: &str) -> Option<i32> {
     })
 }
 
-unsafe fn buffer_secret_export_format(bits: f64) -> Option<String> {
-    let raw = bits.to_bits();
-    if (raw >> 48) as u16 == 0x7FFC {
+pub(super) unsafe fn buffer_secret_export_format(bits: f64) -> Option<String> {
+    let options = JSValue::from_bits(bits.to_bits());
+    if !options.is_pointer() {
         return None;
     }
-    let obj = (raw & 0x0000_FFFF_FFFF_FFFF) as *const ObjectHeader;
+    let obj = options.as_pointer::<ObjectHeader>();
     if (obj as usize) < 0x1000 {
         return None;
     }
@@ -758,7 +753,9 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
     }
     let arg_i32 = |i: usize| -> i32 {
         if i < args.len() {
-            args[i] as i32
+            // 7.1.5 ToIntegerOrInfinity( ToNumber( arg ) ): an object operand
+            // runs its `valueOf` (the sibling Array `slice` conversion).
+            crate::array::array_slice_value_to_index(args[i])
         } else {
             0
         }
@@ -856,7 +853,7 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
         "copyWithin" => {
             let len = crate::buffer::store::raw_length(buf_ptr as usize) as i64;
             let rel = |v: f64| -> i64 {
-                let n = crate::value::JSValue::from_bits(v.to_bits()).to_number();
+                let n = crate::builtins::js_number_coerce(v);
                 if n.is_nan() {
                     return 0;
                 }
@@ -979,8 +976,6 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
         }
         "fill" => {
             let len = crate::buffer::store::raw_length(buf_ptr as usize) as i32;
-            let start = if args.len() >= 2 { arg_i32(1) } else { 0 };
-            let end = if args.len() >= 3 { arg_i32(2) } else { len };
             let value = args
                 .first()
                 .copied()
@@ -1007,6 +1002,10 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
                     return f64::from_bits(JSValue::pointer(result as *mut u8).bits());
                 }
             }
+            // Buffer.prototype.fill converts here; a plain Uint8Array's typed-array
+            // fill above converts its own operands (once).
+            let start = if args.len() >= 2 { arg_i32(1) } else { 0 };
+            let end = if args.len() >= 3 { arg_i32(2) } else { len };
             let result = crate::buffer::js_buffer_fill_value_range(buf_ptr, value, start, end, enc);
             f64::from_bits(JSValue::pointer(result as *mut u8).bits())
         }
@@ -1290,11 +1289,6 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
                         .is_some_and(|idx| idx < crate::buffer::store::raw_length(buf_ptr as usize))
                 }) {
                     own
-                } else if crate::value::is_int32_bits(key_bits) {
-                    // int32 key
-                    let idx = (key_bits & 0xFFFF_FFFF) as i32;
-                    let buf_len = crate::buffer::store::raw_length(buf_ptr as usize) as i32;
-                    idx >= 0 && idx < buf_len
                 } else if !(0x7FF8..=0x7FFF).contains(&(key_bits >> 48)) {
                     // raw f64 numeric key (NaN-boxing tags occupy 0x7FF8..=0x7FFF)
                     let n = args[0];
@@ -1317,7 +1311,6 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
             let key_is_own = if args.is_empty() {
                 false
             } else {
-                let key_bits = args[0].to_bits();
                 if let Some(own) = crate::string::with_string_value_bytes(args[0], |bytes| {
                     // A string key — heap or inline SSO (#11519). Only
                     // numeric-string indices that are in bounds count as own
@@ -1328,10 +1321,6 @@ pub(crate) unsafe fn dispatch_builtin_buffer_method(
                         .is_some_and(|idx| idx < crate::buffer::store::raw_length(buf_ptr as usize))
                 }) {
                     own
-                } else if crate::value::is_int32_bits(key_bits) {
-                    let idx = (key_bits & 0xFFFF_FFFF) as i32;
-                    let buf_len = crate::buffer::store::raw_length(buf_ptr as usize) as i32;
-                    idx >= 0 && idx < buf_len
                 } else if !args[0].is_nan() {
                     let n = args[0];
                     if n.is_finite() && n.fract() == 0.0 && n >= 0.0 {

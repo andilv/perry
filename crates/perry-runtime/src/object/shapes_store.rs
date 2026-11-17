@@ -645,12 +645,20 @@ impl ShapeRecord {
     #[inline]
     pub(crate) fn lane(&self, slot: u32) -> u64 {
         if slot < crate::object::field_rep::REP_SLOTS {
-            crate::object::field_rep::slot_rep(self.rep, slot)
+            self.word0_lane(slot)
         } else if tail_constfn_slot(self.constfn_infos(), slot) {
             crate::object::field_rep::REP_SPECIAL
         } else {
             crate::object::field_rep::REP_ANY
         }
+    }
+
+    /// The lane of `slot` below [`crate::object::field_rep::REP_SLOTS`]:
+    /// word 0 alone, no call (the store probe's leaf, DESIGN_R §3).
+    #[inline(always)]
+    pub(crate) fn word0_lane(&self, slot: u32) -> u64 {
+        debug_assert!(slot < crate::object::field_rep::REP_SLOTS);
+        crate::object::field_rep::slot_rep(self.rep, slot)
     }
 
     /// Does the record carry a ConstFn lane at slot >= 32?
@@ -979,6 +987,14 @@ fn new_extras(infos: &[ConstFnSlotInfo], brands: &[u64]) -> u64 {
         integrity_flags: 0,
     });
     Box::into_raw(extras) as usize as u64
+}
+
+/// Image run: the object kind a mint record's kind code names, decoded by the record's own
+/// decoder.
+pub(in crate::object) fn snap_image_kind_of_code(code: u8) -> ShapeObjectKind {
+    let mut r = ShapeRecord::new(0, 0, 0, 0, ShapeObjectKind::Ordinary, 0);
+    r.flags_and_kind = r.flags_and_kind & !RECORD_KIND_MASK | u32::from(code) << RECORD_KIND_SHIFT;
+    r.object_kind()
 }
 
 /// Brand-list identity. Nearly every shape has none, and slice equality calls
@@ -1313,7 +1329,20 @@ pub(crate) struct BandDir {
     pub(crate) word_dir: std::cell::Cell<*const u8>,
     #[cfg(target_pointer_width = "32")]
     _word_dir_high: u32,
+    /// This agent's property-atom index (`string::intern::AtomTable`), for
+    /// the keyed probe's key resolution; null until the agent's first atom
+    /// and after its table is dropped. Offset 56.
+    atoms: std::cell::Cell<*const u8>,
+    #[cfg(target_pointer_width = "32")]
+    _atoms_high: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<BandDir>() == 64);
+
+/// `BandDir.atoms`' offset: the keyed probe reads the atom index out of the
+/// directory it was handed (`shapes::dir_atoms`).
+pub(crate) const DIR_ATOMS_OFFSET: usize = std::mem::offset_of!(BandDir, atoms);
+const _: () = assert!(DIR_ATOMS_OFFSET == 56);
 
 /// `BandDir.flat_base`'s offset; `flat_ids` follows at +8.
 pub(crate) const FLAT_BASE_OFFSET: usize = crate::codegen_abi::SHAPE_DIR_FLAT_BASE;
@@ -1346,6 +1375,9 @@ impl BandDir {
             word_dir: std::cell::Cell::new(std::ptr::null()),
             #[cfg(target_pointer_width = "32")]
             _word_dir_high: 0,
+            atoms: std::cell::Cell::new(std::ptr::null()),
+            #[cfg(target_pointer_width = "32")]
+            _atoms_high: 0,
         }
     }
 }

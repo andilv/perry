@@ -106,8 +106,16 @@ impl Model {
         // Every event that lands here may shrink the Array: an in-bounds
         // store (`index_kept`) is no proof for it from now on, and the
         // hole it withheld is marked.
-        if self.arr_shrunk.insert(t) && self.inbounds_kept.contains(&t) {
-            self.mark_hole(t);
+        if self.arr_shrunk.insert(t) {
+            if self.inbounds_kept.contains(&t) {
+                self.mark_hole(t);
+            }
+            // An in-bounds read of it may be past its end from now on.
+            if let Some(reads) = self.kept_reads.remove(&t) {
+                for (_, dst) in reads {
+                    self.add_prim(dst, prim::UNDEF);
+                }
+            }
         }
         if self.arr_floor_sabotage {
             return;
@@ -132,6 +140,34 @@ impl Model {
             self.inbounds_kept.insert(t);
         } else {
             self.mark_hole(t);
+        }
+    }
+
+    /// `Cons::IndexHoleIn`: an index store into Array `t` under the Number
+    /// key node `key`. ECMA-262 10.4.2.1: a store at an index below the
+    /// length writes that element (a hole there is filled, none is made);
+    /// only an index past the end leaves the indices between as holes. On
+    /// a program Array of this unit with a length interval
+    /// (`elem_undef_watched`) the hole node (`hole`) is the destination of
+    /// the watched read rule: `Cons::ElemUndef` gives it `undefined` once a
+    /// key may reach the lower bound of the length (Invariant L: the length
+    /// never drops below it) or the length is ⊤. Any other Array may get a
+    /// hole at once (`mark_hole`).
+    pub(crate) fn index_hole_in(&mut self, t: Tok, key: NodeId) {
+        if !self.elem_undef_watched(t) {
+            self.mark_hole(t);
+            return;
+        }
+        let h = self.hole(t);
+        if self.idx_done.insert((key, t, h, crate::model::IDX_HOLE_IN)) {
+            let c = Cons::ElemUndef {
+                obj: t,
+                key,
+                dst: h,
+            };
+            self.cons(key, c);
+            let len = self.arr_len(t);
+            self.cons(len, c);
         }
     }
 
@@ -315,9 +351,51 @@ impl Model {
         if self.nodes[dst as usize].prim & prim::UNDEF != 0 {
             return;
         }
+        // An in-bounds read (`kept_read`) needs no floor: its key was
+        // below the length, so it is past the end only as no index.
+        if self.kept_read_at(t, key, dst) && self.elem_index_key(key) != Some(false) {
+            return;
+        }
         if self.elem_in_floor(t, key) == Some(false) {
             self.add_prim(dst, prim::UNDEF);
         }
+    }
+
+    /// The in-bounds read (`Cons::IdxLoad` with `kept`; gen compared the
+    /// key with the `length` the Array held at a test of the walked code,
+    /// `gen/in_bounds.rs`): does a read of `t` there stay below its length?
+    /// While `t` is an Array of this unit that never shrinks
+    /// (`arr_grow_only`): between the test and the read its length only
+    /// grew. Any other Array may have been shortened in between (through
+    /// another name, in a callee). `arr_len_top` withdraws it
+    /// (`kept_reads`). Not with `PERRY_FACTS_ELEM_UNDEF=0`: every computed
+    /// read then yields `undefined`.
+    pub(crate) fn kept_read(&self, t: Tok) -> bool {
+        self.inbounds_read && self.elem_undef && t != TOP && self.is_arr(t) && self.arr_grow_only(t)
+    }
+
+    /// The read of `t` under `key` into `dst` is a kept in-bounds read.
+    pub(crate) fn kept_read_at(&self, t: Tok, key: NodeId, dst: NodeId) -> bool {
+        self.kept_reads
+            .get(&t)
+            .is_some_and(|rs| rs.contains(&(key, dst)))
+    }
+
+    /// Every value of `key` is an index: a non-negative integer Number
+    /// (`-0` is the index 0). `None` while the key holds nothing. The text
+    /// bounds the key from above only; a negative key, a fraction, NaN or
+    /// a String names a property the Array may not have. The negative
+    /// control `inread` admits any Number.
+    pub(crate) fn elem_index_key(&self, key: NodeId) -> Option<bool> {
+        let k = self.range_input(key);
+        if k.is_empty() {
+            return None;
+        }
+        if self.inbounds_read_sabotage {
+            let nd = &self.nodes[key as usize];
+            return Some(nd.pts.is_empty() && nd.prim == prim::NUM);
+        }
+        Some(!k.is_top() && k.lo >= 0)
     }
 
     /// The `ElemUndef` verdict of reading `t` under `key` now: `Some(true)`

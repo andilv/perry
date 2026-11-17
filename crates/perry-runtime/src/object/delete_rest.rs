@@ -50,6 +50,9 @@ pub extern "C" fn js_object_delete_field(
             crate::typedarray_named::note_named_mutation(owner, bytes);
         }
     }
+    if let Some(result) = crate::web_storage::storage_delete_field(obj, key) {
+        return result;
+    }
     if let Some(result) = crate::process::process_env_delete_field(obj, key) {
         return result;
     }
@@ -880,7 +883,7 @@ fn primitive_receiver_delete(obj_value: f64, key: f64) -> i32 {
             || super::field_get_set::canonical_array_index_bytes(bytes).is_some_and(|i| i < len);
         return i32::from(!own);
     }
-    if k.is_number() || k.is_int32() {
+    if k.is_number() {
         // ToPropertyKey: an integral Number in range names an index (`-0` is "0").
         let n = k.to_number();
         return i32::from(!(n >= 0.0 && n.fract() == 0.0 && n < f64::from(len)));
@@ -1211,6 +1214,16 @@ pub extern "C" fn js_object_delete_dynamic(obj: *mut ObjectHeader, key: f64) -> 
     if key_val.is_short_string() {
         if let Some(result) = unsafe { try_delete_stable_sso(obj, key_val) } {
             return result;
+        }
+    }
+
+    // An ordinary bag with an overflow table: the key's atom names the
+    // entry, as for a keyed read (`layout_probe::probe_delete_keyed`).
+    if key_val.is_any_string() {
+        if let Some(deleted) =
+            unsafe { super::shapes::layout_probe::probe_delete_keyed(obj, key.to_bits()) }
+        {
+            return i32::from(deleted);
         }
     }
 

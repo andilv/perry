@@ -221,11 +221,7 @@ fn validate_exit_code(code: f64) -> Option<i32> {
     // NaN-producing strings rejected as TypeError; everything that is not
     // already a number is a TypeError too.
     let n = if crate::fs::validate::is_numeric(jv) {
-        if jv.is_int32() {
-            jv.as_int32() as f64
-        } else {
-            jv.as_number()
-        }
+        jv.as_number()
     } else if jv.is_any_string() {
         match coerce_exit_code_string(code) {
             Some(num) => num,
@@ -515,11 +511,7 @@ fn throw_cpu_prior_invalid_type(value: f64) -> ! {
 }
 
 fn numeric_value(jv: JSValue) -> f64 {
-    if jv.is_int32() {
-        jv.as_int32() as f64
-    } else {
-        jv.as_number()
-    }
+    jv.as_number()
 }
 
 fn format_node_number(value: f64) -> String {
@@ -967,11 +959,7 @@ pub extern "C" fn js_process_pending_exit_code() -> i32 {
     if jv.is_undefined() || jv.is_null() {
         return 0;
     }
-    if jv.is_int32() {
-        jv.as_int32()
-    } else {
-        jv.as_number() as i32
-    }
+    jv.as_number() as i32
 }
 
 // The natural-exit epilogue emits a call to `js_process_pending_exit_code`
@@ -1580,7 +1568,7 @@ fn js_process_env_impl() -> f64 {
         return cached;
     }
     let census_mark = crate::snap_census::env_storage_begin();
-    let obj = crate::realm_decl! { birth crate::object::js_object_alloc(0, crate::object::INLINE_SLOT_FLOOR as u32); realm { process.env, kind = exotic, members = { }; } };
+    let obj = crate::realm_decl! { birth crate::object::js_object_alloc(0, crate::object::INLINE_SLOT_FLOOR as u32); realm { process.env, kind = exotic, members = { }, values = string; } };
     crate::snap_census::env_storage_end(census_mark, obj as usize);
     let boxed = f64::from_bits(JSValue::pointer(obj as *const u8).bits());
     unsafe { crate::object::proto_validity::mark_exotic_read_receiver(obj as usize) };
