@@ -116,15 +116,33 @@ pub extern "C" fn js_snap_image_begin(
     BASELINE.store(Box::into_raw(b), Relaxed);
 }
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// x86-64 Linux gnu: the cut entry offers its caller's frame to the walk, as
+/// `gc()` does — same naked trampoline (`gc/policy.rs::js_gc_collect`).
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[unsafe(naked)]
 #[no_mangle]
 pub extern "C" fn js_snap_image_cut() {
     crate::gc::offering_entry_asm!(0, js_snap_image_cut_from)
 }
 
+/// x86-64 Linux non-gnu (musl): the offering trampoline is gnu-only (the
+/// macro is written against the gnu unwinder's table shapes), so the cut
+/// runs without the frame offer, exactly like `js_gc_collect`'s fallback:
+/// the baseline buffers are captured and the image written, with no walk
+/// origin for the entry frame.
+#[cfg(all(target_os = "linux", target_arch = "x86_64", not(target_env = "gnu")))]
+#[no_mangle]
+pub extern "C" fn js_snap_image_cut() {
+    let p = BASELINE.load(Relaxed);
+    if !p.is_null() {
+        // SAFETY: leaked in `begin`, never freed; one cut per process.
+        take_pre(unsafe { &mut *p });
+    }
+    cut_body();
+}
+
 /// The cut entry offers its caller's frame to the root walk, as `gc()` does.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 extern "C" fn js_snap_image_cut_from(pc: usize, sp: usize, fp: usize) {
     // First, before the offer below writes the walk origin and before any
     // other code of the capture: the words as the program left them.
