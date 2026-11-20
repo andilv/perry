@@ -307,6 +307,50 @@ pub(crate) unsafe fn generator_record_prototype_word(obj: *const ObjectHeader) -
     other_record_prototype_word(obj)
 }
 
+/// The object a `Get(gen, "next")` on sync generator `obj` first finds an own
+/// key on, when its chain up to that object is all empty: `obj` is on the
+/// sync birth layout with no overflow (no own key but its private state), and
+/// its record's prototype control holds the owner function while the owner's
+/// original prototype is unmaterialized (an empty object whose [[Prototype]]
+/// is `%GeneratorPrototype%`; [`generator_record_prototype_word`]). Then the
+/// answer is `%GeneratorPrototype%`, whose own keys the read scans. `None`
+/// for every other instance: the ordinary [[Get]] decides. Allocation-free.
+///
+/// # Safety
+/// `obj` is a live `GC_TYPE_OBJECT` cell.
+pub(crate) unsafe fn sync_generator_next_owner(
+    obj: *const ObjectHeader,
+) -> Option<*const ObjectHeader> {
+    let sync_shape = BIRTH_SHAPE.with(std::cell::Cell::get);
+    if sync_shape == 0
+        || crate::object::shapes::object_shape_stamp(obj) != LayoutWord(sync_shape)
+        || crate::object::overflow::has_overflow(obj)
+    {
+        return None;
+    }
+    let record = JSValue::from_bits(birth_record_bits(obj));
+    if !record.is_pointer() {
+        return None;
+    }
+    let state = record.as_pointer::<crate::closure::ClosureHeader>();
+    let owner = holder_owner(*state.add(1).cast::<u64>().add(PROTO_SLOT))?;
+    if crate::closure::props::fn_private_intrinsic_read(owner as usize, &ORIGINAL_PROTOTYPE_READ)
+        .is_some()
+    {
+        return None;
+    }
+    let gen_proto =
+        crate::object::GENERATOR_PROTOTYPE_PTR.load(std::sync::atomic::Ordering::Acquire);
+    if gen_proto == 0
+        || !crate::value::addr_class::try_read_gc_header(gen_proto as usize).is_some_and(|h| {
+            crate::gc_type_is_object!(h.obj_type) && h.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+        })
+    {
+        return None;
+    }
+    Some(gen_proto as *const ObjectHeader)
+}
+
 /// [`generator_record_prototype_word`] for an async or transitioned instance.
 #[inline(never)]
 unsafe fn other_record_prototype_word(obj: *const ObjectHeader) -> u64 {
@@ -404,13 +448,10 @@ unsafe fn transitioned_record_held_bits(obj: *const ObjectHeader) -> Option<(u64
 #[inline(never)]
 unsafe fn owner_original_prototype_word<const ASYNC: bool>(holder: u64) -> Option<u64> {
     let owner = holder_owner(holder)?;
-    let bag = (*owner).props;
-    if !bag.is_null() {
-        if let Some(original) =
-            ORIGINAL_PROTOTYPE_READ.read(crate::value::js_nanbox_pointer(bag as i64))
-        {
-            return Some(original.to_bits());
-        }
+    if let Some(original) =
+        crate::closure::props::fn_private_intrinsic_read(owner as usize, &ORIGINAL_PROTOTYPE_READ)
+    {
+        return Some(original.to_bits());
     }
     let gen_proto = if ASYNC {
         crate::object::ASYNC_GENERATOR_PROTOTYPE_PTR.load(std::sync::atomic::Ordering::Acquire)
@@ -466,7 +507,7 @@ pub(crate) fn generator_observe_record_prototype(value: f64) {
         let Some(owner) = holder_owner(*state.add(1).cast::<u64>().add(PROTO_SLOT)) else {
             return;
         };
-        if !(*owner).props.is_null() {
+        if crate::closure::props::has_store(owner as usize) {
             return;
         }
         owner
@@ -692,7 +733,7 @@ pub extern "C" fn js_generator_create(
         owner as *mut crate::closure::ClosureHeader
     };
     let owner = scope.root_raw_const_ptr(owner);
-    ensure_generator_intrinsics();
+    ensure_generator_kind_tower(false);
     // GetPrototypeFromConstructor, read from the owner's declared slot
     // without materializing it.
     let holder = owner.with_const_ptr::<crate::closure::ClosureHeader, _>(|owner| unsafe {
@@ -815,7 +856,11 @@ pub(super) unsafe fn birth_prototype_holder(
     if owner.is_null() {
         return Holder::Record(generator_prototype_bits(is_async));
     }
-    if crate::closure::props::bag_of(owner as usize).is_null()
+    // The `prototype` slot holds the made (or assigned) value.
+    if let Some(value) = crate::closure::props::prototype_slot_value(owner as usize) {
+        return classify_prototype(value, is_async);
+    }
+    if !crate::closure::props::has_store(owner as usize)
         && crate::closure::props::closure_has_generator_body(owner)
     {
         return Holder::Record(crate::value::js_nanbox_pointer(owner as i64).to_bits());

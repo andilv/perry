@@ -12,6 +12,15 @@ use super::*;
 /// default formatting.
 #[no_mangle]
 pub unsafe extern "C" fn js_to_property_key(value: f64) -> f64 {
+    // An integral Number names the key spelled by its decimal text. That key
+    // is the text's property atom, the word every key list compares by
+    // identity, so the key a store adds is the one a later keyed read of the
+    // same Number finds through its atom (`runtime_read_site::probe_integer_key`).
+    if let Some(n) = integral_number(value) {
+        let mut buf = [0u8; 24];
+        let text = super::field_get_set::runtime_read_site::integer_key_text(n, &mut buf);
+        return crate::value::js_nanbox_string(crate::string::property_atom_from_bytes(text) as i64);
+    }
     if value.to_bits() >> 48 == 0 {
         // A Number with clear top 16 bits (a denormal, or +0): its key is
         // ToString of the Number. It is not a raw object pointer, so no
@@ -53,6 +62,17 @@ pub unsafe extern "C" fn js_to_property_key(value: f64) -> f64 {
     crate::value::js_nanbox_string(key as i64)
 }
 
+/// The integer a plain double holds (magnitude at most 2^53, no fraction,
+/// `-0` as 0); `None` for every other value, tagged values included (an
+/// INT32 word can be a class reference).
+#[inline]
+fn integral_number(value: f64) -> Option<i64> {
+    if value.to_bits() & 0x7FFF_0000_0000_0000 >= 0x7FF9_0000_0000_0000 {
+        return None;
+    }
+    super::field_get_set::runtime_read_site::integer_key(value)
+}
+
 /// True when [`js_to_property_key`] provably neither allocates nor calls back
 /// into user JS for `key`, so a caller may hold a raw receiver / stored value
 /// across it without a [`RuntimeHandleScope`] (#6935).
@@ -90,20 +110,6 @@ pub(crate) unsafe fn to_property_key_rooted<'scope>(
     let key_handle = scope.root_nanbox_f64(key);
     let coerced = js_to_property_key(key_handle.get_nanbox_f64());
     scope.root_nanbox_f64(coerced)
-}
-
-/// True when `v` is not a JS Object — i.e. a usable primitive result from
-/// `OrdinaryToPrimitive` (undefined/null/boolean/number/string/bigint and,
-/// crucially, **Symbol**, the one `POINTER_TAG` primitive).
-fn js_value_is_not_object(v: f64) -> bool {
-    let bits = v.to_bits();
-    if (bits & 0xFFFF_0000_0000_0000) != crate::value::POINTER_TAG {
-        return true;
-    }
-    // A Symbol is the one POINTER_TAG primitive. Use `js_is_symbol` (not the
-    // narrower registered-handle table) so a fresh heap `Symbol()` returned
-    // from `toString`/`valueOf` is recognized and preserved as the key.
-    unsafe { crate::symbol::js_is_symbol(v) != 0 }
 }
 
 /// `OrdinaryToPrimitive(O, "string")` with Symbol preservation. The spec
@@ -146,7 +152,7 @@ unsafe fn ordinary_to_primitive_string_key(value: f64) -> Option<f64> {
             std::ptr::null(),
             0,
         );
-        if js_value_is_not_object(result) {
+        if crate::value::to_string_primitive::is_primitive_value(result) {
             return Some(result);
         }
     }

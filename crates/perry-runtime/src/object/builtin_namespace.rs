@@ -90,7 +90,7 @@ fn holder_is_live(p: *const ObjectHeader) -> bool {
 #[inline(always)]
 pub(crate) fn pristine(i: usize) -> bool {
     // SAFETY: the slot names a live holder of this agent or a static stand-in.
-    unsafe { (*holder(i)).parent_class_id < super::layout_desc::UNSHADOWED_WORD_END }
+    unsafe { crate::codegen_abi::is_unshadowed_record_word((*holder(i)).parent_class_id) }
 }
 
 /// The holder of a namespace VALUE: an ordinary object is its own holder, a
@@ -179,7 +179,7 @@ unsafe fn seal_namespace(i: usize, bits: u64) {
     if bits & !crate::value::POINTER_MASK == crate::value::POINTER_TAG
         && crate::closure::is_closure_ptr(addr)
     {
-        crate::closure::props::bag_ensure(addr);
+        crate::closure::props::ensure_key_store(addr);
     }
     let obj = holder_of_value(bits);
     if obj.is_null() {
@@ -203,6 +203,7 @@ unsafe fn seal_namespace(i: usize, bits: u64) {
 /// two-phase realm, whose namespaces the realm seal (phase A) did not see.
 /// No-op for a name that is no builtin namespace. The caller is the
 /// population (a builtin definition, in its no-move window).
+#[cfg_attr(target_os = "linux", link_section = ".perry_tail.seal_namespace_value")]
 #[cold]
 #[inline(never)]
 pub(crate) fn seal_namespace_value(name: &str, bits: u64) {
@@ -239,19 +240,22 @@ pub(crate) unsafe fn note_write(
     }
     // The realm global: only a namespace binding matters.
     let (keys, _) = layout_keys(obj);
+    // A value store names one slot: read the key that owns it once, instead
+    // of searching the global's (long) key list for every namespace name.
+    // Every global write lands here, so that search would be per-store work.
+    let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+    let stored_name = match field {
+        Some(slot) => property_key_text_of_slot(keys, slot, &mut sso),
+        None => None,
+    };
     for (i, name) in crate::codegen_abi::BUILTIN_NAMESPACES.iter().enumerate() {
         if !pristine(i) || !holder_is_live(holder(i)) {
             continue;
         }
         let rebound = match field {
             // A value store: the slot of `name`, about to take a new value.
-            Some(slot) => {
-                !keys.is_null()
-                    && super::keys_find_property_slot_by_bytes(keys, keys.count(), name.as_bytes())
-                        .is_some_and(|pos| {
-                            super::key_attrs::key_storage_slot(keys.arr(), pos) as usize == slot
-                        })
-            }
+            Some(_) => stored_name
+                .is_some_and(|text| crate::string::key_bytes_equal(text, name.as_bytes())),
             // A structural change (key add or delete, descriptor, overflow,
             // relink): does the global still bind `name` to the namespace?
             // A funnel that reports before mutating sees the binding intact;
@@ -265,6 +269,49 @@ pub(crate) unsafe fn note_write(
             withdraw(i, site);
         }
     }
+}
+
+/// The text of the string property key whose storage slot is `slot`, or
+/// `None` when no such key is listed (a symbol or private key, or no key).
+/// Scanned back to front like `keys_find_slot_by_bytes`, so a repeated name
+/// answers with its most-derived position.
+///
+/// # Safety
+/// `keys` is the live global's key view, under the caller's no-move scope;
+/// `sso` outlives the returned text.
+unsafe fn property_key_text_of_slot<'a>(
+    keys: super::ObjectKeys,
+    slot: usize,
+    sso: &'a mut [u8; crate::value::SHORT_STRING_MAX_LEN],
+) -> Option<&'a [u8]> {
+    if keys.is_null() {
+        return None;
+    }
+    let arr = keys.arr();
+    let (slots, len) = super::keys_array_dense_slots(arr);
+    if slots.is_null() {
+        return None;
+    }
+    let count = (keys.count() as usize).min(len);
+    // A list without slot words stores each key at its own position.
+    let (words, written) = super::key_attrs::storage_slot_words(arr);
+    let pos = if words.is_null() {
+        (slot < count).then_some(slot)?
+    } else {
+        (0..count).rev().find(|&p| {
+            let slot_of = if p < written {
+                super::key_attrs::slot_of_word(*words.add(p), p as u32)
+            } else {
+                p as u32
+            };
+            slot_of as usize == slot
+        })?
+    };
+    if super::key_attrs::entry_is_private(super::key_attrs::keys_entry(arr, pos as u32)) {
+        return None;
+    }
+    let key = crate::JSValue::from_bits((*slots.add(pos)).to_bits());
+    crate::string::js_string_key_bytes(key, sso)
 }
 
 /// Set namespace `i`'s bit (or point its slot at the patched stand-in when its

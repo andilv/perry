@@ -1113,32 +1113,49 @@ pub(crate) fn lower(
                         let key = vals[1].clone();
                         let val = vals[2].clone();
                         let strict = if ctx.is_strict_fn { "1" } else { "0" };
-                        let blk = ctx.block();
-                        let handle = unbox_to_i64(blk, &a);
-                        Ok(if key_maybe_string {
-                            // `Uint8ArraySet` is an assignment expression: use
-                            // the canonical receiver-aware setter so expando
-                            // keys, numeric-looking runtime strings, Symbols,
-                            // strictness, and the expression result all match
-                            // ordinary JavaScript property assignment.
-                            blk.call(
-                                DOUBLE,
-                                "js_put_value_set",
-                                &[
-                                    (DOUBLE, &a),
-                                    (DOUBLE, &key),
-                                    (DOUBLE, &val),
-                                    (DOUBLE, &a),
-                                    (I32, strict),
-                                ],
-                            )
-                        } else {
-                            blk.call(
-                                DOUBLE,
-                                "js_typed_array_index_set_dynamic",
-                                &[(I64, &handle), (DOUBLE, &key), (DOUBLE, &val)],
-                            )
-                        })
+                        // The proofs above are static. An unproven key or value
+                        // (`u8[p++] = c` with `p` from a `number` parameter, which
+                        // could hold a BigInt) is still, at run time, usually a
+                        // plain Number index into a Uint8Array: the header-guarded
+                        // byte store tests exactly that, and a plain-Number value
+                        // has no conversion to order before the bounds test. Every
+                        // miss takes the complete runtime store below.
+                        if ctx.block().is_terminated() {
+                            // An operand threw: no block may branch on its
+                            // dropped values (#11450).
+                            return Ok(val);
+                        }
+                        super::u8_buffer_read::emit_u8_cached_dyn_set(ctx, &a, &key, &val, |ctx| {
+                            let blk = ctx.block();
+                            if key_maybe_string {
+                                // `Uint8ArraySet` is an assignment expression: use
+                                // the canonical receiver-aware setter so expando
+                                // keys, numeric-looking runtime strings, Symbols
+                                // and strictness all match ordinary JavaScript
+                                // property assignment.
+                                blk.call(
+                                    DOUBLE,
+                                    "js_put_value_set",
+                                    &[
+                                        (DOUBLE, &a),
+                                        (DOUBLE, &key),
+                                        (DOUBLE, &val),
+                                        (DOUBLE, &a),
+                                        (I32, strict),
+                                    ],
+                                );
+                            } else {
+                                let handle = unbox_to_i64(blk, &a);
+                                blk.call(
+                                    DOUBLE,
+                                    "js_typed_array_index_set_dynamic",
+                                    &[(I64, &handle), (DOUBLE, &key), (DOUBLE, &val)],
+                                );
+                            }
+                        });
+                        // Both runtime stores return the right-hand side, the
+                        // assignment's value on every arm.
+                        Ok(val)
                     })?;
                 if value_discarded {
                     return Ok(double_literal(0.0));
@@ -1573,6 +1590,10 @@ pub(crate) fn lower(
         _ => unreachable!("expr/mod.rs dispatched a variant not handled by this submodule"),
     }
 }
+
+#[cfg(test)]
+#[path = "uint8array_set_tonumber_tests.rs"]
+mod uint8array_set_tonumber_tests;
 
 #[cfg(test)]
 mod map_header_layout_tests {

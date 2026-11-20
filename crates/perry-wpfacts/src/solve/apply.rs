@@ -9,6 +9,9 @@ impl Model {
             // `k in o`: no flow on an ordinary object (a Proxy's `has` trap:
             // `solve/proxy.rs`).
             Cons::HasProp { .. } => {}
+            // `Object.hasOwn(o, k)` and kin: no flow on an ordinary object (a
+            // Proxy's `getOwnPropertyDescriptor` trap: `solve/proxy.rs`).
+            Cons::OwnProp { .. } => {}
             Cons::Load { key, dst } => {
                 // The token loop (⊤ first) runs before the primitive load, so a ⊤
                 // receiver's read keeps the receiver's own root cause instead of being
@@ -82,6 +85,15 @@ impl Model {
                 self.add_prim(dst, prim & prim::STR);
                 for &t in toks {
                     self.own_values_of(t, dst);
+                }
+            }
+            Cons::OwnKeys { dst } => {
+                // A String's own keys are its index names: any String.
+                if prim & prim::STR != 0 {
+                    self.add_prim(dst, prim::STR);
+                }
+                for &t in toks {
+                    self.own_keys_of(t, dst);
                 }
             }
             Cons::OwnDescValues { dst } => {
@@ -222,10 +234,14 @@ impl Model {
                 };
                 let chain = self.chain_sinks.contains(&n);
                 let saved = std::mem::replace(&mut self.chain_escape, chain);
+                let root = self.ledger.as_mut().map(|l| l.enter_sink(n));
                 for &t in toks {
                     if retained != Some(t) {
                         self.escape(t, reason);
                     }
+                }
+                if let (Some(l), Some(r)) = (self.ledger.as_mut(), root) {
+                    l.leave(r);
                 }
                 self.chain_escape = saved;
             }
@@ -497,6 +513,25 @@ impl Model {
                     }
                 }
             }
+            // Rule RP2: an ordinary Array the runtime takes the array arm
+            // for is held back (`solve/record_entry.rs`).
+            Cons::RecordEntry { dst } => {
+                for &t in toks {
+                    if self.record_entry_holds(t) {
+                        if !self.record_entry_held.contains(&(t, dst)) {
+                            self.record_entry_held.push((t, dst));
+                        }
+                    } else {
+                        self.add_tok(dst, t);
+                    }
+                }
+                if prim != 0 {
+                    let strs = self.nodes[n as usize].strs;
+                    let saved = self.cur_range.replace(self.rg(n));
+                    self.add_s(dst, &[], prim, strs);
+                    self.cur_range = saved;
+                }
+            }
             Cons::Defined { dst }
             | Cons::NotNullish { dst }
             | Cons::NotUndefined { dst }
@@ -557,6 +592,19 @@ impl Model {
                         _ => false,
                     };
                     if !buffer {
+                        self.add_tok(dst, t);
+                    }
+                }
+                if prim != 0 {
+                    let strs = self.nodes[n as usize].strs;
+                    let saved = self.cur_range.replace(self.rg(n));
+                    self.add_s(dst, &[], prim, strs);
+                    self.cur_range = saved;
+                }
+            }
+            Cons::NotRegExp { dst } => {
+                for &t in toks {
+                    if !self.is_regexp_tok(t) {
                         self.add_tok(dst, t);
                     }
                 }
@@ -948,6 +996,18 @@ impl Model {
                                 ks.push(key);
                             }
                         }
+                        // A NAMED key on the global object (9.1.1.4: an
+                        // ordinary object whose own properties are the
+                        // global bindings) creates or replaces that one own
+                        // property (20.1.2.4 -> 10.1.6.3) and writes no other
+                        // key: a data descriptor's value is the named store
+                        // `define_by_data` emits (the binding's global field,
+                        // `global_field`), an accessor's get / set are
+                        // installed under that key by `Cons::Accessor`. No
+                        // any-key write of the global object.
+                        _ if builtins::global_object(self, t) && !self.unit_mode => {
+                            self.virt_revoke(t, Some(key));
+                        }
                         // A data descriptor under this NAMED key writes that
                         // key alone (rule D1): HARD, no unknown write of any
                         // other field (`mark_hard_as`).
@@ -996,6 +1056,27 @@ impl Model {
             }
             Cons::Implicit { reason, proto } => {
                 for &t in toks {
+                    // The uncaught report of a native Error (perry-runtime
+                    // exception.rs `print_uncaught`: `ptr_is_native_error`,
+                    // then `uncaught_native_error_report`) reads the stored
+                    // name, message and stack and returns: no property
+                    // lookup, no ToPrimitive, no program code. Every other
+                    // value and every other ToPrimitive keeps the request.
+                    if proto == Protocol::ToPrimitive
+                        && n == self.host_report
+                        && self.native_error_tok(t)
+                    {
+                        continue;
+                    }
+                    // JSON.stringify reads `toJSON` and the values itself
+                    // (json/stringify.rs: native_get, native_call_value_this):
+                    // the request is no route; each call it makes is bound
+                    // by `Model::implicit` and keeps its callee's.
+                    if proto != Protocol::Json {
+                        crate::family_reach::dispatch_route(self, |m| {
+                            format!("the runtime's {proto:?} protocol on {}", m.tok_name(t))
+                        });
+                    }
                     match self.toks[t as usize] {
                         // A function handed to a reflecting runtime helper:
                         // it may be called back with anything.
@@ -1891,8 +1972,17 @@ impl Model {
                 // the named read, which decides presence (`load_from`). A
                 // non-Array object read under such a key got no `undefined`
                 // up front (`idx_load_tok`); once the key holds anything
-                // else, it does.
-                if !self.is_arr(obj) && !self.const_str_key(n) {
+                // else, it does. Rule TA-LEN: a Number key of a typed array
+                // whose length rule watches the read names an element or
+                // no property at all (10.4.5.4); its `Cons::ElemUndef`
+                // decides `undefined`. A key that grows past a Number runs
+                // this again.
+                let ta_floor = toks.is_empty()
+                    && prim == prim::NUM
+                    && self.typed_array_number_key(obj, prim, named)
+                    && self.idx_done.contains(&(n, obj, dst, 0))
+                    && self.elem_undef_watched(obj);
+                if !self.is_arr(obj) && !self.const_str_key(n) && !ta_floor {
                     self.add_prim(dst, prim::UNDEF);
                 }
                 match named.then(|| self.key_entry_shapes(n)).flatten() {
@@ -1963,9 +2053,15 @@ impl Model {
                     self.builtin_field_use(obj, key, ChainAct::Load(dst));
                     if self.typed_array_number_key(obj, prim, named) {
                         // Rule TYPED-ELEM (`typed_array_number_key`): the
-                        // element, a Number (BigInt) or `undefined`.
+                        // element, a Number (BigInt) or `undefined`. Under
+                        // rule TA-LEN (`elem_undef_watched`) the read's
+                        // `Cons::ElemUndef` decides `undefined` (`idx_load_tok`
+                        // registered it, or added `undefined` itself).
                         let p = self.typed_array_elem_prim(obj);
-                        self.add_prim(dst, p | prim::UNDEF);
+                        let floor = self.idx_done.contains(&(n, obj, dst, 0))
+                            && self.elem_undef_watched(obj);
+                        let undef = if floor { 0 } else { prim::UNDEF };
+                        self.add_prim(dst, p | undef);
                     } else {
                         let f = self.num_fields(obj);
                         self.edge(f, dst);
@@ -1987,6 +2083,7 @@ impl Model {
                 }
             }
             Cons::IdxMCall { idx, call, shape } => {
+                crate::family_reach::dispatch_route(self, |_| "a call under a computed key".into());
                 // Primitive receivers (`MCall`'s rule): a number key calls
                 // a key a store into ⊤ wrote on their prototype.
                 if prim != 0 && !self.nodes[n as usize].pts.contains_tok(TOP) {
@@ -2334,23 +2431,16 @@ impl Model {
                 // result is no key: TypeError or the next method). It
                 // stores under that result's key (this rule on that node).
                 // ⊤, a marker or a token without the protocol's result keep
-                // the any-key store. GLOBK.
+                // the any-key store. For every receiver (R-INSPKEY): a
+                // String result never writes a symbol-keyed property such as
+                // the inspect hook. In a result node, ⊤ or a marker (no
+                // primitive bits: `add_top_inner`) may be a Symbol and keeps
+                // the any-key store.
                 let ret_node = self.to_prim_ret_nodes.contains(&n);
                 let mut obj_key = false;
-                // Only a receiver that may be the global object gains from
-                // the ToPrimitive result key (G2's any-String field); every
-                // other receiver keeps the any-key store for an object key
-                // (no extra nodes).
-                let recv_global = {
-                    let gt = self.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
-                    let ot = self.tok(TokKind::Builtin(BuiltinNs::Other));
-                    let p = &self.nodes[o as usize].pts;
-                    p.contains_tok(TOP) || p.contains_tok(gt) || p.contains_tok(ot)
-                };
-                if !ret_node && !recv_global {
-                    obj_key = !toks.is_empty();
-                }
-                if !ret_node && recv_global {
+                if ret_node {
+                    obj_key = toks.iter().any(|&t| t == TOP || self.is_marker(t));
+                } else {
                     let r = self.reason("ToPropertyKey");
                     for &t in toks {
                         let ret = match t != TOP && !self.is_marker(t) {

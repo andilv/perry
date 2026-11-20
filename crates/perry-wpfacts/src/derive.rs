@@ -1,10 +1,17 @@
 //! Derived facts F1–F6 read off the solved graph (design section 2), and
 //! the per-site verdicts the precision report uses.
 
+pub(crate) mod dispatch;
 mod element;
+mod member_ops;
+pub(crate) mod native_calls;
+mod native_member;
 pub(crate) use element::element_facts;
 pub(crate) use element::receiver_set;
 pub use element::{ElementFacts, ElementKey, ElementOp, ReceiverValue};
+pub(crate) use member_ops::member_op_facts;
+use native_member::host_member;
+pub(crate) use native_member::native_member;
 
 use crate::gen::Gen;
 use crate::model::*;
@@ -262,7 +269,8 @@ pub enum Verdict {
     IntrinsicCall,
     /// A named read whose receivers are all module namespace exotic objects
     /// of the program's own modules, under a name each module exports
-    /// itself (`ns_own`; no `export *` resolution): [[Get]] gives the export
+    /// itself (`ns_own`) or one `export *` resolves to (`resolve_export`,
+    /// ResolveExport 16.2.1.6.3: never ambiguous): [[Get]] gives the export
     /// binding's current value, `GetBindingValue` of the module's binding
     /// (ECMA-262 10.4.6.8). No code writes a namespace ([[Set]] 10.4.6.9 and
     /// [[DefineOwnProperty]] 10.4.6.6 change nothing, [[Prototype]] is null
@@ -331,15 +339,7 @@ impl Access {
     }
 }
 
-/// MATHB1: the verdict of a call of a builtin namespace member `N.m`
-/// ([`namespace_callee`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IntrinsicCallee {
-    /// The callee is exactly the realm's original `N.m` (named `N.m`).
-    Exact(String),
-    /// Refused, with the reason.
-    No(String),
-}
+pub use native_calls::IntrinsicCallee;
 
 #[derive(Clone, Debug)]
 pub struct SiteFacts {
@@ -358,10 +358,13 @@ pub struct SiteFacts {
     pub receiver_prims: u16,
     pub top: bool,
     pub verdict: Verdict,
+    /// The shared method-call elision and its optional exact-route proof.
+    pub(crate) method_call: Option<dispatch::MethodCallCertificate>,
+    /// The audited named builtin route, including its runtime protocols.
+    pub(crate) builtin_dispatch: bool,
     /// MATHB1: a call whose receiver (a member call) or callee (a value
     /// call) names a builtin namespace member: is the callee exactly the
     /// original builtin ([`namespace_callee`])? `None`: no namespace member.
-    /// Information only: no count and no consumer reads it yet.
     pub intrinsic_callee: Option<IntrinsicCallee>,
     pub fixed_shape: bool,
     /// A call site: the bodies its callee set holds (every body, sorted;
@@ -386,6 +389,24 @@ pub struct SiteFacts {
     /// DECISIONS 225: the bodies holding the site, in its module (HIR
     /// function id, and for a synthetic context its name; `Model::act_key`).
     pub bodies: Vec<(u32, String)>,
+}
+
+/// DESIGN-native-dispatch §2: the dispatcher obligation of a named member
+/// call: Get-then-Call of `key` on every receiver the solve gives the site,
+/// unguarded (an entry guard's refinement is no linker proof).
+#[derive(Clone, Copy, Debug)]
+pub struct DispatchObligation<'a> {
+    pub key: &'a str,
+    pub receivers: &'a [ReceiverValue],
+    pub prims: u16,
+    /// A HIR-specialized member op: its variant (`None`: a named site).
+    pub op: Option<&'a str>,
+    /// A namespace member op: the namespace, a direct call.
+    pub namespace: Option<&'a str>,
+    /// The op's fallback edge into the dispatcher can be taken
+    /// ([`crate::MemberOpFacts::redispatch`]); named calls require a
+    /// certificate for the actual lowering, including every failed guard.
+    pub redispatch: bool,
 }
 
 /// `Some` (a reason a claim fails) absorbs `None`; of two reasons the
@@ -1786,11 +1807,58 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
             prim,
         )
     };
+    let mut ledger_refused: Vec<crate::hold_ledger::Refused> = Vec::new();
+    let mut ledger_totals = [[0usize; 3]; 2];
     for (i, recvs, funcs) in &groups {
         let s = all[*i];
         let key = m.atoms[s.key as usize].clone();
         let (receivers, top, verdict, fixed_shape, targets, receiver_values, receiver_prims) =
             verdict_of(s, recvs);
+        if m.ledger.is_some() {
+            let store = s.access.is_store();
+            let path = g.modules.get(s.module as usize).map_or("", |(p, _)| *p);
+            let part = crate::hold_ledger::part(path);
+            ledger_totals[store as usize][part] += 1;
+            if matches!(verdict, Verdict::No(_)) || (store && matches!(verdict, Verdict::AddsKey)) {
+                let set = receiver_set(m, &element::with_copies(&copies, recvs));
+                let crate::hold_ledger::Blame {
+                    roots,
+                    full,
+                    causes,
+                } = crate::hold_ledger::blame(m, &set.toks, set.top_recv);
+                // A site no hold explains is named by its own first refusal
+                // (its verdict), so the ledger says why it stays.
+                let why = roots.is_empty().then(|| {
+                    let names: Vec<String> =
+                        set.toks.iter().take(6).map(|&t| m.tok_name(t)).collect();
+                    let origin = if set.toks.contains(&crate::model::TOP) {
+                        m.top_origin(set.top_recv)
+                    } else {
+                        String::new()
+                    };
+                    crate::hold_ledger::Unattributed {
+                        why: match &verdict {
+                            Verdict::No(r) => r.clone(),
+                            _ => "store adds a key".to_owned(),
+                        },
+                        detail: format!(
+                            "{path}\t{}\t{key}\t{}\t{}\t{origin}",
+                            s.byte_offset,
+                            if store { "store" } else { "read" },
+                            names.join(" "),
+                        ),
+                    }
+                });
+                ledger_refused.push(crate::hold_ledger::Refused {
+                    roots,
+                    full,
+                    causes,
+                    part,
+                    store,
+                    why,
+                });
+            }
+        }
         let intrinsic_callee = if s.is_call && !matches!(s.access, Access::Set { .. }) {
             let all = element::with_copies(&copies, recvs);
             let set = receiver_set(m, &all);
@@ -1870,6 +1938,8 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
         bodies.sort_unstable();
         bodies.dedup();
         out.push(SiteFacts {
+            method_call: None,
+            builtin_dispatch: false,
             bodies,
             diagnostic_copies: diagnostic_copies.unwrap_or_default(),
             diagnostic_unit: g
@@ -1893,6 +1963,9 @@ fn site_facts(g: &mut Gen, tfs: &[TemplateFacts]) -> Vec<SiteFacts> {
             target_bodies,
             holder_class,
         });
+    }
+    if m.ledger.is_some() {
+        crate::hold_ledger::write(m, &ledger_refused, ledger_totals);
     }
     out
 }
@@ -2188,7 +2261,7 @@ fn judge(
         }
         if !m.unit_mode {
             if let Some(name) = intrinsic_callee(m, toks, prim) {
-                if !m.realm_held {
+                if !m.realm_held || !intrinsic_replaceable(m, toks) {
                     return (
                         vec![name],
                         false,
@@ -2752,7 +2825,7 @@ fn judge(
     // throws: its TypeError arm.
     if !none && prim != 0 && verdict.is_none() {
         match beside_prims(m, key, s.key, prim, s.is_call) {
-            Some((r, absent)) => {
+            Ok((r, absent)) => {
                 receivers.extend(r);
                 // R9READ6: beside constant chain members the primitive's
                 // absent outcome is one more decided arm (PerKind below).
@@ -2762,9 +2835,9 @@ fn judge(
                     slots.push(None);
                 }
             }
-            None => {
+            Err(w) => {
                 verdict = Some(Verdict::No(format!(
-                    "primitive beside an object (key not absent on its family) {}",
+                    "primitive beside an object (key not absent on its family) {}: {w}",
                     crate::model::prim::name(prim)
                 )))
             }
@@ -2795,8 +2868,14 @@ fn judge(
     }
     // PROXY3: only modeled Proxy objects: the trap verdict. Beside any other
     // receiver or a primitive the site is not decided by one rule.
+    //
+    // PROXY9 (owner 2026-11-17): beside `undefined` / `null` only, the site
+    // is still the trap verdict: there GetV's ToObject throws the TypeError
+    // (7.3.2, 7.1.18), the always-throws arm `beside_prims` named above. The
+    // emitted operation stays the generic one, which throws it as node does.
     if traps > 0 {
-        verdict.get_or_insert(if traps == toks.len() && prim == 0 {
+        use crate::model::prim::{NULL, UNDEF};
+        verdict.get_or_insert(if traps == toks.len() && prim & !(NULL | UNDEF) == 0 {
             Verdict::ProxyTrap
         } else {
             Verdict::No("mixed: Proxy and other receivers".into())
@@ -3182,6 +3261,11 @@ fn judge_store(
                 receivers.push(m.tok_name(t));
                 traps += 1;
             }
+            // BIRTH1 rule GS: a program-owned key of the global object.
+            _ if global_user_sets(m, t, key, s.key) => {
+                receivers.push(m.tok_name(t));
+                sets += 1;
+            }
             // R9STORE5 (i): a builtin function value or an Array.
             _ if builtin_store_sets(m, t, key, s.key) => {
                 receivers.push(m.tok_name(t));
@@ -3242,7 +3326,15 @@ fn judge_store(
     };
     let verdict = match why {
         Some(w) => Verdict::No(w),
-        None if traps > 0 && traps == toks.len() && prim == 0 => Verdict::ProxyTrap,
+        // PROXY9 (owner 2026-11-17): beside `undefined` / `null` only, still
+        // the trap verdict: PutValue's ToObject throws the TypeError there
+        // (6.2.5.6 step 3.a, 7.1.18), the always-throws arm of rule T.
+        None if traps > 0
+            && traps == toks.len()
+            && prim & !(crate::model::prim::NULL | crate::model::prim::UNDEF) == 0 =>
+        {
+            Verdict::ProxyTrap
+        }
         None if traps > 0 => Verdict::No("store: Proxy beside other receivers".into()),
         None if only_nullish => {
             receivers.extend(prim_throw_arms(prim));
@@ -3279,8 +3371,16 @@ fn judge_store(
     let verdict = match verdict {
         // A slot store's receiver test sends only a nullish base to the
         // complete [[Set]] (rule N); another primitive arm composes with the
-        // generic store a KnownObjectStore keeps.
-        v @ (Verdict::T0Mono | Verdict::T0Set | Verdict::KnownObjectStore)
+        // generic store a KnownObjectStore keeps. COVER3: a store proven to
+        // call one setter takes the same receiver test (`undefined` / `null`
+        // only): the nullish base goes to the complete [[Set]], whose
+        // ToObject throws the TypeError after the value was evaluated
+        // (6.2.5.6 step 3.a, 13.15.2); an object calls the setter.
+        v @ (Verdict::T0Mono
+        | Verdict::T0Set
+        | Verdict::KnownObjectStore
+        | Verdict::ProxyTrap
+        | Verdict::AccessorSet)
             if nullish_beside && (prim_obj == 0 || matches!(v, Verdict::KnownObjectStore)) =>
         {
             receivers.extend(prim_throw_arms(prim));
@@ -3356,6 +3456,43 @@ fn builtin_store_sets(m: &Model, t: Tok, key: &str, a: Atom) -> bool {
             && m.accessor_keys.get(&t).is_none_or(|k| !k.contains(&a))
     };
     builtin_chain_plain(m, key, a) && (crate::builtins::builtin_value_sets(m, t, a) || array())
+}
+
+/// BIRTH1 rule GS: a named store of `key` (atom `a`) onto the global
+/// object `t` (`globalThis.k = v`, `g["k"] = v` with `g` the global object)
+/// where `key` is a program-owned global (`global_user_key`: neither the
+/// realm's `%Global%` declarations nor `Object.prototype` list it) adds or
+/// overwrites an own data property and runs no user code. The global
+/// object is an ordinary extensible object (ECMA-262 19, 9.1.1.4); 10.1.9.2
+/// OrdinarySetWithOwnDescriptor: its own `key`, if any, is a writable data
+/// property, since only program stores make it (the solver models each as
+/// the global's field, `solve/store.rs`, while `native_written` is false:
+/// no store into ⊤ and no unknown writer names the key; in whole-program
+/// mode an escaped global records no any-key write, owner decision
+/// 2026-11-18, closed world 11-14) and no accessor, definition, freeze,
+/// seal or preventExtensions reaches it (`accessors`, `accessor_keys`,
+/// `hard`); else the chain `%Object.prototype%` lacks the key
+/// and no program write or definition reaches a builtin prototype under it
+/// (`object_proto_unwritten`, `builtin_protos_unwritten`), so step 2.e
+/// CreateDataProperty creates it. Not `__proto__`, not a private name, no
+/// interpreted code, not unit mode (another unit's writes are unseen).
+fn global_user_sets(m: &Model, t: Tok, key: &str, a: Atom) -> bool {
+    let star = m.atom_index.get(crate::STAR_KEY).copied();
+    crate::builtins::global_object(m, t)
+        && !m.unit_mode
+        && !m.interp_runs
+        && !m.is_private_atom(a)
+        && key != "__proto__"
+        && crate::builtins::global_user_key(m, key)
+        && !crate::builtins::native_written(m, t, a)
+        && !m.hard.contains_key(&t)
+        && !m.super_relink.contains(&t)
+        && !m.accessors.contains_key(&(t, a))
+        && m.accessor_keys
+            .get(&t)
+            .is_none_or(|k| !k.iter().any(|&k| k == a || Some(k) == star))
+        && object_proto_unwritten(m, a)
+        && builtin_protos_unwritten(m, None, a).is_ok()
 }
 
 /// R9STORE6 item 3: `t.length = n`, `t` an Array exotic object
@@ -3666,179 +3803,6 @@ fn known_object_store(m: &Model, t: Tok, key: &str, a: Atom) -> Result<(), Strin
     Ok(())
 }
 
-/// BIV (CHB §2): the receivers of a NativeMember site, or why there are
-/// none. `Err(Some(..))` names the write onto a builtin prototype that alone
-/// keeps an otherwise proven site (obligations 1-3 hold); `Err(None)`: an
-/// obligation 1-3 fails, the site keeps its other reason.
-///
-/// 1. One family: every primitive a String and no object, or every object
-///    an Array exotic object ([`exact_array`]), or every object a
-///    collection of one kind, or every object a RegExp, or every object a
-///    native Promise, or every primitive a Number and no object, or every
-///    object a Buffer (a method `Buffer.prototype` owns); closed markers are skipped (their callers'
-///    values are beside them), ⊤ and other markers are none.
-/// 2. The family's intrinsic chain defines the key: a function for a call,
-///    a function or a data member for a read (`builtins::native_described`).
-/// 3. No receiver holds the key as an own property ([`native_own_free`]).
-/// 4. No builtin prototype is written under the key or under any key: no
-///    accessor on `Object.prototype` (E23), no redefinition of a builtin
-///    prototype's key (defineProperty on one or through ⊤) and no hard
-///    operation on them, no program write onto them, no store into ⊤
-///    (which may be any of them). Per unit, other units' writes are
-///    replayed into the same facts (`SharedWrite`).
-pub(crate) fn native_member(
-    m: &Model,
-    s: &crate::gen::ReadSite,
-    toks: &[Tok],
-    prim: u16,
-) -> Result<Vec<String>, Option<String>> {
-    use crate::builtins::NativeFamily;
-    let mut fam: Option<NativeFamily> = None;
-    // A nullish value beside one primitive family: its TypeError arm.
-    let (prim, mut receivers) = nullish_arms(m, toks, prim).unwrap_or((prim, Vec::new()));
-    let join = |f: NativeFamily, fam: &mut Option<NativeFamily>| match fam {
-        None => {
-            *fam = Some(f);
-            true
-        }
-        Some(g) => *g == f,
-    };
-    if prim != 0 {
-        let (f, r) = match prim {
-            crate::model::prim::STR => (NativeFamily::Str, "primitive:string"),
-            crate::model::prim::NUM => (NativeFamily::Num, "primitive:number"),
-            _ => return Err(None),
-        };
-        join(f, &mut fam);
-        receivers.push(r.to_string());
-    }
-    for &t in toks {
-        if m.closed_marker(t) {
-            continue;
-        }
-        let f = if exact_array(m, t) {
-            NativeFamily::Array
-        } else {
-            match m.toks[t as usize] {
-                TokKind::Obj(tm, _) if !m.is_marker(t) => match m.tmpls[tm as usize].kind {
-                    TmplKind::BObj {
-                        what: w @ ("Map" | "Set" | "WeakMap" | "WeakSet"),
-                        ..
-                    } => NativeFamily::Collection(w),
-                    TmplKind::BObj { what: "RegExp", .. } => NativeFamily::RegExp,
-                    TmplKind::BObj {
-                        what: "Promise", ..
-                    } => NativeFamily::Promise,
-                    // The per-unit solve misses a write onto `Buffer.prototype`
-                    // through `Object.assign`: it proves no Buffer member.
-                    TmplKind::BObj { what: "Buffer", .. } if !m.unit_mode => NativeFamily::Buffer,
-                    TmplKind::BObj {
-                        what: "TypedArray", ..
-                    } => NativeFamily::TypedArray,
-                    TmplKind::BObj { what, .. } if crate::builtins::declared_family(m, what) => {
-                        NativeFamily::Declared(what)
-                    }
-                    _ => return Err(None),
-                },
-                _ => return Err(None),
-            }
-        };
-        if !join(f, &mut fam) {
-            return Err(None);
-        }
-        let Some(tm) = m.tmpl_of(t) else {
-            return Err(None);
-        };
-        receivers.push(m.tmpls[tm as usize].display.clone());
-    }
-    let Some(fam) = fam else {
-        return Err(None);
-    };
-    let a = s.key;
-    if !crate::builtins::native_described(m, fam, &m.atoms[a as usize], s.is_call) {
-        return Err(None);
-    }
-    for &t in toks {
-        if !m.closed_marker(t) && !native_own_free(m, fam, t, a) {
-            return Err(None);
-        }
-    }
-    builtin_protos_unwritten(m, Some(fam), a).map_err(Some)?;
-    receivers.sort();
-    receivers.dedup();
-    Ok(receivers)
-}
-
-/// A site whose receivers are all host objects (`builtins::host_of`):
-/// `Ok` when each one's member under the key is its described native
-/// member and no store reached it; `None` when a receiver is no host
-/// object or a primitive flows.
-fn host_member(
-    m: &Model,
-    s: &crate::gen::ReadSite,
-    toks: &[Tok],
-    prim: u16,
-) -> Option<Result<Vec<String>, String>> {
-    if prim != 0 || toks.is_empty() {
-        return None;
-    }
-    let name = &m.atoms[s.key as usize];
-    let mut receivers = Vec::new();
-    let mut native = true;
-    // A builtin namespace or constructor that is no host object (`Math`,
-    // `Promise`, `Array`): the realm's own member, unwritten
-    // (`builtins::ns_native`, BNSRECV).
-    let mut realm_ns = false;
-    for &t in toks {
-        let TokKind::Builtin(ns) = m.toks[t as usize] else {
-            return None;
-        };
-        match crate::builtins::host_of(ns, name, s.is_call) {
-            Some(h) => {
-                native &= crate::builtins::host_native(m, h, s.key, s.is_call);
-                receivers.push(format!("host:{h:?}"));
-            }
-            None if crate::builtins::ns_native(m, t, ns, s.key, s.is_call) => {
-                realm_ns = true;
-                receivers.push(m.tok_name(t));
-            }
-            None => {
-                // Diagnostic (off: one flag read): who writes the key.
-                if why_indexed() {
-                    eprintln!(
-                        "WHY_NS @{} {} .{name}: {:?}",
-                        s.byte_offset,
-                        m.tok_name(t),
-                        crate::builtins::native_writers_why(m, t, s.key)
-                    );
-                }
-                return None;
-            }
-        }
-    }
-    if !native {
-        return Some(Err("host member undescribed or written".into()));
-    }
-    // Interpreted code (DEC 150) names every global and may write the key;
-    // no namespace object is a lock holder, so nothing refuses the write.
-    if realm_ns && m.interp_runs {
-        return Some(Err(
-            "namespace member: interpreted code may write the key".into()
-        ));
-    }
-    // Unknown code holds the realm (9.3, `realm_held`): a host object's
-    // members are writable, and the solve does not replay unknown code's
-    // replacement of one (`realm_hold_tok`), as for `Verdict::IntrinsicCall`.
-    if m.realm_held {
-        return Some(Err(
-            "host member: unknown code holds the realm and may replace the member".into(),
-        ));
-    }
-    receivers.sort();
-    receivers.dedup();
-    Some(Ok(receivers))
-}
-
 /// Obligation 4 of [`native_member`]: no builtin prototype is written
 /// under key `a` or under any key, so the intrinsics' descriptions
 /// (`members`) decide what their chains read under `a`. `Err`: the write
@@ -4113,11 +4077,11 @@ fn beside_prims(
     a: Atom,
     prim: u16,
     call: bool,
-) -> Option<(Vec<String>, bool)> {
+) -> Result<(Vec<String>, bool), String> {
     use crate::builtins::NativeFamily as F;
     use crate::model::prim::{BOOL, NULL, NUM, STR, UNDEF};
     if prim & !(STR | NUM | BOOL | NULL | UNDEF) != 0 {
-        return None;
+        return Err("a primitive of no String/Number/Boolean family".into());
     }
     let mut r = Vec::new();
     if prim & UNDEF != 0 {
@@ -4132,8 +4096,8 @@ fn beside_prims(
         (BOOL, F::Bool, "primitive:boolean"),
     ] {
         if prim & bit != 0 {
-            if !family_absent(m, fam, key, a) {
-                return None;
+            if let Err(w) = family_absent_why(m, fam, key, a) {
+                return Err(w);
             }
             r.push(if call {
                 format!("{name} (TypeError)")
@@ -4143,7 +4107,7 @@ fn beside_prims(
         }
     }
     let absent = !call && prim & (STR | NUM | BOOL) != 0;
-    Some((r, absent))
+    Ok((r, absent))
 }
 
 /// [`Verdict::OwnDataOrAbsent`] for receiver `t` (layout `tf`) and key `a`:
@@ -4373,19 +4337,36 @@ fn array_absent(m: &Model, t: Tok, key: &str, a: Atom) -> bool {
 /// realm: `builtin_protos_unwritten`). OrdinaryGet (10.1.8.1), for a
 /// primitive on GetV's ToObject wrapper (7.3.2), gives `undefined`.
 fn family_absent(m: &Model, fam: crate::builtins::NativeFamily, key: &str, a: Atom) -> bool {
-    (key != "length"
-        || matches!(
-            fam,
-            crate::builtins::NativeFamily::Num | crate::builtins::NativeFamily::Bool
-        ))
-        && key != "__proto__"
-        && !key.starts_with(|c: char| c.is_ascii_digit() || c == '-')
-        && !matches!(key, "Infinity" | "NaN")
-        && !m.is_private_atom(a)
-        && !m.optimistic_json_key
-        && crate::builtins::family_chain_lacks(fam, key)
-        && object_proto_unwritten(m, a)
-        && builtin_protos_unwritten(m, Some(fam), a).is_ok()
+    family_absent_why(m, fam, key, a).is_ok()
+}
+
+/// [`family_absent`]'s conditions in order; `Err` names the first that
+/// fails (the reason text of a refused site).
+fn family_absent_why(
+    m: &Model,
+    fam: crate::builtins::NativeFamily,
+    key: &str,
+    a: Atom,
+) -> Result<(), String> {
+    use crate::builtins::NativeFamily as F;
+    if (key == "length" && !matches!(fam, F::Num | F::Bool))
+        || key == "__proto__"
+        || key.starts_with(|c: char| c.is_ascii_digit() || c == '-')
+        || matches!(key, "Infinity" | "NaN")
+        || m.is_private_atom(a)
+    {
+        return Err("the family may hold the key".into());
+    }
+    if m.optimistic_json_key {
+        return Err("optimistic JSON-key rule on".into());
+    }
+    if !crate::builtins::family_chain_lacks(fam, key) {
+        return Err("the family's chain holds the key".into());
+    }
+    if !object_proto_unwritten(m, a) {
+        return Err("Object.prototype may be written under the key".into());
+    }
+    builtin_protos_unwritten(m, Some(fam), a)
 }
 
 /// Shape A: a named read whose receiver set holds only primitives (no
@@ -4438,6 +4419,28 @@ fn object_proto_unwritten(m: &Model, a: Atom) -> bool {
 /// [`Verdict::IntrinsicCall`]: the callee set is one `BuiltinFn` token of a
 /// named native (closed markers stand for their callers' values beside
 /// them), no ⊤, no primitive. Its name. The caller adds `!realm_held`.
+/// May unknown code that holds the realm (`realm_held`) replace the
+/// intrinsic callee in `toks` (`intrinsic_callee`)? A built-in prototype's
+/// member, yes. A namespace member (`Math.max`), no: under the closed world
+/// (owner 2026-11-14) that code is the runtime's natives, which replace no
+/// member of a namespace (owner decision 2026-11-18, R-GLOBAL step 3); only
+/// interpreted code or an unseen module does.
+fn intrinsic_replaceable(m: &Model, toks: &[Tok]) -> bool {
+    if m.interp_runs || m.unseen_module_runs {
+        return true;
+    }
+    !toks.iter().all(|&t| {
+        m.closed_marker(t)
+            || matches!(
+                m.toks[t as usize],
+                TokKind::BuiltinFn(Native::Member { identity, .. })
+                    if identity
+                        .rsplit_once('.')
+                        .is_some_and(|(n, _)| crate::builtins::ns_by_name(n).is_some())
+            )
+    })
+}
+
 fn intrinsic_callee(m: &Model, toks: &[Tok], prim: u16) -> Option<String> {
     if prim != 0 {
         return None;
@@ -4544,9 +4547,12 @@ pub(crate) fn namespace_callee(
     if m.unit_mode {
         return no("units mode: the facts-off rule decides");
     }
-    // CLOSED-WORLD PREMISE (owner 2026-11-14).
-    if m.realm_held {
-        return no("unknown code holds the realm and may replace the member");
+    // CLOSED-WORLD PREMISE (owner 2026-11-14): unknown code that holds the
+    // realm is the runtime's natives, which replace no namespace member
+    // (owner decision 2026-11-18, R-GLOBAL step 3); interpreted code and an
+    // unseen module may.
+    if m.realm_held && (m.interp_runs || m.unseen_module_runs) {
+        return no("interpreted code holds the realm and may replace the member");
     }
     if !crate::builtins::members::ns_declares(ns, &member) {
         return no("not a member the realm declares on the namespace");
@@ -4586,7 +4592,8 @@ pub(crate) fn namespace_callee(
 
 /// [`Verdict::NsExport`]: every receiver is a module namespace token of
 /// this program's modules (`ns_own` names what each module exports itself;
-/// a unit's stand-in namespace has none), the key one of those names, no
+/// a unit's stand-in namespace has none), the key one each resolves to
+/// exactly one binding (`resolve_export`), no
 /// primitive, no ⊤. A call reads the binding the same way, but the solve
 /// lets an unproven call escape its namespace receiver to the callee
 /// (DECISIONS 116): the read alone is claimed.
@@ -4595,8 +4602,49 @@ fn ns_export(m: &Model, s: &crate::gen::ReadSite, toks: &[Tok], prim: u16) -> Op
         return None;
     }
     toks.iter()
-        .all(|&t| matches!(m.toks[t as usize], TokKind::ModNs(_)) && m.ns_own.contains(&(t, s.key)))
+        .all(|&t| {
+            matches!(m.toks[t as usize], TokKind::ModNs(_))
+                && matches!(resolve_export(m, t, s.key, &mut Vec::new()), Ok(Some(_)))
+        })
         .then(|| toks.iter().map(|&t| m.tok_name(t)).collect())
+}
+
+/// ResolveExport (ECMA-262 16.2.1.6.3) of name `a` on the module of
+/// namespace `ns`: `Ok(Some(b))` one binding, named by the namespace whose
+/// module exports `a` itself (`ns_own`: a local or indirect export, or
+/// `export * as`); `Ok(None)` none (a cycle: `(ns, a)` already in the
+/// resolve set; `default`, which no `export *` provides; no star source
+/// has it); `Err(())` ambiguous (two star sources resolve to different
+/// bindings) or unknown (a star source outside the program). Own exports
+/// shadow star ones; star sources are followed recursively. The name never
+/// changes along a star edge, so the resolve set is the namespaces seen.
+/// An indirect export is its own module's binding here, so the same
+/// binding reached once through it and once directly counts as two
+/// (refused, never wrongly proven).
+fn resolve_export(m: &Model, ns: Tok, a: Atom, seen: &mut Vec<Tok>) -> Result<Option<Tok>, ()> {
+    if seen.contains(&ns) {
+        return Ok(None);
+    }
+    seen.push(ns);
+    if m.ns_own.contains(&(ns, a)) {
+        return Ok(Some(ns));
+    }
+    if &*m.atoms[a as usize] == "default" {
+        return Ok(None);
+    }
+    let mut found = None;
+    for &src in m.star_from.get(&ns).map_or(&[][..], |v| v.as_slice()) {
+        if !matches!(m.toks[src as usize], TokKind::ModNs(_)) {
+            return Err(());
+        }
+        if let Some(b) = resolve_export(m, src, a, seen)? {
+            if found.is_some_and(|f| f != b) {
+                return Err(());
+            }
+            found = Some(b);
+        }
+    }
+    Ok(found)
 }
 
 /// Obligation 3 of [`native_member`]: no object `t` denotes holds key `a`

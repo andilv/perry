@@ -575,7 +575,8 @@ impl Model {
         // property of the global object (ECMA-262 10.1.9 OrdinarySet,
         // 10.1.6.3) and writes no other object: its value goes into the
         // global's any-key field, which every global binding read takes
-        // (`global_any_read`). OPTIMISTIC (owner): an unknown String key
+        // (`global_any_read`) whose name the key's shape can spell (GLOBS4;
+        // shape 0, a Number key, spells every name). OPTIMISTIC (owner): an unknown String key
         // never names `__proto__`; a key whose known strings do keeps the
         // path below.
         // A Number key (`num_only`: an element or digits key) names an
@@ -589,7 +590,7 @@ impl Model {
                 && builtins::global_object(self, t)
                 && !self.key_names_known_str(key, "__proto__")
             {
-                let ga = builtins::global_any_field(self);
+                let ga = builtins::global_any_field(self, shape);
                 self.edge(src, ga);
                 self.global_any_stores.push((t, key, src, site));
                 return;
@@ -609,14 +610,45 @@ impl Model {
                 return;
             }
         }
+        // `undefined`, `NaN` and `Infinity` are non-writable,
+        // non-configurable own data properties of the global object
+        // (ECMA-262 19.1.1-19.1.4; the runtime installs them so, populate.rs):
+        // a [[Set]] of one writes nothing (10.1.9.2 OrdinarySetWithOwnDescriptor
+        // step 2.a; a strict store throws the runtime's TypeError) and no
+        // code can make it writable again (10.1.6.3 step 5), as for a store
+        // under an unknown String key (`global_any_names`). The entries loop
+        // of rule EK stores its done branch's `undefined` key so.
+        if let Key::Named(a) = key {
+            if !elem
+                && !theirs
+                && !self.unit_mode
+                && builtins::global_object(self, t)
+                && matches!(
+                    self.atoms[a as usize].as_str(),
+                    "undefined" | "NaN" | "Infinity"
+                )
+            {
+                return;
+            }
+        }
         // A [[Set]] that meets the realm's accessor without a setter
         // (`navigator` on the global object) writes nothing; in strict code
         // it throws the runtime's TypeError (`Model::thrown`). Until a
         // native write may have replaced the accessor: then the store runs
-        // again on the ordinary path (`NativeMiss::Store`).
+        // again on the ordinary path (`NativeMiss::Store`). A definition's
+        // value (`Gen::define_property`, `define_by_data`: a store site of
+        // `defineProperty`) is no [[Set]]: [[DefineOwnProperty]] replaces
+        // the accessor (ECMA-262 10.1.6.3 step 2-3, ValidateAndApply...
+        // with a data descriptor over a configurable accessor), so it takes
+        // the ordinary path: a write of that key and no other.
         if let Key::Named(a) = key {
+            let define = self
+                .stores
+                .get(site as usize)
+                .is_some_and(|s| s.desc.starts_with("defineProperty"));
             if !elem
                 && !theirs
+                && !define
                 && !self.unit_mode
                 && builtins::getter_only(self, t, &self.atoms[a as usize])
                 && !builtins::native_written(self, t, a)
@@ -741,7 +773,17 @@ impl Model {
                 return;
             }
             let r = self.reason("stored into a value from unmodeled code");
+            // `hold_ledger`: what the store sinks belongs to the receiver's
+            // ⊤ root, not to a root of its own.
+            let origin = match self.ledger {
+                Some(_) => self.store_at.and_then(|n| self.top_origin_id(n)),
+                None => None,
+            };
+            let saved = self.ledger.as_mut().map(|l| l.enter_top(origin));
             self.sink_node(src, r);
+            if let (Some(l), Some(c)) = (self.ledger.as_mut(), saved) {
+                l.leave(c);
+            }
             return;
         }
         if let Some(is) = self.contract_recv.get(&t).cloned() {

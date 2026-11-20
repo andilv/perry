@@ -121,6 +121,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // context): numeric element in-bounds, TAG_UNDEFINED double for OOB / view /
     // wrong-kind — bit-exact with js_typed_array_get.
     module.declare_function("js_typed_array_read_f64", DOUBLE, &[I64, I32]);
+    module.declare_function("js_typed_array_get_number_key", DOUBLE, &[I64, DOUBLE]);
     // #9342: priming slow arm of the inline Uint8Array byte read
     // (expr/u8_buffer_read.rs); delegates to js_uint8array_index_get_value.
     module.declare_function("js_u8_buffer_read_f64", DOUBLE, &[I64, I32]);
@@ -159,6 +160,11 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     module.declare_function("js_typed_array_find_last_index", DOUBLE, &[I64, I64]);
     // #3148: TypedArray.prototype.set(source, offset?) / subarray(begin?, end?).
     module.declare_function("js_typed_array_set_from", DOUBLE, &[I64, DOUBLE, DOUBLE]);
+    module.declare_function(
+        "js_typed_array_set_call",
+        DOUBLE,
+        &[DOUBLE, DOUBLE, DOUBLE, I32],
+    );
     module.declare_function(
         "js_typed_array_subarray",
         I64,
@@ -305,7 +311,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // The codegen IndexGet/IndexSet paths on `Expr::GlobalGet` route
     // through this helper.
     module.declare_function("js_get_global_this", DOUBLE, &[]);
-    // Two-phase realm (`PERRY_REALM_TWO_PHASE`): the core entry of a static
+    // Two-phase realm (off with `PERRY_REALM_TWO_PHASE=0`): the core entry of a static
     // read of a phase-A name, the entry's mode call, check mode's read check.
     module.declare_function("js_get_global_core", DOUBLE, &[]);
     module.declare_function("js_realm_two_phase", VOID, &[I32]);

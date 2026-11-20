@@ -39,6 +39,7 @@ impl Model {
             ),
             Cons::Load { key, dst } => format!("Load key={:?} dst={:?}", self.packet_key(key), dst),
             Cons::OwnValues { dst } => format!("OwnValues dst={:?}", dst),
+            Cons::OwnKeys { dst } => format!("OwnKeys dst={:?}", dst),
             Cons::OwnDescValues { dst } => format!("OwnDescValues dst={:?}", dst),
             Cons::IndexHole => format!("IndexHole"),
             Cons::IndexHoleIn { key } => format!("IndexHoleIn {key}"),
@@ -46,6 +47,9 @@ impl Model {
             Cons::Identity { route } => format!("Identity route={}", route.name()),
             Cons::HasProp { key, idx } => {
                 format!("HasProp key={:?} idx={idx}", self.packet_key(key))
+            }
+            Cons::OwnProp { key, idx } => {
+                format!("OwnProp key={:?} idx={idx}", self.packet_key(key))
             }
             Cons::LenIndex { lo, hi } => format!("LenIndex {lo} {hi}"),
             Cons::LenPermuted { t } => format!("LenPermuted {t}"),
@@ -154,8 +158,10 @@ impl Model {
             Cons::Falsy { dst } => format!("Falsy dst={:?}", dst),
             Cons::NotUndefined { dst } => format!("NotUndefined dst={:?}", dst),
             Cons::NotNull { dst } => format!("NotNull dst={:?}", dst),
+            Cons::RecordEntry { dst } => format!("RecordEntry dst={:?}", dst),
             Cons::TypeIs { mask, dst } => format!("TypeIs mask={mask:#x} dst={:?}", dst),
             Cons::ProtoObjects { dst } => format!("ProtoObjects dst={:?}", dst),
+            Cons::NotRegExp { dst } => format!("NotRegExp dst={:?}", dst),
             Cons::NotBuffer { shared, dst } => {
                 format!("NotBuffer shared={shared} dst={:?}", dst)
             }

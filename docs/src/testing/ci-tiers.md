@@ -308,7 +308,7 @@ The Actions sidebar has six repository workflows. GitHub also registers four ind
 | **CI** | Required core CI and auxiliary security/coverage checks; defaults to `suite=core` |
 | **Extended Tests** (`compiler-runtime.yml`) | Compiler/runtime, compatibility, integration, and performance; choose a category such as `suite=compatibility`, one suite such as `suite=simctl-tests`, or `suite=all` |
 | **GC** | Six collector suites; choose an individual suite or `suite=all` |
-| **Repository** (`maintenance.yml`) | Documentation and repository maintenance; defaults to offline `suite=validate`; select `suite=docs-check` for docs checks or `suite=docs` for deployment |
+| **Repository** (`maintenance.yml`) | Documentation and repository maintenance; defaults to offline `suite=validate`; select `suite=docs-check` for docs checks or `suite=docs` for deployment. Every 30 minutes `auto-label` adds `platform:`, `area:` and `type:` labels to new issues and PRs (`scripts/auto_label.py`) |
 | **Publish to npm / GitHub Release** | Compiler packages, platform archives, and GitHub releases |
 | **Publish to npm / @perryts/hono-server** | Independent adapter package publication |
 
@@ -328,21 +328,27 @@ After a consolidation lands, Repository automatically deletes completed runs who
 ### Required WASI command and component execution
 
 The `wasi_execution` plan entry joins the core PR, sweep and full tiers and
-starts three Linux jobs in parallel, so the gate waits for the longest of them
+starts five Linux jobs in parallel, so the gate waits for the longest of them
 rather than their sum:
 
 - `wasi-native` runs the `target-wasi` codegen and link-argument unit tests.
-- `wasi-execution` builds Perry with `target-wasi` and matching wasm32-wasip2
-  and wasip1 runtimes, checks the IR ABI, then runs all six smoke cases, twenty
-  acceptance cases, ten pinned-Node comparisons and the preview 1 host suite.
+- `wasi-component-units` runs the component-model unit tests
+  (`scripts/component_unit_tests.sh`).
+- `wasi-execution` builds Perry with `target-wasi` and a matching wasm32-wasip2
+  runtime, checks the IR ABI, then runs all six smoke cases, twenty acceptance
+  cases and ten pinned-Node comparisons.
+- `wasi-execution-p1` builds the same compiler and a wasm32-wasip1 runtime,
+  checks its imports, then runs the preview 1 smoke, acceptance and gap suites
+  and the preview 1 host suite.
 - `wasi-components` builds matching native component tools and instrumented
   runtimes and runs both component harnesses: native hosting, Perry-authored
   guests, resource lifetimes, forced moving GC and direct Rust/Perry
   composition.
 
 Per-case logs, component phase verdicts, source revision and artifacts are
-retained (`wasi-required-<sha>` and `wasi-components-<sha>`). The required
+retained (`wasi-required-<sha>`, `wasi-required-p1-<sha>` and
+`wasi-components-<sha>`). The required
 `pr-gate` rejects a skipped or missing planned WASI job as well as failures and
-cancellation, for each of the three. Docs-only PRs skip this build. The wider Windows/macOS matrix
+cancellation, for each of the five. Docs-only PRs skip this build. The wider Windows/macOS matrix
 remains in the extended suite. Native component execution is currently
 qualified on Linux.

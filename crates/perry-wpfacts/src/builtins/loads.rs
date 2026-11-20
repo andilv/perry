@@ -864,13 +864,14 @@ fn global_shaped_read(m: &mut Model, t: Tok, key: Key, dst: NodeId) {
         }
     }
     m.global_shaped_reads.push((t, key, dst));
-    super::native_protocol::global_any_read(m, dst);
-    if global_value_written(m, t, star) {
+    super::native_protocol::global_any_read_key(m, key, dst);
+    if super::native_protocol::global_value_stored(m, t, star) {
         m.add_top(dst, |_| {
             "globalThis[shaped key] written by unmodeled code".into()
         });
         m.add_prim(dst, prim::ALL);
     } else {
+        super::native_protocol::global_maybe_deleted(m, t, star, dst);
         let f = m.node_l("global-shaped-read");
         m.native_missing.push((t, star, NativeMiss::Global(dst, f)));
     }
@@ -900,7 +901,7 @@ pub(super) fn global_shaped_replay(m: &mut Model, a: Atom) {
 
 fn declared_global_value(m: &mut Model, t: Tok, n: &str, dst: NodeId) {
     if super::native_protocol::global_any_names(m, n) {
-        super::native_protocol::global_any_read(m, dst);
+        super::native_protocol::global_any_read(m, n, dst);
     }
     if n == "navigator" {
         super::native_protocol::global_def_nav_read(m, dst);
@@ -910,12 +911,13 @@ fn declared_global_value(m: &mut Model, t: Tok, n: &str, dst: NodeId) {
         let g = m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
         let f = global_field(m, g, a);
         m.edge(f, dst);
-        if global_value_written(m, t, a) {
+        if super::native_protocol::global_value_stored(m, t, a) {
             m.add_top(dst, |_| format!("globalThis.{n} written by unmodeled code"));
             m.add_prim(dst, prim::ALL);
             let r = m.reason(&format!("globalThis.{n} reaches unmodeled code"));
             m.sink_node(f, r);
         } else {
+            super::native_protocol::global_maybe_deleted(m, t, a, dst);
             m.native_missing.push((t, a, NativeMiss::Global(dst, f)));
         }
     }
@@ -943,7 +945,7 @@ pub fn tok_load(m: &mut Model, t: Tok, key: Key, dst: NodeId) {
             Key::Any(_) => true,
         }
     {
-        super::native_protocol::global_any_read(m, dst);
+        super::native_protocol::global_any_read_key(m, key, dst);
     }
     let name = match key {
         Key::Named(a) => Some(m.atoms[a as usize].clone()),
@@ -991,10 +993,10 @@ pub fn tok_load(m: &mut Model, t: Tok, key: Key, dst: NodeId) {
                 Some(n) if global_user_key(m, n) => {
                     let Key::Named(a) = key else { unreachable!() };
                     if super::native_protocol::global_any_names(m, n) {
-                        super::native_protocol::global_any_read(m, dst);
+                        super::native_protocol::global_any_read(m, n, dst);
                     }
                     let f = global_field(m, t, a);
-                    if global_value_written(m, t, a) {
+                    if super::native_protocol::global_value_stored(m, t, a) {
                         if m.explain {
                             let op = m.tok_index.get(&TokKind::ObjectProto).copied();
                             let hits: Vec<String> = m
@@ -1044,7 +1046,7 @@ pub fn tok_load(m: &mut Model, t: Tok, key: Key, dst: NodeId) {
                 }
                 Some(n) if !m.unit_mode && global_function(m, n) => {
                     let Key::Named(a) = key else { unreachable!() };
-                    super::native_protocol::global_any_read(m, dst);
+                    super::native_protocol::global_any_read(m, n, dst);
                     // What the program stored over it (`program_global_fn`).
                     if super::native_protocol::program_global_fn(m, n) {
                         let f = global_field(m, t, a);
@@ -1700,7 +1702,13 @@ pub fn chain_load(m: &mut Model, of: Tok, q: Tok, key: Key, dst: NodeId) {
             && !m.is_constructor_key(key)
             && locked_chain_read(m, of, a)
         {
-            m.add_prim(dst, prim::UNDEF);
+            // The chain ends in `undefined` only where no locked member
+            // defines the key (`locked_chain_defines`: a RegExp's
+            // `RegExp.prototype[@@split]`); that member reaches the read
+            // through the receiver's builtin field (`builtin_field_use`).
+            if !locked_chain_defines(m, of, a) {
+                m.add_prim(dst, prim::UNDEF);
+            }
             object_proto_method_value(m, a, dst);
             return;
         }

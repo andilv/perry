@@ -28,6 +28,7 @@ mod array_numeric;
 mod array_record;
 mod array_reps;
 mod array_search;
+mod assign_inherited_setter;
 mod assign_to_object;
 mod at_rest;
 mod audit1;
@@ -64,6 +65,8 @@ mod call_shadow;
 mod callback_origin;
 mod called_param_runs;
 mod captured;
+mod chw2_date_statics;
+mod chw4_has_instance;
 mod cjs_require;
 mod class_call_throws;
 mod class_capture_forwarding;
@@ -181,6 +184,8 @@ mod map_entry_pairs;
 mod map_identity_ops;
 mod map_values;
 mod mathb1;
+mod e20g_global_name;
+mod e20g2_self_store;
 mod member_heritage;
 mod memo_context;
 mod method_sites;
@@ -213,6 +218,7 @@ mod own_guarded_read;
 mod own_helper_guard;
 mod own_key_shadow;
 mod own_length;
+mod own_prop_trap;
 mod own_store_read;
 mod own_values_proto;
 mod parent_value;
@@ -300,6 +306,7 @@ mod type_export;
 mod typed_array_element_store;
 mod typed_array_exact;
 mod typed_array_key_bigint;
+mod typed_array_in_bounds;
 mod typed_array_key_read;
 mod typed_array_length;
 mod typed_array_names;
@@ -522,42 +529,6 @@ fn sabotage_plants_the_fact() {
     assert!(field(tmpl(&pf2, "P"), "x").readonly);
     assert!(pf2.dump_text().contains("# sabotage readonly:P.x"));
     assert_ne!(pf.digest_for("t.ts"), pf2.digest_for("t.ts"));
-}
-
-/// Writes `<dir>/t.facts` and `<dir>/t.facts.rel` for the checker scripts
-/// when `WPFACTS_TEST_DUMP_DIR` is set (developer aid; a no-op otherwise).
-#[test]
-fn write_dump_for_checker() {
-    let Some(dir) = std::env::var_os("WPFACTS_TEST_DUMP_DIR") else {
-        return;
-    };
-    let src = std::env::var("WPFACTS_TEST_SRC").unwrap_or_else(|_| {
-        r#"
-        class P { x: number; y = "s"; constructor(x: number) { this.x = x; } m() { return this.x; } }
-        class Q extends P { z = 1; get g() { return this.z; } }
-        function f(p: P) { return p.x + p.m(); }
-        const o = { a: 1, b: [1, 2] };
-        const q = new Q(2);
-        q.z = 3;
-        console.log(f(new P(1)), f(q), q.g, o.a, o.b.length);
-        "#
-        .to_string()
-    });
-    let pf = facts_with(
-        &src,
-        FactsConfig {
-            relations: true,
-            sabotage: std::env::var("WPFACTS_TEST_SABOTAGE").ok(),
-            dynamic_code: None,
-            budget_secs: None,
-            profile: false,
-            max_pts: None,
-            ..Default::default()
-        },
-    );
-    let dir = std::path::PathBuf::from(dir);
-    std::fs::write(dir.join("t.facts"), pf.dump_text()).unwrap();
-    std::fs::write(dir.join("t.facts.rel"), pf.relations_text().unwrap()).unwrap();
 }
 
 /// Decision 150: dynamic code naming the global scope is no kill. The class
@@ -1517,7 +1488,7 @@ mod cycle_locked_member;
 mod date_methods;
 mod declared_constructor;
 mod declared_global_write;
-mod delegate_step;
+mod ek;
 mod field_read_calls;
 mod gen_next;
 mod gen_proto_lock;
@@ -1529,11 +1500,14 @@ mod gk3b;
 mod gl2;
 mod gl3;
 mod gl4;
+mod global_handed_writes_no_global;
 mod global_unresolved;
 mod guard_presence;
 mod helper_protocols;
 mod host_helpers;
+mod inspkey;
 mod iter_result_array;
+mod iterdone;
 mod key_fn_shape;
 mod key_shape;
 mod keycall1;
@@ -1551,6 +1525,7 @@ mod realm_read_static;
 mod regexp_results;
 mod signatures;
 mod static_native_parent;
+mod stepout;
 mod string_iter_lock;
 mod string_methods;
 mod string_results;
@@ -1645,9 +1620,11 @@ mod an6;
 mod an8;
 mod animoom5;
 mod arr_absent;
+mod birth1;
 mod birthdef1;
 mod bns_recv;
 mod builtin_ctor_number_key;
+mod cover3;
 mod d1;
 mod elems1;
 mod env1;
@@ -1658,14 +1635,20 @@ mod getter_result_decls;
 mod given_proto_census;
 mod given_proto_members;
 mod gs1;
+mod gs2;
 mod held_realm_flow;
 mod held_realm_verdicts;
 mod in1;
 mod key2;
 mod key_inherit;
+mod ledg1;
+mod ledg2;
+mod ledg3;
 mod lit_fact;
 mod local_versions;
 mod multi_run;
+mod native_dispatch;
+mod native_dispatch_builtin;
 mod navigator_decl;
 mod navigator_store;
 mod new_verdicts;
@@ -1740,6 +1723,7 @@ mod skinroot9;
 mod sound1;
 mod spread_from_census;
 mod thisbind1;
+mod topc;
 mod w3h;
 mod w3j;
 mod w3k;

@@ -181,6 +181,22 @@ pub(super) fn function_method(m: &mut Model, t: Tok, name: Option<&str>, call: C
         Some("next" | "return" | "throw") | None if matches!(m.toks[t as usize], TokKind::Func(f, _) if m.funcs[f as usize].gen_async) =>
         {
             m.call_tok(call, t, Some(t));
+            // `return(v)` runs PromiseResolve(%Promise%, v) before the step
+            // (27.6.3.9 AsyncGeneratorAwaitReturn, 27.2.4.7): it reads
+            // `constructor` off a promise argument.
+            if matches!(name, Some("return") | None) {
+                if let Some(&value) = c.arg(0) {
+                    let k = m.atom("constructor");
+                    let cn = m.node_l("promise-resolve-constructor");
+                    m.cons(
+                        value,
+                        Cons::Load {
+                            key: Key::Named(k),
+                            dst: cn,
+                        },
+                    );
+                }
+            }
             // It rejects: the shared cell.
             let thrown = m.thrown;
             gen_throw_passes(m, name, thrown, &c.args, &c.spread);
@@ -314,6 +330,21 @@ pub(super) fn cb_call(
     this: ThisArg,
     args: Vec<NodeId>,
 ) -> NodeId {
+    let thrown = m.thrown;
+    cb_call_in(m, by, cb, this, args, thrown)
+}
+
+/// `cb_call` whose callback throws into `region` (a job's own promise, or
+/// the host for a callback the event loop calls; R-JOBTHROW).
+#[track_caller]
+pub(super) fn cb_call_in(
+    m: &mut Model,
+    by: CallId,
+    cb: NodeId,
+    this: ThisArg,
+    args: Vec<NodeId>,
+    region: NodeId,
+) -> NodeId {
     let ret = m.node_l("cb-ret");
     m.nodes[ret as usize].frame = m.call_run(by);
     let site = m.calls.len() as CallId;
@@ -329,7 +360,7 @@ pub(super) fn cb_call(
             spread: vec![],
             ret,
             site,
-            region: m.thrown,
+            region,
         },
         |m, tg, c| m.cons(tg, Cons::Call { call: c }),
     );
@@ -1578,6 +1609,9 @@ pub(super) fn bobj_method(m: &mut Model, t: Tok, what: &str, name: Option<&str>,
         _ => what,
     };
     match (what, name) {
+        // W-HOST (LADDER18): the host Worker's own methods
+        // (`worker_method`).
+        ("Worker", Some(n)) if worker_method(m, t, n, call) => {}
         // An object a realm declaration made (`fresh(P)`) has `P` as its
         // [[Prototype]]: the method is the member of `P`'s declared chain,
         // or absent (`realm_born_method`).
@@ -1703,6 +1737,12 @@ pub(super) fn bobj_method(m: &mut Model, t: Tok, what: &str, name: Option<&str>,
             let exec = capability_executor(m, call, ov, name == Some("finally"));
             promise_species(m, t, call, exec);
             let thrown = m.thrown;
+            // R-JOBTHROW (27.2.5.4, 27.2.2.1 NewPromiseReactionJob): the
+            // rejection handler reads this promise's reason (and `thrown`,
+            // the rejections no promise holds); a handler's abrupt
+            // completion rejects the derived promise `out`.
+            let tr = super::promise_reason(m, t);
+            let or = super::promise_reason(m, out);
             let (on_ok, on_err) = match name {
                 Some("then") => (c.arg(0).copied(), c.arg(1).copied()),
                 Some("catch") => (None, c.arg(0).copied()),
@@ -1716,19 +1756,36 @@ pub(super) fn bobj_method(m: &mut Model, t: Tok, what: &str, name: Option<&str>,
                 } else {
                     v
                 };
-                let r = cb_call(m, call, f, ThisArg::Undef, vec![arg]);
+                let r = cb_call_in(m, call, f, ThisArg::Undef, vec![arg], or);
                 if name != Some("finally") {
-                    adopt(m, call, r, ov);
+                    super::adopt_r(m, call, r, ov, or);
+                } else {
+                    // thenFinally / catchFinally (27.2.5.3.1-2): a rejected
+                    // result of the handler rejects the derived promise.
+                    let ra = super::promise_reason_atom(m);
+                    m.cons(
+                        r,
+                        Cons::Load {
+                            key: Key::Named(ra),
+                            dst: or,
+                        },
+                    );
                 }
             }
             if let Some(f) = on_err {
-                let r = cb_call(m, call, f, ThisArg::Undef, vec![thrown]);
+                let ej = m.node_l("rejection");
+                m.edge(thrown, ej);
+                m.edge(tr, ej);
+                let r = cb_call_in(m, call, f, ThisArg::Undef, vec![ej], or);
                 if name != Some("finally") {
-                    adopt(m, call, r, ov);
+                    super::adopt_r(m, call, r, ov, or);
                 }
             }
             if name == Some("finally") || on_ok.is_none() || !c.spread.is_empty() {
                 m.edge(v, ov);
+            }
+            if name == Some("finally") || on_err.is_none() || !c.spread.is_empty() {
+                m.edge(tr, or);
             }
             ret_tok(m, call, out);
         }
@@ -2091,4 +2148,124 @@ fn dataview_access(n: &str) -> Option<(bool, bool)> {
         "setBigInt64" | "setBigUint64" => Some((false, true)),
         _ => None,
     }
+}
+
+/// W-HOST (LADDER18): a method of the host Worker `t` (perry-stdlib
+/// worker_threads/worker_surface.rs, worker_pump.rs; Node worker_threads,
+/// HTML Workers). `false`: a member this does not describe (generic).
+/// - `postMessage(v, transfer)`: StructuredSerialize of `v` (a [[Get]] of
+///   every own value, own getters run, deep; nothing is stored into `v`,
+///   nothing is called); the transfer list's items (a list, or the
+///   `transfer` of an options object) are detached.
+/// - `addEventListener(type, cb)`: the runtime calls `cb` with an event of
+///   `[[WorkerEvent]]`: a message's with `this` = the Worker
+///   (`call_message_callback1`), any other's with the plain receiver.
+/// - `on` / `once` / `addListener` / `prependListener` /
+///   `prependOnceListener(type, cb)`: `cb` is called with the plain call
+///   receiver and the payload `[[WorkerPayload]]` (`js_closure_call1`).
+/// - A throw of a listener is reported by the host (`host_report`).
+/// - `removeEventListener` / `off` / `removeListener` /
+///   `removeAllListeners`, `ref`, `unref`: compare or flip host state, call
+///   nothing; `terminate()` calls nothing and returns a Promise.
+fn worker_method(m: &mut Model, t: Tok, n: &str, call: CallId) -> bool {
+    let c = m.calls[call as usize].clone();
+    if !c.spread.is_empty() {
+        return false;
+    }
+    match n {
+        "postMessage" => {
+            if let Some(&v) = c.arg(0) {
+                let r = m.reason("Worker postMessage value cloned");
+                m.cons(
+                    v,
+                    Cons::Implicit {
+                        reason: r,
+                        proto: Protocol::Clone,
+                    },
+                );
+            }
+            if let Some(&tl) = c.arg(1) {
+                let rb = m.reason("B3 transfer list");
+                let inner = m.node_l("worker-transfer");
+                m.cons(
+                    tl,
+                    Cons::Load {
+                        key: Key::any(),
+                        dst: inner,
+                    },
+                );
+                let ta = m.atom("transfer");
+                m.cons(
+                    tl,
+                    Cons::Load {
+                        key: Key::Named(ta),
+                        dst: inner,
+                    },
+                );
+                let items = m.node_l("worker-transfer-item");
+                m.edge(inner, items);
+                m.cons(
+                    inner,
+                    Cons::Load {
+                        key: Key::any(),
+                        dst: items,
+                    },
+                );
+                m.cons(
+                    items,
+                    Cons::Hard {
+                        kind: Hard::B3Transfer,
+                        reason: rb,
+                    },
+                );
+            }
+            ret_prim(m, call, prim::UNDEF);
+        }
+        "addEventListener"
+        | "on"
+        | "once"
+        | "addListener"
+        | "prependListener"
+        | "prependOnceListener" => {
+            let web = n == "addEventListener";
+            let slot = if web { "WorkerEvent" } else { "WorkerPayload" };
+            let a = effects::internal_atom(m, slot);
+            let payload = m.field_r(t, a);
+            let this = m.node_l("worker-listener-this");
+            // A message listener runs with `this` = the Worker
+            // (`call_message_callback1`), any other with the plain call
+            // receiver (`js_closure_call1`).
+            if web {
+                m.add_tok(this, t);
+            }
+            m.add_prim(this, prim::UNDEF);
+            if let Some(&cb) = c.arg(1) {
+                let host = m.host_report;
+                let _ = cb_call_in(m, call, cb, ThisArg::Node(this), vec![payload], host);
+            }
+            if web {
+                ret_prim(m, call, prim::UNDEF);
+            } else {
+                ret_tok(m, call, t);
+            }
+        }
+        "removeEventListener"
+        | "off"
+        | "removeListener"
+        | "removeAllListeners"
+        | "ref"
+        | "unref" => {
+            if n == "removeEventListener" || n == "ref" || n == "unref" {
+                ret_prim(m, call, prim::UNDEF);
+            } else {
+                ret_tok(m, call, t);
+            }
+        }
+        "terminate" => {
+            let pr = site_tmpl(m, call, "Promise");
+            ret_tok(m, call, pr);
+        }
+        _ => return false,
+    }
+    true
 }

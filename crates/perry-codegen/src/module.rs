@@ -343,12 +343,6 @@ impl LlModule {
         return_type: LlvmType,
         param_types: &[LlvmType],
     ) {
-        // The straight-line read-region lowering was removed in object-model
-        // step 5. Its retired runtime API has no supplier, including for TOP.
-        debug_assert!(
-            !matches!(name, "js_region_guard_pack" | "js_region_guard_prime"),
-            "retired straight-line read-region helper: {name}"
-        );
         if self.declared_names.contains(name) {
             return;
         }
@@ -400,12 +394,6 @@ impl LlModule {
         param_types: &[LlvmType],
         ret_attrs: &str,
     ) {
-        // The straight-line read-region lowering was removed in object-model
-        // step 5. Its retired runtime API has no supplier, including for TOP.
-        debug_assert!(
-            !matches!(name, "js_region_guard_pack" | "js_region_guard_prime"),
-            "retired straight-line read-region helper: {name}"
-        );
         if self.declared_names.contains(name) {
             return;
         }
@@ -826,11 +814,16 @@ impl LlModule {
     }
 
     /// An external thread-local global with an explicit TLS model
-    /// (`initialexec`, ...): a runtime `#[thread_local]` generated code names.
+    /// (`initialexec`, ...; empty: the default, general-dynamic): a runtime
+    /// `#[thread_local]` generated code names.
     pub fn add_external_tls_global(&mut self, name: &str, ty: &str, model: &str) {
-        self.globals.push(format!(
-            "@{name} = external thread_local({model}) global {ty}"
-        ));
+        let tls = if model.is_empty() {
+            "thread_local".to_string()
+        } else {
+            format!("thread_local({model})")
+        };
+        self.globals
+            .push(format!("@{name} = external {tls} global {ty}"));
     }
 
     pub fn add_external_global(&mut self, name: &str, ty: LlvmType) {
@@ -1325,18 +1318,7 @@ impl LlModule {
             crate::workers::unit_workers(),
             |function, _, _| function,
         );
-        Box::new(parts.into_iter().map(|part| {
-            let mut ir = part.pre;
-            for function in part.funcs {
-                ir.push_str(&render_fn_external_with_gc_leaf_callees(
-                    &function,
-                    &part.gc_leaf_callees,
-                ));
-                ir.push('\n');
-            }
-            ir.push_str(&part.post);
-            ir
-        }))
+        Box::new(parts.into_iter().map(OwnedCodegenUnitPart::into_text))
     }
 
     /// Render this module as `n` independent codegen-unit `.ll` texts (#5391).
@@ -1883,22 +1865,7 @@ impl LlModule {
         }
         parts
             .into_iter()
-            .map(|part| {
-                let mut ir = part.pre;
-                for func in &part.funcs {
-                    ir.push_str(&render_fn_external_with_gc_leaf_callees(
-                        func,
-                        &part.gc_leaf_callees,
-                    ));
-                    ir.push('\n');
-                }
-                for copy in &part.copies {
-                    ir.push_str(&copy.text);
-                    ir.push('\n');
-                }
-                ir.push_str(&part.post);
-                ir
-            })
+            .map(OwnedCodegenUnitPart::into_text)
             .collect()
     }
 }
@@ -1977,6 +1944,30 @@ pub(crate) struct OwnedCodegenUnitPart<T> {
     /// names are not declared in `pre`; `declaration` stands in for that.
     pub copies: Vec<UnitCopy>,
     pub gc_leaf_callees: Arc<HashSet<String>>,
+}
+
+impl<F: std::borrow::Borrow<LlFunction>> OwnedCodegenUnitPart<F> {
+    /// The unit's complete `.ll` text: skeleton, its own functions, the
+    /// `available_externally` copies, metadata. Every text transport renders a
+    /// unit through this one function. The layout leaves a copied callee out
+    /// of `pre`'s declarations, so a unit rendered without its copies names
+    /// a symbol it neither defines nor declares.
+    fn into_text(self) -> String {
+        let mut ir = self.pre;
+        for function in &self.funcs {
+            ir.push_str(&render_fn_external_with_gc_leaf_callees(
+                function.borrow(),
+                &self.gc_leaf_callees,
+            ));
+            ir.push('\n');
+        }
+        for copy in &self.copies {
+            ir.push_str(&copy.text);
+            ir.push('\n');
+        }
+        ir.push_str(&self.post);
+        ir
+    }
 }
 
 /// One `available_externally` body in a caller's unit.

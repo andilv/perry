@@ -125,8 +125,10 @@ fn classify(m: &Model, n: NodeId, c: &Cons) -> Use {
         | Cons::Fulfil { dst }
         | Cons::Falsy { dst }
         | Cons::NotBuffer { dst, .. }
+        | Cons::NotRegExp { dst }
         | Cons::ProtoObjects { dst }
         | Cons::NotNull { dst }
+ | Cons::RecordEntry { dst }
         | Cons::TypeIs { dst, .. }
         | Cons::Objects { dst }
         | Cons::NotUndefined { dst } => Use::To(dst),
@@ -163,6 +165,7 @@ fn classify(m: &Model, n: NodeId, c: &Cons) -> Use {
         | Cons::Raise { .. }
         | Cons::Identity { .. }
         | Cons::HasProp { .. }
+        | Cons::OwnProp { .. }
         | Cons::Hard { .. }
         | Cons::TopIfTop { .. }
         | Cons::OwnTest { .. }
@@ -232,6 +235,8 @@ fn classify(m: &Model, n: NodeId, c: &Cons) -> Use {
         | Cons::ForInKeys { .. }
         | Cons::EnumKeyStore { .. }
         | Cons::EnumKeyAny { .. }
+        // A key list reads no Number (rule EK).
+        | Cons::OwnKeys { .. }
         | Cons::CjsPublish { .. } => Use::Absorb,
         // A property read or a method call on a Number runs its prototype's
         // code with the Number as `this` (`(-0).toLocaleString()` is "-0");

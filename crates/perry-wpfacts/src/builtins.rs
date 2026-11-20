@@ -17,10 +17,6 @@ mod gen_members;
 #[cfg(test)]
 pub(crate) mod effects_for_tests {
     pub(crate) use super::effects::interpretable;
-    /// `Array.prototype.<name>` is declared in forms the interpreter runs.
-    pub(crate) fn declared_array_method(name: &str) -> bool {
-        super::effects::declared(super::Family::Array, name).is_some()
-    }
 }
 pub use constructors::{construct_named, new_builtin_ns};
 pub(crate) mod members;
@@ -32,7 +28,8 @@ mod undeclared;
 pub use native_protocol::sentinel_user_global;
 pub(crate) use native_protocol::{census_native_op_writes, census_native_written};
 pub use undeclared::{
-    builtin_function, global_object, native_may_be, realm_reads_store, undeclared,
+    builtin_function, global_object, global_store_escapes, global_self_key, native_may_be, realm_reads_store,
+    undeclared,
 };
 pub(crate) mod regex_tail;
 pub(crate) mod string_methods;
@@ -51,12 +48,13 @@ pub use members::Family;
 use members::Mem;
 pub use native_protocol::{
     global_any_field, global_any_names, global_any_new, global_def_field, global_field,
-    global_user_key, global_value_written, is_builtin_module, native_accessor_known,
-    native_accessor_written, native_nonplain_written, native_parent_ctor, native_parent_keys,
-    native_parent_summarized, native_parent_value, native_proto, native_writers_why,
-    native_written, native_written_by, note_global_in_top, note_handed_to_unknown,
-    note_native_accessor, note_native_data_write, note_native_write, note_realm_held,
-    program_global_fn, require_parts, settle_native_given, WriteValue,
+    global_user_key, global_user_method, global_value_written, is_builtin_module,
+    native_accessor_known, native_accessor_written, native_nonplain_written, native_parent_ctor,
+    native_parent_keys, native_parent_summarized, native_parent_value, native_proto,
+    native_writers_why, native_written, native_written_by, note_global_in_top,
+    note_handed_to_unknown, note_native_accessor, note_native_data_write, note_native_write,
+    note_realm_held, program_global_fn, require_parts, settle_native_given, GlobalAnyRead,
+    WriteValue,
 };
 use native_protocol::{native_method, native_skips, opaque_written};
 
@@ -877,15 +875,88 @@ pub(crate) fn promise_result_atom(m: &mut Model) -> Atom {
     effects::internal_atom(m, "PromiseResult")
 }
 
+/// A host Worker's internal slots: `[[WorkerPayload]]` (the clone tree a
+/// message delivers) and `[[WorkerEvent]]` (the event its listeners get).
+pub(crate) fn worker_slot_atom(m: &mut Model, name: &str) -> Atom {
+    effects::internal_atom(m, name)
+}
+
+/// W-HOST step 5: the construct queues the `worker` process event
+/// (worker_surface.rs `queue_process_worker_event`: [[Get]](process,
+/// "nextTick") called with a host callback capturing `w`, which does
+/// [[Get]](process, "emit") and calls it with ("worker", w); this =
+/// process). Unwritten, both are the realm's natives: `nextTick` queues
+/// the callback, `emit` hands `w` to the process listeners
+/// (`Model::process_event`). A key the program or unknown code wrote
+/// (`opaque_written`): a stored function is called, an opaque write is the
+/// unknown call (the replay). `tick` passes `w` itself for the callback
+/// (its one capture). `emit` = ("worker", w), `tick` = (w).
+pub(crate) fn process_worker_event(m: &mut Model, w: NodeId, emit: CallId, tick: CallId) {
+    let p = m.tok(TokKind::Builtin(BuiltinNs::Process));
+    let pe = m.process_event;
+    m.edge(w, pe);
+    for (k, call) in [("emit", emit), ("nextTick", tick)] {
+        let a = m.atom(k);
+        let _ = opaque_written(m, p, a, NativeMiss::Call(p, call));
+    }
+}
+
 /// The settled-value field of a promise token.
 fn promise_value(m: &mut Model, p: Tok) -> NodeId {
     let a = promise_result_atom(m);
     m.field(p, a)
 }
 
+/// R-JOBTHROW: a rejected promise's reason is its [[PromiseResult]] in the
+/// rejected state (ECMA-262 27.2.1.7 RejectPromise). The model keeps it in
+/// its own internal slot beside the fulfilled value: what the promise's
+/// rejection handlers (27.2.5.4 PerformPromiseThen, 27.2.2.1) and an
+/// `await` of it (27.7.5.3 Await) read, never a program `catch` directly.
+/// A rejection the model cannot place on its promise stays in `thrown`,
+/// which every rejection reader also reads.
+pub(crate) fn promise_reason_atom(m: &mut Model) -> Atom {
+    effects::internal_atom(m, "PromiseReason")
+}
+
+/// The rejection-reason field of a promise token (`promise_reason_atom`).
+pub(crate) fn promise_reason(m: &mut Model, p: Tok) -> NodeId {
+    let a = promise_reason_atom(m);
+    let r = m.field(p, a);
+    // R-HOSTREPORT: a rejection no handler takes is the host's to report
+    // (promise/rejection.rs `report_unhandled`).
+    let h = m.host_report;
+    m.edge(r, h);
+    r
+}
+
+/// R-HOSTREPORT: the runtime's readers of what it reports as uncaught
+/// (exception.rs `print_uncaught`): Get `message` and Get `stack` (a getter
+/// runs with this = the value), ToString of each, and ToString of the value.
+pub(crate) fn host_report_readers(m: &mut Model, host: NodeId) {
+    string_methods::read_prim(m, host, "message", "uncaught report");
+    string_methods::read_prim(m, host, "stack", "uncaught report");
+    string_methods::to_prim(m, host, "uncaught report");
+}
+
 /// `v` adopted by a promise: the value, the settled value of promise
 /// tokens in it, and whatever a thenable's `then` resolves.
 pub fn adopt(m: &mut Model, by: CallId, v: NodeId, dst: NodeId) {
+    let thrown = m.thrown;
+    adopt_r(m, by, v, dst, thrown)
+}
+
+/// `adopt` by a promise whose rejection reason is `rej`: an adopted
+/// promise's reason and what a thenable's `then` rejects with reach `rej`
+/// (27.2.1.3.2 step 13, 27.2.2.2 NewPromiseResolveThenableJob).
+pub fn adopt_r(m: &mut Model, by: CallId, v: NodeId, dst: NodeId, rej: NodeId) {
+    let ra = promise_reason_atom(m);
+    m.cons(
+        v,
+        Cons::Load {
+            key: Key::Named(ra),
+            dst: rej,
+        },
+    );
     if m.reach_thenable {
         m.cons(v, Cons::Fulfil { dst });
     } else {
@@ -900,8 +971,7 @@ pub fn adopt(m: &mut Model, by: CallId, v: NodeId, dst: NodeId) {
         },
     );
     let res = resolver(m, by, dst);
-    let thrown = m.thrown;
-    let rej = rejecter(m, thrown);
+    let rej = rejecter(m, rej);
     let rn = m.node_l("resolver");
     m.add_tok(rn, res);
     let jn = m.node_l("rejecter");
@@ -1277,6 +1347,22 @@ pub(crate) fn locked_chain_read(m: &Model, t: Tok, a: Atom) -> bool {
             return image_member(m, holder, &m.atoms[a as usize]);
         }
     }
+    // Rule HI: `@@hasInstance` on a class object, whatever its `extends`.
+    // The lookup passes the class's own keys and those of its parents
+    // (program tokens or ⊤: the chain walk reads them, and a `setPrototypeOf`
+    // or `__proto__` store is a parent there), then ends at
+    // `%Function.prototype%`: a superclass is a constructor or null (ECMA-262
+    // 15.7.14), and every constructor's chain ends there unless a program
+    // set its [[Prototype]]. There `@@hasInstance` is non-writable and
+    // non-configurable (20.2.3.6), an image member the runtime refuses to
+    // replace (DEC 250); a plain store of the key on the class or a parent
+    // fails against it (10.1.9.2 step 2.a), so only a define installs one,
+    // as an own key the walk reads. The intrinsic end is final.
+    if matches!(m.toks[t as usize], TokKind::ClassObj(_))
+        && m.atoms[a as usize] == crate::model::WK_HAS_INSTANCE
+    {
+        return true;
+    }
     let what = match &m.toks[t as usize] {
         TokKind::Obj(tm, _) => match &m.tmpls[*tm as usize].kind {
             TmplKind::BObj { what, .. } => Some(*what),
@@ -1304,8 +1390,24 @@ pub(crate) fn locked_chain_read(m: &Model, t: Tok, a: Atom) -> bool {
 /// native member is found, never the chain end's `undefined`
 /// (`Promise.prototype.then` on a promise).
 pub(crate) fn locked_chain_defines(m: &Model, t: Tok, a: Atom) -> bool {
-    locked_chain_read(m, t, a)
-        && lock_family(m, t).is_some_and(|f| members::member(f, &m.atoms[a as usize]).is_some())
+    if !locked_chain_read(m, t, a) {
+        return false;
+    }
+    // A RegExp, a Date, a Map/Set/String iterator: the locked prototype
+    // (`members::image_locked_prototype`) defines `a` when its declaration
+    // holds it (a locked absent key is final too, and defines nothing).
+    if let TokKind::Obj(tm, _) = m.toks[t as usize] {
+        if let TmplKind::BObj { what, .. } = m.tmpls[tm as usize].kind {
+            if let Some((holder, _)) = members::image_locked_prototype(what) {
+                return m.declarations.named(holder, m).is_some_and(|h| {
+                    m.declarations
+                        .property(h, &m.atoms[a as usize], m)
+                        .is_some()
+                });
+            }
+        }
+    }
+    lock_family(m, t).is_some_and(|f| members::member(f, &m.atoms[a as usize]).is_some())
 }
 
 /// Is a read of `name` on the declared intrinsic prototype `holder` final?
@@ -3152,10 +3254,11 @@ fn promise_resolve_reject(m: &mut Model, name: &str, call: CallId) {
     let v = promise_value(m, p);
     if let Some(a) = arg(m, call, 0) {
         if name == "resolve" {
-            adopt(m, call, a, v);
+            let r = promise_reason(m, p);
+            adopt_r(m, call, a, v, r);
         } else {
-            let thrown = m.thrown;
-            m.edge(a, thrown);
+            let r = promise_reason(m, p);
+            m.edge(a, r);
         }
     } else {
         m.add_prim(v, prim::UNDEF);
@@ -3166,6 +3269,33 @@ fn promise_resolve_reject(m: &mut Model, name: &str, call: CallId) {
 fn ns_method(m: &mut Model, ns: BuiltinNs, name: Option<&str>, call: CallId) {
     crate::family_reach::namespace(m, ns, name);
     ns_method_inner(m, ns, name, call, false)
+}
+
+/// R-HOSTREPORT: a call that may register a process listener (`process.on`
+/// and the other EventEmitter registrations on the one process object;
+/// any event, a computed key may name the method) hands the listener what
+/// the host reports and the process events.
+pub(crate) fn process_listener_registered(m: &mut Model, call: CallId) {
+    let (h, e) = (m.host_report, m.esc_raise);
+    m.edge(h, e);
+    // W-HOST: the listener is handed the process events too
+    // (`Model::process_event`).
+    let pe = m.process_event;
+    m.edge(pe, e);
+    // The listener itself runs with them (os_process_emitter.rs
+    // `emit_process_uncaught_exception`: listener(err, origin), this =
+    // process); another event name, or a computed one, may be any of
+    // them. Its own throw is the host's to report.
+    let c = m.calls[call as usize].clone();
+    if let Some(&cb) = c.arg(1) {
+        let arg = m.node_l("process-listener-arg");
+        m.edge(h, arg);
+        m.edge(pe, arg);
+        let p = m.tok(TokKind::Builtin(BuiltinNs::Process));
+        let this = m.node_l("process-listener-this");
+        m.add_tok(this, p);
+        let _ = collections::cb_call_in(m, call, cb, ThisArg::Node(this), vec![arg], h);
+    }
 }
 
 fn ns_method_inner(
@@ -3196,6 +3326,24 @@ fn ns_method_inner(
         {
             m.diagnostic_builtin(call, |_| format!("{ns:?}.{name}"));
         }
+    }
+
+    // R-HOSTREPORT: a process listener ("uncaughtException",
+    // "unhandledRejection": os_process_emitter.rs
+    // `emit_process_uncaught_exception`, promise/rejection.rs
+    // `report_unhandled`) is handed what the host reports. A call that may
+    // register one (any event; a computed key may name the method) gives
+    // the report to unknown code, as the listener is.
+    if ns == BuiltinNs::Process
+        && match name {
+            None => true,
+            Some(n) => matches!(
+                n,
+                "on" | "once" | "addListener" | "prependListener" | "prependOnceListener"
+            ),
+        }
+    {
+        process_listener_registered(m, call);
     }
 
     // A computed key may name any member, one no rule describes included
@@ -3298,7 +3446,12 @@ fn ns_method_inner(
                 } else {
                     ThisArg::Node(this)
                 };
-                let _ = collections::cb_call(m, call, cb, this_arg, args);
+                // R-JOBTHROW / R-HOSTREPORT: a throw of the callback goes to
+                // the host (HTML 8.1.4.6 "report the exception"; perry
+                // timer.rs `with_timer_uncaught_trap`), which no program
+                // `catch` reads (`Model::host_report`).
+                let host = m.host_report;
+                let _ = collections::cb_call_in(m, call, cb, this_arg, args, host);
                 // HTML also accepts string handlers (ToString), which may
                 // run arbitrary script. Perry/Node only accept functions;
                 // no object handler is retained in either case.
@@ -3445,7 +3598,22 @@ fn ns_method_inner(
             }
             ret_prim(m, call, prim::BOOL);
         }
-        (BuiltinNs::Object, "isFrozen" | "isSealed" | "isExtensible" | "hasOwn") => {
+        (BuiltinNs::Object, "isFrozen" | "isSealed" | "isExtensible") => {
+            ret_prim(m, call, prim::BOOL);
+        }
+        // 20.1.2.13: ToObject(O), ToPropertyKey(P), then O.[[GetOwnProperty]](P):
+        // a Proxy's `getOwnPropertyDescriptor` trap runs.
+        (BuiltinNs::Object, "hasOwn") => {
+            if let Some(o) = arg(m, call, 0) {
+                let idx = arg(m, call, 1).unwrap_or(NO_NODE);
+                m.cons(
+                    o,
+                    Cons::OwnProp {
+                        key: Key::any(),
+                        idx,
+                    },
+                );
+            }
             ret_prim(m, call, prim::BOOL);
         }
         // Only a call with a spread argument (`object_statics::value_call`
@@ -3732,10 +3900,16 @@ fn ns_method_inner(
                 _ => None,
             };
             let settled = m.node_l("settled");
+            // R-JOBTHROW: an item's rejection goes where the combinator
+            // sends it (27.2.4.1.2 / .2.2 / .3.1 / .5.1): `all` and `race`
+            // reject their promise with it, `allSettled` records it, `any`
+            // collects it into the AggregateError's errors; never the
+            // shared thrown cell.
+            let item_rej = m.node_l("item-reason");
             if let Some(els) = lit {
                 for (i, e) in els.into_iter().enumerate() {
                     let s = m.node_l("settled");
-                    adopt(m, call, e, s);
+                    adopt_r(m, call, e, s, item_rej);
                     m.edge(s, settled);
                     let slot = m.index_slot(arr, i as u32);
                     m.edge(s, slot);
@@ -3743,7 +3917,7 @@ fn ns_method_inner(
             } else {
                 let vals = all_arg_values(m, call);
                 let items = iterate(m, call, vals);
-                adopt(m, call, items, settled);
+                adopt_r(m, call, items, settled, item_rej);
                 m.edge(settled, fa);
             }
             if name == "allSettled" {
@@ -3753,6 +3927,7 @@ fn ns_method_inner(
                 m.edge(settled, rfa);
                 let thrown = m.thrown;
                 m.edge(thrown, rfa);
+                m.edge(item_rej, rfa);
                 m.add_prim(rfa, prim::STR);
                 m.add_tok(fa, rec);
             }
@@ -3760,6 +3935,10 @@ fn ns_method_inner(
                 m.add_tok(v, arr);
             } else {
                 m.edge(settled, v);
+            }
+            if name == "all" || name == "race" {
+                let r = promise_reason(m, p);
+                m.edge(item_rej, r);
             }
             if name == "any" {
                 // Every item rejected: an AggregateError whose `errors` are
@@ -3769,10 +3948,13 @@ fn ns_method_inner(
                 let efa = m.field_any(errs);
                 let thrown = m.thrown;
                 m.edge(thrown, efa);
+                m.edge(item_rej, efa);
                 let ea = m.atom("errors");
                 let f = m.field(e, ea);
                 m.add_tok(f, errs);
                 m.add_tok(thrown, e);
+                let r = promise_reason(m, p);
+                m.add_tok(r, e);
             }
             ret_tok(m, call, p);
         }
@@ -3834,6 +4016,23 @@ fn ns_method_inner(
         // `ArrayBuffer.isView(a)` (ECMA-262 25.1.5.1): a Boolean; it reads
         // only the argument's [[ViewedArrayBuffer]] slot and runs no code.
         (BuiltinNs::ArrayBuffer, "isView") => ret_prim(m, call, prim::BOOL),
+        // The Date statics called through the constructor (a program that
+        // writes one of them lowers each call as `Date.m(…)`, perry-hir
+        // `try_patched_builtin_call`): the realm's own functions, the steps
+        // of the intrinsic forms (`Expr::DateNow` / `DateParse` / `DateUtc`,
+        // gen_rest.rs; perry-runtime date_proto_thunks.rs
+        // `date_now_static` / `date_parse_static` / `date_utc_static`).
+        // ECMA-262 21.4.3.1 `now`: a Number, no argument read, `this`
+        // ignored. 21.4.3.2 `parse`: ToString of the one operand. 21.4.3.4
+        // `UTC`: ToNumber of each component. A value the program stored
+        // under the key is bound as the callee besides (the ordinary read),
+        // and a write unknown code may make holds the realm where the read
+        // gives ⊤.
+        (BuiltinNs::Date, "now") => ret_prim(m, call, prim::NUM),
+        (BuiltinNs::Date, "parse" | "UTC") => {
+            implicit_args(m, call, "ToPrimitive", Protocol::ToPrimitive);
+            ret_prim(m, call, prim::NUM);
+        }
         // A key the namespace's description (its own keys and its chain)
         // declares absent is no method (TypeError); one the program added
         // is the receiver's own field or chain value (`method_on`).
@@ -4038,10 +4237,19 @@ pub(crate) fn require_by_spec(m: &mut Model, call: CallId, spec: Option<Atom>) {
 /// `promise_constructor_call_thunk`). Not here: constructors with a call
 /// behaviour (`Array`, `Object`, `String`, `Number`, `Boolean`, `BigInt`,
 /// `Symbol`, `Date`, `RegExp`, `Error`s, `Function`).
+///
+/// The global object (ECMA-262 19), `Math` (21.3), `JSON` (25.5) and
+/// `Reflect` (28.1) are ordinary objects without a [[Call]] internal
+/// method: Call throws a TypeError at 7.3.14 step 2, before it uses the
+/// receiver or an argument.
 pub(crate) fn call_throws(ns: BuiltinNs) -> bool {
     matches!(
         ns,
-        BuiltinNs::TypedArray
+        BuiltinNs::GlobalThis
+            | BuiltinNs::Math
+            | BuiltinNs::Json
+            | BuiltinNs::Reflect
+            | BuiltinNs::TypedArray
             | BuiltinNs::TypedArrayKind(_)
             | BuiltinNs::ArrayBuffer
             | BuiltinNs::SharedArrayBuffer

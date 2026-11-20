@@ -272,7 +272,9 @@ fn use_of(m: &Model, c: &Cons, fill_recv: bool, reads: &FxHashSet<NodeId>) -> Op
         | Cons::Defined { .. }
         | Cons::NotNullish { .. }
         | Cons::NotBuffer { .. }
+        | Cons::NotRegExp { .. }
         | Cons::NotNull { .. }
+        | Cons::RecordEntry { .. }
         | Cons::TypeIs { .. }
         | Cons::NotUndefined { .. }
         | Cons::Falsy { .. }

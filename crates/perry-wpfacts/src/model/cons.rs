@@ -104,6 +104,13 @@ pub enum Cons {
     Load { key: Key, dst: NodeId },
     /// Values of own properties only (enumerability over-approximated).
     OwnValues { dst: NodeId },
+    /// Rule EK: the String keys of own properties (ECMA-262 20.1.2.5
+    /// Object.entries, 7.3.23 EnumerableOwnProperties): of a literal whose
+    /// enumerable keys are known (`Model::enum_keys`), those keys, each a
+    /// String constant; of any other value, any String. Looked at again
+    /// once the worklist is empty (`settle_for_in`), so a key written later,
+    /// an escape or a write under a key no name lists widens dst.
+    OwnKeys { dst: NodeId },
     /// The `value` field of an own-property descriptor of each t (20.1.2.8,
     /// 10.1.5.1 OrdinaryGetOwnProperty): `OwnValues`, plus the own data
     /// properties the realm makes, which `OwnValues` (EnumerableOwnProperties
@@ -297,6 +304,12 @@ pub enum Cons {
     /// equal, and the Null type has the one value `null`; `undefined`
     /// passes). A rule of the program text, like `NotNullish`.
     NotNull { dst: NodeId },
+    /// Rule RP2 (`solve/record_entry.rs`): the values the protocol arm of a
+    /// guarded iterator record may see: every value but an ordinary Array
+    /// the runtime takes the array arm for (`Model::record_entry_holds`),
+    /// which is held back until it no longer qualifies
+    /// (`settle_record_entry`).
+    RecordEntry { dst: NodeId },
     /// R9READ6 rule T6: a local `x` where `typeof x === s` held, `s`
     /// "string", "number", "boolean" or "undefined": only its primitives
     /// of `mask` (the one type with that typeof result, ECMA-262 13.5.3)
@@ -314,6 +327,13 @@ pub enum Cons {
     /// primitive pass. The binding's other values pass all (a `Guard`,
     /// `guard::NOT_BUFFER_CTOR`, on the read of the global).
     NotBuffer { shared: bool, dst: NodeId },
+    /// The pattern operand of the RegExp constructor as ECMA-262 22.2.4.1
+    /// steps 4-6 convert it: an object with a [[RegExpMatcher]] slot gives
+    /// its [[OriginalSource]] and [[OriginalFlags]] (no `source`/`flags`
+    /// Get, no ToString). Every value but a token of the RegExp family
+    /// (a literal's or a constructor's birth, the objects with that slot)
+    /// flows into `dst`: other objects, ⊤, markers and every primitive.
+    NotRegExp { dst: NodeId },
     /// A value given as a prototype (`__proto__` store, `setPrototypeOf`,
     /// `Object.create`): dst ⊇ the node's objects (⊤ included) and `null`.
     /// No other primitive is ever one: the `__proto__` setter ignores it
@@ -340,6 +360,12 @@ pub enum Cons {
     /// object; a Proxy runs its `has` trap (`solve/proxy.rs`). `idx`: the
     /// key value, or `NO_NODE` for a named key.
     HasProp { key: Key, idx: NodeId },
+    /// `Object.hasOwn(o, k)`, `o.hasOwnProperty(k)`, `propertyIsEnumerable`
+    /// (ECMA-262 [[GetOwnProperty]], 10.1.5): the twin of `HasProp`. No
+    /// flow on an ordinary object; a Proxy runs its
+    /// `getOwnPropertyDescriptor` trap (`solve/proxy.rs`). `idx`: the key
+    /// value, or `NO_NODE` for a named key.
+    OwnProp { key: Key, idx: NodeId },
     /// `Object.defineProperty(o, key, desc)` with a constant key (FVA 4.3a).
     /// An accessor descriptor (`data` false) on a literal layout that does
     /// not hold `key` as data: the key becomes an accessor key (the getter
@@ -940,8 +966,10 @@ impl Cons {
                 | Cons::FieldTruthy { .. }
                 | Cons::Fulfil { .. }
                 | Cons::NotBuffer { .. }
+                | Cons::NotRegExp { .. }
                 | Cons::ProtoObjects { .. }
                 | Cons::NotNull { .. }
+                | Cons::RecordEntry { .. }
                 | Cons::TypeIs { .. }
                 | Cons::NotUndefined { .. }
         )
@@ -965,8 +993,10 @@ impl Cons {
                 | Cons::FieldTruthy { .. }
                 | Cons::Fulfil { .. }
                 | Cons::NotBuffer { .. }
+                | Cons::NotRegExp { .. }
                 | Cons::ProtoObjects { .. }
                 | Cons::NotNull { .. }
+                | Cons::RecordEntry { .. }
                 | Cons::TypeIs { .. }
                 | Cons::NotUndefined { .. }
                 | Cons::Falsy { .. }
@@ -979,6 +1009,7 @@ impl Cons {
             Cons::Load { .. } => "load",
             Cons::ProtoKey { .. } => "protokey",
             Cons::OwnValues { .. } => "ownvalues",
+            Cons::OwnKeys { .. } => "ownkeys",
             Cons::OwnDescValues { .. } => "owndescvalues",
             Cons::IndexHole => "indexhole",
             Cons::IndexHoleIn { .. } => "indexholein",
@@ -1014,14 +1045,17 @@ impl Cons {
             Cons::Falsy { .. } => "falsy",
             Cons::NotUndefined { .. } => "notundefined",
             Cons::NotNull { .. } => "notnull",
+            Cons::RecordEntry { .. } => "recordentry",
             Cons::TypeIs { .. } => "typeis",
             Cons::NotBuffer { .. } => "notbuffer",
+            Cons::NotRegExp { .. } => "notregexp",
             Cons::ProtoObjects { .. } => "protoobjects",
             Cons::Objects { .. } => "objects",
             Cons::Hard { .. } => "hard",
             Cons::Miss { .. } => "miss",
             Cons::DeleteKey { .. } => "deletekey",
             Cons::HasProp { .. } => "hasprop",
+            Cons::OwnProp { .. } => "ownprop",
             Cons::AddsKeys => "addskeys",
             Cons::DefineKey { .. } => "definekey",
             Cons::DefineAll { .. } => "defineall",

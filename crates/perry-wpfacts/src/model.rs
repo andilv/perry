@@ -792,6 +792,14 @@ pub struct DefineAny {
     pub accessor: bool,
 }
 
+impl DefineAny {
+    /// One define: its key node and its own `get` node (each define site
+    /// reads its descriptor's `get` into a node of its own).
+    pub fn id(&self) -> (NodeId, NodeId) {
+        (self.key, self.get)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum ThisArg {
     Undef,
@@ -1101,6 +1109,12 @@ pub enum Protocol {
     /// arguments). Every value it shows and what a hook returns is
     /// formatted the same way.
     InspectShown,
+    /// The formatter showing a Proxy's TARGET (`format_proxy_value`; Node
+    /// `formatValue` after `getProxyDetails`): its own values, each
+    /// `InspectShown`. No hook is looked up on it here: the Proxy's
+    /// `[util.inspect.custom]` is read off the target and called with
+    /// `this` = the Proxy (`Model::proxy_inspect_shown`).
+    InspectTarget,
     /// Node's `util.inspect(v, { depth: -1 })`, what an argument-type
     /// error's message runs on an object without a named constructor
     /// (lib/internal/errors.js `determineSpecificType`; node 26
@@ -1124,7 +1138,7 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub const ALL: [Protocol; 16] = [
+    pub const ALL: [Protocol; 17] = [
         Protocol::ToPrimitive,
         Protocol::Iterate,
         Protocol::IterNext,
@@ -1138,6 +1152,7 @@ impl Protocol {
         Protocol::OwnKeys,
         Protocol::Inspect,
         Protocol::InspectShown,
+        Protocol::InspectTarget,
         Protocol::ShallowInspect,
         Protocol::Clone,
         Protocol::Any,
@@ -1183,6 +1198,7 @@ impl Protocol {
             Protocol::IterResult
             | Protocol::AsyncIterResult
             | Protocol::OwnKeys
+            | Protocol::InspectTarget
             | Protocol::Clone => &[],
             Protocol::Any => return None,
         })
@@ -1225,7 +1241,7 @@ impl Protocol {
         match self {
             Protocol::Json => &[Protocol::Json],
             Protocol::Inspect => &[Protocol::InspectShown],
-            Protocol::InspectShown => &[Protocol::InspectShown],
+            Protocol::InspectShown | Protocol::InspectTarget => &[Protocol::InspectShown],
             Protocol::Clone => &[Protocol::Clone],
             Protocol::AsyncIterResult => &[Protocol::BufferFrom],
             Protocol::BufferFrom => &[Protocol::ToPrimitive],
@@ -1242,6 +1258,7 @@ impl Protocol {
             Protocol::Json
                 | Protocol::Inspect
                 | Protocol::InspectShown
+                | Protocol::InspectTarget
                 | Protocol::Clone
                 | Protocol::BufferFrom
         )
@@ -1258,6 +1275,7 @@ impl Protocol {
             Protocol::Json
             | Protocol::Inspect
             | Protocol::InspectShown
+            | Protocol::InspectTarget
             | Protocol::ShallowInspect
             | Protocol::Clone
             | Protocol::OwnKeys
@@ -1301,6 +1319,7 @@ impl Protocol {
             | Protocol::AsyncIterResult
             | Protocol::HasInstance
             | Protocol::OwnKeys
+            | Protocol::InspectTarget
             | Protocol::Clone => None,
         }
     }
@@ -1326,6 +1345,7 @@ impl Protocol {
             Protocol::OwnKeys => "ownkeys",
             Protocol::Inspect => "inspect",
             Protocol::InspectShown => "inspectshown",
+            Protocol::InspectTarget => "inspecttarget",
             Protocol::ShallowInspect => "shallowinspect",
             Protocol::Clone => "clone",
             Protocol::Any => "any",
@@ -1856,6 +1876,11 @@ pub struct Model {
     /// `PERRY_FACTS_SABOTAGE=instlit`: the shared node alone, which claims
     /// an instance-born literal's birth state for the Array a callee grew.
     pub instance_nodes: bool,
+    /// Every node a per-binding fact reads through `BindingNodes::of`
+    /// (`bindings::binding_reads`), set before the summaries are built. In
+    /// a body with births `summary::compress` keeps their slots, so each
+    /// has an instance copy that holds the instance's tokens.
+    pub binding_reads: crate::pts::FxHashSet<NodeId>,
     /// Every event that may change Array token `.0`'s length or move its
     /// elements (`Model::len_event`): the store site `.1`, or with `.2` the
     /// call `.1` (a builtin method), or with `u32::MAX` nothing the solve
@@ -2184,6 +2209,12 @@ pub struct Model {
     pub escaped: FxHashMap<Tok, u32>,
     /// `escaped` as a bitset by token (the hot membership test).
     pub esc_bits: Vec<u64>,
+    /// Tokens whose escape bit was set since the last late-escape prune
+    /// (`prune_late_escaped`, R-ESCLATE): that prune's work list, which it
+    /// empties.
+    pub late_esc: Vec<Tok>,
+    /// The work counter when the last late-escape prune ran.
+    pub late_esc_at: u64,
     pub reasons: Vec<String>,
     pub reason_index: FxHashMap<String, u32>,
     pub top_node: NodeId,
@@ -2386,6 +2417,14 @@ pub struct Model {
     /// that source (`gen_sources`: a source whose `@@iterator` returns the
     /// source itself never makes that object).
     pub get_iterator_src: FxHashMap<TmplId, NodeId>,
+    /// Rule RP2: the templates whose objects are born ordinary Arrays with
+    /// `%Array.prototype%` (an array literal, a spread literal, an
+    /// `Object.entries` pair): never an iterator model.
+    pub ordinary_arrays: crate::pts::FxHashSet<TmplId>,
+    /// Rule RP2: (token, dst) of each `Cons::RecordEntry` that held the
+    /// token back (`record_entry_holds`), looked at again in
+    /// `settle_record_entry`.
+    pub record_entry_held: Vec<(Tok, NodeId)>,
     /// The ordinary dispatch behind a name-keyed fold
     /// (`Gen::name_fold_call`), with the builtin kind the fold's helper
     /// serves itself: `method_on` makes it on every other receiver.
@@ -2480,6 +2519,14 @@ pub struct Model {
     pub ta_min_len: FxHashMap<TmplId, u32>,
     pub ta_exact_len: FxHashMap<TmplId, u32>,
     pub ta_birth_input: FxHashMap<TmplId, NodeId>,
+    /// Rule TA-LEN (`Model::ta_fixed_len`): the length a typed-array
+    /// template is born with (-1 when its births disagree) and the Array
+    /// literal nodes it was constructed from, whose iteration must stay the
+    /// intrinsic one.
+    pub ta_birth_len: FxHashMap<TmplId, (i64, Vec<NodeId>)>,
+    /// Typed-array tokens whose length node was born fixed under rule
+    /// TA-LEN; `settle_ta_len` widens one once the rule stops holding.
+    pub ta_len_watch: Vec<Tok>,
     pub resolvers: FxHashMap<NodeId, Tok>,
     /// The reject functions (`builtins::rejecter`) by the node they feed.
     pub rejecters: FxHashMap<NodeId, Tok>,
@@ -2520,6 +2567,18 @@ pub struct Model {
     /// The region of calls unknown code makes to escaped functions: what they
     /// throw goes to unknown code (sunk; no catch reads it).
     pub esc_raise: NodeId,
+    /// R-HOSTREPORT: what the runtime reports as uncaught (perry-runtime
+    /// timer.rs `with_timer_uncaught_trap`, exception.rs `print_uncaught`,
+    /// promise/rejection.rs `report_unhandled`). Its readers are the
+    /// runtime's; it reaches `esc_raise` only when the program may register
+    /// a process listener, which is handed the value.
+    pub host_report: NodeId,
+    /// W-HOST: what the realm's `process.emit` hands process listeners
+    /// beside reports (the `worker` event's Worker, worker_surface.rs
+    /// `emit_process_worker_event`). No reader of its own: it reaches
+    /// `esc_raise` where the program may register a process listener (the
+    /// R-HOSTREPORT call set) and once unknown code holds the realm.
+    pub process_event: NodeId,
     /// The accessor functions of escaped values (unknown code reads them
     /// with `Object.getOwnPropertyDescriptor`): sunk, no one reads it.
     pub esc_accessors: NodeId,
@@ -2554,6 +2613,9 @@ pub struct Model {
     /// intrinsic object and every intrinsic function, whether or not the
     /// program hands it one (`Model::hold_realm`).
     pub realm_held: bool,
+    /// `PERRY_FACTS_LEDGER` only (`hold_ledger`): the realm is never held
+    /// and each hold's effects carry their root. `None` otherwise.
+    pub(crate) ledger: Option<Box<crate::hold_ledger::HoldLedger>>,
     /// `PERRY_WPF_KEYREAD=1` only (`diagnostics::keysnap_plan`): the nodes
     /// snapshotted when the realm is first held; `None` otherwise.
     pub keysnap: Option<Box<crate::diagnostics::KeySnap>>,
@@ -2576,6 +2638,10 @@ pub struct Model {
     /// for the original member's effect; this call binds every callee but
     /// that original (`call_tok`).
     pub ns_pair_calls: crate::pts::FxHashMap<CallId, (BuiltinNs, Atom)>,
+    /// A named member call `o.k(…)` at a read site (`Gen` call arm) and
+    /// its key and receiver node: the site's own dispatch obligation
+    /// states the route of the native member it binds (`call_tok`).
+    pub named_calls: crate::pts::FxHashMap<CallId, (Atom, NodeId)>,
     /// The namespace pairs are the knob's (`FactsConfig::namespace_pairs`):
     /// every direct namespace call is one, walked as one call
     /// (`Gen::namespace_pair`). Off, a pair is main's shadow-bit guard of a
@@ -2728,9 +2794,20 @@ pub struct Model {
     pub val_runs: Vec<(CallId, Tok, Option<Tok>, u16, u32)>,
     /// (call, body token) run once with every key.
     pub for_in_any: crate::pts::FxHashSet<(CallId, Tok)>,
+    /// The atom count when the fixpoint started (`solve_fixpoint`): the
+    /// atoms below it are the names the program and the realm spell
+    /// (finitely many); an atom at or past it is a text a solver rule made
+    /// (a concatenation, a case mapping, a for-in key folded into one).
+    /// `None` before the first solve: every atom is a spelled name.
+    pub spelled_atoms: Option<usize>,
     /// FORIN1: (call, body token, the literal) of a shared run over named
     /// keys (`for_in_named_run`), checked again in `settle_for_in`.
     pub for_in_named: Vec<(CallId, Tok, Tok)>,
+    /// Rule EK: (literal, key node) of each `Cons::OwnKeys` that gave the
+    /// literal's known keys (`own_keys_of`), checked again in
+    /// `settle_for_in`; the set dedups.
+    pub own_keys_on: Vec<(Tok, NodeId)>,
+    pub own_keys_seen: crate::pts::FxHashSet<(Tok, NodeId)>,
     /// FORIN1: (key node, stored value, constant) of a for-in keyed store
     /// made per String constant of its key (`Cons::StoreKeyed`).
     pub keyed_named: crate::pts::FxHashSet<(NodeId, NodeId, Atom)>,
@@ -2840,16 +2917,17 @@ pub struct Model {
     /// shape (the global object's token, the key, the destination): a
     /// global named later that the shape can spell is read into each.
     pub global_shaped_reads: Vec<(Tok, Key, NodeId)>,
-    /// GLOBK G2: the global object's one field under any string key: what
-    /// the program stores there under a key proven a String it cannot name
-    /// (ECMA-262 7.1.19, 10.1.9). Made by the first such store; every
-    /// global binding read takes it (`global_any_reads` until then).
-    pub global_any: Option<NodeId>,
-    /// G2: the global binding reads made before `global_any` exists.
-    pub global_any_reads: Vec<NodeId>,
-    /// G2: the `new K(...)` calls of a literal global name made before
-    /// `global_any` exists.
-    pub global_any_news: Vec<u32>,
+    /// GLOBK G2: the global object's fields under String keys the solver
+    /// cannot name: what the program stores there under a key proven a
+    /// String (ECMA-262 7.1.19, 10.1.9), one field per key shape (0: any
+    /// String). GLOBS4: a global binding read takes the fields whose shape
+    /// can spell its name (`global_any_reads`).
+    pub global_any_fields: Vec<(KeyShapeId, NodeId)>,
+    /// G2: every global binding read, with what it names (a field made
+    /// later links to the reads its shape can spell).
+    pub global_any_reads: Vec<(crate::builtins::GlobalAnyRead, NodeId)>,
+    /// G2: every `new K(...)` of a literal global name `K`.
+    pub global_any_news: Vec<(String, u32)>,
     /// G2: the realm navigator's [[Prototype]] was linked to what the
     /// any-key stores' `prototype` holds (perry-runtime navigator.rs:119
     /// reads the live `Navigator` at the first `navigator` read).
@@ -2867,13 +2945,22 @@ pub struct Model {
     pub global_def: Option<NodeId>,
     /// GLOBK3: the navigator reads made before `global_def` exists.
     pub global_def_navs: Vec<NodeId>,
-    /// GLOBK3: the computed-key defines taken onto the global object (by
-    /// key node), replayed onto the old path when G2 turns off.
+    /// GLOBK3: the computed-key defines taken onto the global object,
+    /// replayed onto the old path when G2 turns off.
     pub global_defs: Vec<(DefineAny, Tok)>,
-    pub global_def_done: crate::pts::FxHashSet<NodeId>,
+    /// GLOBK3: the defines already taken onto the global object, by
+    /// `DefineAny::id`.
+    pub global_def_done: crate::pts::FxHashSet<(NodeId, NodeId)>,
+    /// E5 exact key set: per computed-key define on the global object
+    /// (`DefineAny::id`), the node its `get` call returns into
+    /// (`Model::define_global_keys`).
+    pub global_key_def_ret: crate::pts::FxHashMap<(NodeId, NodeId), NodeId>,
+    /// E5 exact key set: the (define, key) pairs already written.
+    pub global_key_def_done: crate::pts::FxHashSet<((NodeId, NodeId), Atom)>,
     /// GLOBK3: the holder node of a computed-key define's old path (E5
-    /// HARD), by key node.
-    pub define_any_old: crate::pts::FxHashMap<NodeId, NodeId>,
+    /// HARD), by `DefineAny::id`: two defines under one key node (one local
+    /// key) each install their own descriptor.
+    pub define_any_old: crate::pts::FxHashMap<(NodeId, NodeId), NodeId>,
     /// ToPropertyKey (7.1.19): the result node of ToPrimitive on a token
     /// (`implicit`); a computed key's object value stores under what its
     /// ToPrimitive returns (`Cons::StoreIndexed` on that node).
@@ -2884,6 +2971,10 @@ pub struct Model {
     /// dynamic code may hand it out (`Function('return this')()`). Until
     /// then a store into ⊤ cannot write a global.
     pub global_in_top: bool,
+    /// A module outside the program that is no builtin runs at load
+    /// (`Gen`'s import walk): code the closed world does not cover, which may
+    /// call the Function constructor it is handed (`escape_body`).
+    pub unseen_module_runs: bool,
     /// Per module: a Worker of the program may run it (`Gen::worker_side`):
     /// it is reachable from a Worker entry module, or some Worker's entry
     /// is not named. A module past the end counts as one (unknown).

@@ -748,7 +748,7 @@ fn the_front_reads_its_directory_without_a_call_where_the_target_allows() {
     for (target, inline_form) in [
         (
             "x86_64-unknown-linux-gnu",
-            Some("getelementptr i8, ptr @PERRY_AGENT_PTRS, i64 0"),
+            Some("call ptr @llvm.threadlocal.address.p0(ptr @PERRY_AGENT_PTRS)"),
         ),
         (
             "x86_64-pc-windows-msvc",
@@ -943,3 +943,28 @@ fn guarded_length_reads_admit_byte_views_and_use_a_pooled_cold_key() {
 
 #[path = "refusal_join_tests.rs"]
 mod refusal_join;
+
+#[test]
+fn guarded_private_accessor_reads_bypass_public_property_lookup() {
+    let mut module = Module::new("private_accessor.ts");
+    module.init_kind = ModuleInitKind::Eager;
+    module.init.push(Stmt::Expr(Expr::PropertyGet {
+        object: Box::new(Expr::PrivateGuard {
+            class_name: "C".into(),
+            class_id: 1,
+            field_name: "#a".into(),
+            kind: 2,
+            op: 0,
+            receiver_is_brand_owner: false,
+            object: Box::new(Expr::Undefined),
+        }),
+        property: "#<perry:private-member:1:#a>".into(),
+        byte_offset: 0,
+        byte_end: 0,
+    }));
+    let ir = String::from_utf8(compile_module(&module, ir_opts(false, None)).unwrap()).unwrap();
+    assert!(ir.contains("call double @js_private_guard("));
+    assert!(ir.contains("call double @js_object_get_field_by_name_f64("));
+    assert!(!ir.contains("call double @perry_probe_get_binding("));
+    assert!(!ir.contains("call double @js_object_get_field_value("));
+}

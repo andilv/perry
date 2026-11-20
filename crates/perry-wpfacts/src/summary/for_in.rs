@@ -142,6 +142,19 @@ impl Model {
     /// (`Node::enum_key`); keys written later get their run once the
     /// worklist is empty (`settle_for_in`).
     fn for_in_keys(&self, f: FnIdx, t: Tok) -> Option<Vec<Atom>> {
+        let keys = self.enum_keys(t)?;
+        if self.for_in_defines.contains(&f)
+            && keys.iter().any(|a| !self.for_in_define_keys.contains(a))
+        {
+            return None;
+        }
+        Some(keys)
+    }
+
+    /// The enumerable String keys of literal `t` and of its chain, as far
+    /// as the solve knows them now (`for_in_keys` without its body's
+    /// defines): `None` when they are not known.
+    pub(crate) fn enum_keys(&self, t: Tok) -> Option<Vec<Atom>> {
         let TokKind::Obj(tm, _) = self.toks[t as usize] else {
             return None;
         };
@@ -213,6 +226,14 @@ impl Model {
             if name == "__proto__" || star(a) {
                 return None;
             }
+            // A key whose text a solver rule made (`spelled_atoms`): the
+            // run of such a key may write a key made from it in turn
+            // (`o[k + "x"] = v` in the body: "a", "ax", "axx", ...), so per-
+            // key runs need not end. The keys a program can spell are
+            // finitely many; past them the body runs once with every key.
+            if self.spelled_atoms.is_some_and(|n| a as usize >= n) {
+                return None;
+            }
             // A symbol is no for-in key.
             if !name.starts_with(crate::builtins::WK_PREFIX)
                 && self.enum_string_key(a)
@@ -228,12 +249,39 @@ impl Model {
         {
             return None;
         }
-        if self.for_in_defines.contains(&f)
-            && keys.iter().any(|a| !self.for_in_define_keys.contains(a))
-        {
-            return None;
-        }
         Some(keys)
+    }
+
+    /// Rule EK (`Cons::OwnKeys`): dst ⊇ the own enumerable String keys of
+    /// `t` (ECMA-262 7.3.23 EnumerableOwnProperties, 10.1.11.1
+    /// OrdinaryOwnPropertyKeys). A literal whose keys are known
+    /// (`enum_keys`: not escaped, not HARD, no computed member, never
+    /// written under a key no name lists) gives those keys, a superset of
+    /// its own ones; it is looked at again in `settle_for_in`. Any other
+    /// value (⊤ among them) gives any String.
+    pub(crate) fn own_keys_of(&mut self, t: Tok, dst: NodeId) -> bool {
+        let keys = if t == TOP || !self.own_props_modelled(t) {
+            None
+        } else {
+            self.enum_keys(t)
+        };
+        let before = (self.nodes[dst as usize].prim, self.nodes[dst as usize].strs);
+        match keys {
+            None => self.add_prim(dst, prim::STR),
+            Some(mut v) => {
+                if self.own_keys_seen.insert((t, dst)) {
+                    self.own_keys_on.push((t, dst));
+                }
+                if !v.is_empty() {
+                    v.sort_unstable();
+                    v.dedup();
+                    let set = self.str_set(&v);
+                    let set = self.run_born(set);
+                    self.add_s(dst, &[], prim::STR, set);
+                }
+            }
+        }
+        before != (self.nodes[dst as usize].prim, self.nodes[dst as usize].strs)
     }
 
     /// May `Object.prototype`, the chain of every literal, hold a key the
@@ -284,6 +332,10 @@ impl Model {
                 }
                 Some(keys) => more |= self.for_in_named_run(call, ft, &keys),
             }
+        }
+        // Rule EK: the keys `Cons::OwnKeys` gave, the same way.
+        for (t, dst) in self.own_keys_on.clone() {
+            more |= self.own_keys_of(t, dst);
         }
         more
     }

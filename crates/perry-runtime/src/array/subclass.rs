@@ -44,7 +44,7 @@ pub(crate) use loop_guard::{js_packed_arraylike_loop_guard, js_packed_ecs_u32_lo
 //     bit 2       compact nonnegative-int entity proof (mode 2)
 //     bit 3       sealed intrinsic prototype (#11915; family in bits 8..13,
 //                 image key count + 1 in bits 16..31: DEC 250)
-//     bit 4       free
+//     bit 4       plain-object index store (never on an Array subclass)
 //     bit 5       object is a prototype
 //     bit 6       exotic read receiver
 //     bits 8..31  verified prefix bound (24 bits, max 16,000,000)
@@ -436,9 +436,10 @@ pub(crate) unsafe fn drop_packed_subclass_numeric_proof_record(
     // `obj` is a live GC object by contract: its header needs no admission.
     let header = &*crate::gc::header_from_trusted_user_ptr(obj as *const u8);
     if crate::gc_type_is_not_object!(header.obj_type)
-        || crate::object::shapes::shape_object_kind_of_receiver(
+        || !crate::object::shapes::shape_kind_of_receiver_is(
             (crate::object::shapes::object_shape_stamp(obj)).0,
-        ) != Some(crate::object::shapes::ShapeObjectKind::OrdinaryNumericProof)
+            crate::object::shapes::ShapeObjectKind::OrdinaryNumericProof,
+        )
     {
         return None;
     }

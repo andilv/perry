@@ -480,6 +480,7 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     module.declare_function("js_function_bind", DOUBLE, &[DOUBLE, PTR, I64]);
     module.declare_function("perry_probe_get_value", DOUBLE, &[PTR, I64, I64, I64]);
     module.declare_function("perry_probe_get_length", DOUBLE, &[PTR, I64, I64, I64]);
+    module.declare_function("perry_typed_array_proto_get", DOUBLE, &[PTR, I64, I64, I64]);
     module.declare_function("perry_probe_get_binding", DOUBLE, &[PTR, I64, I64, I64]);
     module.declare_function("perry_probe_get_keyed", DOUBLE, &[PTR, I64, I64]);
     // Object rest destructuring: copy all properties from src except excluded keys.
@@ -670,10 +671,18 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // executables (where `use_local_exec_tls` turns this model into
     // local-exec); its slot-1 accessor, and the method-call site's miss entry
     // (`expr/method_site.rs`).
+    // Android's program is a dlopened shared object: bionic refuses
+    // initial-exec there, so the block is named in the general-dynamic model
+    // (`agent_ptr::agent_ptr_access`).
+    let agent_ptrs_model = if module.target_triple.contains("android") {
+        ""
+    } else {
+        "initialexec"
+    };
     module.add_external_tls_global(
         crate::expr::agent_ptr::AGENT_PTRS_SYMBOL,
         &format!("[{} x ptr]", crate::expr::agent_ptr::AGENT_PTR_SLOTS),
-        "initialexec",
+        agent_ptrs_model,
     );
     // Windows x86-64 reaches the same block through the TEB (`agent_ptr.rs`,
     // `WindowsTeb`): the image TLS index and the block offset in that image's

@@ -361,6 +361,11 @@ impl<'a> Gen<'a> {
         let r = self.m.raise_of(init_fn);
         if self.dynamic_only.contains(&mi) {
             self.m.edge(r, self.thrown);
+        } else {
+            // R-HOSTREPORT: the runtime reports it (exception.rs
+            // `exit_on_uncaught`).
+            let h = self.m.host_report;
+            self.m.edge(r, h);
         }
         // A target this module requires lazily (a deferred CommonJS require)
         // runs its body when the require runs, through the path registry.
@@ -1191,7 +1196,9 @@ impl<'a> Gen<'a> {
             self.m.cur_fn = prev;
         }
         if f.is_async && !f.is_generator {
-            fx = self.async_body(&fx).0;
+            let (afx, rejected) = self.async_body(&fx);
+            fx = afx;
+            self.m.gen_region = Some(rejected);
         }
         self.params(&fx, &f.params);
         if f.is_generator {
@@ -1639,6 +1646,14 @@ impl<'a> Gen<'a> {
                 calls,
             });
         }
+        // Rule RP1: the positional steps of each array pattern record.
+        for (i, s) in ss.iter().enumerate() {
+            if let Some(c) = super::record_steps::cursor_let(s) {
+                let mut steps = Vec::new();
+                super::record_steps::positional_steps(c, &ss[i + 1..], &mut steps);
+                self.record_steps.extend(steps);
+            }
+        }
         let mut pushed = 0;
         let mut i = 0;
         // A local derived below a guarded counter in this block
@@ -1845,7 +1860,25 @@ impl<'a> Gen<'a> {
                 // it jumps to (`narrow_leave`).
                 let pre = self.narrow_snapshot();
                 let k = self.narrow_guard(fx, condition, true);
+                // `if (__step_is_error)`: a plain-async step's error arm.
+                let arm = match condition {
+                    Expr::LocalGet(id) => self.step.by_flag.get(&(fx.module, *id)).copied(),
+                    _ => None,
+                };
+                if let Some(v) = arm {
+                    self.step.arms.push((fx.module, v));
+                }
+                // `if (IterResultGetDone)`: the plain-async step's resolve
+                // arm, entered only after a `return` wrote the slot.
+                let done_arm = matches!(condition, Expr::IterResultGetDone)
+                    .then(|| self.iter_done_arm.replace(fx.f));
                 self.stmts(&then_fx, then_branch);
+                if let Some(p) = done_arm {
+                    self.iter_done_arm = p;
+                }
+                if arm.is_some() {
+                    self.step.arms.pop();
+                }
                 self.narrow_pop(k);
                 self.narrow_leave(then_branch, pre);
                 self.own_guard_done(own);

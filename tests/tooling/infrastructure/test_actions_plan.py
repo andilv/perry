@@ -14,7 +14,7 @@ from actions_plan import load_catalog, path_matches, select
 
 
 CATALOG = load_catalog()
-WASI_JOBS = ("wasi-native", "wasi-execution", "wasi-components")
+WASI_JOBS = ("wasi-native", "wasi-component-units", "wasi-execution", "wasi-execution-p1", "wasi-components")
 
 
 def selected(category: str, event_name: str, event: dict, ref: str = "refs/heads/main",
@@ -40,13 +40,13 @@ class PathPatternTests(unittest.TestCase):
 
 
 class CategoryRoutingTests(unittest.TestCase):
-    def test_workflow_contract_has_38_owned_modules_and_six_parents(self):
+    def test_workflow_contract_has_39_owned_modules_and_six_parents(self):
         categories = CATALOG["categories"]
         self.assertEqual(len(categories), 10)
         self.assertEqual(len({category['entrypoint'] for category in categories.values()}), 6)
         files = [module["file"] for c in categories.values() for module in c["modules"]]
-        self.assertEqual(len(files), 38)
-        self.assertEqual(len(set(files)), 38)
+        self.assertEqual(len(files), 39)
+        self.assertEqual(len(set(files)), 39)
 
     def test_native_host_qualification_is_an_isolated_manual_suite(self):
         result = select("ci", "workflow_dispatch", {}, suite="wasi-hosts", catalog=CATALOG)
@@ -182,6 +182,14 @@ class CategoryRoutingTests(unittest.TestCase):
         }.items():
             self.assertEqual(jobs[module]["name"], display_name)
 
+    def test_test262_runs_whenever_its_build_exists(self):
+        from pathlib import Path
+        import yaml
+        workflow = yaml.load(Path(".github/workflows/test.yml").read_text(), Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["jobs"]["test262"]["if"],
+                         "${{ !cancelled() && needs.plan.result == 'success' && needs.gap-suite-build.result == 'success'"
+                         " && fromJSON(needs.plan.outputs.plan).jobs.test262 }}")
+
     def test_required_wasi_job_executes_all_command_suites(self):
         from pathlib import Path
         import yaml
@@ -203,7 +211,15 @@ class CategoryRoutingTests(unittest.TestCase):
             self.assertIn("--suite " + suite, commands("wasi-execution"))
         self.assertIn("wasi_build_runtime.py", commands("wasi-execution"))
         self.assertIn("--features target-wasi", commands("wasi-execution"))
+        for suite in ["smoke", "acceptance", "gap"]:
+            self.assertIn("--flavour p1 --suite " + suite, commands("wasi-execution-p1"))
+        self.assertNotIn("--flavour p1", commands("wasi-execution"))
         self.assertIn("component_check.sh", commands("wasi-components"))
+        self.assertIn("component_unit_tests.sh", commands("wasi-component-units"))
+        self.assertNotIn("component_unit_tests.sh", commands("wasi-native"))
+        self.assertTrue(any(step.get("env", {}).get("COMPONENT_CHECK_UNIT_TESTS") == "0"
+                            for step in jobs["wasi-components"]["steps"]
+                            if "component_check.sh" in step.get("run", "")))
         keys = {name: next(step["with"]["shared-key"] for step in jobs[name]["steps"]
                            if "rust-cache" in step.get("uses", "")) for name in WASI_JOBS}
         self.assertEqual(len(set(keys.values())), len(WASI_JOBS), keys)

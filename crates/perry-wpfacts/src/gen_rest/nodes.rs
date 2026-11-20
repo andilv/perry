@@ -32,6 +32,7 @@ impl<'a> Gen<'a> {
             }
         }
         let owner = self.begin_indexed_owner(mi, t, e);
+        self.note_ta_birth_len(mi, t, e, args.first().copied());
         if let Some(&v) = args.first() {
             let vals = crate::builtins::typed_array_methods::source(&mut self.m, call, v);
             crate::builtins::string_methods::to_prim(
@@ -51,6 +52,43 @@ impl<'a> Gen<'a> {
         n
     }
 
+    /// Rule TA-LEN (`Model::ta_fixed_len`): the length `new TA(k)` (an
+    /// immutable integer definition, `owner_extent`) or `new TA([e1, .., en])`
+    /// (an Array literal of `n` elements, iterated) is born with. Both
+    /// allocate a fresh buffer that is not resizable, and the view does not
+    /// track its length (ECMA-262 23.2.5.1.1, 23.2.5.1.4).
+    fn note_ta_birth_len(&mut self, mi: u32, t: Tok, e: &Expr, src: Option<NodeId>) {
+        if !self.arr_lengths {
+            return;
+        }
+        let arg = match e {
+            Expr::TypedArrayNew { arg: Some(a), .. } | Expr::Uint8ArrayNew(Some(a)) => a,
+            _ => return,
+        };
+        let TokKind::Obj(tm, _) = self.m.toks[t as usize] else {
+            return;
+        };
+        let (len, src) = match arg.as_ref() {
+            Expr::Array(elems, _) => match src {
+                Some(v) => (elems.len() as i64, Some(v)),
+                None => return,
+            },
+            a => match self.owner_extent(mi, a) {
+                Some(k) => (i64::from(k), None),
+                None => return,
+            },
+        };
+        let b = self
+            .m
+            .ta_birth_len
+            .entry(tm)
+            .or_insert_with(|| (len, Vec::new()));
+        if b.0 != len {
+            b.0 = -1;
+        }
+        b.1.extend(src);
+    }
+
     /// The first HIR child is the receiver; the remaining children are
     /// arguments. Solve normal property lookup, including replacements
     /// and unknown receiver families, before choosing a builtin rule.
@@ -67,6 +105,7 @@ impl<'a> Gen<'a> {
     pub(super) fn folded_call(
         &mut self,
         fx: &Fx,
+        e: &Expr,
         call: &perry_hir::folded_call::FoldedCall<'_>,
     ) -> NodeId {
         let recv = match call.receiver {
@@ -78,7 +117,7 @@ impl<'a> Gen<'a> {
             self.list_push(recv, Some(args.len() as u32));
         }
         let a = self.m.atom(call.method);
-        self.folded_site(fx, &call.receiver, a, recv);
+        self.folded_site(fx, &crate::gen::variant_name(e), &call.receiver, a, recv);
         self.mcall(recv, Key::Named(a), args, vec![])
     }
 
@@ -87,10 +126,23 @@ impl<'a> Gen<'a> {
     pub(crate) fn folded_site(
         &mut self,
         fx: &Fx,
+        op: &str,
         receiver: &perry_hir::folded_call::Receiver<'_>,
         key: Atom,
         recv: NodeId,
     ) {
+        self.member_ops.push(crate::member_ops::MemberOp {
+            module: fx.module,
+            op: op.to_owned(),
+            key,
+            recv: Some(recv),
+            namespace: None,
+            folded: true,
+            native_push: (op == "NativeMethodCall" && self.m.atoms[key as usize] == "push")
+                .then(|| perry_hir::folded_call::receiver_site(receiver))
+                .flatten(),
+            form: crate::member_ops::MemberForm::Member,
+        });
         if let Some(site) = perry_hir::folded_call::receiver_site(receiver) {
             self.folded_sites.push(crate::gen::FoldedSite {
                 module: fx.module,
@@ -171,6 +223,20 @@ impl<'a> Gen<'a> {
     /// length in order (ArrayCreate + CreateDataProperty): it has no hole.
     pub(crate) fn new_dense_arr_from(&mut self, mi: u32, what: &str, elems: &[NodeId]) -> NodeId {
         self.new_arr_of(mi, what, elems, true).1
+    }
+
+    /// `new_arr_from` of an ordinary Array with `%Array.prototype%`
+    /// (CreateArrayFromList), never an iterator model: rule RP2 may hold it
+    /// back from a guarded record's protocol arm (`Model::ordinary_arrays`).
+    pub(crate) fn new_ordinary_arr_from(
+        &mut self,
+        mi: u32,
+        what: &str,
+        elems: &[NodeId],
+    ) -> NodeId {
+        let (tm, n) = self.new_arr_of(mi, what, elems, false);
+        self.m.ordinary_arrays.insert(tm);
+        n
     }
 
     /// `new_dense_arr_from`, with the birth's template.

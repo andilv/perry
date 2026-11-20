@@ -33,12 +33,17 @@ pub fn map_cons(
         Load { key, dst } => Load { key, dst: n(dst) },
         ProtoKey { key, dst } => ProtoKey { key, dst: n(dst) },
         OwnValues { dst } => OwnValues { dst: n(dst) },
+        OwnKeys { dst } => OwnKeys { dst: n(dst) },
         OwnDescValues { dst } => OwnDescValues { dst: n(dst) },
         IndexHole => IndexHole,
         IndexHoleIn { key } => IndexHoleIn { key: n(key) },
         IndexKept => IndexKept,
         Identity { route } => Identity { route },
         HasProp { key, idx } => HasProp {
+            key,
+            idx: if idx == NO_NODE { NO_NODE } else { n(idx) },
+        },
+        OwnProp { key, idx } => OwnProp {
             key,
             idx: if idx == NO_NODE { NO_NODE } else { n(idx) },
         },
@@ -132,8 +137,10 @@ pub fn map_cons(
         Falsy { dst } => Falsy { dst: n(dst) },
         NotUndefined { dst } => NotUndefined { dst: n(dst) },
         NotNull { dst } => NotNull { dst: n(dst) },
+        RecordEntry { dst } => RecordEntry { dst: n(dst) },
         TypeIs { mask, dst } => TypeIs { mask, dst: n(dst) },
         ProtoObjects { dst } => ProtoObjects { dst: n(dst) },
+        NotRegExp { dst } => NotRegExp { dst: n(dst) },
         NotBuffer { shared, dst } => NotBuffer {
             shared,
             dst: n(dst),
@@ -620,6 +627,7 @@ pub(super) fn gen_kind(c: &Cons) -> bool {
             | Load { .. }
             | ProtoKey { .. }
             | OwnValues { .. }
+            | OwnKeys { .. }
             | OwnDescValues { .. }
             | CjsPublish { .. }
             | Spread { .. }
@@ -647,8 +655,10 @@ pub(super) fn gen_kind(c: &Cons) -> bool {
             | Fulfil { .. }
             | Falsy { .. }
             | NotBuffer { .. }
+            | NotRegExp { .. }
             | ProtoObjects { .. }
             | NotNull { .. }
+            | RecordEntry { .. }
             | TypeIs { .. }
             | Objects { .. }
             | NotUndefined { .. }
@@ -718,6 +728,7 @@ pub(super) fn read_dst(c: &Cons) -> Option<NodeId> {
         Load { dst, .. }
         | ProtoKey { dst, .. }
         | OwnValues { dst }
+        | OwnKeys { dst }
         | OwnDescValues { dst }
         | CjsPublish { dst }
         | IdxLoad { dst, .. }

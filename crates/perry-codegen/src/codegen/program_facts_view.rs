@@ -659,10 +659,16 @@ pub struct ElisionFacts {
     /// symbol, named from the holder's own module and class (the module that
     /// defines the class emits it; any other module declares it), not from
     /// this module's class table.
-    pub accessor_sets: std::collections::BTreeMap<(u32, String), (u32, String)>,
+    /// The flag is `nullable` (COVER3): the receiver can also be
+    /// `undefined` / `null` (never another primitive), so the site keeps its
+    /// one receiver test, whose nullish edge is the complete [[Set]] (it
+    /// throws the TypeError after the value was evaluated, 13.15.2).
+    pub accessor_sets: std::collections::BTreeMap<(u32, String), (u32, String, bool)>,
     /// The same for named reads (and a compound's GetValue) whose verdict is
     /// `Verdict::AccessorGet`: the class holding the one getter (10.1.8.1).
-    pub accessor_gets: std::collections::BTreeMap<(u32, String), (u32, String)>,
+    /// `nullable` as for `accessor_sets`; the nullish edge is the complete
+    /// [[Get]], whose ToObject throws the TypeError (6.2.5.5, 7.1.18).
+    pub accessor_gets: std::collections::BTreeMap<(u32, String), (u32, String, bool)>,
     /// ONCHANGE2: this module's named method calls whose verdict is
     /// `Verdict::T0Mono` / `T0Set` with one callee body and a holder class: every receiver is an object
     /// (never a primitive, never ⊤) and the key's value at every receiver is
@@ -671,11 +677,12 @@ pub struct ElisionFacts {
     /// ONCHANGE3: with the body's public entry symbol named from the
     /// holder's own module and class (as `accessor_sets`), and the body's
     /// direct-call ABI read from its own parameters (`DirectAbi`).
-    /// NULLCALL1: the last field says the receiver may also be `undefined` /
+    /// NULLCALL1: the first boolean says the receiver may also be `undefined` /
     /// `null` (never another primitive): the call tests it first, and the
-    /// nullish edge is the complete member read, which throws.
+    /// nullish edge is the complete member read, which throws. The final boolean
+    /// selects the defining module's certified public entry for an imported instance.
     pub method_calls:
-        std::collections::BTreeMap<(u32, String), (u32, u32, String, DirectAbi, bool)>,
+        std::collections::BTreeMap<(u32, String), (u32, u32, String, DirectAbi, bool, bool)>,
     /// ONCHG2: this module's named method calls `o.k(args)` whose callee set
     /// is proven to be these compiled closures / declarations of this module
     /// (wpfacts `SiteFacts::target_bodies` of `T0Mono` / `T0Set`), every

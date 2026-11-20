@@ -12,8 +12,7 @@ mod index;
 pub(crate) use index::key_identity;
 #[cfg(test)]
 pub(crate) use index::{
-    test_erase_key_identity, test_has_index, test_index_buckets, test_key_identity,
-    test_snapshot as test_index_snapshot,
+    test_has_index, test_index_buckets, test_key_identity, test_snapshot as test_index_snapshot,
 };
 
 #[cfg(test)]
@@ -3111,3 +3110,7 @@ pub(crate) fn test_enter_catch_foreach(mark: usize) {
 pub(crate) unsafe fn test_remove_compaction_history(set: *mut SetHeader) {
     release_set_compaction(set);
 }
+
+#[cfg(test)]
+#[path = "set_function_key_tests.rs"]
+mod set_function_key_tests;

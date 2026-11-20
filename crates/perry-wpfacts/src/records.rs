@@ -232,6 +232,7 @@ fn record_use(c: &Cons, m: &Model, keys: &[Atom]) -> Use {
     match c {
         // `k in o` (no flow; before PROXY2 it made no constraint at all).
         Cons::HasProp { .. } => Allowed,
+        Cons::OwnProp { .. } => Allowed,
         Cons::Identity { route } => match route {
             IdentityRoute::JsonReplacer => Reject(R5Protocol("JsonReplacer".into())),
             r => Reject(R4Identity(r.name().into())),
@@ -267,7 +268,9 @@ fn record_use(c: &Cons, m: &Model, keys: &[Atom]) -> Use {
         | Cons::Objects { .. }
         | Cons::NotNullish { .. }
         | Cons::NotBuffer { .. }
+        | Cons::NotRegExp { .. }
         | Cons::NotNull { .. }
+ | Cons::RecordEntry { .. }
         | Cons::TypeIs { .. }
         | Cons::NotUndefined { .. }
         | Cons::Guard { .. }
@@ -383,6 +386,7 @@ fn record_use(c: &Cons, m: &Model, keys: &[Atom]) -> Use {
         | Cons::EnumKeyStore { .. }
         | Cons::EnumKeyAny { .. }
         | Cons::OwnValues { .. }
+        | Cons::OwnKeys { .. }
         | Cons::OwnDescValues { .. } => Reject(R5Iterate(c.kind_name().into())),
         // Accessors.
         Cons::Accessor { .. }
@@ -412,7 +416,9 @@ fn array_use(c: &Cons, m: &Model) -> Use {
         | Cons::Objects { .. }
         | Cons::NotNullish { .. }
         | Cons::NotBuffer { .. }
+        | Cons::NotRegExp { .. }
         | Cons::NotNull { .. }
+        | Cons::RecordEntry { .. }
         | Cons::TypeIs { .. }
         | Cons::NotUndefined { .. }
         | Cons::Guard { .. }
@@ -1323,7 +1329,9 @@ impl<'a, 'g> Scan<'a, 'g> {
                                     | Cons::Objects { .. }
                                     | Cons::NotNullish { .. }
                                     | Cons::NotBuffer { .. }
+                                    | Cons::NotRegExp { .. }
                                     | Cons::NotNull { .. }
+                                    | Cons::RecordEntry { .. }
                                     | Cons::TypeIs { .. }
                                     | Cons::NotUndefined { .. }
                                     | Cons::Guard { .. }
@@ -1888,7 +1896,9 @@ impl<'a, 'g> Scan<'a, 'g> {
                 | Cons::Objects { .. }
                 | Cons::NotNullish { .. }
                 | Cons::NotBuffer { .. }
+                | Cons::NotRegExp { .. }
                 | Cons::NotNull { .. }
+                | Cons::RecordEntry { .. }
                 | Cons::TypeIs { .. }
                 | Cons::NotUndefined { .. }
                 | Cons::Guard { .. }

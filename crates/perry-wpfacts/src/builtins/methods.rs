@@ -46,6 +46,27 @@ pub fn prim_plain_key(m: &mut Model, prim: u16, call: CallId) {
 
 pub fn tok_store(m: &mut Model, t: Tok, _key: Key, src: NodeId) {
     crate::family_reach::tok(m, t, _key);
+    // R-GLOBAL-NAME: a named global the runtime never reads by name is the
+    // program's own property of the global object (its field, written by
+    // the store); no E20 sink.
+    if !m.unit_mode && super::global_object(m, t) && !super::global_store_escapes(m, t, _key) {
+        return;
+    }
+    // The global object's self-reference (`globalThis.globalThis = v`):
+    // bare reads of the name are the global object, so a stored global
+    // object (the receiver itself) hands unknown code nothing new and the
+    // realm stays the program's; any other stored value escapes as before.
+    if !m.unit_mode && super::global_object(m, t) && super::global_self_key(m, t, _key) {
+        let r = m.reason("E20 stored on the global object's self-reference");
+        m.cons(
+            src,
+            Cons::RuntimeStore {
+                reason: r,
+                retained: t,
+            },
+        );
+        return;
+    }
     match m.toks[t as usize] {
         // Object.prototype members are reachable from every object the
         // runtime handles: unknown code may call them with any receiver.
@@ -140,8 +161,17 @@ pub(crate) fn native_method_at(m: &mut Model, r: NativeRecv, key: Key, call: Cal
     }
 }
 
+/// A built-in method called under a computed key: a route into the
+/// runtime's generic method dispatcher no named site states.
+fn computed_method(m: &mut Model, key: Key) {
+    if matches!(key, Key::Any(_)) {
+        crate::family_reach::dispatch_route(m, |_| "a built-in method under a computed key".into());
+    }
+}
+
 pub fn prim_method(m: &mut Model, prim: u16, key: Key, call: CallId) {
     crate::family_reach::primitive(m, prim, key);
+    computed_method(m, key);
     if native_waits(m, NativeRecv::Prim(prim), key, call) {
         return;
     }
@@ -447,6 +477,7 @@ pub(super) fn wrapper_method(m: &mut Model, t: Tok, what: &str, name: &str, call
 /// Methods on builtin tokens (the receiver's own builtin behaviour).
 pub fn own_method(m: &mut Model, t: Tok, key: Key, call: CallId) {
     crate::family_reach::tok(m, t, key);
+    computed_method(m, key);
     if native_waits(m, NativeRecv::Own(t), key, call) {
         return;
     }
@@ -598,6 +629,7 @@ pub(super) fn own_method_inner(m: &mut Model, t: Tok, key: Key, call: CallId) {
 /// native parent prototypes), run with `this` = `origin`.
 pub fn proto_method(m: &mut Model, p: Tok, origin: Tok, key: Key, call: CallId) {
     crate::family_reach::chain(m, origin, p, key);
+    computed_method(m, key);
     if native_waits(m, NativeRecv::Proto(p, origin), key, call) {
         return;
     }
@@ -704,6 +736,32 @@ pub(super) fn object_proto_own_call(m: &mut Model, own: crate::model::ProtoOwn, 
                 },
             );
         }
+        // 20.1.3.2 / 20.1.3.4: this.[[GetOwnProperty]](key), with `this` the
+        // receiver a `.call` / method form gives the function.
+        let idx = c.args.first().copied().unwrap_or(NO_NODE);
+        match (m.cur_this, c.this.clone()) {
+            (Some(t), _) | (None, ThisArg::Tok(t)) => {
+                let recv = m.node_l("hasown-recv");
+                m.add_tok(recv, t);
+                m.cons(
+                    recv,
+                    Cons::OwnProp {
+                        key: Key::any(),
+                        idx,
+                    },
+                );
+            }
+            (None, ThisArg::Node(n)) => {
+                m.cons(
+                    n,
+                    Cons::OwnProp {
+                        key: Key::any(),
+                        idx,
+                    },
+                );
+            }
+            (None, ThisArg::Undef) => {}
+        }
     }
     ret_prim(m, call, prim::BOOL);
 }
@@ -732,6 +790,19 @@ pub(super) fn proto_method_inner(m: &mut Model, p: Tok, origin: Tok, key: Key, c
         TokKind::ObjectProto => match name.as_str() {
             "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf" => {
                 implicit_args(m, call, "ToPropertyKey", Protocol::ToPrimitive);
+                if name != "isPrototypeOf" {
+                    // 20.1.3.2 / 20.1.3.4: this.[[GetOwnProperty]](key).
+                    let recv = m.node_l("hasown-recv");
+                    m.add_tok(recv, origin);
+                    let idx = m.calls[call as usize].arg(0).copied().unwrap_or(NO_NODE);
+                    m.cons(
+                        recv,
+                        Cons::OwnProp {
+                            key: Key::any(),
+                            idx,
+                        },
+                    );
+                }
                 if name == "isPrototypeOf" && m.value_records {
                     // The receiver against each object on the argument's chain.
                     let recv = m.node_l("isprototypeof-recv");

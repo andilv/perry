@@ -497,15 +497,30 @@ pub(crate) fn facts_read(
     if property.starts_with('#') {
         return Err("private key requires private-element semantics");
     }
-    if recv.class_ids.is_empty() || recv.class_ids.len() > 4 {
+    if recv.class_ids.is_empty() {
         return Err("receiver class set is empty or exceeds four classes");
     }
-    let mut bare = !recv.checked && !facts.interp_guard;
+    // Past four classes the site would emit code per class (the class-id
+    // compares of a guarded receiver, the select of disagreeing slots).
+    // An unguarded receiver whose classes all hold the key at one slot
+    // emits none of it, whatever the class count: the read is the one
+    // fixed-offset load (PVN-08: a base-class method of eight subclasses).
+    let unguarded = !recv.checked && !facts.interp_guard;
+    let mut one_slot: Option<Option<u32>> = None;
+    let mut bare = unguarded;
     for &cid in &recv.class_ids {
         let f = facts
             .field(cid, property)
             .ok_or("key is not a definite data birth field of every receiver class")?;
         bare &= !f.declared && !f.reserved;
+        match one_slot {
+            None => one_slot = Some(Some(f.slot)),
+            Some(Some(s)) if s != f.slot => one_slot = Some(None),
+            _ => {}
+        }
+    }
+    if recv.class_ids.len() > 4 && !(unguarded && matches!(one_slot, Some(Some(_)))) {
+        return Err("receiver class set is empty or exceeds four classes");
     }
     Ok(bare)
 }
@@ -957,11 +972,30 @@ fn record(ctx: &FnCtx<'_>, site: u64, what: &str, property: &str, p: &FieldProof
     }
 }
 
-fn pack_cids(ids: &[u32]) -> (String, String) {
-    let at = |i: usize| ids.get(i).copied().unwrap_or(u32::MAX) as u64;
-    let a = (at(0) | (at(1) << 32)) as i64;
-    let b = (at(2) | (at(3) << 32)) as i64;
-    (a.to_string(), b.to_string())
+/// The witness's receiver set: every proven class id of the site, as one
+/// private `[N x i32]` constant next to it (check builds only; the witness
+/// admits a receiver by membership in the whole set, however many classes
+/// the proof admits). Returns the address and count operands.
+fn class_ids_operand(ctx: &mut FnCtx<'_>, ids: &[u32]) -> (String, String) {
+    if ids.is_empty() {
+        return ("0".to_string(), "0".to_string());
+    }
+    let ordinal = ctx.ic_site_counter;
+    ctx.ic_site_counter += 1;
+    let global = format!(
+        "perry_wpfacts_cids_{}__{ordinal}",
+        ctx.strings.module_prefix()
+    );
+    let words: Vec<_> = ids.iter().map(|&c| format!("i32 {}", c as i32)).collect();
+    ctx.typed_parse_rodata.push(format!(
+        "@{global} = private constant [{} x i32] [{}], align 4",
+        ids.len(),
+        words.join(", ")
+    ));
+    (
+        format!("ptrtoint (ptr @{global} to i64)"),
+        ids.len().to_string(),
+    )
 }
 
 /// The contract witness of one elided access (contract builds only).
@@ -994,7 +1028,7 @@ pub(crate) fn emit_witness(
             crate::verify_facts::raw_site(ctx, "field", Some(property), &p.class_ids, &what);
         let (key, key_len) =
             crate::verify_facts::raw_bytes(ctx.strings.module_prefix(), property.as_bytes());
-        let (c01, c23) = pack_cids(&p.class_ids);
+        let (cids, ncids) = class_ids_operand(ctx, &p.class_ids);
         let (triple, form) = (ctx.target_triple, p.form());
         let off_of = |s: u32| crate::target_layout::layout_key_off(triple, form, s).to_string();
         let (slot, off) = if p.agrees() {
@@ -1031,8 +1065,8 @@ pub(crate) fn emit_witness(
                 (DOUBLE, value),
                 (I64, &key),
                 (I64, &key_len),
-                (I64, &c01),
-                (I64, &c23),
+                (I64, &cids),
+                (I64, &ncids),
                 (I32, &slot),
                 (I32, &off),
                 (I32, &(p.kind_mask as i32).to_string()),
@@ -1047,7 +1081,7 @@ pub(crate) fn emit_witness(
         crate::verify_facts::site_arg(ctx, &what, crate::verify_facts::Fact::Slot, &p.class_ids);
     let key_idx = ctx.strings.intern(property);
     let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
-    let (c01, c23) = pack_cids(&p.class_ids);
+    let (cids, ncids) = class_ids_operand(ctx, &p.class_ids);
     // The slot names the key (F3); its byte offset is the address the
     // access used, which the witness reads.
     let (triple, form) = (ctx.target_triple, p.form());
@@ -1089,8 +1123,8 @@ pub(crate) fn emit_witness(
             (DOUBLE, recv_box),
             (DOUBLE, value),
             (I64, &key_handle),
-            (I64, &c01),
-            (I64, &c23),
+            (I64, &cids),
+            (I64, &ncids),
             (I32, &slot),
             (I32, &off),
             (I32, &(p.kind_mask as i32).to_string()),
@@ -1677,15 +1711,17 @@ mod tests;
 /// receiver's chain ends at one accessor property of the holder class's
 /// prototype with exactly one setter (`set`) or getter, so [[Set]] / [[Get]]
 /// call it with the receiver as `this` (10.1.9.2 step 3, 10.1.8.1). The call
-/// is direct: no guard, no fallback beside it. `None`: the site keeps its
-/// ordinary lowering.
+/// is direct, with no fallback beside it. The flag is `nullable` (COVER3):
+/// the receiver can also be `undefined` / `null`, and the caller keeps the
+/// one receiver test whose nullish edge is the complete operation (it
+/// throws). `None`: the site keeps its ordinary lowering.
 pub(crate) fn proven_accessor_fn(
     ctx: &mut FnCtx<'_>,
     object: &Expr,
     property: &str,
     offset: u32,
     set: bool,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     // A scalar-replaced receiver is no object (`scalar_receiver`): its
     // accesses are the frame slots' own, never a call with a `this`.
     if ctx.wpfacts_off
@@ -1701,7 +1737,7 @@ pub(crate) fn proven_accessor_fn(
     } else {
         &ctx.wpfacts.accessor_gets
     };
-    let (cid, symbol) = map.get(&(offset, property.to_string()))?.clone();
+    let (cid, symbol, nullable) = map.get(&(offset, property.to_string()))?.clone();
     let prefix = if set { "__set_" } else { "__get_" };
     let member = format!("{prefix}{property}");
     // The symbol is the holder module's own (`program_facts.rs`
@@ -1745,7 +1781,7 @@ pub(crate) fn proven_accessor_fn(
         };
         ctx.pending_declares.push((symbol.clone(), DOUBLE, params));
     }
-    Some(symbol)
+    Some((symbol, nullable))
 }
 
 /// ONCHANGE2: the method body a named call `object.property( ... )` at
@@ -1774,8 +1810,7 @@ pub(crate) fn proven_method_fn(
 ) -> Option<(Option<String>, String, crate::DirectAbi, bool)> {
     if ctx.wpfacts_off
         || ctx.wpfacts.interp_guard
-        || offset == 0
-        || property.starts_with('#')
+        || !perry_hir::method_call::named_site(property, offset)
         || ctx.is_static_class_this(object)
         // A scalar-replaced receiver is no object: the escape pass kept it in
         // frame slots only because `simple_scalar_method_summary` inlines this
@@ -1785,11 +1820,20 @@ pub(crate) fn proven_method_fn(
     {
         return None;
     }
-    let (cid, fid, symbol, abi, nullable) = ctx
+    let (cid, fid, symbol, abi, nullable, imported_instance) = ctx
         .wpfacts
         .method_calls
         .get(&(offset, property.to_string()))?
         .clone();
+    if imported_instance {
+        debug_assert!(!nullable && matches!(object, Expr::LocalGet(_)));
+        ctx.pending_declares.push((
+            symbol.clone(),
+            DOUBLE,
+            vec![DOUBLE; abi.params as usize + 1],
+        ));
+        return Some((None, symbol, abi, false));
+    }
     // NULLCALL1: a receiver a dominating access of the same binding has
     // tested already is an object here.
     let nullable = nullable && !tested_in_block(ctx, object);
@@ -1825,12 +1869,8 @@ pub(crate) fn proven_method_fn(
             stub_named = true;
             continue;
         }
-        if method.id != fid
-            || method.is_generator
-            || method.is_async
-            || crate::codegen::helpers::body_has_fixed_generator_state(&method.body)
+        if perry_hir::method_call::target_in_class(c, fid, property).is_none()
             || super::property_get::class_has_evaluated_accessor(ctx, &class)
-            || c.static_accessor_names.iter().any(|n| n == property)
         {
             return None;
         }
@@ -1856,15 +1896,21 @@ pub(crate) fn proven_method_fn(
 
 /// ACCBUILD2 P3: a named read the facts prove calls one getter: the getter's
 /// direct call with the receiver as `this`; its result is the read's value.
+/// COVER3: a receiver that can be `undefined` / `null` keeps the one
+/// receiver test; its nullish edge is the complete [[Get]], whose ToObject
+/// throws the TypeError (6.2.5.5, 7.1.18) before any getter runs.
 pub(crate) fn try_lower_proven_getter(
     ctx: &mut FnCtx<'_>,
     object: &Expr,
     property: &str,
     offset: u32,
 ) -> Result<Option<String>> {
-    let Some(fn_name) = proven_accessor_fn(ctx, object, property, offset, false) else {
+    let Some((fn_name, nullable)) = proven_accessor_fn(ctx, object, property, offset, false) else {
         return Ok(None);
     };
     let recv = lower_expr(ctx, object)?;
+    if nullable && !tested_in_block(ctx, object) {
+        emit_nullish_throw_test(ctx, object, &recv, property, offset, None);
+    }
     Ok(Some(ctx.block().call(DOUBLE, &fn_name, &[(DOUBLE, &recv)])))
 }

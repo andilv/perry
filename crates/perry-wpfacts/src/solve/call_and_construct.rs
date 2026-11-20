@@ -2,6 +2,23 @@
 use super::*;
 
 impl Model {
+    /// The native member `t` a named member-call site binds on its own
+    /// receiver under the key it names (`Model::named_calls`): the site
+    /// states that route itself. A borrowed, protocol or derived call has
+    /// another call id or key and is no such binding.
+    fn named_own_member(&self, call: CallId, t: Tok, this_tok: Option<Tok>) -> bool {
+        let (Some(&(key, recv)), Some(r)) = (self.named_calls.get(&call), this_tok) else {
+            return false;
+        };
+        let TokKind::BuiltinFn(Native::Member { identity, .. }) = self.toks[t as usize] else {
+            return false;
+        };
+        identity
+            .rsplit_once('.')
+            .is_some_and(|(_, k)| k == self.atoms[key as usize])
+            && self.nodes[recv as usize].pts.contains_tok(r)
+    }
+
     /// Bind `call` to callee token `t`. `this_tok` overrides the call's this.
     pub fn call_tok(&mut self, call: CallId, t: Tok, this_tok: Option<Tok>) {
         // MATHB1B: the generic-arm call of a namespace pair does not bind
@@ -17,6 +34,9 @@ impl Model {
             }
         }
         self.diagnostic_callee(call, t);
+        if !self.named_own_member(call, t, this_tok) {
+            crate::family_reach::callee(self, t);
+        }
         // A bare marker is another unit's value (DECISIONS 119): its call
         // is its contract's escape, and the call itself is one of an
         // unknown function (the reader cannot follow what it is given).
@@ -805,7 +825,7 @@ impl Model {
         // intrinsic (below), node constructs the stored value: the union
         // is true of both.
         if builtins::global_any_names(self, &name) {
-            builtins::global_any_new(self, call);
+            builtins::global_any_new(self, &name, call);
         }
         if builtins::program_global_fn(self, &name) {
             let g = self.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
@@ -1452,9 +1472,11 @@ impl Model {
         }
         // A missing intrinsic member calls exactly the ordinary read's
         // values, including program fields, getters and reopened chains.
-        // No callable value means a TypeError, with no argument escape.
+        // No callable value means a TypeError, with no argument escape. The
+        // global object under a key the program owns is such a member too
+        // (`global_user_method`).
         if let Key::Named(a) = key {
-            if builtins::undeclared(self, t, a) {
+            if builtins::undeclared(self, t, a) || builtins::global_user_method(self, t, a) {
                 let callee = self.node_l("builtin-member-read");
                 self.load_from(t, t, key, callee);
                 self.bind_via(callee, call, t);

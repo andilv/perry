@@ -207,6 +207,35 @@ pub fn global_value_written(m: &Model, np: Tok, a: Atom) -> bool {
     top || own
 }
 
+/// [`global_value_written`] past the writes that only delete (ECMA-262
+/// 13.5.1.2, OrdinaryDelete 10.1.10): a delete stores no value and runs no
+/// code (a Proxy's `deleteProperty` trap is the handler's call, modeled at
+/// the delete), so under any key, through ⊤ that may be the global object
+/// included, it can only make the binding absent. True: a writer that may
+/// have stored a value (a store, a define, an accessor, a prototype) may
+/// have written the key: the read takes ⊤ as before.
+pub fn global_value_stored(m: &Model, np: Tok, a: Atom) -> bool {
+    let (top, own) = written_by(m, np, a, true, &|w| {
+        w.opaque || !w.stored.is_empty() || w.accessor || !w.getters.is_empty() || !w.setters.is_empty()
+    });
+    top || own
+}
+
+/// A global binding read (`NativeMiss::Global` into `dst`) that only
+/// deletes may have reached ([`global_value_stored`] false): it reads
+/// {its prior values} ∪ {`undefined`}; the caller keeps the read parked,
+/// so a later writer of a value replays it. A non-configurable global
+/// (`undefined`, `NaN`, `Infinity`; ECMA-262 19.1) is never removed.
+pub fn global_maybe_deleted(m: &mut Model, np: Tok, a: Atom, dst: NodeId) {
+    if !global_value_written(m, np, a) {
+        return;
+    }
+    if matches!(m.atoms[a as usize].as_str(), "undefined" | "NaN" | "Infinity") {
+        return;
+    }
+    m.add_prim(dst, prim::UNDEF);
+}
+
 fn written_by(
     m: &Model,
     np: Tok,
@@ -295,15 +324,14 @@ fn written_by(
 }
 
 /// Unknown code holds the realm (ECMA-262 9.3, `Model::realm_held`): it may
-/// have replaced (or made an accessor of) any member the realm declares on a
-/// namespace, a host object or the global object, which no `LockHolder`
-/// covers (perry-abi lock.rs locks prototypes only), with any function or
-/// value it made. A call of such a member is the realm's function or unknown
-/// code (`opaque_written` -> `NativeMiss::Call` -> `unknown_method`), a read
-/// is the realm's value or the opaque member. Monotone: `note_realm_held`
-/// replays the lookups parked before it held. The Object.prototype method
-/// namespaces (`builtin_function`: members of a locked prototype) and the
-/// module's own `require` are not members of the realm.
+/// have replaced (or made an accessor of) a member of a built-in family's own
+/// prototype that the runtime's lock does not make final, with any function
+/// or value it made. A call of such a member is the realm's function or
+/// unknown code (`opaque_written` -> `NativeMiss::Call` -> `unknown_method`),
+/// a read is the realm's value or the opaque member. Monotone:
+/// `note_realm_held` replays the lookups parked before it held. A namespace
+/// member, the module's own `require` and the global object are not members
+/// it replaces (owner decisions 2026-11-18, closed world 11-14).
 fn realm_replaced(m: &Model, np: Tok, a: Atom) -> bool {
     if !m.realm_held {
         return false;
@@ -319,32 +347,25 @@ fn realm_replaced(m: &Model, np: Tok, a: Atom) -> bool {
     if let TokKind::NativeProto(what, _) = &m.toks[np as usize] {
         return !super::proto_read_final(m, what, a);
     }
-    let TokKind::Builtin(ns) = m.toks[np as usize] else {
-        return false;
-    };
-    if super::builtin_function(m, np) || ns == BuiltinNs::Require {
-        return false;
-    }
-    let name = m.atoms[a as usize].as_str();
-    if name == crate::STAR_KEY || matches!(members::ns_member(ns, name), Some(Some(_))) {
-        return true;
-    }
-    // The global object is an ordinary extensible object (ECMA-262 19.1,
-    // 9.1.1.4 its object record) that unknown code holding the realm holds:
-    // its [[Set]] (10.1.9.2) defines or replaces any key but the
-    // non-writable `undefined`, `NaN` and `Infinity` (19.1.1-19.1.4): a
-    // function the realm or the program declares, a key the program owns
-    // (`global_user_key`: `globalThis.gf = f`), and a key nobody declares
-    // (rule G reads it as absent, `undefined`, only while no unknown code
-    // holds the realm). A module's own bindings live in the module
-    // environment record, which no other code reaches.
-    super::global_object(m, np) && !matches!(name, "undefined" | "NaN" | "Infinity")
+    // A namespace member (`Math.max`, `console.error`, any key of one) and
+    // the global object (`globalThis` included): owner decisions 2026-11-18
+    // (closed world 11-14). The unknown code that holds the realm is the
+    // runtime's natives, which replace no member of an intrinsic namespace
+    // and write no key of the global object. Their writes are the program's
+    // own stores (`Math.foo = v`) and its stores into ⊤ once the object is in
+    // ⊤'s reach (`Model::global_in_top`, the caller); interpreted code and
+    // unseen modules keep their any-key writes there.
+    false
 }
 
 /// Unknown code now holds the realm: the lookups parked past a member it may
 /// have replaced (`realm_replaced`) take the opaque member.
 pub fn note_realm_held(m: &mut Model) {
     replay_native_missing(m);
+    // Unknown code may register a process listener: it is handed the
+    // process events (`Model::process_event`).
+    let (pe, e) = (m.process_event, m.esc_raise);
+    m.edge(pe, e);
 }
 
 /// Built-in object `np` was handed to unknown code (not reached along a
@@ -509,6 +530,9 @@ fn note_write(
             absent: false,
         });
     w.accessor |= accessor;
+    // A global read only deletes reached stays parked
+    // (`global_maybe_deleted`): this entry's first stored value replays it.
+    let first_value = matches!(value, WriteValue::Value(_)) && w.stored.is_empty() && w.absent;
     match value {
         WriteValue::Opaque => w.opaque = true,
         WriteValue::Value(n) => {
@@ -539,7 +563,7 @@ fn note_write(
     // `note_handed_to_unknown`), never on the other entries. Lookups parked
     // unwritten change only when the entry is new.
     feed_answered(m, (t, k), value);
-    if fresh {
+    if fresh || first_value {
         replay_pending(m);
     }
 }
@@ -764,8 +788,21 @@ pub fn note_global_in_top(m: &mut Model) {
     m.global_written_own |= !m.shared_replay;
     if !m.global_in_top {
         m.global_in_top = true;
+        let fields: Vec<NodeId> = m.global_fields.iter().map(|&(_, n)| n).collect();
+        for n in fields {
+            global_field_read_by_unknown(m, n);
+        }
         replay_native_missing(m);
     }
+}
+
+/// Unknown code that holds the global object (`global_in_top`) reads its
+/// properties: what the program stored in global `n` leaves. R-GLOBAL (owner
+/// decision 2026-11-18) drops only the any-key write by that code, not its
+/// reads.
+fn global_field_read_by_unknown(m: &mut Model, n: NodeId) {
+    let r = m.reason("global property read by unknown code that holds the global object");
+    m.sink_node(n, r);
 }
 
 /// Lookups that passed a native prototype (or read a program-owned global)
@@ -822,7 +859,13 @@ fn replay_pending(m: &mut Model) {
         for (np, a, miss) in pending {
             m.census_native_read(np, a, miss.clone());
             let written = match miss {
-                NativeMiss::Global(..) => global_value_written(m, np, a),
+                NativeMiss::Global(dst, _) => {
+                    let stored = global_value_stored(m, np, a);
+                    if !stored {
+                        global_maybe_deleted(m, np, a, dst);
+                    }
+                    stored
+                }
                 NativeMiss::Lookup(dst, setter) => {
                     let unknown = native_accessor_written(m, np, a);
                     if !unknown {
@@ -1199,6 +1242,17 @@ pub fn global_user_key(m: &Model, name: &str) -> bool {
         })
 }
 
+/// GLOBS13: a method call on the global object (`globalThis.k()`, a
+/// receiver that may be the global object) under a program-owned key
+/// (`global_user_key`) calls what [[Get]] reads there (ECMA-262 13.3.6.1
+/// EvaluateCall, 7.3.21 Invoke): the program's stores, ⊤ once unmodeled
+/// code may have written the key, else `undefined`, whose Call throws a
+/// TypeError (7.3.14 step 2) and hands no argument on.
+pub fn global_user_method(m: &Model, t: Tok, a: Atom) -> bool {
+    matches!(m.toks[t as usize], TokKind::Builtin(BuiltinNs::GlobalThis))
+        && global_user_key(m, &m.atoms[a as usize])
+}
+
 /// S8: a name on the global sentinel (HIR `GlobalGet(0)`: an identifier
 /// with no binding; `console` lowers to it too) that is a program-owned key
 /// of the global object (`global_user_key`) and that the sentinel does not
@@ -1273,44 +1327,107 @@ pub fn global_any_names(m: &Model, n: &str) -> bool {
         && n != crate::STAR_KEY
 }
 
-/// G2: a read of a global binding (bare name, `globalThis.K`, a module
-/// export equal to a global a native reads by name) also reads what the
-/// program stored under unknown String keys.
-pub fn global_any_read(m: &mut Model, dst: NodeId) {
+/// G2: what a global binding read names: one global name, the names a
+/// computed key's shape spells, or (a key of no shape) every name.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GlobalAnyRead {
+    Name(String),
+    Shape(KeyShapeId),
+    All,
+}
+
+/// GLOBS4: may a store under a String key of shape `s` (0: any String)
+/// write what read `r` names? A store writes exactly the key
+/// ToPropertyKey gives (ECMA-262 10.1.9.1 OrdinarySet, 7.1.19); a read of
+/// name N sees the value only if that key can be N (10.1.8.1 OrdinaryGet).
+fn global_any_hits(m: &Model, s: KeyShapeId, r: &GlobalAnyRead) -> bool {
+    match r {
+        GlobalAnyRead::All => true,
+        GlobalAnyRead::Name(n) => m.key_may_name_str(Key::Any(s), n),
+        GlobalAnyRead::Shape(k) => m.shapes_meet(s, *k),
+    }
+}
+
+fn global_any_link(m: &mut Model, r: GlobalAnyRead, dst: NodeId) {
     if m.unit_mode {
         return;
     }
-    match m.global_any {
-        Some(ga) => m.edge(ga, dst),
-        None => m.global_any_reads.push(dst),
+    let hits: Vec<NodeId> = m
+        .global_any_fields
+        .iter()
+        .filter(|(s, _)| global_any_hits(m, *s, &r))
+        .map(|(_, f)| *f)
+        .collect();
+    for f in hits {
+        m.edge(f, dst);
     }
+    m.global_any_reads.push((r, dst));
+}
+
+/// G2: a read of global binding `n` (bare name, `globalThis.n`, a module
+/// export equal to a global a native reads by name) also reads what the
+/// program stored under unknown String keys that can spell `n` (GLOBS4).
+pub fn global_any_read(m: &mut Model, n: &str, dst: NodeId) {
+    global_any_link(m, GlobalAnyRead::Name(n.to_string()), dst);
+}
+
+/// G2: a read of the global object under `key`: a named key is that
+/// binding's read, a shaped key reads the stores whose shape meets it, a
+/// key of no shape reads them all.
+pub fn global_any_read_key(m: &mut Model, key: Key, dst: NodeId) {
+    let r = match key {
+        Key::Named(a) => GlobalAnyRead::Name(m.atoms[a as usize].clone()),
+        Key::Any(0) => GlobalAnyRead::All,
+        Key::Any(s) => GlobalAnyRead::Shape(s),
+    };
+    global_any_link(m, r, dst);
 }
 
 /// G2: `new K(...)` of a literal global name constructs what the program
-/// stored under unknown String keys as well (13.3.5.1 evaluates `K`).
-pub fn global_any_new(m: &mut Model, call: CallId) {
+/// stored under unknown String keys that can spell `K` (13.3.5.1
+/// evaluates `K`).
+pub fn global_any_new(m: &mut Model, name: &str, call: CallId) {
     if m.unit_mode {
         return;
     }
-    match m.global_any {
-        Some(ga) => m.cons(ga, Cons::New { call }),
-        None => m.global_any_news.push(call),
+    let hits: Vec<NodeId> = m
+        .global_any_fields
+        .iter()
+        .filter(|(s, _)| m.key_may_name_str(Key::Any(*s), name))
+        .map(|(_, f)| *f)
+        .collect();
+    for f in hits {
+        m.cons(f, Cons::New { call });
     }
+    m.global_any_news.push((name.to_string(), call));
 }
 
-/// G2: the global object's field under any String key, made by the first
-/// store under an unknown String key (the reads and constructs made before
-/// it are linked now).
-pub fn global_any_field(m: &mut Model) -> NodeId {
-    if let Some(ga) = m.global_any {
-        return ga;
+/// G2: the global object's field under String keys of shape `s` (0: any
+/// String), made by the first store under such a key; the reads and
+/// constructs its shape can spell are linked to it, those made before it
+/// too.
+pub fn global_any_field(m: &mut Model, s: KeyShapeId) -> NodeId {
+    if let Some(&(_, f)) = m.global_any_fields.iter().find(|(k, _)| *k == s) {
+        return f;
     }
     let ga = m.node_l("global-any-key");
-    m.global_any = Some(ga);
-    for d in std::mem::take(&mut m.global_any_reads) {
+    m.global_any_fields.push((s, ga));
+    let reads: Vec<NodeId> = m
+        .global_any_reads
+        .iter()
+        .filter(|(r, _)| global_any_hits(m, s, r))
+        .map(|(_, d)| *d)
+        .collect();
+    for d in reads {
         m.edge(ga, d);
     }
-    for call in std::mem::take(&mut m.global_any_news) {
+    let news: Vec<CallId> = m
+        .global_any_news
+        .iter()
+        .filter(|(n, _)| m.key_may_name_str(Key::Any(s), n))
+        .map(|(_, c)| *c)
+        .collect();
+    for call in news {
         m.cons(ga, Cons::New { call });
     }
     global_any_navigator(m);
@@ -1327,7 +1444,7 @@ pub fn global_def_field(m: &mut Model) -> NodeId {
     }
     let d = m.node_l("global-define-key");
     m.global_def = Some(d);
-    let ga = global_any_field(m);
+    let ga = global_any_field(m, 0);
     m.edge(d, ga);
     for n in std::mem::take(&mut m.global_def_navs) {
         m.edge(d, n);
@@ -1351,19 +1468,27 @@ pub fn global_def_nav_read(m: &mut Model, dst: NodeId) {
 /// `prototype` as its [[Prototype]] when the getter first runs
 /// (perry-runtime navigator.rs:119 `builtin_value_core("Navigator")`,
 /// `navigator_object_with_constructor`): with a value stored under an
-/// unknown String key that may be what `Navigator` holds then.
+/// unknown String key that may be what `Navigator` holds then (a store
+/// whose key can spell `Navigator`, GLOBS4).
 pub fn global_any_navigator(m: &mut Model) {
-    let (Some(ga), Some(nav)) = (m.global_any, m.navigator) else {
+    let Some(nav) = m.navigator else {
         return;
     };
-    if m.global_any_nav {
+    if m.global_any_nav
+        || !m
+            .global_any_fields
+            .iter()
+            .any(|(s, _)| m.key_may_name_str(Key::Any(*s), "Navigator"))
+    {
         return;
     }
     m.global_any_nav = true;
+    let r = m.node_l("global-any-Navigator");
     let p = m.node_l("global-any-Navigator.prototype");
     let key = Key::Named(m.atom("prototype"));
-    m.cons(ga, Cons::Load { key, dst: p });
+    m.cons(r, Cons::Load { key, dst: p });
     m.given_prototype(nav, p);
+    global_any_read(m, "Navigator", r);
 }
 
 /// G2 off: a native the model does not follow reads a global by name and
@@ -1393,6 +1518,9 @@ pub fn global_field(m: &mut Model, g: Tok, a: Atom) -> NodeId {
     }
     let n = m.field(g, a);
     m.global_fields.push((a, n));
+    if m.global_in_top {
+        global_field_read_by_unknown(m, n);
+    }
     super::loads::global_shaped_replay(m, a);
     if m.global_cells {
         m.global_late = true;

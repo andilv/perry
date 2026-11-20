@@ -8,7 +8,7 @@
 
 use crate::gen::{Fx, Gen, ReadSite};
 use crate::model::*;
-use perry_hir::{ArrayElement, CallArg, CompareOp, Expr, LogicalOp, UnaryOp};
+use perry_hir::{ArrayElement, CallArg, CompareOp, Expr, LogicalOp, ObjectPart, UnaryOp};
 
 /// The sink reason of an unmodeled construct's operands (`Gen::fail_closed`).
 pub(crate) const UNMODELED_OPERAND: &str = "operand of unmodeled HIR construct";
@@ -199,6 +199,14 @@ impl<'a> Gen<'a> {
     /// its stores no object, so none of its effects apply. The gate opens
     /// once and stays open (values only grow), so the fixpoint is the same
     /// one. `PERRY_FACTS_GUARD_REGIONS=0` turns it off.
+    /// `__step_self(e, true)` in a plain-async step: its error carrier.
+    fn step_error_reentry(&self, mi: u32, callee: &Expr, args: &[Expr]) -> Option<NodeId> {
+        match (callee, args) {
+            (Expr::LocalGet(s), [_, Expr::Bool(true)]) => self.step.by_self.get(&(mi, *s)).copied(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn region_read(&mut self, fx: &Fx, n: NodeId) -> NodeId {
         use crate::model::guard::*;
         let Some((t, test)) = fx.guard else {
@@ -511,6 +519,21 @@ impl<'a> Gen<'a> {
         dst
     }
 
+    /// The keys `Object.entries` reads from `recv` (`Cons::OwnKeys`).
+    pub(crate) fn own_keys(&mut self, recv: NodeId) -> NodeId {
+        let dst = self.tmp("ownkeys");
+        self.m.cons(recv, Cons::OwnKeys { dst });
+        dst
+    }
+
+    /// Rule RP2: what the protocol arm of a guarded iterator record sees of
+    /// `v` (`Cons::RecordEntry`).
+    pub(crate) fn record_entry(&mut self, v: NodeId) -> NodeId {
+        let dst = self.tmp("recordentry");
+        self.m.cons(v, Cons::RecordEntry { dst });
+        dst
+    }
+
     /// The static blocks of class expression `template` that one
     /// evaluation runs (`ClassFreshStaticInit::Block`, an index into the
     /// template's `__perry_static_init_N` functions in source order): a
@@ -713,7 +736,9 @@ impl<'a> Gen<'a> {
         let zs_ok = std::mem::take(&mut self.zs_ok);
         let seq = self.expr_seq;
         self.expr_seq += 1;
+        let member_ops = self.member_ops.len();
         let n = self.expr_inner(fx, e);
+        self.member_op_class(fx.module, e, member_ops);
         // A namespace pair's argument (`namespace_pair`): the pair is built
         // from one argument list (perry-hir `try_patched_builtin_call`), so
         // the intrinsic arm holds each argument once, as subtrees that do not
@@ -760,6 +785,11 @@ impl<'a> Gen<'a> {
             Expr::I18nString { params, .. } => {
                 let ops: Vec<&Expr> = params.iter().map(|(_, e)| e.as_ref()).collect();
                 self.prim_op(fx, &ops, prim::STR, "i18n param", Protocol::ToPrimitive)
+            }
+            // `__step_value` in its step's error arm: the throw completion.
+            Expr::LocalGet(id) if self.step.arms.last() == Some(&(mi, *id)) => {
+                let err = self.step.by_value[&(mi, *id)];
+                self.region_read(fx, err)
             }
             Expr::LocalGet(id) => match self.for_binding {
                 Some((m, l, n)) if m == mi && l == *id => n,
@@ -1191,8 +1221,15 @@ impl<'a> Gen<'a> {
                 self.prim_node(prim::BOOL)
             }
             Expr::Await(x) => {
+                // 27.7.5.3 Await: a rejection resumes the body with a throw
+                // completion at the await, into its region (R-JOBTHROW).
                 let v = self.expr(fx, x);
-                self.awaited(v)
+                let (out, rj) = self.awaited_r(v);
+                let r = self.region();
+                if rj != r {
+                    self.m.edge(rj, r);
+                }
+                out
             }
             Expr::Yield { value, .. } => {
                 if let Some(v) = value {
@@ -1254,7 +1291,7 @@ impl<'a> Gen<'a> {
                 if let Some(callee) = self.private_method_callee(mi, object) {
                     return callee;
                 }
-                let dst = self.load(o, Key::Named(a));
+                let dst = self.private_getter_or_load(mi, object, o, a);
                 // S8: on the global sentinel a name the main realm does not
                 // declare is [[Get]] on the global object (`loads::tok_load`);
                 // in a module a Worker may run, the Worker global's own
@@ -1861,8 +1898,14 @@ impl<'a> Gen<'a> {
                 obj
             }
             Expr::ObjectSpread { parts } => {
-                let named: Vec<&str> = parts.iter().filter_map(|(k, _)| k.as_deref()).collect();
-                let has_spread = parts.iter().any(|(k, _)| k.is_none());
+                let named: Vec<&str> = parts
+                    .iter()
+                    .filter_map(|p| match p {
+                        ObjectPart::Define(k, _) => Some(k.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let has_spread = parts.iter().any(|p| !matches!(p, ObjectPart::Define(..)));
                 let (tm, t) = self.new_lit(mi, e, if has_spread { &[] } else { &named });
                 let obj = self.tok_node(t);
                 if has_spread {
@@ -1875,10 +1918,36 @@ impl<'a> Gen<'a> {
                         },
                     );
                 }
-                for (k, v) in parts {
-                    let vn = self.expr(fx, v);
-                    match k {
-                        Some(k) => {
+                if parts
+                    .iter()
+                    .any(|p| matches!(p, ObjectPart::Computed { .. }))
+                {
+                    // A computed key defines a key known only at run time
+                    // (as `js_object_literal_set_computed` on the builder).
+                    let tmpl = &mut self.m.tmpls[tm as usize];
+                    tmpl.birth_keys.clear();
+                    tmpl.definite.clear();
+                    tmpl.has_computed_members = true;
+                }
+                for part in parts {
+                    if let ObjectPart::Computed { key, value } = part {
+                        // As the builder: the key, then ToPropertyKey
+                        // (`js_object_literal_to_property_key`: an object
+                        // key's `@@toPrimitive` / `toString` / `valueOf` is
+                        // program code), then the value, then the define of a
+                        // run-time key (`js_object_literal_set_computed`,
+                        // with its U8 own computed key).
+                        let kn = self.expr(fx, key);
+                        self.to_property_key(kn);
+                        let vn = self.expr(fx, value);
+                        self.store(fx, obj, Key::any(), vn, "lit[]".into(), Some(tm), true);
+                        self.m.cons(obj, Cons::OwnComputedKey { key: kn, val: vn });
+                        continue;
+                    }
+                    let vn = self.expr(fx, part.value());
+                    match part {
+                        ObjectPart::Computed { .. } => unreachable!("handled above"),
+                        ObjectPart::Define(k, _) => {
                             let a = self.m.atom(k);
                             self.store(
                                 fx,
@@ -1890,7 +1959,7 @@ impl<'a> Gen<'a> {
                                 true,
                             );
                         }
-                        None => {
+                        ObjectPart::Spread(_) => {
                             // Own enumerable keys of the source, key by key
                             // (getters run): `Cons::Spread`.
                             let site = self.store_site(mi, fx.f, "lit...".into(), Some(tm), true);
@@ -1932,6 +2001,7 @@ impl<'a> Gen<'a> {
             }
             Expr::Array(elems, _) => {
                 let tm = self.new_arr_birth(mi, "lit", true, true);
+                self.m.ordinary_arrays.insert(tm);
                 if let Some(h) = self.direct_arr.take() {
                     self.m.arr_birth_holder.insert(tm, h);
                 }
@@ -1960,6 +2030,7 @@ impl<'a> Gen<'a> {
             Expr::ArraySpread(elems) => {
                 let dense = !elems.iter().any(|e| matches!(e, ArrayElement::Hole));
                 let tm = self.new_arr_birth(mi, "spread", dense, true);
+                self.m.ordinary_arrays.insert(tm);
                 let t = self.m.tok(TokKind::Obj(tm, NO_CTX));
                 let fa = self.m.field_any(t);
                 for el in elems {
@@ -1980,6 +2051,22 @@ impl<'a> Gen<'a> {
             }
 
             // ------------------------------------------------- calls
+            // A step's error re-entry `__step_self(e, true)`: `e` resumes the
+            // body as a throw completion only (`StepSplits`).
+            Expr::Call {
+                callee,
+                args,
+                byte_offset,
+                byte_end,
+                ..
+            } if self.step_error_reentry(mi, callee, args).is_some() => {
+                let err = self.step_error_reentry(mi, callee, args).expect("guard");
+                let e = self.expr(fx, &args[0]);
+                self.m.edge(e, err);
+                let none = self.tmp("step-resume-none");
+                let b = self.prim_node(prim::BOOL);
+                self.call_with(fx, callee, vec![none, b], vec![], (*byte_offset, *byte_end))
+            }
             Expr::Call {
                 callee,
                 args,

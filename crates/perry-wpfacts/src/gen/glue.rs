@@ -7,12 +7,18 @@ use crate::model::*;
 use perry_hir::Expr;
 
 impl<'a> Gen<'a> {
-    pub(crate) fn iter_res_node(&mut self, fx: &Fx) -> NodeId {
-        if let Some(&n) = self.mods[fx.module as usize].iterres.get(&fx.f) {
+    /// A plain-async step's iter-result slot as written with `done`
+    /// (`IterResultSet(value, done)`). The step reads it back right after
+    /// its body leaves: under `if (IterResultGetDone)` the last write was a
+    /// `return` (done), after that arm an await's operand (not done), so
+    /// each read takes the writes of its own flag only.
+    pub(crate) fn iter_res_node(&mut self, fx: &Fx, done: bool) -> NodeId {
+        let key = (fx.f, done);
+        if let Some(&n) = self.mods[fx.module as usize].iterres.get(&key) {
             return n;
         }
         let n = self.tmp("iterres");
-        self.mods[fx.module as usize].iterres.insert(fx.f, n);
+        self.mods[fx.module as usize].iterres.insert(key, n);
         n
     }
 
@@ -266,17 +272,30 @@ impl<'a> Gen<'a> {
             // shape lookup of `return` on %ArrayIteratorPrototype%'s chain;
             // an accessor answers false without being called, so no program
             // code runs here; the close itself is `arrayRecordClose`'s model.
-            "arrayRecordNeedsIterator"
-            | "arrayRecordCloseAbsent"
+            // Rule RP2: the record's source local (`s` of `arrayRecordNeedsIterator(s = s)`).
+            "arrayRecordNeedsIterator" => {
+                if let Some(Expr::LocalSet(s, v)) = source_args.first() {
+                    if matches!(v.as_ref(), Expr::LocalGet(x) if x == s) {
+                        self.record_locals.insert((fx.module, *s));
+                    }
+                }
+                self.prim_node(prim::BOOL)
+            }
+            "arrayRecordCloseAbsent"
             | "arrayRecordForBound"
             | "hasPathModule"
             | "isBuiltin"
             | "typedArrayForOfAdmits" => self.prim_node(prim::BOOL),
             // What codegen lowers them to: the cursor itself, the payload's
             // length, and `mode ? 0 : update`.
-            "arrayRecordIndex" => match arg(0) {
-                Some(a) => a,
-                None => self.prim_node(prim::NUM),
+            // Rule RP1: a positional step reads its own index
+            // (`gen/record_steps.rs`).
+            "arrayRecordIndex" => match self.record_steps.get(&(source_args.as_ptr() as usize)) {
+                Some(&j) => self.num_literal(j as f64),
+                None => match arg(0) {
+                    Some(a) => a,
+                    None => self.prim_node(prim::NUM),
+                },
             },
             "arrayRecordLength" => self.prim_node(prim::NUM),
             "arrayRecordForUpdate" => {
@@ -328,6 +347,16 @@ impl<'a> Gen<'a> {
                 out
             }
             "arrayRecordPayload" | "arrayRecordForValue" => {
+                // Rule RP2: the payload of a guarded record of source `s`.
+                if let (Some(Expr::LocalGet(s)), Some(Expr::LocalSet(p, _))) =
+                    (source_args.first(), source_args.get(1))
+                {
+                    if method == "arrayRecordPayload"
+                        && self.record_locals.contains(&(fx.module, *s))
+                    {
+                        self.record_locals.insert((fx.module, *p));
+                    }
+                }
                 let out = self.tmp("glue-pass");
                 for a in &args {
                     self.m.edge(*a, out);
@@ -359,6 +388,15 @@ impl<'a> Gen<'a> {
                 let (Some(it), Some(next)) = (arg(0), arg(1)) else {
                     return self.prim_node(prim::BOOL);
                 };
+                // Rule RP2: the protocol arm of a guarded record steps its
+                // payload only when that is not an Array the runtime takes
+                // the array arm for.
+                let it = match source_args.first() {
+                    Some(Expr::LocalGet(p)) if self.record_locals.contains(&(fx.module, *p)) => {
+                        self.record_entry(it)
+                    }
+                    _ => it,
+                };
                 // IteratorStep is IteratorNext with no value: `Call(next,
                 // iterator, «»)` (ECMA-262 7.4.4, 7.4.7), as `js_iterator_step`
                 // does it (a generator resumes with `undefined`, any other
@@ -370,7 +408,7 @@ impl<'a> Gen<'a> {
                 // (`js_iterator_step`), which destructuring reads.
                 let va = self.m.atom("value");
                 let v = self.load(res, Key::Named(va));
-                let io = self.iter_out_node(fx);
+                let io = self.step_out_node(fx);
                 self.m.edge(v, io);
                 let all = self.iterate(it);
                 self.m.edge(all, io);
@@ -389,7 +427,7 @@ impl<'a> Gen<'a> {
                 }
                 self.prim_node(prim::BOOL)
             }
-            "iteratorStepOutput" => self.iter_out_node(fx),
+            "iteratorStepOutput" => self.step_out_node(fx),
             // The rest element of an array destructuring (`[a, ...rest] =
             // it`): what codegen lowers it to, `js_array_push_f64(rest,
             // value)`, the array itself as the result.
@@ -639,6 +677,15 @@ impl<'a> Gen<'a> {
         let n = self.tmp("stepyield");
         self.mods[fx.module as usize].stepyield.insert(key, n);
         n
+    }
+
+    /// What the current `iteratorStep` writes (`Gen::step_out`); outside
+    /// a step, the function's output node (`iter_out_node`).
+    fn step_out_node(&mut self, fx: &Fx) -> NodeId {
+        match self.step_out {
+            Some(n) => n,
+            None => self.iter_out_node(fx),
+        }
     }
 
     pub(crate) fn iter_out_node(&mut self, fx: &Fx) -> NodeId {

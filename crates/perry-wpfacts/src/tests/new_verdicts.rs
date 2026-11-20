@@ -37,9 +37,28 @@ fn modules(mods: &[(&str, &str)]) -> ProgramFacts {
             (path, hir)
         })
         .collect();
+    // Re-export sources (`export * from "./x"`) resolve as the driver
+    // resolves them (`export_sources`).
+    let mut cfg = FactsConfig::default();
+    for (path, hir) in &hirs {
+        for e in &hir.exports {
+            let (perry_hir::Export::ReExport { source, .. }
+            | perry_hir::Export::ExportAll { source }
+            | perry_hir::Export::NamespaceReExport { source, .. }) = e
+            else {
+                continue;
+            };
+            if let Some(n) = source.strip_prefix("./") {
+                cfg.export_sources
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(source.clone(), format!("{n}.ts"));
+            }
+        }
+    }
     let list: Vec<(String, &perry_hir::Module)> =
         hirs.iter().map(|(p, h)| (p.clone(), h)).collect();
-    crate::compute(&list, &FactsConfig::default())
+    crate::compute(&list, &cfg)
 }
 
 /// The verdict names of the sites of key `key` (`call`: calls, else
@@ -235,15 +254,138 @@ fn ns_export_control_receiver_may_be_object() {
     none_pf(&pf, main, "v", false, "NsExport");
 }
 
-/// A name the module does not export itself (`export *` from another): no
-/// claim (its resolution is not modeled here).
+/// ROW9B: `export *` resolved per ResolveExport (ECMA-262 16.2.1.6.3).
+/// A name reached through star exports of two files, one of them through
+/// a second star (recursive), and a local export that shadows a star one.
 #[test]
-fn ns_export_control_star_reexport() {
+fn ns_export_star_reexport() {
+    let main = "import * as ns from \"./a\";\nconst y = ns.u;\nconst z = ns.t;\nconst q = ns.s;";
+    let pf = modules(&[
+        ("d", "export const t = 5;"),
+        ("b", "export const u = 4;\nexport const s = 1;"),
+        ("c", "export * from \"./d\";"),
+        (
+            "a",
+            "export * from \"./b\";\nexport * from \"./c\";\nexport const s = 2;",
+        ),
+        ("main", main),
+    ]);
+    all_pf(&pf, main, "u", false, "NsExport");
+    all_pf(&pf, main, "t", false, "NsExport");
+    all_pf(&pf, main, "s", false, "NsExport");
+}
+
+/// The same binding through two star paths (a diamond) is one binding.
+#[test]
+fn ns_export_star_diamond() {
+    let main = "import * as ns from \"./a\";\nconst y = ns.u;";
+    let pf = modules(&[
+        ("d", "export const u = 4;"),
+        ("b", "export * from \"./d\";"),
+        ("c", "export * from \"./d\";"),
+        ("a", "export * from \"./b\";\nexport * from \"./c\";"),
+        ("main", main),
+    ]);
+    all_pf(&pf, main, "u", false, "NsExport");
+}
+
+/// Two star sources with different bindings of `u`: ambiguous, the name is
+/// no export of `a` (`ns.u` is undefined): no claim.
+#[test]
+fn ns_export_control_star_ambiguous() {
     let main = "import * as ns from \"./a\";\nconst y = ns.u;";
     let pf = modules(&[
         ("b", "export const u = 4;"),
-        ("a", "export * from \"./b\";"),
+        ("c", "export const u = 5;"),
+        ("a", "export * from \"./b\";\nexport * from \"./c\";"),
         ("main", main),
     ]);
     none_pf(&pf, main, "u", false, "NsExport");
+}
+
+/// `export *` never re-exports `default`: no claim.
+#[test]
+fn ns_export_control_star_default() {
+    let main = "import * as ns from \"./a\";\nconst y = ns.default;";
+    let pf = modules(&[
+        ("b", "export default 4;"),
+        ("a", "export * from \"./b\";"),
+        ("main", main),
+    ]);
+    none_pf(&pf, main, "default", false, "NsExport");
+}
+
+/// Cyclic star exports terminate: a name one of them exports is proven, a
+/// name neither exports is not.
+#[test]
+fn ns_export_star_cycle() {
+    let main = "import * as ns from \"./a\";\nconst y = ns.u;\nconst z = ns.w;";
+    let pf = modules(&[
+        ("b", "export * from \"./a\";\nexport const u = 4;"),
+        ("a", "export * from \"./b\";"),
+        ("main", main),
+    ]);
+    all_pf(&pf, main, "u", false, "NsExport");
+    none_pf(&pf, main, "w", false, "NsExport");
+}
+
+#[test]
+fn native_dispatch_imported_binding_needs_single_program_target() {
+    let classes = "export class P { m() {return 7;} } export class Q { m() {return 8;} }";
+    for (init, direct) in [
+        ("new P()", true),
+        ("process.argv.length > 5 ? new P() : new Q()", false),
+    ] {
+        let main =
+            format!("import {{P,Q}} from './classes'; const p = {init}; console.log(p.m());");
+        let pf = modules(&[("classes", classes), ("main", &main)]);
+        let site = pf
+            .sites
+            .iter()
+            .find(|s| s.is_call && s.key == "m")
+            .expect("live method call");
+        assert_eq!(
+            !site.dispatch_obligation().unwrap().redispatch,
+            direct,
+            "{}",
+            pf.dump_text()
+        );
+        if direct {
+            assert_eq!(site.target_fns.len(), 1);
+        }
+    }
+}
+
+fn assert_imported_call_redispatches(setup: &str) {
+    let main = format!("import {{P}} from './classes'; {setup} p.m();");
+    let pf = modules(&[
+        ("classes", "export class P { m() {return 7;} }"),
+        ("main", &main),
+    ]);
+    let mut sites = pf
+        .sites
+        .iter()
+        .filter(|s| s.is_call && s.key == "m")
+        .peekable();
+    assert!(sites.peek().is_some(), "missing imported call: {main}");
+    assert!(
+        sites.all(|s| s.dispatch_obligation().unwrap().redispatch),
+        "{main}\n{}",
+        pf.dump_text()
+    );
+}
+
+#[test]
+fn native_dispatch_imported_instance_own_method_write() {
+    assert_imported_call_redispatches("const p = new P(); p.m = () => 9;");
+}
+
+#[test]
+fn native_dispatch_imported_instance_prototype_method_write() {
+    assert_imported_call_redispatches("const p = new P(); P.prototype.m = () => 9;");
+}
+
+#[test]
+fn native_dispatch_imported_instance_mutable_binding() {
+    assert_imported_call_redispatches("let p = new P();");
 }

@@ -7,11 +7,13 @@ impl Model {
         match c {
             Cons::Identity { route } => format!("identity {n} {}", route.name()),
             Cons::HasProp { key, idx } => format!("hasprop {n} {key:?} {idx}"),
+            Cons::OwnProp { key, idx } => format!("ownprop {n} {key:?} {idx}"),
             Cons::Load { key, dst } => format!("load {n} {} {dst}", self.key_name(*key)),
             Cons::ProtoKey { key, dst } => {
                 format!("protokey {n} {} {dst}", self.key_name(Key::Named(*key)))
             }
             Cons::OwnValues { dst } => format!("ownvalues {n} {dst}"),
+            Cons::OwnKeys { dst } => format!("ownkeys {n} {dst}"),
             Cons::OwnDescValues { dst } => format!("owndescvalues {n} {dst}"),
             Cons::IndexHole => format!("indexhole {n}"),
             Cons::IndexHoleIn { key } => format!("indexholein {n} {key}"),
@@ -83,8 +85,10 @@ impl Model {
             Cons::Falsy { dst } => format!("falsy {n} {dst}"),
             Cons::NotUndefined { dst } => format!("notundefined {n} {dst}"),
             Cons::NotNull { dst } => format!("notnull {n} {dst}"),
+            Cons::RecordEntry { dst } => format!("recordentry {n} {dst}"),
             Cons::TypeIs { mask, dst } => format!("typeis {n} {mask:#x} {dst}"),
             Cons::NotBuffer { shared, dst } => format!("notbuffer {n} {dst} shared={shared}"),
+            Cons::NotRegExp { dst } => format!("notregexp {n} {dst}"),
             Cons::ProtoObjects { dst } => format!("protoobjects {n} {dst}"),
             Cons::Objects { dst } => format!("objects {n} {dst}"),
             Cons::TopIfAny { dst, from, reason } => format!(

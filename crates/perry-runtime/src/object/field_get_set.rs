@@ -230,9 +230,11 @@ mod exotic_named_read;
 #[cfg(test)]
 mod exotic_named_read_tests;
 pub(crate) mod field_ops;
-mod for_in_stable;
 mod get_field_by_name;
 mod get_slow;
+mod primitive_canonical_read;
+pub(crate) use primitive_canonical_read::primitive_canonical_get;
+mod array_canonical_read;
 pub(crate) use get_slow::get_field_by_name_of_value;
 pub use get_slow::{
     js_object_get_field_nonptr, js_object_get_field_site_slow, js_object_get_field_slow,
@@ -323,15 +325,15 @@ pub(crate) use enumeration::{
     keys_contain_array_index, own_key_hidden_bytes, own_keys_may_hide, own_slot_hidden,
 };
 pub use enumeration::{
-    js_for_in_keys_value, js_object_entries, js_object_entries_value, js_object_keys,
-    js_object_keys_value, js_object_values, js_object_values_value,
+    js_for_in_begin, js_for_in_key_live, js_for_in_keys_value, js_for_in_loop_fact,
+    js_object_entries, js_object_entries_value, js_object_keys, js_object_keys_value,
+    js_object_values, js_object_values_value,
 };
 pub use field_ops::{
     js_object_free, js_object_get_class_id, js_object_get_field_f64, js_object_set_field,
     js_object_set_field_by_index, js_object_set_field_f64, js_object_set_keys, js_object_to_value,
     js_value_to_object,
 };
-pub use for_in_stable::js_for_in_keys_stable_value;
 pub(crate) use get_field_by_name::class_value_get_field;
 pub use get_field_by_name::js_object_get_field_by_name;
 pub(crate) use get_field_by_name::primitive_number_get;
@@ -354,7 +356,7 @@ pub(crate) use ic_miss::private_member_access_hints_depth;
 pub(crate) use ic_miss::RuntimePrivateElement;
 pub(crate) use ic_miss::{
     bind_primitive_proto_method_static, cannot_be_private_member_name, class_evaluation_of,
-    current_private_lexical_brand_value, define_static_private_field, is_array_method_value_name,
+    current_private_lexical_brand_value, define_static_private_field,
     note_private_template_evaluated, private_evaluation_brand_value,
     private_lexical_brand_check_marks, private_lexical_brand_pop, private_lexical_brand_push,
     private_lexical_brand_push_at, private_lexical_brand_unwind_to,

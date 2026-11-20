@@ -263,11 +263,12 @@ unsafe fn own_property_ordinary(obj_value: f64, key_value: f64) -> Option<OwnPro
                 obj_value, key_value,
             ));
         }
-        if let Some((obj, elements)) = crate::array::subclass_elements::backed_value(obj_value) {
-            if let Some(elements_key) = crate::array::subclass_elements::key_of_value(key_value) {
+        if let Some(view) = crate::array::subclass_elements::own_elements_value(obj_value) {
+            if let Some(elements_key) = crate::array::subclass_elements::key_of_value(key_value)
+                .filter(|k| view.admits(*k) && !view.keyed(*k))
+            {
                 return crate::array::subclass_elements::own_property_descriptor(
-                    obj,
-                    elements,
+                    view,
                     elements_key,
                 )
                 .and_then(OwnProperty::public);
@@ -713,7 +714,7 @@ unsafe fn own_property_ordinary(obj_value: f64, key_value: f64) -> Option<OwnPro
                     // So does an unborn lazy builtin family's constructor when
                     // the key is `prototype` or a declared static (the value
                     // is read): its family's birth gives it the bag.
-                    if crate::closure::props::bag_of(ptr).is_null()
+                    if !crate::closure::props::has_store(ptr)
                         && (name == "prototype"
                             || crate::closure::props::is_declared_static(ptr, name.as_bytes()))
                     {
@@ -721,12 +722,27 @@ unsafe fn own_property_ordinary(obj_value: f64, key_value: f64) -> Option<OwnPro
                             crate::object::birth_unborn_family_of(ptr);
                         });
                     }
+                    // A bag-less plain function whose family record lists
+                    // `prototype`: own from birth. The materialize point
+                    // creates it (allocates) in the bag, its one home, which
+                    // answers its value and attributes below.
+                    let ptr = ptr_handle.with_mut_ptr::<u8, _>(|ptr| ptr as usize);
+                    if name == "prototype"
+                        && crate::object::has_own_helpers::family_key_present(ptr, "prototype")
+                            == Some(true)
+                    {
+                        ptr_handle.across_mut::<u8, _>(|| {
+                            crate::object::ordinary_function_prototype_value_for_read(
+                                crate::value::js_nanbox_pointer(ptr as i64),
+                            );
+                        });
+                    }
                     let ptr = ptr_handle.with_mut_ptr::<u8, _>(|ptr| ptr as usize);
                     let (name, ptr) = if name == "prototype"
                         && crate::closure::props::closure_has_generator_body(
                             ptr as *const crate::closure::ClosureHeader,
                         )
-                        && crate::closure::props::bag_of(ptr).is_null()
+                        && !crate::closure::props::has_store(ptr)
                     {
                         let (_, moved) = ptr_handle.across_mut::<u8, _>(|| {
                             crate::object::generator_function_prototype_of(ptr)
@@ -1127,15 +1143,19 @@ pub extern "C" fn js_object_get_own_property_names(obj_value: f64) -> f64 {
     }
     // An elements-backed Array-subclass instance: present indices, then
     // `length`, then the shape's own string keys.
-    if crate::array::subclass_elements::backed_value(obj_value).is_some() {
+    if crate::array::subclass_elements::own_elements_value(obj_value).is_some() {
         let scope = crate::gc::RuntimeHandleScope::new();
         let obj_h = scope.root_nanbox_f64(obj_value);
         let (names, obj_value) =
             obj_h.across_nanbox(|| js_object_get_own_property_names_shape(obj_value));
-        if let Some((_, elements)) = crate::array::subclass_elements::backed_value(obj_value) {
+        if let Some(view) = crate::array::subclass_elements::own_elements_value(obj_value) {
             let names_ptr = crate::value::js_nanbox_get_pointer(names) as *mut ArrayHeader;
             let combined = unsafe {
-                crate::array::subclass_elements::prepend_index_keys(elements, names_ptr, true)
+                crate::array::subclass_elements::prepend_index_keys(
+                    view,
+                    names_ptr,
+                    view.store_backed(),
+                )
             };
             return crate::value::js_nanbox_pointer(combined as i64);
         }
@@ -1507,7 +1527,13 @@ fn js_object_get_own_property_names_shape(obj_value: f64) -> f64 {
                 {
                     let at = names
                         .iter()
-                        .take_while(|n| *n == "length" || *n == "name")
+                        .take_while(|n| {
+                            (*n == "length" || *n == "name")
+                                && !crate::closure::props::state_is_tombstoned_bytes(
+                                    ptr,
+                                    n.as_bytes(),
+                                )
+                        })
                         .count();
                     names.insert(at, "prototype".to_string());
                 }

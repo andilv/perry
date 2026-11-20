@@ -60,14 +60,13 @@ pub(crate) unsafe fn probe_delete_keyed(obj: *mut ObjectHeader, key_bits: u64) -
         return None;
     }
     let id = crate::object::layout_desc::layout_id_of_word(word);
-    if id.wrapping_sub(super::super::SHAPE_ID_BASE) >= (2 << crate::codegen_abi::LAYOUT_BAND_SHIFT)
-    {
+    if id.wrapping_sub(super::super::SHAPE_ID_BASE) >= crate::codegen_abi::LAYOUT_RECORD_SPAN {
         return None;
     }
     let dir = super::super::ordinary_dir_addr();
     let r = record_of(dir, LayoutWord(word));
     if r.is_null()
-        || (*r).object_kind() != super::super::ShapeObjectKind::Ordinary
+        || !(*r).kind_is(super::super::ShapeObjectKind::Ordinary)
         || !matches!(
             (*r).proto_id,
             super::super::PROTO_ID_DEFAULT | super::super::PROTO_ID_NULL

@@ -67,6 +67,9 @@ added to the binary: only the layout differs.
   programs, and `scripts/hot_text_order.py check` fails when it no longer
   matches the runtime (a listed function was renamed, or a smoke program
   executes too much code outside the ordered run).
+  When a new helper adds an isolated first-touch page, its key can be added
+  beside related helpers without re-recording the list. Compare warm peak
+  RSS and instructions with the unchanged order to verify the placement.
 - GNU ld and lld on Linux by default. On macOS / iOS / tvOS / watchOS /
   visionOS the same list can be passed to ld64 (or ld64.lld) as an
   `-order_file` of exact symbol names resolved from the runtime archives:
@@ -91,6 +94,13 @@ sections, so the data pages a program touches are packed as well.
   alignment padding in front of `.eh_frame_hdr`. Merged sections
   (`.rodata.str1.1`, `.rodata.cst16`) are pooled by the linker and not
   ordered.
+
+Linux links place the two-phase realm population in `.perry_tail`, after
+`perry_js_text`, independently of the hot-text order switch. Each tail function
+has its own input section so unused functions can be discarded. A program
+compiled with `PERRY_REALM_TWO_PHASE=0` links no tail section. See
+[realm population](../runtime/small-process-memory.md#realm-population) for the
+default and its compile-time override.
 
 ## Platforms
 

@@ -108,7 +108,7 @@ impl<'a> Gen<'a> {
         // code runs an own or inherited user method of that name, and the
         // builtin's own effects are its declaration (perry_hir::folded_call).
         if let Some(call) = perry_hir::folded_call::folded_call(e) {
-            return self.folded_call(fx, &call);
+            return self.folded_call(fx, e, &call);
         }
         match e {
             Expr::NativeModuleRef(m) => {
@@ -141,12 +141,58 @@ impl<'a> Gen<'a> {
                 ..
             } => {
                 let o = object.as_ref().map(|o| self.expr(fx, o));
+                // A native step writes its own value binding (the
+                // `LocalSet(value, iteratorStepOutput())` among its
+                // arguments): that write reads this step's output only.
+                let outer = (module == "__perry_runtime" && method == "iteratorStep").then(|| {
+                    let n = self.tmp("iterout");
+                    self.step_out.replace(n)
+                });
                 let a: Vec<NodeId> = args.iter().map(|x| self.expr(fx, x)).collect();
                 let m0 = module.strip_prefix("node:").unwrap_or(module);
+                // R-HOSTREPORT: `process.on(event, listener)` lowers here (the
+                // HIR's receiver-less `NativeMethodCall` on module `process`).
+                // The runtime calls the listener with what it reports as
+                // uncaught and with the process events
+                // (`process_listener_registered`).
+                if object.is_none()
+                    && m0 == "process"
+                    && matches!(
+                        method.as_str(),
+                        "on" | "once" | "addListener" | "prependListener" | "prependOnceListener"
+                    )
+                {
+                    let (call, _) = self.new_call(ThisArg::Undef, a.clone(), vec![]);
+                    crate::builtins::process_listener_registered(&mut self.m, call);
+                }
+                let key = if m0 == "array"
+                    && matches!(method.as_str(), "push_single" | "push_field_single")
+                {
+                    "push"
+                } else {
+                    method
+                };
+                let guarded_push = module == "array"
+                    && o.is_some()
+                    && (method == "push_field_single"
+                        || (matches!(method.as_str(), "push_single" | "push")
+                            && push_method_tiers()
+                            && !self
+                                .push_fill
+                                .pushes
+                                .contains_key(&(e as *const Expr as usize))));
+                // A guarded push publishes its one route at folded_site below.
+                if !guarded_push || perry_hir::folded_call::native_array_push(e).is_none() {
+                    self.member_op(mi, e, key, o, o.is_none().then_some(m0), false);
+                }
                 if module == "__perry_borrowed_proof" {
                     self.prim_node(prim::BOOL)
                 } else if module == "__perry_runtime" {
-                    self.runtime_glue(fx, method, o, a, args)
+                    let r = self.runtime_glue(fx, method, o, a, args);
+                    if let Some(p) = outer {
+                        self.step_out = p;
+                    }
+                    r
                 } else if m0 == "module" && method == "createRequire" && object.is_none() {
                     let t = self.m.tok(TokKind::Builtin(BuiltinNs::Require));
                     self.tok_node(t)
@@ -187,7 +233,7 @@ impl<'a> Gen<'a> {
                     let push = self.m.atom("push");
                     self.list_push(o, Some(a.len() as u32));
                     if let Some(call) = perry_hir::folded_call::native_array_push(e) {
-                        self.folded_site(fx, &call.receiver, push, o);
+                        self.folded_site(fx, "NativeMethodCall", &call.receiver, push, o);
                     }
                     self.mcall(o, Key::Named(push), a, vec![])
                 } else if module == "array" && matches!(method.as_str(), "push_single" | "push") {
@@ -909,10 +955,28 @@ impl<'a> Gen<'a> {
             }
             // `isNaN` / `isFinite` ToNumber their operand (19.2.2, 19.2.3);
             // `Object.hasOwn` and `Reflect.has` ToPropertyKey their key.
-            Expr::ObjectHasOwn(..)
-            | Expr::IsNaN(..)
-            | Expr::IsFinite(..)
-            | Expr::ReflectHas { .. } => self.prim_kids(
+            Expr::ObjectHasOwn(o, k) => {
+                let r = self.m.reason("primitive builtin operand");
+                let on = self.expr(fx, o);
+                let kn = self.expr(fx, k);
+                for n in [on, kn] {
+                    self.m.cons(
+                        n,
+                        Cons::Implicit {
+                            reason: r,
+                            proto: Protocol::ToPrimitive,
+                        },
+                    );
+                }
+                // [[GetOwnProperty]] of the key: a Proxy's trap runs.
+                let (key, idx) = match k.as_ref() {
+                    Expr::String(s) => (Key::Named(self.m.atom(s)), NO_NODE),
+                    _ => (Key::any(), kn),
+                };
+                self.m.cons(on, Cons::OwnProp { key, idx });
+                self.prim_node(prim::BOOL)
+            }
+            Expr::IsNaN(..) | Expr::IsFinite(..) | Expr::ReflectHas { .. } => self.prim_kids(
                 fx,
                 e,
                 prim::BOOL,

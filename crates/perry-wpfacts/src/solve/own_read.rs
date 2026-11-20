@@ -112,11 +112,12 @@ impl Model {
         }
         // An object's own fields: by the key's values (`IdxKey`: a number
         // key names only its numeric fields). A marker's fields are its
-        // reach markers under any key; another value (the global object, a
-        // namespace) keeps every field.
+        // reach markers under any key; another value (a namespace) keeps
+        // every field. The global object under a key of known shape keeps
+        // the fields the shape can spell (`global_read_split`).
         if self.index_needs_all_own_fields(t) {
-            let all = self.all_fields(t);
-            self.edge(all, dst);
+            let own = self.key_fields(t, Key::Any(shape));
+            self.edge(own, dst);
         }
         // PR-C1: a program Array with a length interval reads `undefined`
         // past its end only (`Cons::ElemUndef`, watching the key and the
@@ -139,8 +140,12 @@ impl Model {
         }
         if self.idx_done.insert((idx, t, dst, 0)) {
             if watched || kept {
-                let h = self.hole(t);
-                self.edge(h, dst);
+                // A typed array has no holes (rule TA-LEN): an index below
+                // its length always names an element (10.4.5.15).
+                if self.is_arr(t) {
+                    let h = self.hole(t);
+                    self.edge(h, dst);
+                }
                 let c = Cons::ElemUndef {
                     obj: t,
                     key: idx,
@@ -375,26 +380,33 @@ impl Model {
     /// `t` written under a key no name lists (its any-key field, a shaped
     /// computed-key store)? Read without making the watch node.
     pub(crate) fn enum_any_written(&self, t: Tok) -> bool {
-        let held = |n: NodeId| {
-            let nd = &self.nodes[n as usize];
-            !nd.pts.is_empty() || nd.prim != 0
-        };
-        let any = match self.is_elem_array(t) {
-            true => self.named_any.get(&t),
-            false => self.field_any.get(&t),
-        };
         // The numeric range (`numeric_field`): a Number or BigInt key's
         // store names a numeric string no name lists (7.1.19).
         let numeric = self
             .atom_index
             .get(crate::model::NUM_KEY)
             .and_then(|&a| self.fields.get(&(t, a)));
-        any.is_some_and(|&n| held(n))
-            || numeric.is_some_and(|&n| held(n))
+        self.any_key_written(t) || numeric.is_some_and(|&n| self.node_held(n))
+    }
+
+    /// Was `t` written under a String or Symbol key no name lists: its
+    /// any-key field or a shaped computed-key store (`enum_any_written`
+    /// without the numeric range)?
+    pub(crate) fn any_key_written(&self, t: Tok) -> bool {
+        let any = match self.is_elem_array(t) {
+            true => self.named_any.get(&t),
+            false => self.field_any.get(&t),
+        };
+        any.is_some_and(|&n| self.node_held(n))
             || self
                 .shaped_of
                 .get(&t)
-                .is_some_and(|v| v.iter().any(|&(_, n, store)| store && held(n)))
+                .is_some_and(|v| v.iter().any(|&(_, n, store)| store && self.node_held(n)))
+    }
+
+    fn node_held(&self, n: NodeId) -> bool {
+        let nd = &self.nodes[n as usize];
+        !nd.pts.is_empty() || nd.prim != 0
     }
 
     /// ENUM3: is `a` a key a for-in may yield? String keys only (ECMA-262

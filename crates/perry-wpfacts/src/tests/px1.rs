@@ -195,12 +195,13 @@ console.log(outer.a, outer.b, outer.c, process.argv[2]);
     assert!(!v.is_empty() && v.iter().all(|v| v == "ProxyTrap"), "{v:?}");
 }
 
-// K9: an operation the hook does not model (`Object.keys`: [[OwnPropertyKeys]];
-// a call of the proxy: [[Call]]) keeps the old path: E9, and no trap verdict.
+// K9: an operation the hook does not model (a call of the proxy: [[Call]],
+// twice) keeps the old path: E9, and no trap verdict.
 #[test]
 fn px3_k9_unmodeled_operation_keeps_old_path() {
     let src = r#"const p: any = new Proxy({ a: 1 } as any, { get: (_t: any, k: any) => "g:" + String(k) });
-console.log(p.a, Object.keys(p), process.argv[2]);
+try { p(); } catch (x) {}
+console.log(p.a, process.argv[2]);
 "#;
     let (tops, _) = solve(src);
     assert!(e9(&tops), "{tops:?}");
@@ -242,9 +243,11 @@ fn px4_r2_null_test_of_a_proxy_field() {
     assert!(!e9(&tops), "no E9 unknown: {tops:?}");
     assert!(!held, "realm not held: {tops:?}");
     let v = verdicts(LAZY, "color");
+    // PROXY9 (owner 2026-11-17): the field holds the Proxy or `null`: the
+    // trap verdict, `null` its TypeError arm.
     assert!(
-        !v.is_empty() && v.iter().all(|s| s.contains("Proxy")),
-        "color sites see the Proxy, no escape: {v:?}"
+        !v.is_empty() && v.iter().all(|s| s == "ProxyTrap"),
+        "color sites are trap sites: {v:?}"
     );
 }
 
@@ -327,4 +330,318 @@ console.log(String(f).startsWith("function"), typeof f);
             .all(|t| t == "E9 Proxy target (escape)" || t == "E9 Proxy handler"),
         "only the opaque builtin's escape: {tops:?}"
     );
+}
+
+// PROXY7 R4: the runtime's formatter showing a Proxy (a console argument, or
+// an object's field it shows) unwraps it first: no trap runs (node
+// `getProxyDetails`), the target's own values are shown. The shape of a DOM
+// element whose lazy `style` field holds a Proxy, logged.
+const SHOWN: &str = r#"const N = String(process.argv[2]);
+class El {
+  _style: any = null;
+  get style(): any {
+    if (this._style === null) this._style = new Proxy({ color: N } as any, { get(o: any, k: any) { return k === "color" ? "c" + o.color : o[k]; } });
+    return this._style;
+  }
+}
+const e = new El();
+console.log(e.style.color);
+console.log(e, e.style);
+"#;
+
+#[test]
+fn px7_r4_the_formatter_shows_a_proxy() {
+    let (tops, held) = solve(SHOWN);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+// R5: the `[util.inspect.custom]` hook is read off the target and called
+// with `this` = the Proxy: `this.a` in it runs the get trap.
+const HOOK: &str = r#"const N = String(process.argv[2]);
+const C = Symbol.for("nodejs.util.inspect.custom");
+const t: any = { a: N, [C](this: any): string { return "custom a=" + this.a; } };
+const p: any = new Proxy(t, { get(o: any, k: any) { return k === "a" ? "x" + o.a : o[k]; } });
+console.log(p);
+"#;
+
+#[test]
+fn px7_r5_inspect_hook_this_is_the_proxy() {
+    let (tops, held) = solve(HOOK);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+    let v = verdicts(HOOK, "a");
+    assert!(
+        v.iter().any(|s| s.contains("Proxy")),
+        "`this.a` in the hook sees the Proxy: {v:?}"
+    );
+}
+
+// K13: a get trap that throws: the formatter runs no trap (node prints the
+// target), so the log does not throw.
+#[test]
+fn px7_k13_throwing_get_trap_is_not_run() {
+    let src = r#"const N = String(process.argv[2]);
+const p: any = new Proxy({ a: N }, { get(): any { throw new Error("boom"); } });
+console.log(p);
+"#;
+    let (tops, held) = solve(src);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+// K14: a Proxy over an array: its elements are shown.
+#[test]
+fn px7_k14_proxy_over_an_array() {
+    let src = r#"const N = String(process.argv[2]);
+const p: any = new Proxy([N, N + "1"], {});
+console.log(p, p.length);
+"#;
+    let (tops, held) = solve(src);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+const PX9_MK: &str = r#"const N = String(process.argv[2]);
+function mk(): any {
+  const api: Record<string, unknown> = { item: (i: number): string => "i" + i };
+  return new Proxy(api, { get(t: any, k: any) { return k === "color" ? "c" + N : t[k]; } });
+}
+"#;
+
+// PROXY9 R6: a Proxy or `null` / `undefined`: reads, calls and stores are
+// trap sites (the nullish arm throws the TypeError).
+#[test]
+fn px9_r6_proxy_or_nullish_is_a_trap_site() {
+    let src = format!(
+        "{PX9_MK}const p: any = N === \"x\" ? null : N === \"y\" ? undefined : mk();
+try {{ p.color = N; console.log(p.color, p.item(1)); }} catch (e) {{ console.log((e as Error).message); }}
+"
+    );
+    for key in ["color", "item"] {
+        let v = verdicts(&src, key);
+        assert!(
+            !v.is_empty() && v.iter().all(|s| s == "ProxyTrap"),
+            "{key}: {v:?}"
+        );
+    }
+}
+
+// PROXY9 K15: a Proxy or an ordinary object stays mixed; a Proxy or a
+// string stays undecided by the trap rule.
+#[test]
+fn px9_k15_proxy_beside_an_object_stays_mixed() {
+    let src = format!(
+        "{PX9_MK}const o: any = N === \"x\" ? {{ color: \"o\" }} : mk();
+console.log(o.color);
+o.color = N;
+const q: any = N === \"y\" ? \"s\" : mk();
+console.log(q.item);
+"
+    );
+    let v = verdicts(&src, "color");
+    assert!(
+        !v.is_empty() && v.iter().all(|s| s != "ProxyTrap"),
+        "color: {v:?}"
+    );
+    let v = verdicts(&src, "item");
+    assert!(
+        !v.is_empty() && v.iter().all(|s| s != "ProxyTrap"),
+        "item: {v:?}"
+    );
+}
+
+// PROXY10 (RED on 7a7ed4e1bd: a Proxy as the KEY of a computed store degraded
+// to "E9 Proxy target (storeindexed)"). ToPropertyKey is ToPrimitive: the get
+// trap runs for `@@toPrimitive` and `toString`; the store uses the string.
+const KEY: &str = r#"const N = String(process.argv[2]);
+function mk(tag: string): any {
+  const api: Record<string, unknown> = { tag };
+  return new Proxy(api, {
+    get(t: any, key: any) { if (key === "toString") return () => "key" + String(t.tag); return t[key]; },
+  });
+}
+const p = mk("a" + N);
+const o: Record<string, string> = {};
+o[p] = "v" + N;
+const g: any = globalThis;
+g[p] = 7;
+console.log(Object.keys(o).join(","), o["keya" + N], g["keya" + N]);
+"#;
+
+#[test]
+fn px10_proxy_as_a_computed_store_key() {
+    let (tops, held) = solve(KEY);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+// KEEP: a called Proxy still takes the old path (E9), also when it is a
+// store key.
+#[test]
+fn px10_keep_called_proxy_key_stays_e9() {
+    let src = KEY.replace("g[p] = 7;", "g[p] = 7;\ntry { p(); } catch (e) {}");
+    let (tops, _) = solve(&src);
+    assert!(e9(&tops), "{tops:?}");
+}
+
+// PXSO1 R1: a Proxy whose target may be itself (one birth site in a loop):
+// the forward of each operation reaches the Proxy again. The operation
+// class is made once per Proxy (`ProxyOp`), so the forward joins it
+// instead of making a new trap call and forward without end (a stack
+// overflow on base).
+#[test]
+fn pxso1_r1_proxy_of_itself() {
+    let (tops, held) = solve(
+        r#"const h: any = { get(t: any, k: any) { return k === "z" ? 26 : t[k]; } };
+let x: any = { a: 1, b: "two" };
+for (let i = 0; i < 3; i++) x = new Proxy(x, h);
+console.log(x.a, x.b, x.z, "a" in x, process.argv[2]);
+x.c = 3;
+console.log(x.c, delete x.c, x.c);
+"#,
+    );
+    assert!(!e9(&tops) && !held, "{tops:?}");
+}
+
+// PXSO1 R2: the reads of a Proxy of itself are solved: `x` holds the
+// object and the Proxy (the mixed verdict), nothing escapes.
+#[test]
+fn pxso1_r2_get_of_proxy_of_itself() {
+    let src = r#"const h: any = { get(t: any, k: any) { return k === "z" ? 26 : t[k]; } };
+let x: any = { a: 1 };
+for (let i = 0; i < 3; i++) x = new Proxy(x, h);
+console.log(x.a, x.z, process.argv[2]);
+"#;
+    let (tops, held) = solve(src);
+    assert!(!e9(&tops) && !held, "{tops:?}");
+    let v = verdicts(src, "a");
+    assert!(
+        !v.is_empty() && v.iter().all(|v| !v.contains("E9") && !v.contains("escape")),
+        "{v:?}"
+    );
+}
+
+// PROXY11 (RED on 16c4381812: a Proxy serialized by JSON, or held by a
+// console argument the formatter's `%j` serializes, degraded to "E9 Proxy
+// target (implicit)"; the cube program's first ⊤, bloom's CSSStyleDeclaration
+// Proxy in an Element's `_style`). SerializeJSONProperty runs the Proxy's
+// internal methods: the `toJSON` [[Get]], [[OwnPropertyKeys]],
+// [[GetOwnProperty]] and the member [[Get]]s, each its trap or the target's.
+const JSONP: &str = r#"const N = String(process.argv[2]);
+function style(host: { tag: string }): any {
+  const api: Record<string, unknown> = { cssText: "a" + N, item: (i: number): string => "i" + i };
+  return new Proxy(api, {
+    get(t: any, key: any) { if (typeof key !== "string") return t[key]; if (key in api) return t[key]; return host.tag + key; },
+    set(t: any, key: any, v: any) { t[key] = String(v); return true; },
+    has(_t: any, key: any) { return typeof key === "string" && key in api; },
+  });
+}
+class El { tag = "div" + N; _style: any = null; get style(): any { if (this._style === null) this._style = style(this); return this._style; } }
+const e = new El();
+e.style.color = "red";
+console.log(e);
+console.log({ s: e.style, n: N });
+console.log(JSON.stringify(e.style), e.tag);
+"#;
+
+#[test]
+fn proxy11_json_of_a_proxy_runs_its_internal_methods() {
+    let (tops, held) = solve(JSONP);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+// A Proxy console argument itself: `%j`, ToPrimitive and the unwrapped show;
+// with `ownKeys` / `getOwnPropertyDescriptor` traps.
+#[test]
+fn proxy11_console_argument_proxy_with_key_traps() {
+    let src = r#"const N = String(process.argv[2]);
+const api: Record<string, unknown> = { a: "x" + N };
+const p: any = new Proxy(api, {
+  ownKeys(t: any) { return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t: any, k: any) { return { value: t[k], enumerable: true, configurable: true, writable: true }; },
+  get(t: any, k: any) { return k === "toJSON" ? undefined : t[k]; },
+});
+console.log(p);
+console.log(JSON.stringify([p, { q: p }]), N);
+"#;
+    let (tops, held) = solve(src);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+// KEEP: an operation the rule does not model (a call of the Proxy) still
+// takes the old path: its target is E9.
+#[test]
+fn proxy11_keep_called_proxy_stays_e9() {
+    let src = JSONP.replace(
+        "console.log(e);",
+        "console.log(e);\ntry { (e.style as any)(); } catch (x) {}",
+    );
+    let (tops, _) = solve(&src);
+    assert!(e9(&tops), "{tops:?}");
+}
+
+// PROXY12 (RED on 8742219af8: "E9 Proxy target (fieldtruthy)", the cube
+// program's next op on bloom's CSSStyleDeclaration Proxy). A truthiness or
+// Boolean test of a Proxy's field reads it by [[Get]] (the get trap or the
+// target) and runs no other trap.
+const TRUTHY: &str = r#"const N = String(process.argv[2]);
+function style(host: { tag: string }): any {
+  const api: Record<string, unknown> = { cssText: "a" + N, flag: N === "x" };
+  return new Proxy(api, {
+    get(t: any, key: any) { if (typeof key !== "string") return t[key]; if (key in api) return t[key]; return host.tag + key; },
+    set(t: any, key: any, v: any) { t[key] = String(v); return true; },
+  });
+}
+class El { tag = "div" + N; _style: any = null; get style(): any { if (this._style === null) this._style = style(this); return this._style; } }
+const e = new El();
+const s: any = N === "y" ? null : e.style;
+if (s && s.color) console.log(s.color);
+if (s && s.flag === true) console.log(s.cssText);
+if (s && !s.missing) console.log(s.tag);
+"#;
+
+#[test]
+fn proxy12_field_truthy_of_a_proxy() {
+    let (tops, held) = solve(TRUTHY);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
+}
+
+// KEEP: the same program with a call of the Proxy still takes the old path.
+#[test]
+fn proxy12_keep_called_proxy_stays_e9() {
+    let src = TRUTHY.replace(
+        "const e = new El();",
+        "const e = new El();\ntry { (e.style as any)(); } catch (x) {}",
+    );
+    let (tops, _) = solve(&src);
+    assert!(e9(&tops), "{tops:?}");
+}
+
+// PROXY12 R-PXKEYS (RED on the FieldTruthy head: "E9 Proxy target (implicit
+// OwnKeys: primitive container builtin)"): for-in, Object.keys and
+// Reflect.ownKeys of a Proxy run its ownKeys / getOwnPropertyDescriptor /
+// getPrototypeOf traps (or the target's own) and nothing else.
+#[test]
+fn proxy12_own_keys_of_a_proxy() {
+    let src = r#"const N = String(process.argv[2]);
+const api: Record<string, unknown> = { a: "x" + N, b: 2 };
+const p: any = new Proxy(api, {
+  ownKeys(t: any) { return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t: any, k: any) { return { value: t[k], enumerable: true, configurable: true, writable: true }; },
+  getPrototypeOf(_t: any) { return null; },
+  get(t: any, k: any) { return t[k]; },
+});
+const q: any = new Proxy({ c: N }, {});
+const out: string[] = [];
+for (const k in p) out.push(k);
+for (const k in q) out.push(k);
+console.log(out.join(","), Object.keys(p).length, Object.getOwnPropertyNames(q).length, Reflect.ownKeys(p).length);
+"#;
+    let (tops, held) = solve(src);
+    assert!(!e9(&tops), "no E9 unknown: {tops:?}");
+    assert!(!held, "realm not held: {tops:?}");
 }

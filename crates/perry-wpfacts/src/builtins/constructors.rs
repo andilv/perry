@@ -65,8 +65,10 @@ pub fn new_builtin_ns(m: &mut Model, ns: BuiltinNs, call: CallId) {
             let v = promise_value(m, p);
             if let Some(ex) = arg(m, call, 0) {
                 let res = resolver(m, call, v);
-                let thrown = m.thrown;
-                let rej = rejecter(m, thrown);
+                // R-JOBTHROW: the reject function and an abrupt executor
+                // completion reject this promise (27.2.3.1 steps 9-10).
+                let pr = super::promise_reason(m, p);
+                let rej = rejecter(m, pr);
                 let rn = m.node_l("resolver");
                 m.add_tok(rn, res);
                 let jn = m.node_l("rejecter");
@@ -84,7 +86,7 @@ pub fn new_builtin_ns(m: &mut Model, ns: BuiltinNs, call: CallId) {
                         spread: vec![],
                         ret,
                         site: call2,
-                        region: m.thrown,
+                        region: pr,
                     },
                     move |m, tg, call2| m.cons(tg, Cons::Call { call: call2 }),
                 );
@@ -144,9 +146,13 @@ pub fn new_builtin_ns(m: &mut Model, ns: BuiltinNs, call: CallId) {
             if let Some(&p) = c.arg(0) {
                 let wk = collections::WK_PREFIX;
                 string_methods::read_only(m, p, &format!("{wk}match"));
-                string_methods::read_prim(m, p, "source", "RegExp pattern source ToString");
-                string_methods::read_prim(m, p, "flags", "RegExp pattern flags ToString");
-                string_methods::to_prim(m, p, "RegExp pattern ToString");
+                // Step 4: a pattern with [[RegExpMatcher]] gives its
+                // [[OriginalSource]] / [[OriginalFlags]] (`Cons::NotRegExp`).
+                let q = m.node_l("RegExp pattern");
+                m.cons(p, Cons::NotRegExp { dst: q });
+                string_methods::read_prim(m, q, "source", "RegExp pattern source ToString");
+                string_methods::read_prim(m, q, "flags", "RegExp pattern flags ToString");
+                string_methods::to_prim(m, q, "RegExp pattern ToString");
             }
             if let Some(&f) = c.arg(1) {
                 string_methods::to_prim(m, f, "RegExp flags ToString");

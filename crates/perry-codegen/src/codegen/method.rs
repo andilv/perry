@@ -416,7 +416,7 @@ pub(super) fn compile_method(
         let flat_const_ids: std::collections::HashSet<u32> =
             cross_module.flat_const_arrays.keys().copied().collect();
         let m = crate::scope_env::compact_root_slots(
-            crate::collectors::collect_pointer_typed_locals(
+            cross_module.closure_writes.pointer_locals(
                 &method.params,
                 method_body,
                 &flat_const_ids,
@@ -684,6 +684,10 @@ pub(super) fn compile_method(
         reassigned_locals.remove(&method.params[index].id);
     }
     let mut ctx = FnCtx {
+        for_in_facts: Default::default(),
+        for_in_snapshots: Default::default(),
+        for_in_keys_locals: Default::default(),
+        for_in_lens: Default::default(),
         numeric_order_functions: cross_module.numeric_order_functions,
         numeric_order_closures: cross_module.numeric_order_closures,
         numeric_order_ready: Default::default(),
@@ -866,6 +870,7 @@ pub(super) fn compile_method(
         shadow_slot_clears_after_stmt,
         arena_state_slot: None,
         arena_state_lazy: false,
+        agent_block: None,
         class_keys_slots: HashMap::new(),
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
@@ -1761,6 +1766,7 @@ pub(super) fn compile_method(
     // #10812: throw a catchable RangeError before the native stack runs out.
     crate::expr::numeric_order::parameters_ready(&mut ctx, &method.params);
     let stack_guard_site = crate::expr::stack_guard::emit_stack_guard(&mut ctx);
+    crate::expr::agent_ptr::begin_activation(&mut ctx);
     super::facts_number_locals::emit_param_witnesses(&mut ctx, &facts_number_params);
     super::facts_rep::bind_params(&mut ctx, &facts_number_params);
     if !method.is_async && !method.is_generator {
@@ -1855,6 +1861,7 @@ pub(super) fn compile_method(
             ctx.block().ret(DOUBLE, &return_value);
         }
     }
+    crate::expr::agent_ptr::finish_activation(&mut ctx);
     crate::expr::stack_guard::finish_stack_guard(&mut ctx, stack_guard_site);
     let artifacts = take_lowered_fn_artifacts(&mut ctx);
     drop(ctx);

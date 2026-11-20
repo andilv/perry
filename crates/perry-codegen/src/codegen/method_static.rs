@@ -78,7 +78,9 @@ pub(in crate::codegen) fn compile_static_method(
         let flat_const_ids: std::collections::HashSet<u32> =
             cross_module.flat_const_arrays.keys().copied().collect();
         let m = crate::scope_env::compact_root_slots(
-            crate::collectors::collect_pointer_typed_locals(&f.params, &f.body, &flat_const_ids),
+            cross_module
+                .closure_writes
+                .pointer_locals(&f.params, &f.body, &flat_const_ids),
             &cross_module.scope_map,
         );
         lf.enable_shadow_frame(m.len() as u32 + 1);
@@ -249,6 +251,10 @@ pub(in crate::codegen) fn compile_static_method(
     };
 
     let mut ctx = FnCtx {
+        for_in_facts: Default::default(),
+        for_in_snapshots: Default::default(),
+        for_in_keys_locals: Default::default(),
+        for_in_lens: Default::default(),
         numeric_order_functions: cross_module.numeric_order_functions,
         numeric_order_closures: cross_module.numeric_order_closures,
         numeric_order_ready: Default::default(),
@@ -434,6 +440,7 @@ pub(in crate::codegen) fn compile_static_method(
         shadow_slot_clears_after_stmt,
         arena_state_slot: None,
         arena_state_lazy: false,
+        agent_block: None,
         class_keys_slots: HashMap::new(),
         class_shape_slots: HashMap::new(),
         class_header_images: HashMap::new(),
@@ -592,6 +599,10 @@ pub(in crate::codegen) fn compile_static_method(
     // #10812: throw a catchable RangeError before the native stack runs out.
     crate::expr::numeric_order::parameters_ready(&mut ctx, &f.params);
     let stack_guard_site = crate::expr::stack_guard::emit_stack_guard(&mut ctx);
+    crate::expr::agent_ptr::begin_activation(&mut ctx);
+    if !f.is_async && !f.is_generator && !generator_owner {
+        ctx.method_home_local = crate::expr::super_method::elided_method_home(&ctx, &f.body);
+    }
     if f.is_async {
         stmt::lower_async_rejecting_stmts(&mut ctx, &f.body).with_context(|| {
             format!("lowering async body of static '{}::{}'", class.name, f.name)
@@ -613,6 +624,7 @@ pub(in crate::codegen) fn compile_static_method(
             ctx.block().ret(DOUBLE, &undef);
         }
     }
+    crate::expr::agent_ptr::finish_activation(&mut ctx);
     crate::expr::stack_guard::finish_stack_guard(&mut ctx, stack_guard_site);
     let artifacts = take_lowered_fn_artifacts(&mut ctx);
     drop(ctx);

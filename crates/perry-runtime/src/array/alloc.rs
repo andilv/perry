@@ -205,6 +205,69 @@ pub(crate) fn js_array_alloc_named_props_reserved(
     }
 }
 
+/// A fresh array whose element layout is born tag-scanned
+/// (`GC_LAYOUT_UNKNOWN`, the zero layout state of a fresh header): the caller
+/// writes value words of any kind into `[0, n)` with nothing allocating in
+/// between, then publishes `length = n`. No layout rebuild, no raw-f64 flag
+/// to revoke. Slack holds the hole.
+pub(crate) fn js_array_alloc_tag_scanned(capacity: u32) -> *mut ArrayHeader {
+    let actual_capacity = array_capacity_or_throw(capacity.max(MIN_ARRAY_CAPACITY));
+    let ptr = arena_alloc_gc(
+        array_byte_size(actual_capacity as usize),
+        8,
+        crate::gc::GC_TYPE_ARRAY,
+    ) as *mut ArrayHeader;
+    unsafe {
+        (*ptr).length = 0;
+        (*ptr).capacity = actual_capacity;
+        (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
+        fill_fresh_capacity_with_holes(ptr);
+    }
+    ptr
+}
+
+/// [`js_array_alloc_tag_scanned`] through the birth that cannot collect
+/// (`arena_alloc_gc_no_collect`): null on a refusal, and nothing has collected
+/// then either. The capacity is NOT filled: the caller writes its prefix and
+/// fills the rest with [`fill_capacity_with_holes_from`] before anything can
+/// allocate or collect.
+#[inline(always)]
+pub(crate) fn js_array_try_alloc_tag_scanned_unfilled(capacity: u32) -> *mut ArrayHeader {
+    let actual_capacity = array_capacity_or_throw(capacity.max(MIN_ARRAY_CAPACITY));
+    let ptr = crate::arena::arena_alloc_gc_no_collect(
+        array_byte_size(actual_capacity as usize),
+        8,
+        crate::gc::GC_TYPE_ARRAY,
+    ) as *mut ArrayHeader;
+    if ptr.is_null() {
+        return ptr;
+    }
+    unsafe {
+        (*ptr).length = 0;
+        (*ptr).capacity = actual_capacity;
+        (*ptr).named = std::ptr::null_mut();
+        (*ptr).ek_prefix = 0;
+        (*ptr).ek_kind = 0;
+    }
+    ptr
+}
+
+/// Fills elements `from..capacity` of a just-born array with the hole.
+///
+/// # Safety
+/// `ptr` is a fresh array nothing else references yet.
+#[inline(always)]
+pub(crate) unsafe fn fill_capacity_with_holes_from(ptr: *mut ArrayHeader, from: u32) {
+    let elements = crate::array::array_elements_ptr(ptr as *const ArrayHeader) as *mut u64;
+    for i in from as usize..(*ptr).capacity as usize {
+        // GC_STORE_AUDIT(INIT): a just-allocated array nothing references yet,
+        // written with a non-pointer sentinel: no old value, no edge, no barrier.
+        std::ptr::write(elements.add(i), crate::value::TAG_HOLE);
+    }
+}
+
 /// Allocate a fresh array whose initialized prefix is known to contain only
 /// heap pointers. Runtime producers such as `String.prototype.split` use this
 /// instead of starting as a raw-f64 array and immediately invalidating that
@@ -912,7 +975,6 @@ pub extern "C" fn js_array_from_values(values: *const f64, n: u32) -> *mut Array
     if values.is_null() || n == 0 {
         return arr;
     }
-    let parent = arr as u64;
     let elems = unsafe { crate::array::array_elements_ptr(arr as *const ArrayHeader) as *mut f64 };
     // The birth row of EK §3.1: P = the leading run of non-hole values.
     let mut run = n;
@@ -927,16 +989,41 @@ pub extern "C" fn js_array_from_values(values: *const f64, n: u32) -> *mut Array
         // stored element. No-op for SSO / non-string. (This outline path doesn't
         // funnel through `note_array_slot`.)
         crate::string::js_string_addref_if_heap_string(v);
-        // GC_STORE_AUDIT(BARRIERED): element store immediately followed by the
-        // slot layout note + write barrier below, identical to the inline
-        // array-literal element store via emit_jsvalue_slot_store_on_block.
+        // GC_STORE_AUDIT(BARRIERED): newborn element stores, published below
+        // by `publish_newborn_elements` (one layout decision and the newborn
+        // barrier) before anything can allocate.
         unsafe { core::ptr::write(slot, v) };
-        let vbits = v.to_bits();
-        crate::gc::js_gc_note_slot_layout(parent, i as u32, vbits);
-        crate::gc::js_write_barrier_slot(parent, slot as u64, vbits);
     }
-    unsafe { super::ek_set_prefix(arr, (*arr).ek_prefix, run) };
+    unsafe {
+        publish_newborn_elements(arr, n as usize);
+        super::ek_set_prefix(arr, (*arr).ek_prefix, run)
+    };
     arr
+}
+
+/// The layout and barrier of elements `0..n` of `arr`, a newborn from
+/// [`js_array_alloc_literal`] (`length == n`, pointer-free birth layout, no
+/// element-shape proof) whose slots were all written with nothing allocated
+/// since its birth: the state the per-slot `js_gc_note_slot_layout` +
+/// `js_write_barrier_slot` sequence reaches, decided once. A pointer-bearing
+/// element weakens the payload to the tag scan (and clears the numeric
+/// sub-flags, as its first slot note would); the newborn barrier then
+/// remembers or shades what the parent's generation and an incremental cycle
+/// require (the closure births' rule). An all-scalar payload stays
+/// pointer-free, which every slot note would have left it.
+///
+/// # Safety
+/// As stated: `arr` is that newborn and no collection ran since its birth.
+pub(crate) unsafe fn publish_newborn_elements(arr: *mut ArrayHeader, n: usize) {
+    let elems = crate::array::array_elements_ptr(arr as *const ArrayHeader) as *const u64;
+    if !(0..n).any(|i| crate::gc::layout_pointer_bearing_bits(*elems.add(i))) {
+        return;
+    }
+    crate::array::clear_array_numeric_layout_ptr(arr as usize);
+    crate::gc::layout_mark_unknown(arr as *mut u8);
+    if crate::gc::newborn_parent_needs_barrier(arr as usize) {
+        crate::gc::runtime_write_barrier_newborn_slots(arr as usize, elems, n);
+    }
 }
 
 /// Descriptor tag bytes for [`js_value_from_const_descriptor`]. MUST match the

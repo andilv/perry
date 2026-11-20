@@ -83,6 +83,7 @@ mod shift_queue_tests;
 #[cfg(test)]
 mod small_capacity_tests;
 mod sort;
+pub(crate) use sort::ScratchWorkspace;
 mod sort_numeric;
 pub use sort_numeric::{js_array_sort_key_order, js_array_sort_numeric_order};
 #[cfg(test)]
@@ -97,6 +98,7 @@ mod storage;
 mod tagged_template_tests;
 pub use storage::array_elements_ptr;
 pub(crate) use storage::{array_front_offset, array_physical_capacity, array_truncate_length};
+pub(crate) mod plain_elements;
 mod subclass;
 pub(crate) mod subclass_elements;
 pub(crate) mod subclass_init;
@@ -145,9 +147,10 @@ mod tests;
 mod typed_array_receiver_tests;
 
 pub(crate) use self::alloc::{
-    array_length_range_error, js_array_alloc_canonical_keys, js_array_alloc_key_list,
-    js_array_alloc_key_list_reserved, js_array_alloc_pointer_elements,
-    js_array_alloc_with_length_exact,
+    array_length_range_error, fill_capacity_with_holes_from, js_array_alloc_canonical_keys,
+    js_array_alloc_key_list, js_array_alloc_key_list_reserved, js_array_alloc_pointer_elements,
+    js_array_alloc_tag_scanned, js_array_alloc_with_length_exact,
+    js_array_try_alloc_tag_scanned_unfilled, publish_newborn_elements,
 };
 pub use self::alloc::{
     js_array_alloc, js_array_alloc_literal, js_array_alloc_with_length,
@@ -270,7 +273,8 @@ pub use self::iter_object::{
 };
 pub(crate) use self::iterator::iter_bt_dump;
 pub(crate) use self::iterator::{
-    entries_array_for_small_handle_value, is_builtin_iterator_class_id, spread_values,
+    entries_array_for_small_handle_value, intrinsic_array_like_iteration,
+    is_builtin_iterator_class_id, spread_values,
 };
 pub use self::iterator::{
     js_array_spread_append, js_array_spread_append_iterator, js_for_of_to_array,
@@ -290,9 +294,10 @@ pub(crate) use self::prototype_addr::{
     array_prototype_addr, array_prototype_addr_if_resolved, forget_object_prototype_intrinsic,
     function_prototype_addr, intrinsic_constructor_addr, intrinsic_constructor_addr_if_bound,
     intrinsic_prototype_addr, intrinsic_prototype_addr_if_bound, note_object_prototype_intrinsic,
-    note_realm_intrinsic, object_prototype_addr, object_prototype_addr_if_resolved,
-    object_prototype_addr_matches, object_prototype_cell, prime_prototype_addr_cache,
-    primitive_wrapper_prototype_addr, RealmIntrinsics,
+    note_realm_array_values, note_realm_intrinsic, note_realm_restricted_callee_pair,
+    object_prototype_addr, object_prototype_addr_if_resolved, object_prototype_addr_matches,
+    object_prototype_cell, prime_prototype_addr_cache, primitive_wrapper_prototype_addr,
+    realm_array_values_addr, realm_restricted_callee_pair_addr, RealmIntrinsics,
 };
 #[cfg(test)]
 pub(crate) use self::prototype_addr::{

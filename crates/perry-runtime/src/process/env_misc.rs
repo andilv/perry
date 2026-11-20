@@ -169,6 +169,7 @@ static KEEP_PROCESS_RUN_EXIT_SEQUENCE: extern "C" fn() = js_process_run_exit_seq
 fn terminate_without_atexit(exit_code: i32) -> ! {
     #[cfg(any(unix, windows))]
     crate::source_read_count::report_before_immediate_exit();
+    crate::object::layout_desc::family_diag_report_before_immediate_exit();
     // Use _exit() instead of std::process::exit() to avoid SIGILL during cleanup.
     // std::process::exit() runs atexit handlers and C++ destructors which can trigger
     // illegal instructions when exception handler state (jmp_buf), GC roots, or
@@ -1465,10 +1466,17 @@ fn env_name_is_settable(name: &str) -> bool {
 
 /// Refresh only the current agent's cached mirror. Native strings are copied
 /// before any allocation; neither the backing lock nor a TLS borrow spans GC.
+#[inline]
 pub(crate) fn refresh_process_env(value: f64) -> f64 {
     if env_cache_mutation_active() || !is_process_env_object(value) {
         return value;
     }
+    refresh_process_env_object(value)
+}
+
+/// [`refresh_process_env`] of the `process.env` object itself.
+#[inline(never)]
+fn refresh_process_env_object(value: f64) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let object = scope.root_nanbox_f64(value);
     let vars: Vec<_> = super::environment::current()

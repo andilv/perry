@@ -26,6 +26,7 @@ pub(crate) use own_guard::Region;
 mod primitives;
 mod private_methods;
 mod proto_first;
+mod record_steps;
 mod shared_closures;
 mod view;
 mod walk;
@@ -131,7 +132,9 @@ pub(crate) struct ModInfo {
     pub scope: FxHashMap<String, NodeId>,
     pub ns_tok: Tok,
     pub site_counter: u32,
-    pub iterres: FxHashMap<FnIdx, NodeId>,
+    /// A plain-async step's iter-result slot, per function and `done` flag
+    /// of its writes (`Gen::iter_res_node`).
+    pub iterres: FxHashMap<(FnIdx, bool), NodeId>,
     pub iterout: FxHashMap<FnIdx, NodeId>,
     /// Per for-of loop (its value local): what its step yields
     /// (`Gen::step_yield_node`).
@@ -161,6 +164,12 @@ pub(crate) enum PendingWalk<'a> {
 pub struct Gen<'a> {
     pub m: Model,
     pub(crate) diagnostic: Option<crate::diagnostics::Capture>,
+    /// The output node of the `iteratorStep` whose arguments are being
+    /// generated: what the `iteratorStepOutput` among them reads.
+    pub(crate) step_out: Option<NodeId>,
+    /// The function whose `if (IterResultGetDone)` arm is being walked:
+    /// the `IterResultGetValue` there reads the slot a `return` wrote.
+    pub(crate) iter_done_arm: Option<FnIdx>,
     pub modules: Vec<(&'a str, &'a Module)>,
     pub(crate) mods: Vec<ModInfo>,
     pub path_index: FxHashMap<String, u32>,
@@ -171,6 +180,8 @@ pub struct Gen<'a> {
     /// literal's computed own key (`Cons::OwnComputedKey`).
     pub(crate) prop_key_of: FxHashMap<NodeId, NodeId>,
     pub thrown: NodeId,
+    /// The plain-async step closures and their error carriers (`StepSplits`).
+    pub(crate) step: StepSplits,
     /// The realm error a failed runtime operation throws (`Model::runtime_error`,
     /// held by `thrown`), for a site that throws it into its own region.
     pub runtime_error: Tok,
@@ -187,6 +198,8 @@ pub struct Gen<'a> {
     pub store_sites: Vec<ReadSite>,
     /// The folded method nodes that have a site (`method_sites`).
     pub(crate) folded_sites: Vec<FoldedSite>,
+    /// NDISP2: every HIR-specialized member op (`member_ops`).
+    pub(crate) member_ops: Vec<crate::member_ops::MemberOp>,
     pub(crate) element_sites: Vec<ElementSite>,
     /// `(module, element_offset, value node)` of every `IndexGet` copy
     /// (`canonical_numbers`, P3 B1).
@@ -312,6 +325,14 @@ pub struct Gen<'a> {
     /// While a for-of binding is walked (`Gen::stmts`): its value local
     /// reads the value the loop's `arrayRecordForValue` just wrote.
     pub(crate) for_binding: Option<(u32, u32, NodeId)>,
+    /// Rule RP1 (`gen/record_steps.rs`): the address of the arguments of
+    /// each positional `arrayRecordIndex(c)` step read, with its index.
+    pub(crate) record_steps: FxHashMap<usize, u32>,
+    /// Rule RP2: the (module, local) of each guarded iterator record
+    /// source (`arrayRecordNeedsIterator(s = s)`) and payload
+    /// (`arrayRecordPayload(.., p = ..)`), whose protocol arm never sees a
+    /// held Array (`Cons::RecordEntry`).
+    pub(crate) record_locals: crate::pts::FxHashSet<(u32, u32)>,
     /// The (module, local, value node, `Fx::guard`) of the last local
     /// write walked (`narrow::Gen::narrow_assigned`).
     pub(crate) last_local_set: Option<(u32, u32, NodeId, Option<(NodeId, u8)>)>,
@@ -559,6 +580,26 @@ pub struct Gen<'a> {
     pub(crate) param_calls: FxHashMap<u32, param_key::ParamCalls<'a>>,
 }
 
+/// A plain-async step closure `(__step_value, __step_is_error)` resumes its
+/// body with a normal completion (`__step_is_error` false: the awaited value,
+/// 27.7.5.3 Await step 3, `gen.next(v)`) or with a throw completion (true: the
+/// awaited promise's reason, step 5, `gen.throw(e)`). One parameter carries
+/// both at run time; the solve keeps them apart: the value carrier is the
+/// parameter, the error carrier is one node per step, read wherever
+/// `__step_value` is read under `if (__step_is_error)` and written by every
+/// resume with `true` (`AsyncStepChain`'s reason, `__step_self(e, true)`).
+#[derive(Default)]
+pub(crate) struct StepSplits {
+    /// (module, `__step_value`) -> the step's error carrier.
+    pub(crate) by_value: FxHashMap<(u32, u32), NodeId>,
+    /// (module, `__step_is_error`) -> its `__step_value`.
+    pub(crate) by_flag: FxHashMap<(u32, u32), u32>,
+    /// (module, `__step_self`) -> the step's error carrier.
+    pub(crate) by_self: FxHashMap<(u32, u32), NodeId>,
+    /// The error arms being walked, innermost last: (module, `__step_value`).
+    pub(crate) arms: Vec<(u32, u32)>,
+}
+
 /// Per-function walking context.
 #[derive(Clone)]
 pub(crate) struct Fx {
@@ -637,6 +678,10 @@ impl<'a> Gen<'a> {
         let mut m = Model::default();
         m.cur_fn = NO_FN;
         m.explain = explain;
+        if crate::hold_ledger::on() {
+            m.explain = true;
+            m.ledger = Some(crate::hold_ledger::HoldLedger::new());
+        }
         m.cur_src = NO_NODE;
         m.cur_why = u32::MAX;
         m.rel_phase = b'G';
@@ -701,6 +746,10 @@ impl<'a> Gen<'a> {
         let r = m.reason("thrown into unknown code");
         m.sink_node(esc, r);
         m.esc_raise = esc;
+        let host = m.node_l("HOSTREPORT");
+        crate::builtins::host_report_readers(&mut m, host);
+        m.host_report = host;
+        m.process_event = m.node_l("PROCEVENT");
         let acc = m.node_l("ESCACCESSORS");
         let r = m.reason("accessor function of a value unknown code holds");
         m.sink_node(acc, r);
@@ -725,6 +774,8 @@ impl<'a> Gen<'a> {
         Gen {
             m,
             diagnostic: None,
+            step_out: None,
+            iter_done_arm: None,
             modules,
             mods: Vec::new(),
             path_index,
@@ -732,6 +783,7 @@ impl<'a> Gen<'a> {
             export_resolving: Default::default(),
             prop_key_of: FxHashMap::default(),
             thrown,
+            step: StepSplits::default(),
             runtime_error: rterr,
             cjs_registry,
             cjs_paths: Default::default(),
@@ -739,6 +791,7 @@ impl<'a> Gen<'a> {
             read_sites: Vec::new(),
             store_sites: Vec::new(),
             folded_sites: Vec::new(),
+            member_ops: Vec::new(),
             element_sites: Vec::new(),
             element_values: Vec::new(),
             field_reads: Vec::new(),
@@ -787,6 +840,8 @@ impl<'a> Gen<'a> {
             effect_bad: Default::default(),
             binding_writes: FxHashMap::default(),
             for_binding: None,
+            record_steps: Default::default(),
+            record_locals: Default::default(),
             last_local_set: None,
             narrow: Vec::new(),
             def_collect: Vec::new(),
@@ -1002,6 +1057,7 @@ impl<'a> Gen<'a> {
                     let t = self.m.tok(TokKind::Builtin(BuiltinNs::GlobalThis));
                     let what = format!("module {} runs unseen", imp.source);
                     crate::builtins::note_native_write(&mut self.m, t, None, &what);
+                    self.m.unseen_module_runs = true;
                     crate::builtins::note_global_in_top(&mut self.m);
                 }
                 for spec in &imp.specifiers {

@@ -25,7 +25,7 @@
 //! per-site state, no name classification, and no second copy of the fact.
 
 use crate::block::LlBlock;
-use crate::types::{I1, I32, I64};
+use crate::types::{I1, I64};
 
 pub(crate) use perry_abi::BuiltinProto;
 
@@ -59,9 +59,8 @@ pub(crate) fn emit_prototype_written(
 
 /// The shadow bit of the agent's intrinsic prototype of `family`.
 fn emit_shadow_bit(ctx: &mut crate::expr::FnCtx<'_>, family: BuiltinProto) -> String {
-    let end = (crate::runtime_abi::LAYOUT_ORDINARY_END as i32).to_string();
     let word = crate::expr::agent_ptr::emit_intrinsic_shadow_word(ctx, family as usize);
-    ctx.block().icmp_uge(I32, &word, &end)
+    crate::proto_constants::emit_word_patched(ctx.block(), &word)
 }
 
 /// Unlikely, and said so: a guard's generic arm must not cost the function's
@@ -97,9 +96,8 @@ pub(crate) fn emit_namespace_patched(ctx: &mut crate::expr::FnCtx<'_>, ns: &str)
     let Some(family) = crate::runtime_abi::builtin_namespace_family(ns) else {
         return "true".to_string();
     };
-    let end = (crate::runtime_abi::LAYOUT_ORDINARY_END as i32).to_string();
     let word = crate::expr::agent_ptr::emit_intrinsic_shadow_word(ctx, family);
-    let patched = ctx.block().icmp_uge(I32, &word, &end);
+    let patched = crate::proto_constants::emit_word_patched(ctx.block(), &word);
     ctx.block()
         .call(I1, "llvm.expect.i1", &[(I1, &patched), (I1, "false")])
 }
@@ -118,25 +116,7 @@ fn guarded_member(generic: &perry_hir::Expr) -> Option<&str> {
     }
 }
 
-/// The callee `globalThis.<ns>.<member>` of a namespace pair's generic call
-/// (`patched_builtin_call::dynamic_member_call`), spread or not.
-fn pair_callee<'e>(ns: &str, generic: &'e perry_hir::Expr) -> Option<&'e perry_hir::Expr> {
-    use perry_hir::Expr;
-    let (Expr::Call { callee, .. } | Expr::CallSpread { callee, .. }) = generic else {
-        return None;
-    };
-    let Expr::PropertyGet { object, .. } = callee.as_ref() else {
-        return None;
-    };
-    match object.as_ref() {
-        Expr::PropertyGet {
-            object: g,
-            property,
-            ..
-        } if matches!(g.as_ref(), Expr::GlobalThisExpr) && property == ns => Some(callee.as_ref()),
-        _ => None,
-    }
-}
+use perry_hir::namespace_pairs::pair_callee;
 
 /// A guarded call's generic arm `globalThis.<ns>.<member>(args…)` without
 /// spread: its family, member and arguments.
@@ -265,7 +245,7 @@ pub(crate) fn native_member_site_proven(
     callee: &perry_hir::Expr,
 ) -> bool {
     matches!(callee, perry_hir::Expr::PropertyGet { byte_offset, .. }
-        if *byte_offset != 0 && native_member_calls.contains(byte_offset))
+        if perry_hir::namespace_pairs::intrinsic_selected(*byte_offset, native_member_calls))
 }
 
 /// `console.<member>(args...)` as the real call: read `globalThis.console`
@@ -549,7 +529,8 @@ pub(crate) fn array_entry(method: &str, argc: usize) -> Option<String> {
 /// The builtin methods a method site on an unproven receiver calls directly
 /// (runtime `object/builtin_method.rs`): `(name, argc, families)`, where
 /// `families` is the set of builtin kinds whose intrinsic prototype holds
-/// `name` as that builtin (1 String, 2 Array, 4 Map, 8 Set, 16 Function).
+/// `name` as that builtin (1 String, 2 Array, 4 Map, 8 Set, 16 Function,
+/// 32 a Buffer or `Uint8Array` byte cell).
 /// `js_bm_<name><argc>(site, recv, key, method_id, args…)` proves the
 /// receiver's kind and `Pristine` of its family and calls the body; any other
 /// receiver takes the universal dispatcher with the same operands.
@@ -574,6 +555,9 @@ pub(crate) const BUILTIN_METHODS: &[(&str, usize, u8)] = &[
     ("concat", 0, 1),
     ("concat", 1, 1),
     ("concat", 2, 1),
+    ("copyWithin", 1, 32),
+    ("copyWithin", 2, 32),
+    ("copyWithin", 3, 32),
     ("delete", 1, 12),
     ("endsWith", 0, 1),
     ("endsWith", 1, 1),

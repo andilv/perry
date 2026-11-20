@@ -17,6 +17,9 @@ mod tests;
 use format::{Cell, Image, Stop, Val, Word};
 use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
 
+// ELF linker-defined symbols. Off Linux no image is captured (`begin` and
+// `cut` are Linux x86_64 only), so `build` sees empty ranges there.
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     static __data_start: u8;
     static _end: u8;
@@ -48,6 +51,8 @@ pub(crate) struct Baseline {
     /// Shape records and counters, and the next class-template token, at the baseline.
     shapes: crate::object::shapes::SnapShapeState,
     token: u64,
+    /// The canonical trie at the baseline.
+    canon: crate::object::canonical_keys::snap_image::CanonBaseline,
 }
 
 static BASELINE: AtomicPtr<Baseline> = AtomicPtr::new(std::ptr::null_mut());
@@ -112,6 +117,7 @@ pub extern "C" fn js_snap_image_begin(
         claims: Vec::new(),
         shapes: crate::object::shapes::snap_image_shape_state(),
         token: crate::object::field_get_set::snap_image_next_token(),
+        canon: crate::object::canonical_keys::snap_image::snap_image_canon_baseline(),
     });
     BASELINE.store(Box::into_raw(b), Relaxed);
 }
@@ -331,11 +337,22 @@ fn cell_headers() -> Vec<usize> {
 pub(crate) fn build(base: Option<&Baseline>, pre: Vec<(usize, usize)>, live: bool) -> Image {
     use crate::gc::{GcHeader, GC_HEADER_SIZE};
     let mut headers = cell_headers();
+    // The shape records minted since the baseline name their key lists and prototypes, and
+    // the trie names the backings of its new and changed nodes: the state at the cut holds
+    // them even where no live object does, so they are roots of the mark.
+    let mut mint = base.map(|b| crate::object::shapes::snap_image_mint_collect(&b.shapes));
     if live {
-        headers = mark_live(headers, crate::gc::image_visit_roots);
+        headers = mark_live(headers, |v| {
+            crate::gc::image_visit_roots(v);
+            if let (Some(b), Some(m)) = (base, &mint) {
+                mint_roots(m, v);
+                crate::object::canonical_keys::snap_image::snap_image_canon_words(&b.canon, v);
+            }
+        });
     }
     let mut maps = pre;
     maps.extend(read_maps());
+    #[cfg(target_os = "linux")]
     let sect = |lo: &u8, hi: &u8| (lo as *const u8 as usize, hi as *const u8 as usize);
     // SAFETY: linker-defined section bounds.
     let w = unsafe {
@@ -350,12 +367,18 @@ pub(crate) fn build(base: Option<&Baseline>, pre: Vec<(usize, usize)>, live: boo
                     )
                 })
                 .collect(),
+            #[cfg(target_os = "linux")]
             sections: [
                 sect(&__start_perry_strings, &__stop_perry_strings),
                 sect(&__start_perry_layouts, &__stop_perry_layouts),
                 sect(&__start_perry_atoms, &__stop_perry_atoms),
             ],
+            #[cfg(not(target_os = "linux"))]
+            sections: [(0, 0); 3],
+            #[cfg(target_os = "linux")]
             exe: sect(&__executable_start, &_end),
+            #[cfg(not(target_os = "linux"))]
+            exe: (0, 0),
             tls: base.map_or((0, 0), |b| (b.tls.0, b.tls.0 + b.tls.1.len())),
             maps: merged(maps),
             sym: crate::symbol::snap_image_space(),
@@ -500,7 +523,26 @@ pub(crate) fn build(base: Option<&Baseline>, pre: Vec<(usize, usize)>, live: boo
                 &b.shapes,
                 &crate::object::shapes::snap_image_shape_state(),
             );
-            img.mint = crate::object::shapes::snap_image_mint_collect(&b.shapes);
+            img.mint = mint.take().unwrap_or_default();
+            let mint_notes = mint_capture(
+                &w,
+                &mut img.mint,
+                b.data.0,
+                &b.data.1,
+                &b.pre_data,
+                &b.shapes,
+            );
+            // A torn-down trie leaves the record out: the replay needs it, so the image stops.
+            // The addresses the record names, with their image form, for the replay check.
+            let mut named: Vec<(Val, usize)> = Vec::new();
+            let canon = crate::object::canonical_keys::snap_image::snap_image_canon_capture(
+                &b.canon,
+                &mut |a| {
+                    let v = w.val(a as u64).unwrap_or_else(Val::Opaque);
+                    named.push((v.clone(), a));
+                    v
+                },
+            );
             let mint_stop = mint_stop(&delta, &img.mint);
             let (pending, stops) = completeness(
                 delta,
@@ -510,6 +552,20 @@ pub(crate) fn build(base: Option<&Baseline>, pre: Vec<(usize, usize)>, live: boo
             img.pending = pending;
             img.stops.extend(stops);
             img.stops.extend(mint_stop);
+            // A record keying a canonical list needs the canonical-keys record, which replays
+            // its node: the stop stands only where the record is left out.
+            let held = canon.is_some();
+            img.stops.extend(
+                mint_notes
+                    .into_iter()
+                    .filter(|s| !(held && s.kind == format::STOP_MINT_CANONICAL)),
+            );
+            if let Some((canon, canon_stops)) = canon {
+                img.stops.extend(canon_stops);
+                img.stops.push(canon_stop(&canon));
+                img.stops.push(canon_replay_stop(&b.canon, &canon, named));
+                img.canon = Some(canon);
+            }
             img.registry = registry_record(&w, &mut img.stops);
         }
         None => img.pending = format::PENDING,
@@ -607,6 +663,74 @@ fn mark_live(headers: Vec<usize>, roots: impl FnOnce(&mut dyn FnMut(u64))) -> Ve
         .collect()
 }
 
+/// The words a mint record references: its key list and the content of its prototype slot.
+fn mint_roots(recs: &[format::MintRec], v: &mut dyn FnMut(u64)) {
+    for r in recs {
+        if r.keys != 0 {
+            v(r.keys);
+        }
+        if r.proto_cell != 0 {
+            // SAFETY: the slot of the prototype identity words, a live allocation of the shape table.
+            v(unsafe { std::ptr::read_volatile(r.proto_cell as usize as *const u64) });
+        }
+    }
+}
+
+/// The canonical-keys record is written and read back: the stop that reports its size and
+/// node counts.
+fn canon_stop(c: &format::CanonRec) -> Stop {
+    let blob = format::canon_blob(c);
+    let same = format::parse_canon_blob(&blob)
+        .is_some_and(|(back, used)| used == blob.len() && back == *c);
+    Stop {
+        cell: u32::from(!same),
+        obj_type: 0,
+        kind: format::STOP_CANON_RECORD,
+        off: blob.len() as u32,
+        value: c.new.len() as u64 | (c.changed.len() as u64) << 32,
+    }
+}
+
+/// The canonical-keys record as the file holds it, replayed into a trie rebuilt from the
+/// baseline and compared with the trie at the cut: the stop that reports the outcome.
+fn canon_replay_stop(
+    b: &crate::object::canonical_keys::snap_image::CanonBaseline,
+    c: &format::CanonRec,
+    named: Vec<(Val, usize)>,
+) -> Stop {
+    use crate::object::canonical_keys::snap_image as ck;
+    // The replay overwrites its thread's trie: it runs on a thread of its own, which owns a
+    // copy of the baseline, the record and the address list. The builder's spawn carries no
+    // panic site (a scope would bring one, with this file's location string, into every
+    // binary that links the image module); a failed spawn or a panicked replay is an error.
+    let check = format::parse_canon_blob(&format::canon_blob(c)).and_then(|(back, _)| {
+        let base = b.copy();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let addr = |v: &Val| match v {
+                    Val::Scalar(x) => *x as usize,
+                    _ => named.iter().find(|n| n.0 == *v).map_or(0, |n| n.1),
+                };
+                ck::snap_image_canon_replay_apart(&base, &back, &addr)
+            })
+            .ok()?;
+        let replayed = worker.join().ok().flatten()?;
+        ck::snap_image_canon_check(replayed)
+    });
+    let first = match check {
+        Some(Ok(())) => None,
+        Some(Err(e)) => Some(e.node),
+        None => Some(u32::MAX),
+    };
+    Stop {
+        cell: u32::from(first.is_some()),
+        obj_type: 0,
+        kind: format::STOP_CANON_REPLAY,
+        off: first.unwrap_or(0),
+        value: u64::from(c.cut_len),
+    }
+}
+
 /// The mint record of the shape records minted since the baseline is written (as the file
 /// holds it) and a table rebuilt from it is compared with the live one: the stop that
 /// reports its size, or the first record whose rebuilt form differs.
@@ -622,7 +746,12 @@ fn mint_stop(
         .map(|b| b.0)
         .unwrap_or_default();
     let bad = if back.len() == recs.len() {
-        crate::object::shapes::snap_image_mint_check(&back)
+        // The references are added after the live record is read: the check compares the rest.
+        let mut plain = Vec::new();
+        for r in &back {
+            plain.push(format::mint_without_refs(r));
+        }
+        crate::object::shapes::snap_image_mint_check(&plain)
     } else {
         Some((back.len().min(recs.len()), format::MINT_BAD_FIELDS))
     };
@@ -647,6 +776,242 @@ fn mint_stop(
     stop.off = sat(m[1]) | sat(m[3]) << 16;
     stop.value = recs.len() as u64 | (blob.len() as u64) << 32;
     Some(stop)
+}
+
+/// A reference to a word that is valid in the relinked binary: an image cell or binary data. A scalar
+/// is accepted when it is zero, or when `scalar_any` (a word that is not an address, such as a tagged
+/// null prototype); a heap or stack address that is not a cell is not a reference.
+fn mint_ref(w: &Where, bits: u64, scalar_any: bool) -> Option<Val> {
+    match w.val(bits) {
+        Ok(Val::Scalar(x)) if scalar_any || x == 0 => Some(Val::Scalar(x)),
+        Ok(v @ (Val::Cell { .. } | Val::Ext { .. })) => Some(v),
+        _ => None,
+    }
+}
+
+/// The runtime layout descriptors whose `shape_id` word changed to `id` between the baseline copy `was`
+/// and the cut copy `now` of the data window, and whose `layout_id` is `word`: how many, and the offset
+/// of the last from the window start.
+fn mint_desc_matches(was: &[u8], now: &[u8], id: u32, word: u32) -> (u32, u64) {
+    use crate::object::layout_desc::PerryLayoutDesc;
+    let (so, lo) = (
+        std::mem::offset_of!(PerryLayoutDesc, shape_id),
+        std::mem::offset_of!(PerryLayoutDesc, layout_id),
+    );
+    let u32at = |b: &[u8], o: usize| {
+        b.get(o..o + 4)
+            .map_or(0, |s| u32::from_le_bytes(s.try_into().unwrap_or([0; 4])))
+    };
+    let (mut n, mut at) = (0u32, 0u64);
+    let words = now.len().min(was.len()) / 8;
+    for i in 0..words {
+        if now.get(i * 8..i * 8 + 8) == was.get(i * 8..i * 8 + 8) {
+            continue;
+        }
+        for half in 0..2usize {
+            let c = i * 8 + half * 4;
+            if u32at(now, c) != id {
+                continue;
+            }
+            let Some(d) = c.checked_sub(so) else { continue };
+            if u32at(now, d + lo) == word {
+                n += 1;
+                at = d as u64;
+            }
+        }
+    }
+    (n, at)
+}
+
+/// The prototype serial the first birth of the descriptor at `desc_off` drew for its family: the
+/// family's serial word changed from 0 between the baseline copy `was` and the cut copy `now` of
+/// the data window (which starts at `data_lo`), and no record earlier in mint order drew it
+/// (`families`). 0 when the birth drew none.
+fn mint_fam_serial(
+    was: &[u8],
+    now: &[u8],
+    data_lo: usize,
+    desc_off: u64,
+    families: &mut Vec<u64>,
+) -> u64 {
+    use crate::object::layout_desc as ld;
+    let u64at = |b: &[u8], o: u64| {
+        usize::try_from(o)
+            .ok()
+            .and_then(|o| b.get(o..o.checked_add(8)?))
+            .map_or(0, |s| u64::from_le_bytes(s.try_into().unwrap_or([0; 8])))
+    };
+    let proto = std::mem::offset_of!(ld::PerryLayoutDesc, proto) as u64;
+    let fam = u64at(now, desc_off.saturating_add(proto));
+    if fam < ld::LAYOUT_PROTO_TAG_END as u64 {
+        return 0;
+    }
+    let Some(off) = fam.checked_sub(data_lo as u64) else {
+        return 0;
+    };
+    let off = off.saturating_add(ld::SNAP_IMAGE_FAMILY_SERIAL_OFFSET as u64);
+    let (old, new) = (u64at(was, off), u64at(now, off));
+    if old != 0 || new == 0 || families.contains(&off) {
+        return 0;
+    }
+    families.push(off);
+    new
+}
+
+fn mint_bump(c: &mut [u64], k: usize) {
+    if let Some(x) = c.get_mut(k) {
+        *x += 1;
+    }
+}
+
+fn mint_set(c: &mut [u64], k: usize, v: u64) {
+    if let Some(x) = c.get_mut(k) {
+        *x = v;
+    }
+}
+
+fn mint_note(n: &mut [u32], first: &mut [usize], k: usize, i: usize) {
+    if let (Some(c), Some(f)) = (n.get_mut(k), first.get_mut(k)) {
+        if *c == 0 {
+            *f = i;
+        }
+        *c += 1;
+    }
+}
+
+/// What replay needs of the minted records and the capture adds: each record's references (key list,
+/// prototype word, a runtime layout's descriptor cell), a stop per reason replay cannot rebuild a record
+/// through the normal mint path (the first record and how many), and the census stops. `was` and `now`
+/// are the data window at the baseline and at the cut.
+fn mint_capture(
+    w: &Where,
+    recs: &mut [format::MintRec],
+    data_lo: usize,
+    was: &[u8],
+    now: &[u8],
+    begin: &crate::object::shapes::SnapShapeState,
+) -> Vec<Stop> {
+    use crate::object::shapes as sh;
+    use format as f;
+    let mut stops = Vec::new();
+    if recs.is_empty() {
+        return stops;
+    }
+    let flags = sh::snap_image_mint_replay_flags(recs);
+    // Reasons: keys, canonical, proto word, no descriptor, row gap, successor.
+    let (mut n, mut first): (Vec<u32>, Vec<usize>) = (Vec::new(), Vec::new());
+    // Census items (`MINT_CENSUS_*` order).
+    let mut c: Vec<u64> = Vec::new();
+    // The family serial words a record earlier in mint order drew (offsets in the window).
+    let mut families: Vec<u64> = Vec::new();
+    for _ in 0..6 {
+        n.push(0);
+        first.push(0);
+    }
+    for _ in 0..f::MINT_CENSUS_ITEMS {
+        c.push(0);
+    }
+    for (i, r) in recs.iter_mut().enumerate() {
+        if let Some(x) = c.get_mut(r.route as usize) {
+            *x += 1;
+        }
+        r.keys_ref = mint_ref(w, r.keys, false);
+        match &r.keys_ref {
+            Some(Val::Cell { .. }) => mint_bump(&mut c, 14),
+            Some(Val::Ext { .. }) => mint_bump(&mut c, 15),
+            Some(_) => {}
+            None => mint_note(&mut n, &mut first, 0, i),
+        }
+        if r.proto_cell != 0 {
+            // SAFETY: the slot of the prototype identity words, a live allocation of the shape table.
+            let bits = unsafe { std::ptr::read_volatile(r.proto_cell as usize as *const u64) };
+            r.proto_ref = mint_ref(w, bits, true);
+            if r.proto_ref.is_none() {
+                mint_note(&mut n, &mut first, 2, i);
+            }
+        }
+        if r.route == f::MINT_ROUTE_RUNTIME {
+            let (m, off) = mint_desc_matches(was, now, r.id, r.word);
+            if m == 1 {
+                r.desc_off = Some(off);
+                mint_bump(&mut c, 16);
+                r.fam_serial = mint_fam_serial(was, now, data_lo, off, &mut families);
+                if r.fam_serial != 0 {
+                    mint_bump(&mut c, 17);
+                }
+            } else {
+                mint_note(&mut n, &mut first, 3, i);
+            }
+        }
+        if r.route == f::MINT_ROUTE_LAZY {
+            let d = crate::object::layout_desc::snap_image_lazy_descriptor(r.word);
+            if let Some(off) = d.checked_sub(data_lo).filter(|_| d != 0) {
+                r.fam_serial = mint_fam_serial(was, now, data_lo, off as u64, &mut families);
+                if r.fam_serial != 0 {
+                    mint_bump(&mut c, 17);
+                }
+            }
+        }
+        let fl = flags.get(i).copied().unwrap_or(0);
+        if fl & f::MINT_FLAG_CANONICAL != 0 {
+            mint_bump(&mut c, 4);
+            mint_note(&mut n, &mut first, 1, i);
+        }
+        if fl & f::MINT_FLAG_SUCCESSOR != 0 {
+            mint_bump(&mut c, 5);
+            mint_note(&mut n, &mut first, 5, i);
+        }
+        if fl & f::MINT_FLAG_ROW_GAP != 0 {
+            mint_bump(&mut c, 6);
+            mint_note(&mut n, &mut first, 4, i);
+        }
+        let p = r.proto_id;
+        let k = if p == crate::object::shapes::PROTO_ID_DEFAULT {
+            7
+        } else if (sh::PROTO_ID_CLASS..sh::PROTO_ID_MIXED).contains(&p) {
+            8
+        } else if (sh::PROTO_ID_MIXED..sh::PROTO_ID_UNIQUE).contains(&p) {
+            9
+        } else if (sh::PROTO_ID_UNIQUE..sh::PROTO_ID_RECORD_HELD).contains(&p) {
+            10
+        } else {
+            11
+        };
+        mint_bump(&mut c, k);
+    }
+    let (unique, serial) = sh::snap_image_mint_counters_moved(begin);
+    mint_set(&mut c, 12, unique);
+    mint_set(&mut c, 13, serial);
+    let kinds = [
+        f::STOP_MINT_KEYS,
+        f::STOP_MINT_CANONICAL,
+        f::STOP_MINT_PROTO_WORD,
+        f::STOP_MINT_NO_DESC,
+        f::STOP_MINT_ROW_GAP,
+        f::STOP_MINT_SUCCESSOR,
+    ];
+    for (kind, (cnt, at)) in kinds.iter().zip(n.iter().zip(first.iter())) {
+        if *cnt > 0 {
+            let id = recs.get(*at).map_or(0, |r| r.id);
+            stops.push(Stop {
+                cell: *at as u32,
+                obj_type: 0,
+                kind: *kind,
+                off: *cnt,
+                value: u64::from(id),
+            });
+        }
+    }
+    for (item, value) in c.iter().enumerate() {
+        stops.push(Stop {
+            cell: 0,
+            obj_type: item as u8,
+            kind: f::STOP_MINT_CENSUS,
+            off: 0,
+            value: *value,
+        });
+    }
+    stops
 }
 
 /// Which forms the image still lacks, and why it stops: a shape minted between the
@@ -854,3 +1219,6 @@ fn tls_window(fs: usize, memsz: usize, align: usize) -> (usize, usize) {
     let lo = fs.saturating_sub(memsz.div_ceil(align.max(1)) * align.max(1));
     (lo, memsz.min(fs - lo))
 }
+
+// Image replay R1 (enter step 3b): the shape records minted again with positioned counters.
+mod replay;

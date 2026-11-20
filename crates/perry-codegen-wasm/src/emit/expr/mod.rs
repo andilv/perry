@@ -14,6 +14,7 @@
 mod arrays;
 mod buffers;
 mod calls;
+mod class_eval;
 mod classes;
 mod date_error;
 mod iterator_records;
@@ -30,6 +31,7 @@ mod url_process_path;
 use super::*;
 
 pub(super) use iterator_records::BRIDGES as ITERATOR_RECORD_BRIDGES;
+pub(super) use iterator_records::EAGER as ITERATOR_RECORD_EAGER;
 
 impl<'a> FuncEmitCtx<'a> {
     pub(super) fn emit_expr(&mut self, func: &mut Function, expr: &Expr) {
@@ -55,6 +57,9 @@ impl<'a> FuncEmitCtx<'a> {
             return;
         }
         if self.try_emit_expr_classes(func, expr) {
+            return;
+        }
+        if self.try_emit_expr_class_eval(func, expr) {
             return;
         }
         if self.try_emit_expr_strings_json(func, expr) {

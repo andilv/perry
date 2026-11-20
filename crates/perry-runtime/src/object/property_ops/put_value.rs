@@ -74,6 +74,19 @@ pub extern "C" fn js_put_value_set(
     }
     let target_bits = target.to_bits();
     let key_bits = key.to_bits();
+    // An integral Number key naming an own writable data property: the probe
+    // store of its atom (`runtime_read_site::store_integer_key`).
+    if target_bits == receiver.to_bits()
+        && unsafe {
+            crate::object::field_get_set::runtime_read_site::store_integer_key(
+                target_bits,
+                key,
+                value,
+            )
+        }
+    {
+        return value;
+    }
     // DEC 243(3): a symbol key on an ordinary receiver takes the probe store,
     // as an atom key does.
     if target_bits == receiver.to_bits()
@@ -517,6 +530,12 @@ fn set_dynamic_absent(
             return set_dynamic_rest_atom(target, atom, hash, value, strict);
         }
         let obj = (target.to_bits() & POINTER_MASK) as usize as *mut crate::ObjectHeader;
+        // An empty layout has no slot to migrate: its first key starts its
+        // table (`overflow::ensure_adding`) and is appended to it, under the
+        // admission of every later table add.
+        if crate::object::layout_probe::table_add_admitted(obj, r, atom, hash) {
+            return table_first_append(obj, r, atom, hash, value);
+        }
         if crate::object::layout_probe::keyed_add_admitted(obj, r, atom, hash) {
             if let Some(stored) = keyed_append(obj, atom, value) {
                 return stored;
@@ -541,6 +560,9 @@ fn set_dynamic_overflow_miss(
 ) -> f64 {
     unsafe {
         let obj = (target.to_bits() & POINTER_MASK) as usize as *mut crate::ObjectHeader;
+        if crate::object::layout_probe::table_append(obj, r, atom, hash, value) {
+            return value;
+        }
         if crate::object::layout_probe::keyed_overflow_append(obj, r, atom, hash) {
             if let Some(stored) = keyed_append(obj, atom, value) {
                 return stored;
@@ -674,6 +696,51 @@ unsafe fn keyed_append(obj: *mut crate::ObjectHeader, atom: u64, value: f64) -> 
         value.get_nanbox_f64(),
     );
     Some(value.get_nanbox_f64())
+}
+
+/// [`set_dynamic_absent`]'s add for a receiver whose layout names no key and
+/// which admits the table add (`layout_probe::table_add_admitted`): its table
+/// is started and the entry appended to it, with no migration and no note.
+///
+/// # Safety
+/// `obj`'s layout names no key and it admits the add of `atom` (absent),
+/// whose hash is `hash`.
+#[inline(never)]
+unsafe fn table_first_append(
+    obj: *mut crate::ObjectHeader,
+    r: *const crate::object::layout_probe::ShapeRecord,
+    atom: u64,
+    hash: u64,
+    value: f64,
+) -> f64 {
+    let live = crate::object::layout_probe::record_live_inline_slots(r);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let owner = scope.root_raw_mut_ptr(obj);
+    let value = scope.root_nanbox_f64(value);
+    let key = scope.root_nanbox_u64(atom);
+    let t =
+        crate::object::overflow::start_empty(owner.get_raw_mut_ptr::<crate::ObjectHeader>(), live);
+    // Direct to the inner install: the out-of-line wrapper (overflow::install)
+    // would put a call on this hot first append.
+    let o = owner.get_raw_mut_ptr::<crate::ObjectHeader>();
+    let meta = crate::meta_read!(crate::meta_obj_from_storage!(o as *mut _, t));
+    crate::object::overflow::home::install_in::<false>(o as usize, meta, t);
+    if (*t).length < (*t).capacity {
+        crate::object::overflow::append_plain(
+            t,
+            key.get_nanbox_u64(),
+            hash,
+            crate::object::layout_probe::store_bits(value.get_nanbox_f64()),
+        );
+        return value.get_nanbox_f64();
+    }
+    let obj = owner.get_raw_mut_ptr::<crate::ObjectHeader>();
+    crate::object::overflow::store_unfixed_routed(
+        obj,
+        (atom & POINTER_MASK) as *const crate::StringHeader,
+        value.get_nanbox_f64(),
+    );
+    value.get_nanbox_f64()
 }
 
 /// A store whose key no atom names yet: the atom is minted once (a key has
